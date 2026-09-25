@@ -38,7 +38,7 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | `writable_includes` | empty list | Accepted for compatibility and ignored; it grants no path authority and does not restrict accepted includes. |
 | `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset, at most 4096 bytes. Requires `config_write`. With a state db, a set URL is written into the stored geodata sources at startup, over a URL patched through the API, and removing it returns the asset to its built-in URLs at the next startup; the stored or built-in URLs are the ones used. Without a state db, an empty URL disables updates. |
 | `geoip_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geoip asset, with the same authorization and bounds. |
-| `geodata_download_detour` | `""` | How geodata downloads leave: `direct`, `routing` or a group name. With a state db it is written into the stored route at startup like the URLs; empty leaves the stored route, `direct` by default, in force. Unlike `external_ui_download_detour`, empty does not mean routing. An unknown group is refused at admission. |
+| `geodata_download_detour` | `""` | How geodata downloads leave: `direct`, `routing` or a group name. With a state db it is written into the stored route at startup like the URLs; empty follows routing, like `external_ui_download_detour`, unless a patch stored a route. An unknown group is refused at admission. |
 
 ```dae
 experimental {

@@ -321,10 +321,10 @@ fn named(value: Value) -> Option<Patch> {
 }
 
 #[test]
-fn downloads_go_direct_until_a_route_is_stored() {
+fn downloads_follow_routing_until_a_route_is_stored() {
     let directory = tempfile::tempdir().unwrap();
     let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
-    assert_eq!(sources.effective().download, Route::Direct);
+    assert_eq!(sources.effective().download, Route::Routing);
     let routed = sources
         .apply(named(
             json!({"download": {"route": "group", "group_id": "group-id"}}),
@@ -350,7 +350,7 @@ fn downloads_go_direct_until_a_route_is_stored() {
     let reopened = Sources::open(db(directory.path()), &settings("")).unwrap();
     assert_eq!(reopened.effective().download, Route::Group("proxy".into()));
     let reset = reopened.apply(None).unwrap();
-    assert_eq!(reset.download, Route::Direct);
+    assert_eq!(reset.download, Route::Routing);
 }
 
 #[test]
@@ -374,17 +374,17 @@ fn the_file_seeds_the_download_route_at_startup_over_a_patch() {
     let sources = Sources::open(db(directory.path()), &detour("")).unwrap();
     assert_eq!(
         sources.effective().download,
-        Route::Direct,
+        Route::Routing,
         "a route an earlier file wrote is deleted"
     );
     sources
-        .apply(named(json!({"download": {"route": "routing"}})))
+        .apply(named(json!({"download": {"route": "direct"}})))
         .unwrap();
     drop(sources);
     let sources = Sources::open(db(directory.path()), &detour("")).unwrap();
     assert_eq!(
         sources.effective().download,
-        Route::Routing,
+        Route::Direct,
         "a patched route is kept"
     );
 }

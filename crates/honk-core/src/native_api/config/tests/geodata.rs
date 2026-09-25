@@ -775,7 +775,7 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     for asset in assets.as_array().unwrap() {
         assert_eq!(
             asset["download_route"],
-            json!({"route": "direct", "group_id": null})
+            json!({"route": "routing", "group_id": null})
         );
     }
     assert!(data["last_checked_at"].is_string());
@@ -839,7 +839,7 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
             "geosite": {"urls": [format!("http://{address}/geosite/PRIVATE?token=PRIVATE")]},
             "geoip": {"urls": [format!("http://{address}/geoip")]},
             "auto_update": {"enabled": true, "interval_hours": 24},
-            "download": {"route": "direct", "group_id": null}})
+            "download": {"route": "routing", "group_id": null}})
     );
     let patched = ok(patch_settings(
         &fixture,

@@ -152,7 +152,7 @@ pub(crate) fn urls(
 }
 
 /// The route in force: the stored one when sources are configurable,
-/// otherwise the configuration file's, and direct when it names none.
+/// otherwise the configuration file's, and routing when it names none.
 fn route(settings: &NativeApiConfig, sources: Option<&Sources>) -> Route {
     match sources {
         Some(sources) => sources.effective().download,

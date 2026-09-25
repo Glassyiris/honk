@@ -53,17 +53,19 @@ impl Default for AutoUpdate {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "route", content = "group", rename_all = "lowercase")]
 pub(crate) enum Route {
-    /// The routing rules decide, as for user traffic.
+    /// The routing rules decide, as for user traffic and every other download
+    /// honk makes itself.
+    #[default]
     Routing,
     /// Always through the named group.
     Group(String),
-    /// Straight to the host, as provider fetches go.
-    #[default]
+    /// Straight to the host, outside the routing rules.
     Direct,
 }
 
 impl Route {
-    /// The configuration file's `geodata_download_detour`; `None` when empty.
+    /// The configuration file's `geodata_download_detour`; `None` when empty,
+    /// which leaves the stored route or the routing default in force.
     pub(crate) fn from_detour(detour: &str) -> Option<Self> {
         match detour {
             "" => None,

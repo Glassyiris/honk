@@ -128,8 +128,8 @@ pub struct NativeApiConfig {
     pub geosite_download_url: String,
     pub geoip_download_url: String,
     /// How geodata downloads leave: `direct`, `routing` or a group name.
-    /// Empty leaves the stored route in force, unlike
-    /// `external_ui_download_detour`, where empty follows routing.
+    /// Empty follows routing, like `external_ui_download_detour`, unless a
+    /// route is stored.
     pub geodata_download_detour: String,
 }
 

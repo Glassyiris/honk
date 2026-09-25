@@ -38,7 +38,7 @@
 | `writable_includes` | 空列表 | 为兼容旧配置而接受，不产生作用；不授予路径权限，也不限制已接受 include。 |
 | `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源，最长 4096 字节；要求 `config_write`。有状态库时，已设置的 URL 在启动时写入已存储的 geodata 来源，覆盖通过 API 修改的 URL；删除该项后，下次启动时该资产恢复内置 URL。更新使用已存储或内置的 URL。没有状态库时，URL 为空则不能更新。 |
 | `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
-| `geodata_download_detour` | `""` | Geodata 下载的出口：`direct`、`routing` 或组名。有状态库时，启动时按与 URL 相同的规则写入已存储的路由；空值使已存储的路由（默认 `direct`）继续生效。与 `external_ui_download_detour` 不同，空值不表示遵循路由规则。未知的组在准入时拒绝。 |
+| `geodata_download_detour` | `""` | Geodata 下载的出口：`direct`、`routing` 或组名。有状态库时，启动时按与 URL 相同的规则写入已存储的路由；空值与 `external_ui_download_detour` 相同，遵循路由规则；若已通过 API 存储路由，则保留该路由。未知的组在准入时拒绝。 |
 
 ```dae
 experimental {

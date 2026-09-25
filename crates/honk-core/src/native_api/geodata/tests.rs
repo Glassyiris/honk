@@ -248,6 +248,17 @@ async fn a_url_the_group_cannot_reach_falls_back_to_the_next_through_the_group()
 
 /// At startup a group may have no member it can use yet. Every URL fails and
 /// nothing is fetched direct.
+#[test]
+fn an_empty_detour_follows_routing_without_a_state_db() {
+    let file = |detour: &str| NativeApiConfig {
+        geodata_download_detour: detour.into(),
+        ..Default::default()
+    };
+    assert_eq!(route(&file(""), None), Route::Routing);
+    assert_eq!(route(&file("routing"), None), Route::Routing);
+    assert_eq!(route(&file("direct"), None), Route::Direct);
+}
+
 #[tokio::test]
 async fn a_group_not_ready_at_startup_fails_every_url_without_going_direct() {
     let (first, first_requests) = server(b"first").await;
@@ -260,6 +271,11 @@ async fn a_group_not_ready_at_startup_fails_every_url_without_going_direct() {
             .await
             .unwrap_err(),
         "connection_failed"
+    );
+    assert_eq!(
+        world.fetch(Route::Routing, &urls).await.unwrap_err(),
+        "connection_failed",
+        "the rules send the URLs to the group"
     );
     assert_eq!(
         world
