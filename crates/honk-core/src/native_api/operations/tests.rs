@@ -251,7 +251,7 @@ async fn rejection_and_owner_cancellation_wake_waiters_without_publishing_operat
 }
 
 #[tokio::test(start_paused = true)]
-async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operations() {
+async fn full_store_evicts_oldest_terminal_operation_before_refusing_unfinished_ones() {
     let store = store();
     let mut owners = Vec::new();
     for number in 0..MAX_OPERATIONS {
@@ -260,86 +260,76 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
             assert!(store.accept(&reservation.id));
             assert!(store.running(&reservation.id));
         }
-        if number > 1 {
-            assert!(store.succeed(
-                &reservation.id,
-                OperationResult::Reload {
-                    active_generation_id: None,
-                    datapath_generation_id: None
-                }
-            ));
-        }
         owners.push(reservation);
     }
-    tokio::time::advance(RETENTION - Duration::from_secs(1)).await;
-    let full = store
-        .reserve(
+    let reserve_new = |key: &str| {
+        store.reserve(
             "owner",
             "POST",
             "/api/v1/operations/reload",
-            Some("new"),
+            Some(key),
             b"{}",
             crate::native_api::operations::OperationKind::Reload,
         )
-        .err()
-        .unwrap();
+    };
+    // Every slot is preparing or running, so nothing can be evicted.
     assert_error(
-        full,
+        reserve_new("new-0").err().unwrap(),
         StatusCode::SERVICE_UNAVAILABLE,
         "temporarily_unavailable",
     )
     .await;
-    let pending = reserve(&store, "0");
-    assert!(!pending.fresh);
-    assert!(pending.admission().now_or_never().is_none());
-    let original = reserve(&store, "2");
-    assert_eq!(
-        original.admission().await.unwrap().operation_id,
-        owners[2].id
-    );
-    let conflict = store
-        .reserve(
-            "owner",
-            "POST",
-            "/api/v1/operations/reload",
-            Some("2"),
-            b"different",
-            crate::native_api::operations::OperationKind::Reload,
-        )
-        .err()
-        .unwrap();
-    assert_error(conflict, StatusCode::CONFLICT, "idempotency_conflict").await;
-    for owner in owners.iter().skip(1) {
-        assert_eq!(store.get(&owner.id).unwrap().status(), StatusCode::OK);
+    for owner in owners.iter().skip(2).rev() {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(store.fail(&owner.id, "reload_failed", "Reload failed.", None));
     }
-    tokio::time::advance(Duration::from_secs(1)).await;
+
+    let first = reserve_new("new-1").unwrap();
+    assert!(first.fresh);
+    let oldest = owners.last().unwrap();
     assert_error(
-        store.get(&owners[2].id).unwrap_err(),
+        store.get(&oldest.id).unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
     .await;
-    let renewed = reserve(&store, "2");
-    assert!(renewed.fresh);
-    assert_ne!(renewed.id, owners[2].id);
+    assert_eq!(
+        body(store.get(&owners[2].id).unwrap()).await["status"],
+        "failed"
+    );
+    let second = reserve_new("new-2").unwrap();
+    assert!(second.fresh);
+    assert_error(
+        store.get(&owners[MAX_OPERATIONS - 2].id).unwrap_err(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    )
+    .await;
+
+    // Unfinished operations keep their slot and their idempotent replay.
+    let pending = reserve(&store, "0");
+    assert!(!pending.fresh);
+    assert!(pending.admission().now_or_never().is_none());
+    let running = reserve(&store, "1");
+    assert_eq!(
+        running.admission().await.unwrap().operation_id,
+        owners[1].id
+    );
     assert!(store.accept(&owners[0].id));
     assert_eq!(
         pending.admission().await.unwrap().operation_id,
         owners[0].id
     );
-    assert_eq!(
-        body(store.get(&owners[1].id).unwrap()).await["status"],
-        "running"
-    );
-    assert!(store.fail(&owners[1].id, "reload_failed", "Reload failed.", None));
+
+    // A terminal operation that is not evicted stays for the full retention window.
     tokio::time::advance(RETENTION - Duration::from_secs(1)).await;
     assert_eq!(
-        body(store.get(&owners[1].id).unwrap()).await["status"],
+        body(store.get(&owners[2].id).unwrap()).await["status"],
         "failed"
     );
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_error(
-        store.get(&owners[1].id).unwrap_err(),
+        store.get(&owners[2].id).unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
@@ -566,8 +556,32 @@ async fn geodata_replay_precedes_exclusivity_and_capacity() {
     .await;
     store.fail(&first.id, "download_failed", "Download failed", None);
     assert_eq!(geodata("first").unwrap().id, first.id);
+    let other = geodata("other").unwrap();
+    assert!(other.fresh);
     assert_error(
-        geodata("other").err().unwrap(),
+        store.get(&first.id).unwrap_err(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    )
+    .await;
+    assert_error(
+        geodata("first").err().unwrap(),
+        StatusCode::CONFLICT,
+        "state_conflict",
+    )
+    .await;
+    assert_error(
+        store
+            .reserve(
+                "owner",
+                "POST",
+                "/api/v1/operations/reload",
+                Some("full"),
+                b"{}",
+                OperationKind::Reload,
+            )
+            .err()
+            .unwrap(),
         StatusCode::SERVICE_UNAVAILABLE,
         "temporarily_unavailable",
     )
