@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::records::{self, DnsAnswer, DnsQuestion, MAX_JSON_BYTES};
+use super::records::{self, DnsAnswer, DnsQuestion, MAX_JSON_BYTES, ProjectionError};
 use crate::dns::outcome::{DnsOutcome, Provenance, RequestRoute};
 use crate::dns::query::IngressProfile;
 use crate::dns::response::native;
@@ -247,6 +247,7 @@ impl LogStore {
         let mut budget = MAX_JSON_BYTES - 512;
         let mut rows = Vec::new();
         let mut last = None;
+        let mut full = false;
         for entry in selected.by_ref().take(limit) {
             let meta = Metadata {
                 id: format!("{}:dns:{}", self.instance, entry.sequence),
@@ -262,14 +263,25 @@ impl LogStore {
             let charge = records::json_size(&meta)
                 .map_err(|_| unavailable(id))?
                 .saturating_add(size_of::<Row<'_>>() + 16);
-            budget = budget.checked_sub(charge).ok_or_else(|| unavailable(id))?;
-            let answers =
-                records::project(&entry.query, &entry.response, entry.ingress, &mut budget)
-                    .map_err(|_| unavailable(id))?;
-            rows.push(Row { meta, answers });
+            let answers = match budget.checked_sub(charge) {
+                Some(rest) => {
+                    budget = rest;
+                    records::project(&entry.query, &entry.response, entry.ingress, &mut budget)
+                }
+                None => Err(ProjectionError::Budget),
+            };
+            match answers {
+                Ok(answers) => rows.push(Row { meta, answers }),
+                // A record that fits no page stays an error; skipping it would hide it.
+                Err(ProjectionError::Budget) if !rows.is_empty() => {
+                    full = true;
+                    break;
+                }
+                Err(_) => return Err(unavailable(id)),
+            }
             last = Some(entry.sequence);
         }
-        let more = selected.next().is_some();
+        let more = full || selected.next().is_some();
         let page = Page {
             observed_at: timestamp(SystemTime::now()),
             total: ring.entries.len(),
@@ -567,9 +579,90 @@ mod tests {
             page["records"][0]["answers"][0]["data"],
             format!("\\# 60000 {}", "AB".repeat(60000))
         );
+    }
+
+    #[tokio::test]
+    async fn pages_end_early_at_the_projection_budget_and_walk_every_record_once() {
+        let store = LogStore::new("instance".into(), true);
+        let query = crate::dns::forwarder::build_dns_query("large.example", 65000);
+        let mut response = query.clone();
+        response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 12, 0xfd, 0xe8, 0, 1, 0, 0, 0, 1]);
+        response.extend_from_slice(&60000u16.to_be_bytes());
+        response.resize(response.len() + 60000, 0xab);
+        for _ in 0..7 {
+            store.capture(
+                &query,
+                IngressProfile::Tcp,
+                None,
+                None,
+                &response,
+                Duration::ZERO,
+            );
+        }
+        let id = RequestId("test".into());
+        let data = format!("\\# 60000 {}", "AB".repeat(60000));
+        let mut ids = std::collections::BTreeSet::new();
+        let mut pages = 0;
+        let mut cursor = None;
+        loop {
+            let page = value(
+                store
+                    .page(Filter::default(), MAX_PAGE_SIZE, cursor.as_deref(), &id)
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(page["total"], 7);
+            let records = page["records"].as_array().unwrap();
+            assert!(!records.is_empty());
+            for record in records {
+                assert_eq!(record["answers"][0]["data"], data);
+                assert!(ids.insert(record["id"].as_str().unwrap().to_owned()));
+            }
+            pages += 1;
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(ids.len(), 7);
+        assert!(pages > 1);
+    }
+
+    #[tokio::test]
+    async fn a_record_larger_than_any_page_is_reported_not_skipped() {
+        let store = LogStore::new("instance".into(), true);
+        let domain = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        let query = crate::dns::forwarder::build_dns_query(&domain, 5);
+        let mut response = query.clone();
+        response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        response[6..8].copy_from_slice(&2000u16.to_be_bytes());
+        for _ in 0..2000 {
+            response.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 12]);
+        }
+        store.capture(
+            &query,
+            IngressProfile::Tcp,
+            None,
+            None,
+            &response,
+            Duration::ZERO,
+        );
+        capture(&store, "small.example", None);
+        let id = RequestId("test".into());
+        let first = value(store.page(Filter::default(), 2, None, &id).unwrap()).await;
+        assert_eq!(first["records"].as_array().unwrap().len(), 1);
+        let cursor = first["next_cursor"].as_str().unwrap();
         assert_eq!(
             store
-                .page(Filter::default(), 3, None, &id)
+                .page(Filter::default(), 2, Some(cursor), &id)
                 .unwrap_err()
                 .into_response()
                 .status(),

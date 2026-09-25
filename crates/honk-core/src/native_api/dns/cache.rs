@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use super::{
     ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, bounded_response, canonical_name,
-    full_detail, invalid_query, parameters, records, timestamp, unavailable,
+    full_detail, invalid_query, parameters, records, records::ProjectionError, timestamp,
+    unavailable,
 };
 use crate::dns::cache::{CacheUsage, ExactCacheEntry};
 
@@ -99,7 +100,7 @@ pub(super) async fn serve(
         if position == 0 || position >= snapshot.entries.len() {
             return Err(invalid_query(id));
         }
-        return page(snapshot, position, limit, id);
+        return page(snapshot, position, limit, id).map(|(response, _)| response);
     }
     if snapshots.len() == 8 {
         return Err(unavailable(id));
@@ -156,8 +157,8 @@ pub(super) async fn serve(
         bytes,
         wall,
     };
-    let response = page(&snapshot, 0, limit, id)?;
-    if snapshot.entries.len() > limit {
+    let (response, more) = page(&snapshot, 0, limit, id)?;
+    if more {
         snapshots.push_back(snapshot);
     }
     Ok(response)
@@ -176,16 +177,17 @@ fn at(snapshot: &Snapshot, instant: Instant) -> String {
     timestamp(wall.unwrap_or(snapshot.wall))
 }
 
+/// Returns the page and whether it ends before the snapshot does.
 fn page(
     snapshot: &Snapshot,
     offset: usize,
     limit: usize,
     id: &RequestId,
-) -> Result<Response, ApiError> {
-    let end = offset.saturating_add(limit).min(snapshot.entries.len());
+) -> Result<(Response, bool), ApiError> {
+    let mut end = offset.saturating_add(limit).min(snapshot.entries.len());
     let mut budget = MAX_RESPONSE_BYTES.saturating_sub(1024);
     let mut rows = Vec::with_capacity(end - offset);
-    for entry in &snapshot.entries[offset..end] {
+    for (position, entry) in snapshot.entries[offset..end].iter().enumerate() {
         let question = records::question(entry.key.wire_identity(), entry.key.ingress())
             .map_err(|_| unavailable(id))?;
         let metadata_cost = entry
@@ -193,9 +195,11 @@ fn page(
             .len()
             .saturating_add(question.name.len())
             .saturating_add(512);
-        budget = budget
-            .checked_sub(metadata_cost)
-            .ok_or_else(|| unavailable(id))?;
+        let Some(rest) = budget.checked_sub(metadata_cost) else {
+            end = full_page(offset + position, &rows, id)?;
+            break;
+        };
+        budget = rest;
         let status = if let Some(rcode) = entry.negative {
             match rcode {
                 0 => "NODATA".to_owned(),
@@ -221,13 +225,19 @@ fn page(
             let answers = if let Some(response) =
                 entry.response.as_ref().filter(|_| entry.negative.is_none())
             {
-                records::project(
+                match records::project(
                     entry.key.wire_identity(),
                     response,
                     entry.key.ingress(),
                     &mut budget,
-                )
-                .map_err(|_| unavailable(id))?
+                ) {
+                    Ok(answers) => answers,
+                    Err(ProjectionError::Budget) => {
+                        end = full_page(offset + position, &rows, id)?;
+                        break;
+                    }
+                    Err(ProjectionError::Invalid) => return Err(unavailable(id)),
+                }
             } else {
                 Vec::new()
             };
@@ -235,12 +245,23 @@ fn page(
         }
         rows.push(row);
     }
-    let cursor = (end < snapshot.entries.len()).then(|| format!("{}:{end}", snapshot.id));
+    let more = end < snapshot.entries.len();
+    let cursor = more.then(|| format!("{}:{end}", snapshot.id));
     let usage = &snapshot.usage;
-    bounded_response(
+    let response = bounded_response(
         &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"negative":true,"persistent":false},
         "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor,
         "usage":{"entries":usage.entries.to_string(),"entry_capacity":usage.entry_capacity.to_string()}}),
         id,
-    )
+    )?;
+    Ok((response, more))
+}
+
+/// Ends the page before the entry at `position`; an entry that fits no page stays an error.
+fn full_page<T>(position: usize, rows: &[T], id: &RequestId) -> Result<usize, ApiError> {
+    if rows.is_empty() {
+        Err(unavailable(id))
+    } else {
+        Ok(position)
+    }
 }

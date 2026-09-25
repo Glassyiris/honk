@@ -1,5 +1,6 @@
 pub(crate) use crate::dns::response::native::{
-    DnsAnswer, DnsQuestion, MAX_JSON_BYTES, parse_type, project, question, record_type, status,
+    DnsAnswer, DnsQuestion, MAX_JSON_BYTES, ProjectionError, parse_type, project, question,
+    record_type, status,
 };
 
 pub(super) fn json_size(value: &impl serde::Serialize) -> Result<usize, serde_json::Error> {

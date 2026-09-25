@@ -115,6 +115,77 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     );
 }
 
+#[tokio::test]
+async fn cache_pages_end_early_at_the_response_budget_and_walk_every_entry_once() {
+    use crate::dns::cache::{CacheKey, OperationKind};
+    use crate::dns::forwarder::build_dns_query;
+    use crate::dns::planner::RequestScope;
+    use crate::dns::query::QueryContext;
+
+    let mut config = honk_config::Config::default();
+    config.dns.cache.max_size = 8192;
+    let state = dns_state(config).await;
+    let service = state.dns.cache().lock().await.service();
+    let scope = RequestScope::Upstream(UpstreamTag::new("default").unwrap());
+    let put = |name: &str, qtype: u16, rdata: &[u8]| {
+        let mut response = build_dns_query(name, qtype);
+        let key = CacheKey::new(
+            &QueryContext::parse(&response).unwrap(),
+            None,
+            scope.clone(),
+            OperationKind::Resolve,
+        );
+        response[2..4].copy_from_slice(&[0x81, 0x80]);
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&qtype.to_be_bytes());
+        response.extend_from_slice(&[0, 1, 0, 0, 1, 44]);
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(rdata);
+        service.put_exact(key, response, 300, None);
+    };
+    for index in 0..600 {
+        put(&format!("small-{index}.example"), 1, &[192, 0, 2, 1]);
+    }
+    let text = [[255u8].as_slice(), &[b'x'; 255]].concat().repeat(64);
+    for index in 0..24 {
+        put(&format!("large-{index}.example"), 16, &text);
+    }
+
+    for (filters, expected) in [
+        ("?domain=small-&limit=1000", 600),
+        ("?domain=large-&limit=100&detail=full", 24),
+    ] {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut pages = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let query = match &cursor {
+                Some(cursor) => format!("{filters}&cursor={cursor}"),
+                None => filters.to_owned(),
+            };
+            let (status, page) = cache_page(&state, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(page["total"], expected);
+            let entries = page["entries"].as_array().unwrap();
+            assert!(!entries.is_empty());
+            for entry in entries {
+                assert!(ids.insert(entry["entry_id"].as_str().unwrap().to_owned()));
+            }
+            pages += 1;
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(ids.len(), expected, "{filters}");
+        assert!(
+            pages > 1,
+            "{filters} fit one page; the budget was not reached"
+        );
+    }
+}
+
 async fn cache_page(state: &NativeState, query: &str) -> (StatusCode, Value) {
     let uri = format!("/api/v1/dns/cache{query}").parse().unwrap();
     let response = cache(state, &uri, &RequestId("cache-test".into()))
