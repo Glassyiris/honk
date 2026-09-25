@@ -84,7 +84,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 订阅正文及其产生的节点都只属于 runtime 状态；两者都不会写回 dae 配置。
 
-订阅拉取默认经过路由，与 honk 自身发起的其他下载一致，除非 `download_detour` 另行指定。`routing` 时拉取目标与用户流量一样经过路由规则，因此规则可将其发往节点、组、`direct` 或 `block`；每次重定向都重新路由。组名则强制经过该组。经路由的请求与 geodata、外部 UI 下载共用路由决策和隧道，发送相同的 `User-Agent` 与 header，并保持 30 秒超时、8 MiB 上限和重定向规则（最多 5 次，不从 HTTPS 转到 HTTP，不从公网地址转到私有字面地址）。`direct` 沿用原有传输：bootstrap resolver 加绕过标记，不经过路由。
+订阅拉取默认经过路由，与 honk 自身发起的其他下载一致，除非 `download_detour` 另行指定。`routing` 时拉取目标与用户流量一样经过路由规则，因此规则可将其发往节点、组、`direct` 或 `block`；每次重定向都重新路由。组名则强制经过该组。经路由的请求与 geodata、外部 UI 下载共用路由决策和隧道，发送相同的 `User-Agent` 与 header，并保持 30 秒超时、8 MiB 上限和重定向规则（只跟随 301、302、303、307 和 308，最多 5 次，不从 HTTPS 转到 HTTP，不从公网地址转到私有字面地址）。URL 中的 userinfo 以 basic 认证发送；重定向到其他 scheme、主机或端口时，与直连客户端一样去掉 `Authorization`、`Cookie` 和 `Proxy-Authorization`。`direct` 沿用原有传输：bootstrap resolver 加绕过标记，不经过路由。未启用 `native-api` feature 的构建没有经路由的传输，因此默认值直连，显式的 `routing` 或组名则失败。
 
 订阅可能经由自身提供的节点拉取，例如规则把订阅 URL 发往一个只含该订阅节点的组。全新安装时这些节点尚不存在。honk 不会回退到直连：所选路由没有可用节点时，拉取失败，错误信息指明订阅名和出站，说明该路由暂时无法承载这次下载，并建议为该订阅设置 `download_detour: direct`。原生 API 的 provider 状态中 `last_error.code` 为 `route_unavailable`。期间从已存正文恢复的节点继续生效。
 

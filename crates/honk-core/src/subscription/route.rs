@@ -11,7 +11,17 @@ pub(crate) type Routing = std::convert::Infallible;
 
 /// The subscription is fetched straight from its host, outside routing.
 pub(crate) fn direct(subscription: &Subscription) -> bool {
-    subscription.download_detour == honk_config::Config::BUILTIN_DIRECT_NODE
+    resolves_direct(&subscription.download_detour, cfg!(feature = "native-api"))
+}
+
+/// Without a routed transport the default keeps the direct fetch; an
+/// explicit `routing` or group still fails rather than going direct.
+fn resolves_direct(detour: &str, routed_transport: bool) -> bool {
+    match detour {
+        "direct" => true,
+        "" => !routed_transport,
+        _ => false,
+    }
 }
 
 /// The route chosen for a subscription has no node that can carry it, as when
@@ -40,7 +50,7 @@ pub(super) async fn fetch(
     _routing: Option<&Routing>,
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!(
-        "subscription '{}': this build cannot route subscription downloads; set download_detour: direct",
+        "subscription '{}': this build cannot route subscription downloads; set download_detour: direct or leave it empty",
         subscription.name
     )
 }
@@ -48,7 +58,7 @@ pub(super) async fn fetch(
 #[cfg(feature = "native-api")]
 pub(super) use routed::fetch;
 
-#[cfg(all(test, feature = "native-api"))]
+#[cfg(test)]
 mod tests;
 
 #[cfg(feature = "native-api")]
@@ -77,17 +87,20 @@ mod routed {
             )
         })?;
         let deadline = Instant::now() + TIMEOUT;
+        let mut origin = reqwest::Url::parse(&subscription.url)?;
+        let basic = basic_auth(&origin);
+        strip_userinfo(&mut origin);
         let mut headers = vec![(
             "user-agent",
             super::super::effective_subscription_user_agent(subscription),
         )];
+        headers.extend(basic.as_deref().map(|value| ("authorization", value)));
         headers.extend(
             subscription
                 .headers
                 .iter()
                 .map(|header| (header.key.as_str(), header.value.as_str())),
         );
-        let origin = reqwest::Url::parse(&subscription.url)?;
         let mut url = origin.clone();
         let mut redirects = 0;
         loop {
@@ -95,11 +108,17 @@ mod routed {
             if reply.status.is_success() {
                 return Ok(reply.body.to_vec());
             }
-            let Some(location) = reply.location.filter(|_| reply.status.is_redirection()) else {
+            // The redirects reqwest follows. Every request here is a bodiless
+            // GET, so 303 and 301/302 need no method change.
+            let Some(location) = reply
+                .location
+                .filter(|_| matches!(reply.status.as_u16(), 301 | 302 | 303 | 307 | 308))
+            else {
                 anyhow::bail!("subscription server answered HTTP {}", reply.status);
             };
             redirects += 1;
-            let next = url.join(&location)?;
+            let mut next = url.join(&location)?;
+            strip_userinfo(&mut next);
             anyhow::ensure!(
                 redirects <= super::super::MAX_SUBSCRIPTION_REDIRECTS,
                 "subscription redirected too many times"
@@ -107,8 +126,54 @@ mod routed {
             if let Some(reason) = super::super::subscription_redirect_error(&origin, &next) {
                 anyhow::bail!(reason);
             }
+            if next.scheme() != url.scheme()
+                || next.host_str() != url.host_str()
+                || next.port_or_known_default() != url.port_or_known_default()
+            {
+                headers.retain(|(name, _)| !sensitive(name));
+            }
             url = next;
         }
+    }
+
+    /// Credentials reqwest also drops when a redirect leaves the origin.
+    fn sensitive(name: &str) -> bool {
+        [
+            "authorization",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "www-authenticate",
+        ]
+        .iter()
+        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+    }
+
+    /// Basic credentials from the URL's userinfo, as reqwest sends them.
+    fn basic_auth(url: &reqwest::Url) -> Option<String> {
+        use base64::Engine as _;
+        if url.username().is_empty() && url.password().is_none() {
+            return None;
+        }
+        let decode = |part: &str| {
+            percent_encoding::percent_decode_str(part)
+                .decode_utf8_lossy()
+                .into_owned()
+        };
+        let credentials = format!(
+            "{}:{}",
+            decode(url.username()),
+            url.password().map(decode).unwrap_or_default()
+        );
+        Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(credentials)
+        ))
+    }
+
+    fn strip_userinfo(url: &mut reqwest::Url) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
     }
 
     async fn get(

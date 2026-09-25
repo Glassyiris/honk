@@ -367,11 +367,26 @@ where
     drivers.spawn(connection);
     let result = timeout_at(deadline, async {
         let uri: Uri = url.as_str().parse().map_err(|_| "invalid_source")?;
-        let mut request = Request::builder()
-            .uri(uri.path_and_query().ok_or("invalid_source")?.clone())
-            .header("host", uri.authority().ok_or("invalid_source")?.as_str())
-            .header("connection", "close")
-            .header("accept-encoding", "identity");
+        // Host is host[:port] only; userinfo in the URL never goes on the wire here.
+        let host = url.host_str().ok_or("invalid_source")?;
+        let host = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+        let mut request =
+            Request::builder().uri(uri.path_and_query().ok_or("invalid_source")?.clone());
+        for (name, value) in [
+            ("host", host.as_str()),
+            ("connection", "close"),
+            ("accept-encoding", "identity"),
+        ] {
+            if !headers
+                .iter()
+                .any(|(given, _)| given.eq_ignore_ascii_case(name))
+            {
+                request = request.header(name, value);
+            }
+        }
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
