@@ -10,7 +10,7 @@
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
-| GET | `/api`、`/api/v1/discovery` | 公共 discovery，提供固定 `/api/v1` base、认证状态与全部契约 links。 |
+| GET | `/api`、`/api/v1/discovery` | 公共 discovery：所有请求都能获得认证状态与登录 links；已放行的请求另外获得固定 `/api/v1` base 与全部契约 links。 |
 | POST | `/api/v1/auth/setup` | 创建首个密码模式管理员并签发会话。 |
 | POST | `/api/v1/auth/login` | 校验密码模式管理员并签发会话。 |
 | POST | `/api/v1/auth/logout` | 撤销已认证的密码模式会话。 |
@@ -79,6 +79,8 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 ### 认证发现与密码会话
 
 Discovery 返回 `auth: {mode, setup_required, anonymous_loopback}`。配置非空 `secret` 或使用匿名 loopback 开发模式时，`mode` 为 `token`；`secret` 为空且启用 `password_auth` 时为 `password`。仅在密码模式尚无管理员记录时，`setup_required` 为 true。仅在实际 loopback 监听上显式启用开发模式时，`anonymous_loopback` 为 true。密码模式下，`links.auth_setup`、`links.auth_login`、`links.auth_logout` 为对应 endpoint 路径；其他模式下均为 null。
+
+未被放行的无凭据请求只获得 `name`、`api_major`、`links.auth_setup`、`links.auth_login`、`auth.mode` 与 `auth.setup_required`，其余字段省略。通过 bearer、会话或显式匿名 loopback 放行的请求获得完整响应。
 
 Token 模式不提供三个密码 endpoint，返回 `404 capability_not_supported`。密码模式使用以下契约：
 
