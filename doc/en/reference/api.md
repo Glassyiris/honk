@@ -95,7 +95,7 @@ Setup and login admit at most five attempts per canonical peer and ten attempts 
 
 Only one credential job runs at a time, off Tokio workers; overlapping attempts return 429 with `Retry-After: 1`. HTTP cancellation neither frees that slot nor discards its credential outcome. Discovery reads short-lived credential state, not a lock held across KDF or database I/O.
 
-Session tokens are opaque `hnk1_…` values used as `Authorization: Bearer <session>`. Each has a fixed 12-hour lifetime. The process retains only SHA-256 token digests, keeps at most 32 live sessions and evicts the oldest when issuing another; restart ends every session. Operations started through a configured secret or password login belong to the administrator rather than to one token, so logout does not delete them.
+Session tokens are opaque `hnk1_…` values used as `Authorization: Bearer <session>`. Each has a fixed 12-hour lifetime. The process retains only SHA-256 token digests, keeps at most 32 live sessions and evicts the oldest when issuing another; restart ends every session. A session that ends by logout, expiry or eviction also closes the `/events` and `/logs` streams it opened; the client then reconnects and must authenticate again. Operations started through a configured secret or password login belong to the administrator rather than to one token, so logout does not delete them.
 
 Password mode stores one credential record in the `admin` row of the state db, `<data_dir>/state/honk.db` (a 0600 file in a 0700 directory; see [Configuration db](#configuration-db---store-db)). A malformed record prevents startup, and so does a corrupt state db: password mode never moves it aside.
 

@@ -16,7 +16,7 @@ use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
 use super::{ApiError, ErrorCode, Peer, types::RequestId};
@@ -82,6 +82,25 @@ struct Session {
     digest: [u8; 32],
     issued: Instant,
     expires: Instant,
+    /// Dropped with the session, which tells every lease it has ended.
+    ended: watch::Sender<()>,
+}
+
+/// Held by a response that outlives its request, such as an event stream.
+pub(crate) struct SessionLease {
+    ended: watch::Receiver<()>,
+    expires: Instant,
+}
+
+impl SessionLease {
+    /// Completes when the session is revoked, replaced by a newer login, or expires.
+    pub(crate) async fn ended(mut self) {
+        let expiry = tokio::time::sleep_until(self.expires.into());
+        tokio::select! {
+            () = expiry => {}
+            _ = self.ended.changed() => {}
+        }
+    }
 }
 
 pub(crate) struct Issued {
@@ -113,6 +132,7 @@ impl Sessions {
             digest: Sha256::digest(token.as_bytes()).into(),
             issued: now,
             expires: now + SESSION_LIFETIME,
+            ended: watch::Sender::new(()),
         });
         Issued {
             token,
@@ -120,14 +140,14 @@ impl Sessions {
         }
     }
 
-    /// Whether `token` names a live session; every stored digest is compared so timing does not say which matched.
-    pub(crate) fn authenticate(&self, token: &str) -> bool {
+    /// The live session `token` names; every stored digest is compared so timing does not say which matched.
+    pub(crate) fn authenticate(&self, token: &str) -> Option<SessionLease> {
         self.authenticate_at(token, Instant::now())
     }
 
-    fn authenticate_at(&self, token: &str, now: Instant) -> bool {
+    fn authenticate_at(&self, token: &str, now: Instant) -> Option<SessionLease> {
         if !token.starts_with(TOKEN_PREFIX) {
-            return false;
+            return None;
         }
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let sessions = self.inner.lock();
@@ -135,7 +155,17 @@ impl Sessions {
         for session in sessions.iter().filter(|session| session.expires > now) {
             found |= session.digest.ct_eq(&digest);
         }
-        bool::from(found)
+        if !bool::from(found) {
+            return None;
+        }
+        // Only a holder of the valid token reaches this ordinary lookup.
+        sessions
+            .iter()
+            .find(|session| session.digest == digest)
+            .map(|session| SessionLease {
+                ended: session.ended.subscribe(),
+                expires: session.expires,
+            })
     }
 
     /// Ends the session; returns whether one was ended.

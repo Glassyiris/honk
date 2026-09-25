@@ -202,6 +202,69 @@ async fn login_issues_a_session_and_logout_ends_only_that_one() {
     app.shutdown().await;
 }
 
+/// Opens an authenticated stream and consumes its first frame.
+async fn open_stream(app: &TestApp, path: &str, token: &str) -> Response {
+    // The shared client's whole-request timeout would end any stream on its own.
+    let mut response = Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(app.url(path))
+        .bearer_auth(token)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = timeout(IO_TIMEOUT, response.chunk())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("stream opens with a frame");
+    assert!(
+        std::str::from_utf8(&first)
+            .unwrap()
+            .contains("stream.ready")
+    );
+    response
+}
+
+async fn assert_stream_ended(mut response: Response) {
+    // A heartbeat is 15 seconds away, so a chunk inside IO_TIMEOUT can only be the end.
+    let ended = timeout(IO_TIMEOUT, response.chunk())
+        .await
+        .expect("stream must end with its session");
+    assert!(
+        ended.as_ref().is_ok_and(Option::is_none)
+            || ended.as_ref().is_err_and(|error| !error.is_timeout()),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_session_closes_its_open_streams() {
+    let app = password_app().await;
+    let session: Value = post_credentials(&app, "/api/v1/auth/setup", USER, PASSWORD)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let token = session["token"].as_str().unwrap().to_owned();
+    let events = open_stream(&app, "/api/v1/events?kinds=generation.changed", &token).await;
+    let logs = open_stream(&app, "/api/v1/logs", &token).await;
+    let out = app
+        .client
+        .post(app.url("/api/v1/auth/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.status(), StatusCode::NO_CONTENT);
+    assert_stream_ended(events).await;
+    assert_stream_ended(logs).await;
+    app.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn credentials_are_rejected_before_they_reach_the_store() {
     let app = password_app().await;

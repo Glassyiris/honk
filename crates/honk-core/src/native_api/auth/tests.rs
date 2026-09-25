@@ -241,17 +241,25 @@ fn session_expiry_revocation_and_capacity() {
     let issued = sessions.issue_at(now, SystemTime::UNIX_EPOCH);
     assert!(issued.token.starts_with(TOKEN_PREFIX));
     assert_eq!(issued.expires_at, SystemTime::UNIX_EPOCH + SESSION_LIFETIME);
-    assert!(sessions.authenticate_at(&issued.token, now));
-    assert!(sessions.authenticate_at(
-        &issued.token,
-        now + SESSION_LIFETIME - Duration::from_secs(1)
-    ));
-    assert!(!sessions.authenticate_at(&issued.token, now + SESSION_LIFETIME));
-    assert!(!sessions.authenticate_at("hnk1_nope", now));
-    assert!(!sessions.authenticate_at(&issued.token[1..], now));
+    assert!(sessions.authenticate_at(&issued.token, now).is_some());
+    assert!(
+        sessions
+            .authenticate_at(
+                &issued.token,
+                now + SESSION_LIFETIME - Duration::from_secs(1)
+            )
+            .is_some()
+    );
+    assert!(
+        sessions
+            .authenticate_at(&issued.token, now + SESSION_LIFETIME)
+            .is_none()
+    );
+    assert!(sessions.authenticate_at("hnk1_nope", now).is_none());
+    assert!(sessions.authenticate_at(&issued.token[1..], now).is_none());
     assert!(sessions.revoke(&issued.token));
     assert!(!sessions.revoke(&issued.token));
-    assert!(!sessions.authenticate_at(&issued.token, now));
+    assert!(sessions.authenticate_at(&issued.token, now).is_none());
     let first = sessions.issue_at(now, SystemTime::UNIX_EPOCH);
     for i in 0..SESSION_LIMIT {
         sessions.issue_at(
@@ -261,14 +269,51 @@ fn session_expiry_revocation_and_capacity() {
     }
     assert_eq!(sessions.len(), SESSION_LIMIT);
     assert!(
-        !sessions.authenticate_at(&first.token, now),
+        sessions.authenticate_at(&first.token, now).is_none(),
         "the oldest session is evicted"
     );
     let fresh = Sessions::default();
     assert!(
-        !fresh.authenticate_at(&first.token, now),
+        fresh.authenticate_at(&first.token, now).is_none(),
         "a new process knows no session"
     );
+}
+
+async fn ends_soon(lease: SessionLease) -> bool {
+    tokio::time::timeout(Duration::from_secs(1), lease.ended())
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn a_lease_ends_with_revocation_replacement_or_expiry() {
+    let sessions = Sessions::default();
+    let now = Instant::now();
+    let kept = sessions.issue_at(now, SystemTime::UNIX_EPOCH);
+    let live = sessions.authenticate_at(&kept.token, now).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), live.ended())
+            .await
+            .is_err(),
+        "a live session keeps its lease"
+    );
+    let revoked = sessions.authenticate_at(&kept.token, now).unwrap();
+    sessions.revoke(&kept.token);
+    assert!(ends_soon(revoked).await);
+    let oldest = sessions.issue_at(now, SystemTime::UNIX_EPOCH);
+    let replaced = sessions.authenticate_at(&oldest.token, now).unwrap();
+    for i in 0..SESSION_LIMIT {
+        sessions.issue_at(
+            now + Duration::from_secs(i as u64 + 1),
+            SystemTime::UNIX_EPOCH,
+        );
+    }
+    assert!(ends_soon(replaced).await);
+    let expiring = Sessions::default();
+    let issued_at = Instant::now() - SESSION_LIFETIME + Duration::from_millis(50);
+    let issued = expiring.issue_at(issued_at, SystemTime::UNIX_EPOCH);
+    let lease = expiring.authenticate_at(&issued.token, issued_at).unwrap();
+    assert!(ends_soon(lease).await);
 }
 
 #[test]
