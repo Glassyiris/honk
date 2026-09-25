@@ -47,10 +47,10 @@ pub(crate) enum Route {
     },
 }
 
-/// A route and the outbound name the detour or the routing rules chose.
+/// A route, and the group the detour or the routing rules chose, if any.
 pub(crate) struct Decision {
     pub(crate) route: Route,
-    pub(crate) outbound: String,
+    pub(crate) group: Option<String>,
 }
 
 pub(crate) fn parse_host_ip(host: &str) -> Option<IpAddr> {
@@ -125,7 +125,7 @@ impl Outbounds<'_> {
                 IpVersion::V4
             }
         });
-        let (node, feedback) = {
+        let (node, feedback, group) = {
             let config = self.config.read().await;
             let group_manager = self.group_manager.read().clone();
             // Generic route resolution defaults unknown outputs to direct; an
@@ -137,7 +137,12 @@ impl Outbounds<'_> {
             {
                 anyhow::bail!("{purpose}: detour outbound '{outbound}' not found");
             }
-            if config.groups.iter().any(|group| group.name == outbound) {
+            let group = config
+                .groups
+                .iter()
+                .any(|group| group.name == outbound)
+                .then(|| outbound.clone());
+            if group.is_some() {
                 let context = ScoreSelectionContext {
                     network: SelectionNetwork::Tcp,
                     probe_domain: ProbeDomain::Tcp,
@@ -152,8 +157,8 @@ impl Outbounds<'_> {
                 let plan = group_manager
                     .selection_plan_for_target_with_health_fallback(&outbound, &context, original);
                 match plan.entries.into_iter().next() {
-                    Some(entry) => (Some(entry.node.clone()), entry.feedback),
-                    None => (None, None),
+                    Some(entry) => (Some(entry.node.clone()), entry.feedback, group),
+                    None => (None, None, group),
                 }
             } else {
                 let nodes = crate::control::reload::resolve_outbound_nodes(
@@ -163,7 +168,7 @@ impl Outbounds<'_> {
                     ProbeDomain::Tcp,
                     target_ipver,
                 );
-                (nodes.into_iter().next(), None)
+                (nodes.into_iter().next(), None, None)
             }
         };
         let Some(node) = node else {
@@ -187,7 +192,7 @@ impl Outbounds<'_> {
             },
             "{purpose} routed"
         );
-        Ok(Decision { route, outbound })
+        Ok(Decision { route, group })
     }
 
     /// Prepares a tunnel through `node` to `host:port`. Tunnel handlers dial

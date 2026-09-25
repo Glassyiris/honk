@@ -1,5 +1,5 @@
 use super::*;
-use crate::native_api::geodata::download;
+use crate::native_api::geodata::download_direct;
 use tokio::io::AsyncReadExt;
 
 const GEO: &str = "/api/v1/geodata";
@@ -466,7 +466,7 @@ async fn download_bounds_actual_chunked_bytes_and_joins_timed_out_connection() {
             let read = timeout(WAIT, stream.read_to_end(&mut remaining)).await.unwrap();
             assert!(read.is_ok() || read.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
         });
-        let result = download(&url, "", tokio::time::Instant::now() + Duration::from_millis(100), 4, None).await;
+        let result = download_direct(&url, "", tokio::time::Instant::now() + Duration::from_millis(100), 4, None).await;
         assert_eq!(result.unwrap_err(), expected);
         tasks.join_next().await.unwrap().unwrap();
     }
@@ -772,6 +772,12 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
         mirror.url("/good/geoip.dat")
     );
     assert_eq!(assets[1]["verified"], false);
+    for asset in assets.as_array().unwrap() {
+        assert_eq!(
+            asset["download_route"],
+            json!({"route": "direct", "group_id": null})
+        );
+    }
     assert!(data["last_checked_at"].is_string());
     assert!(data["last_updated_at"].is_string());
     assert_eq!(data["next_check_at"], Value::Null);
@@ -832,7 +838,8 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
         json!({"source": "config",
             "geosite": {"urls": [format!("http://{address}/geosite/PRIVATE?token=PRIVATE")]},
             "geoip": {"urls": [format!("http://{address}/geoip")]},
-            "auto_update": {"enabled": false, "interval_hours": 24}})
+            "auto_update": {"enabled": false, "interval_hours": 24},
+            "download": {"route": "direct", "group_id": null}})
     );
     let patched = ok(patch_settings(
         &fixture,
@@ -974,5 +981,71 @@ async fn null_returns_to_the_built_in_sources() {
     assert_eq!(reset["geodata"], defaults);
     assert_eq!(fixture.get(SETTINGS).await["geodata"], defaults);
     assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    fixture.shutdown().await;
+}
+
+/// Group `proxy` exists in the configuration; the file routes downloads through it.
+fn setup_group(root: &Path, files: &mut HashMap<&'static str, String>) {
+    setup_rules(root, files);
+    files
+        .get_mut("editable.dae")
+        .unwrap()
+        .push_str("group {\n proxy { policy: fallback }\n}\n");
+    let auth = files.get_mut("auth.dae").unwrap();
+    *auth = auth.replace(
+        " enabled: true",
+        " geodata_download_detour: 'proxy'\n enabled: true",
+    );
+}
+
+#[tokio::test]
+async fn the_download_route_names_a_current_group_by_id() {
+    let fixture = Fixture::new_with_state(Access::Admin, setup_group).await;
+    let groups = fixture.get("/api/v1/groups").await;
+    let proxy = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["name"] == "proxy")
+        .unwrap()["id"]
+        .clone();
+    let seeded = fixture.get(SETTINGS).await["geodata"].clone();
+    assert_eq!(
+        seeded["download"],
+        json!({"route": "group", "group_id": proxy})
+    );
+    let before = fixture.get(SETTINGS).await;
+    error(
+        patch_settings(
+            &fixture,
+            json!({"geodata": {"download": {"route": "group", "group_id": "missing"}}}),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], before["geodata"]);
+    let routed = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"download": {"route": "routing"}}}),
+    )
+    .await)
+    .await;
+    assert_eq!(
+        routed["geodata"]["download"],
+        json!({"route": "routing", "group_id": null})
+    );
+    assert_eq!(routed["geodata"]["source"], "default");
+    let grouped = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"download": {"route": "group", "group_id": proxy}}}),
+    )
+    .await)
+    .await;
+    assert_eq!(
+        grouped["geodata"]["download"],
+        json!({"route": "group", "group_id": proxy})
+    );
     fixture.shutdown().await;
 }

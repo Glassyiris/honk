@@ -279,3 +279,109 @@ fn an_unusable_stored_record_is_ignored_and_the_defaults_apply() {
         assert_ne!(stored_record(directory.path()).unwrap(), record);
     }
 }
+
+fn detour(value: &str) -> NativeApiConfig {
+    NativeApiConfig {
+        geodata_download_detour: value.into(),
+        ..Default::default()
+    }
+}
+
+/// A patch as the settings handler stores it, the group id already resolved.
+fn named(value: Value) -> Option<Patch> {
+    let mut patch = patch(value);
+    if let Some(patch) = patch.as_mut() {
+        assert!(patch.resolve_group(|id| (id == "group-id").then(|| "proxy".to_owned())));
+    }
+    patch
+}
+
+#[test]
+fn downloads_go_direct_until_a_route_is_stored() {
+    let directory = tempfile::tempdir().unwrap();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    assert_eq!(sources.effective().download, Route::Direct);
+    let routed = sources
+        .apply(named(
+            json!({"download": {"route": "group", "group_id": "group-id"}}),
+        ))
+        .unwrap();
+    assert_eq!(routed.download, Route::Group("proxy".into()));
+    assert_eq!(
+        routed.source,
+        Source::Default,
+        "the route does not change source"
+    );
+    assert_eq!(
+        routed.json(str::to_owned, |name| (name == "proxy")
+            .then(|| "group-id".to_owned()))["download"],
+        json!({"route": "group", "group_id": "group-id"})
+    );
+    assert_eq!(
+        routed.json(str::to_owned, |_| None)["download"],
+        json!({"route": "group", "group_id": null}),
+        "a group that no longer exists reads null"
+    );
+    drop(sources);
+    let reopened = Sources::open(db(directory.path()), &settings("")).unwrap();
+    assert_eq!(reopened.effective().download, Route::Group("proxy".into()));
+    let reset = reopened.apply(None).unwrap();
+    assert_eq!(reset.download, Route::Direct);
+}
+
+#[test]
+fn the_file_seeds_the_download_route_at_startup_over_a_patch() {
+    let directory = tempfile::tempdir().unwrap();
+    let sources = Sources::open(db(directory.path()), &detour("proxy")).unwrap();
+    assert_eq!(sources.effective().download, Route::Group("proxy".into()));
+    sources
+        .apply(named(json!({"download": {"route": "direct"}})))
+        .unwrap();
+    assert_eq!(sources.effective().download, Route::Direct);
+    drop(sources);
+    let sources = Sources::open(db(directory.path()), &detour("routing")).unwrap();
+    assert_eq!(sources.effective().download, Route::Routing);
+    drop(sources);
+    let sources = Sources::open(db(directory.path()), &detour("direct")).unwrap();
+    assert_eq!(sources.effective().download, Route::Direct);
+    drop(sources);
+    let sources = Sources::open(db(directory.path()), &detour("proxy")).unwrap();
+    drop(sources);
+    let sources = Sources::open(db(directory.path()), &detour("")).unwrap();
+    assert_eq!(
+        sources.effective().download,
+        Route::Direct,
+        "a route an earlier file wrote is deleted"
+    );
+    sources
+        .apply(named(json!({"download": {"route": "routing"}})))
+        .unwrap();
+    drop(sources);
+    let sources = Sources::open(db(directory.path()), &detour("")).unwrap();
+    assert_eq!(
+        sources.effective().download,
+        Route::Routing,
+        "a patched route is kept"
+    );
+}
+
+#[test]
+fn download_patches_name_a_group_only_for_the_group_route() {
+    for value in [
+        json!({"download": {"route": "group"}}),
+        json!({"download": {"route": "direct", "group_id": "group-id"}}),
+        json!({"download": {"route": "routing", "group_id": "group-id"}}),
+        json!({"download": {"route": "group", "group_id": ""}}),
+        json!({"download": {"route": "proxy"}}),
+        json!({"download": {}}),
+    ] {
+        assert!(Patch::parse(value.clone()).is_err(), "{value}");
+    }
+    let mut unknown = patch(json!({"download": {"route": "group", "group_id": "gone"}})).unwrap();
+    assert!(!unknown.resolve_group(|_| None));
+    let mut direct = patch(json!({"download": {"route": "direct"}})).unwrap();
+    assert!(
+        direct.resolve_group(|_| None),
+        "only a group route looks the id up"
+    );
+}

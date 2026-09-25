@@ -1,5 +1,6 @@
 use super::*;
 use crate::configuration::{DependencyReader, DependencySnapshot, digest};
+use crate::download_route::Outbounds;
 use crate::native_api::config_write::{SourceFile, StagedFile};
 use crate::native_api::geodata::{self, GeoUpdatePlan};
 use crate::native_api::operations::OperationResult;
@@ -98,11 +99,22 @@ impl Worker {
         }
         let mut downloads = Vec::with_capacity(plan.assets.len());
         let mut fetched = Vec::with_capacity(plan.assets.len());
+        let egress = geodata::Egress {
+            bootstrap: &active.global.bootstrap_resolver,
+            route: &plan.route,
+            outbounds: Outbounds {
+                router: &plan.traffic_router,
+                config: &self.active,
+                group_manager: &plan.group_manager,
+                proxy_registry: &plan.proxy_registry,
+                runtime_registry: &plan.runtime_registry,
+            },
+        };
         for (asset, urls) in plan.assets.iter().zip(&plan.urls) {
             let (bytes, origin) = geodata::fetch(
                 asset.kind,
                 urls,
-                &active.global.bootstrap_resolver,
+                &egress,
                 offline::MAX_ASSET_BYTES,
                 &plan.policy,
                 geodata::file_url(&active.experimental.native_api, asset.kind),
@@ -203,6 +215,7 @@ impl Worker {
             plan.sources.as_deref(),
             &active,
             &self.service,
+            |name| geodata::group_id(&plan.catalog, name),
         ))
     }
 }

@@ -49,6 +49,41 @@ impl Default for AutoUpdate {
     }
 }
 
+/// How geodata requests leave the device.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "route", content = "group", rename_all = "lowercase")]
+pub(crate) enum Route {
+    /// The routing rules decide, as for user traffic.
+    Routing,
+    /// Always through the named group.
+    Group(String),
+    /// Straight to the host, as provider fetches go.
+    #[default]
+    Direct,
+}
+
+impl Route {
+    /// The configuration file's `geodata_download_detour`; `None` when empty.
+    pub(crate) fn from_detour(detour: &str) -> Option<Self> {
+        match detour {
+            "" => None,
+            "direct" => Some(Self::Direct),
+            "routing" => Some(Self::Routing),
+            group => Some(Self::Group(group.to_owned())),
+        }
+    }
+
+    /// `{route, group_id}`, the group named by the id `group_id` finds, or null.
+    pub(crate) fn json(&self, group_id: impl Fn(&str) -> Option<String>) -> Value {
+        let (route, group) = match self {
+            Self::Routing => ("routing", None),
+            Self::Group(name) => ("group", group_id(name)),
+            Self::Direct => ("direct", None),
+        };
+        json!({"route": route, "group_id": group})
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stored {
@@ -57,6 +92,17 @@ struct Stored {
     urls: [Option<StoredUrls>; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_update: Option<AutoUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download: Option<StoredRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRoute {
+    route: Route,
+    /// The route was last written from the configuration file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    from_config: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +123,10 @@ impl Stored {
             && self
                 .auto_update
                 .is_none_or(|auto| INTERVAL_HOURS.contains(&auto.interval_hours))
+            && self
+                .download
+                .as_ref()
+                .is_none_or(|stored| stored.route != Route::Group(String::new()))
     }
 }
 
@@ -103,6 +153,7 @@ pub(crate) struct Effective {
     pub(crate) source: Source,
     pub(crate) urls: [Vec<String>; 2],
     pub(crate) auto_update: AutoUpdate,
+    pub(crate) download: Route,
 }
 
 impl Effective {
@@ -110,13 +161,19 @@ impl Effective {
         index(kind).map_or(&[], |index| &self.urls[index])
     }
 
-    /// The runtime settings `geodata` object, each URL passed through `display`.
-    pub(crate) fn json(&self, display: impl Fn(&str) -> String) -> Value {
+    /// The runtime settings `geodata` object, each URL passed through
+    /// `display` and the route's group through `group_id`.
+    pub(crate) fn json(
+        &self,
+        display: impl Fn(&str) -> String,
+        group_id: impl Fn(&str) -> Option<String>,
+    ) -> Value {
         let list = |urls: &[String]| urls.iter().map(|url| display(url)).collect::<Vec<_>>();
         json!({"source": self.source,
             "geosite": {"urls": list(&self.urls[0])},
             "geoip": {"urls": list(&self.urls[1])},
-            "auto_update": self.auto_update})
+            "auto_update": self.auto_update,
+            "download": self.download.json(group_id)})
     }
 }
 
@@ -126,6 +183,42 @@ pub(crate) struct Patch {
     geosite: Option<UrlsPatch>,
     geoip: Option<UrlsPatch>,
     auto_update: Option<AutoUpdatePatch>,
+    /// A group route holds the group id until `resolve_group` names the group.
+    #[serde(deserialize_with = "route_patch", default)]
+    download: Option<Route>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutePatch {
+    route: RouteKind,
+    group_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RouteKind {
+    Routing,
+    Group,
+    Direct,
+}
+
+/// `group_id` names a group for the group route and is refused otherwise.
+fn route_patch<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Route>, D::Error> {
+    let patch = RoutePatch::deserialize(deserializer)?;
+    let route = match (patch.route, patch.group_id) {
+        (RouteKind::Routing, None) => Route::Routing,
+        (RouteKind::Direct, None) => Route::Direct,
+        (RouteKind::Group, Some(id)) if !id.is_empty() => Route::Group(id),
+        _ => {
+            return Err(serde::de::Error::custom(
+                "group_id belongs to the group route",
+            ));
+        }
+    };
+    Ok(Some(route))
 }
 
 #[derive(Deserialize)]
@@ -161,11 +254,31 @@ impl Patch {
                     .interval_hours
                     .is_none_or(|hours| INTERVAL_HOURS.contains(&hours))
         });
-        let any = patch.geosite.is_some() || patch.geoip.is_some() || patch.auto_update.is_some();
+        let any = patch.geosite.is_some()
+            || patch.geoip.is_some()
+            || patch.auto_update.is_some()
+            || patch.download.is_some();
         if any && urls_valid && auto_valid {
             Ok(Some(patch))
         } else {
             Err(())
+        }
+    }
+}
+
+impl Patch {
+    /// Replaces a group route's id with the group `name_of` finds for it;
+    /// `false` when it finds none.
+    pub(crate) fn resolve_group(&mut self, name_of: impl FnOnce(&str) -> Option<String>) -> bool {
+        match &mut self.download {
+            Some(Route::Group(group)) => match name_of(group) {
+                Some(name) => {
+                    *group = name;
+                    true
+                }
+                None => false,
+            },
+            _ => true,
         }
     }
 }
@@ -186,6 +299,10 @@ pub(crate) struct Fetched {
     pub(crate) url: String,
     pub(crate) sha256: String,
     pub(crate) verified: bool,
+    /// The route in force for the download.
+    pub(crate) route: Route,
+    /// The group the request went through, including one the rules chose.
+    pub(crate) group: Option<String>,
 }
 
 #[derive(Default)]
@@ -244,9 +361,10 @@ impl Sources {
         effective(&self.stored.lock())
     }
 
-    /// Stores each URL the configuration file names, over whatever a patch
-    /// stored. An asset the file names no URL for keeps a list a patch stored
-    /// and loses one an earlier file wrote, so its default applies again.
+    /// Stores each URL and the route the configuration file names, over
+    /// whatever a patch stored. A value the file does not name is kept when a
+    /// patch stored it and deleted when an earlier file wrote it, so its
+    /// default applies again.
     fn seed(&self, settings: &NativeApiConfig) -> rusqlite::Result<()> {
         let file = [&settings.geosite_download_url, &settings.geoip_download_url];
         let mut stored = self.stored.lock();
@@ -260,6 +378,22 @@ impl Sources {
             } else if list.as_ref().is_some_and(|list| list.from_config) {
                 *list = None;
             }
+        }
+        match Route::from_detour(&settings.geodata_download_detour) {
+            Some(route) => {
+                next.download = Some(StoredRoute {
+                    route,
+                    from_config: true,
+                })
+            }
+            None if next
+                .download
+                .as_ref()
+                .is_some_and(|route| route.from_config) =>
+            {
+                next.download = None;
+            }
+            None => {}
         }
         if next != *stored {
             self.write(&next)?;
@@ -295,6 +429,12 @@ impl Sources {
                     value.enabled = auto.enabled.unwrap_or(value.enabled);
                     value.interval_hours = auto.interval_hours.unwrap_or(value.interval_hours);
                     next.auto_update = Some(value);
+                }
+                if let Some(route) = patch.download {
+                    next.download = Some(StoredRoute {
+                        route,
+                        from_config: false,
+                    });
                 }
                 next
             }
@@ -408,7 +548,8 @@ impl Sources {
     }
 }
 
-/// `source` is `config` only while every stored list came from the file.
+/// `source` is `config` only while every stored list came from the file; the
+/// route does not affect it.
 fn effective(stored: &Stored) -> Effective {
     let mut lists = stored.urls.iter().flatten().peekable();
     let source = if lists.peek().is_none() {
@@ -427,6 +568,10 @@ fn effective(stored: &Stored) -> Effective {
             )
         }),
         auto_update: stored.auto_update.unwrap_or_default(),
+        download: stored
+            .download
+            .as_ref()
+            .map_or_else(Route::default, |stored| stored.route.clone()),
     }
 }
 

@@ -476,13 +476,16 @@ fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value
     if let Some(sources) = state.geodata.as_ref() {
         let secrets = super::config::ListenerSecrets::from_config(active);
         let reveal = state.settings.credentialed();
-        value["geodata"] = sources.effective().json(|url| {
-            if reveal {
-                secrets.mask(url).0
-            } else {
-                super::geodata::redact_fully(url, &secrets, &state.observation.configuration)
-            }
-        });
+        value["geodata"] = sources.effective().json(
+            |url| {
+                if reveal {
+                    secrets.mask(url).0
+                } else {
+                    super::geodata::redact_fully(url, &secrets, &state.observation.configuration)
+                }
+            },
+            |name| super::geodata::group_id(&state.observation.catalog, name),
+        );
     }
     value
 }
@@ -538,7 +541,25 @@ pub(super) async fn patch(
                     id,
                 ));
             }
-            super::geodata::SourcesPatch::parse(patch).map_err(|()| invalid(id))
+            let mut patch = super::geodata::SourcesPatch::parse(patch).map_err(|()| invalid(id))?;
+            let groups = state.observation.catalog.snapshot();
+            if let Some(patch) = patch.as_mut()
+                && !patch.resolve_group(|id| {
+                    groups
+                        .groups
+                        .iter()
+                        .find(|(_, group_id)| group_id.as_str() == id)
+                        .map(|(name, _)| name.clone())
+                })
+            {
+                return Err(super::error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    ErrorCode::UnsupportedValue,
+                    "geodata.download.group_id is not a current group",
+                    id,
+                ));
+            }
+            Ok(patch)
         })
         .transpose()?;
     let others = value.as_object().is_some_and(|object| !object.is_empty());
