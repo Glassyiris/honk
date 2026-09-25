@@ -189,7 +189,7 @@ pub(in crate::native_api) async fn import(
     if initialized && !body.replace {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            ErrorCode::AlreadyInitialized,
+            ErrorCode::StateConflict,
             "The configuration db already holds a revision; send replace to overwrite it",
             None,
         ));

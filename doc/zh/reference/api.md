@@ -217,7 +217,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 `GET /config` 增加 `store {kind, revision, parent, recorded}`，`kind` 为 `file` 或 `db`。capabilities 增加 `config.store`、`config_export {available}`、`config_import {available, replace_required}` 与 `config_revisions {available, can_activate, max_revisions}`；discovery 增加 `config_export`、`config_import` 与 `config_revisions` 链接。
 
 - `GET /config/export` 把已接受的源合并为一份文档返回：`text/plain; charset=utf-8`、`Content-Disposition: attachment; filename="honk-r<n>.dae"`（文件模式为 `honk.dae`）、基于正文的强 `ETag` 与 `Cache-Control: no-store`。正文不含监听凭据；有凭据被省略时，首行为 `# listener secrets omitted`，补回凭据后才能运行。两种模式均可用。
-- `POST /config/import`（数据库模式，需可写）接受严格 JSON `{"replace":bool}`，必须带 `Idempotency-Key`。它重新读取 `-c` 源树，经 reload 操作记录为 origin 为 `import` 的新 revision。因为启动过程总会记录 revision 1，所以必须提交 `replace:true`，其他请求返回 `409 already_initialized`。凭据副本在删除后仍残留时返回 `422 unsupported_value`。源树必须保持入口路径、监听凭据、`native_api` 设置与 `data_dir` 不变，否则返回 403。
+- `POST /config/import`（数据库模式，需可写）接受严格 JSON `{"replace":bool}`，必须带 `Idempotency-Key`。它重新读取 `-c` 源树，经 reload 操作记录为 origin 为 `import` 的新 revision。因为启动过程总会记录 revision 1，所以必须提交 `replace:true`，其他请求返回 `409 state_conflict`。凭据副本在删除后仍残留时返回 `422 unsupported_value`。源树必须保持入口路径、监听凭据、`native_api` 设置与 `data_dir` 不变，否则返回 403。
 - `GET /config/revisions`（数据库模式）返回 `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`，从新到旧排列，不含正文。`active` 与行来自同一数据库快照；父 revision 被留存清理删除后，`parent` 为 null。
 - `POST /config/revisions/{n}/activate`（数据库模式，需可写）接受空 body 或 `{}`，`Idempotency-Key` 可选。它校验并激活 revision `n`，再记录为 origin 为 `activate` 的新 revision。`store.recorded` 为 true 时，激活当前 revision 不产生变更；未知的 `n` 返回 `404 resource_not_found`。
 

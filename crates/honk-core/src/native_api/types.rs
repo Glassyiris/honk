@@ -32,7 +32,6 @@ pub enum ErrorCode {
     SetupRequired,
     SetupAlreadyCompleted,
     InvalidCredentials,
-    AlreadyInitialized,
 }
 
 #[derive(Clone, Debug, Serialize)]
