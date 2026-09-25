@@ -309,7 +309,7 @@ DNS 诊断使用相互独立、单调递增的 atomic counter。类别覆盖缓�
 
 Cache list 的 opaque ID 对应 exact-key incarnation，检查不触发 LRU promotion 或 hit 统计；`persistent:false` 明确只覆盖运行时记录。分页固定 filters/instance，最多 8 个 snapshot、30 秒和合计 8 MiB，底层淘汰不释放仍由 snapshot 持有的预算。按 ID 删除只影响该 incarnation，按完整 name/type 删除可覆盖不同 exact 变体。原生与 Clash 失效共用 DNS/cache owner 的 publication→shard 屏障，等待持久化删除及此前 queued put 的确认；旧 foreground/refresh 不能复活已经确认失效的记录。Flush 仅清答案缓存，不清域名路由投影，持久化失败不能假报成功。
 
-`record_dns_log` 默认 true，进程级 ring 在客户端真实完成点捕获普通 DNS 和有来源的客户端解析；排除原生/Clash diagnostics 与背景 refresh 重复项。保留实际 SocketAddr、问题、最终状态、缓存/上游/路由与时间，最多 512 条/8 MiB，wire 与元数据一起计费；不截断 RRset，超限淘汰整条旧记录。列表最新优先，支持 name/type/src 过滤、最多 500 条一页及绑定过滤器的 cursor，淘汰会使旧 cursor 失效。Query/cache/log 投影不能完整装入 262144 字节时返回 503 与 Retry-After，不返回伪完整答案。关闭 recorder 需重启并释放缓冲；临时缩容由原子 runtime settings owner 处理，显式配置激活重置，provider/network refresh 保留。
+`record_dns_log` 默认 true，进程级 ring 在客户端真实完成点捕获普通 DNS 和有来源的客户端解析；排除原生/Clash diagnostics 与背景 refresh 重复项。保留实际 SocketAddr、问题、最终状态、缓存/上游/路由与时间，最多 512 条/8 MiB，wire 与元数据一起计费；不截断 RRset，超限淘汰整条旧记录。列表最新优先，支持 name/type/src 过滤、最多 500 条一页及绑定过滤器的 cursor，淘汰会使旧 cursor 失效。Query/cache/log 投影不能完整装入 262144 字节时返回 503 与 Retry-After，不返回伪完整答案。cache/log 分页在会超限的记录之前结束并返回 `next_cursor`，只有单条记录独占一页仍超限时才返回 503。关闭 recorder 需重启并释放缓冲；临时缩容由原子 runtime settings owner 处理，显式配置激活重置，provider/network refresh 保留。
 
 ## 相关文档
 
