@@ -400,3 +400,20 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
     assert_eq!(cache_page(&state, "?name=.").await.1["total"], 0);
     state.dns.provider().unwrap().shutdown().await;
 }
+
+#[tokio::test]
+async fn query_type_count_over_limit_is_too_large() {
+    let state = crate::native_api::tests::state().await;
+    let types = (1..=9)
+        .map(|value| format!("type=TYPE{value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let uri = format!("/api/v1/dns/query?domain=example.com&{types}")
+        .parse()
+        .unwrap();
+    let response = query(&state, &uri, &RequestId("dns-test".into()))
+        .await
+        .unwrap_err()
+        .into_response();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

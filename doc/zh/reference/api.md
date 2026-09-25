@@ -231,7 +231,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/测量共享 30 秒 deadline。最终 transport owner 清理即使超期也必须等待 join，因此 operation 总耗时可能超过 30 秒。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。即使已有 4 个 active job，也立即返回 202 与 `queued` 操作；202 只表示 daemon 接管。测量开始前结束的 job 以 `probe_cancelled`、`probe_deadline`、`unsupported_value`（解析出的地址或端口不被允许）或 `engine_unavailable` 失败；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。
 
-`GET /dns/query` 必填 `domain`，`type` 默认 A，可重复指定最多 8 个不同类型；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
+`GET /dns/query` 必填 `domain`，`type` 默认 A，可重复指定最多 8 个不同类型，超过时返回 `413 request_too_large`；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
 
 字面值 `.` 表示 DNS 根，支持实际查询、精确缓存列表和按名称删除。普通输入名称不区分大小写，末尾点可省略；展示名称保留规范化末尾点。合法根域 wire 问题也进入普通严格 DNS 路径；非 UTF-8 label 仍不属于该消费者契约。
 

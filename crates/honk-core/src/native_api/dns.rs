@@ -184,7 +184,12 @@ pub(super) async fn query(
         types.push(1);
     }
     if types.len() > 8 {
-        return Err(invalid_query(id));
+        return Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "Too many DNS record types",
+            id,
+        ));
     }
     if types.iter().any(|value| !TYPES.contains(value)) {
         return Err(error(
