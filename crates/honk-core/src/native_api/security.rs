@@ -323,9 +323,6 @@ pub(super) async fn boundary(
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        response
-            .headers_mut()
-            .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     }
     if is_api && response.status() == StatusCode::UNAUTHORIZED {
         response
