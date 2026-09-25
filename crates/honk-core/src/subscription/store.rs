@@ -54,7 +54,8 @@ impl SubscriptionStore {
     }
 
     /// Records the enabled subscriptions of the configuration being published;
-    /// `put_body` may delete any other body to stay under the cap.
+    /// `put_body` may delete any other body to stay under the cap, and
+    /// maintenance deletes the body of one with `cache` off.
     pub(crate) fn set_enabled<'a>(
         &self,
         subscriptions: impl IntoIterator<Item = &'a Subscription>,
@@ -62,6 +63,7 @@ impl SubscriptionStore {
         self.state.set_enabled_subscriptions(
             subscriptions
                 .into_iter()
+                .filter(|sub| sub.cache)
                 .map(subscription_filename)
                 .collect(),
         );
@@ -81,6 +83,9 @@ impl SubscriptionStore {
         sub: &Subscription,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Option<Vec<Node>>> {
+        if !sub.cache {
+            return Ok(None);
+        }
         let key = subscription_filename(sub);
         let state = Arc::clone(&self.state);
         let body = tokio::task::spawn_blocking(move || read_body(&state.strict(), &key))
@@ -100,6 +105,9 @@ impl SubscriptionStore {
         sub: &Subscription,
         content: String,
     ) -> anyhow::Result<()> {
+        if !sub.cache {
+            return Ok(());
+        }
         let key = subscription_filename(sub);
         let state = Arc::clone(&self.state);
         tokio::task::spawn_blocking(move || put_body(&state, &key, content.as_bytes()))

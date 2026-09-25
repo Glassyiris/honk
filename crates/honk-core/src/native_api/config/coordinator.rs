@@ -419,7 +419,7 @@ impl Worker {
                 {
                     return Err(management::conflict());
                 }
-                append_subscription_source(main, &input.name, &input.url)
+                append_subscription_source(main, &input.name, &input.url, &input.options())
                     .map_err(|_| management::unsupported_value())?
             }
             Mutation::DeleteNode(id) => {

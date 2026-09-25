@@ -172,7 +172,22 @@ impl ProviderApi {
     }
 
     pub(crate) fn capability(&self) -> Value {
-        json!({"available": true, "can_refresh": self.supervisor.read().as_ref().is_some_and(SubscriptionSupervisorHandle::running), "max_page_size": MAX_PAGE_SIZE})
+        let mut create_options = json!({
+            "update_interval": honk_config::subscription::Subscription::default().update_interval,
+            "user_agent": crate::subscription::DEFAULT_SUBSCRIPTION_USER_AGENT,
+        });
+        if self.caches() {
+            create_options["cache"] = json!(true);
+        }
+        json!({"available": true, "can_refresh": self.supervisor.read().as_ref().is_some_and(SubscriptionSupervisorHandle::running), "create_options": create_options, "max_page_size": MAX_PAGE_SIZE})
+    }
+
+    /// Whether a subscription's `cache` setting has any effect in this run.
+    pub(crate) fn caches(&self) -> bool {
+        self.supervisor
+            .read()
+            .as_ref()
+            .is_some_and(SubscriptionSupervisorHandle::caches)
     }
 
     fn resume(

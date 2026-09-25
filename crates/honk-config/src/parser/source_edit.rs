@@ -184,7 +184,7 @@ pub fn append_node_source(
     name: &str,
     link: &str,
 ) -> Result<String, ManagedSourceError> {
-    let (entry, config) = managed_entry("node", name, link)?;
+    let (entry, config) = managed_entry("node", name, link, &[])?;
     let [node] = config.nodes.as_slice() else {
         return Err(ManagedSourceError);
     };
@@ -242,19 +242,44 @@ pub fn remove_node_source(
     }))
 }
 
+/// Per-subscription settings for a new entry; `None` keeps the default.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SubscriptionOptions<'a> {
+    pub update_interval: Option<u64>,
+    pub user_agent: Option<&'a str>,
+    pub cache: Option<bool>,
+}
+
 /// Append an unfetched HTTP(S) subscription, rejecting duplicate source names.
 /// Fetching and whole-candidate admission remain the coordinator's responsibility.
 pub fn append_subscription_source(
     source: &SourceSnapshot,
     name: &str,
     url: &str,
+    options: &SubscriptionOptions<'_>,
 ) -> Result<String, ManagedSourceError> {
-    let (entry, config) = managed_entry("subscription", name, url)?;
+    let quote = |value: &str| quote_scalar(value, None).map_err(|_| ManagedSourceError);
+    let mut fields = Vec::new();
+    if let Some(user_agent) = options.user_agent {
+        fields.push(format!("ua: {}", quote(user_agent)?));
+    }
+    if let Some(seconds) = options.update_interval {
+        fields.push(format!("interval: '{seconds}s'"));
+    }
+    if let Some(cache) = options.cache {
+        fields.push(format!("cache: {cache}"));
+    }
+    let (entry, config) = managed_entry("subscription", name, url, &fields)?;
     let [subscription] = config.subscriptions.as_slice() else {
         return Err(ManagedSourceError);
     };
+    let defaults = crate::subscription::Subscription::default();
     if subscription.name != name
         || subscription.url != url
+        || subscription.user_agent.as_deref() != options.user_agent
+        || subscription.update_interval
+            != options.update_interval.unwrap_or(defaults.update_interval)
+        || subscription.cache != options.cache.unwrap_or(defaults.cache)
         || url::Url::parse(url)
             .ok()
             .is_none_or(|url| url.host_str().is_none())
@@ -364,10 +389,12 @@ fn managed_document(source: &SourceSnapshot) -> Result<Document<'_>, ManagedSour
     .map_err(|_| ManagedSourceError)
 }
 
+/// A scalar `name: value` entry, or with `fields` a block whose `url` is `value`.
 fn managed_entry(
     section: &str,
     name: &str,
     value: &str,
+    fields: &[String],
 ) -> Result<(String, crate::Config), ManagedSourceError> {
     if name.trim().is_empty() {
         return Err(ManagedSourceError);
@@ -380,7 +407,15 @@ fn managed_entry(
         .then(|| name.to_owned());
     // A bare key that the section reads back differently (`mux`) keeps its quotes.
     for key in bare.into_iter().chain([quoted]) {
-        let entry = format!("{key}: {value}");
+        let entry = if fields.is_empty() {
+            format!("{key}: {value}")
+        } else {
+            let mut entry = format!("{key}: {{\n        url: {value}");
+            for field in fields {
+                entry.push_str(&format!("\n        {field}"));
+            }
+            entry + "\n    }"
+        };
         let Ok(config) = super::parse_dae_config_with_detailed_diagnostics(
             &format!("{section} {{\n    {entry}\n}}"),
             &mut Vec::new(),
@@ -409,6 +444,7 @@ fn append_entry(document: &Document<'_>, section: &str, entry: &str) -> String {
     } else {
         "\n"
     };
+    let entry = entry.replace('\n', newline);
     let mut output = content.to_owned();
     if let Some(root) = document.sections().rfind(|root| root.header() == section) {
         let close = root.span().end - 1;
