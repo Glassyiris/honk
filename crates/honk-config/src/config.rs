@@ -798,6 +798,23 @@ impl Config {
 
     fn validate_references_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         const MAX_USER_GROUPS: usize = 0xFC - 2;
+        let detour = self
+            .experimental
+            .native_api
+            .geodata_download_detour
+            .as_str();
+        if !matches!(detour, "" | Self::BUILTIN_DIRECT_NODE | "routing")
+            && !self.groups.iter().any(|group| group.name == detour)
+        {
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("experimental")
+                    .field("native_api")
+                    .field("geodata_download_detour"),
+                "invalid-geodata-detour-target",
+                "geodata download detour must be direct, routing or a group",
+            ));
+        }
         if self.groups.len() > MAX_USER_GROUPS {
             return Err(config_validation_error(
                 source,

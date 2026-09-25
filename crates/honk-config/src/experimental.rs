@@ -127,6 +127,10 @@ pub struct NativeApiConfig {
     pub writable_includes: Vec<String>,
     pub geosite_download_url: String,
     pub geoip_download_url: String,
+    /// How geodata downloads leave: `direct`, `routing` or a group name.
+    /// Empty leaves the stored route in force, unlike
+    /// `external_ui_download_detour`, where empty follows routing.
+    pub geodata_download_detour: String,
 }
 
 fn ignore_config_content<'de, D: serde::Deserializer<'de>>(
@@ -164,6 +168,7 @@ impl Default for NativeApiConfig {
             writable_includes: Vec::new(),
             geosite_download_url: String::new(),
             geoip_download_url: String::new(),
+            geodata_download_detour: String::new(),
         }
     }
 }
