@@ -381,7 +381,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
                 "can_close": true,
                 "max_bulk_close": 1000,
             },
-            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":max_flows, "max_steps_per_flow":64, "retention_seconds":flow_retention, "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "max_flows":max_flows, "max_steps_per_flow":64, "retention_seconds":flow_retention, "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": routing_trace,
             "rules": rules,
             "events": {"available":true,"kinds":kinds,"retention_seconds":60,"max_buffered_events":512,"max_clients":16,"heartbeat_seconds":15},

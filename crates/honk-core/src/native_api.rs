@@ -780,4 +780,14 @@ mod tests {
         assert_eq!(flows["max_flows"], 64);
         assert_eq!(flows["retention_seconds"], 60);
     }
+
+    #[tokio::test]
+    async fn flow_capability_scopes_include_dns_intercept_coverage() {
+        let state = state().await;
+        let flows = &types::capabilities(&state).await["resources"]["flows"];
+        assert_eq!(
+            flows["scopes"],
+            serde_json::json!(["userspace_tcp", "userspace_udp", "dns_intercept"])
+        );
+    }
 }
