@@ -340,3 +340,33 @@ fn installed_guard_detects_later_replacement_and_content_edits() {
         assert_eq!(installed.file.recheck(), Err(WriteError::Conflict));
     }
 }
+
+#[test]
+fn staging_beside_creates_a_new_file_and_never_replaces_one() {
+    let (packaged, path) = fixture();
+    let data = tempfile::tempdir().unwrap();
+    let target = data.path().join("config.dae");
+    let source = SourceFile::open_binary(&path, LIMIT).unwrap();
+    let hash = source.sha256();
+    let installed = source
+        .stage_beside(&hash, &target, REPLACEMENT.as_bytes())
+        .unwrap()
+        .replace(|| Ok(()))
+        .unwrap();
+    assert!(installed.durability_confirmed);
+    installed.file.recheck().unwrap();
+    assert_eq!(fs::read(&target).unwrap(), REPLACEMENT.as_bytes());
+    assert_eq!(fs::read(&path).unwrap(), ORIGINAL.as_bytes());
+    assert_only_config(packaged.path());
+    assert_only_config(data.path());
+
+    fs::write(&target, "concurrent").unwrap();
+    let source = SourceFile::open_binary(&path, LIMIT).unwrap();
+    let staged = source
+        .stage_beside(&hash, &target, REPLACEMENT.as_bytes())
+        .unwrap();
+    assert_eq!(staged.replace(|| Ok(())).err(), Some(WriteError::Conflict));
+    assert_eq!(fs::read(&target).unwrap(), b"concurrent");
+    assert_eq!(fs::read(&path).unwrap(), ORIGINAL.as_bytes());
+    assert_only_config(data.path());
+}

@@ -22,7 +22,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavio
 pub(crate) const STATE_DIR: &str = "state";
 pub(crate) const DB_FILE: &str = "honk.db";
 pub(crate) const APPLICATION_ID: i64 = 0x686f_6e6b;
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 /// 112 MiB of 4 KiB pages.
 const MAX_PAGE_COUNT: i64 = 28672;
@@ -66,6 +66,11 @@ CREATE TABLE dns_answer (key TEXT PRIMARY KEY, expire_at INTEGER NOT NULL,
 CREATE INDEX dns_answer_expiry ON dns_answer(expire_at);
 CREATE TABLE clash_state (key TEXT PRIMARY KEY CHECK (key IN ('mode','global')), value TEXT NOT NULL) WITHOUT ROWID;
 ";
+
+/// Upgrades after schema v1, in order: entry `n` takes version `n + 1` to `n + 2`.
+const MIGRATIONS: [&str; 1] = [
+    "CREATE TABLE geodata_settings (id INTEGER PRIMARY KEY CHECK (id=1), record TEXT NOT NULL CHECK (length(record) <= 65536));",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StateError {
@@ -435,10 +440,8 @@ pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), Stat
             true,
         )
         .map_err(sql)?;
-    if (
-        pragma(&connection, "application_id")?,
-        pragma(&connection, "user_version")?,
-    ) != (APPLICATION_ID, SCHEMA_VERSION)
+    if pragma(&connection, "application_id")? != APPLICATION_ID
+        || !(1..=SCHEMA_VERSION).contains(&pragma(&connection, "user_version")?)
     {
         return Err(StateError::Unsupported);
     }
@@ -558,36 +561,40 @@ fn verify(connection: &Connection, check: &str) -> Result<(), StateError> {
         .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
         .map_err(sql)?;
     match (application_id, version, tables) {
-        (0, 0, 0) | (APPLICATION_ID, SCHEMA_VERSION, _) => Ok(()),
+        (0, 0, 0) => Ok(()),
+        (APPLICATION_ID, 1..=SCHEMA_VERSION, _) => Ok(()),
         (APPLICATION_ID, 0, _) => Err(StateError::Corrupt),
         _ => Err(StateError::Unsupported),
     }
 }
 
-/// Creation-time pragmas and schema v1, once, on an empty file.
+/// Creation-time pragmas and the schema on an empty file, or the missing
+/// migrations on an older one.
 fn create_schema(connection: &mut Connection) -> Result<(), StateError> {
-    if pragma(connection, "user_version")? != 0 {
-        return Ok(());
+    match pragma(connection, "user_version")? {
+        SCHEMA_VERSION => return Ok(()),
+        0 => connection
+            .execute_batch(&format!(
+                "PRAGMA page_size = {PAGE_SIZE}; PRAGMA auto_vacuum = INCREMENTAL;"
+            ))
+            .map_err(sql)?,
+        _ => {}
     }
-    connection
-        .execute_batch(&format!(
-            "PRAGMA page_size = {PAGE_SIZE}; PRAGMA auto_vacuum = INCREMENTAL;"
-        ))
-        .map_err(sql)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Exclusive)
         .map_err(sql)?;
-    // A concurrent first start may have created the schema since the read above.
+    // A concurrent start may have created or upgraded the schema since the read above.
     let current = pragma(&transaction, "user_version")?;
-    if current == SCHEMA_VERSION && pragma(&transaction, "application_id")? == APPLICATION_ID {
-        return Ok(());
-    }
-    if current != 0 {
-        return Err(StateError::Unsupported);
-    }
+    let application_id = pragma(&transaction, "application_id")?;
+    let schema = match (application_id, current) {
+        (APPLICATION_ID, SCHEMA_VERSION) => return Ok(()),
+        (0, 0) => format!("{SCHEMA}{}", MIGRATIONS.concat()),
+        (APPLICATION_ID, 1..SCHEMA_VERSION) => MIGRATIONS[current as usize - 1..].concat(),
+        _ => return Err(StateError::Unsupported),
+    };
     transaction
         .execute_batch(&format!(
-            "{SCHEMA}PRAGMA application_id = {APPLICATION_ID};PRAGMA user_version = {SCHEMA_VERSION};"
+            "{schema}PRAGMA application_id = {APPLICATION_ID};PRAGMA user_version = {SCHEMA_VERSION};"
         ))
         .map_err(sql)?;
     transaction.commit().map_err(sql)

@@ -250,7 +250,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 `record_dns_log` 默认为 true，允许在客户端已连接时记录，最多保留 512 条、8 MiB。显式运行时设置 `record_dns_log: true` 可在无客户端时持续记录；配置中的 false 禁止记录，修改后需重启。实际记录停止时释放历史，已有游标失效。在真实客户端完成点记录普通 DNS 和有来源的客户端解析，排除原生/Clash 诊断与后台刷新重复项。仅存内存；完整 wire 与元数据一起计费，按整条旧记录淘汰。`GET /dns/log` 最新优先，支持大小写不敏感的 name 子串、type、无端口 src、limit（1–500，默认 100）及过滤器绑定 cursor；淘汰使相关 cursor 失效。停止记录不影响正常 DNS 服务。
 
-`PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`record_flows`、`record_logs`、`record_dns_log`（`true`、`false` 或 `"auto"`）、`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界值，或对配置禁止的记录器修改级别、留存上限，均使整次请求返回 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。修改 `log.level` 同时替换控制台与日志文件的过滤器，包括由 `RUST_LOG` 或 `--debug` 设定的过滤器；Clash `/logs` 仍按各请求的级别过滤。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别、启动时的控制台与日志文件过滤器和初始留存上限，并将记录模式重置为 `"auto"`；provider/network refresh 保留运行时设置。
+`PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`record_flows`、`record_logs`、`record_dns_log`（`true`、`false` 或 `"auto"`）、`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界值，或对配置禁止的记录器修改级别、留存上限，均使整次请求返回 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。修改 `log.level` 同时替换控制台与日志文件的过滤器，包括由 `RUST_LOG` 或 `--debug` 设定的过滤器；Clash `/logs` 仍按各请求的级别过滤。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别、启动时的控制台与日志文件过滤器和初始留存上限，并将记录模式重置为 `"auto"`；provider/network refresh 保留运行时设置。`geodata` 单独存储，不受激活影响，见 [Geodata 来源与自动更新](#geodata-来源与自动更新)。
 
 顶层记录字段中，`true` 使获准的记录器持续开启，`false` 强制关闭；初始模式 `"auto"` 对 flow 按诊断需求控制，对日志/DNS 日志按通用客户端连接状态控制。省略的字段保持不变；null 被拒绝。配置中的 false 禁止记录，运行时请求开启该记录器会使整次 PATCH 被拒绝。配置权限决定哪些级别和留存控制可用，与记录器是否暂时停止无关。
 
@@ -266,14 +266,30 @@ DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成
 
 这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`、`written`、`durability_confirmed`、`committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409；DELETE 的受限失败契约也将校验/冲突映射为 503。已耐久写入但激活被拒绝报告 written true/committed false，提交后降级报告 committed true，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
 
-获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 geodata。Geodata GET 按既有 router-before-config 锁序读取流量/DNS 保留元数据，不扫描磁盘、不联网；hash/大小属于已加载字节，不属于后来的磁盘外部编辑。未记录或不一致的修改时间为 null；`source_redacted` 保留字段名，在 GET 与成功操作结果中返回完整配置 URL，未配置来源才为 null。未使用资产不列出；互相冲突的已加载快照报告不可用，不任取其一。
+获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 geodata。Geodata GET 按既有 router-before-config 锁序读取流量/DNS 保留元数据，不扫描磁盘、不联网；hash/大小属于已加载字节，不属于后来的磁盘外部编辑。未记录或不一致的修改时间为 null；`source_redacted` 保留字段名，在 GET 与成功操作结果中返回第一个下载 URL，并遮蔽监听凭据；没有 URL 的资产为 null。未使用资产不列出；互相冲突的已加载快照报告不可用，不任取其一。
 
-更新需要 `config_write`、来源权威，以及为**每个已加载资产**配置 `geosite_download_url`/`geoip_download_url`。它们是需重启的管理员设置，不是请求参数。只接受最终直达 HTTP(S) URL，拒绝 userinfo、fragment、redirect 和 content encoding；HTTPS 验证证书，域名来源必须使用配置的数字地址 `global.bootstrap_resolver`，不回退系统 DNS。使用带 bypass mark 的直连 socket，不选代理 detour。一次更新最多两个各 256 MiB 的资产，共享 30 秒网络期限；校验、磁盘操作与必须等待的 owner join 不承诺硬总期限。
+更新需要 `config_write`、来源权威，以及**每个已加载资产**都有下载 URL：来自配置文件的 `geosite_download_url`/`geoip_download_url`，或在来源可配置时来自已存储或内置的 URL（见下节）。URL 不作为请求参数。只接受最终直达 HTTP(S) URL，拒绝 userinfo、fragment、redirect 和 content encoding；HTTPS 验证证书，域名来源必须使用配置的数字地址 `global.bootstrap_resolver`，不回退系统 DNS。使用带 bypass mark 的直连 socket，不选代理 detour。一次更新最多两个各 256 MiB 的资产；每个 URL 单独计 30 秒网络期限，包括其校验文件；校验、磁盘操作与必须等待的 owner join 不承诺硬总期限。
 
-全部下载完成、解析并编译完整候选后才替换任何文件。目标只能是确切已加载文件，经无符号链接的父目录/文件 FD 打开，别名、字节/来源/依赖冲突和不安全路径均拒绝；父目录分量只在安全打开后做身份规范化。各文件独立原子替换并确认耐久，**不是多文件原子事务**；首个 rename 后失败保留逐资产 written/durability 信息，不自动撤回。真实 reload 在 no-op 与重建两条路径都使用不可变已验证 geo 快照，后续磁盘改动不能替换激活字节。成功结果来自实际发布的 GeoData；拒绝/降级仍失败并报告提交信息。重试前先修复磁盘冲突。
+全部下载完成、解析并编译完整候选后才替换任何文件；新文件缺少当前配置使用的分类时，更新以 `asset_validation_failed` 失败，已加载文件保持不变。已加载文件位于 `global.data_dir` 或 `$DAE_LOCATION_ASSET` 时就地替换。已加载文件来自优先级更低的位置（例如软件包安装的 `/usr/share/honk`）时不会被覆写：更新改为在 `global.data_dir/<文件>` 新建文件，若该路径期间已出现文件则拒绝替换；此后查找顺序优先使用新文件。文件经无符号链接的父目录/文件 FD 打开，别名、字节/来源/依赖冲突和不安全路径均拒绝；父目录分量只在安全打开后做身份规范化。各文件独立原子替换并确认耐久，**不是多文件原子事务**；首个 rename 后失败保留逐资产 written/durability 信息，不自动撤回。真实 reload 在 no-op 与重建两条路径都使用不可变已验证 geo 快照，后续磁盘改动不能替换激活字节。成功结果来自实际发布的 GeoData；拒绝/降级仍失败并报告提交信息。重试前先修复磁盘冲突。
 缓存订阅仍参与准入依赖检查，但其指纹标签指向数据库行，不是文件路径。Geodata 更新通过 rename 前的最后一次重新捕获检查正文是否变化；只有真实文件依赖才取得 inode guard。
 
 `POST /geodata/update` 不带 body；同键幂等重放先于互斥检查，不同的在途请求返回 409，operation 容量满返回 503。`202` 只代表 daemon 接管，不代表文件或路由已变更。相同内容可以 no-op 完成，不伪造 generation.changed。
+
+### Geodata 来源与自动更新
+
+有状态库时，`resources.geodata.configurable_sources` 为 true，`runtime_settings.fields` 列出 `geodata`。启用原生 API 时总会打开 `<data_dir>/state/honk.db`；设置存于其中的严格表 `geodata_settings`，重启和激活后保留；schema 版本 2 在打开已有数据库时添加该表。没有状态库时只使用配置文件中的 URL，下列字段均不出现。
+
+此时 `GET /runtime/settings` 包含 `geodata`：`source`、`geosite.urls`、`geoip.urls`、`auto_update`（`enabled`、`interval_hours`）与 `download`（`route`、`group_id`）。只有已存储的设置生效。启动时，配置文件设置了下载 URL 的，honk 将其写入已存储的设置，覆盖通过 API 修改的 URL。配置文件未设置 URL 的资产，若列表由先前的配置文件写入则删除，改用内置 URL；若由 API 修改则保留。修改 `experimental.native_api`（包括这两个 URL）的 reload 会因需要重启而被拒绝，因此其他激活不会改动已存储的设置，通过 API 修改的 URL 保持到下次启动。已存储的列表全部来自配置文件时 `source` 为 `config`，任一列表来自 API 修改时为 `db`；未存储列表时为 `default`，即内置的 MetaCubeX `meta-rules-dat` release 文件，先 raw.githubusercontent.com，后 fastly.jsdelivr.net。自动更新默认关闭，间隔默认 24 小时。
+
+`download.route` 决定每个 geodata 请求（包括校验文件）的出口。`routing` 为默认值，与用户流量一样遵循路由规则，因为 honk 自身发起的下载除非另行配置，一律经过路由；`group` 始终经过 `group_id` 指定的组，该 ID 即 `GET /groups` 返回的 ID；`direct` 使用 bootstrap resolver 解析并带绕过标记直连主机。经规则或组的请求与外部 UI 下载共用同一套路由决策和隧道。路由无法承载的请求按连接错误处理，使这个 URL 失败：组不存在或没有可选成员时 `last_error.code` 为 `group_unavailable`，规则指向 `block` 时为 `route_blocked`，隧道建立失败时为 `connection_failed`。随后 honk 改试下一个 URL，不会回退到直连。启动后不久，路由或规则选中的组尚无可达节点时，更新就按此处理。经节点下载时，域名由节点出口解析，因此探测目标策略只检查端口和字面 IP 地址。`experimental.native_api.geodata_download_detour` 在启动时按与 URL 相同的规则写入路由：`direct`、`routing` 或组名覆盖通过 API 修改的路由。空值与 `external_ui_download_detour` 为空时相同，遵循路由规则；若已通过 API 存储路由，则保留该路由。空值还会删除先前配置文件写入的路由。路由不影响 `source`。
+
+`PATCH /runtime/settings` 合并并存储 `geodata`，不触发下载。`urls` 列表含 1–4 个互不相同的 HTTP(S) URL，每个最长 4096 字节，不含 userinfo 或 fragment，按回退顺序整体替换原列表；修改任一资产都会存储两个列表，无论原来的 `source` 是什么，都随之变为 `db`。`auto_update` 单独存储，`interval_hours` 取 6–168，配置文件不设置它。`download` 单独存储；`group` 路由必须带 `group_id`，其他路由不能带；ID 不对应当前任何组时返回 `422 unsupported_value`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`"geodata": null` 删除已存储的设置；配置文件中的 URL 在下次启动时重新写入。顶层 `source` 不受影响。`geodata` 与其他字段在同一请求中一起校验，任一部分失败则全部不变。匿名 loopback 主体不能修改 `geodata`（`403 permission_denied`），读到的 URL 去掉 userinfo、query 和 fragment，并遮蔽监听凭据；已认证调用方读到原始 URL，仅遮蔽监听凭据。
+
+更新按顺序尝试资产的各个 URL，遇到连接错误、非 200 状态、超时或校验失败时改试下一个。校验文件的 URL 是在原 URL 的路径末尾加 `.sha256sum`，保留 query。返回 200 时，其第一个字段必须等于文件的 SHA-256；返回 404 视为未发布校验文件，文件按未校验使用；其他状态或失败都使这个 URL 失败。已存储和内置的 URL 遵循探测目标策略：只允许默认端口，除非 `probe_allowed_ports` 另行列出；解析出的受限地址需由 `probe_allowed_cidrs` 放行。与当前配置文件所设 URL 相同的 URL 由管理员自行设置，不受此限制。
+
+此时 `GET /geodata` 还为每个资产报告 `fetched_url_redacted`（已加载文件的下载 URL，去掉 userinfo、query 和 fragment，并遮蔽监听凭据）、`verified` 与 `download_route`（`route` 为该次下载时设置的路由，`group_id` 为请求经过的组，包括规则选中的组，否则为 null），并在顶层报告 `last_checked_at`、`last_updated_at`、`next_check_at`、`last_error` 和 `required_codes`；后者按资产列出当前配置引用的分类，已排序。`last_error.code` 为失败阶段，例如 `http_status_rejected`、`checksum_mismatch` 或 `asset_validation_failed`。这些状态只存于内存，因此重启后在下一次尝试前为 null，`verified` 为 false。
+
+自动更新默认开启，间隔 24 小时；将 `auto_update.enabled` 设为 `false` 即关闭。启动后的首次检查在一个间隔加随机延迟之后执行，与已加载文件的新旧无关，因此升级或重启不会立即触发下载；需要立即更新时调用 `POST /geodata/update`。自动更新使用同一个 `geodata_update` operation，因此自动更新执行期间的手动更新返回 `409 state_conflict`；自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔；成功后恢复正常间隔。
 
 ### 内嵌 doona 来源
 

@@ -610,6 +610,7 @@ pub(super) fn parse_experimental_section(
                     "writable_includes",
                     "geosite_download_url",
                     "geoip_download_url",
+                    "geodata_download_detour",
                 ][..],
                 _ => {
                     return Err(scalar_error(
@@ -834,6 +835,10 @@ pub(super) fn parse_experimental_section(
                         (
                             "geoip_download_url",
                             &mut config.native_api.geoip_download_url,
+                        ),
+                        (
+                            "geodata_download_detour",
+                            &mut config.native_api.geodata_download_detour,
                         ),
                     ] {
                         if let Some(text) = values.get(key) {

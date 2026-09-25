@@ -89,7 +89,15 @@ impl Fixture {
         gated: bool,
         setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
     ) -> Self {
-        Self::build(access, gated, setup, false).await
+        Self::build(access, gated, setup, false, false).await
+    }
+
+    /// Also opens the state db, so geodata sources are configurable.
+    async fn new_with_state(
+        access: Access,
+        setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
+    ) -> Self {
+        Self::build(access, false, setup, false, true).await
     }
 
     /// Starts from `--store db`: the tree is imported as revision 1.
@@ -101,7 +109,7 @@ impl Fixture {
         access: Access,
         setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
     ) -> Self {
-        Self::build(access, false, setup, true).await
+        Self::build(access, false, setup, true, false).await
     }
 
     async fn build(
@@ -109,6 +117,7 @@ impl Fixture {
         gated: bool,
         setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
         db: bool,
+        state_db: bool,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -215,6 +224,10 @@ impl Fixture {
         control_plane
             .install_startup_diagnostics(subscriptions.take_startup_diagnostics())
             .await;
+        if state_db {
+            let db = crate::state::StateDb::open(&directory.path().join("state")).unwrap();
+            control_plane.init_cache_db(Some(Arc::new(db)), None).await;
+        }
         let state = Arc::new(
             NativeState::new(&mut control_plane, addr, SystemTime::now(), Instant::now())
                 .await

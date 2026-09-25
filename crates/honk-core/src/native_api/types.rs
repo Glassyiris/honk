@@ -388,7 +388,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "dns_query": state.observation.dns.query_capability(),
             "dns_cache": state.observation.dns.cache_capability(),
             "dns_log": state.observation.dns.log_capability(),
-            "runtime_settings": super::settings::capability(&state.settings),
+            "runtime_settings": super::settings::capability(&state.settings, state.geodata.as_ref().is_some()),
             "operations": {"available":true,"retention_seconds":300},
             "reload": {"available":config.running()},
             "suspend": {"available":config.coordinator_running()},

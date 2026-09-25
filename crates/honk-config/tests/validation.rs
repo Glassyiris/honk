@@ -692,6 +692,7 @@ mod native_api {
             serde_json::json!({"geoip_download_url":"https://example.test/#PRIVATE"}),
             serde_json::json!({"geosite_download_url":"https://@example.test/data"}),
             serde_json::json!({"geosite_download_url":"https://example.test:0/data"}),
+            serde_json::json!({"geoip_download_url":format!("https://example.test/{}", "a".repeat(4076))}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
@@ -717,12 +718,38 @@ mod native_api {
             serde_json::json!({"enabled":true,"listen":"[::1]:9527","allow_anonymous_loopback":true}),
             serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE"}),
             serde_json::json!({"geosite_download_url":"https://example.test/data?token=PRIVATE","geoip_download_url":"http://[::1]:8080/data"}),
+            serde_json::json!({"geoip_download_url":format!("https://example.test/{}", "a".repeat(4075))}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
                     .unwrap();
             config.validate_detailed().unwrap();
             config.validate_assembled().unwrap();
+        }
+        for (detour, valid) in [
+            ("", true),
+            ("direct", true),
+            ("routing", true),
+            ("proxy", true),
+            ("missing", false),
+        ] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "groups": [{"name": "proxy"}],
+                "experimental": {"native_api": {"geodata_download_detour": detour}},
+            }))
+            .unwrap();
+            for result in [config.validate_detailed(), config.validate_assembled()] {
+                match result {
+                    Ok(()) => assert!(valid, "{detour}"),
+                    Err(error) => {
+                        assert!(!valid, "{detour}: {error:?}");
+                        assert_eq!(
+                            error.diagnostic.setting.to_string(),
+                            "experimental.native_api.geodata_download_detour"
+                        );
+                    }
+                }
+            }
         }
         let config = parse_dae_config_with_detailed_diagnostics(
             "experimental { native_api {\n geosite_download_url: 'https://example.test/site?token=PRIVATE'\n geoip_download_url: 'http://[::1]:8080/ip'\n } }", &mut Vec::new(),
@@ -735,6 +762,15 @@ mod native_api {
         assert_eq!(
             config.experimental.native_api.geoip_download_url,
             "http://[::1]:8080/ip"
+        );
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental { native_api {\n geodata_download_detour: 'routing'\n } }",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "routing"
         );
     }
 }

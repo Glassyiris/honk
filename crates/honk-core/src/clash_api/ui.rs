@@ -24,11 +24,9 @@ use std::time::Duration;
 
 use honk_config::Config;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
-use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::{
     ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreReporter,
-    ScoreSelectionContext, ScoreTarget, SelectionNetwork, SharedGroupManager,
+    SharedGroupManager,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry};
 use honk_outbound::runtime::SharedRuntimeRegistry;
@@ -37,7 +35,8 @@ use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::routing::{ConnectionInfo, Router};
+use crate::download_route::{Outbounds, Route as UiRoute};
+use crate::routing::Router;
 
 /// Default dashboard archive (zashboard release `dist.zip`, latest).
 pub const DEFAULT_UI_DOWNLOAD_URL: &str =
@@ -109,6 +108,18 @@ impl Drop for UiDownloadTask {
         self.stop.send_replace(true);
         if self.handle.is_some() {
             tracing::error!("external UI download owner dropped without stop_and_join");
+        }
+    }
+}
+
+impl UiDownloadContext {
+    fn outbounds(&self) -> Outbounds<'_> {
+        Outbounds {
+            router: &self.router,
+            config: &self.config,
+            group_manager: &self.group_manager,
+            proxy_registry: &self.proxy_registry,
+            runtime_registry: &self.runtime_registry,
         }
     }
 }
@@ -186,158 +197,32 @@ fn download_url(configured: &str) -> String {
     })
 }
 
-/// Where the routing decision sends the download.
-enum UiRoute {
-    Direct {
-        feedback: Option<ScoreAttempt>,
-    },
-    Block,
-    Proxy {
-        node: Box<Node>,
-        feedback: Option<ScoreAttempt>,
-    },
-}
-
-/// Run the download target through the same routing pipeline as user
-/// traffic: `Router::route_with_must` for the outbound name, then the
-/// authoritative group/leaf resolution for the node to dial.
+/// Run the download target through the configured detour, or through the
+/// same routing pipeline as user traffic when none is set.
 async fn decide_route(
     ctx: &UiDownloadContext,
     host: &str,
     port: u16,
     original: Option<&ScoreContinuation>,
 ) -> anyhow::Result<UiRoute> {
-    let host_ip = parse_host_ip(host);
-    let resolved_ip = if let Some(ip) = host_ip {
-        Some(ip)
-    } else {
-        honk_outbound::bootstrap::resolve(host)
-            .await
-            .ok()
-            .and_then(|addresses| addresses.into_iter().next())
-    };
-    let (dst_ip, domain) = match host_ip {
-        Some(ip) => (
-            ip,
-            (!host.parse::<std::net::IpAddr>().is_ok()).then(|| host.to_string()),
-        ),
-        None => (
-            resolved_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            Some(host.to_string()),
-        ),
-    };
-    let info = ConnectionInfo {
-        domain: domain.clone(),
-        dst_ip,
-        dst_port: port,
-        src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        src_port: 0,
-        protocol: "tcp",
-        process_name: None,
-        mac: None,
-        dscp: None,
-    };
-    let configured_detour = {
-        let config = ctx.config.read().await;
-        config
-            .experimental
-            .clash_api
-            .external_ui_download_detour
-            .clone()
-    };
-    let detour_configured = !configured_detour.is_empty();
-    let (outbound, rule) = if !detour_configured {
-        let router = ctx.router.read().await;
-        let (outbound, _must) = router.route_with_must(&info);
-        let rule = router
-            .route_full(&info)
-            .map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
-        (outbound.to_string(), rule)
-    } else {
-        (
-            configured_detour,
-            Some("experimental.clash_api.external_ui_download_detour".to_string()),
+    let detour = ctx
+        .config
+        .read()
+        .await
+        .experimental
+        .clash_api
+        .external_ui_download_detour
+        .clone();
+    ctx.outbounds()
+        .decide(
+            (!detour.is_empty()).then_some(detour.as_str()),
+            "experimental.clash_api.external_ui_download_detour",
+            "external UI download",
+            (host, port),
+            original,
         )
-    };
-    let target_ipver = if matches!(dst_ip, std::net::IpAddr::V6(_)) {
-        IpVersion::V6
-    } else {
-        IpVersion::V4
-    };
-    let score_ipver = resolved_ip.map(|ip| {
-        if ip.is_ipv6() {
-            IpVersion::V6
-        } else {
-            IpVersion::V4
-        }
-    });
-    let (nodes, feedback) = {
-        let config = ctx.config.read().await;
-        let group_manager = ctx.group_manager.read().clone();
-        // Generic route resolution defaults unknown outputs to direct; an
-        // explicitly configured detour must not bypass that operator error.
-        if detour_configured
-            && outbound != Config::BUILTIN_DIRECT_NODE
-            && outbound != Config::BUILTIN_BLOCK_NODE
-            && !config.nodes.iter().any(|node| node.name == outbound)
-            && !config.groups.iter().any(|group| group.name == outbound)
-        {
-            anyhow::bail!("external UI download: detour outbound '{outbound}' not found");
-        }
-        if config.groups.iter().any(|group| group.name == outbound) {
-            let context = ScoreSelectionContext {
-                network: SelectionNetwork::Tcp,
-                probe_domain: ProbeDomain::Tcp,
-                target_family: score_ipver,
-                health_family: score_ipver.unwrap_or(target_ipver),
-                target: Some(if domain.is_some() {
-                    ScoreTarget::domain(host, port)
-                } else {
-                    std::net::SocketAddr::new(dst_ip, port).into()
-                }),
-            };
-            let plan = group_manager
-                .selection_plan_for_target_with_health_fallback(&outbound, &context, original);
-            let mut entries = plan.entries.into_iter();
-            match entries.next() {
-                Some(entry) => (vec![entry.node.clone()], entry.feedback),
-                None => (Vec::new(), None),
-            }
-        } else {
-            (
-                crate::control::reload::resolve_outbound_nodes(
-                    &config,
-                    &group_manager,
-                    &outbound,
-                    ProbeDomain::Tcp,
-                    target_ipver,
-                ),
-                None,
-            )
-        }
-    };
-    let Some(node) = nodes.into_iter().next() else {
-        anyhow::bail!("external UI download: outbound '{outbound}' has no available node");
-    };
-    let route = match node.protocol() {
-        NodeProtocol::Direct => UiRoute::Direct { feedback },
-        NodeProtocol::Block => UiRoute::Block,
-        _ => UiRoute::Proxy {
-            node: Box::new(node),
-            feedback,
-        },
-    };
-    info!(
-        outbound = %outbound,
-        rule = rule.as_deref().unwrap_or("fallback"),
-        via = match &route {
-            UiRoute::Direct { .. } => "direct",
-            UiRoute::Block => "block",
-            UiRoute::Proxy { node, .. } => node.name.as_str(),
-        },
-        "external UI download routed"
-    );
-    Ok(route)
+        .await
+        .map(|decision| decision.route)
 }
 
 /// Download the archive at `url` and extract it into the configured
@@ -506,9 +391,8 @@ enum ProxiedFetch {
     Stopped,
 }
 
-/// One proxied GET through `node`'s tunnel: dial by domain (the node's
-/// egress resolves it, sidestepping local DNS poisoning), TLS for https,
-/// then a minimal HTTP/1.1 exchange.
+/// One proxied GET through `node`'s tunnel: TLS for https, then a minimal
+/// HTTP/1.1 exchange.
 async fn fetch_proxied(
     ctx: &UiDownloadContext,
     node: &Node,
@@ -517,29 +401,12 @@ async fn fetch_proxied(
     archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
-    let protocol = node.protocol();
-    let entry = ctx
-        .proxy_registry
-        .find(protocol)
-        .ok_or_else(|| anyhow::anyhow!("no handler for protocol {:?}", protocol))?;
-    let connect_timeout = tokio::select! {
+    let outbounds = ctx.outbounds();
+    let tunnel = tokio::select! {
         biased;
         _ = download_stopped(stop) => return Ok(ProxiedFetch::Stopped),
-        config = ctx.config.read() => Duration::from_millis(config.global.connect_timeout_ms),
+        tunnel = outbounds.tunnel(node, (host, port)) => tunnel?,
     };
-    // Tunnel handlers dial by domain; the address is only a fallback for
-    // handlers that need a numeric target.
-    let host_ip = parse_host_ip(host);
-    let (domain, addr) = match host_ip {
-        Some(ip) => (None, std::net::SocketAddr::new(ip, port)),
-        None => (Some(host), std::net::SocketAddr::from(([0, 0, 0, 0], port))),
-    };
-    let generation = ctx.runtime_registry.read().clone();
-    let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(
-        &generation,
-        node,
-        honk_outbound::proxy::WarmRequirement::Session,
-    )?;
     let mut reporter = None;
     let result = tokio::select! {
         biased;
@@ -550,17 +417,10 @@ async fn fetch_proxied(
             .map(ScoreAttempt::begin)
             .transpose()?
             .map(ScoreBusinessGuard::start);
-        match generation
-        .scope_dials(
-            entry
-                .tcp
-                .dial_runtime(runtime, addr, domain, connect_timeout),
-        )
-        .await
-    {
-        Ok(proxy) => match tokio::time::timeout(
+        match tunnel.dial().await {
+        Ok(stream) => match tokio::time::timeout(
             DOWNLOAD_TIMEOUT,
-            proxied_get(proxy.stream, (host, path, is_https), archive, &reporter),
+            proxied_get(stream, (host, path, is_https), archive, &reporter),
         )
         .await
         {
@@ -580,9 +440,7 @@ async fn fetch_proxied(
             Err(error) => ScoreOutcome::from_error(error),
         });
     }
-    if let Some(mut guard) = guard {
-        guard.close().await?;
-    }
+    tunnel.close().await?;
     result
 }
 
@@ -800,12 +658,6 @@ fn named_then_unlinked(
     Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
-fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
-    host.parse()
-        .ok()
-        .or_else(|| host.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
-}
-
 /// Split a download URL into (host, port, path, is_https); the scheme is
 /// required and must be http or https.
 fn parse_download_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> {
@@ -937,7 +789,8 @@ mod tests {
     use super::*;
     use honk_config::group::{Group, GroupPolicy};
     use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
-    use honk_outbound::group::GroupManager;
+    use honk_config::types::NodeProtocol;
+    use honk_outbound::group::{GroupManager, SelectionNetwork};
     use honk_outbound::proxy::{ProtocolEntry, ProxyStream, TcpOutbound};
 
     /// Build an in-memory zip with the given (path, contents) entries.

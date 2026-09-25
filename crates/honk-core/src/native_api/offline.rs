@@ -325,7 +325,7 @@ fn geo_dependencies(
 ) -> io::Result<Vec<DependencySnapshot>> {
     let mut dependencies: Vec<DependencySnapshot> = Vec::new();
     for snapshot in geo.snapshots(requirements) {
-        let path = fs::canonicalize(snapshot.path.ok_or(io::ErrorKind::InvalidData)?)?;
+        let path = canonical_asset(&snapshot.path.ok_or(io::ErrorKind::InvalidData)?)?;
         let reader = DependencyReader::Geo(snapshot.kind);
         if let Some(dependency) = dependencies.iter_mut().find(|dependency| {
             dependency.path == path
@@ -344,6 +344,18 @@ fn geo_dependencies(
         }
     }
     Ok(dependencies)
+}
+
+/// An update may validate a file it has yet to create in the data directory;
+/// that path resolves through its directory.
+fn canonical_asset(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = path.file_name().ok_or(io::ErrorKind::InvalidData)?;
+            Ok(fs::canonicalize(path.parent().ok_or(io::ErrorKind::InvalidData)?)?.join(name))
+        }
+        result => result,
+    }
 }
 
 fn error(

@@ -16,6 +16,8 @@ pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
 pub mod dns;
+#[cfg(any(feature = "clash-api", feature = "native-api"))]
+pub(crate) mod download_route;
 pub mod ebpf;
 pub mod mode;
 #[cfg(feature = "native-api")]
@@ -466,6 +468,7 @@ fn open_state_db(
     if cli.store == ConfigStore::Db
         || !(config.experimental.cache_file.stores_selections()
             || config.global.store_subscribe
+            || config.experimental.native_api.enabled
             || config.experimental.native_api.password_auth)
     {
         return Ok((None, false));
@@ -2804,7 +2807,10 @@ mod startup_lifecycle_tests {
                 .join(crate::state::DB_FILE),
         )
         .unwrap()
-        .execute_batch("PRAGMA user_version = 2")
+        .execute_batch(&format!(
+            "PRAGMA user_version = {}",
+            crate::state::SCHEMA_VERSION + 1
+        ))
         .unwrap();
         assert!(super::open_state_db(&cli, &config, newer_dir.path()).is_err());
     }

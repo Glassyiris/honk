@@ -46,6 +46,23 @@ impl GeoRequirements {
         }
     }
 
+    /// The sorted category names `kind` must contain, without attribute selectors.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn codes(&self, kind: &str) -> Vec<String> {
+        let mut codes: Vec<String> = match kind {
+            "geosite" => self
+                .geosite_codes
+                .iter()
+                .map(|code| split_geosite_code(code).0)
+                .collect(),
+            "geoip" => self.geoip_codes.iter().cloned().collect(),
+            _ => Vec::new(),
+        };
+        codes.sort();
+        codes.dedup();
+        codes
+    }
+
     pub(crate) fn union(&self, other: &Self) -> Self {
         let mut union = self.clone();
         union
@@ -242,7 +259,38 @@ impl GeoSourceSet {
         }
         let sources = Self::from_sources(geosite, geoip);
         sources.validate(requirements)?;
+        sources.contain(requirements)?;
         Ok(sources)
+    }
+
+    /// A replacement file must define every category the configuration uses:
+    /// a missing one would silently turn its rules into never-matching ones.
+    #[cfg(feature = "native-api")]
+    fn contain(&self, requirements: &GeoRequirements) -> std::io::Result<()> {
+        let missing = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+        if let Some(bytes) = self.geosite.bytes() {
+            let index = parse_geosite_index_inner(bytes, &requirements.geosite_codes, true)
+                .map_err(|_| missing())?;
+            if requirements
+                .codes("geosite")
+                .iter()
+                .any(|code| !index.contains_key(code))
+            {
+                return Err(missing());
+            }
+        }
+        if let Some(bytes) = self.geoip.bytes() {
+            let index =
+                parse_geoip_index(bytes, &requirements.geoip_codes).map_err(|_| missing())?;
+            if requirements
+                .geoip_codes
+                .iter()
+                .any(|code| !index.contains_key(code))
+            {
+                return Err(missing());
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-api")]

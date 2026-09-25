@@ -1,5 +1,6 @@
 use super::*;
 use crate::configuration::{DependencyReader, DependencySnapshot, digest};
+use crate::download_route::Outbounds;
 use crate::native_api::config_write::{SourceFile, StagedFile};
 use crate::native_api::geodata::{self, GeoUpdatePlan};
 use crate::native_api::operations::OperationResult;
@@ -60,12 +61,20 @@ impl Worker {
                 .service
                 .operations
                 .succeed(id, OperationResult::Geodata(data)),
-            Err(details) => self.service.operations.fail(
-                id,
-                "geodata_update_failed",
-                "Geodata update did not complete successfully",
-                Some(details),
-            ),
+            Err(details) => {
+                if let Some(sources) = &plan.sources {
+                    sources.record(Err(details["stage"]
+                        .as_str()
+                        .unwrap_or("activation_failed")
+                        .to_owned()));
+                }
+                self.service.operations.fail(
+                    id,
+                    "geodata_update_failed",
+                    "Geodata update did not complete successfully",
+                    Some(details),
+                )
+            }
         };
     }
 
@@ -88,14 +97,27 @@ impl Worker {
         {
             return Err(failure("revision_conflict", &writes));
         }
-        let deadline = tokio::time::Instant::now() + geodata::NETWORK_TIMEOUT;
         let mut downloads = Vec::with_capacity(plan.assets.len());
-        for asset in &plan.assets {
-            let bytes = geodata::download(
-                geodata::configured_url(&active.experimental.native_api, asset.kind),
-                &active.global.bootstrap_resolver,
-                deadline,
+        let mut fetched = Vec::with_capacity(plan.assets.len());
+        let egress = geodata::Egress {
+            bootstrap: &active.global.bootstrap_resolver,
+            route: &plan.route,
+            outbounds: Outbounds {
+                router: &plan.traffic_router,
+                config: &self.active,
+                group_manager: &plan.group_manager,
+                proxy_registry: &plan.proxy_registry,
+                runtime_registry: &plan.runtime_registry,
+            },
+        };
+        for (asset, urls) in plan.assets.iter().zip(&plan.urls) {
+            let (bytes, origin) = geodata::fetch(
+                asset.kind,
+                urls,
+                &egress,
                 offline::MAX_ASSET_BYTES,
+                &plan.policy,
+                geodata::file_url(&active.experimental.native_api, asset.kind),
             )
             .await
             .map_err(|stage| failure(stage, &writes))?;
@@ -103,6 +125,7 @@ impl Worker {
                 original: asset.clone(),
                 bytes,
             });
+            fetched.push(origin);
         }
         let service = Arc::clone(&self.service);
         let store = self
@@ -178,12 +201,21 @@ impl Worker {
             details["committed"] = json!(true);
             return Err(details);
         }
+        if let Some(sources) = &plan.sources {
+            let replaced = plan
+                .assets
+                .iter()
+                .zip(&prepared)
+                .any(|(original, prepared)| original.sha256 != prepared.snapshot.sha256);
+            sources.record(Ok((fetched, replaced)));
+        }
         let active = self.active.read().await;
         Ok(geodata::project(
             assets,
-            &self.service.settings,
+            plan.sources.as_deref(),
             &active,
             &self.service,
+            |name| geodata::group_id(&plan.catalog, name),
         ))
     }
 }
@@ -318,12 +350,22 @@ fn prepare_and_replace(
         {
             return Err(failure("asset_alias", &writes));
         }
-        let staged = file
-            .stage(&original.sha256, &download.bytes)
-            .map_err(|_| failure("staging_failed", &writes))?;
+        let target = update_target(
+            path,
+            data_dir,
+            std::env::var_os("DAE_LOCATION_ASSET")
+                .as_deref()
+                .map(Path::new),
+        );
+        let staged = if target == *path {
+            file.stage(&original.sha256, &download.bytes)
+        } else {
+            file.stage_beside(&original.sha256, &target, &download.bytes)
+        }
+        .map_err(|_| failure("staging_failed", &writes))?;
         let snapshot = GeoAssetSnapshot {
             kind: original.kind,
-            path: original.path,
+            path: Some(target),
             sha256: staged.sha256().to_owned(),
             size_bytes: download.bytes.len() as u64,
             modified_at: staged.modified_at(),
@@ -476,10 +518,55 @@ fn prepare_and_replace(
     })
 }
 
+/// Where an update writes the replacement for the loaded file at `loaded`:
+/// in place when that file is in the data directory or in the explicit asset
+/// directory that outranks it, otherwise as a new file in the data directory.
+/// The new file shadows the old one in the lookup order, so a file a package
+/// manager installed is never overwritten.
+fn update_target(loaded: &Path, data_dir: &Path, explicit: Option<&Path>) -> PathBuf {
+    let same = |directory: &Path| {
+        loaded.parent().is_some_and(|parent| {
+            parent == directory
+                || std::fs::canonicalize(parent)
+                    .ok()
+                    .zip(std::fs::canonicalize(directory).ok())
+                    .is_some_and(|(parent, directory)| parent == directory)
+        })
+    };
+    if same(data_dir) || explicit.is_some_and(same) {
+        return loaded.to_owned();
+    }
+    data_dir.join(loaded.file_name().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod settled_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn updates_write_to_the_data_directory_instead_of_a_packaged_file() {
+        let data = Path::new("/var/lib/honk");
+        let explicit = Some(Path::new("/opt/assets"));
+        for packaged in ["/usr/share/honk/geosite.dat", "/usr/share/dae/geosite.dat"] {
+            assert_eq!(
+                update_target(Path::new(packaged), data, None),
+                data.join("geosite.dat")
+            );
+            assert_eq!(
+                update_target(Path::new(packaged), data, explicit),
+                data.join("geosite.dat")
+            );
+        }
+        assert_eq!(
+            update_target(&data.join("geoip.dat"), data, None),
+            data.join("geoip.dat")
+        );
+        assert_eq!(
+            update_target(Path::new("/opt/assets/geoip.dat"), data, explicit),
+            PathBuf::from("/opt/assets/geoip.dat")
+        );
+    }
 
     fn dependency(path: &str, sha256: &str, readers: Vec<DependencyReader>) -> DependencySnapshot {
         DependencySnapshot {
