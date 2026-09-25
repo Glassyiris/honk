@@ -169,21 +169,26 @@ async fn validation_ids_and_display_paths_cannot_expand_file_authority() {
         )
         .await;
     }
-    for path in ["../outside.dae", "/tmp/outside.dae"] {
+    for (entry, path) in [
+        ("main.dae", "../outside.dae"),
+        ("main.dae", "/tmp/outside.dae"),
+        ("main.dae", "notes.txt"),
+        ("editable.dae", "locked.dae"),
+    ] {
         error(
             fixture
                 .request(Method::POST, VALIDATE)
                 .json(&json!({
                     "mode":"full","sources":[
-                        {"id":"main","path":"main.dae","content":fixture.originals["main.dae"]},
+                        {"id":"main","path":entry,"content":fixture.originals["main.dae"]},
                         {"id":"outside","path":path,"content":"# no authority\n"}
                     ]
                 }))
                 .send()
                 .await
                 .unwrap(),
-            StatusCode::FORBIDDEN,
-            "permission_denied",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
         )
         .await;
     }

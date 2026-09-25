@@ -393,12 +393,12 @@ impl DbStore {
         let path = if input.is_absolute() {
             input
                 .strip_prefix(&self.root)
-                .map_err(|_| super::super::config::denied())?
+                .map_err(|_| super::super::config::invalid())?
         } else {
             input
         };
         let path: PathBuf = path.components().collect();
-        valid_name(&path).map_err(|_| super::super::config::denied())?;
+        valid_name(&path).map_err(|_| super::super::config::invalid())?;
         Ok(self.root.join(path))
     }
 

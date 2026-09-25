@@ -177,7 +177,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 启用 `config_write` 且配置非空 secret 或 `password_auth` 时，已接受的非凭据主文件与所有非凭据 include 均可写。只有已接受的源 ID 授权替换，调用方提供的路径不能授权任意文件写入；generated/subscription 来源不可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
 
-校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。从未拉取的订阅以 warning 准入、不产生缓存节点；已有 same-fetch 活动节点仍可 rebase。其他缺失或无效依赖是错误。校验不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
+校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。从未拉取的订阅以 warning 准入、不产生缓存节点；已有 same-fetch 活动节点仍可 rebase。其他缺失或无效依赖是错误。`full` 模式下，首份文档的 `path` 不是入口主文件、路径不是 `.dae` 或位于入口根目录外时，返回 `400 invalid_request`。校验不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
 
 Full 校验先按 include 顺序合并，再判定有效配置语义。未进入实际 include 树的提交文档只检查结构（包含 lexer 恢复后保留的错误），其设置和告警不影响有效候选；其字节与源数量仍和每次依赖物化共用同一预算。
 

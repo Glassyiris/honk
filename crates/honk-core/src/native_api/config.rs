@@ -785,7 +785,7 @@ fn project_diagnostic(
 pub(super) fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {
     let input = Path::new(label);
     let path = if input.is_absolute() {
-        input.strip_prefix(root).map_err(|_| denied())?
+        input.strip_prefix(root).map_err(|_| invalid())?
     } else {
         input
     };
@@ -794,18 +794,18 @@ pub(super) fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, A
         .any(|part| !matches!(part, Component::Normal(_)))
         || path.extension().and_then(|value| value.to_str()) != Some("dae")
     {
-        return Err(denied());
+        return Err(invalid());
     }
     let joined = root.join(path);
     let resolved = if joined.exists() {
         std::fs::canonicalize(&joined).map_err(|_| unavailable())?
     } else {
         let parent =
-            std::fs::canonicalize(joined.parent().ok_or_else(invalid)?).map_err(|_| denied())?;
+            std::fs::canonicalize(joined.parent().ok_or_else(invalid)?).map_err(|_| invalid())?;
         parent.join(joined.file_name().ok_or_else(invalid)?)
     };
     if !resolved.starts_with(root) {
-        return Err(denied());
+        return Err(invalid());
     }
     Ok(resolved)
 }
