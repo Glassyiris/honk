@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
+use futures::StreamExt;
 use futures::future::poll_fn;
 use honk_config::experimental::{NativeApiConfig, parse_native_authority, parse_native_origin};
 use serde::de::IgnoredAny;
@@ -19,6 +20,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::NativeState;
+use super::auth::SessionLease;
 use super::types::{ApiError, ErrorCode, RequestId};
 
 const MAX_TARGET_BYTES: usize = 4096;
@@ -180,17 +182,16 @@ impl Security {
         request: &Request,
         sessions: Option<&super::auth::Sessions>,
         request_id: &str,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Option<SessionLease>, ApiError> {
         let authorization = single_header(request.headers(), "authorization")
             .map_err(|()| unauthorized(request_id))?;
         if let Some(sessions) = sessions {
-            if !self
+            let lease = self
                 .bearer(request)
-                .is_some_and(|token| sessions.authenticate(token))
-            {
-                return Err(unauthorized(request_id));
-            }
-            return self.reject_query_credentials(request, request_id);
+                .and_then(|token| sessions.authenticate(token))
+                .ok_or_else(|| unauthorized(request_id))?;
+            self.reject_query_credentials(request, request_id)?;
+            return Ok(Some(lease));
         }
         match (&self.expected, authorization) {
             (Some(expected), Some(value)) => {
@@ -211,7 +212,8 @@ impl Security {
             (None, None) if self.anonymous_loopback => {}
             _ => return Err(unauthorized(request_id)),
         }
-        self.reject_query_credentials(request, request_id)
+        self.reject_query_credentials(request, request_id)?;
+        Ok(None)
     }
 
     // Decode keys with the same form parser as API queries; never accept query credentials.
@@ -275,6 +277,7 @@ pub(super) async fn boundary(
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
     let mut origin = None;
+    let mut lease = None;
     let result: Result<Response, ApiError> = async {
         let header_bytes = check_bounds(&request, &request_id)?;
         origin = state
@@ -289,7 +292,7 @@ pub(super) async fn boundary(
         }
         if is_api {
             if !public || carries_credential(&request) {
-                state.security.authenticate(
+                lease = state.security.authenticate(
                     &request,
                     state.auth.as_ref().map(|auth| &auth.sessions),
                     &request_id,
@@ -306,9 +309,12 @@ pub(super) async fn boundary(
     }
     .await;
     let boundary_error = result.is_err();
-    let mut response = match result {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
+    let mut response = match (result, lease) {
+        (Ok(response), Some(lease)) if is_event_stream(&response) => {
+            end_with_session(response, lease)
+        }
+        (Ok(response), _) => response,
+        (Err(error), _) => error.into_response(),
     };
     if is_api || boundary_error {
         response
@@ -389,6 +395,21 @@ pub(super) async fn boundary(
         );
     }
     response
+}
+
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+/// Authorization is checked once per request, so a stream must end itself when its session does.
+fn end_with_session(response: Response, lease: SessionLease) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().take_until(Box::pin(lease.ended()));
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a HeaderValue>, ()> {

@@ -98,7 +98,7 @@ Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最�
 
 凭据任务最多同时运行一个，并移出 Tokio worker；重叠请求返回 429 与 `Retry-After: 1`。HTTP 取消不会释放该任务的位置或丢弃其凭据处理结果。Discovery 只读取短时持有的凭据状态，不等待跨 KDF 或数据库 I/O 的锁。
 
-会话 token 是不透明的 `hnk1_…` 值，通过 `Authorization: Bearer <session>` 使用。每个会话固定有效 12 小时。进程只保留 token 的 SHA-256 digest，最多保留 32 个有效会话；签发新会话时淘汰最早会话，重启结束全部会话。通过配置 secret 或密码登录启动的 operation 属于管理员，而非某个 token，因此 logout 不删除 operation。
+会话 token 是不透明的 `hnk1_…` 值，通过 `Authorization: Bearer <session>` 使用。每个会话固定有效 12 小时。进程只保留 token 的 SHA-256 digest，最多保留 32 个有效会话；签发新会话时淘汰最早会话，重启结束全部会话。会话因 logout、过期或被淘汰而结束时，用它打开的 `/events` 与 `/logs` 流随之关闭；客户端须重新认证后再连接。通过配置 secret 或密码登录启动的 operation 属于管理员，而非某个 token，因此 logout 不删除 operation。
 
 密码模式把唯一凭据记录保存在状态数据库 `<data_dir>/state/honk.db` 的 `admin` 行中（文件权限 0600，目录 0700，见[配置数据库](#配置数据库--store-db)）。记录畸形时拒绝启动；状态数据库损坏时同样拒绝启动，密码模式不会把它移走。
 
