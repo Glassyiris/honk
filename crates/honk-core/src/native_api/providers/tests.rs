@@ -666,6 +666,28 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
     origin.stop().await;
 }
 
+#[tokio::test]
+async fn provider_snapshot_over_budget_is_retryable_snapshot_unavailable() {
+    let api = ProviderApi::new();
+    let snapshot = Snapshot {
+        id: Uuid::new_v4(),
+        instance: "instance".into(),
+        created: Instant::now(),
+        rows: vec![Provider::inline(0), Provider::inline(0)],
+        bytes: MAX_SNAPSHOT_BYTES + 1,
+    };
+    let id = RequestId("request-providers".into());
+    let response = api.page(snapshot, 1, &id).unwrap_err().into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "snapshot_unavailable");
+    assert_eq!(body["request_id"], "request-providers");
+}
+
 #[test]
 fn provider_debug_omits_full_url() {
     let subscription = Subscription {

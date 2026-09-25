@@ -136,7 +136,7 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 ### 节点与组（M3）
 
-节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
+节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
 节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，复用源内容/flow 显示的监听凭据遮罩。节点快照在有界序列化前遮罩，续页保留同一份已遮罩字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
 既有遮罩阈值不变：不足八字节的监听凭据值不遮罩，启动时会发出警告。
@@ -247,7 +247,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 ### Provider、日志与临时设置
 
-获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 provider 数据。Provider GET 不联网。订阅条目连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，`Node.provider_id` 可用于关联。订阅返回配置名称，`url_redacted` 返回完整 URL；为兼容客户端保留字段名。GET 与成功操作结果使用相同表示。未观测 usage/expiry 仍为 null。与旧 `provider-<id>` 标签相同的配置名称只是普通名称，不作为 ID 别名。从未加载、等待加载或禁用且无缓存时是 stale、零节点及 null 时间/错误；真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB。启用且有运行 supervisor 的订阅可 POST refresh；订阅已禁用或未挂接 supervisor（`can_refresh: false`）时返回 `404 capability_not_supported`；同 provider 的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。刷新成功须真实 revision-fenced publication 被接受，fetch 或写缓存不等于成功，HTTP 断连不丢失结果。虚拟 inline provider 不可刷新/删除；它关联 `provider_id: inline` 的静态非 builtin 节点，builtin 归属保持 null，订阅 ID 仍为 UUID。
+获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 provider 数据。Provider GET 不联网。订阅条目连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，`Node.provider_id` 可用于关联。订阅返回配置名称，`url_redacted` 返回完整 URL；为兼容客户端保留字段名。GET 与成功操作结果使用相同表示。未观测 usage/expiry 仍为 null。与旧 `provider-<id>` 标签相同的配置名称只是普通名称，不作为 ID 别名。从未加载、等待加载或禁用且无缓存时是 stale、零节点及 null 时间/错误；真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB，放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`。启用且有运行 supervisor 的订阅可 POST refresh；订阅已禁用或未挂接 supervisor（`can_refresh: false`）时返回 `404 capability_not_supported`；同 provider 的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。刷新成功须真实 revision-fenced publication 被接受，fetch 或写缓存不等于成功，HTTP 断连不丢失结果。虚拟 inline provider 不可刷新/删除；它关联 `provider_id: inline` 的静态非 builtin 节点，builtin 归属保持 null，订阅 ID 仍为 UUID。
 
 `record_logs` 默认为 true，允许在客户端已连接时捕获日志，最多保留 512 条、60 秒，日志能力以 `max_buffered_records` 与 `retention_seconds` 声明这两个上限。显式运行时设置 `record_logs: true` 可在无客户端时持续捕获；配置中的 false 禁止捕获，修改后需重启。实际记录停止时释放日志，续传游标失效。保留真实 timestamp/level/target；只有审查过的静态消息和有类型的安全字段可披露，其他 message/fields 明确 withheld，不靠正则猜测所有秘密，也不转发控制台或 Clash 格式化输出。`GET /logs` 以 SSE 返回 `stream.ready` 与日志，支持 level/target 过滤和绑定 stream/instance/过滤器的 cursor；续传顺序与 `/events` 相同，为 **ready→replay→live**，ready 保留请求 cursor，之后才由 replay 推进。每 stream 最多 16 clients、每 client 64 队列、15 秒 heartbeat；过期 cursor 在 200 前返回 409，队满或 replay 丢失则断流。
 

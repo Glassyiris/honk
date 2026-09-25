@@ -726,11 +726,11 @@ fn group_not_found(id: &RequestId) -> ApiError {
     )
 }
 
-fn snapshot_unavailable(id: &RequestId) -> ApiError {
+pub(super) fn snapshot_unavailable(id: &RequestId) -> ApiError {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::SnapshotUnavailable,
-        "Node snapshot capacity exceeded",
+        "Snapshot capacity exceeded",
         id,
     )
 }
