@@ -51,37 +51,41 @@ fn assert_expired(hub: &Arc<EventHub>, filter: Filter, cursor: &str) {
 }
 
 #[tokio::test]
-async fn fresh_ready_then_replay_ready_and_live_have_no_gap() {
+async fn ready_precedes_replay_and_live_on_fresh_and_resumed_streams() {
     let hub = hub();
     let filter = Filter::new(1 << 2, Some("flow-a".into()));
     let mut fresh = subscribe(&hub, filter.clone(), None);
+    publish_flow(&hub, "flow-a", 1);
     let ready = next(&mut fresh).await;
     assert!(ready.starts_with("event: stream.ready\n"));
-    publish_flow(&hub, "flow-a", 1);
     let original = next(&mut fresh).await;
+    assert_eq!(data(&original)["revision"], 1);
     publish_flow(&hub, "flow-b", 1);
     publish_flow(&hub, "flow-a", 2);
     drop(fresh);
 
     let mut resumed = subscribe(&hub, filter.clone(), Some(cursor(&ready)));
     publish_flow(&hub, "flow-a", 3);
+    let resumed_ready = next(&mut resumed).await;
+    assert!(resumed_ready.starts_with("event: stream.ready\n"));
+    assert_eq!(cursor(&resumed_ready), cursor(&ready));
     let replay_one = next(&mut resumed).await;
     assert_eq!(cursor(&replay_one), cursor(&original));
     assert_eq!(data(&replay_one)["revision"], 1);
     assert_eq!(data(&next(&mut resumed).await)["revision"], 2);
-    let resumed_ready = next(&mut resumed).await;
-    assert!(resumed_ready.starts_with("event: stream.ready\n"));
-    assert_ne!(cursor(&ready), cursor(&resumed_ready));
     assert_eq!(data(&next(&mut resumed).await)["revision"], 3);
     drop(resumed);
 
+    // Disconnecting right after ready must not skip the pending replay.
     let mut after_ready = subscribe(&hub, filter, Some(cursor(&resumed_ready)));
-    assert_eq!(data(&next(&mut after_ready).await)["revision"], 3);
     assert!(
         next(&mut after_ready)
             .await
             .starts_with("event: stream.ready\n")
     );
+    for revision in 1..=3 {
+        assert_eq!(data(&next(&mut after_ready).await)["revision"], revision);
+    }
 }
 
 #[tokio::test]
@@ -111,13 +115,16 @@ async fn live_flow_updates_coalesce_at_the_tail_without_rewriting_replay() {
     let mut resumed = subscribe(&hub, all(), Some(cursor(&ready)));
     publish_flow(&hub, "flow-a", 3);
     publish_flow(&hub, "flow-a", 4);
+    assert!(
+        next(&mut resumed)
+            .await
+            .starts_with("event: stream.ready\n")
+    );
     assert_eq!(data(&next(&mut resumed).await)["revision"], 1);
     assert_eq!(data(&next(&mut resumed).await)["resource_id"], "flow-b");
     assert!(next(&mut resumed).await.starts_with("event: flow.gap\n"));
     assert_eq!(next(&mut resumed).await, runtime);
     assert_eq!(next(&mut resumed).await, latest);
-    let ready = next(&mut resumed).await;
-    assert!(ready.starts_with("event: stream.ready\n"));
     let last = next(&mut resumed).await;
     assert_eq!(data(&last)["revision"], 4);
     assert!(resumed.next().now_or_never().is_none());
@@ -125,8 +132,8 @@ async fn live_flow_updates_coalesce_at_the_tail_without_rewriting_replay() {
 
     publish_flow(&hub, "flow-a", 5);
     let mut replay = subscribe(&hub, all(), Some(cursor(&last)));
-    assert_eq!(data(&next(&mut replay).await)["revision"], 5);
     assert!(next(&mut replay).await.starts_with("event: stream.ready\n"));
+    assert_eq!(data(&next(&mut replay).await)["revision"], 5);
 }
 
 #[tokio::test]
@@ -222,24 +229,17 @@ async fn fresh_checkpoint_after_history_expires_resumes_replay_and_live() {
         let mut immediate = subscribe(&hub, filter.clone(), Some(cursor(&checkpoint)));
         let ready = next(&mut immediate).await;
         assert!(ready.starts_with("event: stream.ready\n"));
-        if kind == StreamKind::Logs {
-            assert_eq!(cursor(&ready), cursor(&checkpoint));
-        }
+        assert_eq!(cursor(&ready), cursor(&checkpoint));
         publish(2);
         assert_eq!(revision(&next(&mut immediate).await), 2);
         drop(immediate);
 
         publish(3);
         let mut replay = subscribe(&hub, filter.clone(), Some(cursor(&checkpoint)));
-        if kind == StreamKind::Logs {
-            assert_eq!(cursor(&next(&mut replay).await), cursor(&checkpoint));
-        }
+        assert_eq!(cursor(&next(&mut replay).await), cursor(&checkpoint));
         assert_eq!(revision(&next(&mut replay).await), 2);
         let last_replayed = next(&mut replay).await;
         assert_eq!(revision(&last_replayed), 3);
-        if kind == StreamKind::Events {
-            assert!(next(&mut replay).await.starts_with("event: stream.ready\n"));
-        }
         publish(4);
         assert_eq!(revision(&next(&mut replay).await), 4);
         drop(replay);
@@ -332,6 +332,11 @@ async fn ready_churn_does_not_evict_event_history() {
     }
     publish_flow(&hub, "flow-a", 2);
     let mut resumed = subscribe(&hub, all(), Some(cursor(&event)));
+    assert!(
+        next(&mut resumed)
+            .await
+            .starts_with("event: stream.ready\n")
+    );
     assert_eq!(data(&next(&mut resumed).await)["revision"], 2);
 }
 
@@ -426,6 +431,11 @@ async fn flow_filter_keeps_global_events_but_excludes_other_flows() {
         .unwrap();
     assert_eq!(data(&live)["dropped_records"], "2");
     let mut resumed = subscribe(&hub, filter, Some(cursor(&ready)));
+    assert!(
+        next(&mut resumed)
+            .await
+            .starts_with("event: stream.ready\n")
+    );
     assert!(
         next(&mut resumed)
             .await

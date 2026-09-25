@@ -149,7 +149,7 @@ async fn next_event(response: &mut Response, pending: &mut String) -> (String, S
 }
 
 #[tokio::test]
-async fn native_events_replay_actual_commits_before_ready_and_reject_changed_filters() {
+async fn native_events_replay_actual_commits_after_ready_and_reject_changed_filters() {
     let app = TestApp::new(|_| {}).await;
     let path = "/api/v1/events?kinds=generation.changed";
     let mut fresh = app
@@ -192,14 +192,13 @@ async fn native_events_replay_actual_commits_before_ready_and_reject_changed_fil
         .await
         .unwrap();
     let mut pending = String::new();
+    let ready = next_event(&mut resumed, &mut pending).await;
+    assert_eq!(ready.0, "stream.ready");
+    assert_eq!(ready.1, cursor);
     let replay = next_event(&mut resumed, &mut pending).await;
     assert_eq!(replay.0, "generation.changed");
     assert_eq!(replay.1, committed_cursor);
     assert_eq!(replay.2, committed);
-    assert_eq!(
-        next_event(&mut resumed, &mut pending).await.0,
-        "stream.ready"
-    );
     drop(resumed);
     error_response(
         app.get("/api/v1/events?kinds=flow.updated")
