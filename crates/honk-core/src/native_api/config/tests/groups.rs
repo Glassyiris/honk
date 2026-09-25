@@ -150,3 +150,54 @@ async fn group_patch_keeps_source_bytes_and_separates_group_revision_from_disk_h
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn group_patch_without_writable_source_is_unsupported() {
+    let fixture = Fixture::new(Access::Metadata, false).await;
+    error(
+        patch(
+            &fixture,
+            &json!({"id":"any-group"}),
+            "revision",
+            &json!([{"op":"replace","path":"/config/tolerance","value":100}]),
+        )
+        .send()
+        .await
+        .unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_patch_in_credential_source_is_unsupported() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
+        files
+            .get_mut("auth.dae")
+            .unwrap()
+            .push_str("group {\n L {\n  policy: selector\n  final: direct\n }\n}\n");
+    })
+    .await;
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let detail = fixture
+        .get(&format!("/api/v1/groups/{}", group["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(detail["capabilities"]["mutable_config"], json!([]));
+    error(
+        patch(
+            &fixture,
+            group,
+            detail["config_revision"].as_str().unwrap(),
+            &json!([{"op":"replace","path":"/config/tolerance","value":100}]),
+        )
+        .send()
+        .await
+        .unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
+    fixture.shutdown().await;
+}

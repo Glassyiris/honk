@@ -147,7 +147,7 @@ Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，
 
 组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数。此接口不改成员列表或 icon。
 
-PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用 M6 源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
+源不可写时 `mutable_config` 为空，PATCH 返回 `404 capability_not_supported`。PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用 M6 源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
 
 ### 原生事件（M4）
 

@@ -651,7 +651,7 @@ impl Worker {
             .get(&patch.name)
             .ok_or_else(not_found)?;
         if !self.service.source_writable(&accepted, index) {
-            return Err(denied());
+            return Err(super::super::groups::read_only());
         }
         let changes = patch.changes()?;
         let content = honk_config::parser::source_edit::edit_group_source(
