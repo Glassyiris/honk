@@ -50,6 +50,7 @@ pub(crate) struct Provider {
     traffic: Option<()>,
     status: &'static str,
     last_error: Option<ProviderError>,
+    download: Option<Value>,
 }
 
 impl std::fmt::Debug for Provider {
@@ -94,6 +95,7 @@ impl Provider {
             traffic: None,
             status: "ok",
             last_error: None,
+            download: None,
         }
     }
 
@@ -126,7 +128,22 @@ impl Provider {
                 ),
                 details: None,
             }),
+            download: None,
         }
+    }
+
+    /// The subscription's download route, `{route, group_id}` as for geodata.
+    fn routed(
+        mut self,
+        subscription: &Subscription,
+        group_id: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        self.download = Some(
+            super::geodata::Route::from_detour(&subscription.download_detour)
+                .unwrap_or_default()
+                .json(group_id),
+        );
+        self
     }
 
     fn mask_listener_secrets(
@@ -299,6 +316,9 @@ pub(super) async fn list(
             .map(|owner| owner.observation(subscription))
             .unwrap_or_default();
         let row = Provider::observed(subscription, load, counts[&subscription.id])
+            .routed(subscription, |name| {
+                super::geodata::group_id(&state.observation.catalog, name)
+            })
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {
@@ -343,6 +363,7 @@ pub(super) async fn detail(
         state.observation.providers.supervisor.read().as_ref(),
         provider_id,
         Some(&state.observation.configuration),
+        |name| super::geodata::group_id(&state.observation.catalog, name),
     )
     .map(|value| Json(value).into_response())
     .ok_or_else(not_found)
@@ -353,6 +374,7 @@ pub(super) fn provider_value(
     supervisor: Option<&SubscriptionSupervisorHandle>,
     provider_id: Uuid,
     sources: Option<&super::config::ConfigService>,
+    group_id: impl Fn(&str) -> Option<String>,
 ) -> Option<Value> {
     let subscription = config.subscriptions.iter().find(|s| s.id == provider_id)?;
     let load = supervisor
@@ -364,7 +386,9 @@ pub(super) fn provider_value(
         .filter(|node| node.subscription_id == Some(provider_id))
         .count();
     serde_json::to_value(
-        Provider::observed(subscription, load, count).mask_listener_secrets(config, sources),
+        Provider::observed(subscription, load, count)
+            .routed(subscription, group_id)
+            .mask_listener_secrets(config, sources),
     )
     .ok()
 }
@@ -433,6 +457,9 @@ pub(super) async fn refresh(
                 .clone()
                 .ok_or_else(not_refreshable)?;
             let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
+                .routed(&subscription, |name| {
+                    super::geodata::group_id(&state.observation.catalog, name)
+                })
                 .mask_listener_secrets(&config, Some(&state.observation.configuration));
             Ok((subscription, supervisor, display))
         }
@@ -446,6 +473,7 @@ pub(super) async fn refresh(
                     instance: state.observation.instance_id.clone(),
                     display_name: display.name,
                     display_url: display.url_redacted.expect("subscription URL is present"),
+                    display_download: display.download,
                 },
             )?,
             Err(error) => {
@@ -463,6 +491,7 @@ pub(crate) struct RefreshOperation {
     pub(crate) instance: String,
     pub(crate) display_name: String,
     pub(crate) display_url: String,
+    pub(crate) display_download: Option<Value>,
 }
 
 impl RefreshOperation {
@@ -490,6 +519,7 @@ impl RefreshOperation {
                         let mut provider = Provider::observed(subscription, load, reply.node_count);
                         provider.name = self.display_name;
                         provider.url_redacted = Some(self.display_url);
+                        provider.download = self.display_download;
                         self.operations
                             .succeed(id, OperationResult::ProviderRefresh(provider));
                     }

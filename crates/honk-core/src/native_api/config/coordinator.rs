@@ -551,6 +551,7 @@ impl Worker {
                 Some(&self.subscriptions),
                 id,
                 Some(&self.service),
+                |name| super::super::geodata::group_id(catalog, name),
             )
         }
         .ok_or_else(|| {
