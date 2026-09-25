@@ -1,5 +1,6 @@
 //! The outbound a control-plane download leaves through, chosen and dialed
-//! the way user traffic is: the external UI archive and geodata updates.
+//! the way user traffic is: the external UI archive, geodata updates and
+//! subscriptions.
 //!
 //! A configured detour forces the node or group it names. Otherwise the
 //! target follows the routing rules: `direct` and `block` are returned for the
@@ -33,6 +34,38 @@ pub(crate) struct Outbounds<'a> {
     pub(crate) group_manager: &'a SharedGroupManager,
     pub(crate) proxy_registry: &'a ProxyRegistry,
     pub(crate) runtime_registry: &'a SharedRuntimeRegistry,
+}
+
+/// The owned handles behind [`Outbounds`], for a download that outlives one borrow.
+#[cfg(feature = "native-api")]
+#[derive(Clone)]
+pub(crate) struct SharedOutbounds {
+    pub(crate) router: std::sync::Arc<RwLock<Router>>,
+    pub(crate) config: std::sync::Arc<RwLock<std::sync::Arc<Config>>>,
+    pub(crate) group_manager: SharedGroupManager,
+    pub(crate) proxy_registry: std::sync::Arc<ProxyRegistry>,
+    pub(crate) runtime_registry: SharedRuntimeRegistry,
+}
+
+#[cfg(feature = "native-api")]
+impl SharedOutbounds {
+    pub(crate) fn outbounds(&self) -> Outbounds<'_> {
+        Outbounds {
+            router: &self.router,
+            config: &self.config,
+            group_manager: &self.group_manager,
+            proxy_registry: &self.proxy_registry,
+            runtime_registry: &self.runtime_registry,
+        }
+    }
+}
+
+/// The chosen outbound has no node that can carry the download, for example
+/// a group whose members a subscription has not delivered yet.
+#[derive(Debug, thiserror::Error)]
+#[error("outbound '{outbound}' has no available node")]
+pub(crate) struct NoUsableNode {
+    pub(crate) outbound: String,
 }
 
 /// Where the download goes.
@@ -170,7 +203,7 @@ impl Outbounds<'_> {
             }
         };
         let Some(node) = node else {
-            anyhow::bail!("{purpose}: outbound '{outbound}' has no available node");
+            return Err(anyhow::Error::new(NoUsableNode { outbound }).context(purpose.to_owned()));
         };
         let route = match node.protocol() {
             NodeProtocol::Direct => Route::Direct { feedback },
@@ -265,4 +298,134 @@ impl Tunnel {
         }
         Ok(())
     }
+}
+
+/// The answer to one GET. `body` is read only for a 2xx status.
+#[cfg(feature = "native-api")]
+pub(crate) struct Reply {
+    pub(crate) status: axum::http::StatusCode,
+    pub(crate) location: Option<String>,
+    pub(crate) body: std::sync::Arc<[u8]>,
+}
+
+/// TLS for https, then one HTTP/1.1 GET of `url` with `headers` added.
+/// Errors name the stage that failed.
+#[cfg(feature = "native-api")]
+pub(crate) async fn get<S>(
+    stream: S,
+    url: &reqwest::Url,
+    headers: &[(&str, &str)],
+    deadline: tokio::time::Instant,
+    max_bytes: usize,
+) -> Result<Reply, &'static str>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::time::timeout_at;
+    if url.scheme() == "https" {
+        let host = url
+            .host_str()
+            .ok_or("invalid_source")?
+            .trim_matches(['[', ']']);
+        let connector = honk_outbound::tls::build_dns_connector(false, b"\x08http/1.1")
+            .map_err(|_| "tls_failed")?;
+        let stream = timeout_at(deadline, connector.connect(host, stream))
+            .await
+            .map_err(|_| "download_timeout")?
+            .map_err(|_| "tls_failed")?;
+        receive(stream, url, headers, deadline, max_bytes).await
+    } else {
+        receive(stream, url, headers, deadline, max_bytes).await
+    }
+}
+
+#[cfg(feature = "native-api")]
+async fn receive<S>(
+    stream: S,
+    url: &reqwest::Url,
+    headers: &[(&str, &str)],
+    deadline: tokio::time::Instant,
+    max_bytes: usize,
+) -> Result<Reply, &'static str>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use axum::body::{Body, HttpBody};
+    use axum::http::{Request, Uri};
+    use tokio::time::timeout_at;
+    let (mut sender, connection) = timeout_at(
+        deadline,
+        hyper::client::conn::http1::Builder::new()
+            .max_headers(64)
+            .max_buf_size(32768)
+            .handshake::<_, Body>(hyper_util::rt::TokioIo::new(stream)),
+    )
+    .await
+    .map_err(|_| "download_timeout")?
+    .map_err(|_| "http_failed")?;
+    let mut drivers = tokio::task::JoinSet::new();
+    drivers.spawn(connection);
+    let result = timeout_at(deadline, async {
+        let uri: Uri = url.as_str().parse().map_err(|_| "invalid_source")?;
+        let mut request = Request::builder()
+            .uri(uri.path_and_query().ok_or("invalid_source")?.clone())
+            .header("host", uri.authority().ok_or("invalid_source")?.as_str())
+            .header("connection", "close")
+            .header("accept-encoding", "identity");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(Body::empty()).map_err(|_| "invalid_source")?;
+        let mut response = sender
+            .send_request(request)
+            .await
+            .map_err(|_| "http_failed")?;
+        let status = response.status();
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if !status.is_success() {
+            return Ok(Reply {
+                status,
+                location,
+                body: std::sync::Arc::from([]),
+            });
+        }
+        if response.headers().contains_key("content-encoding") {
+            return Err("content_encoding_rejected");
+        }
+        if response
+            .body()
+            .size_hint()
+            .upper()
+            .is_some_and(|size| size > max_bytes as u64)
+        {
+            return Err("asset_too_large");
+        }
+        let mut bytes = Vec::new();
+        while let Some(frame) =
+            std::future::poll_fn(|cx| std::pin::Pin::new(response.body_mut()).poll_frame(cx)).await
+        {
+            let frame = frame.map_err(|_| "http_failed")?;
+            if let Ok(data) = frame.into_data() {
+                if data.len() > max_bytes.saturating_sub(bytes.len()) {
+                    return Err("asset_too_large");
+                }
+                bytes.extend_from_slice(&data);
+            }
+        }
+        Ok(Reply {
+            status,
+            location,
+            body: std::sync::Arc::from(bytes),
+        })
+    })
+    .await
+    .unwrap_or(Err("download_timeout"));
+    drop(sender);
+    drivers.abort_all();
+    while drivers.join_next().await.is_some() {}
+    result
 }

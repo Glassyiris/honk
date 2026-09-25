@@ -1,9 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::body::{Body, HttpBody};
 use axum::extract::Request;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -625,7 +623,7 @@ pub(crate) async fn download_direct(
     exchange(stream, &url, deadline, max_bytes).await
 }
 
-/// TLS for https, then one HTTP/1.1 GET.
+/// One GET that only a 200 answers.
 async fn exchange<S>(
     stream: S,
     url: &reqwest::Url,
@@ -635,92 +633,10 @@ async fn exchange<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    if url.scheme() == "https" {
-        let host = url
-            .host_str()
-            .ok_or("invalid_source")?
-            .trim_matches(['[', ']']);
-        let connector = honk_outbound::tls::build_dns_connector(false, b"\x08http/1.1")
-            .map_err(|_| "tls_failed")?;
-        let stream = timeout_at(deadline, connector.connect(host, stream))
-            .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "tls_failed")?;
-        receive(stream, url, deadline, max_bytes).await
-    } else {
-        receive(stream, url, deadline, max_bytes).await
+    let reply = download_route::get(stream, url, &[], deadline, max_bytes).await?;
+    match reply.status {
+        StatusCode::OK => Ok(reply.body),
+        StatusCode::NOT_FOUND => Err("http_not_found"),
+        _ => Err("http_status_rejected"),
     }
-}
-
-async fn receive<S>(
-    stream: S,
-    url: &reqwest::Url,
-    deadline: Instant,
-    max_bytes: usize,
-) -> Result<Arc<[u8]>, &'static str>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, connection) = timeout_at(
-        deadline,
-        hyper::client::conn::http1::Builder::new()
-            .max_headers(64)
-            .max_buf_size(32768)
-            .handshake::<_, Body>(hyper_util::rt::TokioIo::new(stream)),
-    )
-    .await
-    .map_err(|_| "download_timeout")?
-    .map_err(|_| "http_failed")?;
-    let mut drivers = tokio::task::JoinSet::new();
-    drivers.spawn(connection);
-    let result = timeout_at(deadline, async {
-        let uri: Uri = url.as_str().parse().map_err(|_| "invalid_source")?;
-        let request = Request::builder()
-            .uri(uri.path_and_query().ok_or("invalid_source")?.clone())
-            .header("host", uri.authority().ok_or("invalid_source")?.as_str())
-            .header("connection", "close")
-            .header("accept-encoding", "identity")
-            .body(Body::empty())
-            .map_err(|_| "invalid_source")?;
-        let mut response = sender
-            .send_request(request)
-            .await
-            .map_err(|_| "http_failed")?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Err("http_not_found");
-        }
-        if response.status() != StatusCode::OK {
-            return Err("http_status_rejected");
-        }
-        if response.headers().contains_key("content-encoding") {
-            return Err("content_encoding_rejected");
-        }
-        if response
-            .body()
-            .size_hint()
-            .upper()
-            .is_some_and(|size| size > max_bytes as u64)
-        {
-            return Err("asset_too_large");
-        }
-        let mut bytes = Vec::new();
-        while let Some(frame) =
-            std::future::poll_fn(|cx| Pin::new(response.body_mut()).poll_frame(cx)).await
-        {
-            let frame = frame.map_err(|_| "http_failed")?;
-            if let Ok(data) = frame.into_data() {
-                if data.len() > max_bytes.saturating_sub(bytes.len()) {
-                    return Err("asset_too_large");
-                }
-                bytes.extend_from_slice(&data);
-            }
-        }
-        Ok(Arc::from(bytes))
-    })
-    .await
-    .unwrap_or(Err("download_timeout"));
-    drop(sender);
-    drivers.abort_all();
-    while drivers.join_next().await.is_some() {}
-    result
 }
