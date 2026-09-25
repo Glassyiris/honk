@@ -735,3 +735,29 @@ async fn refresh_results_keep_full_urls_except_listener_values() {
     fixture.stop().await;
     origin.stop().await;
 }
+
+#[tokio::test]
+async fn refresh_without_subscription_owner_is_unsupported_not_retryable() {
+    let state = crate::native_api::tests::state().await;
+    let subscription = Subscription {
+        url: "http://127.0.0.1:9/provider".into(),
+        ..Default::default()
+    };
+    Arc::make_mut(&mut *state.config.write().await)
+        .subscriptions
+        .push(subscription.clone());
+    let request = Request::post(format!("/api/v1/providers/{}/refresh", subscription.id))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = refresh(
+        &state,
+        &subscription.id.to_string(),
+        request,
+        &RequestId("test".into()),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.headers().get("retry-after").is_none());
+}

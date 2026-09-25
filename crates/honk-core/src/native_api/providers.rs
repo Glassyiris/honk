@@ -401,7 +401,7 @@ pub(super) async fn refresh(
                 .supervisor
                 .read()
                 .clone()
-                .ok_or_else(unavailable)?;
+                .ok_or_else(not_refreshable)?;
             let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
                 .mask_listener_secrets(&config, Some(&state.observation.configuration));
             Ok((subscription, supervisor, display))
