@@ -302,10 +302,10 @@ fn unavailable(id: &RequestId) -> ApiError {
     .with_retry_after(1)
 }
 
-struct BoundedJson(Vec<u8>);
+struct BoundedJson(Vec<u8>, usize);
 impl Write for BoundedJson {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.0.len().saturating_add(bytes.len()) > MAX_RESPONSE_BYTES {
+        if self.0.len().saturating_add(bytes.len()) > self.1 {
             return Err(io::Error::other("DNS response budget exceeded"));
         }
         self.0.extend_from_slice(bytes);
@@ -316,7 +316,10 @@ impl Write for BoundedJson {
     }
 }
 fn bounded_response(value: &impl Serialize, id: &RequestId) -> Result<Response, ApiError> {
-    let mut writer = BoundedJson(Vec::new());
+    json_response(value, MAX_RESPONSE_BYTES, id)
+}
+fn json_response(value: &impl Serialize, cap: usize, id: &RequestId) -> Result<Response, ApiError> {
+    let mut writer = BoundedJson(Vec::new(), cap);
     serde_json::to_writer(&mut writer, value).map_err(|_| unavailable(id))?;
     Ok((
         [(header::CONTENT_TYPE, "application/json")],

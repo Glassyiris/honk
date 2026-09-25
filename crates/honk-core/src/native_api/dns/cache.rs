@@ -5,8 +5,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, bounded_response, canonical_name,
-    full_detail, invalid_query, parameters, records, timestamp, unavailable,
+    ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, canonical_name, full_detail,
+    invalid_query, json_response, parameters, records, timestamp, unavailable,
 };
 use crate::dns::cache::{CacheUsage, ExactCacheEntry};
 
@@ -99,7 +99,7 @@ pub(super) async fn serve(
         if position == 0 || position >= snapshot.entries.len() {
             return Err(invalid_query(id));
         }
-        return page(snapshot, position, limit, id);
+        return page(snapshot, position, limit, id).map(|(response, _)| response);
     }
     if snapshots.len() == 8 {
         return Err(unavailable(id));
@@ -156,8 +156,8 @@ pub(super) async fn serve(
         bytes,
         wall,
     };
-    let response = page(&snapshot, 0, limit, id)?;
-    if snapshot.entries.len() > limit {
+    let (response, more) = page(&snapshot, 0, limit, id)?;
+    if more {
         snapshots.push_back(snapshot);
     }
     Ok(response)
@@ -176,16 +176,17 @@ fn at(snapshot: &Snapshot, instant: Instant) -> String {
     timestamp(wall.unwrap_or(snapshot.wall))
 }
 
+/// Returns the page and whether it ends before the snapshot does.
 fn page(
     snapshot: &Snapshot,
     offset: usize,
     limit: usize,
     id: &RequestId,
-) -> Result<Response, ApiError> {
-    let end = offset.saturating_add(limit).min(snapshot.entries.len());
+) -> Result<(Response, bool), ApiError> {
+    let mut end = offset.saturating_add(limit).min(snapshot.entries.len());
     let mut budget = MAX_RESPONSE_BYTES.saturating_sub(1024);
     let mut rows = Vec::with_capacity(end - offset);
-    for entry in &snapshot.entries[offset..end] {
+    for (position, entry) in snapshot.entries[offset..end].iter().enumerate() {
         let question = records::question(entry.key.wire_identity(), entry.key.ingress())
             .map_err(|_| unavailable(id))?;
         let metadata_cost = entry
@@ -193,9 +194,15 @@ fn page(
             .len()
             .saturating_add(question.name.len())
             .saturating_add(512);
-        budget = budget
-            .checked_sub(metadata_cost)
-            .ok_or_else(|| unavailable(id))?;
+        let first = rows.is_empty();
+        match budget.checked_sub(metadata_cost) {
+            Some(rest) => budget = rest,
+            None if first => budget = 0,
+            None => {
+                end = offset + position;
+                break;
+            }
+        }
         let status = if let Some(rcode) = entry.negative {
             match rcode {
                 0 => "NODATA".to_owned(),
@@ -221,13 +228,19 @@ fn page(
             let answers = if let Some(response) =
                 entry.response.as_ref().filter(|_| entry.negative.is_none())
             {
-                records::project(
+                let Some(answers) = records::page_row(
                     entry.key.wire_identity(),
                     response,
                     entry.key.ingress(),
                     &mut budget,
+                    first,
                 )
                 .map_err(|_| unavailable(id))?
+                else {
+                    end = offset + position;
+                    break;
+                };
+                answers
             } else {
                 Vec::new()
             };
@@ -235,12 +248,21 @@ fn page(
         }
         rows.push(row);
     }
-    let cursor = (end < snapshot.entries.len()).then(|| format!("{}:{end}", snapshot.id));
+    let more = end < snapshot.entries.len();
+    let cursor = more.then(|| format!("{}:{end}", snapshot.id));
     let usage = &snapshot.usage;
-    bounded_response(
+    // A single entry is served whole; see `records::page_row`.
+    let cap = if rows.len() > 1 {
+        MAX_RESPONSE_BYTES
+    } else {
+        usize::MAX
+    };
+    let response = json_response(
         &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"negative":true,"persistent":false},
         "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor,
         "usage":{"entries":usage.entries.to_string(),"entry_capacity":usage.entry_capacity.to_string()}}),
+        cap,
         id,
-    )
+    )?;
+    Ok((response, more))
 }
