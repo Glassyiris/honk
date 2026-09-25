@@ -50,6 +50,37 @@ pub(crate) fn strip_tree(
     Ok((overlay, forbidden))
 }
 
+/// Fresh parses generate identities and timestamps that are not declared source values.
+pub(crate) fn stripped_config_matches(original: &Config, stripped: &mut Config) -> bool {
+    stripped
+        .experimental
+        .native_api
+        .secret
+        .clone_from(&original.experimental.native_api.secret);
+    stripped
+        .experimental
+        .clash_api
+        .secret
+        .clone_from(&original.experimental.clash_api.secret);
+    for (node, original) in stripped.nodes.iter_mut().zip(&original.nodes) {
+        node.created_at = original.created_at;
+        node.updated_at = original.updated_at;
+    }
+    for (group, original) in stripped.groups.iter_mut().zip(&original.groups) {
+        group.id = original.id;
+        group.created_at = original.created_at;
+    }
+    for (subscription, original) in stripped
+        .subscriptions
+        .iter_mut()
+        .zip(&original.subscriptions)
+    {
+        subscription.id = original.id;
+        subscription.created_at = original.created_at;
+    }
+    stripped == original
+}
+
 impl DatabaseStartup {
     /// `entry` must be absolute and lexically normal; it is read only while the db is empty.
     pub(crate) fn open(
@@ -105,10 +136,8 @@ impl DatabaseStartup {
             native_api: config.experimental.native_api.secret.clone(),
             clash_api: config.experimental.clash_api.secret.clone(),
         };
-        loaded.config.experimental.native_api.secret = secrets.native_api.clone();
-        loaded.config.experimental.clash_api.secret = secrets.clash_api.clone();
         ensure!(
-            loaded.config == config
+            stripped_config_matches(&config, &mut loaded.config)
                 && loaded.sources.len() == originals.len()
                 && loaded
                     .sources

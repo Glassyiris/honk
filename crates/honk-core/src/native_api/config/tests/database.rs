@@ -186,6 +186,27 @@ async fn file_mode_has_export_but_no_import_or_revisions() {
 }
 
 #[tokio::test]
+async fn import_preserves_subscription_declarations() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let edited = format!(
+        "{}\nsubscription {{ feed: 'http://127.0.0.1:9/feed' }}\n",
+        fixture.originals["main.dae"]
+    );
+    std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();
+    let terminal = operation(
+        &fixture,
+        "/api/v1/config/import",
+        "subscription-import",
+        json!({"replace":true}),
+    )
+    .await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(fixture.database.as_ref().unwrap().head(), Ok(Some(2)));
+    source(&fixture.get(CONFIG).await, &edited);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn import_export_and_activate_record_revisions() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());

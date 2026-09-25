@@ -50,6 +50,73 @@ fn import_strips_secrets_and_a_later_start_reads_only_the_head() {
 }
 
 #[test]
+fn import_preserves_declared_nodes_groups_and_subscriptions() {
+    let state = tempfile::tempdir().unwrap();
+    let data_dir = state.path().canonicalize().unwrap();
+    let (directory, entry) = tree(&data_dir);
+    let mut content = fs::read_to_string(&entry).unwrap();
+    content.push_str(
+        "\nnode { edge: 'socks5://127.0.0.1:1080' }\n\
+         subscription { feed: 'http://127.0.0.1:9/feed' }\n\
+         group { proxy { filter: name(edge)\n policy: select } }\n",
+    );
+    fs::write(&entry, &content).unwrap();
+    let mut startup = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+    startup.record().unwrap();
+    drop(startup);
+    drop(directory);
+
+    let reopened = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+    let edge = reopened
+        .config
+        .nodes
+        .iter()
+        .find(|node| node.name == "edge")
+        .unwrap();
+    assert_eq!(edge.address, "127.0.0.1:1080");
+    assert_eq!(reopened.config.groups[0].name, "proxy");
+    assert_eq!(reopened.config.groups[0].nodes, vec![edge.id]);
+    assert_eq!(reopened.config.subscriptions[0].name, "feed");
+    assert_eq!(
+        reopened.config.subscriptions[0].url,
+        "http://127.0.0.1:9/feed"
+    );
+    assert_eq!(
+        reopened.config.experimental.native_api.secret,
+        "startup-token"
+    );
+    assert!(
+        reopened
+            .sources
+            .sources
+            .iter()
+            .all(|source| !source.content.contains("startup-token"))
+    );
+}
+
+#[test]
+fn stripped_roundtrip_keeps_declared_values_and_derived_node_identity() {
+    let text = "node { edge: 'socks5://127.0.0.1:1080' }\n\
+                subscription { feed: 'http://127.0.0.1:9/feed' }\n\
+                group { proxy { filter: name(edge)\n policy: select } }\n";
+    let original = honk_config::parser::parse_dae_config(text).unwrap();
+    let mut reparsed = honk_config::parser::parse_dae_config(text).unwrap();
+    assert!(stripped_config_matches(&original, &mut reparsed));
+
+    let mut changed = reparsed.clone();
+    changed.nodes[0].address = "127.0.0.1:1081".into();
+    assert!(!stripped_config_matches(&original, &mut changed));
+    let mut changed = reparsed.clone();
+    changed.nodes[0].id = uuid::Uuid::new_v4();
+    assert!(!stripped_config_matches(&original, &mut changed));
+    let mut changed = reparsed.clone();
+    changed.groups[0].name = "different".into();
+    assert!(!stripped_config_matches(&original, &mut changed));
+    reparsed.subscriptions[0].url = "http://127.0.0.1:9/changed".into();
+    assert!(!stripped_config_matches(&original, &mut reparsed));
+}
+
+#[test]
 fn data_dir_mismatch_refuses_startup() {
     let state = tempfile::tempdir().unwrap();
     let data_dir = state.path().canonicalize().unwrap();

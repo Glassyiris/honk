@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::native_api::store::db::Origin;
-use crate::native_api::store::startup::strip_tree;
+use crate::native_api::store::startup::{strip_tree, stripped_config_matches};
 
 impl Worker {
     /// Reads the `-c` tree, strips its listener secrets and validates it as the next revision.
@@ -29,10 +29,7 @@ impl Worker {
                 let mut loaded =
                     Config::from_dae_sources_in_memory(entry, &overlay, limits(), &mut Vec::new())
                         .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
-                let original = &originals.config.experimental;
-                loaded.config.experimental.native_api.secret = original.native_api.secret.clone();
-                loaded.config.experimental.clash_api.secret = original.clash_api.secret.clone();
-                if loaded.config != originals.config {
+                if !stripped_config_matches(&originals.config, &mut loaded.config) {
                     return Err(management::unsupported_value());
                 }
                 Ok(loaded)
