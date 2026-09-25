@@ -500,9 +500,9 @@ impl EventHub {
             })?;
         let stamp =
             u64::try_from(now.duration_since(self.started).as_nanos()).map_err(|_| expired(id))?;
-        let ready_id = match (self.kind, cursor) {
-            (StreamKind::Logs, Some(cursor)) => cursor.to_owned(),
-            _ => encode_cursor(
+        let ready_id = match cursor {
+            Some(cursor) => cursor.to_owned(),
+            None => encode_cursor(
                 &state.signer,
                 cutoff | CHECKPOINT_BIT,
                 stamp,
@@ -634,9 +634,7 @@ impl Stream for Subscription {
                 "event subscription ended",
             ))));
         }
-        if this.hub.kind == StreamKind::Logs
-            && let Some(ready) = this.ready.take()
-        {
+        if let Some(ready) = this.ready.take() {
             return Poll::Ready(Some(Ok(ready)));
         }
         if let Some((after, cutoff)) = this.replay {
@@ -653,9 +651,6 @@ impl Stream for Subscription {
                 return Poll::Ready(Some(Ok(record_frame(&state.signer, record, filter))));
             }
             this.replay = None;
-        }
-        if let Some(ready) = this.ready.take() {
-            return Poll::Ready(Some(Ok(ready)));
         }
         let subscriber = state.subscribers[this.slot]
             .as_mut()
