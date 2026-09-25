@@ -55,6 +55,7 @@ pub(crate) fn same_subscription_source_spec(left: &Subscription, right: &Subscri
         && left.headers == right.headers
         && left.enabled == right.enabled
         && left.cache == right.cache
+        && left.download_detour == right.download_detour
 }
 
 pub(crate) fn same_subscription_worker_set(left: &[Subscription], right: &[Subscription]) -> bool {
@@ -470,7 +471,7 @@ impl SupervisorState {
             }
             Some(Err(error)) => {
                 warn!(%error, "Subscription refresh failed; keeping active nodes");
-                self.finish(id, Err("fetch_failed"));
+                self.finish(id, Err(super::failure_code(&error)));
             }
             None => self.finish(id, Err("supervisor_paused")),
         }
@@ -950,6 +951,16 @@ impl SubscriptionSupervisor {
             task: None,
         })
     }
+    /// Routed fetches wait for this, so it hands over routing before `start`.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn route_through(&self, routing: crate::download_route::SharedOutbounds) {
+        self.prepared
+            .as_ref()
+            .expect("subscription supervisor already started")
+            .manager
+            .route_through(routing);
+    }
+
     pub(crate) fn take_startup_diagnostics(&mut self) -> DiagnosticBuckets {
         self.startup_diagnostics
             .take()

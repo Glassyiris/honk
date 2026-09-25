@@ -329,6 +329,7 @@ async fn c20_startup_post_prepare_admits_reserved_provider_name() {
     let subscription = Subscription {
         name: "provider".into(),
         url: format!("http://{}/subscription", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         ..Default::default()
     };
     let server = tokio::spawn(async move {

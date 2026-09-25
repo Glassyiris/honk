@@ -401,6 +401,7 @@ async fn subscription_redirects_retain_same_origin_auth_and_strip_it_permanently
     });
     let sub = Subscription {
         url: format!("http://us%40er:p%3Ass@{address}/start"),
+        download_detour: "direct".into(),
         ..Default::default()
     };
     let nodes = tokio::time::timeout(
@@ -447,7 +448,7 @@ async fn configured_subscription_user_agent_reaches_fetch_request() {
             .unwrap();
     });
     let config = honk_config::parser::parse_dae_config(&format!(
-            "subscription {{\nprovider: {{\nurl: 'http://{address}/sub'\nua: 'provider/2.0'\ninterval: 0\n}}\n}}"
+            "subscription {{\nprovider: {{\nurl: 'http://{address}/sub'\nua: 'provider/2.0'\ninterval: 0\ndownload_detour: direct\n}}\n}}"
         ))
         .unwrap();
 
@@ -575,6 +576,7 @@ async fn fetch_error_chain_redacts_subscription_url() {
     let subscription = Subscription {
         name: "provider".into(),
         url: format!("http://{address}/{SENTINEL}?token={SENTINEL}"),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
 
@@ -618,6 +620,7 @@ async fn subscription_store_recovers_last_valid_fetch() {
     let mut sub = Subscription {
         name: "provider".into(),
         url: format!("http://{address}/subscription"),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
     let key = SubscriptionStore::key(&sub);
@@ -647,6 +650,7 @@ async fn c19_store_acceptance_is_independent_of_runtime_publication() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sub = Subscription {
         url: format!("http://{}/sub", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
     let server = tokio::spawn(async move {
@@ -721,6 +725,7 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sub = Subscription {
         url: format!("http://{}/sub", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
     let server = tokio::spawn(async move {

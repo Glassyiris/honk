@@ -230,6 +230,13 @@ impl Fixture {
         );
         let service = Arc::clone(&state.observation.configuration);
         let commands = control_plane.command_sender();
+        subscriptions.route_through(crate::download_route::SharedOutbounds {
+            router: control_plane.traffic_router(),
+            config: control_plane.config_handle(),
+            group_manager: control_plane.group_manager(),
+            proxy_registry: control_plane.proxy_registry(),
+            runtime_registry: control_plane.runtime_registry(),
+        });
         subscriptions.start(commands.clone());
         state.observation.providers.attach(subscriptions.handle());
         control_plane.attach_subscriptions(subscriptions.handle());

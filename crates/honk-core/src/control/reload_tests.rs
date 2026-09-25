@@ -1507,6 +1507,7 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
         id: subscription_id,
         name: "committed".into(),
         url: format!("http://{address}"),
+        download_detour: "direct".into(),
         update_interval: 0,
         ..Default::default()
     };

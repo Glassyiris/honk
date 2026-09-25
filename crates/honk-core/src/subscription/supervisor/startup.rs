@@ -64,6 +64,21 @@ impl SupervisorState {
             }
         }
 
+        // Routing starts after this, so routed first fetches stay queued for
+        // it and do not hold startup; direct ones get the grace period.
+        let (direct, routed): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|id| {
+                super::super::route::direct(&self.providers[id].authorized.subscription)
+            });
+        self.pending = direct;
+        requires_network.retain(|id| !routed.contains(id));
+        if !routed.is_empty() {
+            info!(
+                pending = routed.len(),
+                "Subscriptions fetched through routing wait for it to start"
+            );
+        }
         let startup_limit = if config.experimental.native_api.enabled {
             MAX_ACTIVE_FETCHES
         } else {
@@ -104,7 +119,7 @@ impl SupervisorState {
                                 self.observations.write().get_mut(&subscription.id).unwrap().load = ProviderLoad { updated_at: Some(SystemTime::now()), cached: false, error: None };
                             }
                             Some(Err(error)) => {
-                                self.observations.write().get_mut(&subscription.id).unwrap().load.error = Some("fetch_failed");
+                                self.observations.write().get_mut(&subscription.id).unwrap().load.error = Some(super::super::failure_code(&error));
                                 warn!(subscription = %subscription.name, %error, "Failed to fetch subscription");
                             }
                             None => {}
@@ -131,6 +146,7 @@ impl SupervisorState {
                 }
             }
         }
+        self.pending.extend(routed);
         if !self.fetches.is_empty() {
             info!(
                 pending = self.fetches.len(),

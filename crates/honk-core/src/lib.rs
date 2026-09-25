@@ -1816,6 +1816,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
+    #[cfg(feature = "native-api")]
+    subscription_supervisor.route_through(download_route::SharedOutbounds {
+        router: control_plane.traffic_router(),
+        config: control_plane.config_handle(),
+        group_manager: control_plane.group_manager(),
+        proxy_registry: control_plane.proxy_registry(),
+        runtime_registry: control_plane.runtime_registry(),
+    });
     subscription_supervisor.start(cmd_tx.clone());
     #[cfg(feature = "native-api")]
     control_plane.attach_subscriptions(subscription_supervisor.handle());

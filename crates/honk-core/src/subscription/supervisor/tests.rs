@@ -8,6 +8,7 @@ fn authorized(id: uuid::Uuid, revision: u64, url: String) -> AuthorizedSubscript
             id,
             name: "provider".into(),
             url,
+            download_detour: "direct".into(),
             update_interval: 0,
             ..Default::default()
         },

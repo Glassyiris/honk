@@ -18,6 +18,7 @@ mod json;
 #[cfg(feature = "native-api")]
 mod network;
 mod records;
+mod route;
 mod store;
 mod supervisor;
 
@@ -27,6 +28,7 @@ pub use store::SubscriptionStore;
 pub(crate) use store::same_subscription_fetch_identity;
 pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies};
 
+pub(crate) use route::failure_code;
 #[cfg(feature = "native-api")]
 pub(crate) use supervisor::ProviderLoad;
 pub(crate) use supervisor::SubscriptionMergeReply;
@@ -439,12 +441,15 @@ enum SubscriptionHttp {
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
     http: SubscriptionHttp,
+    /// Set once routing is up; routed fetches fail until then.
+    routing: std::sync::OnceLock<route::Routing>,
 }
 
 impl SubscriptionManager {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             http: SubscriptionHttp::Shared(subscription_client()?),
+            routing: std::sync::OnceLock::new(),
         })
     }
 
@@ -454,7 +459,14 @@ impl SubscriptionManager {
         network.ready().await?;
         Ok(Self {
             http: SubscriptionHttp::Owned(network),
+            routing: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Hands routed fetches the outbounds user traffic uses.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn route_through(&self, routing: route::Routing) {
+        let _ = self.routing.set(routing);
     }
 
     async fn pause_network(&self) -> anyhow::Result<()> {
@@ -509,10 +521,14 @@ impl SubscriptionManager {
         sub: &Subscription,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<(Vec<Node>, String)> {
-        let body = match &self.http {
-            SubscriptionHttp::Shared(client) => fetch_body(client, sub).await?,
-            #[cfg(feature = "native-api")]
-            SubscriptionHttp::Owned(network) => network.fetch(sub).await?,
+        let body = if route::direct(sub) {
+            match &self.http {
+                SubscriptionHttp::Shared(client) => fetch_body(client, sub).await?,
+                #[cfg(feature = "native-api")]
+                SubscriptionHttp::Owned(network) => network.fetch(sub).await?,
+            }
+        } else {
+            route::fetch(sub, self.routing.get()).await?
         };
         let content = finish_attempt(
             String::from_utf8(body).map_err(|_| {

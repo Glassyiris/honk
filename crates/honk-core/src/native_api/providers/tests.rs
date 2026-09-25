@@ -68,6 +68,7 @@ impl Origin {
                 self.address
             ),
             update_interval: 0,
+            download_detour: "direct".into(),
             headers: vec![honk_config::subscription::SubscriptionHeader {
                 key: "Authorization".into(),
                 value: "Bearer private-origin-token".into(),

@@ -71,6 +71,16 @@ struct ProviderError {
     details: Option<Value>,
 }
 
+/// The message for a failure code that says more than the generic one.
+fn error_message(code: &str) -> Option<&'static str> {
+    match code {
+        "route_unavailable" => Some(
+            "The subscription's download route has no usable node yet, so it cannot carry the download. Set download_detour to direct for this subscription.",
+        ),
+        _ => None,
+    }
+}
+
 impl Provider {
     fn inline(node_count: usize) -> Self {
         Self {
@@ -111,7 +121,9 @@ impl Provider {
             },
             last_error: load.error.map(|code| ProviderError {
                 code,
-                message: "Provider loading or runtime publication did not complete successfully.",
+                message: error_message(code).unwrap_or(
+                    "Provider loading or runtime publication did not complete successfully.",
+                ),
                 details: None,
             }),
         }
@@ -493,7 +505,8 @@ impl RefreshOperation {
                 self.operations.fail(
                     id,
                     code,
-                    "Provider refresh did not complete successfully.",
+                    error_message(code)
+                        .unwrap_or("Provider refresh did not complete successfully."),
                     None,
                 );
             }
