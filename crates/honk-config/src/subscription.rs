@@ -24,6 +24,10 @@ pub struct Subscription {
     /// Keep the fetched body for offline startup; only with `global.store_subscribe`.
     #[serde(default = "crate::types::default_true")]
     pub cache: bool,
+    /// How the fetch leaves: empty or `routing` follows the routing rules,
+    /// `direct` goes straight to the host, anything else names a group.
+    #[serde(default)]
+    pub download_detour: String,
     /// Last update time
     #[serde(default)]
     pub last_updated: Option<DateTime<Utc>>,
@@ -51,6 +55,7 @@ impl Default for Subscription {
             headers: Vec::new(),
             enabled: true,
             cache: true,
+            download_detour: String::new(),
             last_updated: None,
             node_count: 0,
             created_at: Utc::now(),
