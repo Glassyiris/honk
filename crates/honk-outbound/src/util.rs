@@ -167,7 +167,9 @@ pub async fn connect_marked(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    let resolution = crate::bootstrap::resolve(host);
+    // Boxed: marked hosts/nameserver resolution and its lookup observation are
+    // several KiB, and every dial wrapper above this one would embed them.
+    let resolution = Box::pin(crate::bootstrap::resolve(host));
     #[cfg(feature = "native-api")]
     let (resolution, selection) =
         crate::runtime::flow_observation::observe_resolution(resolution).await;
