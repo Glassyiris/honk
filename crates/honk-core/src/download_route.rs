@@ -305,7 +305,8 @@ impl Tunnel {
 #[cfg(feature = "native-api")]
 pub(crate) struct Reply {
     pub(crate) status: axum::http::StatusCode,
-    pub(crate) location: Option<String>,
+    /// Unchecked, so a caller that follows it can reject one that is not text.
+    pub(crate) location: Option<http::HeaderValue>,
     pub(crate) body: std::sync::Arc<[u8]>,
 }
 
@@ -394,11 +395,7 @@ where
             .await
             .map_err(|_| "http_failed")?;
         let status = response.status();
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        let location = response.headers().get("location").cloned();
         if status.is_client_error()
             || status.is_server_error()
             || (location.is_some() && crate::marked_http::followed_redirect(status))

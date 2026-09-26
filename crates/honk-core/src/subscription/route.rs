@@ -101,7 +101,7 @@ mod routed {
                 && let Some(location) = reply.location
             {
                 redirects += 1;
-                let mut next = url.join(&location)?;
+                let mut next = url.join(location.to_str()?)?;
                 strip_userinfo(&mut next);
                 anyhow::ensure!(
                     redirects <= super::super::MAX_SUBSCRIPTION_REDIRECTS,

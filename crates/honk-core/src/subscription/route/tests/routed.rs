@@ -26,7 +26,9 @@ type Heads = Arc<parking_lot::Mutex<Vec<String>>>;
 
 /// Answers each request with `respond(path)`, and keeps each request head,
 /// lowercased.
-async fn serve(respond: impl Fn(&str) -> String + Send + 'static) -> (SocketAddr, Heads) {
+async fn serve<R: Into<Vec<u8>>>(
+    respond: impl Fn(&str) -> R + Send + 'static,
+) -> (SocketAddr, Heads) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -39,9 +41,9 @@ async fn serve(respond: impl Fn(&str) -> String + Send + 'static) -> (SocketAddr
                 head.push(stream.read_u8().await.unwrap());
             }
             let head = String::from_utf8_lossy(&head).to_lowercase();
-            let response = respond(head.split(' ').nth(1).unwrap_or_default());
+            let response: Vec<u8> = respond(head.split(' ').nth(1).unwrap_or_default()).into();
             seen.lock().push(head);
-            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&response).await.unwrap();
             let _ = stream.shutdown().await;
         }
     });
@@ -494,4 +496,30 @@ async fn only_followed_redirects_are_followed_and_other_3xx_bodies_are_taken() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("404"), "{error}");
+}
+
+/// A followed redirect whose Location is not text fails on both paths; its
+/// body is never taken.
+#[tokio::test]
+async fn a_followed_redirect_with_a_location_that_is_not_text_fails() {
+    let (address, _) = serve(|_| {
+        let mut response = b"HTTP/1.1 302 Found\r\nLocation: /n\xffxt\r\n".to_vec();
+        response.extend_from_slice(
+            format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                BODY.len()
+            )
+            .as_bytes(),
+        );
+        response
+    })
+    .await;
+    let (routing, _) = routing("direct");
+    let routed = manager(routing).fetch(&subscription(address, "")).await;
+    assert!(routed.is_err(), "routed fetch took the redirect body");
+    let direct = SubscriptionManager::new()
+        .unwrap()
+        .fetch(&subscription(address, "direct"))
+        .await;
+    assert!(direct.is_err(), "direct fetch took the redirect body");
 }
