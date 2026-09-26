@@ -41,6 +41,7 @@ impl SupervisorState {
                         updated_at: Some(SystemTime::now()),
                         cached: true,
                         error: None,
+                        rejection: None,
                     };
                 }
                 Ok(None) => {
@@ -116,7 +117,7 @@ impl SupervisorState {
                                     node.subscription_id != Some(subscription.id)
                                 });
                                 config.nodes.extend(nodes);
-                                self.observations.write().get_mut(&subscription.id).unwrap().load = ProviderLoad { updated_at: Some(SystemTime::now()), cached: false, error: None };
+                                self.observations.write().get_mut(&subscription.id).unwrap().load = ProviderLoad { updated_at: Some(SystemTime::now()), cached: false, error: None, rejection: None };
                             }
                             Some(Err(error)) => {
                                 self.observations.write().get_mut(&subscription.id).unwrap().load.error = Some(super::super::failure_code(&error));

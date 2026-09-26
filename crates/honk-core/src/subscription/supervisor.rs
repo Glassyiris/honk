@@ -20,6 +20,8 @@ pub(crate) struct SubscriptionMergeReply {
     pub(crate) outcome: ReloadOutcome,
     pub(crate) node_count: usize,
     pub(crate) authorized: Vec<AuthorizedSubscription>,
+    /// The configuration diagnostic code that rejected the publication.
+    pub(crate) rejection: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -27,6 +29,8 @@ pub(crate) struct ProviderLoad {
     pub(crate) updated_at: Option<SystemTime>,
     pub(crate) cached: bool,
     pub(crate) error: Option<&'static str>,
+    /// The configuration diagnostic code behind a `publication_rejected` error.
+    pub(crate) rejection: Option<&'static str>,
 }
 
 struct ObservedProvider {
@@ -405,6 +409,7 @@ impl SupervisorState {
                 observed.load.error =
                     matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
                         .then_some("publication_degraded");
+                observed.load.rejection = None;
                 observed.load
             }
             (Err("supervisor_stopped"), Some(observed)) => observed.load,
@@ -416,6 +421,7 @@ impl SupervisorState {
                         .copied()
                         .unwrap_or("publication_rejected"),
                 );
+                observed.load.rejection = result.as_ref().ok().and_then(|reply| reply.rejection);
                 observed.load
             }
             (Ok(reply), None) if reply.outcome.accepted() => ProviderLoad {
@@ -423,6 +429,7 @@ impl SupervisorState {
                 cached: false,
                 error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
                     .then_some("publication_degraded"),
+                rejection: None,
             },
             _ => ProviderLoad::default(),
         };

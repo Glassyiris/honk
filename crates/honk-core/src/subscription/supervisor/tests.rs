@@ -95,6 +95,7 @@ async fn replacement_during_fetch_keeps_original_revision_until_publication_fenc
             outcome: ReloadOutcome::Rejected,
             node_count: 0,
             authorized: vec![state.providers[&id].authorized.clone()],
+            rejection: None,
         })
         .unwrap();
     let (id, reply) = state.publications.join_next().await.unwrap().unwrap();
@@ -148,6 +149,7 @@ async fn shutdown_waits_for_admitted_merge_acknowledgement() {
             outcome: ReloadOutcome::Committed { generation: 2 },
             node_count: 1,
             authorized: vec![subscription.clone()],
+            rejection: None,
         })
         .unwrap();
     let state = shutdown.await.unwrap();
@@ -267,6 +269,7 @@ async fn shutdown_joins_fetches_and_keeps_the_accepted_load() {
         updated_at: Some(accepted_at),
         cached: true,
         error: Some("cache_load_failed"),
+        rejection: None,
     };
     state.start_pending(MAX_ACTIVE_FETCHES);
     let mut sockets = Vec::new();
@@ -660,6 +663,7 @@ async fn deferred_provider_survives_same_revision_reconcile_until_replaced() {
             outcome: ReloadOutcome::Committed { generation: 2 },
             node_count: nodes.len(),
             authorized: vec![provider.clone()],
+            rejection: None,
         })
         .unwrap();
     supervisor.shutdown().await.unwrap();

@@ -82,6 +82,11 @@ fn error_message(code: &str) -> Option<&'static str> {
     }
 }
 
+/// Names the configuration diagnostic that rejected a publication.
+fn rejection_details(rejection: Option<&'static str>) -> Option<Value> {
+    rejection.map(|code| json!({"diagnostic_code": code}))
+}
+
 impl Provider {
     fn inline(node_count: usize) -> Self {
         Self {
@@ -126,7 +131,7 @@ impl Provider {
                 message: error_message(code).unwrap_or(
                     "Provider loading or runtime publication did not complete successfully.",
                 ),
-                details: None,
+                details: rejection_details(load.rejection),
             }),
             download: None,
         }
@@ -527,7 +532,7 @@ impl RefreshOperation {
                         self.operations.fail(id, "publication_degraded", "Provider nodes were committed but the runtime is degraded.", Some(json!({"committed": true, "active_generation_id": format!("{}:{generation}", self.instance), "datapath_generation_id": generation.to_string()})));
                     }
                     ReloadOutcome::Rejected => {
-                        self.operations.fail(id, "publication_rejected", "Provider runtime publication was rejected; active nodes were retained.", None);
+                        self.operations.fail(id, "publication_rejected", "Provider runtime publication was rejected; active nodes were retained.", rejection_details(reply.rejection));
                     }
                 }
             }
