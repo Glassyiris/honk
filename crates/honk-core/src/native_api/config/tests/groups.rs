@@ -57,7 +57,7 @@ async fn group_patch_keeps_source_bytes_and_separates_group_revision_from_disk_h
     .await;
     assert_eq!(disk(fixture.directory.path()), original);
     let unsupported =
-        json!([{"op":"replace","path":"/config/check_url","value":"https://127.0.0.1/"}]);
+        json!([{"op":"replace","path":"/config/check_url","value":"ftp://127.0.0.1/"}]);
     error(
         patch(&fixture, group, revision, &unsupported)
             .send()
@@ -199,5 +199,72 @@ async fn group_patch_in_credential_source_is_unsupported() {
         "capability_not_supported",
     )
     .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_patch_check_url_rewrites_the_source_and_reregisters_the_probe() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let source_text = "# Explicitly writable include.\ngroup {\n G {\n  policy: fallback\n  check_url: 'http://old.test/' # replaced\n }\n}\n";
+    std::fs::write(fixture.path("editable.dae"), source_text).unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let path = format!("/api/v1/groups/{}", group["id"].as_str().unwrap());
+    let detail = fixture.get(&path).await;
+    assert!(
+        detail["capabilities"]["mutable_config"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("check_url"))
+    );
+    assert_eq!(detail["config"]["check_url"], "http://old.test/");
+    let revision = detail["config_revision"].as_str().unwrap();
+    let invalid =
+        json!([{"op":"replace","path":"/config/check_url","value":"https://user@new.test/"}]);
+    error(
+        patch(&fixture, group, revision, &invalid)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    // PATCH writes the normalized form, so the source, GET, `test` and the probe agree.
+    let mut previous = "http://old.test/";
+    for (url, written) in [
+        ("http://example.test", "http://example.test/"),
+        ("https://example.test/p#frag", "https://example.test/p"),
+        ("http://Example.Test:80/x", "http://example.test/x"),
+    ] {
+        let revision = fixture.get(&path).await["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let body = json!([
+            {"op":"test","path":"/config/check_url","value":previous},
+            {"op":"replace","path":"/config/check_url","value":url}
+        ]);
+        let operation = accepted(
+            patch(&fixture, group, &revision, &body)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path("editable.dae")).unwrap(),
+            source_text.replace("http://old.test/", written)
+        );
+        assert_eq!(fixture.get(&path).await["config"]["check_url"], written);
+        let state = fixture.state.upgrade().unwrap();
+        assert_eq!(
+            state.alive_set.group_check_urls(),
+            vec![("G".to_owned(), written.to_owned())]
+        );
+        previous = url;
+    }
     fixture.shutdown().await;
 }

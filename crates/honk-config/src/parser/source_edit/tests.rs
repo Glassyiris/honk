@@ -420,6 +420,58 @@ fn exact_group_edit_preserves_crlf_comments_includes_and_last_winners() {
 }
 
 #[test]
+fn group_check_url_edits_add_replace_and_remove_quoted_values() {
+    let parse = |text: &str| {
+        parse_dae_sources(
+            &[(PathBuf::from("main.dae"), Arc::from(text))],
+            SourceLimits::default(),
+            &mut Vec::new(),
+        )
+        .unwrap()
+    };
+    let check_url = |text: &str| {
+        crate::parser::parse_dae_config(text).unwrap().groups[0]
+            .check_url
+            .clone()
+    };
+    let url = "https://example.test/generate_204?a=1#x";
+    let empty = "group {\n  G {\n    policy: urltest\n  }\n}\n";
+    let added = edit_group_source(
+        &parse(empty).sources[0],
+        "G",
+        &[(GroupField::CheckUrl, Some(url.into()))],
+    )
+    .unwrap();
+    assert_eq!(
+        added,
+        empty.replace("  }\n}", &format!("      check_url: '{url}'\n  }}\n}}"))
+    );
+    assert_eq!(check_url(&added).as_deref(), Some(url));
+    let quoted =
+        "group {\n  G {\n    policy: urltest\n    check_url: \"http://old.test/\" # kept\n  }\n}\n";
+    let apostrophe = "http://example.test/it's";
+    let replaced = edit_group_source(
+        &parse(quoted).sources[0],
+        "G",
+        &[(GroupField::CheckUrl, Some(apostrophe.into()))],
+    )
+    .unwrap();
+    assert_eq!(replaced, quoted.replace("http://old.test/", apostrophe));
+    assert_eq!(check_url(&replaced).as_deref(), Some(apostrophe));
+    let removed = edit_group_source(
+        &parse(quoted).sources[0],
+        "G",
+        &[(GroupField::CheckUrl, None)],
+    )
+    .unwrap();
+    assert_eq!(
+        removed,
+        quoted.replace("check_url: \"http://old.test/\"", "")
+    );
+    assert_eq!(check_url(&removed), None);
+}
+
+#[test]
 fn group_scalars_keep_inheritance_and_icons_keep_exact_values() {
     for icon in [
         "https://example.test/icon.svg?q=%2F",
