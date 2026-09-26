@@ -541,3 +541,23 @@ async fn an_identity_content_encoding_is_accepted() {
         assert_eq!(result.is_ok(), accepted, "{encoding}: {result:?}");
     }
 }
+
+/// The configured User-Agent goes out whether the rules pick a group or
+/// direct.
+#[tokio::test]
+async fn the_configured_user_agent_is_sent_on_every_route() {
+    for (rules, dialed) in [("proxy", 1), ("direct", 0)] {
+        let (address, requests) = server().await;
+        let (routing, dials) = routing(rules);
+        let mut sub = subscription(address, "");
+        sub.user_agent = Some("Clash-Verge/2.0".into());
+        manager(routing).fetch(&sub).await.unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), dialed, "{rules}");
+        let head = &requests.lock()[0];
+        assert_eq!(head.matches("user-agent:").count(), 1, "{rules}: {head}");
+        assert!(
+            head.contains("user-agent: clash-verge/2.0\r\n"),
+            "{rules}: {head}"
+        );
+    }
+}
