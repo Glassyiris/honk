@@ -15,6 +15,9 @@ use uuid::Uuid;
 
 use super::{ApiError, ErrorCode, NativeState, config, parse_query, types::RequestId};
 
+/// One year, the contract's ceiling for `update_interval`.
+const MAX_UPDATE_INTERVAL: u64 = 365 * 24 * 60 * 60;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NodeCreate {
@@ -28,6 +31,19 @@ pub(super) struct ProviderCreate {
     pub(super) name: String,
     pub(super) kind: String,
     pub(super) url: String,
+    pub(super) update_interval: Option<u64>,
+    pub(super) user_agent: Option<String>,
+    pub(super) cache: Option<bool>,
+}
+
+impl ProviderCreate {
+    pub(super) fn options(&self) -> honk_config::parser::source_edit::SubscriptionOptions<'_> {
+        honk_config::parser::source_edit::SubscriptionOptions {
+            update_interval: self.update_interval,
+            user_agent: self.user_agent.as_deref(),
+            cache: self.cache,
+        }
+    }
 }
 
 pub(super) enum Action {
@@ -180,6 +196,14 @@ pub(super) async fn mutate(
                     || reqwest::Url::parse(&input.url)
                         .ok()
                         .is_none_or(|url| url.host_str().is_none())
+                    || input
+                        .update_interval
+                        .is_some_and(|seconds| seconds > MAX_UPDATE_INTERVAL)
+                    || input.user_agent.as_ref().is_some_and(|agent| {
+                        !(1..=256).contains(&agent.len())
+                            || !agent.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                    })
+                    || (input.cache.is_some() && !state.observation.providers.caches())
                 {
                     return Err(unsupported_value());
                 }

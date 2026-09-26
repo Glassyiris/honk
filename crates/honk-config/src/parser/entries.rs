@@ -293,6 +293,7 @@ struct SubscriptionFields<'d, 'a> {
     url: Option<Text<'d, 'a>>,
     user_agent: Option<Text<'d, 'a>>,
     interval: Option<Text<'d, 'a>>,
+    cache: Option<Text<'d, 'a>>,
 }
 
 fn collect_subscription_fields<'d, 'a>(
@@ -316,6 +317,7 @@ fn collect_subscription_fields<'d, 'a>(
                 "url" => fields.url = Some(value),
                 "ua" => fields.user_agent = Some(value),
                 "interval" => fields.interval = Some(value),
+                "cache" => fields.cache = Some(value),
                 _ if super::read::block_header(&child).is_none() => key.notice(
                     diagnostics,
                     Severity::Warning,
@@ -364,6 +366,19 @@ fn parse_subscription_block<'d, 'a>(
                 setting: format!("subscription.{}.interval", subscription.name),
                 value: value.to_owned(),
                 message: "duration is unsupported by honk; using fallback 0s".to_string(),
+            },
+        );
+    }
+    if let Some(cache) = fields.cache {
+        let value = cache.raw();
+        subscription.cache = super::lenient(
+            super::scalars::strict_bool(value),
+            true,
+            diagnostics,
+            || ConfigDiagnostic {
+                setting: format!("subscription.{}.cache", subscription.name),
+                value: value.to_owned(),
+                message: "value is not a boolean; using fallback true".to_string(),
             },
         );
     }

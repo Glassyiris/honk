@@ -1254,6 +1254,7 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                         "user_agent",
                         "headers",
                         "enabled",
+                        "cache",
                         "last_updated",
                         "node_count",
                         "created_at",

@@ -346,7 +346,8 @@ impl reqwest::dns::Resolve for BootstrapDnsResolve {
 }
 
 const SUBSCRIPTION_STORE_DIR: &str = ".sub";
-const DEFAULT_SUBSCRIPTION_USER_AGENT: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));
+pub(crate) const DEFAULT_SUBSCRIPTION_USER_AGENT: &str =
+    concat!("honk/", env!("CARGO_PKG_VERSION"));
 
 fn effective_subscription_user_agent(sub: &Subscription) -> &str {
     sub.user_agent

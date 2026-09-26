@@ -806,3 +806,72 @@ async fn db_store_degraded_management_reports_recorded_write() {
     assert_eq!(fixture.database.as_ref().unwrap().head(), Ok(Some(2)));
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn managed_provider_options_are_advertised_validated_and_written() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    // The fixture turns store_subscribe off, so cache is not offered.
+    assert_eq!(
+        capabilities["resources"]["providers"]["create_options"],
+        json!({"update_interval": 86400, "user_agent": format!("honk/{}", env!("CARGO_PKG_VERSION"))})
+    );
+    for invalid in [
+        json!({"update_interval": 31_536_001}),
+        json!({"update_interval": -1}),
+        json!({"user_agent": ""}),
+        json!({"user_agent": "agent\r\nX-Injected: 1"}),
+        json!({"user_agent": "é"}),
+        json!({"user_agent": "a".repeat(257)}),
+        json!({"cache": false}),
+    ] {
+        let mut input =
+            json!({"name":"optioned","kind":"subscription","url":"https://example.test/sub"});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        let response = fixture
+            .request(Method::POST, PROVIDERS)
+            .json(&input)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST
+            ),
+            "{invalid} was accepted"
+        );
+    }
+    assert!(
+        !std::fs::read_to_string(fixture.path("main.dae"))
+            .unwrap()
+            .contains("optioned")
+    );
+    created(
+        fixture
+            .request(Method::POST, PROVIDERS)
+            .json(&json!({
+                "name": "optioned",
+                "kind": "subscription",
+                "url": "https://example.test/sub",
+                "update_interval": 3600,
+                "user_agent": "clash.meta"
+            }))
+            .send()
+            .await
+            .unwrap(),
+        "providers",
+    )
+    .await;
+    let main = std::fs::read_to_string(fixture.path("main.dae")).unwrap();
+    assert!(
+        main.contains(
+            "    optioned: {\n        url: 'https://example.test/sub'\n        ua: 'clash.meta'\n        interval: '3600s'\n    }\n"
+        ),
+        "{main}"
+    );
+    fixture.shutdown().await;
+}
