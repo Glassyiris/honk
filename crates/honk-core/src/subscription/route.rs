@@ -87,88 +87,40 @@ mod routed {
             )
         })?;
         let deadline = Instant::now() + TIMEOUT;
-        let mut origin = reqwest::Url::parse(&subscription.url)?;
-        let basic = basic_auth(&origin);
-        strip_userinfo(&mut origin);
-        let mut headers = vec![(
-            "user-agent",
-            super::super::effective_subscription_user_agent(subscription),
-        )];
-        headers.extend(basic.as_deref().map(|value| ("authorization", value)));
-        headers.extend(
-            subscription
-                .headers
-                .iter()
-                .map(|header| (header.key.as_str(), header.value.as_str())),
-        );
-        let mut url = origin.clone();
+        let mut url = reqwest::Url::parse(&subscription.url)?;
+        let mut headers = super::super::subscription_request_headers(subscription)?;
+        // Userinfo becomes Basic auth unless a configured Authorization wins.
+        crate::marked_http::normalize_url(&mut url, &mut headers)?;
+        let origin = url.clone();
         let mut redirects = 0;
         loop {
             let reply = get(subscription, routing, &url, &headers, deadline).await?;
-            if reply.status.is_success() {
-                return Ok(reply.body.to_vec());
-            }
-            // The redirects reqwest follows. Every request here is a bodiless
-            // GET, so 303 and 301/302 need no method change.
-            let Some(location) = reply
-                .location
-                .filter(|_| matches!(reply.status.as_u16(), 301 | 302 | 303 | 307 | 308))
-            else {
-                anyhow::bail!("subscription server answered HTTP {}", reply.status);
-            };
-            redirects += 1;
-            let mut next = url.join(&location)?;
-            strip_userinfo(&mut next);
-            anyhow::ensure!(
-                redirects <= super::super::MAX_SUBSCRIPTION_REDIRECTS,
-                "subscription redirected too many times"
-            );
-            if let Some(reason) = super::super::subscription_redirect_error(&origin, &next) {
-                anyhow::bail!(reason);
-            }
-            if next.scheme() != url.scheme()
-                || next.host_str() != url.host_str()
-                || next.port_or_known_default() != url.port_or_known_default()
+            // The direct fetch's rules: follow a redirect status that names
+            // a Location, fail on 4xx and 5xx, and take any other body.
+            if crate::marked_http::followed_redirect(reply.status)
+                && let Some(location) = reply.location
             {
-                headers.retain(|(name, _)| !sensitive(name));
+                redirects += 1;
+                let mut next = url.join(&location)?;
+                strip_userinfo(&mut next);
+                anyhow::ensure!(
+                    redirects <= super::super::MAX_SUBSCRIPTION_REDIRECTS,
+                    "subscription redirected too many times"
+                );
+                if let Some(reason) = super::super::subscription_redirect_error(&origin, &next) {
+                    anyhow::bail!(reason);
+                }
+                super::super::follow_subscription_redirect(&url, &next, &mut headers);
+                url = next;
+                continue;
             }
-            url = next;
+            anyhow::ensure!(
+                !reply.status.is_client_error() && !reply.status.is_server_error(),
+                "subscription server answered HTTP {}",
+                reply.status
+            );
+            return Ok(reply.body.to_vec());
         }
-    }
-
-    /// Credentials reqwest also drops when a redirect leaves the origin.
-    fn sensitive(name: &str) -> bool {
-        [
-            "authorization",
-            "cookie",
-            "cookie2",
-            "proxy-authorization",
-            "www-authenticate",
-        ]
-        .iter()
-        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
-    }
-
-    /// Basic credentials from the URL's userinfo, as reqwest sends them.
-    fn basic_auth(url: &reqwest::Url) -> Option<String> {
-        use base64::Engine as _;
-        if url.username().is_empty() && url.password().is_none() {
-            return None;
-        }
-        let decode = |part: &str| {
-            percent_encoding::percent_decode_str(part)
-                .decode_utf8_lossy()
-                .into_owned()
-        };
-        let credentials = format!(
-            "{}:{}",
-            decode(url.username()),
-            url.password().map(decode).unwrap_or_default()
-        );
-        Some(format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(credentials)
-        ))
     }
 
     fn strip_userinfo(url: &mut reqwest::Url) {
@@ -180,7 +132,7 @@ mod routed {
         subscription: &Subscription,
         routing: &Routing,
         url: &reqwest::Url,
-        headers: &[(&str, &str)],
+        headers: &http::HeaderMap,
         deadline: Instant,
     ) -> anyhow::Result<Reply> {
         let host = url

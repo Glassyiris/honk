@@ -377,16 +377,121 @@ async fn a_redirect_within_the_origin_keeps_credentials() {
     );
 }
 
+/// A configured Host names the first authority, so a hop to another origin
+/// drops it and the request names the new one.
 #[tokio::test]
-async fn only_the_redirects_reqwest_follows_are_followed() {
-    for status in ["300 Multiple Choices", "304 Not Modified"] {
-        let (address, requests) = serve(move |_| redirect(status, "/next")).await;
+async fn a_redirect_to_another_origin_drops_a_configured_host() {
+    let (target, target_requests) = server().await;
+    let location = format!("http://{target}/sub");
+    let (origin, origin_requests) = serve(move |_| redirect("302 Found", &location)).await;
+    let mut sub = subscription(origin, "");
+    sub.headers.push(SubscriptionHeader {
+        key: "Host".into(),
+        value: "subscription.example".into(),
+    });
+    let (routing, _) = routing("direct");
+    manager(routing).fetch(&sub).await.unwrap();
+    let first = &origin_requests.lock()[0];
+    assert!(first.contains("host: subscription.example\r\n"), "{first}");
+    let second = &target_requests.lock()[0];
+    assert!(second.contains(&format!("host: {target}\r\n")), "{second}");
+    assert!(!second.contains("subscription.example"), "{second}");
+}
+
+/// Each followed hop names the previous URL as Referer, without its userinfo
+/// or fragment.
+#[tokio::test]
+async fn each_followed_redirect_sends_the_previous_url_as_referer() {
+    let (address, requests) = serve(|path| match path {
+        "/sub" => redirect("302 Found", "/next#part"),
+        "/next" => redirect("307 Temporary Redirect", "/last"),
+        _ => ok(),
+    })
+    .await;
+    let (routing, _) = routing("direct");
+    manager(routing)
+        .fetch(&credentialed(address))
+        .await
+        .unwrap();
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].contains("referer"), "{}", requests[0]);
+    for (head, previous) in requests[1..].iter().zip(["/sub", "/next"]) {
+        assert!(
+            head.contains(&format!("referer: http://{address}{previous}\r\n")),
+            "{head}"
+        );
+    }
+}
+
+/// The Referer rule is the direct fetch's, so an https page never names
+/// itself to a plaintext hop.
+#[test]
+fn a_redirect_from_https_to_http_sends_no_referer() {
+    use crate::subscription::follow_subscription_redirect;
+    let referer = |previous: &str, next: &str| {
+        let mut headers = http::HeaderMap::new();
+        follow_subscription_redirect(
+            &previous.parse().unwrap(),
+            &next.parse().unwrap(),
+            &mut headers,
+        );
+        headers.get(http::header::REFERER).cloned()
+    };
+    assert_eq!(
+        referer("https://a.example/sub", "http://a.example/next"),
+        None
+    );
+    assert_eq!(
+        referer("https://u:p@a.example/sub#part", "https://b.example/next").unwrap(),
+        "https://a.example/sub"
+    );
+}
+
+/// A configured Authorization wins over the URL's userinfo; only one is sent.
+#[tokio::test]
+async fn a_configured_authorization_wins_over_userinfo() {
+    let (address, requests) = server().await;
+    let mut sub = credentialed(address);
+    sub.headers.push(SubscriptionHeader {
+        key: "Authorization".into(),
+        value: "Bearer configured".into(),
+    });
+    let (routing, _) = routing("direct");
+    manager(routing).fetch(&sub).await.unwrap();
+    let head = &requests.lock()[0];
+    assert_eq!(head.matches("authorization:").count(), 1, "{head}");
+    assert!(head.contains("authorization: bearer configured"), "{head}");
+}
+
+/// As on the direct fetch, only a redirect status with a Location is
+/// followed, only 4xx and 5xx fail, and any other answer's body is taken.
+#[tokio::test]
+async fn only_followed_redirects_are_followed_and_other_3xx_bodies_are_taken() {
+    for (status, location) in [
+        ("300 Multiple Choices", "Location: /next\r\n"),
+        ("302 Found", ""),
+    ] {
+        let (address, requests) = serve(move |_| {
+            format!(
+                "HTTP/1.1 {status}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                BODY.len()
+            )
+        })
+        .await;
         let (routing, _) = routing("direct");
-        let error = manager(routing)
+        let nodes = manager(routing)
             .fetch(&subscription(address, ""))
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains(&status[..3]), "{error}");
+            .unwrap();
+        assert_eq!(nodes.len(), 1, "{status}");
         assert_eq!(requests.lock().len(), 1, "{status} is not followed");
     }
+    let (address, _) = serve(|_| redirect("404 Not Found", "/next")).await;
+    let (routing, _) = routing("direct");
+    let error = manager(routing)
+        .fetch(&subscription(address, ""))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("404"), "{error}");
 }

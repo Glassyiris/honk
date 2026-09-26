@@ -300,7 +300,8 @@ impl Tunnel {
     }
 }
 
-/// The answer to one GET. `body` is read only for a 2xx status.
+/// The answer to one GET. `body` is left unread for a 4xx or 5xx status and
+/// for a redirect the caller follows.
 #[cfg(feature = "native-api")]
 pub(crate) struct Reply {
     pub(crate) status: axum::http::StatusCode,
@@ -314,7 +315,7 @@ pub(crate) struct Reply {
 pub(crate) async fn get<S>(
     stream: S,
     url: &reqwest::Url,
-    headers: &[(&str, &str)],
+    headers: &http::HeaderMap,
     deadline: tokio::time::Instant,
     max_bytes: usize,
 ) -> Result<Reply, &'static str>
@@ -343,7 +344,7 @@ where
 async fn receive<S>(
     stream: S,
     url: &reqwest::Url,
-    headers: &[(&str, &str)],
+    headers: &http::HeaderMap,
     deadline: tokio::time::Instant,
     max_bytes: usize,
 ) -> Result<Reply, &'static str>
@@ -380,15 +381,12 @@ where
             ("connection", "close"),
             ("accept-encoding", "identity"),
         ] {
-            if !headers
-                .iter()
-                .any(|(given, _)| given.eq_ignore_ascii_case(name))
-            {
+            if !headers.contains_key(name) {
                 request = request.header(name, value);
             }
         }
         for (name, value) in headers {
-            request = request.header(*name, *value);
+            request = request.header(name, value);
         }
         let request = request.body(Body::empty()).map_err(|_| "invalid_source")?;
         let mut response = sender
@@ -401,7 +399,10 @@ where
             .get("location")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        if !status.is_success() {
+        if status.is_client_error()
+            || status.is_server_error()
+            || (location.is_some() && crate::marked_http::followed_redirect(status))
+        {
             return Ok(Reply {
                 status,
                 location,

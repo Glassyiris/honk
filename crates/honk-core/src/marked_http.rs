@@ -195,6 +195,12 @@ impl Client {
     }
 }
 
+/// The redirect statuses a caller follows when they carry a Location. Every
+/// request here is a bodiless GET, so 303 and 301/302 need no method change.
+pub(crate) fn followed_redirect(status: http::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
 /// Move initial URL credentials into headers before a caller follows redirects.
 pub(crate) fn normalize_url(
     url: &mut reqwest::Url,

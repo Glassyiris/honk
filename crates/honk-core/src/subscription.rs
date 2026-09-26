@@ -311,6 +311,43 @@ fn subscription_redirect_error(
     }
 }
 
+/// Carries the request headers over a followed redirect, on the direct and
+/// the routed fetch alike. Leaving the previous origin drops credentials and
+/// a configured Host; the previous URL becomes the Referer unless the hop
+/// goes from https to http.
+fn follow_subscription_redirect(
+    previous: &reqwest::Url,
+    next: &reqwest::Url,
+    headers: &mut http::HeaderMap,
+) {
+    use http::header;
+
+    if previous.host_str() != next.host_str()
+        || previous.port_or_known_default() != next.port_or_known_default()
+        || previous.scheme() != next.scheme()
+    {
+        for name in [
+            header::AUTHORIZATION,
+            header::COOKIE,
+            header::HeaderName::from_static("cookie2"),
+            header::WWW_AUTHENTICATE,
+            header::PROXY_AUTHORIZATION,
+            header::HOST,
+        ] {
+            headers.remove(name);
+        }
+    }
+    if previous.scheme() != "https" || next.scheme() == "https" {
+        let mut referer = previous.clone();
+        let _ = referer.set_username("");
+        let _ = referer.set_password(None);
+        referer.set_fragment(None);
+        if let Ok(value) = header::HeaderValue::from_str(referer.as_str()) {
+            headers.insert(header::REFERER, value);
+        }
+    }
+}
+
 const SUBSCRIPTION_STORE_DIR: &str = ".sub";
 pub(crate) const DEFAULT_SUBSCRIPTION_USER_AGENT: &str =
     concat!("honk/", env!("CARGO_PKG_VERSION"));
@@ -347,6 +384,16 @@ async fn fetch_body(
     sub: &Subscription,
 ) -> anyhow::Result<Vec<u8>> {
     let url = reqwest::Url::parse(&sub.url)?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fetch_url_body(client, url, subscription_request_headers(sub)?),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("subscription HTTP request timed out"))?
+}
+
+/// The User-Agent and configured headers every subscription request sends.
+fn subscription_request_headers(sub: &Subscription) -> anyhow::Result<http::HeaderMap> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::USER_AGENT,
@@ -358,12 +405,7 @@ async fn fetch_body(
             header.value.parse()?,
         );
     }
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        fetch_url_body(client, url, headers),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("subscription HTTP request timed out"))?
+    Ok(headers)
 }
 
 /// Redirects are followed here, not by the client, so each hop is checked
@@ -381,7 +423,7 @@ async fn fetch_url_body(
         let response = client
             .get(&url, &headers, std::time::Duration::from_secs(30))
             .await?;
-        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+        if crate::marked_http::followed_redirect(response.status())
             && let Some(location) = response.headers().get(header::LOCATION)
         {
             anyhow::ensure!(
@@ -395,31 +437,8 @@ async fn fetch_url_body(
             if let Some(reason) = subscription_redirect_error(&origin, &next) {
                 anyhow::bail!(reason);
             }
-            let previous = std::mem::replace(&mut url, next);
-            if previous.host_str() != url.host_str()
-                || previous.port_or_known_default() != url.port_or_known_default()
-                || previous.scheme() != url.scheme()
-            {
-                for name in [
-                    header::AUTHORIZATION,
-                    header::COOKIE,
-                    header::HeaderName::from_static("cookie2"),
-                    header::WWW_AUTHENTICATE,
-                    header::PROXY_AUTHORIZATION,
-                    header::HOST,
-                ] {
-                    headers.remove(name);
-                }
-            }
-            if previous.scheme() != "https" || url.scheme() == "https" {
-                let mut referer = previous;
-                let _ = referer.set_username("");
-                let _ = referer.set_password(None);
-                referer.set_fragment(None);
-                if let Ok(value) = header::HeaderValue::from_str(referer.as_str()) {
-                    headers.insert(header::REFERER, value);
-                }
-            }
+            follow_subscription_redirect(&url, &next, &mut headers);
+            url = next;
             continue;
         }
         return read_capped_body(

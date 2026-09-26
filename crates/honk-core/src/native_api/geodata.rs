@@ -633,7 +633,8 @@ async fn exchange<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let reply = download_route::get(stream, url, &[], deadline, max_bytes).await?;
+    let reply =
+        download_route::get(stream, url, &http::HeaderMap::new(), deadline, max_bytes).await?;
     match reply.status {
         StatusCode::OK => Ok(reply.body),
         StatusCode::NOT_FOUND => Err("http_not_found"),
