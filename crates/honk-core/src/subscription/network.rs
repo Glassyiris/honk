@@ -22,7 +22,7 @@ struct NetworkThread {
 
 impl NetworkThread {
     fn start(
-        build_client: impl FnOnce() -> anyhow::Result<reqwest::Client> + Send + 'static,
+        build_client: impl FnOnce() -> anyhow::Result<crate::marked_http::Client> + Send + 'static,
     ) -> anyhow::Result<Self> {
         let (requests, receiver) = mpsc::channel(MAX_REQUESTS);
         let (stop, stopped) = watch::channel(false);
@@ -34,8 +34,8 @@ impl NetworkThread {
                     .enable_all()
                     .build()
                     .map_err(|_| "subscription network runtime creation failed")?;
-                // Default runtime drop cancels reqwest's hidden async drivers and waits for
-                // started blocking NSS jobs; timeout/background shutdown would detach them.
+                // Default runtime drop cancels the HTTP client's spawned connection tasks and
+                // waits for started blocking jobs; timeout/background shutdown would detach them.
                 runtime.block_on(async move {
                     let client =
                         build_client().map_err(|_| "subscription HTTP client creation failed")?;
@@ -98,7 +98,7 @@ impl SubscriptionNetwork {
     }
 
     fn with_client(
-        build_client: impl FnOnce() -> anyhow::Result<reqwest::Client> + Send + 'static,
+        build_client: impl FnOnce() -> anyhow::Result<crate::marked_http::Client> + Send + 'static,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             state: Mutex::new(State {
@@ -216,10 +216,12 @@ impl SubscriptionNetwork {
 }
 
 async fn run(
-    client: reqwest::Client,
+    client: crate::marked_http::Client,
     mut requests: mpsc::Receiver<Request>,
     mut stop: watch::Receiver<bool>,
 ) -> ThreadResult {
+    // One marked client serves every in-flight request task.
+    let client = std::sync::Arc::new(client);
     let mut active = JoinSet::new();
     let mut result = Ok(());
     loop {

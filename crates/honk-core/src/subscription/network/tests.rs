@@ -1,5 +1,4 @@
 use super::*;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -111,26 +110,6 @@ struct BlockingResolver {
     finished: AtomicBool,
 }
 
-struct Resolver(Arc<BlockingResolver>);
-
-impl reqwest::dns::Resolve for Resolver {
-    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let state = Arc::clone(&self.0);
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                state.entered.lock().take().unwrap().send(()).unwrap();
-                state.released.lock().recv().unwrap();
-                let addresses = ("localhost", 0).to_socket_addrs();
-                state.finished.store(true, Ordering::Release);
-                addresses.map(|addresses| Box::new(addresses) as reqwest::dns::Addrs)
-            })
-            .await
-            .unwrap()
-            .map_err(Into::into)
-        })
-    }
-}
-
 async fn held_resolver() -> (
     Arc<SubscriptionNetwork>,
     Arc<BlockingResolver>,
@@ -147,10 +126,14 @@ async fn held_resolver() -> (
     let owned = Arc::clone(&resolver);
     let network = Arc::new(
         SubscriptionNetwork::with_client(move || {
-            Ok(reqwest::Client::builder()
-                .no_proxy()
-                .dns_resolver(Arc::new(Resolver(owned)))
-                .build()?)
+            // The marked client resolves without a hook, so hold a started
+            // blocking job on the network runtime directly.
+            tokio::task::spawn_blocking(move || {
+                owned.entered.lock().take().unwrap().send(()).unwrap();
+                owned.released.lock().recv().unwrap();
+                owned.finished.store(true, Ordering::Release);
+            });
+            crate::marked_http::Client::new()
         })
         .unwrap(),
     );

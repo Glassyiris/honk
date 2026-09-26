@@ -116,20 +116,22 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
         (category.len() >> 7) as u8,
     ];
     geoip.extend(category);
-    let router = Router::new_with_geo_sources(
-        &[RoutingRule {
-            condition: RoutingCondition {
-                geo_ip: vec!["test".into()],
-                port: vec!["443".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("direct".into()),
-            name: String::new(),
-            priority: 0,
-            must: false,
-            mark: 0,
-        }],
-        "block",
+    let mut routing = honk_config::routing::RoutingConfig::default();
+    routing.default_outbound = "block".into();
+    routing.rules = vec![RoutingRule {
+        condition: RoutingCondition {
+            geo_ip: vec!["test".into()],
+            port: vec!["443".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        name: String::new(),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::from_config_with_geo_sources(
+        &routing,
         &GeoSourceSet::from_bytes(Vec::new(), geoip),
     )
     .unwrap();
@@ -145,7 +147,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
         dscp: None,
     };
     let observed = router.route_full_observed(&connection, None, MAX_RULE_VALUES);
-    assert_eq!(observed.matched.unwrap().outbound_name, "direct");
+    assert_eq!(observed.matched.unwrap().action.outbound, "direct");
     let rules =
         super::super::routing::observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(rules[0].conditions[0].expression, "dip(geoip: test)");

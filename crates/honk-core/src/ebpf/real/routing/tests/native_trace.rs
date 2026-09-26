@@ -12,14 +12,8 @@ use honk_ebpf_common::{
 
 fn compile(source: &str) -> (Router, RoutingPushPlan) {
     let config = honk_config::parser::parse_dae_config(source).unwrap();
-    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
-    let mut plan = RoutingPushPlan::compile(
-        &router,
-        &outbound_ids(),
-        &config.routing.default_outbound,
-        DialMode::Domain,
-    )
-    .unwrap();
+    let router = Router::from_config(&config.routing).unwrap();
+    let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Domain).unwrap();
     plan.enable_trace(true);
     (router, plan)
 }
@@ -335,7 +329,7 @@ fn capture_preserves_every_golden_decision_before_and_after_dns_override() {
         DialMode::DomainPlus,
         DialMode::DomainPlusPlus,
     ] {
-        let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), "direct", mode).unwrap();
+        let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), mode).unwrap();
         for capture in [false, true] {
             plan.enable_trace(capture);
             backend.publish_routing_plan(&plan, &[]).unwrap();

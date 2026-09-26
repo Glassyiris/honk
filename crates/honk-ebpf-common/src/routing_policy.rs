@@ -63,6 +63,8 @@ pub struct RoutingDecision {
     pub must: u32,
     pub domain_final: u32,
     pub rule_id: u32,
+    /// Index in the generation's canonical table, meaningful for marked direct.
+    pub direct_mark_index: u32,
 }
 
 impl Default for RoutingDecision {
@@ -73,6 +75,7 @@ impl Default for RoutingDecision {
             must: 0,
             domain_final: 0,
             rule_id: u32::MAX,
+            direct_mark_index: u32::MAX,
         }
     }
 }
@@ -170,30 +173,30 @@ pub struct RoutingPolicyDescriptor {
 }
 
 const _: () = assert!(core::mem::size_of::<RoutingInput>() == 128);
-const _: () = assert!(core::mem::size_of::<RoutingDecision>() == 20);
+const _: () = assert!(core::mem::size_of::<RoutingDecision>() == 24);
 const _: () = assert!(core::mem::size_of::<RoutingPolicyDescriptor>() == 24);
-const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 288);
+const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 304);
 const _: () = assert!(core::mem::align_of::<RoutingTestResult>() == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, status) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, decision) == 4);
-const _: () = assert!(core::mem::offset_of!(RoutingTestResult, trace) == 24);
-const _: () = assert!(core::mem::size_of::<KernelRouteOutput>() == 264);
+const _: () = assert!(core::mem::offset_of!(RoutingTestResult, trace) == 32);
+const _: () = assert!(core::mem::size_of::<KernelRouteOutput>() == 272);
 const _: () = assert!(core::mem::align_of::<KernelRouteOutput>() == 8);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, decision) == 0);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, flags) == 20);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, generation) == 24);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, policy_id) == 32);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, fact_state) == 36);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, input) == 40);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, domain_bitmap) == 168);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, outcomes) == 200);
-const _: () = assert!(core::mem::size_of::<KernelRouteWitness>() == 320);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, flags) == 24);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, generation) == 32);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, policy_id) == 40);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, fact_state) == 44);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, input) == 48);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, domain_bitmap) == 176);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, outcomes) == 208);
+const _: () = assert!(core::mem::size_of::<KernelRouteWitness>() == 328);
 const _: () = assert!(core::mem::align_of::<KernelRouteWitness>() == 8);
 const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, output) == 0);
-const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, tuple) == 264);
-const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, decision_token) == 304);
-const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, capture_id) == 308);
-const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, observed_ns) == 312);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, tuple) == 272);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, decision_token) == 312);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, capture_id) == 316);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, observed_ns) == 320);
 const _: () = assert!(core::mem::align_of::<RoutingInput>() == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, src_ip) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, dst_ip) == 16);
@@ -213,6 +216,7 @@ const _: () = assert!(core::mem::offset_of!(RoutingDecision, mark) == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, must) == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, domain_final) == 12);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, rule_id) == 16);
+const _: () = assert!(core::mem::offset_of!(RoutingDecision, direct_mark_index) == 20);
 const _: () = assert!(core::mem::align_of::<RoutingPolicyDescriptor>() == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, slot) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, features) == 4);

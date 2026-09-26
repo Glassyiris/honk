@@ -1,3 +1,4 @@
+use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::{HashMap, HashSet};
 
@@ -523,12 +524,29 @@ impl ControlPlaneHandle {
         }
     }
 
+    /// Clash mode override (approximate clash semantics), applied after the
+    /// eBPF handoff / userspace Router produced an outbound and before
+    /// `resolve_outbound_nodes`:
+    ///
+    /// - mode `Direct` forces `direct`;
+    /// - mode `Global` forces the current GLOBAL selection (a group or node
+    ///   name, resolved via the normal path; when it resolves to nothing the
+    ///   original routing result is kept);
+    /// - `block` results and `must` results (dae `(must)` rules / eBPF
+    ///   handoff must flag) are never overridden — both are final routing
+    ///   decisions that mode switches must not bypass.
+    ///
+    /// The route's rule mark survives only on a routed `direct` flow that
+    /// remains `direct`.
+    pub(super) async fn apply_mode_override(&self, route: &mut RoutingDecision) -> ModeDecision {
+        let decision = self.mode_override(route.outbound.clone(), route.must).await;
+        let replacement = (decision.name != route.outbound).then(|| decision.name.clone());
+        route.apply_final_outbound(replacement);
+        decision
+    }
+
     /// Preserve exact native target identity until the selected generation is pinned.
-    pub(super) async fn apply_mode_override(
-        &self,
-        outbound_name: String,
-        must: bool,
-    ) -> ModeDecision {
+    async fn mode_override(&self, outbound_name: String, must: bool) -> ModeDecision {
         let mut result = ModeDecision {
             name: outbound_name,
             constraint: Default::default(),

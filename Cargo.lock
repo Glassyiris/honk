@@ -1534,6 +1534,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "rustls-pemfile",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "serde_yaml",

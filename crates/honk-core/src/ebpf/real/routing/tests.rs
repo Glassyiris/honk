@@ -86,6 +86,7 @@ fn decision(
         must: must as u32,
         domain_final,
         rule_id,
+        direct_mark_index: u32::MAX,
     }
 }
 
@@ -209,8 +210,7 @@ fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
         ),
     ];
     let router = Router::new(&rules, "direct").unwrap();
-    let plan =
-        RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Domain).unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Domain).unwrap();
     let mut a = golden::connection();
     a.domain = Some("a.test".into());
     a.dst_ip = "192.0.2.10".parse().unwrap();
@@ -269,8 +269,7 @@ fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
     ];
     let changed_router = Router::new(&changed_rules, "direct").unwrap();
     let changed =
-        RoutingPushPlan::compile(&changed_router, &outbound_ids(), "direct", DialMode::Domain)
-            .unwrap();
+        RoutingPushPlan::compile(&changed_router, &outbound_ids(), DialMode::Domain).unwrap();
     backend.publish_routing_plan(&changed, &[]).unwrap();
     assert_route(
         &mut backend,
@@ -339,7 +338,7 @@ fn lazy_fact_cache_ipv6_host_overlap_and_default_prefix() {
         ),
     ];
     let router = Router::new(&rules, "direct").unwrap();
-    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
@@ -401,8 +400,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
         ),
     ];
     let router = Router::new(&facts, "direct").unwrap();
-    let mut zero_plan =
-        RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    let mut zero_plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
     for entries in [
         &mut zero_plan.facts.destination_v4,
         &mut zero_plan.facts.destination_v6,
@@ -461,8 +459,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
         ),
     ];
     let mac_router = Router::new(&mac_rules, "direct").unwrap();
-    let mac_plan =
-        RoutingPushPlan::compile(&mac_router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    let mac_plan = RoutingPushPlan::compile(&mac_router, &outbound_ids(), DialMode::Ip).unwrap();
     backend.publish_routing_plan(&mac_plan, &[]).unwrap();
     let mut zero_mac = golden::connection();
     zero_mac.mac = Some("00:00:00:00:00:00".into());
@@ -512,7 +509,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
     ];
     let family_router = Router::new(&family_rules, "direct").unwrap();
     let family_plan =
-        RoutingPushPlan::compile(&family_router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+        RoutingPushPlan::compile(&family_router, &outbound_ids(), DialMode::Ip).unwrap();
     backend.publish_routing_plan(&family_plan, &[]).unwrap();
     let valid = input(&connection);
     assert_route(
@@ -547,7 +544,7 @@ fn four_mode_golden_policies() {
         DialMode::DomainPlus,
         DialMode::DomainPlusPlus,
     ] {
-        let plan = RoutingPushPlan::compile(&router, &ids, "direct", mode).unwrap();
+        let plan = RoutingPushPlan::compile(&router, &ids, mode).unwrap();
         backend.publish_routing_plan(&plan, &[]).unwrap();
         let mut present = HashSet::new();
         for case in &cases {
@@ -609,15 +606,16 @@ fn empty_scalar_predicates_preserve_rule_reachability() {
         ("block".into(), 1),
         ("proxy".into(), 2),
     ]);
-    let plan = RoutingPushPlan::compile(&router, &ids, "block", DialMode::Ip).unwrap();
+    let plan = RoutingPushPlan::compile(&router, &ids, DialMode::Ip).unwrap();
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
     for (port, outbound, must, rule_id) in [(8443, 2, 1, 1), (443, 1, 0, 2), (80, 0, 1, 3)] {
         let mut connection = golden::connection();
         connection.dst_port = port;
+        let (action, _) = router.route_action(&connection);
         assert_eq!(
-            router.route_with_must(&connection),
+            (action.outbound.as_str(), action.must),
             (["direct", "block", "proxy"][outbound as usize], must != 0),
         );
         let actual = backend.run_routing_test(&input(&connection)).unwrap();
@@ -630,6 +628,7 @@ fn empty_scalar_predicates_preserve_rule_reachability() {
                 must,
                 domain_final: 1,
                 rule_id,
+                direct_mark_index: u32::MAX,
             },
         );
     }
@@ -659,7 +658,7 @@ fn large_prefix_fact_policy() {
         "direct",
     )
     .unwrap();
-    let large_plan = RoutingPushPlan::compile(&large_router, &ids, "direct", DialMode::Ip).unwrap();
+    let large_plan = RoutingPushPlan::compile(&large_router, &ids, DialMode::Ip).unwrap();
     backend.publish_routing_plan(&large_plan, &[]).unwrap();
     let large_match = RoutingDecision {
         outbound: 2,
@@ -667,6 +666,7 @@ fn large_prefix_fact_policy() {
         must: 0,
         domain_final: 1,
         rule_id: 0,
+        direct_mark_index: u32::MAX,
     };
     for destination in ["10.0.0.0", "10.1.0.0"] {
         let mut connection = golden::connection();
@@ -687,6 +687,7 @@ fn large_prefix_fact_policy() {
             must: 0,
             domain_final: 1,
             rule_id: u32::MAX,
+            direct_mark_index: u32::MAX,
         }
     );
 }
@@ -721,7 +722,7 @@ fn predicate_bits_and_capacity_limits() {
             })
             .collect::<Vec<_>>();
         let router = Router::new(&rules, "direct").unwrap();
-        let plan = RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip).unwrap();
+        let plan = RoutingPushPlan::compile(&router, &ids, DialMode::Ip).unwrap();
         if !domains {
             backend.publish_routing_plan(&plan, &[]).unwrap();
         }
@@ -775,7 +776,7 @@ fn predicate_bits_and_capacity_limits() {
             mark: 0,
         });
         let rejected = Router::new(&overflow, "direct")
-            .and_then(|router| RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip));
+            .and_then(|router| RoutingPushPlan::compile(&router, &ids, DialMode::Ip));
         assert!(rejected.is_err());
         assert_route(
             &mut backend,
@@ -783,5 +784,93 @@ fn predicate_bits_and_capacity_limits() {
             &preserved_input,
             decision(2, 0x6ff, false, 1, 255),
         );
+    }
+}
+
+#[test]
+fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() {
+    let mut strings = vec![0];
+    let mut name = |value: &str| {
+        let offset = strings.len() as u32;
+        strings.extend_from_slice(value.as_bytes());
+        strings.push(0);
+        offset
+    };
+    let integer = name("u32");
+    let structure = name("RoutingDecision");
+    let slot = name("honk_route_slot0");
+    let fields = [
+        "outbound",
+        "mark",
+        "must",
+        "domain_final",
+        "rule_id",
+        "direct_mark_index",
+    ]
+    .map(&mut name);
+    let output = name("KernelRouteOutput");
+    let output_fields = [
+        ("decision", offset_of!(KernelRouteOutput, decision)),
+        ("flags", offset_of!(KernelRouteOutput, flags)),
+        ("generation", offset_of!(KernelRouteOutput, generation)),
+        ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
+        ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
+        ("input", offset_of!(KernelRouteOutput, input)),
+        (
+            "domain_bitmap",
+            offset_of!(KernelRouteOutput, domain_bitmap),
+        ),
+        ("outcomes", offset_of!(KernelRouteOutput, outcomes)),
+    ]
+    .map(|(field, offset)| (name(field), offset as u32 * 8));
+    let mut types = vec![integer, 1 << 24, 4, 32];
+    let structure_offset = types.len();
+    types.extend([structure, (4 << 24) | 6, 24]);
+    for (index, field) in fields.into_iter().enumerate() {
+        types.extend([field, 1, index as u32 * 32]);
+    }
+    let output_offset = types.len();
+    types.extend([
+        output,
+        (4 << 24) | output_fields.len() as u32,
+        size_of::<KernelRouteOutput>() as u32,
+    ]);
+    for (index, (field, offset)) in output_fields.into_iter().enumerate() {
+        // The decision is type 2; other member types are not inspected.
+        types.extend([field, if index == 0 { 2 } else { 1 }, offset]);
+    }
+    types.extend([0, 2 << 24, 3]); // pointer to the output struct
+    let prototype_offset = types.len();
+    types.extend([0, (13 << 24) | 2, 1, 0, 4, 0, 4]);
+    types.extend([slot, (12 << 24) | 1, 5]);
+    let encode = |types: &[u32]| {
+        let mut bytes = vec![0x9f, 0xeb, 1, 0];
+        for word in [
+            24,
+            0,
+            types.len() as u32 * 4,
+            types.len() as u32 * 4,
+            strings.len() as u32,
+        ] {
+            bytes.extend(word.to_le_bytes());
+        }
+        for word in types {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend(&strings);
+        bytes
+    };
+    validate_routing_decision_abi(&encode(&types), "honk_route_slot0").unwrap();
+    for (word, replacement) in [
+        (structure_offset + 2, 20),
+        (structure_offset + 3 + 5 * 3 + 2, 128),
+        (output_offset + 2, 264),
+        (output_offset + 3 + 2, 32),
+        (output_offset + 3 + 1, 1),
+        (prototype_offset + 6, 3),
+    ] {
+        let mut incompatible = types.clone();
+        incompatible[word] = replacement;
+        assert!(validate_routing_decision_abi(&encode(&incompatible), "honk_route_slot0").is_err());
     }
 }

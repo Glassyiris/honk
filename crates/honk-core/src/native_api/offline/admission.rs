@@ -36,12 +36,7 @@ impl CapturedConfig {
         let hosts = hosts
             .parse()
             .map_err(|cause| dependency_error(source, "dns", cause))?;
-        let router = Router::new_with_geo_sources(
-            &config.routing.rules,
-            &config.routing.default_outbound,
-            &geo,
-        )
-        .map_err(|_| {
+        let router = Router::from_config_with_geo_sources(&config.routing, &geo).map_err(|_| {
             error(
                 source,
                 "routing",

@@ -105,11 +105,9 @@ impl Outbounds<'_> {
         let (outbound, rule) = match detour {
             None => {
                 let router = self.router.read().await;
-                let (outbound, _must) = router.route_with_must(&info);
-                let rule = router
-                    .route_full(&info)
-                    .map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
-                (outbound.to_string(), rule)
+                let (action, matched) = router.route_action(&info);
+                let rule = matched.map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
+                (action.outbound.clone(), rule)
             }
             Some(detour) => (detour.to_owned(), Some(setting.to_owned())),
         };

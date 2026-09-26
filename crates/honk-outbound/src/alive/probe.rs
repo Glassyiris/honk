@@ -861,7 +861,11 @@ impl AliveDialerSet {
             let Some(result) = cancel
                 .run(tokio::time::timeout(
                     timeout,
-                    crate::util::connect_marked_addr(*a, self.so_mark, timeout),
+                    crate::util::connect_marked_addr(
+                        *a,
+                        Some(self.so_mark.unwrap_or_else(crate::util::bypass_mark)),
+                        timeout,
+                    ),
                 ))
                 .await
             else {

@@ -196,12 +196,7 @@ impl Fixture {
             |path| std::fs::read(path).map(Arc::from),
         )
         .unwrap();
-        let router = Router::new_with_geo_sources(
-            &config.routing.rules,
-            &config.routing.default_outbound,
-            &geo,
-        )
-        .unwrap();
+        let router = Router::from_config_with_geo_sources(&config.routing, &geo).unwrap();
         let forwarder = Arc::new(DnsForwarder::new(
             Arc::new(NoDns),
             Arc::new(tokio::sync::Mutex::new(DnsCache::new(16))),

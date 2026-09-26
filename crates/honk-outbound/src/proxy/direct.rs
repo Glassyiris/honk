@@ -5,13 +5,33 @@ use honk_config::node::Node;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tracing::debug;
 
 use super::{
     PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound,
     UdpSocketTransport,
 };
+
+/// A direct rule's nonzero policy-routing mark; an unmarked direct flow uses the global mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DirectMark(std::num::NonZeroU32);
+
+impl DirectMark {
+    /// `None` for `0`, the configuration's "no mark" value.
+    pub fn new(mark: u32) -> Option<Self> {
+        std::num::NonZeroU32::new(mark).map(Self)
+    }
+
+    /// The configured low-30-bit policy value.
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Socket/skb mark: the rule mark plus the datapath's final-classification flag.
+    pub fn socket_mark(self) -> u32 {
+        self.get() | honk_ebpf_common::CLASSIFIED_MARK
+    }
+}
 
 #[derive(Default)]
 pub struct DirectHandler;
@@ -20,21 +40,18 @@ impl DirectHandler {
     pub fn new() -> Self {
         Self
     }
-}
 
-#[async_trait]
-impl TcpOutbound for DirectHandler {
-    async fn dial(
-        &self,
-        _node: &Node,
+    /// A routed mark replaces, rather than augments, the global bypass mark.
+    pub(crate) async fn dial_marked(
         target: SocketAddr,
-        _target_domain: Option<&str>,
+        mark: Option<DirectMark>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         debug!("Direct dial to {}", target);
+        let mark = mark.map_or_else(crate::util::bypass_mark, DirectMark::socket_mark);
         let stream = crate::runtime::admit_physical_dial(crate::util::connect_marked_addr(
             target,
-            Some(honk_ebpf_common::DAE_BYPASS_MARK),
+            Some(mark),
             connect_timeout,
         ))
         .await?;
@@ -50,37 +67,51 @@ impl TcpOutbound for DirectHandler {
         })
     }
 
-    async fn dial_with_tcp(
+    /// Create an unpooled direct UDP flow with its mark set before the first send.
+    pub(crate) fn dial_udp_marked(
+        target: SocketAddr,
+        mark: Option<DirectMark>,
+    ) -> anyhow::Result<Arc<UdpSocketTransport>> {
+        debug!("Direct UDP to {}", target);
+        let bind_addr = SocketAddr::new(
+            if target.is_ipv4() {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv6Addr::UNSPECIFIED.into()
+            },
+            0,
+        );
+        let mark = mark.map_or_else(crate::util::bypass_mark, DirectMark::socket_mark);
+        let socket = tokio::net::UdpSocket::from_std(crate::util::marked_udp_socket_with_mark(
+            bind_addr, mark,
+        )?)?;
+        #[cfg(feature = "native-api")]
+        crate::runtime::flow_observation::milestone("transport_ready");
+        Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
+    }
+}
+
+#[async_trait]
+impl TcpOutbound for DirectHandler {
+    async fn dial(
         &self,
         _node: &Node,
         target: SocketAddr,
         _target_domain: Option<&str>,
-        tcp: TcpStream,
-        _connect_timeout: Duration,
+        connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        debug!("Direct dial (pooled) to {}", target);
-        #[cfg(feature = "native-api")]
-        if let Some(observer) = crate::runtime::flow_observation::current() {
-            let server_addr = tcp.peer_addr().ok();
-            observer.publish(
-                crate::runtime::flow_observation::FlowEvent::TransportAttached {
-                    server_addr,
-                    resolution_location: "original_ip",
-                },
-            );
-            if server_addr == Some(target) {
-                observer.milestone_once("target_confirmed");
-            } else {
-                observer.publish(crate::runtime::flow_observation::FlowEvent::Gap(
-                    "not_instrumented",
-                ));
-            }
-        }
-        Ok(ProxyStream {
-            stream: Box::new(tcp),
-            target_addr: target,
-            target_domain: None,
-        })
+        Self::dial_marked(target, None, connect_timeout).await
+    }
+
+    async fn dial_runtime_marked(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<ProxyStream> {
+        Self::dial_marked(target, Some(mark), connect_timeout).await
     }
 }
 
@@ -93,17 +124,18 @@ impl PacketOutbound for DirectHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        debug!("Direct UDP to {}", target);
-        // Bind to the correct address family so the source address matches.
-        let bind_addr: SocketAddr = if target.is_ipv4() {
-            "0.0.0.0:0".parse().expect("hardcoded IPv4 bind address")
-        } else {
-            "[::]:0".parse().expect("hardcoded IPv6 bind address")
-        };
-        let socket = crate::util::udp_marked_bind(bind_addr).await?;
-        #[cfg(feature = "native-api")]
-        crate::runtime::flow_observation::milestone("transport_ready");
-        Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
+        Ok(Self::dial_udp_marked(target, None)?)
+    }
+
+    async fn dial_udp_transport_runtime_marked(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Ok(Self::dial_udp_marked(target, Some(mark))?)
     }
 }
 

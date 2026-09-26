@@ -1037,6 +1037,7 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             None,
             "outer",
             crate::stats::OutboundKind::Group,
+            None,
             Duration::from_secs(5),
             tokio::time::Instant::now() + Duration::from_millis(100),
             generation,
