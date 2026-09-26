@@ -21,7 +21,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    ApiError, ErrorCode, NativeState, invalid_query,
+    ApiError, ErrorCode, NativeState,
+    catalog::snapshot_unavailable,
+    invalid_query,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
     parse_query, timestamp,
     types::RequestId,
@@ -197,7 +199,7 @@ impl ProviderApi {
         Ok(snapshot.page(offset, limit))
     }
 
-    fn page(&self, snapshot: Snapshot, limit: usize) -> Result<Response, ApiError> {
+    fn page(&self, snapshot: Snapshot, limit: usize, id: &RequestId) -> Result<Response, ApiError> {
         let response = snapshot.page(0, limit);
         if snapshot.rows.len() > limit {
             let mut snapshots = self.snapshots.lock();
@@ -207,7 +209,7 @@ impl ProviderApi {
                     > MAX_SNAPSHOT_BYTES
             {
                 if snapshots.pop_front().is_none() {
-                    return Err(unavailable());
+                    return Err(snapshot_unavailable(id));
                 }
             }
             snapshots.push_back(snapshot);
@@ -247,7 +249,7 @@ pub(super) async fn list(
         })
         >= MAX_SNAPSHOT_BYTES
     {
-        return Err(unavailable());
+        return Err(snapshot_unavailable(id));
     }
     let mut counts: HashMap<_, usize> = config.subscriptions.iter().map(|s| (s.id, 0)).collect();
     let mut inline_count = 0;
@@ -273,7 +275,7 @@ pub(super) async fn list(
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {
-            return Err(unavailable());
+            return Err(snapshot_unavailable(id));
         }
         rows.push(row);
     }
@@ -287,6 +289,7 @@ pub(super) async fn list(
             bytes,
         },
         limit,
+        id,
     )
 }
 

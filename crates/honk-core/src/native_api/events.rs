@@ -36,7 +36,7 @@ const MAX_CLIENTS: usize = 16;
 const CLIENT_QUEUE: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 4096;
 const MAX_RETAINED_BYTES: usize = MAX_EVENTS * MAX_PAYLOAD_BYTES;
-const RETENTION: Duration = Duration::from_secs(60);
+pub(super) const RETENTION: Duration = Duration::from_secs(60);
 const HEARTBEAT: Duration = Duration::from_secs(15);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 // Signed cursors distinguish an after-record checkpoint from the record itself.

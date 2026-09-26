@@ -375,6 +375,27 @@ async fn native_catalog_masks_listener_secrets_without_changing_membership_or_cu
     )
     .await;
 
+    let single = response_json(
+        app.get(&format!("/api/v1/nodes/{}", nodes[0].id))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    clean(&single);
+    assert_eq!(single, first["nodes"][0]);
+    for unknown in ["00000000-0000-4000-8000-000000000000", "not-a-node"] {
+        error_response(
+            app.get(&format!("/api/v1/nodes/{unknown}"))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::NOT_FOUND,
+            "resource_not_found",
+        )
+        .await;
+    }
+
     for summary in [parent, child] {
         let response = app
             .get(&format!(

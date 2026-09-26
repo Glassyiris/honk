@@ -20,8 +20,8 @@ use crate::routing::{
 };
 
 use super::{
-    ApiError, ErrorCode, NativeState, error, parse_query, security::RequestRate, timestamp,
-    types::RequestId,
+    ApiError, ErrorCode, NativeState, catalog::snapshot_unavailable, error, parse_query,
+    security::RequestRate, timestamp, types::RequestId,
 };
 
 const MAX_RULES: usize = 4096;
@@ -255,7 +255,7 @@ async fn evaluate_current(
         Ok((evaluation, generation))
     })
     .await
-    .map_err(|_| unavailable(id))?
+    .map_err(|_| snapshot_unavailable(id))?
 }
 
 pub(super) async fn trace(
@@ -354,7 +354,7 @@ pub(super) async fn rules(
         Ok::<_, ApiError>(result)
     })
     .await
-    .map_err(|_| unavailable(id))??;
+    .map_err(|_| snapshot_unavailable(id))??;
     Ok(Json(super::config::administrative_projection(
         state,
         json!(result),

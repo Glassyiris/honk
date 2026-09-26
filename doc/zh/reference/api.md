@@ -22,6 +22,7 @@
 | GET | `/api/v1/flows`、`/api/v1/flows/{flow_id}` | 活跃及保留的终态用户态决策；detail 包含执行源头记录的 trace。 |
 | GET | `/api/v1/nodes` | 稳定节点 ID、当前直接成员/订阅来源与真实测量。 |
 | POST | `/api/v1/nodes` | 用 `{name,link}` 创建主文件节点；真实激活后才返回 201。 |
+| GET | `/api/v1/nodes/{id}` | 单个节点，字段与列表相同；未知 ID 返回 404。 |
 | DELETE | `/api/v1/nodes/{id}` | 删除主文件 inline 节点；激活后返回 `{deleted:0\|1}`。 |
 | GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision/ETag 与捕获的健康数据。 |
 | PUT | `/api/v1/groups/{groupId}/selection` | 按直接成员 ID 设置 Selector 的 `tcp`、`udp` 或 `both` 选择。 |
@@ -58,7 +59,7 @@
 
 连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建选择。启用记录时，`flow_id`、捕获的 root-first 组/叶 ID、首次观测 UTC、domain 来源与用户态 rule ID 关联保留证据；缺失或淘汰的证据保持 unknown。逐连接 rate 仍为 null。空列表是 `visibility: partial`，不代表设备没有连接。Mock 数据面显示 disabled/none；真实后端只依据实际程序、hooks、routing root、listener 和 admission 观测报告状态，未知项为 unknown/null，覆盖仍为 partial。HTTP 就绪不等于数据面就绪。
 
-单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；503 不表示已完成的关闭回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
+单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；批量关闭中任一退役无法确认时，等全部已选连接处理完再返回 503，`error.details` 带 `closed/skipped` 计数，这些连接不会回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
 
 TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 仍未知。`generation.activated_at` 是当前 generation 的发布时间，启动 generation 取引擎首次进入运行状态的时间。配置激活或挂起后重建进行期间，`generation.state` 为 `reloading`；引擎运行且健康时，`lifecycle.state` 同为 `reloading`。有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
@@ -138,7 +139,7 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 ### 节点与组（M3）
 
-节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
+节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
 节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，复用源内容/flow 显示的监听凭据遮罩。节点快照在有界序列化前遮罩，续页保留同一份已遮罩字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
 既有遮罩阈值不变：不足八字节的监听凭据值不遮罩，启动时会发出警告。
@@ -231,7 +232,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 `POST /probes` 接受节点/组 target、`kind=tcp_connect|http|dns`、purpose、transport 数组、地址族与 `warmth=cold|warm`，不接受任意调用方 URL。组可选直接成员、叶节点或显式成员 ID；先固定当前配置/成员/注册代次，再去重执行并保留 member→leaf 关联。TCP-connect 测节点实际端口；HTTP 使用配置检查 URL，不跟随重定向；DNS 执行实际 UDP 或带长度帧的 TCP exchange。HTTP/HTTPS 默认仅端口 80/443，DNS 默认 53，额外端口需管理员 `probe_allowed_ports`；私网、loopback、link-local 等受限目标（包括节点地址）另需 `probe_allowed_cidrs`。解析后的地址规范化、校验并固定，不能以端口许可代替 CIDR 许可或交给代理重新解析。
 
-每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/测量共享 30 秒 deadline。最终 transport owner 清理即使超期也必须等待 join，因此 operation 总耗时可能超过 30 秒。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。即使已有 4 个 active job，也立即返回 202 与 `queued` 操作；202 只表示 daemon 接管。测量开始前结束的 job 以 `probe_cancelled`、`probe_deadline`、`unsupported_value`（解析出的地址或端口不被允许）或 `engine_unavailable` 失败；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。
+每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/测量共享 30 秒 deadline。最终 transport owner 清理即使超期也必须等待 join，因此 operation 总耗时可能超过 30 秒。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。即使已有 4 个 active job，也立即返回 202 与 `queued` 操作；202 只表示 daemon 接管。测量开始前结束的 job 以 `probe_cancelled`、`probe_deadline`、`unsupported_value`（解析出的地址或端口不被允许）或 `engine_unavailable` 失败；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。最终清理失败时 operation 以 `probe_cleanup_failed` 失败，`result` 保持 null，已完成的测量放在 `error.details`。
 
 `GET /dns/query` 必填 `domain`，`type` 默认 A，可重复指定最多 8 个不同类型，超过时返回 `413 request_too_large`；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
 
@@ -243,15 +244,15 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 每页还带 `usage {entries, entry_capacity}`，描述快照时刻的整个运行时缓存，不受过滤器影响。`entry_capacity` 为 `max_cache_size` 钳制到 1–100,000 后的值。两个值均为十进制字符串，在所有分片同时加锁时读取；同一快照的后续页重复相同的值。淘汰按分片进行，因此单个热点分片可能已在淘汰，而合计值仍显示有余量。`usage.entries` 还计入 `total` 不包含的过期记录与非 exact-key 记录。
 
-获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
+获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。两者在期限内无法固定 router 时返回 `503 snapshot_unavailable` 并带 `Retry-After`。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
 对已接受 `.dae` 配置中的规则，包括含凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序以 dae 写法显示配置值，不加引号：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。监听凭据值仍被遮蔽；普通条件文本无需写权限即可读取，`config_content` 不产生作用。没有已接受来源元数据的规则显示编译后条件值，来源保持 null。编译后展示反映规范化的谓词，不等同于原始编写语法，也不展开 geodata。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 保留各自代次捕获的有界编译后值，包括程序内构造路由器的值。
 
 ### Provider、日志与临时设置
 
-获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 provider 数据。Provider GET 不联网。订阅条目连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，`Node.provider_id` 可用于关联。订阅返回配置名称，`url_redacted` 返回完整 URL；为兼容客户端保留字段名。GET 与成功操作结果使用相同表示。未观测 usage/expiry 仍为 null。与旧 `provider-<id>` 标签相同的配置名称只是普通名称，不作为 ID 别名。从未加载、等待加载或禁用且无缓存时是 stale、零节点及 null 时间/错误；真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB。启用且有运行 supervisor 的订阅可 POST refresh；订阅已禁用或未挂接 supervisor（`can_refresh: false`）时返回 `404 capability_not_supported`；同 provider 的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。刷新成功须真实 revision-fenced publication 被接受，fetch 或写缓存不等于成功，HTTP 断连不丢失结果。虚拟 inline provider 不可刷新/删除；它关联 `provider_id: inline` 的静态非 builtin 节点，builtin 归属保持 null，订阅 ID 仍为 UUID。
+获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 provider 数据。Provider GET 不联网。订阅条目连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，`Node.provider_id` 可用于关联。订阅返回配置名称，`url_redacted` 返回完整 URL；为兼容客户端保留字段名。GET 与成功操作结果使用相同表示。未观测 usage/expiry 仍为 null。与旧 `provider-<id>` 标签相同的配置名称只是普通名称，不作为 ID 别名。从未加载、等待加载或禁用且无缓存时是 stale、零节点及 null 时间/错误；真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB，放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`。启用且有运行 supervisor 的订阅可 POST refresh；订阅已禁用或未挂接 supervisor（`can_refresh: false`）时返回 `404 capability_not_supported`；同 provider 的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。刷新成功须真实 revision-fenced publication 被接受，fetch 或写缓存不等于成功，HTTP 断连不丢失结果。虚拟 inline provider 不可刷新/删除；它关联 `provider_id: inline` 的静态非 builtin 节点，builtin 归属保持 null，订阅 ID 仍为 UUID。
 
-`record_logs` 默认为 true，允许在客户端已连接时捕获日志，最多保留 512 条、60 秒。显式运行时设置 `record_logs: true` 可在无客户端时持续捕获；配置中的 false 禁止捕获，修改后需重启。实际记录停止时释放日志，续传游标失效。保留真实 timestamp/level/target；只有审查过的静态消息和有类型的安全字段可披露，其他 message/fields 明确 withheld，不靠正则猜测所有秘密，也不转发控制台或 Clash 格式化输出。`GET /logs` 以 SSE 返回 `stream.ready` 与日志，支持 level/target 过滤和绑定 stream/instance/过滤器的 cursor；续传顺序与 `/events` 相同，为 **ready→replay→live**，ready 保留请求 cursor，之后才由 replay 推进。每 stream 最多 16 clients、每 client 64 队列、15 秒 heartbeat；过期 cursor 在 200 前返回 409，队满或 replay 丢失则断流。
+`record_logs` 默认为 true，允许在客户端已连接时捕获日志，最多保留 512 条、60 秒，日志能力以 `max_buffered_records` 与 `retention_seconds` 声明这两个上限。显式运行时设置 `record_logs: true` 可在无客户端时持续捕获；配置中的 false 禁止捕获，修改后需重启。实际记录停止时释放日志，续传游标失效。保留真实 timestamp/level/target；只有审查过的静态消息和有类型的安全字段可披露，其他 message/fields 明确 withheld，不靠正则猜测所有秘密，也不转发控制台或 Clash 格式化输出。`GET /logs` 以 SSE 返回 `stream.ready` 与日志，支持 level/target 过滤和绑定 stream/instance/过滤器的 cursor；续传顺序与 `/events` 相同，为 **ready→replay→live**，ready 保留请求 cursor，之后才由 replay 推进。每 stream 最多 16 clients、每 client 64 队列、15 秒 heartbeat；过期 cursor 在 200 前返回 409，队满或 replay 丢失则断流。
 
 `record_dns_log` 默认为 true，允许在客户端已连接时记录，最多保留 512 条、8 MiB。显式运行时设置 `record_dns_log: true` 可在无客户端时持续记录；配置中的 false 禁止记录，修改后需重启。实际记录停止时释放历史，已有游标失效。在真实客户端完成点记录普通 DNS 和有来源的客户端解析，排除原生/Clash 诊断与后台刷新重复项。仅存内存；完整 wire 与元数据一起计费，按整条旧记录淘汰。`GET /dns/log` 最新优先，支持大小写不敏感的 name 子串、type、无端口 src、limit（1–500，默认 100）及过滤器绑定 cursor；淘汰使相关 cursor 失效。停止记录不影响正常 DNS 服务。
 

@@ -368,7 +368,7 @@ impl OperationStore {
                 None,
             );
         }
-        self.finish(id, Ok(result), None)
+        self.finish(id, Ok(result))
     }
 
     /// Details must already be safe structured fields, not engine error strings or source text.
@@ -390,11 +390,11 @@ impl OperationStore {
                 message,
                 details,
             }),
-            None,
         )
     }
 
-    /// Preserve completed measurement facts when lifecycle cleanup fails.
+    /// Preserve completed measurement facts in `error.details` when lifecycle cleanup
+    /// fails; a failed operation's `result` stays null.
     pub(crate) fn fail_with_result(
         &self,
         id: &str,
@@ -402,26 +402,20 @@ impl OperationStore {
         message: &'static str,
         result: OperationResult,
     ) -> bool {
-        let result = serde_json::to_writer(DetailsBudget(MAX_RESULT_BYTES), &result)
-            .is_ok()
-            .then_some(result);
+        let details = serde_json::to_value(result)
+            .ok()
+            .filter(|value| serde_json::to_writer(DetailsBudget(MAX_RESULT_BYTES), value).is_ok());
         self.finish(
             id,
             Err(SafeError {
                 code,
                 message,
-                details: None,
+                details,
             }),
-            result,
         )
     }
 
-    fn finish(
-        &self,
-        id: &str,
-        result: Result<OperationResult, SafeError>,
-        failed_result: Option<OperationResult>,
-    ) -> bool {
+    fn finish(&self, id: &str, result: Result<OperationResult, SafeError>) -> bool {
         let mut records = self.records.lock();
         let Some(record) = records.iter_mut().find(|record| record.id == id) else {
             return false;
@@ -451,7 +445,6 @@ impl OperationStore {
             Err(error) => {
                 operation.status = Status::Failed;
                 operation.error = Some(error);
-                operation.result = failed_result.filter(|result| result.kind() == record.kind);
             }
         }
         operation.finished_at = Some(SystemTime::now());

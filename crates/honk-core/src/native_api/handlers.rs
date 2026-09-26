@@ -245,7 +245,15 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
         .route(
             "/api/v1/nodes/{id}",
             resource(
-                delete(
+                get(
+                    |State(state): App, Extension(id): Id, uri: Uri| async move {
+                        respond(
+                            catalog::node(&state, path_id(uri.path()), &uri, &id).await,
+                            id,
+                        )
+                    },
+                )
+                .delete(
                     |State(state): App, Extension(id): Id, request: Request| async move {
                         let action = management::Action::DeleteNode(
                             path_id(request.uri().path()).to_owned(),
@@ -253,7 +261,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                         respond(management::mutate(&state, action, request, &id).await, id)
                     },
                 ),
-                &["DELETE"],
+                &["GET", "DELETE"],
             ),
         )
         .route(
