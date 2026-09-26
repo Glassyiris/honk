@@ -302,7 +302,7 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
             for (port, mark, redirected) in [
                 (443, USER_MARK, true),
                 (444, 0, false),
-                (53, USER_MARK, false),
+                (53, USER_MARK, true),
             ] {
                 let key = tuple(src, dst, 43020, port, protocol);
                 let bytes = packet(src, dst, protocol, 43020, port, 5, 2);
@@ -315,7 +315,24 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
                         TC_ACT_OK
                     }
                 );
-                if redirected {
+                if redirected && port == 53 && protocol == IPPROTO_UDP {
+                    // Must UDP DNS ownership is per packet: the route rides cb[2]
+                    // and no tuple handoff is written.
+                    assert!(backend.routing_handoff_take(&key).unwrap().is_none());
+                    assert_eq!(
+                        result.cb[2],
+                        UdpDnsRoute::direct(0, backend.routing_policy_generation())
+                            .unwrap()
+                            .to_mark()
+                    );
+                    let trace_id = result.cb[3];
+                    assert_ne!(trace_id, 0);
+                    assert_ne!(trace_id, ROUTE_TRACE_LOST);
+                    let captured = witness(&backend, trace_id);
+                    assert_eq!(captured.output.decision.mark, mark);
+                    assert_eq!(captured.output.decision.must, 1);
+                    assert_ne!(captured.output.flags & ROUTE_TRACE_COMPLETE, 0);
+                } else if redirected {
                     let entry = handoff(&backend, &key);
                     assert_eq!(entry.result.outbound, OutboundIndex::Direct as u8);
                     assert_eq!(entry.result.mark, mark);
