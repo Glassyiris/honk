@@ -92,28 +92,21 @@ pub async fn resolve_with(
             Err(e) => tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e),
         }
     }
-    #[cfg(feature = "native-api")]
-    let mut observation = LookupObservation::start(host, "UNKNOWN", None);
-    let result = resolve_system(host);
-    #[cfg(feature = "native-api")]
-    let result = match &observation {
-        Some(observation) => observation.child().scope(result).await,
-        None => result.await,
-    };
-    #[cfg(not(feature = "native-api"))]
-    let result = result.await;
-    #[cfg(feature = "native-api")]
-    if let Some(observation) = &mut observation {
-        observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
-    }
-    result
+    resolve_system(host).await
 }
 
 /// `/etc/hosts`, then bypass-marked queries to the first numeric system nameserver.
+/// A hosts answer is observed as its own lookup; each nameserver query observes itself.
 async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
         let addrs = hosts_addresses(&contents, host);
         if !addrs.is_empty() {
+            #[cfg(feature = "native-api")]
+            if let Some(mut observation) =
+                LookupObservation::start(host, "UNKNOWN", LookupOrigin::Hosts)
+            {
+                observation.finish(Ok::<_, &io::Error>(addrs.iter().copied()));
+            }
             return Ok(addrs);
         }
     }
@@ -171,7 +164,7 @@ impl BootstrapResolver {
         let mut observation = LookupObservation::start(
             host,
             qtype_name(qtype),
-            Some((self.server, if self.use_tcp { "tcp" } else { "udp" })),
+            LookupOrigin::Upstream(self.server, if self.use_tcp { "tcp" } else { "udp" }),
         );
         let result = async {
             let msg = tokio::time::timeout(QUERY_TIMEOUT, self.query_raw(host, qtype))
@@ -316,10 +309,10 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
     let mut observation = LookupObservation::start(
         host,
         "HTTPS",
-        Some((
+        LookupOrigin::Upstream(
             resolver.server,
             if resolver.use_tcp { "tcp" } else { "udp" },
-        )),
+        ),
     );
     let operation = resolver.query_raw(host, QTYPE_HTTPS);
     #[cfg(feature = "native-api")]
@@ -501,6 +494,15 @@ fn qtype_name(qtype: u16) -> &'static str {
     }
 }
 
+/// Where an observed lookup's answer comes from.
+#[cfg(feature = "native-api")]
+enum LookupOrigin {
+    /// `/etc/hosts`, without a DNS exchange.
+    Hosts,
+    /// A bypass-marked exchange with this nameserver over this transport.
+    Upstream(SocketAddr, &'static str),
+}
+
 #[cfg(feature = "native-api")]
 struct LookupObservation {
     observer: crate::runtime::flow_observation::FlowObserver,
@@ -510,11 +512,7 @@ struct LookupObservation {
 
 #[cfg(feature = "native-api")]
 impl LookupObservation {
-    fn start(
-        host: &str,
-        qtype: &str,
-        upstream: Option<(SocketAddr, &'static str)>,
-    ) -> Option<Self> {
+    fn start(host: &str, qtype: &str, origin: LookupOrigin) -> Option<Self> {
         use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
         let observer = current()?;
         if host.is_empty() || host.len() > 253 {
@@ -522,6 +520,10 @@ impl LookupObservation {
             return None;
         }
         let context = observer.context();
+        let (source, upstream) = match origin {
+            LookupOrigin::Hosts => ("hosts", None),
+            LookupOrigin::Upstream(address, transport) => ("upstream", Some((address, transport))),
+        };
         let data = DnsLookup {
             lookup_id: uuid::Uuid::new_v4(),
             parent_lookup_id: context.lookup_id,
@@ -529,18 +531,10 @@ impl LookupObservation {
             purpose: context.dns_purpose,
             name: host.to_owned(),
             qtype: qtype.to_owned(),
-            source: if upstream.is_some() {
-                "upstream"
-            } else {
-                "unknown"
-            },
+            source,
             upstream_transport: upstream.map(|(_, transport)| transport),
             carrier_transport: upstream.map(|(_, transport)| transport),
-            cache: if upstream.is_some() {
-                "bypass"
-            } else {
-                "unknown"
-            },
+            cache: "bypass",
             cache_entry_id: None,
             upstream: upstream.map(|(address, _)| address.to_string()),
             route_evaluation_ids: Vec::new(),
@@ -549,11 +543,6 @@ impl LookupObservation {
             selected_ip: None,
             error: None,
         };
-        if upstream.is_none() {
-            // The system hosts/nameserver fallback supplies an
-            // outcome, not its hosts/cache/upstream decision path.
-            observer.publish(FlowEvent::Gap("not_instrumented"));
-        }
         observer.publish(FlowEvent::Dns(data.clone()));
         Some(Self {
             observer,
