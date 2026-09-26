@@ -16,6 +16,7 @@ pub enum GroupField {
     Tolerance,
     IdleTimeout,
     InterruptConnections,
+    CheckUrl,
 }
 
 impl GroupField {
@@ -27,6 +28,7 @@ impl GroupField {
             Self::Tolerance => "tolerance",
             Self::IdleTimeout => "idle_timeout",
             Self::InterruptConnections => "interrupt_connections",
+            Self::CheckUrl => "check_url",
         }
     }
 }

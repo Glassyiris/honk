@@ -159,9 +159,13 @@ fn policy(policy: GroupPolicy) -> &'static str {
     }
 }
 
-fn check_url(group: &Group) -> Option<String> {
-    let target =
-        honk_config::check::decode_http_check_target(group.check_url.as_deref()?, false).ok()?;
+pub(super) fn check_url(group: &Group) -> Option<String> {
+    normalized_check_url(group.check_url.as_deref()?)
+}
+
+/// The URL a health check probes, as GET reports and PATCH writes it.
+pub(super) fn normalized_check_url(value: &str) -> Option<String> {
+    let target = honk_config::check::decode_http_check_target(value, false).ok()?;
     Some(format!(
         "{}://{}{}",
         if target.is_https() { "https" } else { "http" },

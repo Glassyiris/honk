@@ -14,31 +14,35 @@ use super::{
     types::RequestId,
 };
 
-pub(crate) const MUTABLE_CONFIG: [&str; 6] = [
+pub(crate) const MUTABLE_CONFIG: [&str; 7] = [
     "policy",
     "default_member_id",
     "final_outbound",
     "tolerance",
     "idle_timeout",
     "interrupt_connections",
+    "check_url",
 ];
-const PATHS: [&str; 6] = [
+const PATHS: [&str; 7] = [
     "/policy",
     "/config/default_member_id",
     "/config/final_outbound",
     "/config/tolerance",
     "/config/idle_timeout",
     "/config/interrupt_connections",
+    "/config/check_url",
 ];
-const FIELDS: [GroupField; 6] = [
+const FIELDS: [GroupField; 7] = [
     GroupField::Policy,
     GroupField::Default,
     GroupField::Final,
     GroupField::Tolerance,
     GroupField::IdleTimeout,
     GroupField::InterruptConnections,
+    GroupField::CheckUrl,
 ];
 const MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
+const MAX_CHECK_URL_BYTES: usize = 2048;
 
 pub(super) struct GroupPatch {
     pub(super) id: String,
@@ -98,8 +102,9 @@ fn integer(value: &Value) -> Option<u64> {
         })
 }
 
-fn valid_value(index: usize, value: &Value) -> bool {
-    match index {
+/// The stored form of a supported value, as GET reports it.
+fn normalized(index: usize, value: &Value) -> Option<Value> {
+    let valid = match index {
         0 => value.as_object().is_some_and(|policy| {
             policy.len() == 2
                 && policy
@@ -111,10 +116,34 @@ fn valid_value(index: usize, value: &Value) -> bool {
                     })
         }),
         1 | 2 => value.is_null() || value.as_str().is_some_and(|value| !value.is_empty()),
-        3 | 4 => value.is_null() || integer(value).is_some(),
+        3 | 4 if !value.is_null() => return integer(value).map(Value::from),
         5 => value.is_boolean(),
+        6 if !value.is_null() => return value.as_str().and_then(check_url).map(Value::from),
+        3 | 4 | 6 => true,
         _ => false,
+    };
+    valid.then(|| value.clone())
+}
+
+/// The contract's SafeHttpUrl in the normalized form the probe sends: health
+/// checks split on commas and the source edit needs a usable quote.
+fn check_url(value: &str) -> Option<String> {
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))?;
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if authority.contains('@')
+        || value
+            .chars()
+            .any(|char| char.is_whitespace() || char.is_control())
+    {
+        return None;
     }
+    super::catalog::normalized_check_url(value).filter(|url| {
+        url.len() <= MAX_CHECK_URL_BYTES
+            && !url.contains(',')
+            && !(url.contains('\'') && url.contains('"'))
+    })
 }
 
 impl GroupPatch {
@@ -133,6 +162,7 @@ impl GroupPatch {
             json!(self.group.tolerance),
             json!(self.group.idle_timeout),
             json!(self.group.interrupt_connections),
+            json!(super::catalog::check_url(&self.group)),
         ];
         let mut values = initial.clone().map(Some);
         let operations = self
@@ -165,18 +195,10 @@ impl GroupPatch {
                     if operation.len() != 3 || !operation.contains_key("value") {
                         return Err(invalid());
                     }
-                    let value = &operation["value"];
-                    if !valid_value(path, value) {
-                        return Err(unsupported());
-                    }
+                    let value = normalized(path, &operation["value"]).ok_or_else(unsupported)?;
                     if op != "add" && values[path].is_none() {
                         return Err(invalid());
                     }
-                    let value = if matches!(path, 3 | 4) && !value.is_null() {
-                        json!(integer(value).ok_or_else(invalid)?)
-                    } else {
-                        value.clone()
-                    };
                     if op == "test" {
                         if values[path].as_ref() != Some(&value) {
                             return Err(ApiError::new(
@@ -205,10 +227,8 @@ impl GroupPatch {
                             .and_then(Value::as_str)
                             .ok_or_else(invalid)?,
                     )?;
-                    let value = values[from].clone().ok_or_else(invalid)?;
-                    if !valid_value(path, &value) {
-                        return Err(unsupported());
-                    }
+                    let value = values[from].as_ref().ok_or_else(invalid)?;
+                    let value = normalized(path, value).ok_or_else(unsupported)?;
                     if op == "move" {
                         values[from] = None;
                     }
@@ -512,7 +532,7 @@ mod tests {
             json!([{"op":"replace","path":"/config/tolerance","value":9},{"op":"test","path":"/config/tolerance","value":50}]),
             json!([{"op":"remove","path":"/config/tolerance"},{"op":"replace","path":"/config/tolerance","value":1}]),
             json!([{"op":"copy","path":"/policy","from":"/config/tolerance"}]),
-            json!([{"op":"replace","path":"/config/check_url","value":"https://localhost/"}]),
+            json!([{"op":"replace","path":"/config/check_url","value":"localhost/"}]),
             json!([{"op":"replace","path":"/config/tolerance","value":0.5}]),
             json!(vec![
                 json!({"op":"test","path":"/config/tolerance","value":50});
@@ -521,5 +541,62 @@ mod tests {
         ] {
             assert!(request(operations).changes().is_err());
         }
+    }
+
+    #[test]
+    fn check_url_patch_accepts_safe_http_urls_and_null() {
+        let change = |value: Value| {
+            request(json!([{"op":"replace","path":"/config/check_url","value":value}])).changes()
+        };
+        for (url, written) in [
+            ("https://www.gstatic.com/generate_204", None),
+            ("http://127.0.0.1:8080/probe?x=1", None),
+            ("https://[::1]/a@b", None),
+            ("https://example.test/it's", None),
+            ("http://example.test", Some("http://example.test/")),
+            (
+                "https://example.test/p#frag",
+                Some("https://example.test/p"),
+            ),
+            ("http://Example.Test:80/x", Some("http://example.test/x")),
+            ("http://example.test?x", Some("http://example.test/?x")),
+        ] {
+            assert_eq!(
+                change(json!(url)).unwrap(),
+                vec![(GroupField::CheckUrl, Some(written.unwrap_or(url).into()))]
+            );
+        }
+        assert!(change(Value::Null).unwrap().is_empty());
+        let long = format!("https://example.test/{}", "a".repeat(2048));
+        for url in [
+            "ftp://example.test/",
+            "https://user:pass@example.test/",
+            "https://user@example.test/",
+            "example.test/generate_204",
+            "HTTPS://example.test/",
+            "https:///path",
+            "https://a.test/,https://b.test/",
+            " https://example.test/",
+            "https://example.test/a\u{a0}b",
+            "https://example.test/a\u{85}b",
+            "https://example.test/'\"",
+            long.as_str(),
+        ] {
+            assert!(change(json!(url)).is_err(), "{url}");
+        }
+        assert!(change(json!(204)).is_err());
+    }
+
+    #[test]
+    fn check_url_test_compares_the_catalog_form() {
+        let mut patch = request(json!([
+            {"op":"test","path":"/config/check_url","value":"http://example.test/"},
+            {"op":"remove","path":"/config/check_url"}
+        ]));
+        patch.group.check_url = Some("example.test".into());
+        assert_eq!(patch.changes().unwrap(), vec![(GroupField::CheckUrl, None)]);
+        patch.operations =
+            json!([{"op":"replace","path":"/config/check_url","value":"http://example.test/"}]);
+        assert!(patch.changes().unwrap().is_empty());
     }
 }

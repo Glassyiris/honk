@@ -82,6 +82,7 @@ pub struct NativeState {
     #[cfg(test)]
     after_generation: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     sample: parking_lot::RwLock<Option<TrafficSummary>>,
+    cpu_percent: parking_lot::RwLock<Option<f64>>,
 }
 
 impl NativeState {
@@ -181,6 +182,7 @@ impl NativeState {
             after_generation: parking_lot::Mutex::new(None),
             healthy: control.datapath_health_handle(),
             sample: parking_lot::RwLock::new(None),
+            cpu_percent: parking_lot::RwLock::new(None),
         })
     }
 
@@ -455,7 +457,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
         traffic,
         process: Process {
             pid: full.then_some(std::process::id()),
-            cpu_percent: None,
+            cpu_percent: *state.cpu_percent.read(),
         },
         last_reload,
     })
@@ -776,6 +778,57 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(state.sample.read().as_ref().unwrap().rates.is_none());
+        stop.send(true).unwrap();
+        sampler.await.unwrap();
+    }
+
+    #[test]
+    fn cpu_percent_is_one_cpu_scaled_and_unknown_without_forward_time() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(2);
+        let percent = |cpu: u64| {
+            super::server::cpu_percent(
+                (start, Duration::from_millis(500)),
+                (later, Duration::from_millis(cpu)),
+            )
+        };
+        assert_eq!(percent(1_500), Some(50.0));
+        assert_eq!(percent(4_500), Some(200.0));
+        assert_eq!(percent(500), Some(0.0));
+        assert_eq!(percent(499), None);
+        let same = (start, Duration::from_secs(1));
+        assert_eq!(super::server::cpu_percent(same, same), None);
+        assert_eq!(
+            super::server::cpu_percent((later, Duration::ZERO), (start, Duration::from_secs(1))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reports_the_sampled_cpu_percent() {
+        let state = state().await;
+        assert!(runtime_body(&state).await["process"]["cpu_percent"].is_null());
+        *state.cpu_percent.write() = Some(137.5);
+        assert_eq!(runtime_body(&state).await["process"]["cpu_percent"], 137.5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_sampler_measures_cpu_after_two_samples() {
+        let state = state().await;
+        let (stop, receiver) = watch::channel(false);
+        let sampler = tokio::spawn(sample_traffic(state.clone(), receiver));
+        while state.sample.read().is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert!(state.cpu_percent.read().is_none());
+        // A tick writes the sample and cpu_percent without awaiting in between.
+        *state.sample.write() = None;
+        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        while state.sample.read().is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert!(state.cpu_percent.read().is_some());
         stop.send(true).unwrap();
         sampler.await.unwrap();
     }

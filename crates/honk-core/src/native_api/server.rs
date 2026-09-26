@@ -20,6 +20,7 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous: Option<(Instant, Option<(u64, u64)>)> = None;
+    let mut previous_cpu: Option<(Instant, Duration)> = None;
     loop {
         tokio::select! {
             biased;
@@ -47,12 +48,28 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
                     bytes: TrafficBytes { upload: totals.map(|bytes| bytes.0.to_string()), download: totals.map(|bytes| bytes.1.to_string()) }, rates,
                 });
                 previous = Some((now, totals));
+                let cpu = process_cpu_time().map(|time| (now, time));
+                *state.cpu_percent.write() = previous_cpu.zip(cpu).and_then(|(old, new)| cpu_percent(old, new));
+                previous_cpu = cpu;
                 let sample = state.sample.read().clone().expect("sample published above");
                 state.observation.telemetry.sample(&sample).await;
                 state.observation.events.publish("runtime.updated", serde_json::json!({}), None);
             }
         }
     }
+}
+
+fn process_cpu_time() -> Option<Duration> {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_PROCESS_CPUTIME_ID)
+        .ok()
+        .map(Duration::from)
+}
+
+/// Process CPU time over the wall interval as a percentage of one CPU, so a busy multi-threaded process exceeds 100.
+pub(super) fn cpu_percent(previous: (Instant, Duration), now: (Instant, Duration)) -> Option<f64> {
+    let wall = now.0.checked_duration_since(previous.0)?;
+    let cpu = now.1.checked_sub(previous.1)?;
+    (!wall.is_zero()).then(|| cpu.as_secs_f64() / wall.as_secs_f64() * 100.0)
 }
 
 struct NativeConsumer(Arc<ConnectionTracker>);
