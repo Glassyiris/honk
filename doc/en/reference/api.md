@@ -10,7 +10,7 @@ The base contract is [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](
 
 | Method | Path | Meaning |
 | --- | --- | --- |
-| GET | `/api`, `/api/v1/discovery` | Public discovery, fixed `/api/v1` base, authentication state and all contract links. |
+| GET | `/api`, `/api/v1/discovery` | Public discovery: authentication state and sign-in links for every caller; the fixed `/api/v1` base and all contract links for an admitted caller. |
 | POST | `/api/v1/auth/setup` | Create the first password-mode administrator and issue a session. |
 | POST | `/api/v1/auth/login` | Verify the password-mode administrator and issue a session. |
 | POST | `/api/v1/auth/logout` | Revoke the authenticated password-mode session. |
@@ -76,6 +76,8 @@ With `ui` configured, `/` and `/ui` redirect to `/ui/`. Directory hosting retain
 ### Authentication discovery and password sessions
 
 Discovery returns `auth: {mode, setup_required, anonymous_loopback}`. `mode` is `token` for a nonempty configured `secret` and for anonymous loopback development, or `password` when `secret` is empty and `password_auth` is enabled. `setup_required` is true only in password mode before the administrator record exists. `anonymous_loopback` is true only for the explicit development mode on an actual loopback bind. `links.auth_setup`, `links.auth_login` and `links.auth_logout` contain their endpoint paths in password mode and are null otherwise.
+
+A request without a credential that the listener does not admit gets only `name`, `api_major`, `links.auth_setup`, `links.auth_login`, `auth.mode` and `auth.setup_required`; every other field is omitted. A request admitted by bearer, session or explicit anonymous loopback gets the full response.
 
 In token mode, the three password endpoints are unavailable with `404 capability_not_supported`. Password-mode requests use the following contract:
 
