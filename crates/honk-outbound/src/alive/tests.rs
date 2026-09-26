@@ -2200,8 +2200,8 @@ impl HttpProber for JoinedSocketProbe {
 }
 
 #[tokio::test]
-async fn health_pause_drains_nested_probe_and_retains_loop() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn health_shutdown_drains_nested_probe_and_stops_loop() {
+    use tokio::io::AsyncReadExt;
     tokio::time::timeout(Duration::from_secs(15), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2250,100 +2250,68 @@ async fn health_pause_drains_nested_probe_and_retains_loop() {
         let (mut peer, _) = listener.accept().await.unwrap();
         set.register_node(id(2), "queued".into(), addr.to_string());
         set.trigger_probe(id(2));
-        let pause = tokio::spawn({
+        let shutdown = tokio::spawn({
             let set = Arc::clone(&set);
-            async move { set.pause_health_checks().await }
+            async move { set.shutdown_health_checks().await }
         });
         cleanup_started.notified().await;
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
         assert!(
-            !pause.is_finished(),
+            !shutdown.is_finished(),
             "cleanup completion is part of the ack"
         );
         assert!(!set.probe_node(id(2), Duration::from_secs(1)).await);
         cleanup_release.add_permits(1);
-        pause.await.unwrap().unwrap();
+        shutdown.await.unwrap().unwrap();
+        owner.await.unwrap();
         assert_eq!(completions.recv().await, Some(id(1)));
         assert!(
-            set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4)
-                .is_empty()
+            completions.try_recv().is_err(),
+            "queued triggers must not run after shutdown"
         );
-        assert!(
-            set.get_probe_history(id(2), ProbeDomain::Tcp, IpVersion::V4)
-                .is_empty()
-        );
+        for node in [id(1), id(2)] {
+            assert!(
+                set.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4)
+                    .is_empty()
+            );
+        }
         assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(set.native_observations(id(1)), vec![sample]);
         assert_eq!(set.native_group_observations(id(3)).len(), 1);
-        set.trigger_probe(id(2));
-        set.resume_health_checks().unwrap();
         assert!(!set.complete_native_probe(&ticket, None, sample));
-        for _ in 0..2 {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            peer.write_u8(1).await.unwrap();
-            completions.recv().await.unwrap();
-        }
-        cleanup_release.add_permits(10);
-        set.shutdown_health_checks().await.unwrap();
-        owner.await.unwrap();
-        assert!(
-            completions.try_recv().is_err(),
-            "pre-pause triggers must not replay"
-        );
-        for node in [id(1), id(2)] {
-            let history = set.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4);
-            assert_eq!(history.len(), 1);
-            assert!(history[0].success);
-        }
-        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(set.resume_health_checks(), Err(HealthCheckError::Stopped));
     })
     .await
     .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-async fn health_pause_timeout_keeps_admission_closed_and_discards_queued_triggers() {
+async fn health_shutdown_timeout_keeps_admission_closed() {
     use futures_util::FutureExt as _;
 
     let set = AliveDialerSet::new();
-    set.trigger_probe(id(1));
     let permit = set.acquire_health_probe().unwrap();
     let old_cancel = permit.cancellation();
-    let pause = set.pause_health_checks();
-    tokio::pin!(pause);
-    assert!(pause.as_mut().now_or_never().is_none());
+    let shutdown = set.shutdown_health_checks();
+    tokio::pin!(shutdown);
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    assert!(old_cancel.is_cancelled());
     tokio::time::advance(Duration::from_secs(6)).await;
-    assert!(pause.as_mut().now_or_never().is_none());
-    assert_eq!(
-        set.resume_health_checks(),
-        Err(HealthCheckError::NotDrained)
-    );
+    assert!(shutdown.as_mut().now_or_never().is_none());
     assert!(matches!(
         set.acquire_health_probe(),
-        Err(HealthCheckError::Paused)
+        Err(HealthCheckError::Stopped)
     ));
-    set.trigger_probe(id(2));
     drop(permit);
-    assert_eq!(pause.await, Err(HealthCheckError::DrainTimeout));
-    set.pause_health_checks().await.unwrap();
-    set.resume_health_checks().unwrap();
-    assert!(old_cancel.is_cancelled());
-    assert!(
-        !set.acquire_health_probe()
-            .unwrap()
-            .cancellation()
-            .is_cancelled()
-    );
-    set.trigger_probe(id(3));
-    let mut receiver = set.take_trigger_rx().unwrap();
-    assert_eq!(receiver.try_recv(), Ok(id(3)));
-    assert!(receiver.try_recv().is_err());
+    assert_eq!(shutdown.await, Err(HealthCheckError::DrainTimeout));
     set.shutdown_health_checks().await.unwrap();
+    assert!(matches!(
+        set.acquire_health_probe(),
+        Err(HealthCheckError::Stopped)
+    ));
 }
 
 #[tokio::test]
-async fn health_external_jobs_survive_response_disconnect_and_join_on_pause() {
+async fn health_external_jobs_survive_response_disconnect_and_join_on_shutdown() {
     tokio::time::timeout(Duration::from_secs(2), async {
         let set = Arc::new(AliveDialerSet::new());
         let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
@@ -2371,22 +2339,19 @@ async fn health_external_jobs_survive_response_disconnect_and_join_on_pause() {
             request.abort();
             let _ = request.await;
         }
-        set.pause_health_checks().await.unwrap();
+        set.shutdown_health_checks().await.unwrap();
         assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 10);
         assert_eq!(
             set.run_external_probe(|_| async { 1 }).await,
-            Err(HealthCheckError::Paused)
+            Err(HealthCheckError::Stopped)
         );
-        set.resume_health_checks().unwrap();
-        assert_eq!(set.run_external_probe(|_| async { 42 }).await, Ok(42));
-        set.shutdown_health_checks().await.unwrap();
     })
     .await
     .unwrap();
 }
 
 #[tokio::test]
-async fn health_pause_preserves_completed_failure_before_cancelled_retry() {
+async fn health_shutdown_preserves_completed_failure_before_cancelled_retry() {
     struct RetryProbe(Arc<tokio::sync::Notify>, std::sync::atomic::AtomicUsize);
     impl HttpProber for RetryProbe {
         fn probe_http(
@@ -2425,7 +2390,7 @@ async fn health_pause_preserves_completed_failure_before_cancelled_retry() {
             async move { set.probe_node(id(1), Duration::from_secs(1)).await }
         });
         started.notified().await;
-        set.pause_health_checks().await.unwrap();
+        set.shutdown_health_checks().await.unwrap();
         assert!(!probe.await.unwrap());
         let history = set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4);
         assert_eq!(history.len(), 1);
@@ -2437,7 +2402,7 @@ async fn health_pause_preserves_completed_failure_before_cancelled_retry() {
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
-async fn health_pause_rejects_panicked_resolver_child() {
+async fn health_shutdown_rejects_panicked_resolver_child() {
     let set = AliveDialerSet::new();
     set.enable_native_observations();
     let permit = set.acquire_health_probe().unwrap();
@@ -2457,17 +2422,13 @@ async fn health_pause_rejects_panicked_resolver_child() {
     receive.await.unwrap();
     drop(permit);
     assert_eq!(
-        set.pause_health_checks().await,
-        Err(HealthCheckError::WorkerFailed)
-    );
-    assert_eq!(
-        set.resume_health_checks(),
-        Err(HealthCheckError::WorkerFailed)
-    );
-    assert_eq!(
         set.shutdown_health_checks().await,
         Err(HealthCheckError::WorkerFailed)
     );
+    assert!(matches!(
+        set.acquire_health_probe(),
+        Err(HealthCheckError::WorkerFailed)
+    ));
 }
 
 #[cfg(feature = "native-api")]
@@ -2521,13 +2482,11 @@ async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error
         );
         assert!(completed.load(Ordering::Acquire));
         assert!(child.is_finished());
-        assert_eq!(
-            set.resume_health_checks(),
-            Err(if panics {
-                HealthCheckError::WorkerFailed
-            } else {
-                HealthCheckError::Stopped
-            })
-        );
+        let expected = if panics {
+            HealthCheckError::WorkerFailed
+        } else {
+            HealthCheckError::Stopped
+        };
+        assert!(matches!(set.acquire_health_probe(), Err(error) if error == expected));
     }
 }

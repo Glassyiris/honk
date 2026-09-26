@@ -785,7 +785,7 @@ async fn native_udp_dns_records_only_the_actual_target_family() {
 }
 
 #[tokio::test]
-async fn health_pause_closes_real_http_probe_without_failure_evidence() {
+async fn health_shutdown_closes_real_http_probe_without_failure_evidence() {
     tokio::time::timeout(Duration::from_secs(3), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -802,7 +802,7 @@ async fn health_pause_closes_real_http_probe_without_failure_evidence() {
         });
         let (mut peer, _) = listener.accept().await.unwrap();
         read_request_head(&mut peer).await;
-        alive.pause_health_checks().await.unwrap();
+        alive.shutdown_health_checks().await.unwrap();
         assert!(!request.await.unwrap());
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
         assert!(alive.native_observations(node).is_empty());
@@ -811,23 +811,6 @@ async fn health_pause_closes_real_http_probe_without_failure_evidence() {
                 .get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4)
                 .is_empty()
         );
-        alive.resume_health_checks().unwrap();
-        let request = tokio::spawn({
-            let alive = Arc::clone(&alive);
-            async move { alive.probe_node(node, Duration::from_secs(1)).await }
-        });
-        let (mut peer, _) = listener.accept().await.unwrap();
-        for _ in 0..2 {
-            read_request_head(&mut peer).await;
-            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        }
-        assert!(request.await.unwrap());
-        alive.shutdown_health_checks().await.unwrap();
-        let history = alive.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4);
-        assert_eq!(history.len(), 1);
-        assert!(history[0].success);
     })
     .await
     .unwrap();

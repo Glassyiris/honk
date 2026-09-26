@@ -1370,7 +1370,7 @@ async fn test_group_delay_omits_failed_members() {
 }
 
 #[tokio::test]
-async fn delay_owner_errors_distinguish_saturation_pause_stop_and_failure() {
+async fn delay_owner_errors_distinguish_saturation_stop_and_failure() {
     use honk_outbound::alive::HealthCheckError;
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1392,26 +1392,16 @@ async fn delay_owner_errors_distinguish_saturation_pause_stop_and_failure() {
             starts.recv().await.unwrap();
         }
         let client = http_client();
-        for expected in [HealthCheckError::Busy, HealthCheckError::Paused] {
-            for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
-                let response = client.get(app.url(path)).send().await.unwrap();
-                assert_eq!(response.status(), 503);
-                let body: serde_json::Value = response.json().await.unwrap();
-                assert_eq!(body["message"], expected.to_string());
-            }
-            owner.pause_health_checks().await.unwrap();
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::Busy.to_string());
         }
+        owner.shutdown_health_checks().await.unwrap();
         for job in jobs {
             job.await.unwrap().unwrap();
         }
-        owner.resume_health_checks().unwrap();
-        let response = client
-            .get(app.url("/group/no-such-group/delay"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 404, "resumed owner must admit work");
-        owner.shutdown_health_checks().await.unwrap();
         for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
             let response = client.get(app.url(path)).send().await.unwrap();
             assert_eq!(response.status(), 503);

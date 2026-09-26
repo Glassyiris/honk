@@ -520,9 +520,6 @@ async fn silent_handshake_timeout_does_not_retire_health_owner() {
             "measurement completion must join the transport workers"
         );
         assert_eq!(owner.run_external_probe(|_| async { 42 }).await, Ok(42));
-        owner.pause_health_checks().await.unwrap();
-        owner.resume_health_checks().unwrap();
-        assert_eq!(owner.run_external_probe(|_| async { 43 }).await, Ok(43));
         owner.shutdown_health_checks().await.unwrap();
     })
     .await
