@@ -199,7 +199,7 @@ async fn attempt_wire(
             let start = std::time::Instant::now();
             let socket = honk_outbound::util::connect_marked_addr(
                 addr,
-                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                Some(honk_outbound::util::bypass_mark()),
                 deadline.saturating_duration_since(Instant::now()),
             )
             .await?;

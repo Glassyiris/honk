@@ -39,11 +39,11 @@ use state::{SelectorState, UrlTestSelections};
 pub use resolver::{NativeGroupMember, NativeGroupSelection};
 pub use score::{
     ScoreAttempt, ScoreAttribution, ScoreBudgetCounters, ScoreBusinessGuard, ScoreCacheSnapshot,
-    ScoreComparison, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceGaps,
-    ScoreEvidenceQuestion, ScoreFeedback, ScoreLocalComparison, ScoreOutcome, ScorePolicyState,
-    ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,
-    ScoreSource, ScoreTarget, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
-    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
+    ScoreChallenger, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceQuestion, ScoreFeedback,
+    ScoreOutcome, ScorePolicyState, ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreRelation,
+    ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget, ScoreTrialSource,
+    ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
+    ScoreVerificationState, ScoreWaitReason,
 };
 pub use state::{
     InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorChoices, SelectorError,

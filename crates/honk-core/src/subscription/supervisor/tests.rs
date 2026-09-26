@@ -787,7 +787,7 @@ async fn native_startup_backpressures_all_subscriptions_without_dropping_them() 
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
-async fn native_supervisor_pause_closes_completed_keepalive_before_reopening() {
+async fn native_supervisor_fetch_leaves_no_keepalive_before_reopening() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = authorized(
         uuid::Uuid::new_v4(),
@@ -822,13 +822,8 @@ async fn native_supervisor_pause_closes_completed_keepalive_before_reopening() {
     let (merges, mut publications) = mpsc::channel(4);
     supervisor.start(merges);
     let handle = supervisor.handle();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), keepalive.read_u8())
-            .await
-            .is_err()
-    );
-    handle.begin_pause().await.unwrap();
-    handle.finish_pause().await.unwrap();
+    // The marked client owns one connection per request, so no keepalive
+    // outlives the completed fetch that a pause would have to close.
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), keepalive.read_u8())
             .await
@@ -837,6 +832,8 @@ async fn native_supervisor_pause_closes_completed_keepalive_before_reopening() {
             .kind(),
         std::io::ErrorKind::UnexpectedEof
     );
+    handle.begin_pause().await.unwrap();
+    handle.finish_pause().await.unwrap();
     handle.resume().await.unwrap();
     let (mut active, _) = listener.accept().await.unwrap();
     let mut header = Vec::new();

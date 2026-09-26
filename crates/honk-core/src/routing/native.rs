@@ -254,13 +254,13 @@ impl Router {
                 }
             }
             if matches!(result, MatchResult::Matched | MatchResult::Indeterminate) {
-                add_candidate(&mut candidate, &mut disagreement, &route.outbound);
+                add_candidate(&mut candidate, &mut disagreement, &route.action.outbound);
             }
             stopped |= result == MatchResult::Matched;
             rules.push(EvaluatedRule { result, conditions });
         }
         if !stopped {
-            add_candidate(&mut candidate, &mut disagreement, self.default_outbound());
+            add_candidate(&mut candidate, &mut disagreement, &self.fallback().outbound);
         }
         rules.push(EvaluatedRule {
             result: if stopped {

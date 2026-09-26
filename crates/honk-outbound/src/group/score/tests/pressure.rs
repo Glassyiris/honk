@@ -32,6 +32,7 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         let start = Instant::now();
         let state = manager.score_state();
         let refs = nodes.iter().collect::<Vec<_>>();
+        train_at(&manager, &nodes[0], &target, 20, 100, 1, start);
         for _ in 0..exploration_target(nodes.len()) {
             let (_, feedback) = state.rank_plan_at("score", &target, &refs, start);
             let guard = feedback.begin_at(start).unwrap();
@@ -39,9 +40,8 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
                 .start_at(start)
                 .finish_at(ScoreOutcome::Cancelled, false, start);
         }
-        for leaf in &nodes {
-            train_at(&manager, leaf, &target, 20, 100, 1, start);
-        }
+        // Trailing the selection's completions keeps the challenger under the trial ceiling.
+        train_at(&manager, &nodes[1], &target, 16, 100, 1, start);
         let ready = start + Duration::from_secs(2);
         for _ in 0..16 {
             assert_eq!(rank_at(&manager, &nodes, &target, ready), 0);
@@ -161,6 +161,7 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
         let start = Instant::now();
         let state = manager.score_state();
         let refs: Vec<_> = nodes.iter().collect();
+        train_at(&manager, &nodes[0], &target, 64, 100, download, start);
         for _ in 0..exploration_target(nodes.len()) {
             let (_, attempt) = state.rank_plan_at("score", &target, &refs, start);
             attempt.begin_at(start).unwrap().start_at(start).finish_at(
@@ -169,16 +170,14 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
                 start,
             );
         }
-        for leaf in &nodes {
-            train_at(&manager, leaf, &target, 64, 100, download, start);
-        }
+        // Trailing the selection's completions keeps the challenger under the trial ceiling.
+        train_at(&manager, &nodes[1], &target, 60, 100, download, start);
         let at = start + Duration::from_secs(3);
         assert_eq!(state.rank_at("score", &target, &refs, at), 0);
         pressure_at(&manager, nodes[0].id, IpVersion::V4, at);
         let snapshot = state
             .verification_snapshot_at("score", &target, &refs, at)
             .unwrap();
-        assert!(snapshot.missing.response);
         assert_eq!(snapshot.question, ScoreEvidenceQuestion::Response);
         let funded = state.budget_counters("score", target.network);
         assert!(funded.earned_available >= 2);
@@ -202,13 +201,6 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
             reporter.first_response_at(began + Duration::from_millis(100));
             reporter.transfer_at(1, 1, began + Duration::from_millis(100));
             open.push(reporter);
-            let answered = began + Duration::from_millis(200);
-            let (_, ordinary) = state.rank_plan_at("score", &target, &refs, answered);
-            ordinary
-                .begin_at(answered)
-                .unwrap()
-                .start_at(answered)
-                .finish_at(ScoreOutcome::Cancelled, false, answered);
             assert_eq!(
                 state
                     .budget_counters("score", target.network)
@@ -224,7 +216,7 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
 }
 
 #[test]
-fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() {
+fn pressure_reopens_responses_until_every_common_target_refreshes() {
     let nodes = [node("refresh winner"), node("refresh peer")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let targets = [
@@ -247,8 +239,20 @@ fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() 
             .verification_snapshot_at("score", scope, &refs, at)
             .unwrap()
     };
-    let before = snapshot(&aggregate, start + Duration::from_secs(2));
-    assert_eq!(before.comparison, ScoreComparison::Equivalent);
+    let equivalent = |snapshot: ScoreVerificationSnapshot| {
+        snapshot
+            .challengers
+            .iter()
+            .map(|c| c.relation)
+            .collect::<Vec<_>>()
+            == [ScoreRelation::Equivalent]
+    };
+    let reopened =
+        |snapshot: ScoreVerificationSnapshot| snapshot.question == ScoreEvidenceQuestion::Response;
+    assert!(equivalent(snapshot(
+        &aggregate,
+        start + Duration::from_secs(2)
+    )));
     pressure_at(
         &manager,
         nodes[0].id,
@@ -260,42 +264,29 @@ fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() 
         train_at(&manager, leaf, &targets[0], 4, 100, 1, fresh);
     }
     let partially_refreshed = start + Duration::from_millis(4300);
-    assert!(!snapshot(&targets[0], partially_refreshed).missing.response);
-    assert!(snapshot(&aggregate, partially_refreshed).missing.response);
+    assert!(!reopened(snapshot(&targets[0], partially_refreshed)));
+    assert!(reopened(snapshot(&aggregate, partially_refreshed)));
     let fresh = start + Duration::from_secs(4);
     let now = start + Duration::from_secs(5);
     for (index, leaf) in nodes.iter().enumerate() {
         train_at(&manager, leaf, &targets[1], 4, 100, 1, fresh);
         if index == 0 {
-            assert!(snapshot(&aggregate, now).missing.response);
+            assert!(reopened(snapshot(&aggregate, now)));
         }
     }
     let funded = state.budget_counters("score", SelectionNetwork::Tcp);
     assert!(funded.cold_available + funded.earned_available > 0);
     for scope in [&targets[0], &targets[1], &aggregate] {
         let refreshed = snapshot(scope, now);
-        assert_eq!(refreshed.comparison, ScoreComparison::Equivalent);
-        assert!(!refreshed.missing.response);
-        assert_eq!(refreshed.question, ScoreEvidenceQuestion::Transfer);
-        assert_eq!(
-            refreshed.evidence_age_ms,
-            before.evidence_age_ms.map(|age| age + 3000)
-        );
-        assert_eq!(
-            refreshed.valid_for_ms,
-            before.valid_for_ms.map(|valid_for| valid_for - 3000)
-        );
+        assert_eq!(refreshed.question, ScoreEvidenceQuestion::None);
+        assert!(equivalent(refreshed));
         let (_, attempt) = state.rank_plan_at("score", scope, &refs, now);
         attempt
             .begin_at(now)
             .unwrap()
             .start_at(now)
             .finish_at(ScoreOutcome::Cancelled, false, now);
-        assert!(
-            snapshot(scope, start + Duration::from_secs(61))
-                .missing
-                .response
-        );
+        assert!(reopened(snapshot(scope, start + Duration::from_secs(61))));
     }
     assert_eq!(
         state

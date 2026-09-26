@@ -76,10 +76,10 @@ flowchart LR
 flowchart TB
   PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[入口排除与有序策略]
   TC -->|非 DNS 本地 socket 接收| LOCAL[本地服务]
-  TC -->|direct must 或非 DNS 安全 direct| NATIVE[Linux 原生路径]
+  TC -->|LAN 或无 mark 的 direct must，或非 DNS 安全 direct| NATIVE[Linux 原生路径]
   TC -->|block must、非 DNS block 或失活丢包| DROP[丢弃]
   TC -->|非 must DNS :53| DAE0[dae0]
-  TC -->|proxy 或用户态决策| DAE0
+  TC -->|带 mark 的 WAN direct、proxy 或用户态决策| DAE0
   TC -->|有歧义的 LAN UDP，可选| NFQ[NFQUEUE 320]
   DAE0 --> SK[daens sk_lookup]
   SK --> LISTEN[透明 TCP/UDP 监听器]
@@ -88,13 +88,13 @@ flowchart TB
   CP -->|非 must DNS| DNS[DnsController]
   CP -->|其余流量，must 跳过嗅探| DECIDE[嗅探、路由回退、Clash 模式、组叶子]
   DECIDE --> DIAL[出站拨号与中继]
-  DIAL -->|DAE_BYPASS_MARK 0x100| WAN[WAN 出口]
+  DIAL -->|配置的旁路或已分类直连标记| WAN[WAN 出口]
   DIAL -->|anyfrom| REPLY[以原始目的地址发出 UDP 回包]
 ```
 
 ### 报文路径
 
-1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。既有入口与控制平面排除先执行；普通 LAN 端口 53 不能因本地 socket 而跳过策略，非 DNS 本地探测行为不变。`direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径。
+1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。既有入口与控制平面排除先执行；普通 LAN 端口 53 不能因本地 socket 而跳过策略，非 DNS 本地探测行为不变。LAN `direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径；非零 mark 的 WAN 直连改用用户态套接字，重新执行带 mark 的路由查找。
 2. [流量规则所有权](../reference/routing.md#出站目标与-must)决定哪些端口 53 查询进入[DNS 管线](./dns.md)。已准入的透明查询、可选 host-netns `dns.bind` 与流关联 reality/目标查询共用按代固定的 DNS 策略、缓存/singleflight、上游池和路由投影。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
 4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
@@ -102,11 +102,11 @@ flowchart TB
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
 7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威策略选择解析为叶节点。Score 只用逐目标 TCP/UDP 证据在健康合格成员中排名。TCP/UDP 通常只采用一个权威叶节点；只有冷启动顶层 URLTest 会先 stagger 候选，且只有 winner 提交 endpoint 或 source transport。
 8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；XUDP/Mux.Cool 可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source session。嗅探得到的 TCP 字节先于后续流量转发。
-9. 控制面出口携带 `DAE_BYPASS_MARK`（`0x100`），避免再次被 WAN TC 拦截。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
+9. 控制面出口使用 `global.so_mark_from_dae`（零值选择默认 `0x100`）；带 mark 的直连使用规则 mark 加 `CLASSIFIED_MARK`。WAN TC 识别这两类标记，不再额外叠加默认旁路位。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
 ## 运行时不变量
 
-- **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带 `DAE_BYPASS_MARK`（`0x100`）或使用 loopback。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
+- **旁路标记纪律：** 拨号、探测、DNS 上游、HTTP 下载、QUIC endpoint 和透明监听器携带进程配置的旁路 mark。非零直连规则 mark 替换其低 30 位，并携带 `CLASSIFIED_MARK`；策略路由须使用 `0x3fffffff` 掩码。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。
 - **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
 - **VLESS source 边界：** 共享 XUDP/Mux.Cool 按 reused runtime、规范化 client、UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source session 持有唯一 receiver 与 transport health。
@@ -118,9 +118,9 @@ flowchart TB
 - **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 豁免该健康检查丢包，但仍遵循用户的终局 `must` 结果。
 - **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不依赖自动生成的接口规则或隐藏白名单；接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
-- **Score 隔离与原因：** 健康过滤与业务目标地址族保持独立。首次选择的 utility 仍为启发式；健康晋升比较有界、按需求确定大小的评估集内所有合格挑战者与固定现任，依据共同目标／时间证据，而非无关聚合／setup 均值。可选试用共享保留的组／网络／地址族预算，由原始业务开始赚取，时间流逝不产生额度；试用不取得已提交现任身份。真实连败保留退避和三连败排除。精确与聚合证据各有 4,096 项 LRU；比较存储最多 256 个 cell、1 MiB 逻辑分配，不是进程 RSS。重叠计数不相加。reload 保留已准入业务结果，同时撤销近期确认与探测基线。公开摘要和计数始终限定范围，不导出原始目标键，详见[组设计](./groups.md#score-评分与生命周期)。
+- **Score 隔离与原因：** 健康过滤与业务目标地址族保持独立。首次选择的 utility 仍为启发式；健康晋升比较有界、按需求确定大小的评估集内所有合格挑战者与固定现任，依据共同目标／时间证据，而非无关聚合／setup 均值。可选试用共享保留的组／网络／地址族预算，由原始业务开始赚取，时间流逝不产生额度；试用不取得已提交现任身份。真实连败保留退避和三连败排除。精确与聚合证据各有 4,096 项 LRU；比较存储最多 256 个 cell、1 MiB 逻辑分配，不是进程 RSS。重叠计数不相加。reload 保留已准入业务结果，同时撤销近期可用性与探测基线。公开摘要和计数始终限定范围，不导出原始目标键，详见[组设计](./groups.md#score-评分与生命周期)。
 - **Score 按需反馈：** setup/首响应与有界分方向进展可在终态前发布，不增加 Beta 完成。业务、配置健康与预热分别承担不同作用；任意手动 delay 测量不变成业务可靠性或配置基线。Score TCP 建立失败可在原 deadline 内通过不同的合格叶节点恢复一次，不打开新 final、不越过 Selector、不重放负载。
-- **条件性验证接口：** Score 代理组发布聚合临时／可用状态、比较依据、证据问题、等待原因和剩余有效期，并与同一次只读选择的成员一致。活跃挑战者 `localComparison` 不能认证不完整的全局覆盖。`/stats` 增加固定组／网络验证及预算／成本字段，以及嵌套去重的根业务计数；实际试用失败不是因果额外失败。两者都不导出原始目标键或最优概率。详见 [API 验证](../reference/api.md#score-验证信息)。
+- **条件性验证接口：** Score 代理组发布聚合临时／可用状态、新鲜的成对挑战者响应关系、证据问题和等待原因，并与同一次只读选择的成员一致；不存在全组比较结论。`/stats` 增加固定组／网络验证及预算／成本字段，以及嵌套去重的根业务计数；实际试用失败不是因果额外失败。两者都不导出原始目标键或最优概率。详见 [API 验证](../reference/api.md#score-验证信息)。
 - **内部与特殊流量：** honk 的内部链路地址范围 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
 
 ## 构建 feature 与 mock 模式

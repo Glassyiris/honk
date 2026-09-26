@@ -385,8 +385,8 @@ fn dictionary(
             rule_id: rule_id(instance, generation, Some(rule.id)),
             index,
             expression: rule.expression.clone(),
-            outbound: rule.outbound.clone(),
-            must: rule.must,
+            outbound: rule.action.outbound.clone(),
+            must: rule.action.must,
             source: None,
             kind: "rule",
         });
@@ -395,8 +395,8 @@ fn dictionary(
         rule_id: rule_id(instance, generation, None),
         index: rules.len(),
         expression: "fallback".into(),
-        outbound: router.default_outbound().into(),
-        must: false,
+        outbound: router.fallback().outbound.clone(),
+        must: router.fallback().must,
         source: None,
         kind: "fallback",
     });
@@ -405,7 +405,7 @@ fn dictionary(
         generation_id: format!("{instance}:{generation}"),
         rules,
         fallback: RuleFallback {
-            outbound: router.default_outbound().into(),
+            outbound: router.fallback().outbound.clone(),
             source: None,
         },
     })

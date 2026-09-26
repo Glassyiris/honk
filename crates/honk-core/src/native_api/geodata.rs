@@ -606,7 +606,7 @@ pub(crate) async fn download_direct(
             deadline,
             honk_outbound::util::connect_marked_addr(
                 SocketAddr::new(ip, port),
-                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                Some(honk_outbound::util::bypass_mark()),
                 remaining,
             ),
         )

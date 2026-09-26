@@ -12,7 +12,8 @@ use honk_ebpf_common::receive_trace::{
 };
 use parking_lot::Mutex;
 
-use super::process_name::{Btf as OffsetBtf, VMLINUX_BTF_ENV, VMLINUX_BTF_PATHS};
+use super::btf::Btf as OffsetBtf;
+use super::process_name::{VMLINUX_BTF_ENV, VMLINUX_BTF_PATHS};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReceiveTraceOffsets {

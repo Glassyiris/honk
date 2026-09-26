@@ -8,28 +8,29 @@ pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &st
     selection_chain
 }
 
-#[cfg(any(feature = "ebpf", test))]
-pub(super) fn final_udp_rule_mark(
-    routed_direct: bool,
-    final_outbound: &str,
-    routed_mark: u32,
-) -> u32 {
-    if final_outbound == "direct" && !routed_direct {
-        0
-    } else {
-        routed_mark
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct RoutingDecision {
     pub(super) outbound: String,
     pub(super) must: bool,
-    pub(super) mark: u32,
+    pub(super) mark: Option<honk_outbound::proxy::DirectMark>,
     pub(super) matched_rule: Option<(String, String)>,
     pub(super) reroute_by_sniffed_domain: bool,
     #[cfg(feature = "native-api")]
     pub(super) native_route: Option<super::observation::RouteObservation>,
+}
+
+impl RoutingDecision {
+    /// Installs a mode override's replacement outbound, if any. A rule mark
+    /// survives only on a routed `direct` flow that remains `direct`.
+    pub(super) fn apply_final_outbound(&mut self, replacement: Option<String>) {
+        let routed_direct = self.outbound == "direct";
+        if let Some(outbound) = replacement {
+            self.outbound = outbound;
+        }
+        if !routed_direct || self.outbound != "direct" {
+            self.mark = None;
+        }
+    }
 }
 
 pub(super) fn build_connection_info(
@@ -209,7 +210,7 @@ impl ControlPlaneHandle {
             return RoutingDecision {
                 outbound: self.outbound_index_to_name(handoff.outbound).await,
                 must: handoff.must != 0,
-                mark: handoff.mark,
+                mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
                 #[cfg(feature = "native-api")]
@@ -269,15 +270,14 @@ impl ControlPlaneHandle {
             };
             #[cfg(not(feature = "native-api"))]
             let matched = router.route_full(&routing_conn_info);
-            match matched {
-                Some(route) => (
-                    route.outbound_name.to_string(),
-                    route.must,
-                    route.mark,
-                    Some((route.rule_type.to_string(), route.rule_payload.to_string())),
-                ),
-                None => (router.default_outbound().to_string(), false, 0, None),
-            }
+            // First matching rule's action, else the configured fallback action.
+            let action = matched.as_ref().map_or(router.fallback(), |hit| hit.action);
+            (
+                action.outbound.clone(),
+                action.must,
+                action.mark,
+                matched.map(|hit| (hit.rule_type.to_string(), hit.rule_payload.to_string())),
+            )
         };
         let (outbound, must, mark) = match handoff {
             Some(ho) => {
@@ -297,7 +297,7 @@ impl ControlPlaneHandle {
                     (
                         self.outbound_index_to_name(ho.outbound).await,
                         ho.must != 0,
-                        ho.mark,
+                        honk_outbound::proxy::DirectMark::new(ho.mark),
                     )
                 }
             }

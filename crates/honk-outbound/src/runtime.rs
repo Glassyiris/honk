@@ -17,8 +17,6 @@ pub mod flow_observation;
 mod tasks;
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
-#[cfg(feature = "native-api")]
-pub(crate) use tasks::lookup_host_owned;
 pub(crate) use tasks::{
     RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
 };

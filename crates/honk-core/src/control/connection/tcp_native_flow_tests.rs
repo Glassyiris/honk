@@ -463,6 +463,15 @@ async fn native_tcp_proxy_hostname_resolution_is_not_business_target_resolution(
             })
             .expect("the actual proxy hostname resolution is recorded");
         assert_eq!(resolution["data"]["purpose"], "proxy_server");
+        assert_eq!(resolution["data"]["source"], "hosts");
+        assert_eq!(resolution["data"]["cache"], "bypass");
+        assert!(resolution["data"]["upstream"].is_null());
+        assert!(
+            lookups
+                .iter()
+                .filter(|step| step["data"]["name"] == "localhost")
+                .all(|step| step["data"]["source"] != "unknown")
+        );
         assert!(
             lookups
                 .iter()
@@ -1037,6 +1046,7 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             None,
             "outer",
             crate::stats::OutboundKind::Group,
+            None,
             Duration::from_secs(5),
             tokio::time::Instant::now() + Duration::from_millis(100),
             generation,

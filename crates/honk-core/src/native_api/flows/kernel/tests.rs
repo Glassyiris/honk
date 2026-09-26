@@ -14,7 +14,6 @@ fn fixture() -> (
     let mut plan = RoutingPushPlan::compile(
         &router,
         &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-        "direct",
         DialMode::Ip,
     )
     .unwrap();
@@ -319,7 +318,6 @@ fn oversized_dictionary_reports_only_executed_evidence_loss() {
     let mut plan = RoutingPushPlan::compile(
         &router,
         &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-        "block",
         DialMode::Ip,
     )
     .unwrap();
@@ -399,7 +397,6 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
     let mut plan = RoutingPushPlan::compile(
         &router,
         &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-        "direct",
         DialMode::Ip,
     )
     .unwrap();

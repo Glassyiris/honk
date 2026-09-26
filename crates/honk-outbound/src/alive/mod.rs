@@ -555,7 +555,7 @@ impl AliveDialerSet {
     }
 
     /// Resolve `host` via the installed hook. Typed local refusal is returned;
-    /// ordinary empty or failed hook results retain the system fallback.
+    /// ordinary empty or failed hook results retain marked bootstrap/system fallback.
     pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let permit = self.acquire_health_probe()?;
         let cancel = permit.cancellation();
@@ -574,17 +574,22 @@ impl AliveDialerSet {
                 Err(error) if crate::proxy::is_packet_rejection(&error) => return Err(error),
                 Ok(_) => {
                     tracing::debug!(
-                        "health-check resolver found nothing for {host}; system fallback"
+                        "health-check resolver found nothing for {host}; bootstrap/system fallback"
                     )
                 }
                 Err(_) => {
-                    tracing::debug!("health-check resolver failed for {host}; system fallback")
+                    tracing::debug!(
+                        "health-check resolver failed for {host}; bootstrap/system fallback"
+                    )
                 }
             }
         }
-        Ok(crate::bootstrap::lookup_host(host, port)
+        Ok(crate::bootstrap::resolve(host)
             .await
-            .unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect())
     }
 
     /// Refresh the cached check URL IPs.  Called at the start of each full

@@ -19,8 +19,9 @@ use aya_ebpf_cty::c_void;
 use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
-    IpVersionType, L4ProtoType, RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
-    UdpDnsRoute,
+    CLASSIFIED_MARK, IpVersionType, L4ProtoType, ROUTING_META_FLAG_OFFLOAD,
+    ROUTING_META_FLAG_WAN_USERSPACE, RedirectEntry, RedirectTuple, SKB_MARK_RESERVED_MASK,
+    TASK_COMM_LEN, TPROXY_MARK, UdpDnsRoute,
     conn::BpfStatsKey,
     redirect_need::{PIDName, RoutingHandoffEntry, Tuples, TuplesKey},
 };
@@ -112,7 +113,6 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
 /// The caller must additionally check:
 /// - `pid_name.pid == PARAM.control_plane_pid` to detect the control plane
 /// - `PARAM.dae_socket_mark && skb_mark == PARAM.dae_socket_mark`
-/// - `skb_mark & 0x100 == 0x100`
 ///   to determine whether the packet should be allowed to pass.
 #[inline(always)]
 pub fn pid_is_control_plane(ctx: &TcContext) -> Option<&PIDName> {
@@ -141,9 +141,6 @@ pub fn is_control_plane(ctx: &TcContext) -> bool {
     let mark = skb_mark(ctx);
 
     if param.dae_socket_mark != 0 && mark == param.dae_socket_mark {
-        return true;
-    }
-    if (mark & 0x100) == 0x100 {
         return true;
     }
 
@@ -347,7 +344,8 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 0,    // dscp
                 None, // pname
                 0,    // pid
-                0,
+                0,    // trace_id
+                0,    // routing_meta_flags
             );
         }
         _ => {}
@@ -448,7 +446,7 @@ fn do_tproxy_wan_egress_tcp(
             && (crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
                 || ROUTING_HANDOFF_MAP.get_ptr(&tuples.five).is_some());
         trace_id = if outbound == OUTBOUND_BLOCK
-            || (outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)))
+            || (outbound == OUTBOUND_DIRECT && mark == 0 && (!dns || must))
         {
             0
         } else {
@@ -512,7 +510,9 @@ fn do_tproxy_wan_egress_tcp(
         }
     }
 
-    if outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)) {
+    // Egress runs after route lookup: a nonzero direct mark needs a fresh
+    // userspace dial, including terminal DNS rules.
+    if outbound == OUTBOUND_DIRECT && mark == 0 && (!dns || must) {
         ctx.set_mark(mark);
         return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
@@ -534,7 +534,7 @@ fn do_tproxy_wan_egress_tcp(
         0,
     );
     if prepare_result != 0 {
-        if dns || prepare_result == TOKEN_IDENTITY_MISMATCH {
+        if dns || mark != 0 || prepare_result == TOKEN_IDENTITY_MISMATCH {
             return Err(TC_ACT_SHOT);
         }
         // Preserve the existing non-DNS direct-pass fallback for map write failures.
@@ -573,7 +573,7 @@ fn do_tproxy_wan_egress_tcp(
             .is_err()
         {
             increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-            if dns {
+            if dns || mark != 0 {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -599,9 +599,10 @@ fn fast_path_decision(
     decision_token: u32,
     routing_generation: u64,
     trace_id: u32,
+    direct_mark_index: u32,
 ) -> Verdict {
     let dns = tuples.five.dst_port == 53;
-    if outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)) {
+    if outbound == OUTBOUND_DIRECT && mark == 0 && (!dns || must) {
         ctx.set_mark(mark);
         return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
@@ -609,7 +610,15 @@ fn fast_path_decision(
     }
 
     let dns_route_mark = if dns {
-        let Some(route) = UdpDnsRoute::new(outbound, routing_generation) else {
+        let route = if outbound == OUTBOUND_DIRECT && must && mark != 0 {
+            if direct_mark_index > u8::MAX as u32 {
+                return Err(TC_ACT_SHOT);
+            }
+            UdpDnsRoute::direct(direct_mark_index as u8, routing_generation)
+        } else {
+            UdpDnsRoute::new(outbound, routing_generation)
+        };
+        let Some(route) = route else {
             return Err(TC_ACT_SHOT);
         };
         route.to_mark()
@@ -632,7 +641,7 @@ fn fast_path_decision(
         decision_token,
     );
     if prepare_result != 0 {
-        if dns || prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
+        if dns || mark != 0 || prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
             return Err(TC_ACT_SHOT);
         }
         return Err(TC_ACT_OK);
@@ -645,8 +654,8 @@ fn fast_path_decision(
         (*ctx.skb.skb).cb[3] = trace_id;
     }
 
-    // Raw must UDP53 is admitted from the per-packet carrier, so only flows
-    // that userspace may look up publish a tuple handoff.
+    // Must UDP53 ownership (including the direct mark index) is entirely
+    // per-packet. A tuple handoff could be overwritten before this skb arrives.
     if !(dns_route_mark != 0 && must) {
         let now = unsafe { bpf_ktime_get_ns() };
         let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
@@ -683,7 +692,7 @@ fn fast_path_decision(
                 .is_err()
             {
                 increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-                if dns {
+                if dns || mark != 0 {
                     return Err(TC_ACT_SHOT);
                 }
             }
@@ -761,6 +770,7 @@ fn do_tproxy_wan_egress_udp(
                 decision_token,
                 0,
                 conn_state.trace_id,
+                u32::MAX,
             );
         }
     }
@@ -808,7 +818,7 @@ fn do_tproxy_wan_egress_udp(
         outbound = OUTBOUND_DIRECT;
     }
     let trace_id = if outbound == OUTBOUND_BLOCK
-        || (outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)))
+        || (outbound == OUTBOUND_DIRECT && mark == 0 && (!dns || must))
     {
         0
     } else {
@@ -819,6 +829,13 @@ fn do_tproxy_wan_egress_udp(
         let must_u8 = must as u8;
         let pname = pid_pname_opt.map(|pid_pname| &pid_pname.pname);
         let pid = pid_pname_opt.map_or(0, |pid_pname| pid_pname.pid);
+        let routing_meta_flags = if outbound == OUTBOUND_DIRECT && mark == 0 {
+            ROUTING_META_FLAG_OFFLOAD
+        } else if outbound != OUTBOUND_BLOCK {
+            ROUTING_META_FLAG_WAN_USERSPACE
+        } else {
+            0
+        };
         let state = mark_udp_seen(
             &tuples.five,
             0u8,
@@ -830,6 +847,7 @@ fn do_tproxy_wan_egress_udp(
             pname,
             pid,
             trace_id,
+            routing_meta_flags,
         );
         if state.is_none() {
             if outbound == OUTBOUND_DIRECT && mark == 0 {
@@ -853,6 +871,7 @@ fn do_tproxy_wan_egress_udp(
         decision_token,
         routing_generation,
         trace_id,
+        decision.direct_mark_index,
     )
 }
 
@@ -909,21 +928,30 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_UNSPEC);
     }
 
-    // Control-plane bypass (Go dae `pid_is_control_plane` mark fallback,
-    // tproxy.c:2613-2616): packets from dae's own marked sockets are never
-    // re-routed.  The cookie/PID check inside the per-protocol handlers only
-    // covers sockets the cgroup hooks recorded; when that mapping is missing
-    // (hook not attached, cookie lookup miss) the mark check here is the
-    // reliable fallback that prevents dae's own dials from being redirected
-    // back into daens and looping.
+    // Global socket marks match exactly. Final userspace direct sockets carry
+    // the same classified flag as native/NFQUEUE direct packets, independent
+    // of cookie/PID availability. Pending queue tokens are never this bypass.
     let mark = skb_mark(ctx);
-    if (param.dae_socket_mark != 0 && mark == param.dae_socket_mark) || (mark & 0x100) == 0x100 {
+    if (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
+        || mark & SKB_MARK_RESERVED_MASK == CLASSIFIED_MARK
+    {
         return Err(TC_ACT_OK);
     }
 
     match pkt.l4proto {
         IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt),
-        IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
+        IPPROTO_UDP => {
+            let Some(epoch) = crate::maps::begin_udp_decision() else {
+                return Err(TC_ACT_SHOT);
+            };
+            let verdict = if crate::maps::udp_decision_retiring(&pkt.tuples.five) {
+                Err(TC_ACT_SHOT)
+            } else {
+                do_tproxy_wan_egress_udp(ctx, link_h_len, pkt)
+            };
+            crate::maps::end_udp_decision(epoch);
+            verdict
+        }
         _ => Ok(TC_ACT_OK),
     }
 }

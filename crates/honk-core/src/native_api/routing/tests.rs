@@ -426,7 +426,7 @@ fn observed_route_retains_real_priority_and_short_circuit_outcomes() {
     .unwrap();
     let observed = router.route_full_observed(&connection(), None, 64);
     assert!(!observed.truncated);
-    assert_eq!(observed.matched.unwrap().outbound_name, "winner");
+    assert_eq!(observed.matched.unwrap().action.outbound, "winner");
     let evaluated = observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(
         evaluated.iter().map(|rule| rule.result).collect::<Vec<_>>(),
@@ -516,7 +516,7 @@ fn observed_route_uses_production_absence_before_negation_not_simulation_unknown
     )
     .unwrap();
     let observed = router.route_full_observed(&connection(), None, 64);
-    assert_eq!(observed.matched.unwrap().outbound_name, "absent");
+    assert_eq!(observed.matched.unwrap().action.outbound, "absent");
     assert_eq!(
         observed.rules[0].conditions,
         [
@@ -568,7 +568,14 @@ fn observed_route_uses_authoritative_domain_bitmap_and_preserves_action() {
     let observed = router.route_full_observed(&conn, Some(&zero), 64);
     let matched = observed.matched.unwrap();
     assert_eq!(
-        (matched.outbound_name, matched.must, matched.mark),
+        (
+            matched.action.outbound.as_str(),
+            matched.action.must,
+            matched
+                .action
+                .mark
+                .map_or(0, honk_outbound::proxy::DirectMark::get)
+        ),
         ("direct", true, 42)
     );
     assert_eq!(observed.rules[0].conditions, [MatchResult::NotMatched]);
@@ -576,7 +583,7 @@ fn observed_route_uses_authoritative_domain_bitmap_and_preserves_action() {
     conn.domain = None;
     let positive = router.domain_bitmap("example.test").unwrap();
     let observed = router.route_full_observed(&conn, Some(&positive), 64);
-    assert_eq!(observed.matched.unwrap().outbound_name, "proxy");
+    assert_eq!(observed.matched.unwrap().action.outbound, "proxy");
     assert_eq!(observed.rules[0].conditions, [MatchResult::Matched]);
     assert_eq!(observed.rules[1].conditions, [MatchResult::Skipped]);
 }
@@ -612,7 +619,14 @@ fn observed_route_budget_only_truncates_evidence_never_decisions() {
         let observed = router.route_full_observed(&connection(), None, budget);
         let matched = observed.matched.unwrap();
         assert_eq!(
-            (matched.outbound_name, matched.must, matched.mark),
+            (
+                matched.action.outbound.as_str(),
+                matched.action.must,
+                matched
+                    .action
+                    .mark
+                    .map_or(0, honk_outbound::proxy::DirectMark::get)
+            ),
             ("winner", true, 42)
         );
         assert_eq!(observed.truncated, budget < required, "budget={budget}");

@@ -111,11 +111,7 @@ impl Fixture {
                 .map(Arc::from)
             },
         )?;
-        let router = Router::new_with_geo_sources(
-            &config.routing.rules,
-            &config.routing.default_outbound,
-            &sources,
-        )?;
+        let router = Router::from_config_with_geo_sources(&config.routing, &sources)?;
         let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_with_geo_sources(
             &config.dns,
             &sources,

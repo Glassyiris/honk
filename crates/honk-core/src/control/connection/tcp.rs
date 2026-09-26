@@ -161,16 +161,22 @@ impl ControlPlaneHandle {
                 && handoff.routing_generation == backend.routing_policy_generation(),
             "TCP DNS routing generation is stale"
         );
-        let group = handoff
-            .outbound
-            .checked_sub(OutboundIndex::UserBase as u8)
-            .filter(|_| handoff.outbound < OutboundIndex::MustRules as u8)
-            .and_then(|index| config.groups.get(index as usize))
-            .ok_or_else(|| anyhow::anyhow!("invalid terminal TCP DNS outbound"))?;
+        let outbound = if handoff.outbound == OutboundIndex::Direct as u8 {
+            "direct".to_owned()
+        } else {
+            handoff
+                .outbound
+                .checked_sub(OutboundIndex::UserBase as u8)
+                .filter(|_| handoff.outbound < OutboundIndex::MustRules as u8)
+                .and_then(|index| config.groups.get(index as usize))
+                .ok_or_else(|| anyhow::anyhow!("invalid terminal TCP DNS outbound"))?
+                .name
+                .clone()
+        };
         let decision = super::routing::RoutingDecision {
-            outbound: group.name.clone(),
+            outbound,
             must: true,
-            mark: handoff.mark,
+            mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
             matched_rule: None,
             reroute_by_sniffed_domain: false,
             #[cfg(feature = "native-api")]
@@ -379,7 +385,7 @@ impl ControlPlaneHandle {
                 let mut pinned_native = pinned_dns_route
                     .as_ref()
                     .and_then(|snapshot| snapshot.native.clone());
-                let (route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
+                let (mut route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
                     (
                         snapshot.decision,
                         Some((snapshot.config, snapshot.group_manager, snapshot.runtime)),
@@ -399,14 +405,10 @@ impl ControlPlaneHandle {
                     )
                 };
                 #[cfg(feature = "native-api")]
-                let route = {
-                    let mut route = route;
-                    observation.routed(&mut route);
-                    route
-                };
+                observation.routed(&mut route);
                 let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
-                let matched_rule = route.matched_rule;
-                let mode_decision = self.apply_mode_override(route.outbound, route.must).await;
+                let matched_rule = route.matched_rule.take();
+                let mode_decision = self.apply_mode_override(&mut route).await;
                 let outbound_name = mode_decision.name;
                 let mode_constraint = mode_decision.constraint;
                 #[cfg(feature = "native-api")]
@@ -421,42 +423,6 @@ impl ControlPlaneHandle {
                 {
                     self.push_sniffed_domain_bitmap(domain, original_dst.ip())
                         .await;
-                }
-
-                // If eBPF already decided this flow should go direct (not just punted
-                // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
-                // For ControlPlaneRouting handoffs we must relay in userspace even if
-                // the final routing decision is direct, because eBPF has not installed
-                // the flow state needed to forward the accepted socket.
-                let ebpf_offload = outbound_name == "direct"
-                    && handoff
-                        .as_ref()
-                        .map(|ho| {
-                            ho.outbound == OutboundIndex::Direct as u8
-                                && ho.mark != 0
-                                && ho.outbound != OutboundIndex::ControlPlaneRouting as u8
-                        })
-                        .unwrap_or(false);
-                if ebpf_offload {
-                    debug!(
-                        network = "tcp",
-                        outbound = %outbound_name,
-                        ip = %original_dst,
-                        src = %client_addr,
-                        ebpf_offload = true,
-                        "TCP offloaded to eBPF: {} -> {}",
-                        client_addr,
-                        original_dst,
-                    );
-                    self.stats
-                        .record_connection(&outbound_name, crate::stats::OutboundKind::Builtin);
-                    self.stats
-                        .record_close(&outbound_name, crate::stats::OutboundKind::Builtin);
-                    #[cfg(feature = "native-api")]
-                    {
-                        terminal = Some(("unknown", "kernel_handoff"));
-                    }
-                    return Ok(());
                 }
 
                 let ipver = if original_dst.is_ipv6() {
@@ -613,6 +579,7 @@ impl ControlPlaneHandle {
                         target_domain.clone(),
                         &outbound_name,
                         outbound_kind,
+                        route.mark,
                         connect_timeout,
                         dial_deadline,
                         Arc::clone(&runtime_generation),
@@ -739,6 +706,7 @@ impl ControlPlaneHandle {
                                         target_domain.clone(),
                                         &outbound_name,
                                         outbound_kind,
+                                        route.mark,
                                         connect_timeout,
                                         retry_deadline,
                                         Arc::clone(&runtime_generation),
@@ -1138,6 +1106,22 @@ mod score_tests {
             ..Default::default()
         };
         let manager = crate::group::GroupManager::new(&[group], &nodes);
+        // Trials only serve challengers trailing the selection's completions.
+        let seed = manager
+            .feedback_for_node(
+                nodes[0].id,
+                crate::group::ScoreSelectionContext::aggregate(
+                    SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .unwrap()
+            .start();
+        seed.setup_succeeded();
+        seed.tx(1);
+        seed.rx(1);
+        seed.finish(crate::group::ScoreOutcome::Success);
         let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
         let mut plan = manager.selection_plan_for_target("score", &context);
         let attempt = plan.entries[0].feedback.take().unwrap();
@@ -1216,10 +1200,6 @@ mod score_tests {
                 };
                 let before = snapshot();
                 assert_eq!(before.state, ScoreVerificationState::ObservedUsable);
-                assert_eq!(
-                    before.next_action,
-                    crate::group::ScoreValidationAction::NextBusinessFlow
-                );
                 drop(manager.selection_plan_for_target("score", &context));
                 let before_counts =
                     manager.score_verification_counters("score", SelectionNetwork::Tcp);
@@ -1288,10 +1268,6 @@ mod score_tests {
                 let after = snapshot();
                 // A target reset cannot erase the node's factual aggregate RX.
                 assert_eq!(after.state, ScoreVerificationState::ObservedUsable);
-                assert_eq!(
-                    after.next_action,
-                    crate::group::ScoreValidationAction::NextBusinessFlow
-                );
                 drop(manager.selection_plan_for_target("score", &context));
                 let after_counts =
                     manager.score_verification_counters("score", SelectionNetwork::Tcp);
