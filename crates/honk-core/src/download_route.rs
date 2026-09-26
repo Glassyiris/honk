@@ -61,7 +61,7 @@ pub(crate) fn parse_host_ip(host: &str) -> Option<IpAddr> {
 
 impl Outbounds<'_> {
     /// Runs `host:port` through `detour`, or through the routing rules when it
-    /// is `None`: `Router::route_with_must` for the outbound name, then the
+    /// is `None`: `Router::route_action` for the outbound name, then the
     /// authoritative group/leaf resolution for the node to dial. `setting`
     /// names the detour's setting in the log, and `purpose` the download in errors.
     pub(crate) async fn decide(
