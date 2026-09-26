@@ -242,7 +242,6 @@ struct SupervisorState {
     flights: HashMap<uuid::Uuid, Flight>,
     pending: VecDeque<uuid::Uuid>,
     stop: watch::Sender<bool>,
-    paused: bool,
     pause_failure: Option<String>,
 }
 
@@ -260,7 +259,6 @@ impl SupervisorState {
             flights: HashMap::new(),
             pending: VecDeque::new(),
             stop: watch::channel(false).0,
-            paused: false,
             pause_failure: None,
         }
     }
@@ -273,7 +271,7 @@ impl SupervisorState {
         if matches!(provider.schedule, ProviderSchedule::Deferred) {
             return;
         }
-        if self.paused || self.flights.contains_key(&id) {
+        if self.flights.contains_key(&id) {
             return;
         }
         self.flights.insert(
@@ -288,9 +286,6 @@ impl SupervisorState {
     }
 
     fn start_pending(&mut self, limit: usize) {
-        if self.paused {
-            return;
-        }
         while self.fetches.len() + self.publications.len() < limit {
             let Some(id) = self.pending.pop_front() else {
                 break;
@@ -412,7 +407,7 @@ impl SupervisorState {
                         .then_some("publication_degraded");
                 observed.load
             }
-            (Err("supervisor_paused" | "supervisor_stopped"), Some(observed)) => observed.load,
+            (Err("supervisor_stopped"), Some(observed)) => observed.load,
             (_, Some(observed)) => {
                 observed.load.error = Some(
                     result
@@ -446,7 +441,6 @@ impl SupervisorState {
     fn fetched(&mut self, completion: FetchCompletion, command_tx: &mpsc::Sender<ControlCommand>) {
         let id = completion.authorized.subscription.id;
         match completion.result {
-            Some(Ok(_)) if self.paused => self.finish(id, Err("supervisor_paused")),
             Some(Ok(nodes)) => {
                 let command_tx = command_tx.clone();
                 let task = self.publications.spawn(async move {
@@ -471,7 +465,7 @@ impl SupervisorState {
                 warn!(%error, "Subscription refresh failed; keeping active nodes");
                 self.finish(id, Err(super::failure_code(&error)));
             }
-            None => self.finish(id, Err("supervisor_paused")),
+            None => self.finish(id, Err("supervisor_stopped")),
         }
     }
 
@@ -481,10 +475,6 @@ impl SupervisorState {
         subscription: Subscription,
         operation: crate::native_api::providers::RefreshOperation,
     ) {
-        if self.paused {
-            operation.reject(crate::native_api::providers::paused());
-            return;
-        }
         let id = subscription.id;
         let Some(provider) = self.providers.get_mut(&id) else {
             operation.reject(crate::native_api::providers::not_refreshable());
@@ -517,11 +507,10 @@ impl SupervisorState {
         self.pending.push_back(id);
     }
 
-    async fn pause_fetches(&mut self, reason: &'static str) -> anyhow::Result<()> {
-        self.paused = true;
+    async fn stop_fetches(&mut self) -> anyhow::Result<()> {
         self.stop.send_replace(true);
         while let Some(id) = self.pending.pop_front() {
-            self.finish(id, Err(reason));
+            self.finish(id, Err("supervisor_stopped"));
         }
         if let Err(error) = self.manager.pause_network().await {
             self.pause_failure.get_or_insert_with(|| error.to_string());
@@ -536,7 +525,7 @@ impl SupervisorState {
                             warn!(%error, "Subscription refresh failed; keeping active nodes");
                             self.finish(id, Err("fetch_failed"));
                         }
-                        Some(Ok(_)) | None => self.finish(id, Err(reason)),
+                        Some(Ok(_)) | None => self.finish(id, Err("supervisor_stopped")),
                     }
                 }
                 Err(error) => {
@@ -557,7 +546,7 @@ impl SupervisorState {
     }
 
     async fn shutdown(&mut self) -> anyhow::Result<()> {
-        let result = self.pause_fetches("supervisor_stopped").await;
+        let result = self.stop_fetches().await;
         // An admitted merge may already have committed; retain its acknowledgement owner.
         while let Some(result) = self.publications.join_next_with_id().await {
             match result {
@@ -668,7 +657,7 @@ impl SupervisorState {
                     },
                     None => {}
                 },
-                _ = ticks.tick(), if !self.paused => {
+                _ = ticks.tick() => {
                     let now = Instant::now();
                     let due: Vec<_> = self.providers.iter_mut().filter_map(|(id, provider)| {
                         match provider.schedule {

@@ -561,14 +561,6 @@ pub(crate) fn busy() -> ApiError {
         None,
     )
 }
-pub(crate) fn paused() -> ApiError {
-    ApiError::new(
-        StatusCode::CONFLICT,
-        ErrorCode::StateConflict,
-        "Provider refresh is unavailable while the runtime is stopping.",
-        None,
-    )
-}
 pub(crate) fn not_refreshable() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
