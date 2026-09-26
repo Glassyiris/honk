@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use honk_config::Config;
 use honk_config::diagnostic::{
-    DetailedDiagnostic, SafeValue, SettingPath, SourceRef, finish_attempt,
+    DetailedDiagnostic, SafeValue, SettingPath, SettingSegment, SourceRef, finish_attempt,
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
@@ -163,7 +163,10 @@ fn capture_inner(
     .map_err(|cause| dependency_error(source, "config", cause))?;
     config.append_diagnostics(source.clone(), diagnostics);
     config.validate_detailed().map_err(|mut error| {
-        error.diagnostic.source = source.clone();
+        error.diagnostic.source = validated_subscription(&config, &error)
+            .and_then(|subscription| declaring_source(&sources, subscription))
+            .unwrap_or(source)
+            .clone();
         error
     })?;
     crate::subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
@@ -186,6 +189,7 @@ fn capture_inner(
             .enumerate()
             .filter(|(_, sub)| sub.enabled)
         {
+            let declared = declaring_source(&sources, subscription).unwrap_or(source);
             if deferred.iter().any(|owner| {
                 crate::subscription::same_subscription_source_spec(owner, subscription)
             }) {
@@ -193,7 +197,7 @@ fn capture_inner(
             }
             let cached = match store.as_ref().map(|store| store.find(subscription)) {
                 Some(Ok(cached)) => cached,
-                Some(Err(cause)) => return Err(dependency_error(source, "subscription", cause)),
+                Some(Err(cause)) => return Err(dependency_error(declared, "subscription", cause)),
                 None => None,
             };
             // The runtime starts a never-fetched subscription with no nodes and
@@ -202,7 +206,7 @@ fn capture_inner(
             let Some(body) = cached else {
                 diagnostics.push(DetailedDiagnostic::warning(
                     "subscription-not-fetched",
-                    source.clone(),
+                    declared.clone(),
                     SettingPath::new("subscription").index(index + 1),
                     SafeValue::Redacted,
                     "subscription has not been fetched yet; its nodes join after the first fetch",
@@ -214,10 +218,10 @@ fn capture_inner(
                 .stored(label, length, DependencyReader::Subscription(index), || {
                     body.read()
                 })
-                .map_err(|cause| dependency_error(source, "subscription", cause))?;
+                .map_err(|cause| dependency_error(declared, "subscription", cause))?;
             let contents = std::str::from_utf8(&contents).map_err(|_| {
                 error(
-                    source,
+                    declared,
                     "subscription",
                     "invalid-offline-dependency",
                     "cached subscription is not valid UTF-8",
@@ -228,7 +232,7 @@ fn capture_inner(
                 parse_subscription_content_with_diagnostics(subscription, contents, &mut notices);
             // Decoded-provider coordinates are not coordinates in the referring dae document.
             for mut notice in notices.into_iter().filter(|notice| !notice.terminal) {
-                notice.source = source.clone();
+                notice.source = declared.clone();
                 notice.setting = SettingPath::new("subscription").index(index + 1);
                 notice.span = None;
                 notice.line = None;
@@ -239,7 +243,7 @@ fn capture_inner(
             }
             config.nodes.extend(nodes.map_err(|_| {
                 error(
-                    source,
+                    declared,
                     "subscription",
                     "invalid-offline-dependency",
                     "cached subscription contains no usable configuration",
@@ -356,6 +360,32 @@ fn canonical_asset(path: &Path) -> io::Result<PathBuf> {
         }
         result => result,
     }
+}
+
+/// The subscription a `subscriptions[n]` validation error names.
+fn validated_subscription<'a>(
+    config: &'a Config,
+    error: &DetailedConfigError,
+) -> Option<&'a honk_config::subscription::Subscription> {
+    match error.diagnostic.setting.0.as_slice() {
+        [
+            SettingSegment::Field("subscriptions"),
+            SettingSegment::Index(ordinal),
+            ..,
+        ] => config.subscriptions.get(ordinal.checked_sub(1)?),
+        _ => None,
+    }
+}
+
+fn declaring_source<'a>(
+    sources: &'a [SourceSnapshot],
+    subscription: &honk_config::subscription::Subscription,
+) -> Option<&'a SourceRef> {
+    let index = subscription.source?;
+    sources
+        .iter()
+        .map(|snapshot| &snapshot.source)
+        .find(|source| source.index() == index)
 }
 
 fn error(

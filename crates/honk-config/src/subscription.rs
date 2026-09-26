@@ -37,6 +37,10 @@ pub struct Subscription {
     /// Created at
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
+    /// Diagnostic source-table index of the dae file that declared this
+    /// subscription (`SourceRef::index`); `None` when it was not parsed from one.
+    #[serde(skip)]
+    pub source: Option<usize>,
 }
 
 fn default_update_interval() -> u64 {
@@ -59,6 +63,7 @@ impl Default for Subscription {
             last_updated: None,
             node_count: 0,
             created_at: Utc::now(),
+            source: None,
         }
     }
 }
