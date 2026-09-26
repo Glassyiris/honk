@@ -287,8 +287,6 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
-引擎 suspend 是显式关闭连接的无网络负载边界：停止独立 listener、关闭 provider query admission、取消并 join foreground lease/应答 I/O、refresh、DNS transport 与其协议任务。保留稳定 DnsService/controller、答案缓存、persister 和路由投影 owner；不把 controller 的终止关闭当可逆暂停。Resume 使用 accepted 的 hosts/geo/router 快照和保留缓存构建 fresh forwarder、DNS runtime/fork，仍共享进程物理资源 gate，不恢复旧 flight 或重放数据。已开始的阻塞系统解析必须实际结束并 join，取消 waiter 不是完成证明，因而总暂停时间不保证硬上限。
-
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
 
 路由发布在准入前拒绝旧代排队元数据；已准入查询保留原代 lease。20 位 carrier 使用持久化、启动周期内不回绕的分配器，也计入只替换 descriptor 的 NFQUEUE fence。失败预留值不复用，普通重启不重置耗尽；见[路由发布](./routing.md)。

@@ -12,7 +12,7 @@
 
 `Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-普通重载构建完整的替代 `GroupManager`，分别迁移 TCP/UDP Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。两种 API 的选择写入与 accepted-manager 替换通过同一 control/reload owner 串行化，不能确认对旧管理器的写入。因此读者只会看到完整旧图或新图。Suspend/resume 不是普通 reload：保留同一管理器及所有策略状态，只重建 transport/task owner。
+普通重载构建完整的替代 `GroupManager`，分别迁移 TCP/UDP Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。两种 API 的选择写入与 accepted-manager 替换通过同一 control/reload owner 串行化，不能确认对旧管理器的写入。因此读者只会看到完整旧图或新图。
 
 facade 与内部实现按职责拆分：
 

@@ -233,7 +233,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
-- `src/subscription.rs` 负责拉取、解析与 FD 相对的正文持久化。`subscription/supervisor.rs` 将当前授权及 deferred/可刷新调度状态放在同一 provider record；`supervisor/startup.rs` 恢复缓存正文并执行共用五秒启动宽限。启动与稳态使用同一 supervisor state；在途工作独立保留捕获的 revision 与发布确认，暂停/关闭等待其结束，reconcile 不丢弃可能已提交的确认。
+- `src/subscription.rs` 负责拉取、解析与 FD 相对的正文持久化。`subscription/supervisor.rs` 将当前授权及 deferred/可刷新调度状态放在同一 provider record；`supervisor/startup.rs` 恢复缓存正文并执行共用五秒启动宽限。启动与稳态使用同一 supervisor state；在途工作独立保留捕获的 revision 与发布确认，关闭等待其结束，reconcile 不丢弃可能已提交的确认。
 - 守护进程的拉取/恢复路径与 `honk-tool sub` 的本地文件共用正文格式检测。`Simple`/`Custom` 接受 BOM、可换行的标准/URL-safe Base64、原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及 Surge/Surfboard/Loon/Quantumult X 记录。`src/subscription/json.rs` 与 `records.rs` 规范化外部记录，`clash.rs` 构造并校验类型化节点。
   只导入节点，不导入完整配置中的路由、DNS 或组。原生 JSON 保留以 Unicode 代理项对编码的名称。跳过不支持的节点，身份重复时保留首个可用节点，空结果不替换活动订阅。导入的 Trojan/AnyTLS/QUIC 节点必须使用 TLS，不会静默降级为明文。
   Clash 与 sing-box 的 TCP ALPN 归入共享 TLS 模型，而不是 TUIC 的 QUIC 字段。共享构造器的跳过告警只包含从 1 开始的代理序号和静态拒绝原因，不包含原始节点记录或凭据。
@@ -280,23 +280,15 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 
 原生 mode 资源因固定 PUT 契约缺少生命周期冲突及 owner/backend 不可用的响应而暂缓；同一 capability 覆盖读写，所以 GET/HEAD/PUT 均返回 `404 capability_not_supported`。内部临时模式、Clash 控制与上述激活 reset 不受影响。
 
-### 暂停、恢复与终止所有权
+### 终止所有权
 
-Suspend/resume 是由唯一 control command owner 执行的引擎生命周期，原生 API 不提供该操作。暂停先关闭 datapath admission 和 NFQUEUE readiness，完成 epoch fence 与 held verdict 排空；停止/join TCP accept（含 pre-ID sniff/dial）、UDP initializer/view/source driver/退役 worker、独立 DNS listener、健康与按需探测、预热/预连接、协议 session 后台任务、订阅网络及接口 watcher 扫描。只有真实 owner 全部停止才发布 suspended，不能用暂停健康检查代替无负载状态。暂停期间拒绝新网络工作、模式/组修改和配置激活；API 的内存观测仍可用。
+`control/lifecycle/teardown.rs` 共用网络清理支持存在或不存在 listener epoch，涵盖部分启动。独立 DNS supervisor 保留已回收 child 的失败，并经 joined teardown 传播；主动关闭导致的取消是中性的，但 owner panic 会使清理失败。
 
-`control/lifecycle/teardown.rs` 共用网络清理支持存在或不存在 listener epoch，涵盖部分启动和恢复失败。独立 DNS supervisor 保留已回收 child 的失败，并经 joined teardown 传播；主动关闭导致的取消是中性的，但 owner panic 不能产生成功暂停。
+网络维护任务属于 `RuntimeEpoch`。延迟缓存 writer 属于进程，仅在终止关闭时 join。
 
-网络维护任务属于 `RuntimeEpoch`，恢复时重新创建。延迟缓存 writer 属于进程，跨暂停继续周期快照，仅在终止关闭时 join；恢复不重复执行启动缓存恢复。
+已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。阶段 deadline 超过后仍保有 join，不丢弃线程继续运行。终止关闭先关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间。
 
-保留同一 API/operation owner、instance、accepted 配置/来源、router/compiled plan、GroupManager（含 Selector/Fallback/轮询/Score 状态）、mode/settings、统计、DNS 缓存与留存历史；留存期限仍正常生效。程序、maps 与自有 TC/cgroup/sk_lookup hooks 可保留，但 admission 关闭时 TC pass-through，附着不表示 active。接口 watcher 保留真实 attached map，在暂停确认后不再改 hook 或扫描网络。
-
-恢复从 accepted 内存配置与 hosts/geodata artifact 重建 fresh runtime/listener、UDP pool、DNS fork 与协议任务 owner，不从磁盘悄悄 reload，也不复用已终止的 transport。新的 owner 继续共用原进程 FD/dial/carrier gate；完整重查拓扑，确认 listeners/routing/NFQUEUE 就绪后最后打开 admission。旧连接不会恢复，取消的流量与订阅正文不会重放；provider/network 通知不改变 retained settings/mode。安全清理完成的恢复失败保持 suspended；fence 或清理不确定则 failed 并终止。已经发布的新 userspace generation 不因后续 reopen 失败伪装成旧代，operation 分别报告 committed/current generation。
-
-恢复先让 DNS query acquisition 就绪，再重开 pending/NFQUEUE/datapath 准入。主动健康检查与按需探测调度仍在入口开放后恢复；DNS 就绪失败时保留 candidate 栅栏，交给原有 joined cleanup。
-
-已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。阶段 deadline 超过后仍保有 join，不能声称十秒内一定暂停或丢弃线程继续运行。终止关闭具有不同顺序：关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间，shutdown 优先于恢复，不在半完成 transition 中遗失任务所有权。
-
-健康检查 owner 的五秒 drain deadline 遵循同一规则：暂停和终止关闭均等待同一个 drain 完成，包括健康检查持有的阻塞解析任务，然后才返回 deadline 错误。若在超时后的清理中发现子任务失败，该失败优先于 deadline 错误返回。
+健康检查 owner 的五秒 drain deadline 遵循同一规则：终止关闭等待 drain 完成，包括健康检查持有的阻塞解析任务，然后才返回 deadline 错误。若在超时后的清理中发现子任务失败，该失败优先于 deadline 错误返回。
 
 ## Clash API 与 cache DB
 
