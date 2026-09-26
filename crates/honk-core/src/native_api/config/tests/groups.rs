@@ -266,5 +266,94 @@ async fn group_patch_check_url_rewrites_the_source_and_reregisters_the_probe() {
         );
         previous = url;
     }
+}
+
+#[tokio::test]
+async fn automatic_group_pin_is_reported_and_cleared_per_network() {
+    let fixture = Fixture::new_custom(Access::Metadata, false, |_, files| {
+        files.insert(
+            "editable.dae",
+            "node {\n a: 'socks5://127.0.0.1:1081'\n b: 'socks5://127.0.0.1:1082'\n}\ngroup {\n auto {\n  filter: name(a, b)\n  policy: fallback\n }\n manual {\n  filter: name(a, b)\n  policy: select\n }\n}\n"
+                .into(),
+        );
+    })
+    .await;
+    let groups = fixture.get("/api/v1/groups").await;
+    let id = |name: &str| {
+        groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["name"] == name)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (auto, manual) = (id("auto"), id("manual"));
+    let group = fixture.get(&format!("/api/v1/groups/{auto}")).await;
+    assert_eq!(group["capabilities"]["can_override"], true);
+    let member = group["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["name"] == "b")
+        .unwrap()["id"]
+        .clone();
+    let selection = format!("/api/v1/groups/{auto}/selection");
+    let pinned = ok(fixture
+        .request(Method::PUT, &selection)
+        .header("content-type", "application/json")
+        .body(json!({ "member_id": member, "network": "both" }).to_string())
+        .send()
+        .await
+        .unwrap())
+    .await;
+    assert_eq!(pinned["source"], "override");
+    let group = fixture.get(&format!("/api/v1/groups/{auto}")).await;
+    for network in ["tcp", "udp"] {
+        let current = &group["runtime"]["selection"][network];
+        assert_eq!(current["member_id"], member);
+        assert_eq!(current["source"], "override");
+    }
+
+    let clear = |query: &'static str, path: &str| {
+        fixture.request(Method::DELETE, &format!("{path}{query}"))
+    };
+    let cleared = ok(clear("?network=tcp", &selection).send().await.unwrap()).await;
+    assert_eq!(cleared["network"], "tcp");
+    assert_ne!(cleared["selection"]["tcp"]["source"], "override");
+    assert_eq!(cleared["selection"]["udp"]["member_id"], member);
+    assert_eq!(cleared["selection"]["udp"]["source"], "override");
+    assert_ne!(cleared["selection_revision"], pinned["selection_revision"]);
+    let again = ok(clear("?network=tcp", &selection).send().await.unwrap()).await;
+    assert_eq!(again["selection"], cleared["selection"]);
+    assert_eq!(again["selection_revision"], cleared["selection_revision"]);
+
+    let manual = fixture.get(&format!("/api/v1/groups/{manual}")).await;
+    assert_eq!(manual["capabilities"]["can_override"], false);
+    error(
+        clear(
+            "",
+            &format!(
+                "/api/v1/groups/{}/selection",
+                manual["id"].as_str().unwrap()
+            ),
+        )
+        .send()
+        .await
+        .unwrap(),
+        StatusCode::CONFLICT,
+        "state_conflict",
+    )
+    .await;
+
+    // The UDP pin still stands; an activation drops it.
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = fixture.get(&format!("/api/v1/groups/{auto}")).await;
+    for network in ["tcp", "udp"] {
+        assert_ne!(group["runtime"]["selection"][network]["source"], "override");
+    }
     fixture.shutdown().await;
 }

@@ -555,6 +555,21 @@ fn member_id(member: NativeGroupMember<'_>, identity: &CatalogIdentity) -> Optio
     }
 }
 
+/// A group's current `{tcp, udp}` selections, `null` where none is formed.
+pub(crate) fn runtime_selection(
+    manager: &GroupManager,
+    identity: &CatalogIdentity,
+    group_name: &str,
+) -> Value {
+    let group = manager.native_group(group_name);
+    let [tcp, udp] = [SelectionNetwork::Tcp, SelectionNetwork::Udp].map(|network| {
+        group.map_or(Value::Null, |group| {
+            selection(manager, group, network, identity)
+        })
+    });
+    json!({ "tcp": tcp, "udp": udp })
+}
+
 fn selection(
     manager: &GroupManager,
     group: &Group,
@@ -571,6 +586,7 @@ fn selection(
         "member_id": member_id,
         "resolved_leaf_node_id": selection.leaf.map(|node| node.id.to_string()),
         "source": match group.policy {
+            _ if manager.has_override(&group.name, network) => "override",
             GroupPolicy::Selector => "runtime",
             GroupPolicy::URLTest => "health",
             _ => "policy",
@@ -683,7 +699,7 @@ fn group_value(
     });
     result["runtime"] = json!({ "selection": { "tcp": tcp, "udp": udp }, "health": group_health(manager, group, identity, alive) });
     result["capabilities"] = json!({
-        "can_select": group.policy == honk_config::group::GroupPolicy::Selector, "can_override": false, "supports_nested_groups": true,
+        "can_select": group.policy == honk_config::group::GroupPolicy::Selector, "can_override": group.policy != honk_config::group::GroupPolicy::Selector, "supports_nested_groups": true,
         "mutable_config": [], "probe_transports": ["tcp", "udp"]
     });
     result

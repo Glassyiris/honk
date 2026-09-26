@@ -6,7 +6,7 @@
 
 本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
-基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
+基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。采用该后续 bundle 的自动策略 override（固定成员与 DELETE selection），不采用其 mode 变更：原生 mode 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -26,6 +26,7 @@
 | DELETE | `/api/v1/nodes/{id}` | 删除主文件 inline 节点；激活后返回 `{deleted:0\|1}`。 |
 | GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision/ETag 与捕获的健康数据。 |
 | PUT | `/api/v1/groups/{groupId}/selection` | 按直接成员 ID 设置 Selector 的 `tcp`、`udp` 或 `both` 选择。 |
+| DELETE | `/api/v1/groups/{groupId}/selection` | 清除自动策略组在 `tcp`、`udp` 或 `both` 上的固定成员。 |
 | PATCH | `/api/v1/groups/{groupId}` | 对可写 `.dae` 来源执行受限 JSON Patch，返回真实更新 operation。 |
 | GET | `/api/v1/events` | 有界且需认证的 SSE，支持绑定过滤器的续传游标。 |
 | GET | `/api/v1/runtime/outbounds` | 共用计数生命周期内按 `kind/name` 区分的全宽出站计数。 |
@@ -145,7 +146,7 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 返回通过配置校验并应用监听凭据遮罩的 HTTP(S)/data URI，未配置为 null，不猜测或抓取图标。
 
-Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，network 必填且接受 `tcp/udp/both`。TCP 与 UDP 分开保存，`both` 一次校验并原子发布；自动策略拒绝手动选择。原生与 Clash 写入都由共同 control/reload owner 串行化，Clash 写入等价于 both，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧 owner，而非按当前可达叶名称删除记录；已有选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
+Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，network 必填且接受 `tcp/udp/both`。TCP 与 UDP 分开保存，`both` 一次校验并原子发布；对自动策略组（`can_override: true`）的写入会固定该成员，报告 `source: override`；固定成员不可用时不改选同组其他成员。固定只存在于运行时，不持久化，每次配置激活（包括订阅刷新）都会清除，健康检查照常执行。`DELETE /groups/{groupId}/selection?network=` 清除 `tcp`、`udp` 或 `both`（默认）的固定，返回 `GroupOverrideCleared` 与各网络当前选择；未固定的网络保持原选择，对 Selector 返回 `409 state_conflict`。原生与 Clash 写入都由共同 control/reload owner 串行化，Clash 写入等价于 both，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧 owner，而非按当前可达叶名称删除记录；已有选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
 
 组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`、`/config/check_url`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数；`check_url` 为 null，或以小写 `http://`/`https://` 开头、含主机的 URL，不含 userinfo、空白、控制字符与逗号，也不同时含单引号和双引号；PATCH 写入 GET 显示且探测实际发送的规范化形式（去掉 fragment、空路径补 `/`、主机转小写、省略默认端口），不超过 2048 字节，`test` 也按此形式比较。Selector 组接受并保存 `check_url`，但不据此探测。此接口不改成员列表或 icon。
 

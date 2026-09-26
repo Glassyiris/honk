@@ -329,7 +329,7 @@ Shutdown preserves the existing accepted-flow drain grace before joined teardown
 
 The health-check owner's five-second drain deadline follows the same rule: terminal shutdown waits for the drain to finish, including health-owned blocking resolver jobs, before returning the deadline error. A child failure observed during that late cleanup takes precedence over the deadline error.
 
-When native is enabled, the engine and Clash share one transient mode/target/origin owner: startup and accepted explicit activation (including no-op) reset rule/settings; provider/network refresh preserves them. A backend mode-reset failure retains previous mode/source: before commit it rejects activation; after routing commit it reports committed-degraded and fences admission. Settings still reset at accepted commit. Global mode retains stable identity and fails closed if that target disappears. With native disabled, existing Clash cached/default mode behavior is unchanged. Native mode and automatic-policy overrides remain gated.
+When native is enabled, the engine and Clash share one transient mode/target/origin owner: startup and accepted explicit activation (including no-op) reset rule/settings; provider/network refresh preserves them. A backend mode-reset failure retains previous mode/source: before commit it rejects activation; after routing commit it reports committed-degraded and fences admission. Settings still reset at accepted commit. Global mode retains stable identity and fails closed if that target disappears. With native disabled, existing Clash cached/default mode behavior is unchanged. Native mode remains gated.
 
 ## Clash API and cache DB
 

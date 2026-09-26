@@ -7,8 +7,9 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl GroupManager {
-    /// Resolve the configured member before health filtering, so an
-    /// unavailable choice cannot redirect traffic to a sibling member.
+    /// Resolve the configured member, or an automatic group's pin, before
+    /// health filtering, so an unavailable choice cannot redirect traffic to
+    /// a sibling member.
     pub(super) fn selector_member<'a>(
         &'a self,
         group: &'a Group,
@@ -24,7 +25,11 @@ impl GroupManager {
         state: &SelectorState,
     ) -> Option<GroupMember<'a>> {
         if group.policy != GroupPolicy::Selector {
-            return None;
+            return state
+                .overrides
+                .get(&group.name)
+                .and_then(|pins| pins[network.slot()].as_ref())
+                .and_then(|identity| self.member_by_identity(group, identity));
         }
         state
             .choices

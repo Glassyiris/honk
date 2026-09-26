@@ -390,7 +390,16 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                         respond(groups::select(&state, &group_id, request, &id).await, id)
                     },
                 )
-                .delete(unsupported),
+                .delete(
+                    |State(state): App, Extension(id): Id, request: Request| async move {
+                        let group_id =
+                            path_id(request.uri().path().trim_end_matches("/selection")).to_owned();
+                        respond(
+                            groups::clear_override(&state, &group_id, request.uri(), &id).await,
+                            id,
+                        )
+                    },
+                ),
                 &["PUT", "DELETE"],
             ),
         )

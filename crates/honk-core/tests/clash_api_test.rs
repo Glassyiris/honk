@@ -540,6 +540,68 @@ async fn test_score_proxy_contract_and_put_rejection() {
 }
 
 #[tokio::test]
+async fn test_automatic_group_pin_is_reported_as_now() {
+    use honk_outbound::group::{SelectorMember, SelectorNetworks};
+
+    let (a, b) = (make_node("node-a"), make_node("node-b"));
+    for policy in [
+        GroupPolicy::URLTest,
+        GroupPolicy::Fallback,
+        GroupPolicy::LoadBalance,
+        GroupPolicy::Score,
+    ] {
+        let app = spawn_app_with_config(
+            Config {
+                nodes: vec![a.clone(), b.clone()],
+                groups: vec![Group {
+                    name: "auto".into(),
+                    policy,
+                    nodes: vec![a.id, b.id],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "",
+            "",
+        )
+        .await;
+        let client = http_client();
+        let now = || async {
+            let body: serde_json::Value = client
+                .get(app.url("/proxies"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let single: serde_json::Value = client
+                .get(app.url("/proxies/auto"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(body["proxies"]["auto"]["now"], single["now"], "{policy:?}");
+            single["now"].clone()
+        };
+        let before = now().await;
+        let manager = app.state.group_manager.read().clone();
+        manager
+            .publish_override("auto", &SelectorMember::Node(b.id), SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(now().await, "node-b", "{policy:?}");
+        manager
+            .clear_override("auto", SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(now().await, before, "{policy:?}");
+    }
+}
+
+#[tokio::test]
 async fn score_stats_are_authenticated_deterministic_and_private() {
     use honk_outbound::group::{ScoreSelectionContext, ScoreTarget, SelectionNetwork};
 
