@@ -67,6 +67,11 @@ impl Worker {
                     }
                     _ => unavailable(),
                 };
+                let error = if written {
+                    error.without_retry_after()
+                } else {
+                    error
+                };
                 self.service.operations.reject(id, error);
                 *self.service.recording.write() = RecordState::Idle;
                 return;

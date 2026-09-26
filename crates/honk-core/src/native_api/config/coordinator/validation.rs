@@ -25,7 +25,7 @@ impl Worker {
                 let path=source.path.as_deref();
                 let resolved=if request.mode=="syntax" {PathBuf::from(path.map(str::to_owned).unwrap_or_else(||format!("source-{}.dae",index+1)))}
                     else if index==0 {
-                        if let Some(path)=path {let supplied=store.resolve(path)?;if supplied!=entry{return Err(denied());}}
+                        if let Some(path)=path {let supplied=store.resolve(path)?;if supplied!=entry{return Err(invalid());}}
                         entry.clone()
                     }else if let Some(path)=path { store.resolve(path)? }
                     else if let Some(path)=source.id.as_ref().and_then(|id|accepted.as_ref()?.ids.iter().find(|(_,value)|*value==id).map(|(path,_)|path.clone())) { path }

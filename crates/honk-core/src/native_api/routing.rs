@@ -255,14 +255,7 @@ async fn evaluate_current(
         Ok((evaluation, generation))
     })
     .await
-    .map_err(|_| {
-        error(
-            StatusCode::CONFLICT,
-            ErrorCode::SnapshotUnavailable,
-            "Routing snapshot is unavailable",
-            id,
-        )
-    })?
+    .map_err(|_| unavailable(id))?
 }
 
 pub(super) async fn trace(

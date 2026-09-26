@@ -129,8 +129,8 @@ pub(in crate::native_api) async fn replace(
     if !state.observation.configuration.writable() {
         return Err(denied());
     }
+    let expected = if_match(&request)?;
     json_type(&request)?;
-    let expected = if_match(&request);
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
     let path = request.uri().path().to_owned();
     let bytes = axum::body::to_bytes(request.into_body(), 65536)

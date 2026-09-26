@@ -1,6 +1,8 @@
 mod completion;
 mod geodata;
 mod revisions;
+#[cfg(test)]
+mod tests;
 mod validation;
 
 use super::super::management::{self, Completion, Mutation};
@@ -477,7 +479,7 @@ impl Worker {
             .prepare_replace(
                 &accepted.ids[&main.path],
                 content,
-                Ok(accepted.hashes[0].clone()),
+                accepted.hashes[0].clone(),
                 Some(accepted.revision.clone()),
                 match &mutation {
                     Mutation::CreateProvider(input) => Some(input.name.clone()),
@@ -650,7 +652,7 @@ impl Worker {
             .get(&patch.name)
             .ok_or_else(not_found)?;
         if !self.service.source_writable(&accepted, index) {
-            return Err(denied());
+            return Err(super::super::groups::read_only());
         }
         let changes = patch.changes()?;
         let content = honk_config::parser::source_edit::edit_group_source(
@@ -681,7 +683,7 @@ impl Worker {
         self.prepare_replace(
             &accepted.ids[&accepted.update.sources[index].path],
             content,
-            Ok(accepted.hashes[index].clone()),
+            accepted.hashes[index].clone(),
             Some(patch.revision),
             None,
             principal,
@@ -695,12 +697,11 @@ impl Worker {
         &self,
         source_id: &str,
         content: String,
-        expected: Result<String, ApiError>,
+        expected: String,
         group_revision: Option<String>,
         new_provider: Option<String>,
         principal: &str,
     ) -> Result<Prepared, ApiError> {
-        let expected = expected?;
         if content.len() > MAX_SOURCE_BYTES {
             return Err(too_large());
         }
@@ -933,7 +934,7 @@ fn write_error(error: WriteError) -> ApiError {
         WriteError::InvalidUtf8 => invalid(),
         WriteError::Unavailable => unavailable().with_details(json!({"stage":"write"})),
         WriteError::ChangedButNotDurable => {
-            unavailable().with_details(json!({"stage":"durability","written":true,"durability_confirmed":false,"committed":false}))
+            unavailable().with_details(json!({"stage":"durability","written":true,"durability_confirmed":false,"committed":false})).without_retry_after()
         }
     }
 }

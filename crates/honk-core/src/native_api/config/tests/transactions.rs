@@ -501,6 +501,48 @@ async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
         assert_eq!(disk(fixture.directory.path()), before_disk);
         assert_eq!(fixture.get(CONFIG).await, before);
     }
+    // The precondition is checked before the media type and body.
+    for (condition, content_type, body, status, code) in [
+        (
+            None,
+            "text/plain",
+            "{}",
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+        ),
+        (
+            None,
+            "application/json",
+            "not json",
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+        ),
+        (
+            Some("*".to_owned()),
+            "text/plain",
+            "{}",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some(strong.clone()),
+            "text/plain",
+            "{}",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ),
+    ] {
+        let request = fixture
+            .request(Method::PUT, &source_path(main))
+            .header("content-type", content_type)
+            .body(body);
+        let request = if let Some(condition) = condition {
+            request.header("if-match", condition)
+        } else {
+            request
+        };
+        error(request.send().await.unwrap(), status, code).await;
+    }
     let invalid = fixture.originals["main.dae"].replace(
         "nfqueue_enable: false",
         "nfqueue_enable: private-invalid-value",
@@ -638,4 +680,31 @@ async fn source_replacement_preserves_text_mode_and_independent_revision_generat
     fixture.assert_last_reload(&terminal).await;
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn written_source_whose_reload_cannot_dispatch_is_not_retryable() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]).clone();
+    // Stop the engine after admission checks and before the reload is dispatched.
+    let commands = fixture.commands.clone();
+    *fixture.service.before_replace.lock() = Some(Box::new(move || {
+        commands.blocking_send(ControlCommand::Shutdown).unwrap();
+        let started = std::time::Instant::now();
+        while !commands.is_closed() {
+            assert!(started.elapsed() < WAIT, "control loop did not stop");
+            std::thread::yield_now();
+        }
+    }));
+    let content = format!("{}# written\n", fixture.originals["main.dae"]);
+    let response = fixture.replace(&main, &content).send().await.unwrap();
+    assert!(response.headers().get("retry-after").is_none());
+    let failure = error(
+        response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
+    assert_eq!(failure["error"]["details"]["written"], true);
 }

@@ -59,6 +59,15 @@ fn invalid() -> ApiError {
     )
 }
 
+pub(super) fn read_only() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        ErrorCode::CapabilityNotSupported,
+        "Group source is not writable",
+        None,
+    )
+}
+
 fn unsupported() -> ApiError {
     ApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -259,12 +268,7 @@ pub(super) async fn patch(
     parse_query(request.uri(), &[], id)?;
     let service = &state.observation.configuration;
     if !service.writable() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            ErrorCode::PermissionDenied,
-            "Group source is not writable",
-            None,
-        ));
+        return Err(read_only());
     }
     if config::request_header(&request, "content-type")?
         .and_then(|value| value.split(';').next())
@@ -316,7 +320,7 @@ pub(super) async fn patch(
         })?;
     let operations: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     let reservation = state.observation.operations.reserve(
-        "control",
+        state.principal(),
         "PATCH",
         &path,
         key.as_deref(),

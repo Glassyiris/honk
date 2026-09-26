@@ -293,7 +293,7 @@ async fn import_export_and_activate_record_revisions() {
         .send()
         .await
         .unwrap();
-    error(response, StatusCode::CONFLICT, "already_initialized").await;
+    error(response, StatusCode::CONFLICT, "state_conflict").await;
 
     let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
     std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();

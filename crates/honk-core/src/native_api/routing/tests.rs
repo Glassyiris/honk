@@ -640,3 +640,20 @@ fn observed_route_budget_only_truncates_evidence_never_decisions() {
     assert!(observed.truncated);
     assert_eq!(router.route(&miss), "fallback");
 }
+
+#[tokio::test]
+async fn lock_wait_past_deadline_is_retryable_unavailable() {
+    let state = crate::native_api::tests::state().await;
+    let _reload = state.traffic_router.write().await;
+    let error = evaluate_current(
+        &state,
+        &destination(),
+        Instant::now() + Duration::from_millis(20),
+        &RequestId("test".into()),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.headers()["retry-after"], "1");
+}
