@@ -406,7 +406,17 @@ where
                 body: std::sync::Arc::from([]),
             });
         }
-        if response.headers().contains_key("content-encoding") {
+        // The request asks for identity, so only identity may come back.
+        if response
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .any(|value| {
+                !value
+                    .to_str()
+                    .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity"))
+            })
+        {
             return Err("content_encoding_rejected");
         }
         if response

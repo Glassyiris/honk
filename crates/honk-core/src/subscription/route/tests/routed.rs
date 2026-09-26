@@ -523,3 +523,21 @@ async fn a_followed_redirect_with_a_location_that_is_not_text_fails() {
         .await;
     assert!(direct.is_err(), "direct fetch took the redirect body");
 }
+
+/// The request asks for identity, so an answer that names identity is
+/// taken and one that names a real encoding is not.
+#[tokio::test]
+async fn an_identity_content_encoding_is_accepted() {
+    for (encoding, accepted) in [(" Identity ", true), ("gzip", false)] {
+        let (address, _) = serve(move |_| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding:{encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                BODY.len()
+            )
+        })
+        .await;
+        let (routing, _) = routing("direct");
+        let result = manager(routing).fetch(&subscription(address, "")).await;
+        assert_eq!(result.is_ok(), accepted, "{encoding}: {result:?}");
+    }
+}
