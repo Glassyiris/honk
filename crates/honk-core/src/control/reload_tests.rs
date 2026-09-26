@@ -742,6 +742,34 @@ fn source_update(content: &str) -> crate::configuration::SourceUpdate {
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
+async fn native_generation_is_reloading_until_the_activation_returns() {
+    let mut cp = test_cp().await;
+    let native = Arc::new(crate::native_api::observation::NativeObservation::new(
+        &Config::default(),
+    ));
+    cp.native = Some(Arc::clone(&native));
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (observer, witness) = (Arc::clone(&native), Arc::clone(&seen));
+    let _hook_guard = cp.set_pre_dns_publication_hook(move |_| {
+        witness.store(observer.reloading(), std::sync::atomic::Ordering::SeqCst);
+    });
+    assert!(
+        cp.apply_runtime_config(
+            changed_routing_config(),
+            Default::default(),
+            &DrainTracker::new()
+        )
+        .await
+        .accepted()
+    );
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!native.reloading());
+    let generation = cp.diagnostics.read().generation;
+    assert!(native.activated_at(generation).is_some());
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
 async fn group_patch_revision_rejects_same_named_provider_replacement_before_activation() {
     let provider = honk_config::subscription::Subscription {
         name: "provider".into(),

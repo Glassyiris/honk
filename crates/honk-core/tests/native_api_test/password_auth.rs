@@ -69,6 +69,7 @@ async fn discovery_reports_the_mode_and_setup_state() {
     assert_eq!(body["auth"]["anonymous_loopback"], false);
     assert_eq!(body["links"]["auth_setup"], "/api/v1/auth/setup");
     assert_eq!(body["links"]["auth_login"], "/api/v1/auth/login");
+    assert!(body["links"].get("runtime_mode").is_none());
     let alias: Value = app
         .client
         .get(app.url("/api/v1/discovery"))

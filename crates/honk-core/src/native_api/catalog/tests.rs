@@ -570,3 +570,18 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     );
     assert_eq!(alive.native_observations(node.id), global);
 }
+
+#[test]
+fn manual_selector_reports_runtime_selection_source() {
+    let config = fixture();
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let identity = Catalog::new(&config).snapshot();
+    let value = selection(
+        &manager,
+        manager.native_group("child").unwrap(),
+        SelectionNetwork::Tcp,
+        &identity,
+    );
+    assert_eq!(value["member_id"], config.nodes[1].id.to_string());
+    assert_eq!(value["source"], "runtime");
+}

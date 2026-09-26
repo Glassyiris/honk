@@ -10,7 +10,7 @@ use super::super::{
     store::{Committed, SourceStore, StoreKind},
 };
 use super::*;
-use crate::configuration::{Activation, ActivationFailure, ActivationRequest};
+use crate::configuration::{Activation, ActivationRequest};
 use crate::control::{ControlCommand, LogFiles};
 use crate::subscription::SubscriptionSupervisorHandle;
 use honk_config::parser::LoadedConfig;
@@ -513,10 +513,11 @@ impl Worker {
                 deferred_provider: deferred,
             })
             .await;
-        self.record(committed, &completion)
+        let stored = self
+            .record(committed, &completion)
             .await
             .map_err(|details| unavailable().with_details(details))?;
-        completion.map_err(ActivationFailure::management_error)?;
+        completion.map_err(|failure| failure.management_error(stored))?;
         if mutation.deleting() {
             return Ok(Completion::Deleted(1));
         }

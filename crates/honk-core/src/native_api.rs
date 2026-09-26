@@ -386,7 +386,16 @@ fn timestamp(time: SystemTime) -> String {
 async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["detail"], id)?;
     let full = full_detail(&query, id)?;
-    let (generation, phase, healthy, config_revision, last_reload, datapath_observation) = {
+    let (
+        generation,
+        phase,
+        healthy,
+        reloading,
+        activated_at,
+        config_revision,
+        last_reload,
+        datapath_observation,
+    ) = {
         let _config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
         #[cfg(test)]
@@ -401,6 +410,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             generation,
             phase,
             state.healthy.load(Ordering::Acquire),
+            state.observation.reloading(),
+            state.observation.activated_at(generation),
             state.observation.configuration.sources.revision(),
             state.observation.configuration.last_reload(),
             state.backend.read().await.observe_datapath(),
@@ -409,6 +420,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
     let lifecycle = match phase {
         EnginePhase::Starting => "starting",
         EnginePhase::Running if !healthy => "degraded",
+        EnginePhase::Running if reloading => "reloading",
         EnginePhase::Running => "running",
         EnginePhase::Suspending => "draining",
         EnginePhase::Suspended => "suspended",
@@ -447,8 +459,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
         generation: Generation {
             active_id: format!("{}:{generation}", state.instance_id),
             config_revision,
-            state: "active",
-            activated_at: None,
+            state: if reloading { "reloading" } else { "active" },
+            activated_at: activated_at.map(timestamp),
         },
         datapath: datapath::summary(&datapath_observation, &state.instance_id, healthy),
         traffic,
@@ -679,6 +691,36 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "1");
+    }
+
+    #[tokio::test]
+    async fn runtime_reports_reloading_and_activation_time() {
+        let state = state().await;
+        let idle = runtime_body(&state).await;
+        assert_eq!(idle["generation"]["state"], "active");
+        let started = idle["generation"]["activated_at"]
+            .as_str()
+            .expect("startup generation has an activation time")
+            .to_owned();
+        let reloading = state.observation.begin_reload();
+        let during = runtime_body(&state).await;
+        assert_eq!(during["lifecycle"]["state"], "reloading");
+        assert_eq!(during["generation"]["state"], "reloading");
+        assert_eq!(during["generation"]["activated_at"], started.as_str());
+        drop(reloading);
+        {
+            let _writer = state.config.write().await;
+            state.diagnostics.write().generation = 1;
+        }
+        let uncommitted = runtime_body(&state).await;
+        assert!(uncommitted["generation"]["activated_at"].is_null());
+        state
+            .observation
+            .committed(state.observation.catalog.snapshot(), 0, 1);
+        let after = runtime_body(&state).await;
+        assert_eq!(after["lifecycle"]["state"], "running");
+        assert_eq!(after["generation"]["state"], "active");
+        assert!(after["generation"]["activated_at"].as_str().unwrap() >= started.as_str());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

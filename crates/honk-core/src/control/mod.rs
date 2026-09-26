@@ -234,6 +234,11 @@ impl ControlPlane {
 
     #[cfg(feature = "native-api")]
     pub(crate) fn publish_phase(&self, phase: EnginePhase) {
+        if let Some(native) = &self.native
+            && phase == EnginePhase::Running
+        {
+            native.started(self.diagnostics.read().generation);
+        }
         if let Some(sender) = &self.phase {
             sender.send_replace(phase);
         }

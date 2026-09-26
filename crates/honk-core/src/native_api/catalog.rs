@@ -531,7 +531,11 @@ fn selection(
     json!({
         "member_id": member_id,
         "resolved_leaf_node_id": selection.leaf.map(|node| node.id.to_string()),
-        "source": if group.policy == GroupPolicy::URLTest { "health" } else { "policy" }
+        "source": match group.policy {
+            GroupPolicy::Selector => "runtime",
+            GroupPolicy::URLTest => "health",
+            _ => "policy",
+        }
     })
 }
 

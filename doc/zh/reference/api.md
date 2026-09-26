@@ -60,7 +60,7 @@
 
 单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；503 不表示已完成的关闭回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
 
-TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 与 activation 时间仍未知；有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
+TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 仍未知。`generation.activated_at` 是当前 generation 的发布时间，启动 generation 取引擎首次进入运行状态的时间。配置激活或挂起后重建进行期间，`generation.state` 为 `reloading`；引擎运行且健康时，`lifecycle.state` 同为 `reloading`。有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
 所有认证模式都公开 `GET /api` 及其等价别名 `/api/v1/discovery`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
@@ -267,7 +267,7 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成功删除在激活后返回 `{"deleted":1}`；builtin、订阅派生节点、非主文件条目及不支持/歧义归属返回 `404 capability_not_supported`。静态 include 仍在 inline 下可见；固定客户端没有逐节点 writable 字段，因此显示的删除按钮仍可能被拒绝。仍被引用的条目须先修正引用，否则写前校验失败。编辑已有条目继续使用源 PUT，不新增 node/provider PATCH。
 
-这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`、`written`、`durability_confirmed`、`committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409；DELETE 的受限失败契约也将校验/冲突映射为 503。已耐久写入但激活被拒绝报告 written true/committed false，提交后降级报告 committed true，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
+这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`、`written`、`durability_confirmed`、`committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409；DELETE 的受限失败契约也将校验/冲突映射为 503。已耐久写入但激活被拒绝报告 written true/committed false；`--store db` 在激活前不写入，被拒绝时报告 written false；提交后降级报告 committed true，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 geodata。Geodata GET 按既有 router-before-config 锁序读取流量/DNS 保留元数据，不扫描磁盘、不联网；hash/大小属于已加载字节，不属于后来的磁盘外部编辑。未记录或不一致的修改时间为 null；`source_redacted` 保留字段名，在 GET 与成功操作结果中返回第一个下载 URL，并遮蔽监听凭据；没有 URL 的资产为 null。未使用资产不列出；互相冲突的已加载快照报告不可用，不任取其一。
 
@@ -276,7 +276,7 @@ DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成
 全部下载完成、解析并编译完整候选后才替换任何文件；新文件缺少当前配置使用的分类时，更新以 `asset_validation_failed` 失败，已加载文件保持不变。已加载文件位于 `global.data_dir` 或 `$DAE_LOCATION_ASSET` 时就地替换。已加载文件来自优先级更低的位置（例如软件包安装的 `/usr/share/honk`）时不会被覆写：更新改为在 `global.data_dir/<文件>` 新建文件，若该路径期间已出现文件则拒绝替换；此后查找顺序优先使用新文件。文件经无符号链接的父目录/文件 FD 打开，别名、字节/来源/依赖冲突和不安全路径均拒绝；父目录分量只在安全打开后做身份规范化。各文件独立原子替换并确认耐久，**不是多文件原子事务**；首个 rename 后失败保留逐资产 written/durability 信息，不自动撤回。真实 reload 在 no-op 与重建两条路径都使用不可变已验证 geo 快照，后续磁盘改动不能替换激活字节。成功结果来自实际发布的 GeoData；拒绝/降级仍失败并报告提交信息。重试前先修复磁盘冲突。
 缓存订阅仍参与准入依赖检查，但其指纹标签指向数据库行，不是文件路径。Geodata 更新通过 rename 前的最后一次重新捕获检查正文是否变化；只有真实文件依赖才取得 inode guard。
 
-`POST /geodata/update` 不带 body；同键幂等重放先于互斥检查，不同的在途请求返回 409，operation 容量满返回 503。`202` 只代表 daemon 接管，不代表文件或路由已变更。相同内容可以 no-op 完成，不伪造 generation.changed。
+`POST /geodata/update` 不带 body；同键幂等重放先于互斥检查，不同的在途请求返回 409，operation 容量满返回 503。`202` 只代表 daemon 接管，不代表文件或路由已变更。相同内容可以 no-op 完成，不伪造 generation.changed。更新进入激活阶段后（含 no-op）会写入 `runtime.last_reload`；激活前失败则不改变该字段。
 
 ### Geodata 来源与自动更新
 

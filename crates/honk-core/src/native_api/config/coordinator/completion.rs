@@ -24,7 +24,7 @@ impl ActivationFailure {
         }
     }
 
-    pub(super) fn management_error(self) -> ApiError {
+    pub(super) fn management_error(self, written: bool) -> ApiError {
         let stage = match self {
             Self::Unconfirmed => "activation_unconfirmed",
             failure => failure.reason().0,
@@ -34,7 +34,7 @@ impl ActivationFailure {
             Self::Degraded(_) | Self::Reconciliation(_) => Some(true),
             _ => Some(false),
         };
-        management::activation_error(stage, Some(true), Some(true), committed)
+        management::activation_error(stage, Some(written), Some(written), committed)
     }
 }
 
@@ -75,22 +75,25 @@ impl Worker {
         self.service.operations.accept(id);
         self.service.operations.running(id);
         let completion = self.activation.complete(pending).await;
-        if let Err(details) = self.record(committed, &completion).await {
-            let (code, message) = match completion {
-                Err(ActivationFailure::Unconfirmed) => ActivationFailure::Unconfirmed.reason(),
-                _ => (
-                    "store_unavailable",
-                    "Configuration is active but was not recorded",
-                ),
-            };
-            self.failed(id, code, message, Some(details));
-            return;
-        }
+        let stored = match self.record(committed, &completion).await {
+            Ok(stored) => stored,
+            Err(details) => {
+                let (code, message) = match completion {
+                    Err(ActivationFailure::Unconfirmed) => ActivationFailure::Unconfirmed.reason(),
+                    _ => (
+                        "store_unavailable",
+                        "Configuration is active but was not recorded",
+                    ),
+                };
+                self.failed(id, code, message, Some(details));
+                return;
+            }
+        };
         self.publish_operation(
             id,
             completion,
             group,
-            Some(json!({"written":written,"committed":false})),
+            Some(json!({"written":stored,"committed":false})),
         );
     }
 
@@ -101,23 +104,24 @@ impl Worker {
         }
     }
 
-    /// Records an activated candidate in the store; `Err` carries the failure details.
+    /// Records an activated candidate in the store. `Ok` says whether the store
+    /// now holds the candidate; `Err` carries the failure details.
     pub(super) async fn record(
         &self,
         committed: Committed,
         completion: &ActivationCompletion,
-    ) -> Result<(), Value> {
-        let Some(store) = &self.store else {
-            return Ok(());
-        };
+    ) -> Result<bool, Value> {
         if committed.written() {
-            return Ok(());
+            return Ok(true);
         }
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
         let result = match completion {
             Ok(_) | Err(ActivationFailure::Degraded(_) | ActivationFailure::Reconciliation(_)) => {
                 let writer = Arc::clone(store);
                 match tokio::task::spawn_blocking(move || writer.promote(committed)).await {
-                    Ok(Ok(())) => Ok(()),
+                    Ok(Ok(())) => Ok(true),
                     _ => {
                         store.block();
                         Err(json!({"stage":"store","committed":true,"durable":false}))
@@ -128,7 +132,7 @@ impl Worker {
                 store.block();
                 Err(json!({"stage":"store","committed":null}))
             }
-            Err(_) => Ok(()),
+            Err(_) => Ok(false),
         };
         *self.service.recording.write() = RecordState::Idle;
         result
@@ -185,11 +189,15 @@ impl Worker {
                     }
                 };
                 self.service.operations.succeed(id, result);
-                *self.service.last_reload.write() = Some(
-                    json!({"operation_id":id,"status":"succeeded","finished_at":timestamp(SystemTime::now()),"error":null}),
-                );
+                self.reloaded(id);
             }
         }
+    }
+
+    pub(super) fn reloaded(&self, id: &str) {
+        *self.service.last_reload.write() = Some(
+            json!({"operation_id":id,"status":"succeeded","finished_at":timestamp(SystemTime::now()),"error":null}),
+        );
     }
 
     pub(super) fn failed(

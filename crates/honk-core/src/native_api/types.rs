@@ -305,7 +305,6 @@ pub(super) fn discovery(auth: AuthDiscovery) -> Value {
             "runtime_outbounds": "/api/v1/runtime/outbounds",
             "traffic_history": "/api/v1/runtime/traffic/history",
             "memory_history": "/api/v1/runtime/memory/history",
-            "runtime_mode": "/api/v1/runtime/mode",
             "logs": "/api/v1/logs",
             "providers": "/api/v1/providers",
             "rules": "/api/v1/rules",

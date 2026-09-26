@@ -56,11 +56,14 @@ impl Worker {
         let id = &reservation.id;
         self.service.operations.accept(id);
         self.service.operations.running(id);
-        match self.update_geodata(&plan).await {
-            Ok(data) => self
-                .service
-                .operations
-                .succeed(id, OperationResult::Geodata(data)),
+        let mut activated = false;
+        match self.update_geodata(&plan, &mut activated).await {
+            Ok(data) => {
+                self.service
+                    .operations
+                    .succeed(id, OperationResult::Geodata(data));
+                self.reloaded(id);
+            }
             Err(details) => {
                 if let Some(sources) = &plan.sources {
                     sources.record(Err(details["stage"]
@@ -68,17 +71,32 @@ impl Worker {
                         .unwrap_or("activation_failed")
                         .to_owned()));
                 }
-                self.service.operations.fail(
-                    id,
-                    "geodata_update_failed",
-                    "Geodata update did not complete successfully",
-                    Some(details),
-                )
+                if activated {
+                    self.failed(
+                        id,
+                        "geodata_update_failed",
+                        "Geodata update did not complete successfully",
+                        Some(details),
+                    );
+                } else {
+                    self.service.operations.fail(
+                        id,
+                        "geodata_update_failed",
+                        "Geodata update did not complete successfully",
+                        Some(details),
+                    );
+                }
             }
-        };
+        }
     }
 
-    async fn update_geodata(&mut self, plan: &GeoUpdatePlan) -> Result<geodata::GeoData, Value> {
+    /// Sets `activated` once the new assets reach activation, so the caller
+    /// records `last_reload` only for updates that reloaded the runtime.
+    async fn update_geodata(
+        &mut self,
+        plan: &GeoUpdatePlan,
+        activated: &mut bool,
+    ) -> Result<geodata::GeoData, Value> {
         let writes = unwritten(&plan.assets);
         let active = self.active.read().await.clone();
         let accepted = self
@@ -159,12 +177,13 @@ impl Worker {
             activation,
             assets: prepared,
         } = prepared;
+        *activated = true;
         self.activation
             .activate(activation)
             .await
             .map_err(|failure| {
                 let mut details = failure
-                    .management_error()
+                    .management_error(true)
                     .into_details()
                     .unwrap_or_else(|| json!({"committed":null}));
                 details["assets"] = json!(
