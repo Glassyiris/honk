@@ -123,6 +123,15 @@ mod routed {
         }
     }
 
+    /// The direct fetch's rule: the body of every answer that is neither
+    /// followed nor failed.
+    fn wants_body(status: http::StatusCode, headers: &http::HeaderMap) -> bool {
+        !status.is_client_error()
+            && !status.is_server_error()
+            && !(crate::marked_http::followed_redirect(status)
+                && headers.contains_key(http::header::LOCATION))
+    }
+
     fn strip_userinfo(url: &mut reqwest::Url) {
         let _ = url.set_username("");
         let _ = url.set_password(None);
@@ -175,6 +184,7 @@ mod routed {
                     stream,
                     url,
                     headers,
+                    wants_body,
                     deadline,
                     super::super::MAX_SUBSCRIPTION_BYTES,
                 )
@@ -195,6 +205,7 @@ mod routed {
                             stream,
                             url,
                             headers,
+                            wants_body,
                             deadline,
                             super::super::MAX_SUBSCRIPTION_BYTES,
                         )

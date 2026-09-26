@@ -458,6 +458,8 @@ async fn download_bounds_actual_chunked_bytes_and_joins_timed_out_connection() {
         (b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n".as_slice(), "download_timeout"),
         (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: 0\r\n\r\n".as_slice(), "http_status_rejected"),
         (b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n".as_slice(), "content_encoding_rejected"),
+        (b"HTTP/1.1 302 Found\r\nContent-Length: 1\r\n\r\n".as_slice(), "http_status_rejected"),
+        (b"HTTP/1.1 302 Found\r\nContent-Length: 5\r\n\r\n12345".as_slice(), "http_status_rejected"),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/data", listener.local_addr().unwrap());

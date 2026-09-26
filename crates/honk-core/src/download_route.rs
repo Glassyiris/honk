@@ -300,8 +300,7 @@ impl Tunnel {
     }
 }
 
-/// The answer to one GET. `body` is left unread for a 4xx or 5xx status and
-/// for a redirect the caller follows.
+/// The answer to one GET. `body` is empty unless the caller wanted it.
 #[cfg(feature = "native-api")]
 pub(crate) struct Reply {
     pub(crate) status: axum::http::StatusCode,
@@ -311,12 +310,15 @@ pub(crate) struct Reply {
 }
 
 /// TLS for https, then one HTTP/1.1 GET of `url` with `headers` added.
+/// The body is read only when `wants_body` accepts the answer's status and
+/// headers, so an unwanted answer is neither waited for nor size checked.
 /// Errors name the stage that failed.
 #[cfg(feature = "native-api")]
 pub(crate) async fn get<S>(
     stream: S,
     url: &reqwest::Url,
     headers: &http::HeaderMap,
+    wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
     deadline: tokio::time::Instant,
     max_bytes: usize,
 ) -> Result<Reply, &'static str>
@@ -335,9 +337,9 @@ where
             .await
             .map_err(|_| "download_timeout")?
             .map_err(|_| "tls_failed")?;
-        receive(stream, url, headers, deadline, max_bytes).await
+        receive(stream, url, headers, wants_body, deadline, max_bytes).await
     } else {
-        receive(stream, url, headers, deadline, max_bytes).await
+        receive(stream, url, headers, wants_body, deadline, max_bytes).await
     }
 }
 
@@ -346,6 +348,7 @@ async fn receive<S>(
     stream: S,
     url: &reqwest::Url,
     headers: &http::HeaderMap,
+    wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
     deadline: tokio::time::Instant,
     max_bytes: usize,
 ) -> Result<Reply, &'static str>
@@ -396,10 +399,7 @@ where
             .map_err(|_| "http_failed")?;
         let status = response.status();
         let location = response.headers().get("location").cloned();
-        if status.is_client_error()
-            || status.is_server_error()
-            || (location.is_some() && crate::marked_http::followed_redirect(status))
-        {
+        if !wants_body(status, response.headers()) {
             return Ok(Reply {
                 status,
                 location,
