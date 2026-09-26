@@ -175,10 +175,10 @@ impl GroupManager {
         if depth >= MAX_GROUP_DEPTH {
             return None;
         }
-        let member = match group.policy {
-            GroupPolicy::Selector => self.selector_member(group, network)?,
-            GroupPolicy::LoadBalance => return None,
-            GroupPolicy::Score => {
+        let member = match (group.policy, self.selector_member(group, network)) {
+            (_, Some(member)) => member,
+            (GroupPolicy::Selector | GroupPolicy::LoadBalance, None) => return None,
+            (GroupPolicy::Score, None) => {
                 let context = ScoreSelectionContext::aggregate(
                     network,
                     match network {
@@ -200,7 +200,7 @@ impl GroupManager {
                     leaf: Some(candidate.node),
                 });
             }
-            GroupPolicy::URLTest | GroupPolicy::Fallback => {
+            (GroupPolicy::URLTest | GroupPolicy::Fallback, None) => {
                 let tag = if group.policy == GroupPolicy::URLTest {
                     self.get_urltest_selection_for_network(&group.name, network)?
                 } else {
@@ -465,10 +465,12 @@ impl GroupManager {
         if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
-        let selected = if respect_selectors && group.policy == GroupPolicy::Selector {
-            Some(self.selector_member(group, SelectionNetwork::Tcp)?)
-        } else {
-            None
+        let selected = match respect_selectors
+            .then(|| self.selector_member(group, SelectionNetwork::Tcp))
+            .flatten()
+        {
+            None if respect_selectors && group.policy == GroupPolicy::Selector => return None,
+            selected => selected,
         };
         visited.push(group.name.as_str());
         let result = match selected {
@@ -525,16 +527,16 @@ impl GroupManager {
             return (chain, None);
         };
         for _ in 0..MAX_GROUP_DEPTH {
-            let member = match group.policy {
-                GroupPolicy::Selector => self.selector_member(group, network),
-                GroupPolicy::URLTest => self
+            let member = match (group.policy, self.selector_member(group, network)) {
+                (_, Some(member)) => Some(member),
+                (GroupPolicy::Selector | GroupPolicy::LoadBalance, None) => None,
+                (GroupPolicy::URLTest, None) => self
                     .get_urltest_selection_for_network(&group.name, network)
                     .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
-                GroupPolicy::Fallback => self
+                (GroupPolicy::Fallback, None) => self
                     .get_fallback_selection_for_network(&group.name, network)
                     .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
-                GroupPolicy::LoadBalance => None,
-                GroupPolicy::Score => self
+                (GroupPolicy::Score, None) => self
                     .get_score_selection_for_network(&group.name, network)
                     .and_then(|tag| {
                         self.members(group)
@@ -641,6 +643,7 @@ impl GroupManager {
     /// same-named node. The control owner fences writes against this publication.
     pub fn migrate_selector_choices_from(&self, old: &GroupManager) {
         let mut state = old.selector_choice.read().clone();
+        state.overrides.clear();
         state.choices.retain(|name, choices| {
             let Ok(group) = self.selector_group(name) else {
                 return false;

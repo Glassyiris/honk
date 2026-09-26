@@ -83,6 +83,8 @@ pub enum SelectorError {
     GroupNotFound,
     #[error("group is not a selector")]
     NotSelector,
+    #[error("group is a selector")]
+    IsSelector,
     #[error("choice is not a direct group member")]
     NotMember,
     #[error("selector revision exhausted")]
@@ -92,6 +94,9 @@ pub enum SelectorError {
 #[derive(Default, Clone)]
 pub(super) struct SelectorState {
     pub(super) choices: HashMap<String, [Option<SelectorMember>; 2]>,
+    /// Runtime pins on automatic groups; never persisted or migrated, so the
+    /// next configuration activation drops them.
+    pub(super) overrides: HashMap<String, [Option<SelectorMember>; 2]>,
     pub(super) revision: u64,
 }
 
@@ -113,7 +118,7 @@ pub struct SelectorUpdate {
     pub changed_networks: Vec<SelectionNetwork>,
     persisted_networks: [bool; 2],
     group: String,
-    member: SelectorMember,
+    member: Option<SelectorMember>,
     persist: Option<PersistCallback>,
     changed: Option<SelectorChangeCallback>,
     interrupt: Option<InterruptCallback>,
@@ -131,8 +136,11 @@ impl SelectorUpdate {
             .into_iter()
             .zip(self.persisted_networks)
         {
-            if stored && let Some(callback) = &self.persist {
-                callback(&self.group, network, &self.member);
+            if stored
+                && let Some(callback) = &self.persist
+                && let Some(member) = &self.member
+            {
+                callback(&self.group, network, member);
             }
         }
         if !self.changed_networks.is_empty()
@@ -235,8 +243,102 @@ impl GroupManager {
             changed_networks,
             persisted_networks,
             group: group_name.to_owned(),
-            member: member.clone(),
+            member: Some(member.clone()),
             persist: self.persist_callback.read().clone(),
+            changed: self.selector_change_callback.read().clone(),
+            interrupt: group
+                .interrupt_connections
+                .then(|| self.interrupt_callback.read().clone())
+                .flatten(),
+        })
+    }
+
+    /// Pin a member of an automatic group, which then behaves like a Selector
+    /// choice until cleared or until the next configuration activation.
+    pub fn publish_override(
+        &self,
+        group_name: &str,
+        member: &SelectorMember,
+        networks: SelectorNetworks,
+    ) -> Result<SelectorUpdate, SelectorError> {
+        let group = self.automatic_group(group_name)?;
+        self.member_by_identity(group, member)
+            .ok_or(SelectorError::NotMember)?;
+        self.publish_override_change(group, Some(member), networks)
+    }
+
+    /// Return the requested networks of an automatic group to its policy.
+    pub fn clear_override(
+        &self,
+        group_name: &str,
+        networks: SelectorNetworks,
+    ) -> Result<SelectorUpdate, SelectorError> {
+        let group = self.automatic_group(group_name)?;
+        self.publish_override_change(group, None, networks)
+    }
+
+    pub fn has_override(&self, group_name: &str, network: SelectionNetwork) -> bool {
+        self.selector_choice
+            .read()
+            .overrides
+            .get(group_name)
+            .is_some_and(|pins| pins[network.slot()].is_some())
+    }
+
+    fn automatic_group(&self, group_name: &str) -> Result<&Group, SelectorError> {
+        let group = self
+            .groups
+            .get(group_name)
+            .ok_or(SelectorError::GroupNotFound)?;
+        if group.policy == GroupPolicy::Selector {
+            return Err(SelectorError::IsSelector);
+        }
+        Ok(group)
+    }
+
+    fn publish_override_change(
+        &self,
+        group: &Group,
+        member: Option<&SelectorMember>,
+        networks: SelectorNetworks,
+    ) -> Result<SelectorUpdate, SelectorError> {
+        let mut state = self.selector_choice.write();
+        let pins = state
+            .overrides
+            .get(&group.name)
+            .cloned()
+            .unwrap_or_default();
+        let changed_networks: Vec<_> = [SelectionNetwork::Tcp, SelectionNetwork::Udp]
+            .into_iter()
+            .filter(|network| {
+                networks.contains(*network) && pins[network.slot()].as_ref() != member
+            })
+            .collect();
+        if !changed_networks.is_empty() {
+            let revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(SelectorError::RevisionExhausted)?;
+            let mut pins = pins;
+            for network in &changed_networks {
+                pins[network.slot()] = member.cloned();
+            }
+            if pins.iter().any(Option::is_some) {
+                state.overrides.insert(group.name.clone(), pins);
+            } else {
+                state.overrides.remove(&group.name);
+            }
+            state.revision = revision;
+        }
+        let revision = state.revision;
+        drop(state);
+        Ok(SelectorUpdate {
+            revision,
+            changed_networks,
+            persisted_networks: [false; 2],
+            group: group.name.clone(),
+            member: member.cloned(),
+            persist: None,
             changed: self.selector_change_callback.read().clone(),
             interrupt: group
                 .interrupt_connections
@@ -273,7 +375,8 @@ impl GroupManager {
             .map(GroupMember::identity)
     }
 
-    /// Explicit runtime choice, projected to its display tag for legacy readers.
+    /// Explicit runtime choice, or an automatic group's pin, projected to its
+    /// display tag for legacy readers.
     pub fn get_selector_choice(
         &self,
         group_name: &str,
@@ -281,7 +384,12 @@ impl GroupManager {
     ) -> Option<String> {
         let group = self.groups.get(group_name)?;
         let state = self.selector_choice.read();
-        let member = state.choices.get(group_name)?[network.slot()].as_ref()?;
+        let choices = if group.policy == GroupPolicy::Selector {
+            &state.choices
+        } else {
+            &state.overrides
+        };
+        let member = choices.get(group_name)?[network.slot()].as_ref()?;
         self.member_by_identity(group, member)
             .map(|member| member.tag().to_owned())
     }

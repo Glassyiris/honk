@@ -362,3 +362,177 @@ fn selecting_effective_default_pins_identity_across_member_reorder() {
         Some(b.id)
     );
 }
+
+#[test]
+fn automatic_group_pins_act_as_selector_choices_until_replaced() {
+    let a = make_node(nid("pin-a"), "a");
+    let b = make_node(nid("pin-b"), "b");
+    let leaf = make_node(nid("pin-leaf"), "leaf");
+    let child = make_group("child", GroupPolicy::Selector, vec![leaf.id]);
+    let nodes = [a.clone(), b.clone(), leaf.clone()];
+    for policy in [
+        GroupPolicy::URLTest,
+        GroupPolicy::Fallback,
+        GroupPolicy::LoadBalance,
+        GroupPolicy::Score,
+    ] {
+        let mut group = make_group("auto", policy, vec![a.id, b.id]);
+        group.groups.push("child".into());
+        group.interrupt_connections = true;
+        let groups = [child.clone(), group];
+        let alive = Arc::new(AliveDialerSet::new());
+        let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive.clone()));
+        let persisted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = Arc::clone(&persisted);
+        manager.set_persist_callback(Some(Arc::new(move |_, network, _| {
+            calls.lock().push(network);
+        })));
+        let interrupted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = Arc::clone(&interrupted);
+        manager
+            .set_interrupt_callback(Some(Arc::new(move |_, network| calls.lock().push(network))));
+
+        let update = manager
+            .publish_override("auto", &SelectorMember::Node(b.id), SelectorNetworks::Tcp)
+            .unwrap();
+        assert_eq!(update.changed_networks, [SelectionNetwork::Tcp]);
+        update.run_callbacks();
+        manager
+            .publish_override(
+                "auto",
+                &SelectorMember::Group("child".into()),
+                SelectorNetworks::Udp,
+            )
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(
+            *interrupted.lock(),
+            [SelectionNetwork::Tcp, SelectionNetwork::Udp],
+            "{policy:?}"
+        );
+        assert!(persisted.lock().is_empty());
+        assert!(manager.has_override("auto", SelectionNetwork::Tcp));
+        assert_eq!(
+            manager
+                .get_selector_choice("auto", SelectionNetwork::Tcp)
+                .as_deref(),
+            Some("b"),
+            "{policy:?}"
+        );
+        for (domain, expected) in [(ProbeDomain::Tcp, b.id), (ProbeDomain::DataUdp, leaf.id)] {
+            assert_eq!(
+                manager
+                    .select_node_for_domain("auto", domain, IpVersion::V4)
+                    .map(|node| node.id),
+                Some(expected),
+                "{policy:?}"
+            );
+        }
+        assert_eq!(
+            manager.selection_chain_for_network("auto", SelectionNetwork::Udp),
+            ["auto", "child", "leaf"]
+        );
+        #[cfg(feature = "native-api")]
+        assert!(
+            matches!(manager.native_selection("auto", SelectionNetwork::Tcp).unwrap().member, NativeGroupMember::Node(node) if node.id == b.id)
+        );
+
+        alive.report_unavailable_forced(b.id, ProbeDomain::Tcp, IpVersion::V4);
+        assert!(
+            manager.select_node("auto").is_none(),
+            "{policy:?}: an unavailable pin must not fall back to a sibling"
+        );
+
+        for (group, member, error) in [
+            (
+                "auto",
+                SelectorMember::Node(nid("outside")),
+                SelectorError::NotMember,
+            ),
+            (
+                "child",
+                SelectorMember::Node(leaf.id),
+                SelectorError::IsSelector,
+            ),
+            (
+                "missing",
+                SelectorMember::Node(a.id),
+                SelectorError::GroupNotFound,
+            ),
+        ] {
+            assert_eq!(
+                manager
+                    .publish_override(group, &member, SelectorNetworks::Both)
+                    .err(),
+                Some(error)
+            );
+        }
+        assert_eq!(
+            manager
+                .clear_override("child", SelectorNetworks::Both)
+                .err(),
+            Some(SelectorError::IsSelector)
+        );
+
+        let cleared = manager
+            .clear_override("auto", SelectorNetworks::Tcp)
+            .unwrap();
+        assert_eq!(cleared.changed_networks, [SelectionNetwork::Tcp]);
+        let revision = cleared.revision;
+        cleared.run_callbacks();
+        assert!(!manager.has_override("auto", SelectionNetwork::Tcp));
+        assert!(manager.has_override("auto", SelectionNetwork::Udp));
+        assert_ne!(
+            manager.select_node("auto").map(|node| node.id),
+            Some(b.id),
+            "{policy:?}"
+        );
+        let unchanged = manager
+            .clear_override("auto", SelectorNetworks::Tcp)
+            .unwrap();
+        assert!(unchanged.changed_networks.is_empty());
+        assert_eq!(unchanged.revision, revision);
+        unchanged.run_callbacks();
+        assert!(persisted.lock().is_empty());
+
+        let replacement = GroupManager::new(&groups, &nodes);
+        replacement.migrate_selector_choices_from(&manager);
+        assert!(!replacement.has_override("auto", SelectionNetwork::Udp));
+    }
+}
+
+#[test]
+fn pinned_automatic_group_does_not_advance_unchosen_members() {
+    let a = make_node(nid("pin-lb-a"), "a");
+    let x = make_node(nid("pin-lb-x"), "x");
+    let y = make_node(nid("pin-lb-y"), "y");
+    let nodes = [a.clone(), x.clone(), y.clone()];
+    let lb = make_group("lb", GroupPolicy::LoadBalance, vec![x.id, y.id]);
+    for policy in [
+        GroupPolicy::URLTest,
+        GroupPolicy::Fallback,
+        GroupPolicy::LoadBalance,
+        GroupPolicy::Score,
+    ] {
+        let mut group = make_group("auto", policy, vec![a.id]);
+        group.groups.push("lb".into());
+        let alive = Arc::new(AliveDialerSet::new());
+        let manager =
+            GroupManager::with_alive_set(&[lb.clone(), group], &nodes, Some(alive.clone()));
+        manager
+            .publish_override("auto", &SelectorMember::Node(a.id), SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select_node("auto").map(|node| node.id),
+                Some(a.id),
+                "{policy:?}"
+            );
+        }
+        let rotation: Vec<_> = (0..2)
+            .map(|_| manager.select_node("lb").map(|node| node.id))
+            .collect();
+        assert_eq!(rotation, [Some(x.id), Some(y.id)], "{policy:?}");
+    }
+}

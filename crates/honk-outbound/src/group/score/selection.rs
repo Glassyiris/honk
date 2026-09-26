@@ -528,6 +528,12 @@ impl super::GroupManager {
         if let Some(member) = selected_member {
             observation::previous(member);
         }
+        // A pinned automatic group chooses exactly like a Selector.
+        let policy = if selected_member.is_some() {
+            honk_config::group::GroupPolicy::Selector
+        } else {
+            group.policy
+        };
         let mut candidates =
             self.flatten_candidates_for_target(group, context, visited, depth, effects, rules);
         let before_filter = (effects.applies()
@@ -560,7 +566,7 @@ impl super::GroupManager {
                 .flatten();
             let mode = if candidate.is_none()
                 && rules.cold_urltest
-                && group.policy == honk_config::group::GroupPolicy::URLTest
+                && policy == honk_config::group::GroupPolicy::URLTest
             {
                 super::SelectionPlanMode::ColdUrlTest
             } else {
@@ -577,7 +583,7 @@ impl super::GroupManager {
             return (mode, candidate.into_iter().collect());
         }
         if rules.cold_urltest
-            && group.policy == honk_config::group::GroupPolicy::URLTest
+            && policy == honk_config::group::GroupPolicy::URLTest
             && !candidates.iter().any(|candidate| {
                 self.node_latency(
                     candidate.node,
@@ -600,7 +606,7 @@ impl super::GroupManager {
                 ),
             );
         }
-        let candidate = match group.policy {
+        let candidate = match policy {
             honk_config::group::GroupPolicy::Selector => {
                 observation::reason("selector_choice");
                 selected_member
@@ -650,10 +656,9 @@ impl super::GroupManager {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
-        let selected_member = if group.policy == honk_config::group::GroupPolicy::Selector {
-            Some(self.selector_member(group, context.network)?)
-        } else {
-            None
+        let selected_member = match self.selector_member(group, context.network) {
+            None if group.policy == honk_config::group::GroupPolicy::Selector => return None,
+            selected_member => selected_member,
         };
         let node = self.last_resort_tcp_leaf(group, context.probe_domain, effects)?;
         if group.nodes.contains(&node.id)
@@ -760,13 +765,16 @@ impl super::GroupManager {
             return Vec::new();
         }
         visited.push(group.name.as_str());
-        // Only the serving Selector member may advance nested policy state.
-        let sub_effects =
-            if group.policy == honk_config::group::GroupPolicy::Selector && effects.applies() {
-                effects.peek()
-            } else {
-                effects
-            };
+        // Only the serving Selector or pinned member may advance nested policy
+        // state.
+        let sub_effects = if effects.applies()
+            && (group.policy == honk_config::group::GroupPolicy::Selector
+                || self.selector_member(group, context.network).is_some())
+        {
+            effects.peek()
+        } else {
+            effects
+        };
         let mut candidates: Vec<_> = group
             .nodes
             .iter()
