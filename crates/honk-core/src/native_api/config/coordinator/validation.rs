@@ -114,6 +114,12 @@ pub(super) fn diagnostics_error(
     ApiError::new(StatusCode::UNPROCESSABLE_ENTITY,ErrorCode::UnsupportedValue,"Configuration validation failed",None)
         .with_details(json!({"diagnostics":diagnostics.iter().map(|diagnostic|project_diagnostic(diagnostic,sources,ids,fallback)).collect::<Vec<_>>()}))
 }
+/// A created path that no include pattern of the candidate loads.
+pub(super) fn not_included(main: &str) -> ApiError {
+    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY,ErrorCode::UnsupportedValue,"Configuration validation failed",None)
+        .with_details(json!({"diagnostics":[{"level":"error","source_id":main,"line":null,"column":null,"span":null,
+            "code":"source-not-included","message":"No include pattern loads this path."}]}))
+}
 pub(super) fn config_error(
     error: honk_config::error::DetailedConfigError,
     diagnostics: &[DetailedDiagnostic],

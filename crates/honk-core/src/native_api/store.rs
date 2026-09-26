@@ -1,6 +1,7 @@
 //! Where the coordinator reads and writes the `.dae` sources it administers.
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use honk_config::error::DetailedConfigError;
 use honk_config::parser::{LoadedConfig, SourceSnapshot};
 
 use super::ApiError;
-use super::config_write::{SourceFile, WriteError};
+use super::config_write::{CreatedFile, SourceFile, WriteError};
 use crate::configuration::{MAX_SOURCE_BYTES, limits};
 
 pub(crate) mod db;
@@ -52,6 +53,8 @@ impl Pin {
 /// What `commit` left for `promote` once the candidate is active.
 pub(crate) enum Committed {
     Written,
+    /// A new file on disk; a failed activation removes it again.
+    Created(CreatedFile),
     Pending(db::Pending),
     /// `head` itself re-activated to bring a blocked store back in sync; records nothing.
     Resync,
@@ -59,7 +62,7 @@ pub(crate) enum Committed {
 
 impl Committed {
     pub(crate) fn written(&self) -> bool {
-        matches!(self, Self::Written)
+        matches!(self, Self::Written | Self::Created(_))
     }
 }
 
@@ -83,6 +86,16 @@ pub(crate) trait SourceStore: Send + Sync + 'static {
     fn commit(
         &self,
         pin: Pin,
+        content: &str,
+        candidate: &[SourceSnapshot],
+        principal: &str,
+        before: Box<dyn FnOnce() -> Result<(), WriteError> + '_>,
+    ) -> Result<Committed, WriteError>;
+    /// Adds `path` holding `content`, never replacing a source already there.
+    /// `before` runs after the last precondition and must recheck the candidate.
+    fn create(
+        &self,
+        path: &Path,
         content: &str,
         candidate: &[SourceSnapshot],
         principal: &str,
@@ -162,6 +175,21 @@ impl SourceStore for FileStore {
         Ok(Committed::Written)
     }
 
+    fn create(
+        &self,
+        path: &Path,
+        content: &str,
+        _candidate: &[SourceSnapshot],
+        _principal: &str,
+        before: Box<dyn FnOnce() -> Result<(), WriteError> + '_>,
+    ) -> Result<Committed, WriteError> {
+        let mode = std::fs::metadata(&self.entry)
+            .map_err(|_| WriteError::Unavailable)?
+            .mode();
+        super::config_write::create_new(path, content.as_bytes(), mode, before)
+            .map(Committed::Created)
+    }
+
     fn promote(&self, _committed: Committed) -> Result<(), WriteError> {
         Ok(())
     }
@@ -219,6 +247,22 @@ impl SourceStore for DbStore {
         DbStore::commit(self, pin, content, candidate, principal, before).map(Committed::Pending)
     }
 
+    fn create(
+        &self,
+        path: &Path,
+        content: &str,
+        candidate: &[SourceSnapshot],
+        principal: &str,
+        before: Box<dyn FnOnce() -> Result<(), WriteError> + '_>,
+    ) -> Result<Committed, WriteError> {
+        // The entry's pin fences `head`; commit then checks the new path's content.
+        let pin = db::RevisionPin {
+            path: path.to_owned(),
+            ..DbStore::pin(self, DbStore::entry(self))?
+        };
+        DbStore::commit(self, pin, content, candidate, principal, before).map(Committed::Pending)
+    }
+
     fn promote(&self, committed: Committed) -> Result<(), WriteError> {
         match committed {
             Committed::Pending(pending) => DbStore::promote(self, pending).map(drop),
@@ -226,7 +270,7 @@ impl SourceStore for DbStore {
                 self.unblock();
                 Ok(())
             }
-            Committed::Written => Ok(()),
+            Committed::Written | Committed::Created(_) => Ok(()),
         }
     }
 

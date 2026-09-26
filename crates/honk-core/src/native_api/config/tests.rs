@@ -1,5 +1,6 @@
 //! File-authority regressions through real HTTP, reload publication and supervisor handoff.
 
+mod creation;
 mod database;
 mod geodata;
 mod groups;
@@ -566,6 +567,7 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         let capabilities = fixture.get("/api/v1/capabilities").await;
         assert_eq!(capabilities["resources"]["config"]["content"], true);
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
+        assert_eq!(capabilities["resources"]["config"]["create"], false);
         // Replacement content travels in one JSON body, so it cannot exceed that body limit.
         assert_eq!(
             capabilities["resources"]["config"]["max_bytes"],

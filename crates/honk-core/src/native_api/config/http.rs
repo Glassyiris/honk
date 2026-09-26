@@ -32,6 +32,13 @@ struct Replacement {
     _secrets_redacted: Option<bool>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Creation {
+    path: String,
+    content: String,
+}
+
 pub(in crate::native_api) fn administrative_projection(
     state: &NativeState,
     mut value: Value,
@@ -151,6 +158,50 @@ pub(in crate::native_api) async fn replace(
             source_id,
             content: replacement.content,
             if_match: expected,
+            reservation,
+        })?;
+    }
+    Ok(admission.await?.into_response())
+}
+
+pub(in crate::native_api) async fn create(
+    state: &NativeState,
+    request: Request,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(request.uri(), &[], id)?;
+    if !state.observation.configuration.sources.available() {
+        return Err(unsupported());
+    }
+    if !state.observation.configuration.writable() {
+        return Err(denied());
+    }
+    // A blocked store advertises `create: false`.
+    if !state.observation.configuration.editable() {
+        return Err(unsupported());
+    }
+    json_type(&request)?;
+    let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
+    let bytes = axum::body::to_bytes(request.into_body(), 65536)
+        .await
+        .map_err(|_| too_large())?;
+    let creation: Creation = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if !new_source_path(&creation.path) {
+        return Err(invalid());
+    }
+    let reservation = state.observation.configuration.operations.reserve(
+        state.principal(),
+        "POST",
+        "/api/v1/config/sources",
+        key.as_deref(),
+        &bytes,
+        crate::native_api::operations::OperationKind::Reload,
+    )?;
+    let admission = reservation.admission();
+    if reservation.fresh {
+        state.observation.configuration.enqueue(Work::Create {
+            path: creation.path,
+            content: creation.content,
             reservation,
         })?;
     }

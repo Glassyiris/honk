@@ -370,3 +370,54 @@ fn staging_beside_creates_a_new_file_and_never_replaces_one() {
     assert_eq!(fs::read(&path).unwrap(), ORIGINAL.as_bytes());
     assert_only_config(data.path());
 }
+
+#[test]
+fn create_new_never_replaces_and_refuses_a_swapped_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path().join("config.d");
+    fs::create_dir(&parent).unwrap();
+    let target = parent.join("new.dae");
+    let created = create_new(&target, REPLACEMENT.as_bytes(), 0o100640, || Ok(())).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), REPLACEMENT.as_bytes());
+    assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o640);
+    assert_eq!(
+        create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).err(),
+        Some(WriteError::Exists)
+    );
+    assert_eq!(fs::read(&target).unwrap(), REPLACEMENT.as_bytes());
+
+    let moved = directory.path().join("moved.d");
+    let result = create_new(
+        &parent.join("other.dae"),
+        ORIGINAL.as_bytes(),
+        0o640,
+        || {
+            fs::rename(&parent, &moved).unwrap();
+            symlink(&moved, &parent).unwrap();
+            Ok(())
+        },
+    );
+    assert_eq!(result.err(), Some(WriteError::UnsafePath));
+    let names: Vec<_> = fs::read_dir(&moved)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [OsString::from("new.dae")]);
+    drop(created);
+}
+
+#[test]
+fn created_file_is_removed_only_while_its_name_holds_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("new.dae");
+    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
+    assert!(created.remove());
+    assert!(!target.exists());
+    assert!(created.remove(), "already gone");
+
+    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
+    fs::remove_file(&target).unwrap();
+    fs::write(&target, REPLACEMENT).unwrap();
+    assert!(!created.remove());
+    assert_eq!(fs::read_to_string(&target).unwrap(), REPLACEMENT);
+}
