@@ -4,7 +4,7 @@ mod coordinator;
 mod http;
 mod revisions;
 
-pub(super) use http::{administrative_projection, get, reload, replace, source, validate};
+pub(super) use http::{administrative_projection, create, get, reload, replace, source, validate};
 pub(super) use revisions::{activate, export, import, revisions};
 
 use axum::body::HttpBody;
@@ -308,6 +308,11 @@ enum Work {
         if_match: String,
         reservation: Reservation,
     },
+    Create {
+        path: String,
+        content: String,
+        reservation: Reservation,
+    },
     Reload {
         reservation: Reservation,
     },
@@ -586,6 +591,7 @@ impl ConfigService {
         if let Err(error) = self.check_phase(&work) {
             match &work {
                 Work::Replace { reservation, .. }
+                | Work::Create { reservation, .. }
                 | Work::GeoUpdate { reservation, .. }
                 | Work::GroupPatch { reservation, .. }
                 | Work::Reload { reservation } => {
@@ -660,6 +666,22 @@ pub(super) fn invalid() -> ApiError {
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest,
         "Invalid configuration request",
+        None,
+    )
+}
+fn exists() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        ErrorCode::StateConflict,
+        "A configuration source already exists at this path",
+        None,
+    )
+}
+fn changed() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        ErrorCode::StateConflict,
+        "Configuration changed during the write",
         None,
     )
 }
@@ -748,6 +770,16 @@ fn project_diagnostic(
     json!({"level":match diagnostic.severity{Severity::Error=>"error",Severity::Warning=>"warning",Severity::Info=>"info"},
         "source_id":source_id,"line":if exact{diagnostic.line}else{None},"column":if exact{diagnostic.byte_column}else{None},
         "span":null,"code":diagnostic.code,"message":diagnostic.message})
+}
+
+/// A new source path as clients spell it: relative normal segments naming a `.dae` file.
+fn new_source_path(label: &str) -> bool {
+    label.len() <= 1024
+        && label.ends_with(".dae")
+        && !label.chars().any(char::is_control)
+        && label
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
 pub(super) fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {

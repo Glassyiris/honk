@@ -551,6 +551,14 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     );
     let capabilities = fixture.get("/api/v1/capabilities").await;
     assert_eq!(capabilities["resources"]["config"]["writable"], false);
+    assert_eq!(capabilities["resources"]["config"]["create"], false);
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/sources")
+        .json(&json!({"path":"config.d/new.dae","content":""}))
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
     assert_eq!(
         capabilities["resources"]["config_revisions"]["can_activate"],
         true

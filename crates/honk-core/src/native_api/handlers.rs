@@ -128,6 +128,17 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
+            "/api/v1/config/sources",
+            resource(
+                post(
+                    |State(state): App, Extension(id): Id, request: Request| async move {
+                        respond(config::create(&state, request, &id).await, id)
+                    },
+                ),
+                &["POST"],
+            ),
+        )
+        .route(
             "/api/v1/config/sources/{source_id}",
             resource(
                 get(

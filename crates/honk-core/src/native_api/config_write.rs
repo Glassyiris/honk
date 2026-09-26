@@ -16,6 +16,8 @@ use sha2::{Digest as _, Sha256};
 pub(crate) enum WriteError {
     #[error("configuration source changed")]
     Conflict,
+    #[error("configuration source already exists")]
+    Exists,
     #[error("configuration source is unavailable")]
     Unavailable,
     #[error("configuration source exceeds the size limit")]
@@ -133,19 +135,8 @@ impl SourceFile {
         target: &Path,
         content: &[u8],
     ) -> Result<StagedFile, WriteError> {
-        let target = std::path::absolute(target).map_err(|_| WriteError::Unavailable)?;
-        let parent_path = target.parent().ok_or(WriteError::UnsafePath)?.to_owned();
-        let filename = target.file_name().ok_or(WriteError::UnsafePath)?.to_owned();
-        let directory = open_directory(&parent_path).map_err(path_error)?;
-        self.stage_into(
-            expected_hash,
-            content,
-            Some(Target {
-                directory,
-                parent_path,
-                filename,
-            }),
-        )
+        let target = Target::open(target)?;
+        self.stage_into(expected_hash, content, Some(target))
     }
 
     fn stage_into(
@@ -160,27 +151,17 @@ impl SourceFile {
         if content.len() > self.max_bytes {
             return Err(WriteError::TooLarge);
         }
-        let mut temporary = TemporaryFile::create(
+        let temporary = TemporaryFile::write(
             target
                 .as_ref()
                 .map_or(&self.directory, |target| &target.directory),
+            content,
+            self.metadata.mode(),
         )?;
-        temporary
-            .file
-            .write_all(content)
-            .map_err(|_| WriteError::Unavailable)?;
-        temporary
-            .file
-            .set_permissions(Permissions::from_mode(self.metadata.mode() & 0o7777))
-            .map_err(|_| WriteError::Unavailable)?;
         #[cfg(test)]
         if self.sync_fault == Some(SyncFault::File) {
             return Err(WriteError::Unavailable);
         }
-        temporary
-            .file
-            .sync_all()
-            .map_err(|_| WriteError::Unavailable)?;
 
         Ok(StagedFile {
             source: self,
@@ -191,17 +172,7 @@ impl SourceFile {
     }
 
     pub(crate) fn recheck(&self) -> Result<(), WriteError> {
-        let current_directory = open_directory(&self.parent_path).map_err(recheck_error)?;
-        let original_directory = self
-            .directory
-            .metadata()
-            .map_err(|_| WriteError::Unavailable)?;
-        let current_directory = current_directory
-            .metadata()
-            .map_err(|_| WriteError::Unavailable)?;
-        if !same_inode(&original_directory, &current_directory) {
-            return Err(WriteError::Conflict);
-        }
+        recheck_directory(&self.directory, &self.parent_path)?;
         let current = open_source(&self.directory, &self.filename).map_err(recheck_error)?;
         let metadata = regular_metadata(&current, self.max_bytes)?;
         if !same_version(&self.metadata, &metadata)
@@ -256,6 +227,105 @@ struct Target {
     directory: File,
     parent_path: PathBuf,
     filename: OsString,
+}
+
+impl Target {
+    fn open(path: &Path) -> Result<Self, WriteError> {
+        let path = std::path::absolute(path).map_err(|_| WriteError::Unavailable)?;
+        let parent_path = path.parent().ok_or(WriteError::UnsafePath)?.to_owned();
+        let filename = path.file_name().ok_or(WriteError::UnsafePath)?.to_owned();
+        let directory = open_directory(&parent_path).map_err(path_error)?;
+        Ok(Self {
+            directory,
+            parent_path,
+            filename,
+        })
+    }
+
+    /// Moves `temporary` to the target name; never replaces anything already there.
+    fn install(&self, temporary: &mut TemporaryFile) -> Result<(), WriteError> {
+        rustix::fs::renameat_with(
+            &self.directory,
+            temporary.name.as_str(),
+            &self.directory,
+            self.filename.as_os_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| match Errno::from_raw(error.raw_os_error()) {
+            Errno::EEXIST => WriteError::Conflict,
+            error => path_error(error),
+        })?;
+        temporary.renamed = true;
+        Ok(())
+    }
+}
+
+/// A file `create_new` installed, identified by inode so removal never touches a successor.
+pub(crate) struct CreatedFile {
+    directory: File,
+    name: OsString,
+    dev: u64,
+    ino: u64,
+}
+
+impl CreatedFile {
+    /// Unlinks the file while its name still holds it. True when the name no longer does.
+    pub(crate) fn remove(&self) -> bool {
+        let current = openat(
+            &self.directory,
+            self.name.as_os_str(),
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        );
+        match current.map(File::from) {
+            Ok(current) => current.metadata().is_ok_and(|metadata| {
+                metadata.dev() == self.dev
+                    && metadata.ino() == self.ino
+                    && unlinkat(
+                        &self.directory,
+                        self.name.as_os_str(),
+                        UnlinkatFlags::NoRemoveDir,
+                    )
+                    .is_ok()
+            }),
+            Err(error) => error == Errno::ENOENT,
+        }
+    }
+}
+
+/// Creates `path` with `content` and `mode` through a temporary file and a rename that
+/// never replaces anything at `path`. The callback must recheck the candidate.
+pub(crate) fn create_new(
+    path: &Path,
+    content: &[u8],
+    mode: u32,
+    before_rename: impl FnOnce() -> Result<(), WriteError>,
+) -> Result<CreatedFile, WriteError> {
+    let target = Target::open(path)?;
+    let mut temporary = TemporaryFile::write(&target.directory, content, mode)?;
+    recheck_directory(&target.directory, &target.parent_path)?;
+    before_rename()?;
+    recheck_directory(&target.directory, &target.parent_path)?;
+    // The no-replace rename is the only conflict `install` reports.
+    target
+        .install(&mut temporary)
+        .map_err(|error| match error {
+            WriteError::Conflict => WriteError::Exists,
+            error => error,
+        })?;
+    let metadata = temporary
+        .file
+        .metadata()
+        .map_err(|_| WriteError::ChangedButNotDurable)?;
+    if target.directory.sync_all().is_err() {
+        return Err(WriteError::ChangedButNotDurable);
+    }
+    Ok(CreatedFile {
+        directory: target.directory,
+        name: target.filename,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
 }
 
 pub(crate) struct InstalledFile {
@@ -313,18 +383,7 @@ impl StagedFile {
                 durability_confirmed,
             });
         };
-        rustix::fs::renameat_with(
-            &target.directory,
-            self.temporary.name.as_str(),
-            &target.directory,
-            target.filename.as_os_str(),
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| match Errno::from_raw(error.raw_os_error()) {
-            Errno::EEXIST => WriteError::Conflict,
-            error => path_error(error),
-        })?;
-        self.temporary.renamed = true;
+        target.install(&mut self.temporary)?;
         let file = self
             .temporary
             .file
@@ -417,6 +476,18 @@ fn path_error(error: Errno) -> WriteError {
     }
 }
 
+/// Fails unless `parent_path` still walks, without symlinks, to `directory`.
+fn recheck_directory(directory: &File, parent_path: &Path) -> Result<(), WriteError> {
+    let current = open_directory(parent_path).map_err(recheck_error)?;
+    if !same_inode(
+        &directory.metadata().map_err(|_| WriteError::Unavailable)?,
+        &current.metadata().map_err(|_| WriteError::Unavailable)?,
+    ) {
+        return Err(WriteError::Conflict);
+    }
+    Ok(())
+}
+
 fn recheck_error(error: Errno) -> WriteError {
     match error {
         Errno::ENOENT => WriteError::Conflict,
@@ -453,6 +524,24 @@ impl TemporaryFile {
             file: File::from(descriptor),
             renamed: false,
         })
+    }
+
+    /// A synced temporary file holding `content` with the permission bits of `mode`.
+    fn write(directory: &File, content: &[u8], mode: u32) -> Result<Self, WriteError> {
+        let mut temporary = Self::create(directory)?;
+        temporary
+            .file
+            .write_all(content)
+            .map_err(|_| WriteError::Unavailable)?;
+        temporary
+            .file
+            .set_permissions(Permissions::from_mode(mode & 0o7777))
+            .map_err(|_| WriteError::Unavailable)?;
+        temporary
+            .file
+            .sync_all()
+            .map_err(|_| WriteError::Unavailable)?;
+        Ok(temporary)
     }
 }
 

@@ -17,7 +17,7 @@ use crate::control::{ControlCommand, LogFiles};
 use crate::subscription::SubscriptionSupervisorHandle;
 use honk_config::parser::LoadedConfig;
 use tokio::sync::watch;
-use validation::{config_error, diagnostics_error, restart_diagnostics};
+use validation::{config_error, diagnostics_error, not_included, restart_diagnostics};
 
 pub(crate) struct ConfigCoordinator {
     service: Arc<ConfigService>,
@@ -120,6 +120,7 @@ impl Worker {
                     let _ = response.send(Err(error.for_management(mutation.deleting())));
                 }
                 Work::Replace { reservation, .. }
+                | Work::Create { reservation, .. }
                 | Work::GeoUpdate { reservation, .. }
                 | Work::GroupPatch { reservation, .. }
                 | Work::Reload { reservation }
@@ -231,6 +232,18 @@ impl Worker {
                         self.service.operations.reject(&id, error);
                     }
                 }
+                drop(reservation);
+            }
+            Work::Create {
+                path,
+                content,
+                reservation,
+            } => {
+                let id = reservation.id.clone();
+                let prepared = self
+                    .prepare_create(path, content, &reservation.principal)
+                    .await;
+                self.tree_operation(&id, prepared).await;
                 drop(reservation);
             }
             Work::Import { reservation } => {
@@ -669,21 +682,15 @@ impl Worker {
             return Err(denied());
         }
         let target = accepted.update.sources[index].path.clone();
-        let store = self.store.clone().ok_or_else(unsupported)?;
-        let active = self.active.read().await.clone();
-        let log_files = self.log_files.clone();
-        let data_dir = self.data_dir.clone();
-        let mut deferred = self
-            .subscriptions
-            .deferred_subscriptions()
-            .await
-            .map_err(|_| unavailable())?;
+        let mut check = self.candidate_check(accepted).await?;
         let source_id = source_id.to_owned();
         let principal = principal.to_owned();
         #[cfg(test)]
         let before_replace = self.service.before_replace.lock().take();
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
+            let store = Arc::clone(&check.store);
+            let accepted = &check.accepted;
             let kind = store.kind();
             let pin = store
                 .pin(&target)
@@ -722,144 +729,279 @@ impl Worker {
                     .iter()
                     .find(|provider| provider.name == *name)
                     .ok_or_else(management::unsupported_value)?;
-                if active.subscriptions.iter().any(|other| {
+                if check.active.subscriptions.iter().any(|other| {
                     crate::subscription::same_subscription_fetch_identity(other, provider)
                 }) {
                     return Err(management::unsupported_value());
                 }
-                deferred.push(provider.clone());
+                check.deferred.push(provider.clone());
             }
-            let parsed_sources = loaded.sources.clone();
-            let validate = |loaded, diagnostics: &mut Vec<DetailedDiagnostic>| {
-                offline::validate_for_coordinator(
-                    loaded,
-                    store.dependency_root(),
-                    &active,
-                    &data_dir,
-                    limits(),
-                    diagnostics,
-                    &deferred,
-                    None,
-                    &[],
-                )
-            };
-            let validated = validate(loaded, &mut diagnostics).map_err(|error| {
-                config_error(
-                    error,
-                    &diagnostics,
-                    &parsed_sources,
-                    Some(&source_id),
-                    Some(&accepted.ids),
-                )
-            })?;
-            if diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == Severity::Error)
-            {
-                return Err(diagnostics_error(
-                    &diagnostics,
-                    &validated.sources,
-                    Some(&source_id),
-                    Some(&accepted.ids),
-                ));
-            }
-            if validated.config.experimental.native_api != active.experimental.native_api
-                || validated.config.experimental.clash_api.secret
-                    != active.experimental.clash_api.secret
-                || (store.kind() == StoreKind::Database
-                    && validated.config.global.data_dir != active.global.data_dir)
-            {
-                return Err(denied());
-            }
-            let old_credentials: Vec<_> = accepted
-                .update
-                .sources
-                .iter()
-                .filter(|source| source.contains_api_secret)
-                .map(|source| (&source.path, &source.content))
-                .collect();
-            let new_credentials: Vec<_> = validated
-                .sources
-                .iter()
-                .filter(|source| source.contains_api_secret)
-                .map(|source| (&source.path, &source.content))
-                .collect();
-            if old_credentials != new_credentials
-                || validated
-                    .sources
-                    .iter()
-                    .any(|source| source.path == target && source.contains_api_secret)
-                || [
-                    &active.experimental.native_api.secret,
-                    &active.experimental.clash_api.secret,
-                ]
-                .iter()
-                .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
-            {
-                return Err(denied());
-            }
-            // The reload would reject these, and a rejected reload leaves the written file
-            // ahead of the accepted hash; refuse before writing.
-            let written = validated
-                .sources
-                .iter()
-                .find(|source| source.path == target)
-                .unwrap_or(&validated.sources[0]);
-            let restart = restart_diagnostics(
-                &active,
-                &validated.config,
-                &log_files,
-                &written.source,
-                Severity::Error,
-            );
-            if !restart.is_empty() {
-                diagnostics.extend(restart);
-                return Err(diagnostics_error(
-                    &diagnostics,
-                    &validated.sources,
-                    Some(&source_id),
-                    Some(&accepted.ids),
-                ));
-            }
+            let validated = check.validate(
+                loaded,
+                &mut diagnostics,
+                &target,
+                &content,
+                Some(&source_id),
+                &check.accepted.ids,
+            )?;
             let recheck = Box::new(|| {
                 #[cfg(test)]
                 if let Some(hook) = before_replace {
                     hook();
                 }
-                let mut recheck_diagnostics = Vec::new();
                 if group_revision
                     .as_ref()
                     .is_some_and(|revision| service.sources.revision().as_ref() != Some(revision))
                 {
                     return Err(WriteError::Conflict);
                 }
-                let reloaded = store
-                    .load(&overlay, &mut recheck_diagnostics)
-                    .map_err(|_| WriteError::Conflict)?;
-                if !same_source_documents(&validated.sources, &reloaded.sources) {
-                    return Err(WriteError::Conflict);
-                }
-                let dependencies = validated
-                    .recapture_dependencies(&active, &data_dir, limits(), &deferred)
-                    .map_err(|_| WriteError::Conflict)?;
-                if !same_dependencies(&validated.dependencies, &dependencies) {
-                    return Err(WriteError::Conflict);
-                }
-                Ok(())
+                check.recheck(&overlay, &validated)
             });
             let committed = store
                 .commit(pin, &content, &validated.sources, &principal, recheck)
                 .map_err(|error| store_write_error(kind, error))?;
-            let update = SourceUpdate {
-                sources: validated.sources,
-                dependencies: validated.dependencies,
-                geo_sources: None,
-            };
-            Ok((validated.config, update, diagnostics, committed))
+            Ok(prepared(validated, diagnostics, committed))
         })
         .await
         .map_err(|_| unavailable())?
     }
+
+    async fn prepare_create(
+        &self,
+        label: String,
+        content: String,
+        principal: &str,
+    ) -> Result<Prepared, ApiError> {
+        if content.len() > MAX_SOURCE_BYTES {
+            return Err(too_large());
+        }
+        let accepted = self
+            .service
+            .sources
+            .accepted
+            .read()
+            .clone()
+            .ok_or_else(unsupported)?;
+        let check = self.candidate_check(accepted).await?;
+        let principal = principal.to_owned();
+        #[cfg(test)]
+        let before_replace = self.service.before_replace.lock().take();
+        tokio::task::spawn_blocking(move || {
+            let store = &check.store;
+            let accepted = &check.accepted;
+            let target = store.resolve(&label)?;
+            if accepted.ids.contains_key(&target)
+                || (store.kind() == StoreKind::File && target.symlink_metadata().is_ok())
+            {
+                return Err(exists());
+            }
+            let main = accepted.ids[&accepted.update.sources[0].path].as_str();
+            // The new source has no accepted ID until it loads; this one names it in diagnostics.
+            let mut ids = accepted.ids.clone();
+            ids.insert(target.clone(), uuid::Uuid::new_v4().to_string());
+            let overlay = HashMap::from([(target.clone(), Arc::<str>::from(content.as_str()))]);
+            let mut diagnostics = Vec::new();
+            let loaded = store.load(&overlay, &mut diagnostics).map_err(|error| {
+                config_error(
+                    error,
+                    &diagnostics,
+                    &accepted.update.sources,
+                    Some(main),
+                    Some(&ids),
+                )
+            })?;
+            let validated = check.validate(
+                loaded,
+                &mut diagnostics,
+                &target,
+                &content,
+                Some(main),
+                &ids,
+            )?;
+            if !validated.sources.iter().any(|source| source.path == target) {
+                return Err(not_included(main));
+            }
+            let recheck = Box::new(|| {
+                #[cfg(test)]
+                if let Some(hook) = before_replace {
+                    hook();
+                }
+                check.recheck(&overlay, &validated)
+            });
+            let committed = store
+                .create(&target, &content, &validated.sources, &principal, recheck)
+                .map_err(|error| match error {
+                    WriteError::Conflict => changed(),
+                    // The parent became a symlink after resolution: still a path outside the root.
+                    WriteError::UnsafePath => invalid(),
+                    error => store_write_error(store.kind(), error),
+                })?;
+            Ok(prepared(validated, diagnostics, committed))
+        })
+        .await
+        .map_err(|_| unavailable())?
+    }
+
+    async fn candidate_check(&self, accepted: Accepted) -> Result<CandidateCheck, ApiError> {
+        Ok(CandidateCheck {
+            store: self.store.clone().ok_or_else(unsupported)?,
+            active: self.active.read().await.clone(),
+            log_files: self.log_files.clone(),
+            data_dir: self.data_dir.clone(),
+            deferred: self
+                .subscriptions
+                .deferred_subscriptions()
+                .await
+                .map_err(|_| unavailable())?,
+            accepted,
+        })
+    }
+}
+
+/// What a source write validates its candidate against, captured before blocking work.
+struct CandidateCheck {
+    store: Arc<dyn SourceStore>,
+    active: Arc<Config>,
+    log_files: LogFiles,
+    data_dir: PathBuf,
+    deferred: Vec<honk_config::subscription::Subscription>,
+    accepted: Accepted,
+}
+
+impl CandidateCheck {
+    /// Full validation of a candidate that puts `content` at `target`, refusing anything
+    /// the write or the following reload must not admit.
+    fn validate(
+        &self,
+        loaded: LoadedConfig,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        target: &Path,
+        content: &str,
+        fallback: Option<&str>,
+        ids: &HashMap<PathBuf, String>,
+    ) -> Result<offline::ValidatedConfig, ApiError> {
+        let active = &self.active;
+        let parsed_sources = loaded.sources.clone();
+        let validated = offline::validate_for_coordinator(
+            loaded,
+            self.store.dependency_root(),
+            active,
+            &self.data_dir,
+            limits(),
+            diagnostics,
+            &self.deferred,
+            None,
+            &[],
+        )
+        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, Some(ids)))?;
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+        {
+            return Err(diagnostics_error(
+                diagnostics,
+                &validated.sources,
+                fallback,
+                Some(ids),
+            ));
+        }
+        if validated.config.experimental.native_api != active.experimental.native_api
+            || validated.config.experimental.clash_api.secret
+                != active.experimental.clash_api.secret
+            || (self.store.kind() == StoreKind::Database
+                && validated.config.global.data_dir != active.global.data_dir)
+        {
+            return Err(denied());
+        }
+        let old_credentials: Vec<_> = self
+            .accepted
+            .update
+            .sources
+            .iter()
+            .filter(|source| source.contains_api_secret)
+            .map(|source| (&source.path, &source.content))
+            .collect();
+        let new_credentials: Vec<_> = validated
+            .sources
+            .iter()
+            .filter(|source| source.contains_api_secret)
+            .map(|source| (&source.path, &source.content))
+            .collect();
+        if old_credentials != new_credentials
+            || validated
+                .sources
+                .iter()
+                .any(|source| source.path == target && source.contains_api_secret)
+            || [
+                &active.experimental.native_api.secret,
+                &active.experimental.clash_api.secret,
+            ]
+            .iter()
+            .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
+        {
+            return Err(denied());
+        }
+        // The reload would reject these, and a rejected reload leaves the written file
+        // ahead of the accepted hash; refuse before writing.
+        let written = validated
+            .sources
+            .iter()
+            .find(|source| source.path == target)
+            .unwrap_or(&validated.sources[0]);
+        let restart = restart_diagnostics(
+            active,
+            &validated.config,
+            &self.log_files,
+            &written.source,
+            Severity::Error,
+        );
+        if !restart.is_empty() {
+            diagnostics.extend(restart);
+            return Err(diagnostics_error(
+                diagnostics,
+                &validated.sources,
+                fallback,
+                Some(ids),
+            ));
+        }
+        Ok(validated)
+    }
+
+    /// Fails with `Conflict` unless the store still yields the validated candidate.
+    fn recheck(
+        &self,
+        overlay: &HashMap<PathBuf, Arc<str>>,
+        validated: &offline::ValidatedConfig,
+    ) -> Result<(), WriteError> {
+        let mut diagnostics = Vec::new();
+        let reloaded = self
+            .store
+            .load(overlay, &mut diagnostics)
+            .map_err(|_| WriteError::Conflict)?;
+        if !same_source_documents(&validated.sources, &reloaded.sources) {
+            return Err(WriteError::Conflict);
+        }
+        let dependencies = validated
+            .recapture_dependencies(&self.active, &self.data_dir, limits(), &self.deferred)
+            .map_err(|_| WriteError::Conflict)?;
+        if !same_dependencies(&validated.dependencies, &dependencies) {
+            return Err(WriteError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+fn prepared(
+    validated: offline::ValidatedConfig,
+    diagnostics: Vec<DetailedDiagnostic>,
+    committed: Committed,
+) -> Prepared {
+    let update = SourceUpdate {
+        sources: validated.sources,
+        dependencies: validated.dependencies,
+        geo_sources: None,
+    };
+    (validated.config, update, diagnostics, committed)
 }
 
 type Prepared = (Config, SourceUpdate, Vec<DetailedDiagnostic>, Committed);
@@ -876,6 +1018,7 @@ fn store_write_error(kind: StoreKind, error: WriteError) -> ApiError {
 fn write_error(error: WriteError) -> ApiError {
     match error {
         WriteError::Conflict => stale(),
+        WriteError::Exists => exists(),
         WriteError::TooLarge => too_large(),
         WriteError::UnsafePath => denied().with_details(json!({"stage":"write"})),
         WriteError::InvalidUtf8 => invalid(),

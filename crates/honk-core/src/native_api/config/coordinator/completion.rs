@@ -56,13 +56,20 @@ impl Worker {
         group: Option<&str>,
         committed: Committed,
     ) {
-        let written = committed.written();
+        let mut written = committed.written();
+        let created = matches!(committed, Committed::Created(_));
         self.begin_record(&committed);
         let pending = match self.activation.dispatch(request).await {
             Ok(pending) => pending,
             Err(failure) => {
+                if let Committed::Created(file) = &committed {
+                    written = !file.remove();
+                }
                 let error = match failure {
                     ActivationFailure::EngineUnavailable => {
+                        unavailable().with_details(json!({"written":written}))
+                    }
+                    _ if matches!(committed, Committed::Created(_)) => {
                         unavailable().with_details(json!({"written":written}))
                     }
                     _ => unavailable(),
@@ -80,6 +87,16 @@ impl Worker {
         self.service.operations.accept(id);
         self.service.operations.running(id);
         let completion = self.activation.complete(pending).await;
+        if let (Committed::Created(file), Err(failure)) = (&committed, &completion)
+            && !matches!(
+                failure,
+                ActivationFailure::Unconfirmed
+                    | ActivationFailure::Degraded(_)
+                    | ActivationFailure::Reconciliation(_)
+            )
+        {
+            written = !file.remove();
+        }
         let stored = match self.record(committed, &completion).await {
             Ok(stored) => stored,
             Err(details) => {
@@ -98,7 +115,8 @@ impl Worker {
             id,
             completion,
             group,
-            Some(json!({"written":stored,"committed":false})),
+            Some(json!({"written":stored && written,"committed":false})),
+            created.then_some(written),
         );
     }
 
@@ -145,7 +163,7 @@ impl Worker {
 
     pub(super) async fn reload_operation(&mut self, id: &str, request: ActivationRequest) {
         let completion = self.activation.activate(request).await;
-        self.publish_operation(id, completion, None, None);
+        self.publish_operation(id, completion, None, None, None);
     }
 
     fn publish_operation(
@@ -154,10 +172,12 @@ impl Worker {
         completion: ActivationCompletion,
         group: Option<&str>,
         rejected_details: Option<Value>,
+        // For a created source: whether its file remains, reported on every failure.
+        created_written: Option<bool>,
     ) {
         match completion {
             Err(failure) => {
-                let details = match failure {
+                let mut details = match failure {
                     ActivationFailure::Rejected => rejected_details,
                     ActivationFailure::Degraded(generation) => Some(
                         json!({"active_generation_id":format!("{}:{generation}",self.service.instance_id),"committed":true}),
@@ -167,6 +187,9 @@ impl Worker {
                     ),
                     _ => None,
                 };
+                if let Some(written) = created_written {
+                    details.get_or_insert_with(|| json!({}))["written"] = json!(written);
+                }
                 let (code, message) = failure.reason();
                 self.failed(id, code, message, details);
             }
