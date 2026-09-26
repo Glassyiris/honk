@@ -401,6 +401,10 @@ async fn failed_fetch_and_failed_merge_preserve_previously_accepted_nodes() {
     let operation = fixture.terminal(&accepted).await;
     assert_eq!(operation["status"], "failed");
     assert_eq!(operation["error"]["code"], "publication_rejected");
+    assert_eq!(
+        operation["error"]["details"]["diagnostic_code"],
+        "duplicate-node-id"
+    );
     assert!(
         fixture
             .state
@@ -411,11 +415,14 @@ async fn failed_fetch_and_failed_merge_preserve_previously_accepted_nodes() {
             .iter()
             .any(|node| node.name == "old" && node.subscription_id == Some(subscription.id))
     );
+    let provider = fixture
+        .get(&format!("/api/v1/providers/{}", subscription.id))
+        .await;
+    assert_eq!(provider["updated_at"], after_fetch["updated_at"]);
+    assert_eq!(provider["last_error"]["code"], "publication_rejected");
     assert_eq!(
-        fixture
-            .get(&format!("/api/v1/providers/{}", subscription.id))
-            .await["updated_at"],
-        after_fetch["updated_at"]
+        provider["last_error"]["details"],
+        json!({"diagnostic_code": "duplicate-node-id"})
     );
     fixture.stop().await;
     origin.stop().await;

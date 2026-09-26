@@ -3584,12 +3584,13 @@ async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection()
     let mut cp = control_plane(current.clone());
     let mut authorizations =
         crate::subscription::SubscriptionAuthorizations::new(&current.subscriptions).unwrap();
+    let (result, reply) = tokio::sync::oneshot::channel();
     let command = ControlCommand::MergeSubscription {
         subscription_id: subscription.id,
         revision: authorizations.revision(subscription.id).unwrap(),
         nodes,
         diagnostics: Vec::new(),
-        result: tokio::sync::oneshot::channel().0,
+        result,
     };
     let log = capture_runtime_admission(cp.dispatch_control_command(
         command,
@@ -3599,6 +3600,9 @@ async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection()
     .await;
     assert_eq!(cp.config_handle().read().await.as_ref(), &current);
     assert_eq!(log.matches("duplicate-node-id").count(), 1, "{log}");
+    let reply = reply.await.unwrap();
+    assert!(matches!(reply.outcome, ReloadOutcome::Rejected));
+    assert_eq!(reply.rejection, Some("duplicate-node-id"));
     assert!(
         !log.contains("127.0.0.1") && !log.contains("private-provider"),
         "{log}"

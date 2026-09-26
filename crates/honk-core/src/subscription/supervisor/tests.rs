@@ -95,6 +95,7 @@ async fn replacement_during_fetch_keeps_original_revision_until_publication_fenc
             outcome: ReloadOutcome::Rejected,
             node_count: 0,
             authorized: vec![state.providers[&id].authorized.clone()],
+            rejection: None,
         })
         .unwrap();
     let (id, reply) = state.publications.join_next().await.unwrap().unwrap();
@@ -148,6 +149,7 @@ async fn shutdown_waits_for_admitted_merge_acknowledgement() {
             outcome: ReloadOutcome::Committed { generation: 2 },
             node_count: 1,
             authorized: vec![subscription.clone()],
+            rejection: None,
         })
         .unwrap();
     let state = shutdown.await.unwrap();
@@ -245,7 +247,7 @@ async fn refresh_queue_refusal_wakes_idempotent_waiters_and_shutdown_settles_acc
 }
 
 #[tokio::test]
-async fn pause_joins_fetches_and_admits_no_new_ones() {
+async fn shutdown_joins_fetches_and_keeps_the_accepted_load() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut periodic = authorized(
         uuid::Uuid::new_v4(),
@@ -267,6 +269,7 @@ async fn pause_joins_fetches_and_admits_no_new_ones() {
         updated_at: Some(accepted_at),
         cached: true,
         error: Some("cache_load_failed"),
+        rejection: None,
     };
     state.start_pending(MAX_ACTIVE_FETCHES);
     let mut sockets = Vec::new();
@@ -278,7 +281,7 @@ async fn pause_joins_fetches_and_admits_no_new_ones() {
         }
         sockets.push(socket);
     }
-    state.pause_fetches("supervisor_paused").await.unwrap();
+    state.shutdown().await.unwrap();
     for mut socket in sockets {
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), socket.read_u8())
@@ -293,16 +296,12 @@ async fn pause_joins_fetches_and_admits_no_new_ones() {
     assert_eq!(load.updated_at, Some(accepted_at));
     assert!(load.cached);
     assert_eq!(load.error, Some("cache_load_failed"));
-    state.reconcile(vec![periodic.clone()]);
-    state.start_pending(MAX_ACTIVE_FETCHES);
     assert!(receiver.try_recv().is_err());
-    assert!(state.flights.is_empty());
-    state.shutdown().await.unwrap();
     assert_eq!(state.owned_task_count(), 0);
 }
 
 #[test]
-fn pause_joins_queued_blocking_persistence() {
+fn shutdown_joins_queued_blocking_persistence() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -354,18 +353,18 @@ fn pause_joins_queued_blocking_persistence() {
             .fetch_ids
             .insert(task.id(), subscription.subscription.id);
         writing_rx.await.unwrap();
-        let pause = state.pause_fetches("supervisor_paused");
-        tokio::pin!(pause);
+        let shutdown = state.shutdown();
+        tokio::pin!(shutdown);
         std::future::poll_fn(|cx| {
             assert!(
-                pause.as_mut().poll(cx).is_pending(),
-                "pause must retain the blocked cache writer"
+                shutdown.as_mut().poll(cx).is_pending(),
+                "shutdown must retain the blocked cache writer"
             );
             std::task::Poll::Ready(())
         })
         .await;
         release.send(()).unwrap();
-        pause.await.unwrap();
+        shutdown.await.unwrap();
         blocker.await.unwrap();
         let cached = store
             .load_nodes(&subscription.subscription)
@@ -378,13 +377,12 @@ fn pause_joins_queued_blocking_persistence() {
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
-async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
+async fn shutdown_cancels_periodic_and_explicit_fetches_without_losing_replay() {
     use crate::native_api::{
         events::EventHub,
         operations::{OperationKind, OperationStore},
         providers::RefreshOperation,
     };
-    use axum::response::IntoResponse;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut periodic = authorized(
         uuid::Uuid::new_v4(),
@@ -444,7 +442,7 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
         }
         sockets.push(socket);
     }
-    state.pause_fetches("supervisor_paused").await.unwrap();
+    state.shutdown().await.unwrap();
     for mut socket in sockets {
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), socket.read_u8())
@@ -474,41 +472,13 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["status"], "failed");
-        assert_eq!(value["error"]["code"], "supervisor_paused");
+        assert_eq!(value["error"]["code"], "supervisor_stopped");
     }
-    let path = format!("/api/v1/providers/{}/refresh", explicit.subscription.id);
-    let reservation = operations
-        .reserve(
-            "control",
-            "POST",
-            &path,
-            Some("paused"),
-            b"",
-            OperationKind::ProviderRefresh,
-        )
-        .unwrap();
-    let admission = reservation.admission();
-    state.refresh(
-        explicit.subscription.clone(),
-        RefreshOperation {
-            display_name: explicit.subscription.name.clone(),
-            display_url: explicit.subscription.url.clone(),
-            display_download: None,
-            reservation,
-            operations,
-            instance,
-        },
-    );
-    assert_eq!(
-        admission.await.unwrap_err().into_response().status(),
-        axum::http::StatusCode::CONFLICT
-    );
     assert_eq!(state.owned_task_count(), 0);
-    state.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn pause_preserves_a_completed_http_failure() {
+async fn shutdown_preserves_a_completed_http_failure() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let subscription = authorized(
         uuid::Uuid::new_v4(),
@@ -544,12 +514,11 @@ async fn pause_preserves_a_completed_http_failure() {
         .await
         .unwrap();
     completion.await.unwrap();
-    state.pause_fetches("supervisor_paused").await.unwrap();
+    state.shutdown().await.unwrap();
     assert_eq!(
         state.observations.read()[&id].load.error,
         Some("fetch_failed")
     );
-    state.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "native-api")]
@@ -694,6 +663,7 @@ async fn deferred_provider_survives_same_revision_reconcile_until_replaced() {
             outcome: ReloadOutcome::Committed { generation: 2 },
             node_count: nodes.len(),
             authorized: vec![provider.clone()],
+            rejection: None,
         })
         .unwrap();
     supervisor.shutdown().await.unwrap();

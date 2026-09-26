@@ -98,6 +98,7 @@ async fn trace_displays_configured_values_in_compiled_condition_order() {
 
 struct AssetServer {
     address: SocketAddr,
+    assets: Arc<parking_lot::Mutex<(Vec<u8>, Vec<u8>)>>,
     requests: Arc<AtomicUsize>,
     entered: oneshot::Receiver<()>,
     release: Option<oneshot::Sender<()>>,
@@ -110,6 +111,8 @@ impl AssetServer {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
+        let assets = Arc::new(parking_lot::Mutex::new((site, ip)));
+        let served = Arc::clone(&assets);
         let (entered, wait) = oneshot::channel();
         let (release, resume) = oneshot::channel();
         let mut tasks = JoinSet::new();
@@ -141,27 +144,35 @@ impl AssetServer {
                         resume.take().unwrap().await.unwrap();
                     }
                 }
-                let bytes = if head.starts_with(b"GET /geosite") {
-                    &site
-                } else {
-                    &ip
+                let bytes = {
+                    let assets = served.lock();
+                    if head.starts_with(b"GET /geosite") {
+                        assets.0.clone()
+                    } else {
+                        assets.1.clone()
+                    }
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     bytes.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
-                stream.write_all(bytes).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
                 stream.shutdown().await.unwrap();
             }
         });
         Self {
             address,
+            assets,
             requests,
             entered: wait,
             release: Some(release),
             tasks,
         }
+    }
+
+    fn serve_geosite(&self, site: Vec<u8>) {
+        self.assets.lock().0 = site;
     }
 
     async fn close(mut self) {
@@ -561,6 +572,8 @@ async fn cached_subscription_rows_are_fenced_without_filesystem_guards() {
     let store = crate::subscription::SubscriptionStore::in_dir(&fixture.path("state"));
 
     for port in [17771, 17772] {
+        let domain = format!("{port}.example");
+        server.serve_geosite(geosite(&domain));
         store
             .store_content(&subscription, format!("socks5://127.0.0.1:{port}#cached"))
             .await
@@ -568,8 +581,9 @@ async fn cached_subscription_rows_are_fenced_without_filesystem_guards() {
         let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
         let terminal = fixture.terminal(&operation).await;
         assert_eq!(terminal["status"], "succeeded", "{terminal}");
-        assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "block");
+        assert_eq!(route(&fixture, &domain, "192.0.2.5").await, "block");
     }
+    server.serve_geosite(geosite("final.example"));
 
     let before = fixture.get(GEO).await;
     let (entered, resume) = fixture.pause_before_replace();
@@ -593,7 +607,7 @@ async fn cached_subscription_rows_are_fenced_without_filesystem_guards() {
     assert_eq!(fixture.get(GEO).await["assets"], before["assets"]);
     assert_eq!(
         std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
-        geosite("new.example")
+        geosite("17772.example")
     );
     drop(store);
     fixture.shutdown().await;
@@ -1067,6 +1081,110 @@ async fn rejected_activation_records_failed_last_reload() {
     assert_eq!(terminal["status"], "failed", "{terminal}");
     assert_eq!(terminal["error"]["details"]["stage"], "reload_rejected");
     fixture.assert_last_reload(&terminal).await;
+    fixture.shutdown().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn identical_bytes_keep_the_loaded_files_and_generation() {
+    let server = AssetServer::new(geosite("old.example"), geoip(198), false).await;
+    let fixture = fixture(server.address, false).await;
+    let old = fixture.get(GEO).await;
+    let inode = |name: &str| std::fs::metadata(fixture.path(name)).unwrap().ino();
+    let before = [inode("state/geosite.dat"), inode("state/geoip.dat")];
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(terminal["result"]["assets"], old["assets"]);
+    assert_eq!(
+        [inode("state/geosite.dat"), inode("state/geoip.dat")],
+        before
+    );
+    assert_eq!(std::fs::read_dir(fixture.path("state")).unwrap().count(), 2);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.get("/api/v1/runtime").await["last_reload"],
+        Value::Null
+    );
+    fixture.shutdown().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn identical_bytes_over_a_changed_loaded_file_are_not_a_success() {
+    let server = AssetServer::new(geosite("old.example"), geoip(198), false).await;
+    let fixture = fixture(server.address, false).await;
+    std::fs::write(fixture.path("state/geosite.dat"), geosite("edited.example")).unwrap();
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(
+        terminal["error"]["details"]["stage"], "asset_conflict",
+        "{terminal}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
+        geosite("edited.example")
+    );
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+    server.close().await;
+}
+
+/// A reload keeps a router whose asset bytes are unchanged, so it can go on
+/// naming a packaged file after an identical copy starts shadowing it.
+#[tokio::test]
+async fn an_update_replaces_the_resolved_copy_of_an_unchanged_loaded_file() {
+    let server = AssetServer::new(geosite("new.example"), geoip(198), false).await;
+    let fixture = fixture(server.address, false).await;
+    let packaged = fixture.path("packaged");
+    std::fs::create_dir_all(&packaged).unwrap();
+    for name in ["geosite.dat", "geoip.dat"] {
+        std::fs::copy(fixture.path(&format!("state/{name}")), packaged.join(name)).unwrap();
+    }
+    {
+        let state = fixture.state.upgrade().unwrap();
+        let config = state.config.read().await.clone();
+        let requirements = crate::routing::GeoRequirements::for_traffic(&config.routing.rules)
+            .union(&DnsRouter::geo_requirements(&config.dns));
+        let geo = crate::routing::GeoSourceSet::load_captured(&requirements, &packaged, |path| {
+            std::fs::read(path).map(Arc::from)
+        })
+        .unwrap();
+        *state.traffic_router.write().await =
+            Router::from_config_with_geo_sources(&config.routing, &geo).unwrap();
+    }
+    let geoip_inode = std::fs::metadata(fixture.path("state/geoip.dat"))
+        .unwrap()
+        .ino();
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(
+        terminal["result"]["assets"][0]["sha256"],
+        crate::configuration::digest(&geosite("new.example"))
+    );
+    assert_eq!(
+        std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
+        geosite("new.example")
+    );
+    assert_eq!(
+        std::fs::read(packaged.join("geosite.dat")).unwrap(),
+        geosite("old.example")
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.path("state/geoip.dat"))
+            .unwrap()
+            .ino(),
+        geoip_inode
+    );
+    assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "block");
+    assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "direct");
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 1);
+    let again = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&again).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 1);
     fixture.shutdown().await;
     server.close().await;
 }

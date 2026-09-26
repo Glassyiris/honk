@@ -344,7 +344,7 @@ impl ControlPlane {
                     nodes = nodes.len(),
                     message = "Publishing accepted subscription body"
                 );
-                let outcome = match self
+                let (outcome, rejection) = match self
                     .merge_authorized_subscription_nodes_with_drain(
                         subscription_id,
                         revision,
@@ -360,15 +360,15 @@ impl ControlPlane {
                             ?outcome,
                             message = "Subscription runtime publication applied"
                         );
-                        outcome
+                        (outcome, None)
                     }
                     Ok(outcome) => {
                         warn!(message = "Subscription runtime publication rejected");
-                        outcome
+                        (outcome, None)
                     }
                     Err(error) => {
                         crate::report_runtime_admission_error(&error);
-                        ReloadOutcome::Rejected
+                        (ReloadOutcome::Rejected, Some(error.diagnostic.code))
                     }
                 };
                 let config = self.config.read().await;
@@ -380,6 +380,7 @@ impl ControlPlane {
                         .filter(|node| node.subscription_id == Some(subscription_id))
                         .count(),
                     authorized: subscription_authorizations.committed(&config.subscriptions),
+                    rejection,
                 });
             }
             ControlCommand::NetworkChanged => {

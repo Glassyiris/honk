@@ -791,9 +791,7 @@ impl ControlPlane {
         }
         retain_error(&mut fatal, joined(&mut self.health_task).await);
         #[cfg(feature = "native-api")]
-        if let Some(native) = &self.native
-            && !native.probes.paused()
-        {
+        if let Some(native) = &self.native {
             retain_error(
                 &mut fatal,
                 cleanup_stage(async { native.probes.pause().await.map_err(anyhow::Error::from) })

@@ -229,7 +229,6 @@ enum WorkerState {
     NotStarted,
     Running,
     Transitioning,
-    Paused,
     Faulted,
     Stopped,
 }
@@ -369,9 +368,6 @@ impl ProbeService {
                 .and_then(std::sync::Weak::upgrade)
                 .is_some_and(|state| state.require_running().is_ok())
     }
-    pub(crate) fn paused(&self) -> bool {
-        self.gate.lock().state == WorkerState::Paused
-    }
     pub(crate) async fn pause(&self) -> Result<(), ProbeLifecycleError> {
         let (reply, result) = oneshot::channel();
         {
@@ -450,7 +446,7 @@ impl ProbeService {
                             }
                             owner.drain_requests().await;
                             while let Some(result) = jobs.join_next().await { clean &= matches!(result, Ok(Ok(()))); }
-                            owner.gate.lock().state = if clean { WorkerState::Paused } else { WorkerState::Faulted };
+                            owner.gate.lock().state = if clean { WorkerState::Stopped } else { WorkerState::Faulted };
                             let _ = reply.send(if clean { Ok(()) } else { Err(ProbeLifecycleError::CleanupFailed) });
                         }
                         None => break,
@@ -499,13 +495,7 @@ impl ProbeService {
             error
         };
         if gate.state != WorkerState::Running {
-            return Err(reject(
-                if matches!(gate.state, WorkerState::Paused | WorkerState::Transitioning) {
-                    paused()
-                } else {
-                    unavailable()
-                },
-            ));
+            return Err(reject(unavailable()));
         }
         let key = job.plan.context.spec.target.key();
         if targets.contains(&key) {
@@ -608,13 +598,7 @@ pub(super) async fn create(
     let bytes = if let Some(cancel) = &guard.cancel {
         wire::bounded(deadline, cancel.clone(), body)
             .await
-            .map_err(|_| {
-                if *cancel.borrow() {
-                    paused()
-                } else {
-                    unavailable()
-                }
-            })?
+            .map_err(|_| unavailable())?
     } else {
         tokio::time::timeout_at(deadline, body)
             .await
@@ -634,20 +618,8 @@ pub(super) async fn create(
         let operation_id = reservation.id.clone();
         let preparation = async {
             state.require_running()?;
-            let Some(cancel) = &guard.cancel else {
-                return Err(
-                    if matches!(
-                        service.gate.lock().state,
-                        WorkerState::Paused | WorkerState::Transitioning
-                    ) {
-                        paused()
-                    } else {
-                        unavailable()
-                    },
-                );
-            };
-            if *cancel.borrow() {
-                return Err(paused());
+            if guard.cancel.as_ref().is_none_or(|cancel| *cancel.borrow()) {
+                return Err(unavailable());
             }
             let request: ProbeRequest = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
             let plan = capture(state, request).await?;
@@ -658,13 +630,7 @@ pub(super) async fn create(
         let result = if let Some(cancel) = &guard.cancel {
             wire::bounded(deadline, cancel.clone(), preparation)
                 .await
-                .unwrap_or_else(|_| {
-                    Err(if *cancel.borrow() {
-                        paused()
-                    } else {
-                        unavailable()
-                    })
-                })
+                .unwrap_or_else(|_| Err(unavailable()))
         } else {
             preparation.await
         };
@@ -723,12 +689,4 @@ fn unavailable() -> ApiError {
         None,
     )
     .with_retry_after(1)
-}
-fn paused() -> ApiError {
-    ApiError::new(
-        StatusCode::CONFLICT,
-        ErrorCode::StateConflict,
-        "Probe admission is paused.",
-        None,
-    )
 }

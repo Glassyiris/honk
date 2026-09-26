@@ -17,12 +17,20 @@ struct AssetWrite {
 struct DownloadedAsset {
     original: GeoAssetSnapshot,
     bytes: Arc<[u8]>,
+    unchanged: bool,
 }
 
 struct StagedAsset {
     snapshot: GeoAssetSnapshot,
     bytes: Arc<[u8]>,
     staged: StagedFile,
+}
+
+/// A download identical to the loaded file, which stays in place unwritten.
+struct KeptAsset {
+    snapshot: GeoAssetSnapshot,
+    bytes: Arc<[u8]>,
+    file: SourceFile,
 }
 
 struct InstalledAsset {
@@ -36,8 +44,21 @@ struct PreparedGeodata {
     assets: Vec<InstalledAsset>,
 }
 
-fn failure(stage: &'static str, writes: impl IntoIterator<Item = impl serde::Serialize>) -> Value {
-    json!({"stage":stage,"assets":writes.into_iter().collect::<Vec<_>>(),"committed":false})
+fn failure(
+    stage: &'static str,
+    writes: impl IntoIterator<Item = impl std::borrow::Borrow<AssetWrite>>,
+) -> Value {
+    let mut writes: Vec<AssetWrite> = writes.into_iter().map(|write| *write.borrow()).collect();
+    writes.sort_by_key(|write| write.kind != "geosite");
+    json!({"stage":stage,"assets":writes,"committed":false})
+}
+
+fn unwritten_receipt(kind: &'static str) -> AssetWrite {
+    AssetWrite {
+        kind,
+        written: Some(false),
+        durability_confirmed: Some(false),
+    }
 }
 
 fn unwritten(assets: &[GeoAssetSnapshot]) -> Vec<AssetWrite> {
@@ -62,7 +83,9 @@ impl Worker {
                 self.service
                     .operations
                     .succeed(id, OperationResult::Geodata(data));
-                self.reloaded(id);
+                if activated {
+                    self.reloaded(id);
+                }
             }
             Err(details) => {
                 if let Some(sources) = &plan.sources {
@@ -141,6 +164,7 @@ impl Worker {
             .map_err(|stage| failure(stage, &writes))?;
             downloads.push(DownloadedAsset {
                 original: asset.clone(),
+                unchanged: digest(&bytes) == asset.sha256,
                 bytes,
             });
             fetched.push(origin);
@@ -166,17 +190,27 @@ impl Worker {
         .map_err(|_| {
             failure(
                 "write_completion_unconfirmed",
-                writes.into_iter().map(|write| AssetWrite {
+                writes.iter().map(|write| AssetWrite {
                     kind: write.kind,
                     written: None,
                     durability_confirmed: None,
                 }),
             )
         })??;
-        let PreparedGeodata {
+        // Identical bytes leave the loaded files and the generation as they are.
+        let Some(PreparedGeodata {
             activation,
             assets: prepared,
-        } = prepared;
+        }) = prepared
+        else {
+            if let Some(sources) = &plan.sources {
+                sources.record(Ok((fetched, false)));
+            }
+            let assets = geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
+                .await
+                .map_err(|_| failure("loaded_assets_unavailable", &writes))?;
+            return Ok(self.project(plan, assets).await);
+        };
         *activated = true;
         self.activation
             .activate(activation)
@@ -204,11 +238,12 @@ impl Worker {
                 details["committed"] = json!(true);
                 details
             })?;
+        // A kept file may still be published under the path its unchanged router recorded.
         if assets.len() != prepared.len()
             || assets.iter().zip(&prepared).any(|(actual, prepared)| {
                 let expected = &prepared.snapshot;
                 actual.kind != expected.kind
-                    || actual.path != expected.path
+                    || (prepared.receipt.written == Some(true) && actual.path != expected.path)
                     || actual.sha256 != expected.sha256
                     || actual.size_bytes != expected.size_bytes
             })
@@ -228,14 +263,22 @@ impl Worker {
                 .any(|(original, prepared)| original.sha256 != prepared.snapshot.sha256);
             sources.record(Ok((fetched, replaced)));
         }
+        Ok(self.project(plan, assets).await)
+    }
+
+    async fn project(
+        &self,
+        plan: &GeoUpdatePlan,
+        assets: Vec<GeoAssetSnapshot>,
+    ) -> geodata::GeoData {
         let active = self.active.read().await;
-        Ok(geodata::project(
+        geodata::project(
             assets,
             plan.sources.as_deref(),
             &active,
             &self.service,
             |name| geodata::group_id(&plan.catalog, name),
-        ))
+        )
     }
 }
 
@@ -266,6 +309,8 @@ fn same_settled_dependencies(
     same_dependencies(&settled(accepted), &settled(captured))
 }
 
+/// `None` when every download matches its loaded file: nothing is written,
+/// but the loaded files still pass the checks a write would run first.
 #[allow(clippy::too_many_arguments)]
 fn prepare_and_replace(
     service: &ConfigService,
@@ -276,14 +321,10 @@ fn prepare_and_replace(
     revision: &str,
     data_dir: &Path,
     deferred: &[honk_config::subscription::Subscription],
-) -> Result<PreparedGeodata, Value> {
+) -> Result<Option<PreparedGeodata>, Value> {
     let writes: Vec<_> = downloads
         .iter()
-        .map(|asset| AssetWrite {
-            kind: asset.original.kind,
-            written: Some(false),
-            durability_confirmed: Some(false),
-        })
+        .map(|asset| unwritten_receipt(asset.original.kind))
         .collect();
     let mut diagnostics = Vec::new();
     let loaded = store
@@ -339,44 +380,67 @@ fn prepare_and_replace(
     }
     let mut assets: std::collections::VecDeque<StagedAsset> =
         std::collections::VecDeque::with_capacity(downloads.len());
+    let mut kept: Vec<KeptAsset> = Vec::new();
     for download in downloads {
         let original = download.original;
-        let path = original
+        let recorded = original
             .path
             .as_ref()
             .ok_or_else(|| failure("asset_path_unavailable", &writes))?;
-        let file = SourceFile::open_binary(path, offline::MAX_ASSET_BYTES)
-            .map_err(|_| failure("asset_path_unavailable", &writes))?;
-        let dependency_path =
-            std::fs::canonicalize(path).map_err(|_| failure("asset_path_unavailable", &writes))?;
-        if file.sha256() != original.sha256
-            || !captured.dependencies.iter().any(|dependency| {
+        // A reload keeps a router whose asset bytes did not change, so the path
+        // it recorded can name a file the lookup no longer resolves. The loaded
+        // asset is the resolved file with those bytes, which a reload or restart
+        // would load again.
+        let dependency = captured
+            .dependencies
+            .iter()
+            .find(|dependency| {
                 dependency.asset
-                    && dependency.path == dependency_path
                     && dependency.sha256 == original.sha256
                     && dependency
                         .readers
-                        .contains(&crate::configuration::DependencyReader::Geo(original.kind))
+                        .contains(&DependencyReader::Geo(original.kind))
             })
-        {
+            .ok_or_else(|| failure("asset_conflict", &writes))?;
+        let path = if std::fs::canonicalize(recorded).is_ok_and(|path| path == dependency.path) {
+            recorded.clone()
+        } else {
+            dependency.path.clone()
+        };
+        let file = SourceFile::open_binary(&path, offline::MAX_ASSET_BYTES)
+            .map_err(|_| failure("asset_path_unavailable", &writes))?;
+        if file.sha256() != original.sha256 {
             return Err(failure("asset_conflict", &writes));
         }
         if guards
             .iter()
             .chain(source_pins.iter().filter_map(Pin::file))
+            .chain(kept.iter().map(|asset| &asset.file))
             .any(|other| file.same_target(other))
             || assets.iter().any(|asset| asset.staged.same_target(&file))
         {
             return Err(failure("asset_alias", &writes));
         }
+        if download.unchanged {
+            kept.push(KeptAsset {
+                snapshot: GeoAssetSnapshot {
+                    modified_at: original.modified_at.filter(|_| path == *recorded),
+                    path: Some(path),
+                    ..original
+                },
+                bytes: download.bytes,
+                file,
+            });
+            continue;
+        }
         let target = update_target(
-            path,
+            &path,
             data_dir,
             std::env::var_os("DAE_LOCATION_ASSET")
                 .as_deref()
                 .map(Path::new),
         );
-        let staged = if target == *path {
+        let staged = if target == path {
             file.stage(&original.sha256, &download.bytes)
         } else {
             file.stage_beside(&original.sha256, &target, &download.bytes)
@@ -395,11 +459,18 @@ fn prepare_and_replace(
             staged,
         });
     }
+    if assets.is_empty() {
+        return Ok(None);
+    }
     let geo = GeoSourceSet::from_assets(
         &requirements,
         assets
             .iter()
             .map(|asset| (asset.snapshot.clone(), Arc::clone(&asset.bytes)))
+            .chain(
+                kept.iter()
+                    .map(|asset| (asset.snapshot.clone(), Arc::clone(&asset.bytes))),
+            )
             .collect(),
     )
     .map_err(|_| failure("asset_validation_failed", &writes))?;
@@ -430,11 +501,15 @@ fn prepare_and_replace(
                     .iter()
                     .map(|asset| asset.receipt)
                     .chain(std::iter::once(receipt))
-                    .chain(assets.iter().map(|asset| AssetWrite {
-                        kind: asset.snapshot.kind,
-                        written: Some(false),
-                        durability_confirmed: Some(false),
-                    })),
+                    .chain(
+                        assets
+                            .iter()
+                            .map(|asset| unwritten_receipt(asset.snapshot.kind)),
+                    )
+                    .chain(
+                        kept.iter()
+                            .map(|asset| unwritten_receipt(asset.snapshot.kind)),
+                    ),
             )
         };
         let result = staged.replace(|| {
@@ -451,7 +526,7 @@ fn prepare_and_replace(
             for pin in &source_pins {
                 store.recheck(pin)?;
             }
-            for guard in &guards {
+            for guard in guards.iter().chain(kept.iter().map(|asset| &asset.file)) {
                 guard.recheck()?;
             }
             for completed in &installed {
@@ -502,6 +577,12 @@ fn prepare_and_replace(
             receipt,
         });
     }
+    installed.extend(kept.into_iter().map(|asset| InstalledAsset {
+        receipt: unwritten_receipt(asset.snapshot.kind),
+        snapshot: asset.snapshot,
+        installed: asset.file,
+    }));
+    installed.sort_by_key(|asset| asset.snapshot.kind != "geosite");
     for pin in &source_pins {
         store.recheck(pin).map_err(|_| {
             failure(
@@ -521,7 +602,7 @@ fn prepare_and_replace(
             )
         })?;
     }
-    Ok(PreparedGeodata {
+    Ok(Some(PreparedGeodata {
         activation: ActivationRequest {
             candidate: validated.config,
             sources: Some(SourceUpdate {
@@ -534,7 +615,7 @@ fn prepare_and_replace(
             deferred_provider: None,
         },
         assets: installed,
-    })
+    }))
 }
 
 /// Where an update writes the replacement for the loaded file at `loaded`:
