@@ -624,3 +624,83 @@ async fn native_startup_backpressures_all_subscriptions_without_dropping_them() 
     );
     assert_eq!(supervisor.shutdown().await.unwrap(), 0);
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn deferred_provider_survives_same_revision_reconcile_until_replaced() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut provider = authorized(
+        uuid::Uuid::new_v4(),
+        1,
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    provider.subscription.update_interval = 1;
+    let mut supervisor = SubscriptionSupervisor::prepare(&mut Config::default(), None, Vec::new())
+        .await
+        .unwrap();
+    let (merge_tx, mut merges) = mpsc::channel(4);
+    supervisor.start(merge_tx);
+    let handle = supervisor.handle();
+    handle
+        .reconcile_managed(vec![provider.clone()], provider.subscription.id)
+        .await
+        .unwrap();
+    handle.reconcile(vec![provider.clone()]).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1100), listener.accept())
+            .await
+            .is_err(),
+        "neither a same-revision reconcile nor periodic ticks may activate a deferred provider"
+    );
+    let deferred = handle.deferred_subscriptions().await.unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert!(same_worker_spec(&deferred[0], &provider.subscription));
+
+    provider.revision += 1;
+    provider.subscription.name = "replacement-with-same-fetch-identity".into();
+    handle.reconcile(vec![provider.clone()]).await.unwrap();
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let body = "socks5://127.0.0.1:11088#replacement";
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let ControlCommand::MergeSubscription {
+        revision,
+        nodes,
+        result,
+        ..
+    } = tokio::time::timeout(Duration::from_secs(1), merges.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected replacement publication");
+    };
+    assert_eq!(revision, 2);
+    assert_eq!(nodes[0].name, "replacement");
+    assert!(handle.deferred_subscriptions().await.unwrap().is_empty());
+    result
+        .send(SubscriptionMergeReply {
+            outcome: ReloadOutcome::Committed { generation: 2 },
+            node_count: nodes.len(),
+            authorized: vec![provider.clone()],
+        })
+        .unwrap();
+    supervisor.shutdown().await.unwrap();
+    assert!(
+        handle
+            .observation(&provider.subscription)
+            .updated_at
+            .is_some()
+    );
+}
