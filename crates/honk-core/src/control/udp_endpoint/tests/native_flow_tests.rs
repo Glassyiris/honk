@@ -576,7 +576,6 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
         let mut plan = crate::control::routing_matcher::RoutingPushPlan::compile(
             &router,
             &std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-            "direct",
             honk_config::types::DialMode::Ip,
         )
         .unwrap();

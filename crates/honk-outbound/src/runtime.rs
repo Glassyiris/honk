@@ -17,8 +17,6 @@ pub mod flow_observation;
 mod tasks;
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
-#[cfg(feature = "native-api")]
-pub(crate) use tasks::lookup_host_owned;
 pub(crate) use tasks::{
     RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
 };
@@ -554,17 +552,21 @@ impl NodeRuntime {
 
     /// Scope protocol jobs to this runtime, never to a caller's probe owner.
     /// Callers retain and drain their own dialing future before final shutdown.
-    pub async fn scope_tasks<T, F>(&self, future: F) -> anyhow::Result<T>
+    pub fn scope_tasks<T, F>(&self, future: F) -> impl Future<Output = anyhow::Result<T>>
     where
         F: Future<Output = anyhow::Result<T>>,
     {
         #[cfg(feature = "native-api")]
-        match &self.task_owner {
-            Some(owner) => owner.scope(future).await,
-            None => tasks::scope_owner(None, future).await,
+        {
+            match &self.task_owner {
+                Some(owner) => futures_util::future::Either::Left(owner.scope(future)),
+                None => futures_util::future::Either::Right(tasks::scope_owner(None, future)),
+            }
         }
         #[cfg(not(feature = "native-api"))]
-        future.await
+        {
+            future
+        }
     }
 
     pub(crate) fn task_scope(&self) -> TaskScope {

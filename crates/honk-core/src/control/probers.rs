@@ -835,9 +835,7 @@ pub(super) fn build_dns_probe_query() -> Vec<u8> {
 /// Resolve the UDP health check target from `global.udp_check_dns`
 /// (dae semantics: `host[:port]` list, default port 53).
 ///
-/// IP literals in the list are preferred over domain entries: the system
-/// resolver can return DNS-poisoned answers for popular check domains
-/// (e.g. dns.google), which would send every probe to a black hole.
+/// IP literals in the list are preferred over domain entries.
 /// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when the list is empty, no entry
 /// resolves, or ordinary resolution fails. Typed local refusal is returned.
 pub(super) async fn resolve_udp_check_target(
@@ -857,8 +855,13 @@ pub(super) async fn resolve_udp_check_target(
                 }
                 Err(_) => Vec::new(),
             },
-            None => honk_outbound::bootstrap::lookup_host(host, port)
+            None => honk_outbound::bootstrap::resolve(host)
                 .await
+                .map(|ips| {
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         if let Some(addr) = addrs.into_iter().next() {
@@ -910,8 +913,13 @@ pub(super) async fn resolve_quic_score_target(
                     return Ok(None);
                 }
             },
-            None => honk_outbound::bootstrap::lookup_host(host.as_str(), port)
+            None => honk_outbound::bootstrap::resolve(&host)
                 .await
+                .map(|ips| {
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     };

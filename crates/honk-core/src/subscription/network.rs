@@ -1,4 +1,5 @@
-use super::{Subscription, fetch_body, subscription_client};
+use super::{Subscription, fetch_body};
+use crate::marked_http::Client;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -22,7 +23,7 @@ struct NetworkThread {
 
 impl NetworkThread {
     fn start(
-        build_client: impl FnOnce() -> anyhow::Result<reqwest::Client> + Send + 'static,
+        build_client: impl FnOnce() -> anyhow::Result<Client> + Send + 'static,
     ) -> anyhow::Result<Self> {
         let (requests, receiver) = mpsc::channel(MAX_REQUESTS);
         let (stop, stopped) = watch::channel(false);
@@ -34,8 +35,7 @@ impl NetworkThread {
                     .enable_all()
                     .build()
                     .map_err(|_| "subscription network runtime creation failed")?;
-                // Default runtime drop cancels reqwest's hidden async drivers and waits for
-                // started blocking NSS jobs; timeout/background shutdown would detach them.
+                // Runtime drop joins the HTTP drivers cancelled with their response owners.
                 runtime.block_on(async move {
                     let client =
                         build_client().map_err(|_| "subscription HTTP client creation failed")?;
@@ -94,11 +94,11 @@ pub(super) struct SubscriptionNetwork {
 
 impl SubscriptionNetwork {
     pub(super) fn new() -> anyhow::Result<Self> {
-        Self::with_client(subscription_client)
+        Self::with_client(Client::new)
     }
 
     fn with_client(
-        build_client: impl FnOnce() -> anyhow::Result<reqwest::Client> + Send + 'static,
+        build_client: impl FnOnce() -> anyhow::Result<Client> + Send + 'static,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             state: Mutex::new(State {
@@ -203,7 +203,7 @@ impl SubscriptionNetwork {
             state.joining.is_none() && state.active.is_none(),
             "subscription network has not finished pausing"
         );
-        match NetworkThread::start(subscription_client) {
+        match NetworkThread::start(Client::new) {
             Ok(active) => state.active = Some(active),
             Err(error) => {
                 state.failure = Some("subscription network restart failed");
@@ -216,7 +216,7 @@ impl SubscriptionNetwork {
 }
 
 async fn run(
-    client: reqwest::Client,
+    client: Client,
     mut requests: mpsc::Receiver<Request>,
     mut stop: watch::Receiver<bool>,
 ) -> ThreadResult {

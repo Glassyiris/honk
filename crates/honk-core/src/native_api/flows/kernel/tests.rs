@@ -14,7 +14,6 @@ fn fixture() -> (
     let mut plan = RoutingPushPlan::compile(
         &router,
         &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-        "direct",
         DialMode::Ip,
     )
     .unwrap();
@@ -315,11 +314,10 @@ fn oversized_dictionary_reports_only_executed_evidence_loss() {
     }
     source.push_str("fallback: block\n}\n");
     let config = honk_config::parser::parse_dae_config(&source).unwrap();
-    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let router = Router::from_config(&config.routing).unwrap();
     let mut plan = RoutingPushPlan::compile(
         &router,
         &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-        "block",
         DialMode::Ip,
     )
     .unwrap();
@@ -395,11 +393,10 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
         "routing {{\n pname('{name}') -> block\n fallback: direct\n}}\n"
     ))
     .unwrap();
-    let router = Router::new(&config.routing.rules, "direct").unwrap();
+    let router = Router::from_config(&config.routing).unwrap();
     let mut plan = RoutingPushPlan::compile(
         &router,
         &HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-        "direct",
         DialMode::Ip,
     )
     .unwrap();

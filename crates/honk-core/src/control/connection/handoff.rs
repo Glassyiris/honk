@@ -1,3 +1,4 @@
+use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::{HashMap, HashSet};
 
@@ -372,7 +373,6 @@ impl Drop for TcpFlowGuard {
 }
 
 pub(super) struct ModeDecision {
-    pub(super) name: String,
     pub(super) constraint: crate::control::reload::OutboundConstraint,
     #[cfg(feature = "native-api")]
     pub(super) group_id: Option<String>,
@@ -523,14 +523,10 @@ impl ControlPlaneHandle {
         }
     }
 
-    /// Preserve exact native target identity until the selected generation is pinned.
-    pub(super) async fn apply_mode_override(
-        &self,
-        outbound_name: String,
-        must: bool,
-    ) -> ModeDecision {
-        let mut result = ModeDecision {
-            name: outbound_name,
+    /// Preserve exact native target identity and clear marks when mode changes the route.
+    pub(super) async fn apply_mode_override(&self, route: &mut RoutingDecision) -> ModeDecision {
+        route.apply_final_outbound(None);
+        let result = ModeDecision {
             constraint: Default::default(),
             #[cfg(feature = "native-api")]
             group_id: None,
@@ -538,36 +534,42 @@ impl ControlPlaneHandle {
         let Some(mode_state) = &self.mode_state else {
             return result;
         };
-        if must || result.name == "block" {
+        if route.must || route.outbound == "block" {
             return result;
         }
         let state = mode_state.read().clone();
         #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
         if state.native_enabled {
+            let mut result = result;
             let config = self.config.read().await;
             let state = mode_state.read().clone();
             let Some(native) = &self.native else {
-                result.name = "block".into();
+                route.apply_final_outbound(Some("block".into()));
                 return result;
             };
             let catalog = native.catalog.snapshot();
-            match state.native_override(&result.name, must, &config, &catalog.groups) {
+            match state.native_override(&route.outbound, route.must, &config, &catalog.groups) {
                 crate::mode::ModeOverride::Unchanged => {}
-                crate::mode::ModeOverride::Direct => result.name = "direct".into(),
-                crate::mode::ModeOverride::Block => result.name = "block".into(),
+                crate::mode::ModeOverride::Direct => {
+                    route.apply_final_outbound(Some("direct".into()));
+                }
+                crate::mode::ModeOverride::Block => {
+                    route.apply_final_outbound(Some("block".into()));
+                }
                 crate::mode::ModeOverride::Node(id) => {
-                    result.name = config
+                    let name = config
                         .nodes
                         .iter()
                         .find(|node| node.id == id)
                         .expect("validated mode target")
                         .name
                         .clone();
+                    route.apply_final_outbound(Some(name));
                     result.constraint = crate::control::reload::OutboundConstraint::Node(id);
                 }
                 crate::mode::ModeOverride::Group(name) => {
                     result.group_id = catalog.groups.get(&name).cloned();
-                    result.name = name;
+                    route.apply_final_outbound(Some(name));
                 }
             }
             return result;
@@ -586,7 +588,8 @@ impl ControlPlaneHandle {
         } else {
             false
         };
-        result.name = state.override_outbound(&result.name, false, selection_resolvable);
+        let outbound = state.override_outbound(&route.outbound, false, selection_resolvable);
+        route.apply_final_outbound(Some(outbound));
         result
     }
 }

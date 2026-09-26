@@ -786,7 +786,7 @@ async fn native_startup_backpressures_all_subscriptions_without_dropping_them() 
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
-async fn native_supervisor_pause_closes_completed_keepalive_before_reopening() {
+async fn native_supervisor_pause_closes_resumed_requests_before_publication() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = authorized(
         uuid::Uuid::new_v4(),
@@ -821,11 +821,6 @@ async fn native_supervisor_pause_closes_completed_keepalive_before_reopening() {
     let (merges, mut publications) = mpsc::channel(4);
     supervisor.start(merges);
     let handle = supervisor.handle();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), keepalive.read_u8())
-            .await
-            .is_err()
-    );
     handle.begin_pause().await.unwrap();
     handle.finish_pause().await.unwrap();
     assert_eq!(

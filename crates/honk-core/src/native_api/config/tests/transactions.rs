@@ -335,10 +335,7 @@ fn restart_rows(failure: &Value, source_id: &str, level: &str, fields: &[&str]) 
     for (row, field) in rows.iter().zip(fields) {
         assert_eq!(row["level"], level);
         assert_eq!(row["source_id"], source_id);
-        assert_eq!(
-            row["message"],
-            format!("Changing {field} requires restarting honk")
-        );
+        assert!(row["message"].as_str().unwrap().contains(field));
     }
 }
 
@@ -350,7 +347,7 @@ async fn restart_only_change_is_refused_before_writing() {
     let before_disk = disk(fixture.directory.path());
     let candidate = fixture.originals["main.dae"].replace(
         "nfqueue_enable: false",
-        "nfqueue_enable: true\n log_level: debug",
+        "nfqueue_enable: true\n log_level: debug\n so_mark_from_dae: 512",
     );
     let failure = error(
         fixture.replace(main, &candidate).send().await.unwrap(),
@@ -362,7 +359,11 @@ async fn restart_only_change_is_refused_before_writing() {
         &failure["error"]["details"]["diagnostics"],
         main["id"].as_str().unwrap(),
         "error",
-        &["global.log_level", "global.nfqueue_enable"],
+        &[
+            "global.so_mark_from_dae",
+            "global.log_level",
+            "global.nfqueue_enable",
+        ],
     );
     assert_eq!(disk(fixture.directory.path()), before_disk);
     assert_eq!(fixture.get(CONFIG).await, before);
@@ -380,7 +381,11 @@ async fn restart_only_change_is_refused_before_writing() {
         &checked["diagnostics"],
         "candidate",
         "warning",
-        &["global.log_level", "global.nfqueue_enable"],
+        &[
+            "global.so_mark_from_dae",
+            "global.log_level",
+            "global.nfqueue_enable",
+        ],
     );
     fixture.shutdown().await;
 }

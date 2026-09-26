@@ -302,7 +302,7 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
             for (port, mark, redirected) in [
                 (443, USER_MARK, true),
                 (444, 0, false),
-                (53, USER_MARK, false),
+                (53, USER_MARK, true),
             ] {
                 let key = tuple(src, dst, 43020, port, protocol);
                 let bytes = packet(src, dst, protocol, 43020, port, 5, 2);
@@ -316,13 +316,24 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
                     }
                 );
                 if redirected {
-                    let entry = handoff(&backend, &key);
-                    assert_eq!(entry.result.outbound, OutboundIndex::Direct as u8);
-                    assert_eq!(entry.result.mark, mark);
-                    assert_eq!(entry.result.must, 1);
-                    assert_ne!(entry.trace_id, 0);
-                    assert_ne!(entry.trace_id, ROUTE_TRACE_LOST);
-                    let captured = witness(&backend, entry.trace_id);
+                    let trace_id = if protocol == IPPROTO_UDP && port == 53 {
+                        assert!(backend.routing_handoff_take(&key).unwrap().is_none());
+                        assert_eq!(
+                            UdpDnsRoute::from_mark(result.cb[2]),
+                            UdpDnsRoute::direct(0, backend.routing_policy_generation())
+                        );
+                        result.cb[3]
+                    } else {
+                        let entry = handoff(&backend, &key);
+                        assert_eq!(entry.result.outbound, OutboundIndex::Direct as u8);
+                        assert_eq!(entry.result.mark, mark);
+                        assert_eq!(entry.result.must, 1);
+                        entry.trace_id
+                    };
+                    assert_ne!(trace_id, 0);
+                    assert_ne!(trace_id, ROUTE_TRACE_LOST);
+                    let captured = witness(&backend, trace_id);
+                    assert_eq!(captured.output.decision.direct_mark_index, 0);
                     assert_eq!(captured.output.decision.mark, mark);
                     assert_eq!(captured.output.decision.must, 1);
                     assert_ne!(captured.output.flags & ROUTE_TRACE_COMPLETE, 0);

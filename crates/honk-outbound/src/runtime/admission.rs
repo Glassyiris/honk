@@ -218,12 +218,12 @@ impl CapturedDialScope {
             let future = DIAL_SCOPE.scope(captured.0, future);
             #[cfg(feature = "native-api")]
             {
-                let observation = async {
-                    if suppressed || super::flow_observation::is_suppressed() {
-                        super::flow_observation::without(future).await
-                    } else {
-                        super::flow_observation::scope(captured.2, future).await
-                    }
+                let observation = if suppressed || super::flow_observation::is_suppressed() {
+                    futures_util::future::Either::Left(super::flow_observation::without(future))
+                } else {
+                    futures_util::future::Either::Right(super::flow_observation::scope(
+                        captured.2, future,
+                    ))
                 };
                 super::tasks::scope_owner(captured.1, observation).await
             }

@@ -70,7 +70,7 @@ impl Fixture {
         config.experimental.native_api.record_flows = recording;
         config.experimental.native_api.allow_anonymous_loopback = true;
         configure(&mut config);
-        let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+        let router = Router::from_config(&config.routing)?;
         let mut plane = ControlPlane::new(
             config,
             Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
@@ -1037,6 +1037,7 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             None,
             "outer",
             crate::stats::OutboundKind::Group,
+            None,
             Duration::from_secs(5),
             tokio::time::Instant::now() + Duration::from_millis(100),
             generation,

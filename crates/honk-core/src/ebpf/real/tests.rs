@@ -591,7 +591,6 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
             &router,
             &std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
-            "direct",
             honk_config::types::DialMode::Ip,
         )
         .unwrap();

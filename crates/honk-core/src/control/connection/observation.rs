@@ -394,7 +394,11 @@ impl ConnectionObservation {
                     rules: std::mem::take(&mut capture.rules),
                     outbound: Some(decision.outbound.clone()),
                     must: Some(decision.must),
-                    mark: Some(decision.mark),
+                    mark: Some(
+                        decision
+                            .mark
+                            .map_or(0, honk_outbound::proxy::DirectMark::get),
+                    ),
                     input: capture.input.take().map(EvaluationInput::Traffic),
                     dns_action: None,
                 },

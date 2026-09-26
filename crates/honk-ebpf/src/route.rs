@@ -41,12 +41,14 @@ pub unsafe extern "C" fn honk_route_slot0(
         for word in 0..32 {
             let _ = core::ptr::read_volatile(_input.cast::<u32>().add(word));
         }
-        for word in 0..5 {
+        for word in 0..core::mem::size_of::<RoutingDecision>() / 4 {
             let pointer = _decision.cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
         if core::ptr::read_volatile(core::ptr::addr_of!((*_decision).flags)) & 1 != 0 {
-            for word in 5..66 {
+            for word in core::mem::size_of::<RoutingDecision>() / 4
+                ..core::mem::size_of::<KernelRouteOutput>() / 4
+            {
                 let pointer = _decision.cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }
@@ -70,12 +72,14 @@ pub unsafe extern "C" fn honk_route_slot1(
         for word in 0..32 {
             let _ = core::ptr::read_volatile(_input.cast::<u32>().add(word));
         }
-        for word in 0..5 {
+        for word in 0..core::mem::size_of::<RoutingDecision>() / 4 {
             let pointer = _decision.cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
         if core::ptr::read_volatile(core::ptr::addr_of!((*_decision).flags)) & 1 != 0 {
-            for word in 5..66 {
+            for word in core::mem::size_of::<RoutingDecision>() / 4
+                ..core::mem::size_of::<KernelRouteOutput>() / 4
+            {
                 let pointer = _decision.cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }
@@ -165,12 +169,14 @@ fn evaluate_policy(
     };
     // freplace writes are opaque to LLVM; retain the replacement's whole output.
     unsafe {
-        for word in 0..5 {
+        for word in 0..core::mem::size_of::<RoutingDecision>() / 4 {
             let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
         if policy_id != 0 {
-            for word in 5..66 {
+            for word in core::mem::size_of::<RoutingDecision>() / 4
+                ..core::mem::size_of::<KernelRouteOutput>() / 4
+            {
                 let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }

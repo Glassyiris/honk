@@ -679,10 +679,11 @@ pub(crate) fn route_upstream(
         return (router.route(input).to_owned(), None);
     };
     let observed = router.route_full_observed(input, None, MAX_RULE_VALUES);
-    let outbound = observed.matched.as_ref().map_or_else(
-        || router.default_outbound(),
-        |matched| matched.outbound_name,
-    );
+    let action = observed
+        .matched
+        .as_ref()
+        .map_or_else(|| router.fallback(), |matched| matched.action);
+    let outbound = action.outbound.as_str();
     let context = observer.context();
     if observed.truncated {
         observer.publish(FlowEvent::Gap("buffer_overflow"));
@@ -708,13 +709,8 @@ pub(crate) fn route_upstream(
             rule_id: Some(rule_id),
             rules,
             outbound: Some(bounded(outbound)),
-            must: Some(
-                observed
-                    .matched
-                    .as_ref()
-                    .is_some_and(|matched| matched.must),
-            ),
-            mark: Some(observed.matched.as_ref().map_or(0, |matched| matched.mark)),
+            must: Some(action.must),
+            mark: Some(action.mark.map_or(0, |mark| mark.get())),
             input: Some(EvaluationInput::Traffic(super::record::RouteInput {
                 network: input.protocol,
                 src_ip: input.src_ip,

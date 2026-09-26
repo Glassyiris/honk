@@ -115,6 +115,54 @@ fn dns_rows(detail: &serde_json::Value) -> Vec<&serde_json::Value> {
 }
 
 #[tokio::test]
+async fn upstream_route_evidence_preserves_rule_and_fallback_marks() {
+    let config = honk_config::parser::parse_dae_config(
+        "routing {\n dport(53) -> direct(must, mark: 42)\n fallback: direct(must, mark: 43)\n}",
+    )
+    .unwrap();
+    let router = crate::routing::Router::from_config(&config.routing).unwrap();
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance.clone())),
+    ));
+    let api = Arc::new(DnsApi::new(instance.clone(), false, Arc::downgrade(&store)));
+    for (port, mark, suffix) in [(53, 42, "rule:0"), (853, 43, "fallback")] {
+        let (flow, observer) = observer(&store);
+        let input = crate::routing::ConnectionInfo {
+            src_ip: "127.0.0.1".parse().unwrap(),
+            src_port: 31000,
+            dst_ip: "192.0.2.17".parse().unwrap(),
+            dst_port: port,
+            protocol: "tcp",
+            domain: None,
+            process_name: None,
+            mac: None,
+            dscp: None,
+        };
+        let (outbound, evaluation) = scope_api(
+            Arc::downgrade(&api),
+            observer.scope(async { route_upstream(&router, &input) }),
+        )
+        .await;
+        assert_eq!(outbound, "direct");
+        let view = detail(&store, &flow);
+        let data = view["trace"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| &step["data"])
+            .find(|data| data["chain"] == "dns_upstream")
+            .unwrap();
+        assert_eq!(data["evaluation_id"], evaluation.unwrap());
+        assert_eq!(data["rule_id"], format!("{instance}:7:{suffix}"));
+        assert_eq!(data["outbound"], "direct");
+        assert_eq!(data["must"], true);
+        assert_eq!(data["mark"], mark);
+    }
+}
+
+#[tokio::test]
 async fn source_policy_cache_and_verification_ignore_dns_log_toggle() {
     let (service, store, api, gate, mut calls, server) = fixture().await;
     let (flow, observer) = observer(&store);

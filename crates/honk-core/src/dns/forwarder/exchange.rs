@@ -12,7 +12,6 @@ use crate::dns::planner::RequestScope;
 use crate::dns::query::{DnsRequestMeta, IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
 use crate::dns::singleflight::FlightKey;
-use honk_ebpf_common::DAE_BYPASS_MARK;
 
 use super::message::{build_dns_query, new_asis_socket_with_mark};
 use super::ttl::{patch_txid, rewrite_answer_ttls};
@@ -304,7 +303,10 @@ impl DnsForwarder {
             let sock2 = new_asis_socket_with_mark(destination, |socket| {
                 #[cfg(target_os = "linux")]
                 {
-                    honk_outbound::util::set_mark_best_effort(socket, DAE_BYPASS_MARK)
+                    honk_outbound::util::set_mark_best_effort(
+                        socket,
+                        honk_outbound::util::bypass_mark(),
+                    )
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -356,7 +358,7 @@ impl DnsForwarder {
         crate::native_api::flows::dns::transport("tcp", "tcp");
         let mut stream = honk_outbound::util::connect_marked_addr(
             destination,
-            Some(DAE_BYPASS_MARK),
+            Some(honk_outbound::util::bypass_mark()),
             self.dial_timeout,
         )
         .await

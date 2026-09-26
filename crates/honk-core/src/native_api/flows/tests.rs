@@ -103,7 +103,7 @@ fn rejected_source_writes_never_authorize_causal_references() {
 #[test]
 fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
     use crate::routing::{ConnectionInfo, GeoSourceSet, Router};
-    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+    use honk_config::routing::{RoutingCondition, RoutingConfig, RoutingOutbound, RoutingRule};
 
     // GeoIPList with one category and 128 IPv4 CIDRs, independent of host assets.
     let mut category = b"\x0a\x04test".to_vec();
@@ -116,20 +116,22 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
         (category.len() >> 7) as u8,
     ];
     geoip.extend(category);
-    let router = Router::new_with_geo_sources(
-        &[RoutingRule {
-            condition: RoutingCondition {
-                geo_ip: vec!["test".into()],
-                port: vec!["443".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("direct".into()),
-            name: String::new(),
-            priority: 0,
-            must: false,
-            mark: 0,
-        }],
-        "block",
+    let mut routing = RoutingConfig::default();
+    routing.rules = vec![RoutingRule {
+        condition: RoutingCondition {
+            geo_ip: vec!["test".into()],
+            port: vec!["443".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        name: String::new(),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    routing.default_outbound = "block".into();
+    let router = Router::from_config_with_geo_sources(
+        &routing,
         &GeoSourceSet::from_bytes(Vec::new(), geoip),
     )
     .unwrap();
@@ -145,7 +147,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
         dscp: None,
     };
     let observed = router.route_full_observed(&connection, None, MAX_RULE_VALUES);
-    assert_eq!(observed.matched.unwrap().outbound_name, "direct");
+    assert_eq!(observed.matched.unwrap().action.outbound, "direct");
     let rules =
         super::super::routing::observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(rules[0].conditions[0].expression, "dip(geoip: test)");

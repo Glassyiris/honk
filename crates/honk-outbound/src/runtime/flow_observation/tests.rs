@@ -254,43 +254,6 @@ async fn trojan_header_write_does_not_fabricate_target_confirmation() {
     drop(stream);
 }
 
-#[tokio::test]
-async fn external_resolution_reports_only_known_facts() {
-    let (observer, events) = recorder();
-    let addresses = observer
-        .scope(crate::bootstrap::lookup_host("localhost", 80))
-        .await
-        .unwrap();
-    assert!(!addresses.is_empty());
-    let events = events.lock();
-    assert!(
-        events
-            .iter()
-            .any(|(_, event)| matches!(event, FlowEvent::Gap("not_instrumented")))
-    );
-    let lookups: Vec<_> = events
-        .iter()
-        .filter_map(|(_, event)| match event {
-            FlowEvent::Dns(lookup) => Some(lookup),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(lookups.len(), 2);
-    assert_eq!(lookups[0].lookup_id, lookups[1].lookup_id);
-    let lookup = lookups[1];
-    assert_eq!(lookup.status, "succeeded");
-    assert_eq!(lookup.source, "unknown");
-    assert_eq!(lookup.cache, "unknown");
-    assert!(lookup.upstream.is_none());
-    assert!(lookup.selected_ip.is_none());
-    assert!(
-        lookup
-            .addresses
-            .iter()
-            .all(|address| addresses.iter().any(|socket| socket.ip() == *address))
-    );
-}
-
 #[test]
 fn shared_milestones_are_once_per_causal_context_not_once_per_carrier() {
     let (observer, events) = recorder();

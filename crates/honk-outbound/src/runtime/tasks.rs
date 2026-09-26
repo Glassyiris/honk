@@ -229,11 +229,11 @@ pub(super) fn capture_owner() -> Option<std::sync::Weak<TaskOwner>> {
 }
 
 #[cfg(feature = "native-api")]
-pub(super) async fn scope_owner<F: Future>(
+pub(super) fn scope_owner<F: Future>(
     owner: Option<std::sync::Weak<TaskOwner>>,
     future: F,
-) -> F::Output {
-    OWNER.scope(owner, future).await
+) -> impl Future<Output = F::Output> {
+    OWNER.scope(owner, future)
 }
 
 #[cfg(feature = "native-api")]
@@ -498,41 +498,6 @@ impl TaskOwner {
     }
 }
 
-#[cfg(feature = "native-api")]
-pub(crate) async fn lookup_host_owned(
-    host: &str,
-    port: u16,
-) -> Option<std::io::Result<Vec<std::net::SocketAddr>>> {
-    use std::net::ToSocketAddrs as _;
-
-    let owner = capture_owner()?;
-    let Some(owner) = owner.upgrade() else {
-        return Some(Err(std::io::ErrorKind::Interrupted.into()));
-    };
-    let host = host.to_owned();
-    let (result, receiver) = tokio::sync::oneshot::channel();
-    if owner
-        .spawn_blocking(move || {
-            let addresses = (host.as_str(), port)
-                .to_socket_addrs()
-                .map(Iterator::collect);
-            let _ = result.send(addresses);
-        })
-        .is_none()
-    {
-        return Some(Err(if owner.state.lock().capacity_rejected {
-            crate::proxy::PacketRejection::Capacity.into()
-        } else {
-            std::io::ErrorKind::Interrupted.into()
-        }));
-    }
-    Some(
-        receiver
-            .await
-            .unwrap_or_else(|_| Err(std::io::Error::other("owned resolver task stopped"))),
-    )
-}
-
 impl Drop for TaskOwner {
     fn drop(&mut self) {
         self.abort();
@@ -719,15 +684,7 @@ mod tests {
         assert!(close.as_mut().now_or_never().is_none());
         drop(close);
         assert_eq!(capacity.available_permits(), 0);
-        assert_eq!(
-            owner
-                .task_scope()
-                .scope(crate::bootstrap::lookup_host("localhost", 0))
-                .await
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::Interrupted
-        );
+        assert!(owner.spawn_blocking(|| ()).is_none());
         release.send(()).unwrap();
         owner.close().await;
         assert_eq!(capacity.available_permits(), 1);
