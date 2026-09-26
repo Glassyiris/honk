@@ -871,3 +871,43 @@ mod routing_marks {
         }
     }
 }
+
+#[test]
+fn subscription_download_detour_names_direct_routing_or_a_group() {
+    use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
+    for (detour, valid) in [
+        ("", true),
+        ("direct", true),
+        ("routing", true),
+        ("proxy", true),
+        ("missing", false),
+    ] {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "groups": [{"name": "proxy"}],
+            "subscriptions": [{"name": "sub", "url": "https://example.test/sub", "download_detour": detour}],
+        }))
+        .unwrap();
+        for result in [config.validate_detailed(), config.validate_assembled()] {
+            match result {
+                Ok(()) => assert!(valid, "{detour}"),
+                Err(error) => {
+                    assert!(!valid, "{detour}: {error:?}");
+                    assert_eq!(
+                        error.diagnostic.setting.to_string(),
+                        "subscriptions[1].download_detour"
+                    );
+                }
+            }
+        }
+    }
+    let config = parse_dae_config_with_detailed_diagnostics(
+        "subscription {\n own: {\n url: 'https://example.test/sub'\n download_detour: direct\n }\n other: 'https://example.test/other'\n}",
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(config.subscriptions[0].download_detour, "direct");
+    assert_eq!(
+        config.subscriptions[1].download_detour, "",
+        "routing by default"
+    );
+}

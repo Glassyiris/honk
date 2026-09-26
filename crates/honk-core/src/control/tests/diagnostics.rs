@@ -63,6 +63,7 @@ fn provider_config() -> (Config, DiagnosticBuckets) {
         let provider = Subscription {
             name: code.into(),
             url: format!("http://127.0.0.1:{}/", 1080 + index),
+            download_detour: "direct".into(),
             update_interval: 0,
             ..Default::default()
         };
@@ -108,6 +109,7 @@ async fn c14_startup_snapshot_follows_body_and_collection_admission() {
     let provider = Subscription {
         name: "private-provider".into(),
         url: format!("http://{}/", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         update_interval: 0,
         ..Default::default()
     };

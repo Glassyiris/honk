@@ -294,6 +294,7 @@ struct SubscriptionFields<'d, 'a> {
     user_agent: Option<Text<'d, 'a>>,
     interval: Option<Text<'d, 'a>>,
     cache: Option<Text<'d, 'a>>,
+    download_detour: Option<Text<'d, 'a>>,
 }
 
 fn collect_subscription_fields<'d, 'a>(
@@ -318,6 +319,7 @@ fn collect_subscription_fields<'d, 'a>(
                 "ua" => fields.user_agent = Some(value),
                 "interval" => fields.interval = Some(value),
                 "cache" => fields.cache = Some(value),
+                "download_detour" => fields.download_detour = Some(value),
                 _ if super::read::block_header(&child).is_none() => key.notice(
                     diagnostics,
                     Severity::Warning,
@@ -355,6 +357,9 @@ fn parse_subscription_block<'d, 'a>(
     }
     if let Some(user_agent) = fields.user_agent {
         subscription.user_agent = Some(user_agent.raw().to_owned());
+    }
+    if let Some(detour) = fields.download_detour {
+        subscription.download_detour = detour.raw().to_owned();
     }
     if let Some(interval) = fields.interval {
         let value = interval.raw();

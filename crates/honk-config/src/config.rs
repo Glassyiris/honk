@@ -816,16 +816,16 @@ impl Config {
         Ok(())
     }
 
+    /// A download detour: empty or `routing` for the routing rules, `direct`,
+    /// or a group name.
+    fn valid_download_detour(&self, detour: &str) -> bool {
+        matches!(detour, "" | Self::BUILTIN_DIRECT_NODE | "routing")
+            || self.groups.iter().any(|group| group.name == detour)
+    }
+
     fn validate_references_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         const MAX_USER_GROUPS: usize = 0xFC - 2;
-        let detour = self
-            .experimental
-            .native_api
-            .geodata_download_detour
-            .as_str();
-        if !matches!(detour, "" | Self::BUILTIN_DIRECT_NODE | "routing")
-            && !self.groups.iter().any(|group| group.name == detour)
-        {
+        if !self.valid_download_detour(&self.experimental.native_api.geodata_download_detour) {
             return Err(config_validation_error(
                 source,
                 SettingPath::new("experimental")
@@ -939,6 +939,16 @@ impl Config {
                         .field("url"),
                     "invalid-config-value",
                     "subscription URL must use http:// or https://",
+                ));
+            }
+            if !self.valid_download_detour(&subscription.download_detour) {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("subscriptions")
+                        .index(index + 1)
+                        .field("download_detour"),
+                    "invalid-subscription-detour-target",
+                    "subscription download detour must be direct, routing or a group",
                 ));
             }
         }
@@ -1275,6 +1285,7 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                         "headers",
                         "enabled",
                         "cache",
+                        "download_detour",
                         "last_updated",
                         "node_count",
                         "created_at",

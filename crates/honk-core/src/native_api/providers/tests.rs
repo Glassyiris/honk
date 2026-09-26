@@ -68,6 +68,7 @@ impl Origin {
                 self.address
             ),
             update_interval: 0,
+            download_detour: "direct".into(),
             headers: vec![honk_config::subscription::SubscriptionHeader {
                 key: "Authorization".into(),
                 value: "Bearer private-origin-token".into(),
@@ -715,11 +716,51 @@ fn provider_projection_masks_only_listener_values_in_names_and_urls() {
     };
     let id = subscription.id;
     config.subscriptions.push(subscription);
-    let value = provider_value(&config, None, id, None).unwrap();
+    let value = provider_value(&config, None, id, None, |_| None).unwrap();
     assert_eq!(value["name"], "provider-<redacted>");
     assert_eq!(
         value["url_redacted"],
         "https://user:password@example.test/path?token=<redacted>#fragment"
+    );
+}
+
+#[test]
+fn provider_rows_report_the_download_route_like_geodata() {
+    let mut config = Config::default();
+    for (name, detour) in [
+        ("routed", ""),
+        ("direct", "direct"),
+        ("grouped", "proxy"),
+        ("gone", "removed"),
+    ] {
+        config.subscriptions.push(Subscription {
+            name: name.into(),
+            url: "https://example.test/sub".into(),
+            download_detour: detour.into(),
+            ..Default::default()
+        });
+    }
+    let group_id = |name: &str| (name == "proxy").then(|| "group-proxy".to_owned());
+    let routes: Vec<_> = config
+        .subscriptions
+        .iter()
+        .map(|subscription| {
+            provider_value(&config, None, subscription.id, None, group_id).unwrap()["download"]
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        routes,
+        [
+            json!({"route": "routing", "group_id": null}),
+            json!({"route": "direct", "group_id": null}),
+            json!({"route": "group", "group_id": "group-proxy"}),
+            json!({"route": "group", "group_id": null}),
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(Provider::inline(0)).unwrap()["download"],
+        Value::Null
     );
 }
 
