@@ -131,36 +131,6 @@ async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     Ok(addrs)
 }
 
-/// Resolve with the platform resolver, retaining its blocking job when scoped
-/// to a native runtime/health/DNS owner. Cancellation never detaches owned libc work.
-pub async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![SocketAddr::new(ip, port)]);
-    }
-    #[cfg(feature = "native-api")]
-    let mut observation = LookupObservation::start(host, "UNKNOWN", None);
-    let result = lookup_host_inner(host, port).await;
-    #[cfg(feature = "native-api")]
-    if let Some(observation) = &mut observation {
-        observation.finish(
-            result
-                .as_ref()
-                .map(|addresses| addresses.iter().map(SocketAddr::ip)),
-        );
-    }
-    result
-}
-
-async fn lookup_host_inner(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    #[cfg(feature = "native-api")]
-    if let Some(result) = crate::runtime::lookup_host_owned(host, port).await {
-        return result;
-    }
-    tokio::net::lookup_host((host, port))
-        .await
-        .map(Iterator::collect)
-}
-
 fn hosts_addresses(contents: &str, host: &str) -> Vec<IpAddr> {
     let mut addrs = Vec::new();
     let host = host.trim_end_matches('.');
@@ -580,7 +550,7 @@ impl LookupObservation {
             error: None,
         };
         if upstream.is_none() {
-            // libc/NSS or the system hosts/nameserver fallback supplies an
+            // The system hosts/nameserver fallback supplies an
             // outcome, not its hosts/cache/upstream decision path.
             observer.publish(FlowEvent::Gap("not_instrumented"));
         }

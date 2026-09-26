@@ -255,10 +255,10 @@ async fn trojan_header_write_does_not_fabricate_target_confirmation() {
 }
 
 #[tokio::test]
-async fn external_resolution_reports_only_known_facts() {
+async fn system_fallback_resolution_reports_only_known_facts() {
     let (observer, events) = recorder();
     let addresses = observer
-        .scope(crate::bootstrap::lookup_host("localhost", 80))
+        .scope(crate::bootstrap::resolve_with(None, "localhost"))
         .await
         .unwrap();
     assert!(!addresses.is_empty());
@@ -287,7 +287,7 @@ async fn external_resolution_reports_only_known_facts() {
         lookup
             .addresses
             .iter()
-            .all(|address| addresses.iter().any(|socket| socket.ip() == *address))
+            .all(|address| addresses.contains(address))
     );
 }
 

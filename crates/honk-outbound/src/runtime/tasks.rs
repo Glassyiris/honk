@@ -254,7 +254,7 @@ struct OwnedTasks {
 
 #[derive(Debug)]
 /// Joined task lifetime for a runtime or pre-runtime health/DNS work.
-/// Closing rejects new work; already-started blocking resolvers must finish.
+/// Closing rejects new work; already-started blocking jobs must finish.
 pub struct TaskOwner {
     // Probe fanout has a separate logical cap; production follows the existing
     // carrier/flow limits and reaps completed jobs instead of capping streams.
@@ -469,7 +469,7 @@ impl TaskOwner {
     }
 
     /// Await every retained task and QUIC endpoint. Cancellation preserves ownership.
-    /// Started libc resolver calls cannot be aborted and can delay completion.
+    /// Started blocking jobs cannot be aborted and can delay completion.
     pub async fn close(&self) {
         self.abort();
         let _joining = self.joining.lock().await;
@@ -496,41 +496,6 @@ impl TaskOwner {
             endpoint.endpoint.take();
         }
     }
-}
-
-#[cfg(feature = "native-api")]
-pub(crate) async fn lookup_host_owned(
-    host: &str,
-    port: u16,
-) -> Option<std::io::Result<Vec<std::net::SocketAddr>>> {
-    use std::net::ToSocketAddrs as _;
-
-    let owner = capture_owner()?;
-    let Some(owner) = owner.upgrade() else {
-        return Some(Err(std::io::ErrorKind::Interrupted.into()));
-    };
-    let host = host.to_owned();
-    let (result, receiver) = tokio::sync::oneshot::channel();
-    if owner
-        .spawn_blocking(move || {
-            let addresses = (host.as_str(), port)
-                .to_socket_addrs()
-                .map(Iterator::collect);
-            let _ = result.send(addresses);
-        })
-        .is_none()
-    {
-        return Some(Err(if owner.state.lock().capacity_rejected {
-            crate::proxy::PacketRejection::Capacity.into()
-        } else {
-            std::io::ErrorKind::Interrupted.into()
-        }));
-    }
-    Some(
-        receiver
-            .await
-            .unwrap_or_else(|_| Err(std::io::Error::other("owned resolver task stopped"))),
-    )
 }
 
 impl Drop for TaskOwner {
@@ -690,7 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn started_blocking_resolution_survives_cancelled_close_until_real_completion() {
+    async fn started_blocking_job_survives_cancelled_close_until_real_completion() {
         use futures_util::FutureExt as _;
 
         let owner = Arc::new(TaskOwner::production());
@@ -719,14 +684,10 @@ mod tests {
         assert!(close.as_mut().now_or_never().is_none());
         drop(close);
         assert_eq!(capacity.available_permits(), 0);
-        assert_eq!(
+        assert!(
             owner
-                .task_scope()
-                .scope(crate::bootstrap::lookup_host("localhost", 0))
-                .await
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::Interrupted
+                .spawn_blocking(|| panic!("closed owner admitted blocking work"))
+                .is_none()
         );
         release.send(()).unwrap();
         owner.close().await;
