@@ -8,7 +8,6 @@ mod ranking;
 pub(in crate::group) mod selection;
 #[cfg(test)]
 mod tests;
-mod validation;
 mod verification;
 
 pub use budget::ScoreBudgetCounters;
@@ -18,9 +17,9 @@ pub use feedback::{
 };
 pub(in crate::group) use pressure::TransportQualitySource;
 pub use verification::{
-    ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreEvidenceQuestion,
-    ScoreLocalComparison, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
-    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
+    ScoreChallenger, ScoreEvidenceBasis, ScoreEvidenceQuestion, ScoreRelation, ScoreTrialSource,
+    ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
+    ScoreVerificationState, ScoreWaitReason,
 };
 
 use super::{
@@ -240,7 +239,6 @@ struct Stats {
     incarnation: u64,
     node_incarnation: u64,
     last_node_failure_episode: u64,
-    attempts: f64,
     setup_success: f64,
     setup_failure: f64,
     useful_success: f64,
@@ -253,7 +251,6 @@ struct Stats {
     qualified_until: Option<Instant>,
     warm_setup_ms: WeightedMean,
     probes: [evidence::ProbeMetric; 6],
-    last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
     carrier_pressure: [Option<crate::transport_quality::TransportPressure>; 2],
     fail_streak: u32,
@@ -290,11 +287,6 @@ impl SelectionCadenceKey {
     }
 }
 
-struct SelectionCadence {
-    revalidated_at: Instant,
-    run: Option<validation::ValidationRun>,
-}
-
 /// Flap history is scoped to the same target the pick was ranked for:
 /// unrelated targets interleaving their own winners is not a flap. The
 /// exploration cadence keeps the coarser [`SelectionCadenceKey`].
@@ -324,7 +316,6 @@ struct SelectionHistory {
     /// Committed non-exploration selections seen by this target scope.
     selections: u64,
     switched_at: u64,
-    verification: Option<verification::VerificationHistory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,7 +411,7 @@ struct StateInner {
     budgets: HashMap<SelectionCadenceKey, budget::Scope>,
     root_business_starts: u64,
     comparisons: comparison::Store,
-    selection_counts: HashMap<SelectionCadenceKey, SelectionCadence>,
+    revalidated_at: HashMap<SelectionCadenceKey, Instant>,
     evaluation: HashMap<SelectionReasonKey, evaluation::EvaluationSet>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
@@ -446,7 +437,7 @@ impl Default for StateInner {
             budgets: HashMap::new(),
             root_business_starts: 0,
             comparisons: comparison::Store::default(),
-            selection_counts: HashMap::new(),
+            revalidated_at: HashMap::new(),
             evaluation: HashMap::new(),
             selection_history: LruCache::new(
                 // SAFE-EXPECT: the capacity is a positive compile-time constant.
@@ -531,7 +522,7 @@ impl ScorePolicyState {
         inner.valid_groups = groups.into_iter().collect();
         inner.comparisons.clear();
         let StateInner {
-            selection_counts,
+            revalidated_at,
             evaluation,
             selection_reasons,
             verification_counters,
@@ -541,7 +532,7 @@ impl ScorePolicyState {
             valid_groups,
             ..
         } = &mut *inner;
-        selection_counts.clear();
+        revalidated_at.clear();
         evaluation.retain(|key, _| valid_groups.contains(&key.group));
         for set in evaluation.values_mut() {
             set.reset_members();
@@ -552,27 +543,17 @@ impl ScorePolicyState {
         }
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
         verification_counters.retain(|key, _| valid_groups.contains(&key.group));
+        // A removed winner must no longer participate in incumbent/flap protection.
         let invalid_history: Vec<_> = selection_history
             .iter()
             .filter(|(key, history)| {
                 !valid_groups.contains(&key.group)
-                    || (!valid.contains(&(key.group.clone(), history.current))
-                        && history
-                            .verification
-                            .is_none_or(|verification| verification.claims == 0))
+                    || !valid.contains(&(key.group.clone(), history.current))
             })
             .map(|(key, _)| key.clone())
             .collect();
         for key in invalid_history {
             selection_history.pop(&key);
-        }
-        // Preserve only pending claim revocation until the next authorized Apply;
-        // a removed winner must no longer participate in incumbent/flap protection.
-        for (key, history) in selection_history.iter_mut() {
-            if !valid.contains(&(key.group.clone(), history.current)) {
-                history.selections = 0;
-                history.previous = None;
-            }
         }
         let stale_previous: Vec<_> = selection_history
             .iter()
@@ -677,16 +658,10 @@ impl ScorePolicyState {
                     previous: None,
                     selections: 1,
                     switched_at: 0,
-                    verification: None,
                 },
             );
             return;
         };
-        if history.selections == 0 {
-            history.current = node_id;
-            history.selections = 1;
-            return;
-        }
         history.selections = history.selections.saturating_add(1);
         if history.current == node_id {
             return;
@@ -778,7 +753,7 @@ impl ScorePolicyState {
         group: &str,
         context: &ScoreSelectionContext,
         node_id: Uuid,
-    ) -> Option<(u64, u64, u64)> {
+    ) -> Option<(u64, u64)> {
         let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) else {
             return None;
         };
@@ -794,7 +769,6 @@ impl ScorePolicyState {
             })
             .map(|stats| {
                 (
-                    stats.attempts.round() as u64,
                     stats.setup_success.round() as u64,
                     stats.setup_failure.round() as u64,
                 )
@@ -830,7 +804,7 @@ impl ScorePolicyState {
         group: &str,
         network: SelectionNetwork,
         node_id: Uuid,
-    ) -> Option<(u64, u64, u64)> {
+    ) -> Option<(u64, u64)> {
         self.inner
             .lock()
             .aggregate
@@ -842,7 +816,6 @@ impl ScorePolicyState {
             })
             .map(|stats| {
                 (
-                    stats.attempts.round() as u64,
                     stats.setup_success.round() as u64,
                     stats.setup_failure.round() as u64,
                 )
@@ -852,7 +825,6 @@ impl ScorePolicyState {
 
 #[derive(Clone, Copy, Default)]
 struct ScoreSnapshot {
-    attempts: f64,
     completed: f64,
     reliability: f64,
     reliability_upper: f64,
@@ -866,13 +838,10 @@ struct ScoreSnapshot {
     warm_setup: MetricSnapshot,
     probe_scope: u64,
     observed_reliability: f64,
-    last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
     carrier_pressure_at: Option<Instant>,
     unresolved_failure: bool,
     explore_backed_off: bool,
-    node_failure: bool,
-    target_failure: bool,
     fail_streak: u32,
     selected_at: u64,
 }
@@ -903,6 +872,5 @@ struct FlowSample {
     tx: u64,
     rx: u64,
     eligible_rx_at: Option<Instant>,
-    elapsed: Duration,
     count_usefulness: bool,
 }
