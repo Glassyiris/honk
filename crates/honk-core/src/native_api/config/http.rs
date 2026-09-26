@@ -198,60 +198,6 @@ pub(in crate::native_api) async fn reload(
     Ok(admission.await?.into_response())
 }
 
-pub(in crate::native_api) async fn lifecycle(
-    state: &NativeState,
-    request: Request,
-    id: &RequestId,
-    resume: bool,
-) -> Result<Response, ApiError> {
-    parse_query(request.uri(), &[], id)?;
-    let service = &state.observation.configuration;
-    if !service.coordinator_running() {
-        return Err(unsupported());
-    }
-    let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
-    if request.body().size_hint().upper() != Some(0) {
-        json_type(&request)?;
-    }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
-    if !bytes.is_empty()
-        && !serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .is_some_and(|body| body.as_object().is_some_and(|object| object.is_empty()))
-    {
-        return Err(invalid());
-    }
-    let (path, kind) = if resume {
-        (
-            "/api/v1/operations/resume",
-            crate::native_api::operations::OperationKind::Resume,
-        )
-    } else {
-        (
-            "/api/v1/operations/suspend",
-            crate::native_api::operations::OperationKind::Suspend,
-        )
-    };
-    let reservation = state.observation.operations.reserve(
-        state.principal(),
-        "POST",
-        path,
-        key.as_deref(),
-        &bytes,
-        kind,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        service.enqueue(Work::Lifecycle {
-            resume,
-            reservation,
-        })?;
-    }
-    Ok(admission.await?.into_response())
-}
-
 pub(in crate::native_api) async fn validate(
     state: &NativeState,
     request: Request,

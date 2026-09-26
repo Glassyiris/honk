@@ -4,11 +4,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-mod dns_failure;
-mod retention;
-#[cfg(feature = "rprx")]
-mod xudp;
-
 pub(super) fn enable_udp_provenance(
     v4: &[Arc<UdpSocket>],
     v6: &[Arc<UdpSocket>],
@@ -36,19 +31,12 @@ struct Fixture {
     commands: mpsc::Sender<ControlCommand>,
     phase: watch::Receiver<EnginePhase>,
     native: Arc<crate::native_api::observation::NativeObservation>,
-    tracker: Arc<crate::connection_tracker::ConnectionTracker>,
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    groups: honk_outbound::group::SharedGroupManager,
     alive: Arc<honk_outbound::alive::AliveDialerSet>,
-    cache_db: Option<Arc<crate::state::cache::CacheDb>>,
-    dns_service: crate::dns::DnsService,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
     api: crate::native_api::NativeServer,
-    http: reqwest::Client,
-    base: String,
     tproxy: SocketAddr,
-    dns: SocketAddr,
     peer: tokio::net::TcpListener,
 }
 
@@ -181,13 +169,9 @@ impl Fixture {
         let phase = plane.observe_phase();
         let native = plane.native_observation();
         let commands = plane.command_sender();
-        let tracker = plane.connection_tracker();
         let backend = plane.ebpf_handle();
-        let groups = plane.group_manager();
-        let dns_service = plane.dns_service();
         let shutdown = plane.shutdown_requested.clone();
         let alive = plane.alive_set();
-        let cache_db = plane.cache_db();
         alive.pause_health_checks().await?;
         let api = crate::native_api::NativeServer::start(listener, Arc::new(state));
         let task = tokio::spawn(async move {
@@ -198,22 +182,12 @@ impl Fixture {
             commands,
             phase,
             native,
-            tracker,
             backend,
-            groups,
             alive,
-            cache_db,
-            dns_service,
             shutdown,
             task,
             api,
-            http: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(WAIT)
-                .build()?,
-            base: format!("http://{address}/api/v1"),
             tproxy,
-            dns,
             peer,
         };
         tokio::time::timeout(WAIT, async {
@@ -255,28 +229,6 @@ impl Fixture {
             },
         )?;
         Ok(tokio::time::timeout(WAIT, socket.connect(self.tproxy)).await??)
-    }
-
-    async fn transition(&self, resume: bool) -> Result<(), super::super::client::ControlError> {
-        let (reply, response) = tokio::sync::oneshot::channel();
-        let command = if resume {
-            ControlCommand::Resume { reply }
-        } else {
-            ControlCommand::Suspend { reply }
-        };
-        self.commands.send(command).await.unwrap();
-        tokio::time::timeout(WAIT, response).await.unwrap().unwrap()
-    }
-
-    async fn get(&self, path: &str) -> serde_json::Value {
-        let response = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        response.json().await.unwrap()
     }
 
     async fn socks_peer(&self) -> TcpStream {
@@ -351,296 +303,6 @@ async fn complete_socks(stream: &mut TcpStream) {
     })
     .await
     .expect("timed out completing the SOCKS handshake");
-}
-
-async fn closed(stream: &mut TcpStream) {
-    let mut byte = [0];
-    let read = tokio::time::timeout(WAIT, stream.read(&mut byte))
-        .await
-        .unwrap();
-    assert!(
-        matches!(read, Ok(0)) || read.is_err(),
-        "transport remained usable: {read:?}"
-    );
-}
-
-async fn prepare_loopback_epoch(
-    plane: &mut ControlPlane,
-    resuming: bool,
-) -> anyhow::Result<(RuntimeEpoch, SocketAddr)> {
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
-    tcp.set_nonblocking(true)?;
-    let dns = dns_listener::BoundDnsListener::bind(&honk_config::dns::DnsBindEndpoint::parse(
-        "udp://127.0.0.1:0",
-    )?)?;
-    let address = dns.local_addr();
-    let epoch = plane
-        .prepare_epoch(
-            BoundListeners {
-                tcp4: tokio::io::unix::AsyncFd::new(tcp)?,
-                tcp6: None,
-                udp4: Vec::new(),
-                udp6: Vec::new(),
-                dns: Some(dns),
-                nfqueue_enabled: false,
-            },
-            resuming,
-        )
-        .await?;
-    Ok((epoch, address))
-}
-
-async fn suspended_loopback_plane() -> anyhow::Result<ControlPlane> {
-    let mut config = Config::default();
-    config.ensure_builtin_nodes();
-    config.global.nfqueue_enable = false;
-    config.dns.strategy = honk_config::dns::DnsStrategy::Ipv4Only;
-    let mut plane = crate::control::tests::support::control_plane(config);
-    plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
-        crate::mode::ModeState::native(),
-    )));
-    plane.start_datapath_flags_coordinator()?;
-    let (epoch, _) = prepare_loopback_epoch(&mut plane, false).await?;
-    let mut epoch = Some(epoch);
-    plane.open_epoch(epoch.as_mut().unwrap(), false).await?;
-    let authorizations = crate::subscription::SubscriptionAuthorizations::new(&[])?;
-    let mut commands = plane.command_rx.take().unwrap();
-    plane
-        .suspend_epoch(&mut epoch, &mut commands, &authorizations)
-        .await?;
-    plane.command_rx = Some(commands);
-    assert!(epoch.is_none());
-    Ok(plane)
-}
-
-#[tokio::test]
-async fn resumed_epoch_admits_dns_before_ingress_publication() -> anyhow::Result<()> {
-    let mut plane = suspended_loopback_plane().await?;
-    assert!(plane.rebuild_suspended_runtime().await?.accepted());
-    let (epoch, address) = prepare_loopback_epoch(&mut plane, true).await?;
-    let mut epoch = Some(epoch);
-    assert!(plane.dns_controller.try_admit_query(true).is_err());
-    // Hold the publication writer so admission is checked before any ready write.
-    let backend = plane.ebpf.clone();
-    let publication = backend.write().await;
-    let controller = plane.dns_controller.clone();
-    let mut opening = Box::pin(plane.open_epoch(epoch.as_mut().unwrap(), true));
-    assert!(futures::poll!(opening.as_mut()).is_pending());
-    drop(
-        controller
-            .try_admit_query(true)
-            .expect("DNS must admit before ingress publication can proceed"),
-    );
-    drop(publication);
-    opening.await?;
-    let client = UdpSocket::bind("127.0.0.1:0").await?;
-    let query = crate::dns::forwarder::build_dns_query("resume.example", 28);
-    client.send_to(&query, address).await?;
-    let mut answer = [0; 512];
-    let (size, source) = tokio::time::timeout(WAIT, client.recv_from(&mut answer)).await??;
-    assert_eq!(source, address);
-    assert!(size >= 12);
-    assert_eq!(&answer[..2], &query[..2]);
-    assert_ne!(answer[2] & 0x80, 0);
-    assert_eq!(answer[3] & 0x0f, 0, "resumed DNS must answer NOERROR");
-    assert_eq!(&answer[6..8], &[0, 0], "ipv4only answers AAAA locally");
-    let authorizations = crate::subscription::SubscriptionAuthorizations::new(&[])?;
-    let mut commands = plane.command_rx.take().unwrap();
-    plane
-        .suspend_epoch(&mut epoch, &mut commands, &authorizations)
-        .await?;
-    plane.finalize_shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn dns_resume_rejection_keeps_candidate_epoch_fenced_and_owned() -> anyhow::Result<()> {
-    let mut plane = suspended_loopback_plane().await?;
-    // A drained runtime without a fresh publication is not eligible to resume.
-    let (epoch, address) = prepare_loopback_epoch(&mut plane, true).await?;
-    let mut epoch = Some(epoch);
-    let error = plane
-        .open_epoch(epoch.as_mut().unwrap(), true)
-        .await
-        .expect_err("unready DNS must reject ingress reopening");
-    assert!(matches!(
-        error.downcast_ref::<crate::dns::runtime::DnsPauseError>(),
-        Some(crate::dns::runtime::DnsPauseError::NotReady)
-    ));
-    assert!(plane.drain_tracker.should_reject());
-    assert!(plane.dns_controller.try_admit_query(true).is_err());
-    plane
-        .ebpf
-        .write()
-        .await
-        .clear_listener_sockets()
-        .expect("datapath admission must remain closed after DNS resume rejection");
-    let authorizations = crate::subscription::SubscriptionAuthorizations::new(&[])?;
-    let mut commands = plane.command_rx.take().unwrap();
-    plane
-        .suspend_epoch(&mut epoch, &mut commands, &authorizations)
-        .await?;
-    assert!(epoch.is_none());
-    assert_eq!(plane.drain_tracker.active_count(), 0);
-    let _rebound = UdpSocket::bind(address).await?;
-    plane.finalize_shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
-async fn mock_commands_close_live_and_pre_id_tcp_preserving_api_history() -> anyhow::Result<()> {
-    let fixture = Fixture::start().await?;
-    let mut active = fixture.connect_tcp().await?;
-    active.write_all(b"retained counters").await?;
-    let mut peer = fixture.socks_peer().await;
-    complete_socks(&mut peer).await;
-    let mut payload = [0; 17];
-    tokio::time::timeout(WAIT, peer.read_exact(&mut payload))
-        .await
-        .expect("timed out receiving pre-suspend TCP payload at the SOCKS peer")?;
-    assert_eq!(&payload, b"retained counters");
-    peer.write_all(&payload).await?;
-    tokio::time::timeout(WAIT, active.read_exact(&mut payload))
-        .await
-        .expect("timed out receiving pre-suspend TCP echo at the client")?;
-    let mut before_id = fixture.connect_tcp().await?;
-    before_id.write_all(b"pending").await?;
-    let mut dialing_peer = fixture.socks_peer().await;
-    assert_eq!(
-        fixture.tracker.snapshot().len(),
-        1,
-        "second handshake must still be pre-ID"
-    );
-    let runtime = fixture.get("/runtime").await;
-    let history = tokio::time::timeout(WAIT, async {
-        loop {
-            let history = fixture.get("/runtime/traffic/history").await;
-            if !history["samples"].as_array().unwrap().is_empty() {
-                break history;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    fixture.transition(false).await.unwrap();
-    assert_eq!(*fixture.phase.borrow(), EnginePhase::Suspended);
-    let refused = fixture
-        .http
-        .get(format!(
-            "{}/dns/query?domain=paused.example&type=A",
-            fixture.base
-        ))
-        .send()
-        .await?;
-    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(refused.headers()["retry-after"], "1");
-    assert_eq!(
-        refused.json::<serde_json::Value>().await?["error"]["code"],
-        "temporarily_unavailable"
-    );
-    closed(&mut active).await;
-    closed(&mut peer).await;
-    closed(&mut before_id).await;
-    closed(&mut dialing_peer).await;
-    assert!(fixture.tracker.snapshot().is_empty());
-    assert!(fixture.transition(false).await.is_err());
-    assert_eq!(
-        fixture.get("/runtime").await["instance_id"],
-        runtime["instance_id"]
-    );
-    fixture.transition(true).await.unwrap();
-    let after = fixture.get("/runtime/traffic/history").await;
-    assert!(
-        after["samples"]
-            .as_array()
-            .unwrap()
-            .contains(&history["samples"][0])
-    );
-    assert_eq!(
-        fixture.get("/runtime").await["instance_id"],
-        runtime["instance_id"]
-    );
-    assert!(fixture.transition(true).await.is_err());
-    let plane = fixture.finish(false).await;
-    assert_eq!(plane.drain_tracker.active_count(), 0);
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
-async fn failed_resume_dns_bind_remains_fenced_and_can_retry() -> anyhow::Result<()> {
-    let fixture = Fixture::start().await?;
-    fixture.transition(false).await.unwrap();
-    let occupied = tokio::net::TcpListener::bind(fixture.dns).await?;
-    assert!(fixture.transition(true).await.is_err());
-    assert_eq!(*fixture.phase.borrow(), EnginePhase::Suspended);
-    assert!(
-        fixture
-            .backend
-            .write()
-            .await
-            .set_datapath_ready(true)
-            .is_err()
-    );
-    assert!(!fixture.task.is_finished());
-    drop(occupied);
-    fixture.transition(true).await.unwrap();
-    assert_eq!(*fixture.phase.borrow(), EnginePhase::Running);
-    fixture.finish(false).await;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
-async fn suspend_quiescence_failure_is_fatal_not_suspended() -> anyhow::Result<()> {
-    let fixture = Fixture::start().await?;
-    fixture.backend.write().await.arm_quiesce_fault();
-    assert!(fixture.transition(false).await.is_err());
-    let backend = fixture.backend.clone();
-    fixture.finish(true).await;
-    assert!(backend.write().await.set_datapath_ready(true).is_err());
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
-async fn mock_suspend_retires_live_udp_association_without_replay() -> anyhow::Result<()> {
-    let fixture = Fixture::start().await?;
-    let relay = UdpSocket::bind("127.0.0.1:0").await?;
-    let client = UdpSocket::bind("127.0.0.1:0").await?;
-    client.send_to(b"lifecycle-udp", fixture.tproxy).await?;
-    let mut association = tokio::time::timeout(WAIT, fixture.socks_peer()).await?;
-    assert_eq!(socks_request(&mut association).await, 3);
-    let port = relay.local_addr()?.port().to_be_bytes();
-    association
-        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])
-        .await?;
-    let mut packet = [0; 128];
-    let (length, source) = tokio::time::timeout(WAIT, relay.recv_from(&mut packet)).await??;
-    assert!(packet[..length].ends_with(b"lifecycle-udp"));
-    relay.send_to(&packet[..length], source).await?;
-    let mut answer = [0; 128];
-    let (size, _) = tokio::time::timeout(WAIT, client.recv_from(&mut answer)).await??;
-    assert_eq!(&answer[..size], b"lifecycle-udp");
-    assert!(
-        fixture
-            .tracker
-            .snapshot()
-            .iter()
-            .any(|entry| entry.network == "udp")
-    );
-    fixture.transition(false).await.unwrap();
-    closed(&mut association).await;
-    assert!(fixture.tracker.snapshot().is_empty());
-    fixture.transition(true).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), relay.recv_from(&mut packet))
-            .await
-            .is_err()
-    );
-    fixture.finish(false).await;
-    Ok(())
 }
 
 #[tokio::test]

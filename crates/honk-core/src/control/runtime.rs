@@ -260,10 +260,6 @@ impl ControlPlane {
         subscription_authorizations: &mut crate::subscription::SubscriptionAuthorizations,
     ) -> bool {
         match command {
-            #[cfg(feature = "native-api")]
-            ControlCommand::Suspend { reply } | ControlCommand::Resume { reply } => {
-                let _ = reply.send(Err(super::client::ControlError::Unavailable));
-            }
             #[cfg(all(feature = "native-api", feature = "clash-api"))]
             ControlCommand::SetRuntimeMode { request, reply } => {
                 let _reload = self.reload_lock.lock().await;

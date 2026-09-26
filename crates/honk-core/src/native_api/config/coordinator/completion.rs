@@ -219,31 +219,4 @@ impl Worker {
             json!({"operation_id":id,"status":"failed","finished_at":timestamp(SystemTime::now()),"error":{"code":code,"message":message,"details":details}}),
         );
     }
-
-    pub(super) fn lifecycle_error(
-        &self,
-        error: crate::control::client::ControlError,
-        before: u64,
-    ) -> ApiError {
-        if matches!(error, crate::control::client::ControlError::StateConflict) {
-            return ApiError::new(
-                StatusCode::CONFLICT,
-                ErrorCode::StateConflict,
-                "Runtime transition conflicts with the current state",
-                None,
-            );
-        }
-        let error = ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::TemporarilyUnavailable,
-            "Runtime transition could not be completed",
-            None,
-        );
-        let generation = self.diagnostics.read().generation;
-        if generation != before {
-            error.with_details(json!({"committed":true,"active_generation_id":format!("{}:{generation}",self.service.instance_id)}))
-        } else {
-            error
-        }
-    }
 }

@@ -12,7 +12,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager; suspend/resume instead retains the same manager and its automatic-policy state.
+A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -275,7 +275,7 @@ gets a fresh runtime. The existing outbound maintenance pass reaps unretained
 idle VLESS carriers together with its other idle resources; no new protocol
 timer is created.
 
-Native probes capture member-to-leaf associations and generation owners without advancing policy state. Real raw-TCP, HTTP and TCP/UDP DNS measurements retain transport/purpose/family/warmth; obsolete or cancelled results do not publish fresh health. Restricted destination/port admission and pinned resolution apply even to configured endpoints. Suspension stops and joins probes, warm producers and protocol runtime tasks; resume uses fresh network owners while preserving group observations and choices. See [bounded probes](../reference/api.md#bounded-probes).
+Native probes capture member-to-leaf associations and generation owners without advancing policy state. Real raw-TCP, HTTP and TCP/UDP DNS measurements retain transport/purpose/family/warmth; obsolete or cancelled results do not publish fresh health. Restricted destination/port admission and pinned resolution apply even to configured endpoints. See [bounded probes](../reference/api.md#bounded-probes).
 
 ## Dial admission budget
 

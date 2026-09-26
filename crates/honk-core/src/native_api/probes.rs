@@ -235,7 +235,6 @@ enum WorkerState {
 }
 enum Command {
     Pause(oneshot::Sender<Result<(), ProbeLifecycleError>>),
-    Resume(oneshot::Sender<Result<(), ProbeLifecycleError>>),
 }
 struct Gate {
     state: WorkerState,
@@ -397,29 +396,6 @@ impl ProbeService {
             .await
             .unwrap_or(Err(ProbeLifecycleError::Unavailable))
     }
-    pub(crate) async fn resume(&self) -> Result<(), ProbeLifecycleError> {
-        let (reply, result) = oneshot::channel();
-        {
-            let mut gate = self.gate.lock();
-            match gate.state {
-                WorkerState::Paused => {}
-                WorkerState::NotStarted | WorkerState::Stopped => {
-                    return Err(ProbeLifecycleError::Unavailable);
-                }
-                WorkerState::Faulted => return Err(ProbeLifecycleError::CleanupFailed),
-                _ => return Err(ProbeLifecycleError::Conflict),
-            }
-            let permit = self
-                .commands
-                .try_reserve()
-                .map_err(|_| ProbeLifecycleError::Unavailable)?;
-            gate.state = WorkerState::Transitioning;
-            permit.send(Command::Resume(reply));
-        }
-        result
-            .await
-            .unwrap_or(Err(ProbeLifecycleError::Unavailable))
-    }
     fn request(&self) -> RequestGuard<'_> {
         let mut gate = self.gate.lock();
         let cancel = if gate.state == WorkerState::Running {
@@ -476,18 +452,6 @@ impl ProbeService {
                             while let Some(result) = jobs.join_next().await { clean &= matches!(result, Ok(Ok(()))); }
                             owner.gate.lock().state = if clean { WorkerState::Paused } else { WorkerState::Faulted };
                             let _ = reply.send(if clean { Ok(()) } else { Err(ProbeLifecycleError::CleanupFailed) });
-                        }
-                        Some(Command::Resume(reply)) => {
-                            let result = if clean {
-                                let mut gate = owner.gate.lock();
-                                gate.cancel = watch::channel(false).0;
-                                gate.state = WorkerState::Running;
-                                Ok(())
-                            } else {
-                                owner.gate.lock().state = WorkerState::Faulted;
-                                Err(ProbeLifecycleError::CleanupFailed)
-                            };
-                            let _ = reply.send(result);
                         }
                         None => break,
                     },

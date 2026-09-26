@@ -496,15 +496,6 @@ impl SubscriptionManager {
         Ok(())
     }
 
-    #[cfg(any(feature = "native-api", test))]
-    async fn resume_network(&self) -> anyhow::Result<()> {
-        #[cfg(feature = "native-api")]
-        if let SubscriptionHttp::Owned(network) = &self.http {
-            network.resume().await?;
-        }
-        Ok(())
-    }
-
     /// Fetch a subscription URL and parse its contents into a list of nodes.
     pub async fn fetch(&self, sub: &Subscription) -> anyhow::Result<Vec<Node>> {
         self.fetch_and_store(sub, None).await

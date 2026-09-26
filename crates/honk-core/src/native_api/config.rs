@@ -4,9 +4,7 @@ mod coordinator;
 mod http;
 mod revisions;
 
-pub(super) use http::{
-    administrative_projection, get, lifecycle, reload, replace, source, validate,
-};
+pub(super) use http::{administrative_projection, get, reload, replace, source, validate};
 pub(super) use revisions::{activate, export, import, revisions};
 
 use axum::body::HttpBody;
@@ -300,10 +298,6 @@ enum Work {
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         response: oneshot::Sender<Result<super::management::Completion, ApiError>>,
     },
-    Lifecycle {
-        resume: bool,
-        reservation: Reservation,
-    },
     GroupPatch {
         patch: Box<super::groups::GroupPatch>,
         reservation: Reservation,
@@ -425,9 +419,6 @@ impl ConfigService {
         phase: tokio::sync::watch::Receiver<crate::control::EnginePhase>,
     ) {
         *self.phase.write() = Some(phase);
-    }
-    pub(crate) fn coordinator_running(&self) -> bool {
-        self.sender.lock().is_some()
     }
     fn engine_phase(&self) -> Option<crate::control::EnginePhase> {
         self.phase.read().as_ref().map(|phase| *phase.borrow())
@@ -585,32 +576,10 @@ impl ConfigService {
             return Ok(());
         }
         let phase = self.engine_phase();
-        let expected = if matches!(work, Work::Lifecycle { resume: true, .. }) {
-            EnginePhase::Suspended
-        } else {
-            EnginePhase::Running
-        };
-        if phase == Some(expected) {
+        if phase == Some(EnginePhase::Running) {
             return Ok(());
         }
-        if matches!(work, Work::Manage { .. }) {
-            return Err(unavailable());
-        }
-        Err(
-            if matches!(
-                phase,
-                None | Some(EnginePhase::Starting | EnginePhase::Failed | EnginePhase::Draining)
-            ) {
-                unavailable()
-            } else {
-                ApiError::new(
-                    StatusCode::CONFLICT,
-                    ErrorCode::StateConflict,
-                    "Engine lifecycle prevents this transition",
-                    None,
-                )
-            },
-        )
+        Err(unavailable())
     }
 
     fn enqueue(&self, work: Work) -> Result<(), ApiError> {
@@ -619,8 +588,7 @@ impl ConfigService {
                 Work::Replace { reservation, .. }
                 | Work::GeoUpdate { reservation, .. }
                 | Work::GroupPatch { reservation, .. }
-                | Work::Reload { reservation }
-                | Work::Lifecycle { reservation, .. } => {
+                | Work::Reload { reservation } => {
                     self.operations.reject(&reservation.id, error.clone());
                 }
                 _ => {}

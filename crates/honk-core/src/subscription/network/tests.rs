@@ -31,29 +31,24 @@ async fn peer_eof(socket: &mut TcpStream) {
 }
 
 #[tokio::test]
-async fn completed_request_leaves_no_keepalive_and_resume_owns_a_fresh_client() {
+async fn completed_request_leaves_no_keepalive_before_pause() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let network = Arc::new(SubscriptionNetwork::new().unwrap());
     network.ready().await.unwrap();
-    for cycle in 0..3 {
-        let sub = subscription(&listener);
-        let requester = Arc::clone(&network);
-        let fetch = tokio::spawn(async move { requester.fetch(&sub).await });
-        let (mut socket, _) = listener.accept().await.unwrap();
-        read_request(&mut socket).await;
-        socket
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")
-            .await
-            .unwrap();
-        assert_eq!(fetch.await.unwrap().unwrap(), b"body");
-        // The marked client owns one connection per request and keeps no idle pool.
-        peer_eof(&mut socket).await;
-        network.pause().await.unwrap();
-        assert!(network.fetch(&subscription(&listener)).await.is_err());
-        if cycle < 2 {
-            network.resume().await.unwrap();
-        }
-    }
+    let sub = subscription(&listener);
+    let requester = Arc::clone(&network);
+    let fetch = tokio::spawn(async move { requester.fetch(&sub).await });
+    let (mut socket, _) = listener.accept().await.unwrap();
+    read_request(&mut socket).await;
+    socket
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")
+        .await
+        .unwrap();
+    assert_eq!(fetch.await.unwrap().unwrap(), b"body");
+    // The marked client owns one connection per request and keeps no idle pool.
+    peer_eof(&mut socket).await;
+    network.pause().await.unwrap();
+    assert!(network.fetch(&subscription(&listener)).await.is_err());
 }
 
 #[tokio::test]
@@ -160,17 +155,11 @@ async fn started_blocking_resolver_is_joined_after_cancelled_pause_waiter() {
         "request cancellation is not resolver completion"
     );
     assert!(!resolver.finished.load(Ordering::Acquire));
-    assert!(
-        network.resume().await.is_err(),
-        "an unfinished join cannot be replaced"
-    );
     let mut again = Box::pin(network.pause());
     assert!(futures::poll!(again.as_mut()).is_pending());
     release.send(()).unwrap();
     again.await.unwrap();
     assert!(resolver.finished.load(Ordering::Acquire));
-    network.resume().await.unwrap();
-    network.pause().await.unwrap();
 }
 
 #[tokio::test]
@@ -186,7 +175,6 @@ async fn overdue_actual_join_is_sticky_even_after_cancelled_waiter() {
     assert!(resolver.finished.load(Ordering::Acquire));
     assert!(fetch.await.unwrap().is_err());
     assert!(network.pause().await.is_err());
-    assert!(network.resume().await.is_err());
 }
 
 #[tokio::test]
@@ -196,5 +184,4 @@ async fn network_thread_panic_cannot_be_reported_as_a_successful_pause() {
     assert!(network.ready().await.is_err());
     assert!(network.pause().await.is_err());
     assert!(network.pause().await.is_err());
-    assert!(network.resume().await.is_err());
 }

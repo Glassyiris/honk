@@ -34,14 +34,6 @@ pub(crate) struct ReloadReply {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ControlCommand {
-    #[cfg(feature = "native-api")]
-    Suspend {
-        reply: tokio::sync::oneshot::Sender<Result<(), super::client::ControlError>>,
-    },
-    #[cfg(feature = "native-api")]
-    Resume {
-        reply: tokio::sync::oneshot::Sender<Result<(), super::client::ControlError>>,
-    },
     #[cfg(any(feature = "native-api", feature = "clash-api"))]
     SetSelector {
         request: super::client::SelectionRequest,

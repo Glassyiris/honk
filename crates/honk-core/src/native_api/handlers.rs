@@ -592,25 +592,11 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
         )
         .route(
             "/api/v1/operations/suspend",
-            resource(
-                post(
-                    |State(state): App, Extension(id): Id, request: Request| async move {
-                        respond(config::lifecycle(&state, request, &id, false).await, id)
-                    },
-                ),
-                &["POST"],
-            ),
+            resource(post(unsupported), &["POST"]),
         )
         .route(
             "/api/v1/operations/resume",
-            resource(
-                post(
-                    |State(state): App, Extension(id): Id, request: Request| async move {
-                        respond(config::lifecycle(&state, request, &id, true).await, id)
-                    },
-                ),
-                &["POST"],
-            ),
+            resource(post(unsupported), &["POST"]),
         )
         .route(
             "/api/v1/operations/{id}",

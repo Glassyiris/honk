@@ -193,26 +193,6 @@ impl SubscriptionNetwork {
         }
         Ok(())
     }
-
-    pub(super) async fn resume(&self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        if let Some(error) = state.failure {
-            anyhow::bail!(error);
-        }
-        anyhow::ensure!(
-            state.joining.is_none() && state.active.is_none(),
-            "subscription network has not finished pausing"
-        );
-        match NetworkThread::start(subscription_client) {
-            Ok(active) => state.active = Some(active),
-            Err(error) => {
-                state.failure = Some("subscription network restart failed");
-                return Err(error);
-            }
-        }
-        state.stopped_at = None;
-        Self::await_ready(&mut state).await
-    }
 }
 
 async fn run(

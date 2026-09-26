@@ -228,24 +228,6 @@ impl DnsServiceProvider {
         state.failure.map_or(Ok(()), Err)
     }
 
-    #[cfg(any(feature = "native-api", test))]
-    pub(crate) fn resume(&self) -> Result<(), DnsPauseError> {
-        let mut state = self.state.write();
-        if let Some(error) = state.failure {
-            return Err(error);
-        }
-        if !state.paused
-            || state.pausing
-            || state.stopped
-            || state.current.state() != RuntimeState::Active
-            || !self.supervisors.lock().is_empty()
-        {
-            return Err(DnsPauseError::NotReady);
-        }
-        state.paused = false;
-        Ok(())
-    }
-
     pub(crate) async fn shutdown(&self) {
         self.state.write().stopped = true;
         self.begin_pause();

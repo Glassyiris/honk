@@ -122,13 +122,8 @@ async fn private_child_panic_fails_operation_and_pause_without_negating_measurem
                 service.pause().await,
                 Err(ProbeLifecycleError::CleanupFailed)
             );
-            assert_eq!(
-                service.resume().await,
-                Err(ProbeLifecycleError::CleanupFailed)
-            );
         } else {
             service.pause().await.unwrap();
-            service.resume().await.unwrap();
         }
         stop.send(true).unwrap();
         worker.await.unwrap();
@@ -137,7 +132,7 @@ async fn private_child_panic_fails_operation_and_pause_without_negating_measurem
 }
 
 #[tokio::test]
-async fn pause_drains_started_and_disconnected_queued_jobs_then_resumes_same_owner() {
+async fn pause_drains_started_and_disconnected_queued_jobs() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
@@ -149,10 +144,6 @@ async fn pause_drains_started_and_disconnected_queued_jobs_then_resumes_same_own
     let state = state(config).await;
     let service = &state.observation.probes;
     assert_eq!(service.pause().await, Err(ProbeLifecycleError::Unavailable));
-    assert_eq!(
-        service.resume().await,
-        Err(ProbeLifecycleError::Unavailable)
-    );
     let identity = state.observation.catalog.snapshot();
     let (stop, receiver) = watch::channel(false);
     let worker = service.start(Arc::clone(&state), receiver);
@@ -287,26 +278,6 @@ async fn pause_drains_started_and_disconnected_queued_jobs_then_resumes_same_own
             .is_empty()
     );
     assert_eq!(service.pause().await, Err(ProbeLifecycleError::Conflict));
-    service.resume().await.unwrap();
-    assert!(service.running());
-    let resumed = body(
-        create(
-            &state,
-            http_request(&input, "resumed"),
-            &RequestId("resumed".into()),
-        )
-        .await
-        .unwrap(),
-    )
-    .await;
-    let (mut socket, _) = listener.accept().await.unwrap();
-    receive_headers(&mut socket).await;
-    socket
-        .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
-        .await
-        .unwrap();
-    let result = terminal(&state, resumed["operation_id"].as_str().unwrap()).await;
-    assert_eq!(result["result"]["results"][0]["state"], "healthy");
     stop.send(true).unwrap();
     worker.await.unwrap();
     assert_eq!(service.pause().await, Err(ProbeLifecycleError::Unavailable));
@@ -399,7 +370,6 @@ async fn pause_cancels_body_and_reserved_capture_without_late_enqueue() {
         StatusCode::CONFLICT
     );
     drop(router);
-    service.resume().await.unwrap();
     assert!(
         state
             .alive_set

@@ -426,22 +426,27 @@ async fn dependency_change_before_rename_rejects_without_overwriting_external_co
 }
 
 #[tokio::test]
-async fn suspended_admission_rejects_without_waiting_for_busy_coordinator() {
+async fn stopped_admission_rejects_without_waiting_for_busy_coordinator() {
     let mut fixture = Fixture::new(Access::Admin, true).await;
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     let accepted = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
     let release = fixture.next_reload().await;
-    let (phase, receiver) = tokio::sync::watch::channel(crate::control::EnginePhase::Suspending);
+    let (phase, receiver) = tokio::sync::watch::channel(crate::control::EnginePhase::Draining);
     fixture.service.attach_phase(receiver);
     let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
     let response = fixture
         .replace(main, &candidate)
-        .header("idempotency-key", "during-suspend")
+        .header("idempotency-key", "during-drain")
         .send()
         .await
         .unwrap();
-    error(response, StatusCode::CONFLICT, "state_conflict").await;
+    error(
+        response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
     assert_eq!(
         std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
         fixture.originals["main.dae"]
@@ -707,4 +712,27 @@ async fn written_source_whose_reload_cannot_dispatch_is_not_retryable() {
     )
     .await;
     assert_eq!(failure["error"]["details"]["written"], true);
+}
+
+#[tokio::test]
+async fn suspend_and_resume_are_not_offered() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(capabilities["resources"]["reload"]["available"], true);
+    assert_eq!(capabilities["resources"]["suspend"]["available"], false);
+    assert_eq!(capabilities["resources"]["resume"]["available"], false);
+    for path in ["/api/v1/operations/suspend", "/api/v1/operations/resume"] {
+        error(
+            fixture
+                .request(Method::POST, path)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::NOT_FOUND,
+            "capability_not_supported",
+        )
+        .await;
+    }
+    fixture.shutdown().await;
 }
