@@ -627,7 +627,7 @@ pub async fn quic_handshake_probe(
     cancel: crate::alive::ProbeCancellation,
 ) -> anyhow::Result<crate::alive::ProbeMeasurement> {
     if cancel.is_cancelled() {
-        return Err(crate::alive::HealthCheckError::Paused.into());
+        return Err(crate::alive::HealthCheckError::Stopped.into());
     }
     let tasks = Arc::new(crate::runtime::TaskOwner::production());
     let endpoint =
@@ -650,7 +650,7 @@ pub async fn quic_handshake_probe(
         let conn = cancel
             .run(tokio::time::timeout(timeout, connecting))
             .await
-            .ok_or(crate::alive::HealthCheckError::Paused)?
+            .ok_or(crate::alive::HealthCheckError::Stopped)?
             .context("QUIC handshake timeout")
             .and_then(|result| result.map_err(anyhow::Error::from))
             .map_err(|error| endpoint.terminal_error().map_or(error, anyhow::Error::from))?;

@@ -32,7 +32,6 @@ struct Fixture {
     phase: watch::Receiver<EnginePhase>,
     native: Arc<crate::native_api::observation::NativeObservation>,
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    alive: Arc<honk_outbound::alive::AliveDialerSet>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
     api: crate::native_api::NativeServer,
@@ -171,8 +170,7 @@ impl Fixture {
         let commands = plane.command_sender();
         let backend = plane.ebpf_handle();
         let shutdown = plane.shutdown_requested.clone();
-        let alive = plane.alive_set();
-        alive.pause_health_checks().await?;
+        plane.alive_set().shutdown_health_checks().await?;
         let api = crate::native_api::NativeServer::start(listener, Arc::new(state));
         let task = tokio::spawn(async move {
             let result = plane.run().await;
@@ -183,7 +181,6 @@ impl Fixture {
             phase,
             native,
             backend,
-            alive,
             shutdown,
             task,
             api,
@@ -205,7 +202,6 @@ impl Fixture {
             }
         })
         .await?;
-        fixture.alive.pause_health_checks().await?;
         Ok(fixture)
     }
 

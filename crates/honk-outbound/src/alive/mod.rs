@@ -435,7 +435,7 @@ impl AliveDialerSet {
     pub fn new() -> Self {
         const TRIGGER_QUEUE_CAPACITY: usize = 256;
         let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
-        let (health_mode, _) = tokio::sync::watch::channel(probe::HealthMode::Running(0));
+        let (health_mode, _) = tokio::sync::watch::channel(probe::HealthMode::Running);
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
@@ -563,7 +563,7 @@ impl AliveDialerSet {
         cancel
             .run(cancel.scope_resolution(operation))
             .await
-            .ok_or(HealthCheckError::Paused)?
+            .ok_or(HealthCheckError::Stopped)?
     }
 
     async fn resolve_host_inner(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
@@ -748,7 +748,7 @@ impl AliveDialerSet {
 
     pub fn trigger_probe(&self, node_id: Uuid) {
         let _control = self.health_control.lock();
-        if !matches!(*self.health_mode.borrow(), probe::HealthMode::Running(_)) {
+        if *self.health_mode.borrow() != probe::HealthMode::Running {
             return;
         }
         let mut pending = self.trigger_pending.lock();

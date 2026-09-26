@@ -5,8 +5,7 @@ use crate::group::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HealthMode {
-    Running(u64),
-    Paused(u64),
+    Running,
     Stopped,
     Failed,
 }
@@ -15,21 +14,15 @@ pub(super) enum HealthMode {
 pub(super) struct HealthControl {
     active: usize,
     loop_running: bool,
-    loop_parked: bool,
     failed: bool,
-    drained: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HealthCheckError {
-    #[error("health checks are paused")]
-    Paused,
     #[error("health checks are stopped")]
     Stopped,
     #[error("health probe capacity exhausted")]
     Busy,
-    #[error("health checks have not drained")]
-    NotDrained,
     #[error("health-check drain timed out")]
     DrainTimeout,
     #[error("health-check worker failed")]
@@ -40,7 +33,7 @@ pub enum HealthCheckError {
 /// callers must finish child/transport cleanup outside `run`.
 #[derive(Clone, Default)]
 pub struct ProbeCancellation {
-    mode: Option<(tokio::sync::watch::Sender<HealthMode>, u64)>,
+    mode: Option<tokio::sync::watch::Sender<HealthMode>>,
     #[cfg(feature = "native-api")]
     resolver_tasks: Option<Arc<crate::runtime::TaskOwner>>,
 }
@@ -49,14 +42,14 @@ impl ProbeCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.mode
             .as_ref()
-            .is_some_and(|(mode, epoch)| *mode.borrow() != HealthMode::Running(*epoch))
+            .is_some_and(|mode| *mode.borrow() != HealthMode::Running)
     }
     pub async fn cancelled(&self) {
-        let Some((sender, epoch)) = self.mode.as_ref() else {
+        let Some(sender) = self.mode.as_ref() else {
             return std::future::pending().await;
         };
         let mut mode = sender.subscribe();
-        while *mode.borrow_and_update() == HealthMode::Running(*epoch) {
+        while *mode.borrow_and_update() == HealthMode::Running {
             if mode.changed().await.is_err() {
                 return;
             }
@@ -64,7 +57,7 @@ impl ProbeCancellation {
     }
 
     pub fn report_cleanup_failure(&self) {
-        if let Some((mode, _)) = &self.mode {
+        if let Some(mode) = &self.mode {
             mode.send_replace(HealthMode::Failed);
         }
     }
@@ -129,7 +122,6 @@ impl Drop for HealthLoopGuard {
     fn drop(&mut self) {
         let mut control = self.alive.health_control.lock();
         control.loop_running = false;
-        control.loop_parked = true;
         if !self.terminal {
             control.failed = true;
             self.alive.health_mode.send_replace(HealthMode::Stopped);
@@ -152,15 +144,14 @@ impl AliveDialerSet {
         if control.failed {
             return Err(HealthCheckError::WorkerFailed);
         }
-        let epoch = match *self.health_mode.borrow() {
-            HealthMode::Running(epoch) => epoch,
-            HealthMode::Paused(_) => return Err(HealthCheckError::Paused),
+        match *self.health_mode.borrow() {
+            HealthMode::Running => {}
             HealthMode::Stopped => return Err(HealthCheckError::Stopped),
             HealthMode::Failed => return Err(HealthCheckError::WorkerFailed),
-        };
+        }
         control.active += 1;
         Ok(ProbeCancellation {
-            mode: Some((self.health_mode.clone(), epoch)),
+            mode: Some(self.health_mode.clone()),
             #[cfg(feature = "native-api")]
             resolver_tasks: self.native_observations.read().is_some().then(|| {
                 Arc::clone(
@@ -204,7 +195,7 @@ impl AliveDialerSet {
             }
             tasks.spawn(async move {
                 let result = if cancel.is_cancelled() {
-                    Err(HealthCheckError::Paused)
+                    Err(HealthCheckError::Stopped)
                 } else {
                     Ok(make(cancel).await)
                 };
@@ -215,44 +206,23 @@ impl AliveDialerSet {
         receive.await.map_err(|_| HealthCheckError::WorkerFailed)?
     }
 
-    pub async fn pause_health_checks(&self) -> Result<(), HealthCheckError> {
-        self.close_health_admission(false);
-        self.wait_health_drained().await
-    }
-
     /// Terminal stop; the caller still joins the retained health-loop handle.
     pub async fn shutdown_health_checks(&self) -> Result<(), HealthCheckError> {
-        self.close_health_admission(true);
+        self.close_health_admission();
         self.wait_health_drained().await
     }
 
-    fn close_health_admission(&self, terminal: bool) {
-        let mut control = self.health_control.lock();
-        control.drained = false;
-        let mode = *self.health_mode.borrow();
-        let next = match (mode, terminal) {
-            (HealthMode::Failed, _) => HealthMode::Failed,
-            (_, true) | (HealthMode::Stopped, _) => HealthMode::Stopped,
-            (HealthMode::Running(epoch) | HealthMode::Paused(epoch), false) => {
-                HealthMode::Paused(epoch)
+    fn close_health_admission(&self) {
+        let _control = self.health_control.lock();
+        let closed = self.health_mode.send_if_modified(|mode| {
+            if *mode != HealthMode::Running {
+                return false;
             }
-        };
-        if mode != next {
-            self.health_mode.send_if_modified(|mode| {
-                if *mode == HealthMode::Failed {
-                    return false;
-                }
-                *mode = next;
-                true
-            });
+            *mode = HealthMode::Stopped;
+            true
+        });
+        if closed {
             self.advance_native_probe_epoch();
-        }
-        if !control.loop_running
-            && let Some(rx) = self.trigger_rx.lock().as_mut()
-        {
-            while let Ok(id) = rx.try_recv() {
-                self.finish_trigger_probe(id);
-            }
         }
     }
 
@@ -265,7 +235,7 @@ impl AliveDialerSet {
                 let drained = {
                     let control = self.health_control.lock();
                     control.active == 0
-                        && (!control.loop_running || control.loop_parked)
+                        && !control.loop_running
                         && self.external_probes.lock().is_empty()
                 };
                 if drained {
@@ -279,8 +249,7 @@ impl AliveDialerSet {
                             }
                         }
                     }
-                    let mut control = self.health_control.lock();
-                    control.drained = true;
+                    let control = self.health_control.lock();
                     return if control.failed || *self.health_mode.borrow() == HealthMode::Failed {
                         Err(HealthCheckError::WorkerFailed)
                     } else {
@@ -313,36 +282,6 @@ impl AliveDialerSet {
                 Err(HealthCheckError::DrainTimeout)
             }
         }
-    }
-
-    /// Call only after datapath admission has actually reopened.
-    pub fn resume_health_checks(&self) -> Result<(), HealthCheckError> {
-        let control = self.health_control.lock();
-        if control.failed {
-            return Err(HealthCheckError::WorkerFailed);
-        }
-        let epoch = match *self.health_mode.borrow() {
-            HealthMode::Paused(epoch) => epoch,
-            HealthMode::Running(_) => return Ok(()),
-            HealthMode::Stopped => return Err(HealthCheckError::Stopped),
-            HealthMode::Failed => return Err(HealthCheckError::WorkerFailed),
-        };
-        if !control.drained
-            || control.active != 0
-            || (control.loop_running && !control.loop_parked)
-            || !self.external_probes.lock().is_empty()
-        {
-            return Err(HealthCheckError::NotDrained);
-        }
-        let Some(epoch) = epoch.checked_add(1) else {
-            self.health_mode.send_replace(HealthMode::Stopped);
-            return Err(HealthCheckError::Stopped);
-        };
-        #[cfg(feature = "native-api")]
-        self.health_resolver_tasks.lock().take();
-        self.advance_native_probe_epoch();
-        self.health_mode.send_replace(HealthMode::Running(epoch));
-        Ok(())
     }
 
     fn health_worker_failed(&self) {
@@ -1346,7 +1285,6 @@ impl AliveDialerSet {
             .take_trigger_rx()
             .expect("health trigger receiver owned");
         control.loop_running = true;
-        control.loop_parked = false;
         let mut mode = self.health_mode.subscribe();
         let mut owner = HealthLoopGuard {
             alive: Arc::clone(self),
@@ -1371,30 +1309,15 @@ impl AliveDialerSet {
             );
             recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                if !matches!(*mode.borrow_and_update(), HealthMode::Running(_)) {
+                if *mode.borrow_and_update() != HealthMode::Running {
                     while let Some(result) = emergency_workers.join_next().await {
                         if result.is_err() {
                             this.health_worker_failed();
                         }
                     }
-                    while let Ok(id) = trigger_rx.try_recv() {
-                        this.finish_trigger_probe(id);
-                    }
-                    this.trigger_pending.lock().clear();
-                    this.health_control.lock().loop_parked = true;
-                    this.health_changed.notify_waiters();
-                    if matches!(*mode.borrow(), HealthMode::Stopped | HealthMode::Failed) {
-                        owner.terminal = true;
-                        drop(owner);
-                        return;
-                    }
-                    if mode.changed().await.is_err() {
-                        return;
-                    }
-                    this.health_control.lock().loop_parked = false;
-                    ticker.reset_immediately();
-                    recovery_ticker.reset();
-                    continue;
+                    owner.terminal = true;
+                    drop(owner);
+                    return;
                 }
                 tokio::select! {
                     biased;
