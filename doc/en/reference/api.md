@@ -166,6 +166,8 @@ Event capture is active while a client is attached or a permitted recorder is ex
 
 Traffic and memory histories use the existing one-second sampler with missed ticks skipped, not a task per client. Each enabled ring retains at most 600 points for 600 seconds, even with no clients; restart clears it. `record_traffic: false` or `record_memory: false` disables the corresponding history capability and releases its buffer on restart, without disabling current observations. History selects actual samples in the requested window. If thinning is needed, it uses the smallest stride that fits `max_points`, anchored at the newest sample, and returns oldest first. `sampled_every_seconds` describes that nominal stride, not a promise of evenly spaced timestamps: gaps and nulls remain, with no interpolation or zero filling.
 
+`process.cpu_percent` in `/runtime` is the process CPU time (`CLOCK_PROCESS_CPUTIME_ID`) over the sampler's last one-second interval, as a percentage of one CPU: 100 is one fully busy core, and multi-threaded work can exceed 100. It is null until two samples exist.
+
 RSS comes from `/proc/self/status`. Cgroup-v2 membership and mount discovery select the actual `memory.current`, `memory.max` and `memory.events` files; unreadable/unknown values are null, not zero or substituted RSS. An unlimited `memory.max` also has a null limit. Cgroup scope is `unknown`; process and cgroup usage overlap and must not be added together. Capabilities list observed metrics, read once at startup before the first sample; `kernel` is null and kernel-memory accounting is not advertised.
 
 ### Accepted configuration and reload operations (M6)
