@@ -265,7 +265,7 @@ mod routed {
     }
 
     /// Straight to the host, resolved with the bootstrap resolver, over the
-    /// bypass mark.
+    /// configured bypass mark.
     async fn connect_direct(
         host: &str,
         port: u16,
@@ -282,7 +282,7 @@ mod routed {
         for ip in addresses {
             match honk_outbound::util::connect_marked_addr(
                 SocketAddr::new(ip, port),
-                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                Some(honk_outbound::util::bypass_mark()),
                 deadline.saturating_duration_since(Instant::now()),
             )
             .await
