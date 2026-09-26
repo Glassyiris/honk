@@ -5,7 +5,7 @@ use crate::group::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HealthMode {
-    Running(u64),
+    Running,
     Stopped,
     Failed,
 }
@@ -35,7 +35,7 @@ pub enum HealthCheckError {
 /// callers must finish child/transport cleanup outside `run`.
 #[derive(Clone, Default)]
 pub struct ProbeCancellation {
-    mode: Option<(tokio::sync::watch::Sender<HealthMode>, u64)>,
+    mode: Option<tokio::sync::watch::Sender<HealthMode>>,
     #[cfg(feature = "native-api")]
     resolver_tasks: Option<Arc<crate::runtime::TaskOwner>>,
 }
@@ -44,14 +44,14 @@ impl ProbeCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.mode
             .as_ref()
-            .is_some_and(|(mode, epoch)| *mode.borrow() != HealthMode::Running(*epoch))
+            .is_some_and(|mode| *mode.borrow() != HealthMode::Running)
     }
     pub async fn cancelled(&self) {
-        let Some((sender, epoch)) = self.mode.as_ref() else {
+        let Some(sender) = self.mode.as_ref() else {
             return std::future::pending().await;
         };
         let mut mode = sender.subscribe();
-        while *mode.borrow_and_update() == HealthMode::Running(*epoch) {
+        while *mode.borrow_and_update() == HealthMode::Running {
             if mode.changed().await.is_err() {
                 return;
             }
@@ -59,7 +59,7 @@ impl ProbeCancellation {
     }
 
     pub fn report_cleanup_failure(&self) {
-        if let Some((mode, _)) = &self.mode {
+        if let Some(mode) = &self.mode {
             mode.send_replace(HealthMode::Failed);
         }
     }
@@ -146,14 +146,14 @@ impl AliveDialerSet {
         if control.failed {
             return Err(HealthCheckError::WorkerFailed);
         }
-        let epoch = match *self.health_mode.borrow() {
-            HealthMode::Running(epoch) => epoch,
+        match *self.health_mode.borrow() {
+            HealthMode::Running => {}
             HealthMode::Stopped => return Err(HealthCheckError::Stopped),
             HealthMode::Failed => return Err(HealthCheckError::WorkerFailed),
-        };
+        }
         control.active += 1;
         Ok(ProbeCancellation {
-            mode: Some((self.health_mode.clone(), epoch)),
+            mode: Some(self.health_mode.clone()),
             #[cfg(feature = "native-api")]
             resolver_tasks: self.native_observations.read().is_some().then(|| {
                 Arc::clone(
@@ -217,7 +217,7 @@ impl AliveDialerSet {
     fn close_health_admission(&self) {
         let _control = self.health_control.lock();
         let closed = self.health_mode.send_if_modified(|mode| {
-            if !matches!(mode, HealthMode::Running(_)) {
+            if *mode != HealthMode::Running {
                 return false;
             }
             *mode = HealthMode::Stopped;
@@ -1311,7 +1311,7 @@ impl AliveDialerSet {
             );
             recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                if !matches!(*mode.borrow_and_update(), HealthMode::Running(_)) {
+                if *mode.borrow_and_update() != HealthMode::Running {
                     while let Some(result) = emergency_workers.join_next().await {
                         if result.is_err() {
                             this.health_worker_failed();
