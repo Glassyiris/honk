@@ -32,8 +32,6 @@ pub(crate) enum OperationKind {
     Probe,
     ProviderRefresh,
     GroupUpdate,
-    Suspend,
-    Resume,
     GeodataUpdate,
 }
 
@@ -51,12 +49,6 @@ pub(crate) enum OperationResult {
         group_id: String,
         config_revision: String,
     },
-    Suspend {
-        runtime_state: &'static str,
-    },
-    Resume {
-        runtime_state: &'static str,
-    },
 }
 
 impl OperationResult {
@@ -67,8 +59,6 @@ impl OperationResult {
             Self::ProviderRefresh(_) => OperationKind::ProviderRefresh,
             Self::Geodata(_) => OperationKind::GeodataUpdate,
             Self::GroupUpdate { .. } => OperationKind::GroupUpdate,
-            Self::Suspend { .. } => OperationKind::Suspend,
-            Self::Resume { .. } => OperationKind::Resume,
         }
     }
 }

@@ -33,7 +33,6 @@ struct Worker {
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
     log_files: LogFiles,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
-    commands: mpsc::Sender<ControlCommand>,
     subscriptions: SubscriptionSupervisorHandle,
     activation: Activation,
 }
@@ -73,8 +72,7 @@ impl ConfigService {
                 active,
                 log_files,
                 diagnostics,
-                activation: Activation::new(commands.clone(), subscriptions.clone()),
-                commands,
+                activation: Activation::new(commands, subscriptions.clone()),
                 subscriptions,
             };
             loop {
@@ -126,8 +124,7 @@ impl Worker {
                 | Work::GroupPatch { reservation, .. }
                 | Work::Reload { reservation }
                 | Work::Import { reservation }
-                | Work::ActivateRevision { reservation, .. }
-                | Work::Lifecycle { reservation, .. } => {
+                | Work::ActivateRevision { reservation, .. } => {
                     self.service.operations.reject(&reservation.id, error);
                 }
                 Work::Sighup => tracing::warn!("SIGHUP refused while engine is not running"),
@@ -152,57 +149,6 @@ impl Worker {
                     .await
                     .map_err(|error| error.for_management(deleting));
                 let _ = response.send(result);
-            }
-            Work::Lifecycle {
-                resume,
-                reservation,
-            } => {
-                let id = &reservation.id;
-                let before = self.diagnostics.read().generation;
-                let (reply, result) = oneshot::channel();
-                let command = if resume {
-                    ControlCommand::Resume { reply }
-                } else {
-                    ControlCommand::Suspend { reply }
-                };
-                if self.commands.send(command).await.is_err() {
-                    self.service.operations.reject(id, unavailable());
-                    return;
-                }
-                self.service.operations.accept(id);
-                self.service.operations.running(id);
-                match result.await {
-                    Ok(Ok(())) => {
-                        self.service.operations.succeed(
-                            id,
-                            if resume {
-                                super::super::operations::OperationResult::Resume {
-                                    runtime_state: "running",
-                                }
-                            } else {
-                                super::super::operations::OperationResult::Suspend {
-                                    runtime_state: "suspended",
-                                }
-                            },
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        self.service.operations.fail(
-                            id,
-                            "lifecycle_failed",
-                            "Lifecycle transition failed",
-                            self.lifecycle_error(error, before).into_details(),
-                        );
-                    }
-                    Err(_) => {
-                        self.service.operations.fail(
-                            id,
-                            "engine_unavailable",
-                            "Lifecycle owner is unavailable",
-                            None,
-                        );
-                    }
-                }
             }
             Work::GroupPatch { patch, reservation } => {
                 let id = reservation.id.clone();

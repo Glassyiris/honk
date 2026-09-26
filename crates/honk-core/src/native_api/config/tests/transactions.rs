@@ -708,3 +708,26 @@ async fn written_source_whose_reload_cannot_dispatch_is_not_retryable() {
     .await;
     assert_eq!(failure["error"]["details"]["written"], true);
 }
+
+#[tokio::test]
+async fn suspend_and_resume_are_not_offered() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(capabilities["resources"]["reload"]["available"], true);
+    assert_eq!(capabilities["resources"]["suspend"]["available"], false);
+    assert_eq!(capabilities["resources"]["resume"]["available"], false);
+    for path in ["/api/v1/operations/suspend", "/api/v1/operations/resume"] {
+        error(
+            fixture
+                .request(Method::POST, path)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::NOT_FOUND,
+            "capability_not_supported",
+        )
+        .await;
+    }
+    fixture.shutdown().await;
+}
