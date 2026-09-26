@@ -427,3 +427,10 @@ fn log_request_rejects_ambiguous_unknown_or_invalid_filters_before_streaming() {
         );
     }
 }
+
+#[test]
+fn log_capability_advertises_the_replay_age_limit() {
+    let capability = store().capability();
+    assert_eq!(capability["retention_seconds"], 60);
+    assert_eq!(capability["max_buffered_records"], 512);
+}

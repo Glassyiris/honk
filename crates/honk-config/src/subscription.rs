@@ -21,6 +21,9 @@ pub struct Subscription {
     pub headers: Vec<SubscriptionHeader>,
     #[serde(default = "crate::types::default_true")]
     pub enabled: bool,
+    /// Keep the fetched body for offline startup; only with `global.store_subscribe`.
+    #[serde(default = "crate::types::default_true")]
+    pub cache: bool,
     /// Last update time
     #[serde(default)]
     pub last_updated: Option<DateTime<Utc>>,
@@ -47,6 +50,7 @@ impl Default for Subscription {
             user_agent: None,
             headers: Vec::new(),
             enabled: true,
+            cache: true,
             last_updated: None,
             node_count: 0,
             created_at: Utc::now(),

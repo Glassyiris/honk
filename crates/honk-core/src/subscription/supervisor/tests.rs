@@ -466,6 +466,7 @@ async fn finish_pause_waits_for_late_enqueue_and_retains_removed_provider_commit
     let handle = SubscriptionSupervisorHandle {
         command_tx,
         observations: Arc::clone(&state.observations),
+        caches: false,
     };
     let worker = tokio::spawn(state.run(commands, merge_tx));
     handle.begin_pause().await.unwrap();

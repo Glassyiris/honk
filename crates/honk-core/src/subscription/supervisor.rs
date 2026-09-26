@@ -54,6 +54,7 @@ pub(crate) fn same_subscription_source_spec(left: &Subscription, right: &Subscri
         && left.user_agent == right.user_agent
         && left.headers == right.headers
         && left.enabled == right.enabled
+        && left.cache == right.cache
 }
 
 pub(crate) fn same_subscription_worker_set(left: &[Subscription], right: &[Subscription]) -> bool {
@@ -781,12 +782,20 @@ pub(crate) struct SubscriptionSupervisorHandle {
     command_tx: mpsc::Sender<SupervisorCommand>,
     #[cfg(feature = "native-api")]
     observations: Observations,
+    /// A subscription store is open, so `cache` has an effect.
+    #[cfg(feature = "native-api")]
+    caches: bool,
 }
 
 impl SubscriptionSupervisorHandle {
     #[cfg(feature = "native-api")]
     pub(crate) fn running(&self) -> bool {
         !self.command_tx.is_closed()
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn caches(&self) -> bool {
+        self.caches
     }
 
     #[cfg(feature = "native-api")]
@@ -904,6 +913,8 @@ pub(crate) struct SubscriptionSupervisor {
     startup_diagnostics: Option<DiagnosticBuckets>,
     #[cfg(feature = "native-api")]
     observations: Observations,
+    #[cfg(feature = "native-api")]
+    caches: bool,
     command_tx: Option<mpsc::Sender<SupervisorCommand>>,
     task: Option<JoinHandle<()>>,
 }
@@ -931,6 +942,8 @@ impl SubscriptionSupervisor {
         Ok(Self {
             #[cfg(feature = "native-api")]
             observations: Arc::clone(&state.observations),
+            #[cfg(feature = "native-api")]
+            caches: state.store.is_some(),
             prepared: Some(state),
             startup_diagnostics: Some(startup_diagnostics),
             command_tx: None,
@@ -965,6 +978,8 @@ impl SubscriptionSupervisor {
         SubscriptionSupervisorHandle {
             #[cfg(feature = "native-api")]
             observations: Arc::clone(&self.observations),
+            #[cfg(feature = "native-api")]
+            caches: self.caches,
             command_tx: self
                 .command_tx
                 .as_ref()

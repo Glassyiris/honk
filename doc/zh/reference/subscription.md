@@ -19,7 +19,7 @@ subscription {
 }
 ```
 
-简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua` 和可选的 `interval`；`interval` 是 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。
+简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua`、可选的 `interval` 和可选的 `cache`；`interval` 是 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。
 
 tag 可以省略。条目不带引号时，第一个 `:` 之前的文本是 tag；如果该冒号属于 `://`，则没有 tag，也不会按 URL 中后续的冒号拆分。tag 和 URL 都可以使用配对的单引号或双引号。带引号的 tag 后接 `:` 表示显式 tag；否则，解析器先去掉 URL 的外层引号，再应用相同的首个冒号规则。因此，`'paid:https://example.com/sub'` 的 tag 是 `paid`，而 `'https://example.com/sub'` 没有 tag。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，会自动识别下文列出的正文格式。
 
@@ -50,6 +50,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | `user_agent` | string 或 null | `honk/<version>` | 是，对应 `(UA)` 或块内 `ua` | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
 | `headers` | `{key,value}[]` | `[]` | 否 | 有序的额外请求 header。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不会恢复、拉取或刷新。 |
+| `cache` | bool | `true` | 是，对应块内 `cache` | 在 `global.store_subscribe` 启用时保存拉取到的正文，供离线启动恢复。设为 `false` 时既不保存也不恢复，维护任务会删除此前保存的正文。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型元数据；当前 core runtime 不更新它。 |
 | `node_count` | u32 | `0` | 否 | 模型元数据；当前 core runtime 不更新它。 |
 | `created_at` | datetime | 构造时间 | 否 | 模型构造时间。 |

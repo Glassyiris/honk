@@ -33,6 +33,31 @@ async fn a_body_survives_restart() {
 }
 
 #[tokio::test]
+async fn a_subscription_with_cache_off_is_neither_stored_nor_restored_nor_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
+    let mut sub = subscription("a");
+    store
+        .store_content(&sub, "socks5://127.0.0.1:1080#stored".into())
+        .await
+        .unwrap();
+    sub.cache = false;
+    assert!(store.load_nodes(&sub).await.unwrap().is_none());
+    store.remove_body(&sub);
+    store
+        .store_content(&sub, "socks5://127.0.0.1:1080#fresh".into())
+        .await
+        .unwrap();
+    assert!(store.body(&sub).is_none());
+    let kept = subscription("b");
+    store.set_enabled([&sub, &kept]);
+    assert_eq!(
+        *store.state().enabled_subscriptions(),
+        Some([SubscriptionStore::key(&kept)].into())
+    );
+}
+
+#[tokio::test]
 async fn a_replacement_url_frees_the_old_bodies() {
     let temp = tempfile::tempdir().unwrap();
     let store = SubscriptionStore::in_dir(temp.path());

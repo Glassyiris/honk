@@ -162,6 +162,35 @@ async fn response_json(response: Response) -> Value {
 }
 
 #[tokio::test]
+async fn routing_reads_that_cannot_pin_the_router_are_retryable_snapshot_unavailable() {
+    let app = TestApp::new(|_| {}).await;
+    let router = app.control.traffic_router();
+    let reload = router.write().await;
+    let wait = Duration::from_secs(10);
+    let (rules, trace) = tokio::join!(
+        app.get("/api/v1/rules").timeout(wait).send(),
+        app.client
+            .post(app.url("/api/v1/routing/trace"))
+            .bearer_auth(SECRET)
+            .json(&json!({"input":{"network":"tcp","dst_ip":"198.51.100.20","dst_port":443}}))
+            .timeout(wait)
+            .send(),
+    );
+    drop(reload);
+    for response in [rules.unwrap(), trace.unwrap()] {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        error_response(
+            response,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "snapshot_unavailable",
+        )
+        .await;
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types() {
     let app = TestApp::new(|_| {}).await;
     for path in ["/api/v1/probes", "/api/v1/routing/trace"] {
@@ -323,13 +352,40 @@ async fn authentication_precedes_capability_and_query_validation() {
 }
 
 #[tokio::test]
+async fn discovery_withholds_detail_from_callers_without_a_credential() {
+    let app = TestApp::new(|_| {}).await;
+    // Without a credential a caller learns only how to sign in.
+    for path in ["/api", "/api/v1/discovery"] {
+        let public = response_json(app.client.get(app.url(path)).send().await.unwrap()).await;
+        assert_eq!(
+            public,
+            serde_json::json!({
+                "name": "dae/honk-native",
+                "api_major": 1,
+                "links": {"auth_setup": null, "auth_login": null},
+                "auth": {"mode": "token", "setup_required": false},
+            }),
+            "{path}"
+        );
+    }
+    let full = response_json(app.get("/api").send().await.unwrap()).await;
+    assert_eq!(full["status"], "draft");
+    assert_eq!(full["links"]["version"], "/api/v1/version");
+    assert_eq!(full["auth"]["anonymous_loopback"], false);
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn anonymous_loopback_does_not_forgive_credentials_or_cross_site_requests() {
     let app = TestApp::new(|config| {
         config.experimental.native_api.secret.clear();
         config.experimental.native_api.allow_anonymous_loopback = true;
     })
     .await;
-    response_json(app.client.get(app.url("/api")).send().await.unwrap()).await;
+    // A secretless loopback listener admits the caller, so it gets the full view.
+    let full = response_json(app.client.get(app.url("/api")).send().await.unwrap()).await;
+    assert_eq!(full["links"]["version"], "/api/v1/version");
+    assert_eq!(full["auth"]["anonymous_loopback"], true);
     for authorization in ["Bearer wrong", "Basic value", "Bearer"] {
         error_response(
             app.client

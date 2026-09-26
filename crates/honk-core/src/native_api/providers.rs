@@ -21,7 +21,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    ApiError, ErrorCode, NativeState, invalid_query,
+    ApiError, ErrorCode, NativeState,
+    catalog::snapshot_unavailable,
+    invalid_query,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
     parse_query, timestamp,
     types::RequestId,
@@ -172,7 +174,22 @@ impl ProviderApi {
     }
 
     pub(crate) fn capability(&self) -> Value {
-        json!({"available": true, "can_refresh": self.supervisor.read().as_ref().is_some_and(SubscriptionSupervisorHandle::running), "max_page_size": MAX_PAGE_SIZE})
+        let mut create_options = json!({
+            "update_interval": honk_config::subscription::Subscription::default().update_interval,
+            "user_agent": crate::subscription::DEFAULT_SUBSCRIPTION_USER_AGENT,
+        });
+        if self.caches() {
+            create_options["cache"] = json!(true);
+        }
+        json!({"available": true, "can_refresh": self.supervisor.read().as_ref().is_some_and(SubscriptionSupervisorHandle::running), "create_options": create_options, "max_page_size": MAX_PAGE_SIZE})
+    }
+
+    /// Whether a subscription's `cache` setting has any effect in this run.
+    pub(crate) fn caches(&self) -> bool {
+        self.supervisor
+            .read()
+            .as_ref()
+            .is_some_and(SubscriptionSupervisorHandle::caches)
     }
 
     fn resume(
@@ -197,7 +214,7 @@ impl ProviderApi {
         Ok(snapshot.page(offset, limit))
     }
 
-    fn page(&self, snapshot: Snapshot, limit: usize) -> Result<Response, ApiError> {
+    fn page(&self, snapshot: Snapshot, limit: usize, id: &RequestId) -> Result<Response, ApiError> {
         let response = snapshot.page(0, limit);
         if snapshot.rows.len() > limit {
             let mut snapshots = self.snapshots.lock();
@@ -207,7 +224,7 @@ impl ProviderApi {
                     > MAX_SNAPSHOT_BYTES
             {
                 if snapshots.pop_front().is_none() {
-                    return Err(unavailable());
+                    return Err(snapshot_unavailable(id));
                 }
             }
             snapshots.push_back(snapshot);
@@ -247,7 +264,7 @@ pub(super) async fn list(
         })
         >= MAX_SNAPSHOT_BYTES
     {
-        return Err(unavailable());
+        return Err(snapshot_unavailable(id));
     }
     let mut counts: HashMap<_, usize> = config.subscriptions.iter().map(|s| (s.id, 0)).collect();
     let mut inline_count = 0;
@@ -273,7 +290,7 @@ pub(super) async fn list(
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {
-            return Err(unavailable());
+            return Err(snapshot_unavailable(id));
         }
         rows.push(row);
     }
@@ -287,6 +304,7 @@ pub(super) async fn list(
             bytes,
         },
         limit,
+        id,
     )
 }
 

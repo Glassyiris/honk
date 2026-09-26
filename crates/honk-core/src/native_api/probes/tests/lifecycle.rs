@@ -97,9 +97,16 @@ async fn private_child_panic_fails_operation_and_pause_without_negating_measurem
             operation["status"],
             if panic { "failed" } else { "succeeded" }
         );
-        assert_eq!(operation["result"]["results"][0]["state"], "healthy");
-        assert_eq!(operation["result"]["results"][0]["health_updated"], true);
-        assert_eq!(operation["result"]["results"][0]["error"], Value::Null);
+        // A failed operation keeps result null; completed measurements move to error.details.
+        let measured = if panic {
+            assert_eq!(operation["result"], Value::Null);
+            &operation["error"]["details"]
+        } else {
+            &operation["result"]
+        };
+        assert_eq!(measured["results"][0]["state"], "healthy");
+        assert_eq!(measured["results"][0]["health_updated"], true);
+        assert_eq!(measured["results"][0]["error"], Value::Null);
         assert_eq!(
             state
                 .alive_set

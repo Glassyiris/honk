@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq;
 
 use super::NativeState;
 use super::auth::SessionLease;
-use super::types::{ApiError, ErrorCode, RequestId};
+use super::types::{Admitted, ApiError, ErrorCode, RequestId};
 
 const MAX_TARGET_BYTES: usize = 4096;
 const MAX_HEADER_BYTES: usize = 16384;
@@ -291,12 +291,18 @@ pub(super) async fn boundary(
             };
         }
         if is_api {
-            if !public || carries_credential(&request) {
-                lease = state.security.authenticate(
-                    &request,
-                    state.auth.as_ref().map(|auth| &auth.sessions),
-                    &request_id,
-                )?;
+            // A public route still records whether the caller is admitted, so discovery can withhold detail.
+            match state.security.authenticate(
+                &request,
+                state.auth.as_ref().map(|auth| &auth.sessions),
+                &request_id,
+            ) {
+                Ok(session) => {
+                    lease = session;
+                    request.extensions_mut().insert(Admitted);
+                }
+                Err(error) if !public || carries_credential(&request) => return Err(error),
+                Err(_) => {}
             }
             let (parts, body) = request.into_parts();
             let bytes = read_body(body, header_bytes, &request_id).await?;

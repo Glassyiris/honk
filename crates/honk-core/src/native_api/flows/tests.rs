@@ -476,28 +476,67 @@ fn aged_out_records_report_one_gap_per_interval_with_the_running_count() {
     assert_eq!((gaps(), store.inner.lock().dropped), (2, 7));
 }
 
+fn count(store: &FlowStore, kind: &str) -> usize {
+    store
+        .events
+        .buffered_kinds()
+        .into_iter()
+        .filter(|buffered| *buffered == kind)
+        .count()
+}
+
 #[test]
-fn room_making_overflow_is_reported_per_interval_but_lost_history_per_record() {
+fn room_making_eviction_is_reported_once_per_interval() {
     let store = store();
-    let gaps = || {
-        store
-            .events
-            .buffered_kinds()
-            .into_iter()
-            .filter(|kind| *kind == "flow.gap")
-            .count()
-    };
     // Keep going until twenty records had to make room for newer ones.
     while store.inner.lock().dropped < 20 {
         begin(&store, "tcp").finish("closed", "relay_finished");
     }
-    assert_eq!(gaps(), 1);
-    // A record that overflowed its own step budget is still named on its own.
+    assert_eq!(count(&store, "flow.gap"), 1);
+}
+
+#[test]
+fn step_overflow_updates_the_record_without_a_gap() {
+    let store = store();
     let flow = begin(&store, "tcp");
-    for _ in 0..MAX_STEPS + 1 {
+    while store.inner.lock().records[0].steps.len() < MAX_STEPS {
         flow.step(Some(1), dial_mode());
     }
-    assert_eq!(gaps(), 2);
+    let updates = count(&store, "flow.updated");
+    let revision = store.inner.lock().records[0].summary.revision;
+    flow.step(Some(1), dial_mode());
+    let inner = store.inner.lock();
+    assert!(inner.records[0].overflow);
+    assert_eq!(inner.records[0].summary.revision, revision + 1);
+    drop(inner);
+    assert_eq!(count(&store, "flow.updated"), updates + 1);
+    assert_eq!(count(&store, "flow.gap"), 0);
+    // Later steps find the record already truncated and publish nothing.
+    flow.step(Some(1), dial_mode());
+    assert_eq!(count(&store, "flow.updated"), updates + 1);
+    assert_eq!(count(&store, "flow.gap"), 0);
+}
+
+#[test]
+fn revision_exhaustion_joins_the_interval_notice() {
+    let store = store();
+    for _ in 0..2 {
+        let flow = begin(&store, "tcp");
+        store
+            .inner
+            .lock()
+            .records
+            .back_mut()
+            .unwrap()
+            .summary
+            .revision = MAX_SAFE_UINT;
+        flow.step(Some(1), dial_mode());
+    }
+    let inner = store.inner.lock();
+    assert!(inner.records.is_empty());
+    assert_eq!(inner.dropped, 2);
+    drop(inner);
+    assert_eq!(count(&store, "flow.gap"), 1);
 }
 
 #[test]

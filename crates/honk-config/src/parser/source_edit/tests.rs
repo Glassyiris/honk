@@ -35,6 +35,7 @@ fn managed_appends_use_last_roots_and_preserve_literal_names_and_crlf() {
         &loaded.sources[0],
         "paid # east",
         "https://example.test/sub?q=%2F#token",
+        &SubscriptionOptions::default(),
     )
     .unwrap();
     assert_eq!(edited, loaded.sources[0].content.replace("subscription {} # last", "subscription {\r\n    'paid # east': 'https://example.test/sub?q=%2F#token'\r\n} # last"));
@@ -57,9 +58,13 @@ fn managed_appends_create_sections_after_unterminated_comments() {
         "# preserved EOF comment\nnode {\n    node: 'socks5://127.0.0.1:1080'\n}\n"
     );
     let loaded = managed_source(&edited);
-    let edited =
-        append_subscription_source(&loaded.sources[0], "provider", "https://example.test/sub")
-            .unwrap();
+    let edited = append_subscription_source(
+        &loaded.sources[0],
+        "provider",
+        "https://example.test/sub",
+        &SubscriptionOptions::default(),
+    )
+    .unwrap();
     let config = managed_source(&edited).config;
     assert_eq!(config.nodes[0].name, "node");
     assert_eq!(config.subscriptions[0].name, "provider");
@@ -79,9 +84,13 @@ fn managed_entries_write_bare_keys_and_delete_whole_lines() {
         let edited =
             append_node_source(&loaded.sources[0], "lab-1.b", "socks5://127.0.0.1:1081").unwrap();
         let loaded = managed_source(&edited);
-        let edited =
-            append_subscription_source(&loaded.sources[0], "lab_2", "https://example.test/b")
-                .unwrap();
+        let edited = append_subscription_source(
+            &loaded.sources[0],
+            "lab_2",
+            "https://example.test/b",
+            &SubscriptionOptions::default(),
+        )
+        .unwrap();
         assert_eq!(
             edited,
             text.replace(
@@ -120,7 +129,15 @@ fn managed_appends_reject_injection_parse_skips_and_duplicate_identities() {
         "new\n}\nrouting { fallback: block }",
     ] {
         assert!(append_node_source(source, name, "socks5://127.0.0.1:1081").is_err());
-        assert!(append_subscription_source(source, name, "https://example.test/new").is_err());
+        assert!(
+            append_subscription_source(
+                source,
+                name,
+                "https://example.test/new",
+                &SubscriptionOptions::default()
+            )
+            .is_err()
+        );
     }
     for link in [
         "unsupported://PRIVATE",
@@ -136,11 +153,22 @@ fn managed_appends_reject_injection_parse_skips_and_duplicate_identities() {
         "https://example.test/PRIVATE\n}",
         "https://example.test/two'quotes\"",
     ] {
-        assert!(append_subscription_source(source, "new", url).is_err());
+        assert!(
+            append_subscription_source(source, "new", url, &SubscriptionOptions::default())
+                .is_err()
+        );
     }
     assert!(append_node_source(source, "old", "socks5://127.0.0.1:1081").is_err());
     assert!(append_node_source(source, "new", "socks5://127.0.0.1:1080#different-name").is_err());
-    assert!(append_subscription_source(source, "old", "https://example.test/new").is_err());
+    assert!(
+        append_subscription_source(
+            source,
+            "old",
+            "https://example.test/new",
+            &SubscriptionOptions::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -161,6 +189,67 @@ fn managed_node_deletion_uses_normalized_identity_and_keeps_nested_siblings() {
         remove_node_source(&loaded.sources[0], id)
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole() {
+    for newline in ["\n", "\r\n"] {
+        let text =
+            format!("subscription {{{newline}    a: 'https://example.test/a'{newline}}}{newline}");
+        let loaded = managed_source(&text);
+        let options = SubscriptionOptions {
+            update_interval: Some(3600),
+            user_agent: Some("east's agent/1.0"),
+            cache: Some(false),
+        };
+        let edited =
+            append_subscription_source(&loaded.sources[0], "b", "https://example.test/b", &options)
+                .unwrap();
+        assert_eq!(
+            edited,
+            text.replace(
+                "a'",
+                &format!(
+                    "a'{newline}    b: {{{newline}        url: 'https://example.test/b'{newline}        ua: \"east's agent/1.0\"{newline}        interval: '3600s'{newline}        cache: false{newline}    }}"
+                )
+            )
+        );
+        let loaded = managed_source(&edited);
+        let [first, added] = loaded.config.subscriptions.as_slice() else {
+            panic!("two subscriptions");
+        };
+        assert!(first.cache);
+        assert_eq!(first.update_interval, 86400);
+        assert_eq!(added.name, "b");
+        assert_eq!(added.url, "https://example.test/b");
+        assert_eq!(added.user_agent.as_deref(), Some("east's agent/1.0"));
+        assert_eq!(added.update_interval, 3600);
+        assert!(!added.cache);
+        let removed = remove_subscription_source(&loaded.sources[0], added)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed, text);
+        let manual = SubscriptionOptions {
+            update_interval: Some(0),
+            ..Default::default()
+        };
+        let edited =
+            append_subscription_source(&loaded.sources[0], "c", "https://example.test/c", &manual)
+                .unwrap();
+        let config = managed_source(&edited).config;
+        assert_eq!(config.subscriptions[2].update_interval, 0);
+        assert!(config.subscriptions[2].cache);
+        assert!(config.subscriptions[2].user_agent.is_none());
+    }
+    let loaded = managed_source("");
+    let control = SubscriptionOptions {
+        user_agent: Some("agent\r\nX-Injected: 1"),
+        ..Default::default()
+    };
+    assert!(
+        append_subscription_source(&loaded.sources[0], "d", "https://example.test/d", &control)
+            .is_err()
     );
 }
 
