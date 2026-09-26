@@ -34,17 +34,6 @@ pub(crate) struct ReloadReply {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ControlCommand {
-    // The engine keeps suspend and resume, which the native API no longer exposes.
-    #[cfg(feature = "native-api")]
-    #[allow(dead_code)]
-    Suspend {
-        reply: tokio::sync::oneshot::Sender<Result<(), super::client::ControlError>>,
-    },
-    #[cfg(feature = "native-api")]
-    #[allow(dead_code)]
-    Resume {
-        reply: tokio::sync::oneshot::Sender<Result<(), super::client::ControlError>>,
-    },
     #[cfg(any(feature = "native-api", feature = "clash-api"))]
     SetSelector {
         request: super::client::SelectionRequest,

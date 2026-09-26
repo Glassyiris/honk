@@ -1,7 +1,7 @@
 use super::*;
 
 impl ControlPlane {
-    // A failed resume can publish fresh transports before an epoch exists.
+    // Startup can fail before an epoch exists.
     // Always retire shared network owners; only listener/task joins need an epoch.
     pub(super) async fn stop_network_epoch(
         &mut self,

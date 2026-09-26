@@ -221,14 +221,6 @@ impl NativeState {
     pub(crate) fn require_running(&self) -> Result<(), ApiError> {
         match *self.phase.borrow() {
             EnginePhase::Running if self.healthy.load(Ordering::Acquire) => Ok(()),
-            EnginePhase::Suspending | EnginePhase::Suspended | EnginePhase::Resuming => {
-                Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    ErrorCode::StateConflict,
-                    "Engine lifecycle prevents this operation",
-                    None,
-                ))
-            }
             _ => Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::TemporarilyUnavailable,
@@ -422,9 +414,6 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
         EnginePhase::Running if !healthy => "degraded",
         EnginePhase::Running if reloading => "reloading",
         EnginePhase::Running => "running",
-        EnginePhase::Suspending => "draining",
-        EnginePhase::Suspended => "suspended",
-        EnginePhase::Resuming => "starting",
         EnginePhase::Draining => "draining",
         EnginePhase::Failed => "failed",
     };
@@ -675,22 +664,6 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
-    }
-
-    #[tokio::test]
-    async fn suspended_dns_query_uses_declared_unavailable_response() {
-        let mut state = state().await;
-        Arc::get_mut(&mut state).unwrap().phase = watch::channel(EnginePhase::Suspended).1;
-        let response = dns::query(
-            &state,
-            &"/api/v1/dns/query?domain=example.test".parse().unwrap(),
-            &RequestId("test".into()),
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()["retry-after"], "1");
     }
 
     #[tokio::test]

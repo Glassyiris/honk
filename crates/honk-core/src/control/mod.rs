@@ -122,9 +122,6 @@ type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
 pub(crate) enum EnginePhase {
     Starting,
     Running,
-    Suspending,
-    Suspended,
-    Resuming,
     Draining,
     Failed,
 }

@@ -325,11 +325,7 @@ impl ControlPlane {
         self.health_task = Some(alive_set.spawn_health_check_loop(period, check_timeout));
     }
 
-    async fn prepare_epoch(
-        &mut self,
-        listeners: BoundListeners,
-        resuming: bool,
-    ) -> anyhow::Result<RuntimeEpoch> {
+    async fn prepare_epoch(&mut self, listeners: BoundListeners) -> anyhow::Result<RuntimeEpoch> {
         use std::os::fd::AsRawFd;
         let tcp4 = listeners.tcp4.as_raw_fd();
         let tcp6 = listeners.tcp6.as_ref().map_or(tcp4, AsRawFd::as_raw_fd);
@@ -445,27 +441,19 @@ impl ControlPlane {
                 } else {
                     false
                 };
-                anyhow::ensure!(
-                    !resuming || !epoch.listeners.nfqueue_enabled || sequence_ready,
-                    "no safe UDP decision generation is available"
-                );
                 match self
                     .start_nfqueue_runtime(epoch.listeners.nfqueue_enabled, sequence_ready)
                     .await
                 {
                     Ok(queue) => epoch.queue = queue,
-                    Err(error) if !resuming => {
+                    Err(error) => {
                         self.degrade_nfqueue_startup(&mut epoch.listeners.nfqueue_enabled, error)
                             .await
                     }
-                    Err(error) => return Err(error),
                 }
                 if let Some(queue) = epoch.queue.as_mut()
                     && let Err(error) = queue.check_startup_health().await
                 {
-                    if resuming {
-                        return Err(error.into());
-                    }
                     self.cleanup_nfqueue_startup_failure(&mut epoch.queue).await;
                     epoch.queue = None;
                     self.degrade_nfqueue_startup(
@@ -475,8 +463,6 @@ impl ControlPlane {
                     .await;
                 }
             }
-            #[cfg(not(feature = "ebpf"))]
-            let _ = resuming;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -491,7 +477,7 @@ impl ControlPlane {
         Ok(epoch)
     }
 
-    async fn open_epoch(&mut self, epoch: &mut RuntimeEpoch, resuming: bool) -> anyhow::Result<()> {
+    async fn open_epoch(&mut self, epoch: &mut RuntimeEpoch) -> anyhow::Result<()> {
         #[cfg(feature = "ebpf")]
         let queue_ready = epoch
             .queue
@@ -499,30 +485,13 @@ impl ControlPlane {
             .is_some_and(|queue| queue.sequence_ready);
         #[cfg(not(feature = "ebpf"))]
         let queue_ready = false;
-        if resuming {
-            anyhow::ensure!(
-                !epoch.listeners.nfqueue_enabled || queue_ready,
-                "NFQUEUE token admission is not ready"
-            );
-            // Receive loops are already running; DNS must admit before ingress opens.
-            #[cfg(feature = "native-api")]
-            self.dns_controller.runtime_provider().resume()?;
-        } else {
-            self.initialize_datapath_flags(epoch.listeners.nfqueue_enabled, queue_ready)
-                .await?;
-        }
+        self.initialize_datapath_flags(epoch.listeners.nfqueue_enabled, queue_ready)
+            .await?;
         #[cfg(feature = "ebpf")]
         if let Some(queue) = epoch.queue.as_ref()
             && queue.sequence_ready
         {
             queue.pending.open_admission();
-        }
-        if resuming {
-            self.datapath_flags
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("datapath flags owner unavailable"))?
-                .reopen_nfqueue()
-                .await?;
         }
         self.ebpf.write().await.set_datapath_ready(true)?;
         self.drain_tracker.stop_rejecting();
@@ -692,197 +661,6 @@ impl ControlPlane {
         error.map_or(Ok(()), Err)
     }
 
-    #[cfg(feature = "native-api")]
-    async fn reject_paused_command(
-        &self,
-        command: ControlCommand,
-        authorizations: &crate::subscription::SubscriptionAuthorizations,
-    ) {
-        match command {
-            ControlCommand::Suspend { reply } | ControlCommand::Resume { reply } => {
-                let _ = reply.send(Err(super::client::ControlError::StateConflict));
-            }
-            #[cfg(feature = "clash-api")]
-            ControlCommand::SetRuntimeMode { reply, .. } => {
-                let _ = reply.send(Err(super::client::ControlError::StateConflict));
-            }
-            ControlCommand::SetSelector { reply, .. } => {
-                let _ = reply.send(Err(super::client::ControlError::StateConflict));
-            }
-            ControlCommand::ReloadConfig { result, .. } => {
-                let _ = result.send(ReloadReply {
-                    outcome: ReloadOutcome::Rejected,
-                    authorized: Vec::new(),
-                });
-            }
-            ControlCommand::MergeSubscription {
-                subscription_id,
-                result,
-                ..
-            } => {
-                let config = self.config.read().await;
-                let _ = result.send(crate::subscription::SubscriptionMergeReply {
-                    outcome: ReloadOutcome::Rejected,
-                    node_count: config
-                        .nodes
-                        .iter()
-                        .filter(|node| node.subscription_id == Some(subscription_id))
-                        .count(),
-                    authorized: authorizations.committed(&config.subscriptions),
-                });
-            }
-            ControlCommand::NetworkChanged => {} // Resume always reads complete current topology.
-            ControlCommand::Shutdown => {
-                self.shutdown_requested.store(true, Ordering::Release);
-            }
-        }
-    }
-
-    #[cfg(feature = "native-api")]
-    async fn pause_network_owners(
-        &self,
-        commands: &mut mpsc::Receiver<ControlCommand>,
-        authorizations: &crate::subscription::SubscriptionAuthorizations,
-    ) -> anyhow::Result<()> {
-        #[cfg(feature = "ebpf")]
-        if let Some(watcher) = &self.iface_watcher {
-            cleanup_stage(watcher.pause()).await?;
-        }
-        if let Some(subscriptions) = &self.subscriptions {
-            cleanup_stage(subscriptions.begin_pause()).await?;
-            let finished = cleanup_stage(subscriptions.finish_pause());
-            tokio::pin!(finished);
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut finished => { result?; break; },
-                    command = commands.recv() => match command {
-                        Some(command) => self.reject_paused_command(command, authorizations).await,
-                        None => { self.shutdown_requested.store(true, Ordering::Release); }
-                    },
-                }
-            }
-        }
-        if self.health_task.is_some() {
-            cleanup_stage(async {
-                self.alive_set
-                    .pause_health_checks()
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await?;
-        }
-        if let Some(native) = &self.native
-            && !native.probes.paused()
-        {
-            cleanup_stage(async { native.probes.pause().await.map_err(anyhow::Error::from) })
-                .await?;
-        }
-        #[cfg(feature = "clash-api")]
-        {
-            let mut slot = self.ui_download.lock().await;
-            if let Some(download) = slot.as_mut() {
-                cleanup_stage(download.stop_and_join()).await?;
-            }
-            slot.take();
-        }
-        self.dns_controller.runtime_provider().begin_pause();
-        Ok(())
-    }
-
-    #[cfg(feature = "native-api")]
-    async fn suspend_epoch(
-        &mut self,
-        epoch: &mut Option<RuntimeEpoch>,
-        commands: &mut mpsc::Receiver<ControlCommand>,
-        authorizations: &crate::subscription::SubscriptionAuthorizations,
-    ) -> anyhow::Result<()> {
-        self.publish_phase(EnginePhase::Suspending);
-        self.fence_runtime().await?;
-        let mut error = None;
-        retain_error(
-            &mut error,
-            self.pause_network_owners(commands, authorizations).await,
-        );
-        retain_error(&mut error, self.stop_network_epoch(epoch.as_mut()).await);
-        self.dns_controller.runtime_provider().begin_pause();
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                self.dns_controller
-                    .runtime_provider()
-                    .finish_pause()
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await,
-        );
-        anyhow::ensure!(
-            self.drain_tracker.active_count() == 0,
-            "accepted runtime tasks did not drain"
-        );
-        if let Some(error) = error {
-            return Err(error);
-        }
-        epoch.take();
-        anyhow::ensure!(
-            !self.shutdown_requested.load(Ordering::Acquire),
-            "shutdown superseded suspension"
-        );
-        self.publish_phase(EnginePhase::Suspended);
-        Ok(())
-    }
-
-    #[cfg(feature = "native-api")]
-    async fn resume_epoch(&mut self, epoch: &mut Option<RuntimeEpoch>) -> anyhow::Result<()> {
-        self.publish_phase(EnginePhase::Resuming);
-        let listeners = self.bind_runtime_listeners().await?;
-        #[cfg(feature = "ebpf")]
-        if let Some(watcher) = &self.iface_watcher {
-            watcher.reconcile_paused().await?;
-        }
-        self.udp_pool = Arc::new(UdpEndpointPool::with_capacity_limit(
-            self.resource_budget.udp_endpoints,
-        ));
-        self.install_node_death_callback();
-        let outcome = self.rebuild_suspended_runtime().await?;
-        anyhow::ensure!(outcome.accepted(), "retained runtime rebuild was rejected");
-        anyhow::ensure!(
-            !matches!(outcome, ReloadOutcome::CommittedDegraded { .. }),
-            "retained runtime publication is degraded"
-        );
-        *epoch = Some(self.prepare_epoch(listeners, true).await?);
-        anyhow::ensure!(
-            !self.shutdown_requested.load(Ordering::Acquire),
-            "shutdown superseded resume"
-        );
-        self.open_epoch(epoch.as_mut().expect("prepared epoch"), true)
-            .await?;
-        if self.health_task.is_some() {
-            self.alive_set.resume_health_checks()?;
-        }
-        if let Some(native) = &self.native {
-            native.probes.resume().await?;
-        }
-        if let Some(subscriptions) = &self.subscriptions {
-            subscriptions.resume().await?;
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(watcher) = &self.iface_watcher {
-            watcher.resume().await?;
-        }
-        self.start_epoch_maintenance(epoch.as_mut().expect("resumed epoch"))
-            .await;
-        self.alive_set.notify_network_change();
-        anyhow::ensure!(
-            !self.shutdown_requested.load(Ordering::Acquire),
-            "shutdown superseded resume"
-        );
-        self.datapath_healthy.store(true, Ordering::Release);
-        self.publish_phase(EnginePhase::Running);
-        Ok(())
-    }
-
     fn shutdown_pending(&self) -> bool {
         #[cfg(feature = "native-api")]
         {
@@ -905,9 +683,9 @@ impl ControlPlane {
         let mut epoch = None;
         let startup = async {
             let listeners = self.bind_runtime_listeners().await?;
-            epoch = Some(self.prepare_epoch(listeners, false).await?);
+            epoch = Some(self.prepare_epoch(listeners).await?);
             self.configure_health_loop().await;
-            self.open_epoch(epoch.as_mut().expect("startup epoch"), false)
+            self.open_epoch(epoch.as_mut().expect("startup epoch"))
                 .await?;
             Ok::<(), anyhow::Error>(())
         }
@@ -935,72 +713,12 @@ impl ControlPlane {
                     let Some(command) = command else {
                         break;
                     };
-                    #[cfg(feature = "native-api")]
-                    match command {
-                        ControlCommand::Suspend { reply } => {
-                            if epoch.is_none() || !self.is_datapath_healthy() {
-                                let _ = reply.send(Err(super::client::ControlError::StateConflict));
-                                continue;
-                            }
-                            match self
-                                .suspend_epoch(&mut epoch, &mut commands, &authorizations)
-                                .await
-                            {
-                                Ok(()) => {
-                                    let _ = reply.send(Ok(()));
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        reply.send(Err(super::client::ControlError::Unavailable));
-                                    fatal = Some(error);
-                                }
-                            }
-                            continue;
-                        }
-                        ControlCommand::Resume { reply } => {
-                            if epoch.is_some() {
-                                let _ = reply.send(Err(super::client::ControlError::StateConflict));
-                                continue;
-                            }
-                            if let Err(error) = self.resume_epoch(&mut epoch).await {
-                                let fatal_cleanup = error.is::<EpochCleanupFailure>();
-                                if fatal_cleanup {
-                                    fatal = Some(error);
-                                } else if let Err(cleanup) = self
-                                    .suspend_epoch(&mut epoch, &mut commands, &authorizations)
-                                    .await
-                                {
-                                    fatal = Some(cleanup.context(error));
-                                }
-                                let _ = reply.send(Err(super::client::ControlError::Unavailable));
-                            } else {
-                                let _ = reply.send(Ok(()));
-                            }
-                            continue;
-                        }
-                        command if epoch.is_none() => {
-                            self.reject_paused_command(command, &authorizations).await;
-                            continue;
-                        }
-                        command => {
-                            let drain = self.drain_tracker.clone();
-                            if !self
-                                .dispatch_control_command(command, &drain, &mut authorizations)
-                                .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "native-api"))]
+                    let drain = self.drain_tracker.clone();
+                    if !self
+                        .dispatch_control_command(command, &drain, &mut authorizations)
+                        .await
                     {
-                        let drain = self.drain_tracker.clone();
-                        if !self
-                            .dispatch_control_command(command, &drain, &mut authorizations)
-                            .await
-                        {
-                            break;
-                        }
+                        break;
                     }
                 }
                 EpochEvent::Fatal(error) => fatal = Some(error),

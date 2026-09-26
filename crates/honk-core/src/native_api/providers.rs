@@ -565,7 +565,7 @@ pub(crate) fn paused() -> ApiError {
     ApiError::new(
         StatusCode::CONFLICT,
         ErrorCode::StateConflict,
-        "Provider refresh is unavailable while the runtime is suspended or transitioning.",
+        "Provider refresh is unavailable while the runtime is stopping.",
         None,
     )
 }

@@ -579,24 +579,7 @@ impl ConfigService {
         if phase == Some(EnginePhase::Running) {
             return Ok(());
         }
-        if matches!(work, Work::Manage { .. }) {
-            return Err(unavailable());
-        }
-        Err(
-            if matches!(
-                phase,
-                None | Some(EnginePhase::Starting | EnginePhase::Failed | EnginePhase::Draining)
-            ) {
-                unavailable()
-            } else {
-                ApiError::new(
-                    StatusCode::CONFLICT,
-                    ErrorCode::StateConflict,
-                    "Engine lifecycle prevents this transition",
-                    None,
-                )
-            },
-        )
+        Err(unavailable())
     }
 
     fn enqueue(&self, work: Work) -> Result<(), ApiError> {

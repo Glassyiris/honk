@@ -243,7 +243,6 @@ struct SupervisorState {
     pending: VecDeque<uuid::Uuid>,
     stop: watch::Sender<bool>,
     paused: bool,
-    pause_done: Option<oneshot::Sender<anyhow::Result<()>>>,
     pause_failure: Option<String>,
 }
 
@@ -262,7 +261,6 @@ impl SupervisorState {
             pending: VecDeque::new(),
             stop: watch::channel(false).0,
             paused: false,
-            pause_done: None,
             pause_failure: None,
         }
     }
@@ -551,32 +549,6 @@ impl SupervisorState {
         self.pause_result()
     }
 
-    #[cfg(any(feature = "native-api", test))]
-    async fn resume(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.paused
-                && self.owned_task_count() == 0
-                && self.flights.is_empty()
-                && self.pause_done.is_none(),
-            "subscription pause has not completed"
-        );
-        self.pause_result()?;
-        if let Err(error) = self.manager.resume_network().await {
-            self.pause_failure.get_or_insert_with(|| error.to_string());
-            return Err(error);
-        }
-        self.stop = watch::channel(false).0;
-        self.paused = false;
-        let now = Instant::now();
-        for provider in self.providers.values_mut() {
-            provider.reset_deadline(now);
-        }
-        for id in self.providers.keys().copied().collect::<Vec<_>>() {
-            self.schedule(id);
-        }
-        Ok(())
-    }
-
     fn pause_result(&self) -> anyhow::Result<()> {
         match &self.pause_failure {
             Some(error) => Err(anyhow::anyhow!(error.clone())),
@@ -615,9 +587,6 @@ impl SupervisorState {
         #[cfg(not(feature = "native-api"))]
         self.flights.clear();
         self.fetch_ids.clear();
-        if let Some(done) = self.pause_done.take() {
-            let _ = done.send(self.pause_result());
-        }
         result
     }
 
@@ -634,13 +603,6 @@ impl SupervisorState {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             self.start_pending(MAX_ACTIVE_FETCHES);
-            if self.paused
-                && self.owned_task_count() == 0
-                && self.flights.is_empty()
-                && let Some(done) = self.pause_done.take()
-            {
-                let _ = done.send(self.pause_result());
-            }
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(SupervisorCommand::Reconcile { authorized, done }) => {
@@ -673,21 +635,6 @@ impl SupervisorState {
                     }
                     #[cfg(feature = "native-api")]
                     Some(SupervisorCommand::Refresh { subscription, operation }) => self.refresh(subscription, operation),
-                    #[cfg(feature = "native-api")]
-                    Some(SupervisorCommand::BeginPause { done }) => {
-                        let result = self.pause_fetches("supervisor_paused").await;
-                        let _ = done.send(result);
-                    }
-                    #[cfg(feature = "native-api")]
-                    Some(SupervisorCommand::FinishPause { done }) => {
-                        if !self.paused || self.pause_done.is_some() {
-                            let _ = done.send(Err(anyhow::anyhow!("subscription pause is not awaiting completion")));
-                        } else {
-                            self.pause_done = Some(done);
-                        }
-                    }
-                    #[cfg(feature = "native-api")]
-                    Some(SupervisorCommand::Resume { done }) => { let _ = done.send(self.resume().await); }
                     Some(SupervisorCommand::Shutdown { done }) => {
                         commands.close();
                         let result = self.shutdown().await.map(|()| self.owned_task_count());
@@ -760,18 +707,6 @@ enum SupervisorCommand {
     Refresh {
         subscription: Subscription,
         operation: crate::native_api::providers::RefreshOperation,
-    },
-    #[cfg(feature = "native-api")]
-    BeginPause {
-        done: oneshot::Sender<anyhow::Result<()>>,
-    },
-    #[cfg(feature = "native-api")]
-    FinishPause {
-        done: oneshot::Sender<anyhow::Result<()>>,
-    },
-    #[cfg(feature = "native-api")]
-    Resume {
-        done: oneshot::Sender<anyhow::Result<()>>,
     },
     Shutdown {
         done: oneshot::Sender<anyhow::Result<usize>>,
@@ -868,44 +803,6 @@ impl SubscriptionSupervisorHandle {
             .map_err(|_| anyhow::anyhow!("subscription supervisor stopped before snapshot"))?;
         wait.await
             .map_err(|_| anyhow::anyhow!("subscription supervisor stopped during snapshot"))
-    }
-
-    #[cfg(feature = "native-api")]
-    /// Closes fetch admission and joins network/cache-write work, not publication acknowledgements.
-    pub(crate) async fn begin_pause(&self) -> anyhow::Result<()> {
-        let (done, wait) = oneshot::channel();
-        self.command_tx
-            .send(SupervisorCommand::BeginPause { done })
-            .await
-            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped before pause"))?;
-        wait.await
-            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped during pause"))?
-    }
-
-    #[cfg(feature = "native-api")]
-    /// The control owner must keep receiving and replying to merges until this resolves.
-    pub(crate) async fn finish_pause(&self) -> anyhow::Result<()> {
-        let (done, wait) = oneshot::channel();
-        self.command_tx
-            .send(SupervisorCommand::FinishPause { done })
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("subscription supervisor stopped before pause completion")
-            })?;
-        wait.await.map_err(|_| {
-            anyhow::anyhow!("subscription supervisor stopped during pause completion")
-        })?
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) async fn resume(&self) -> anyhow::Result<()> {
-        let (done, wait) = oneshot::channel();
-        self.command_tx
-            .send(SupervisorCommand::Resume { done })
-            .await
-            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped before resume"))?;
-        wait.await
-            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped during resume"))?
     }
 }
 

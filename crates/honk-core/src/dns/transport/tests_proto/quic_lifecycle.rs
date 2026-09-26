@@ -148,9 +148,5 @@ async fn quic_adapter_panic_is_a_sticky_dns_pause_failure() {
                 Err(crate::dns::runtime::DnsPauseError::TaskFailed)
             ));
         }
-        assert!(matches!(
-            provider.resume(),
-            Err(crate::dns::runtime::DnsPauseError::TaskFailed)
-        ));
     }
 }

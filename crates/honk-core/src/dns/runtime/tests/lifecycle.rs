@@ -50,7 +50,7 @@ fn answer(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn pause_closes_wire_query_but_waits_for_its_lease_then_resumes_fresh_runtime() {
+async fn pause_closes_wire_query_but_waits_for_its_lease() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (entered, wire_entered) = tokio::sync::oneshot::channel();
@@ -151,63 +151,11 @@ async fn pause_closes_wire_query_but_waits_for_its_lease_then_resumes_fresh_runt
     query.await.unwrap();
     provider.finish_pause().await.unwrap();
     assert_eq!(old.lease_count(), 0);
-    assert!(
-        provider.resume().is_err(),
-        "a retired current runtime cannot reopen"
-    );
     assert!(Arc::ptr_eq(&cache, &service.cache()));
     assert_eq!(
         service.cache().lock().await.get("saved").unwrap().response,
         saved
     );
-
-    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let (fresh, pool) = wire_runtime(
-        2,
-        udp.local_addr().unwrap(),
-        DnsProtocol::Udp,
-        Arc::clone(&cache),
-    );
-    provider.publish(Arc::clone(&fresh));
-    assert!(provider.try_acquire().is_err());
-    assert!(
-        service
-            .resolve(&build_dns_query("new.example", 1), IngressProfile::Api)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        udp.try_recv_from(&mut [0; 512]).unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-    let response = tokio::spawn(async move {
-        let mut packet = [0; 512];
-        let (size, peer) = udp.recv_from(&mut packet).await.unwrap();
-        udp.send_to(&answer(&packet[..size], [192, 0, 2, 2]), peer)
-            .await
-            .unwrap();
-    });
-    provider.resume().unwrap();
-    let resolved = service
-        .resolve(&build_dns_query("new.example", 1), IngressProfile::Api)
-        .await
-        .unwrap();
-    response.await.unwrap();
-    assert!(resolved.ends_with(&[192, 0, 2, 2]));
-    assert_eq!(
-        pool.lifecycle_stats().tasks,
-        1,
-        "new UDP receive driver is real"
-    );
-    provider.begin_pause();
-    provider.finish_pause().await.unwrap();
-    assert_eq!(
-        pool.lifecycle_stats().tasks,
-        0,
-        "pause joins transport background driver"
-    );
-    assert_eq!(fresh.lease_count(), 0);
-    assert!(Arc::ptr_eq(&cache, &service.cache()));
     service.flush_cache().await.unwrap();
     assert!(cache.lock().await.is_empty());
 }
@@ -269,13 +217,11 @@ async fn pause_retains_evicted_lease_cleanup_and_deadline_failure_after_wait_can
     assert_eq!(oldest.lease_count(), 0);
     assert_eq!(transport.query_drop_order.load(Ordering::Acquire), 1);
     assert_eq!(transport.close_order.load(Ordering::Acquire), 2);
-    provider.publish(runtime(7, 0).0);
-    assert!(matches!(provider.resume(), Err(DnsPauseError::Deadline)));
     provider.shutdown().await;
 }
 
 #[tokio::test]
-async fn cleanup_task_failure_does_not_acknowledge_pause_or_reopen() {
+async fn cleanup_task_failure_does_not_acknowledge_pause() {
     struct FailedTransport;
     #[async_trait]
     impl RuntimeTransport for FailedTransport {
@@ -295,7 +241,6 @@ async fn cleanup_task_failure_does_not_acknowledge_pause_or_reopen() {
         provider.finish_pause().await,
         Err(DnsPauseError::TaskFailed)
     ));
-    assert!(matches!(provider.resume(), Err(DnsPauseError::TaskFailed)));
     assert!(provider.try_acquire().is_err());
 }
 

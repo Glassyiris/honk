@@ -57,9 +57,6 @@ pub(crate) enum ControlError {
     NotFound,
     #[error("selection is unsupported")]
     Unsupported,
-    #[cfg(feature = "native-api")]
-    #[error("engine lifecycle prevents this transition")]
-    StateConflict,
     #[error("control owner is unavailable")]
     Unavailable,
     #[error("transport interruption could not be confirmed")]
@@ -133,11 +130,6 @@ impl super::ControlPlane {
         if self.native.is_some() {
             match self.phase.as_ref().map(|phase| *phase.borrow()) {
                 Some(super::EnginePhase::Running) if self.is_datapath_healthy() => {}
-                Some(
-                    super::EnginePhase::Suspending
-                    | super::EnginePhase::Suspended
-                    | super::EnginePhase::Resuming,
-                ) => return Err(ControlError::StateConflict),
                 _ => return Err(ControlError::Unavailable),
             }
         }

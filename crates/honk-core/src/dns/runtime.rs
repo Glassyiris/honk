@@ -23,7 +23,7 @@ pub(crate) enum DnsPauseError {
     Deadline,
     #[error("DNS runtime cleanup task failed")]
     TaskFailed,
-    #[error("DNS runtime is not ready to resume")]
+    #[error("DNS runtime is not paused")]
     NotReady,
 }
 mod provider;

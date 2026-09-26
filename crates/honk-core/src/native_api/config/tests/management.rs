@@ -484,7 +484,7 @@ async fn management_write_and_phase_failures_do_not_mutate_sources() {
     assert_eq!(failure["error"]["details"]["written"], false);
     std::fs::remove_file(fixture.path("main.dae")).unwrap();
     std::fs::rename(saved, fixture.path("main.dae")).unwrap();
-    let (_phase, receiver) = tokio::sync::watch::channel(crate::control::EnginePhase::Suspended);
+    let (_phase, receiver) = tokio::sync::watch::channel(crate::control::EnginePhase::Draining);
     fixture.service.attach_phase(receiver);
     let failure = error(
         fixture

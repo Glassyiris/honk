@@ -462,9 +462,6 @@ pub(super) async fn select(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     ErrorCode::UnsupportedValue,
                 ),
-                crate::control::client::ControlError::StateConflict => {
-                    (StatusCode::CONFLICT, ErrorCode::StateConflict)
-                }
                 _ => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorCode::TemporarilyUnavailable,
