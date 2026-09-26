@@ -254,18 +254,16 @@ async fn pause_drains_started_and_disconnected_queued_jobs() {
     )
     .await;
     assert_eq!(replay["operation_id"], accepted[0]["operation_id"]);
-    assert_eq!(
-        create(
-            &state,
-            http_request(&input, "fresh-paused"),
-            &RequestId("fresh".into())
-        )
-        .await
-        .unwrap_err()
-        .into_response()
-        .status(),
-        StatusCode::CONFLICT
-    );
+    let stopped = create(
+        &state,
+        http_request(&input, "fresh-stopped"),
+        &RequestId("fresh".into()),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(stopped.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(stopped.headers().contains_key("retry-after"));
     assert!(
         tokio::time::timeout(Duration::from_millis(30), listener.accept())
             .await
@@ -277,7 +275,7 @@ async fn pause_drains_started_and_disconnected_queued_jobs() {
             .native_observations(honk_config::config::DIRECT_NODE_ID)
             .is_empty()
     );
-    assert_eq!(service.pause().await, Err(ProbeLifecycleError::Conflict));
+    assert_eq!(service.pause().await, Err(ProbeLifecycleError::Unavailable));
     stop.send(true).unwrap();
     worker.await.unwrap();
     assert_eq!(service.pause().await, Err(ProbeLifecycleError::Unavailable));
@@ -354,11 +352,11 @@ async fn pause_cancels_body_and_reserved_capture_without_late_enqueue() {
         .unwrap();
     assert_eq!(
         capture.await.unwrap().unwrap_err().into_response().status(),
-        StatusCode::CONFLICT
+        StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(
         body.await.unwrap().unwrap_err().into_response().status(),
-        StatusCode::CONFLICT
+        StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(
         waiter
@@ -367,7 +365,7 @@ async fn pause_cancels_body_and_reserved_capture_without_late_enqueue() {
             .unwrap_err()
             .into_response()
             .status(),
-        StatusCode::CONFLICT
+        StatusCode::SERVICE_UNAVAILABLE
     );
     drop(router);
     assert!(
