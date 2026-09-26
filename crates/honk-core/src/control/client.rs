@@ -39,6 +39,11 @@ pub(crate) enum SelectionRequest {
         member_id: String,
         networks: SelectorNetworks,
     },
+    #[cfg(feature = "native-api")]
+    ClearOverride {
+        group_id: String,
+        networks: SelectorNetworks,
+    },
 }
 
 #[cfg(any(feature = "native-api", feature = "clash-api"))]
@@ -48,6 +53,13 @@ pub(crate) struct SelectionResult {
     pub(crate) revision: u64,
     #[cfg(feature = "native-api")]
     pub(crate) interrupted: bool,
+    /// The group is automatic, so the choice is a runtime pin.
+    #[cfg(feature = "native-api")]
+    pub(crate) overridden: bool,
+    /// A cleared group's selections, read under the same reload lock as the
+    /// clear so they match `revision`.
+    #[cfg(feature = "native-api")]
+    pub(crate) selection: Option<serde_json::Value>,
 }
 
 #[cfg(any(feature = "native-api", feature = "clash-api"))]
@@ -57,6 +69,8 @@ pub(crate) enum ControlError {
     NotFound,
     #[error("selection is unsupported")]
     Unsupported,
+    #[error("a selector has no override to clear")]
+    Conflict,
     #[error("control owner is unavailable")]
     Unavailable,
     #[error("transport interruption could not be confirmed")]
@@ -141,7 +155,7 @@ impl super::ControlPlane {
                 let selected = manager
                     .selector_member_by_name(&group, &member)
                     .map_err(selection_error)?;
-                (group, selected, SelectorNetworks::Both)
+                (group, Some(selected), SelectorNetworks::Both)
             }
             #[cfg(feature = "native-api")]
             SelectionRequest::Native {
@@ -149,14 +163,8 @@ impl super::ControlPlane {
                 member_id,
                 networks,
             } => {
-                let native = self.native.as_ref().ok_or(ControlError::Unavailable)?;
-                let catalog = native.catalog.snapshot();
-                let name = catalog
-                    .groups
-                    .iter()
-                    .find(|(_, id)| **id == group_id)
-                    .map(|(name, _)| name.clone())
-                    .ok_or(ControlError::NotFound)?;
+                let catalog = self.native_catalog()?;
+                let name = native_group_name(&catalog, &group_id)?;
                 let selected = manager
                     .native_members(&name)
                     .find_map(|member| match member {
@@ -173,7 +181,13 @@ impl super::ControlPlane {
                         _ => None,
                     })
                     .ok_or(ControlError::Unsupported)?;
-                (name, selected, networks)
+                (name, Some(selected), networks)
+            }
+            #[cfg(feature = "native-api")]
+            SelectionRequest::ClearOverride { group_id, networks } => {
+                let catalog = self.native_catalog()?;
+                let name = native_group_name(&catalog, &group_id)?;
+                (name, None, networks)
             }
         };
         let group = config
@@ -221,11 +235,24 @@ impl super::ControlPlane {
                 }
             }
         }
-        let update = manager
-            .publish_selector_choice(&name, &member, networks)
-            .map_err(selection_error)?;
+        let overridden = group.policy != honk_config::group::GroupPolicy::Selector;
+        let update = match &member {
+            Some(member) if overridden => manager.publish_override(&name, member, networks),
+            Some(member) => manager.publish_selector_choice(&name, member, networks),
+            None => manager.clear_override(&name, networks),
+        }
+        .map_err(selection_error)?;
         #[cfg(feature = "native-api")]
         let revision = update.revision;
+        #[cfg(feature = "native-api")]
+        let selection = match (&member, &self.native) {
+            (None, Some(native)) => Some(crate::native_api::catalog::runtime_selection(
+                &manager,
+                &native.catalog.snapshot(),
+                &name,
+            )),
+            _ => None,
+        };
         let changed = update.changed_networks.clone();
         drop(config);
         update.run_callbacks_without_interrupt();
@@ -259,8 +286,37 @@ impl super::ControlPlane {
             revision,
             #[cfg(feature = "native-api")]
             interrupted,
+            #[cfg(feature = "native-api")]
+            overridden,
+            #[cfg(feature = "native-api")]
+            selection,
         })
     }
+
+    #[cfg(feature = "native-api")]
+    fn native_catalog(
+        &self,
+    ) -> Result<Arc<crate::native_api::catalog::CatalogIdentity>, ControlError> {
+        Ok(self
+            .native
+            .as_ref()
+            .ok_or(ControlError::Unavailable)?
+            .catalog
+            .snapshot())
+    }
+}
+
+#[cfg(feature = "native-api")]
+fn native_group_name(
+    catalog: &crate::native_api::catalog::CatalogIdentity,
+    group_id: &str,
+) -> Result<String, ControlError> {
+    catalog
+        .groups
+        .iter()
+        .find(|(_, id)| **id == group_id)
+        .map(|(name, _)| name.clone())
+        .ok_or(ControlError::NotFound)
 }
 
 #[cfg(any(feature = "native-api", feature = "clash-api"))]
@@ -268,6 +324,7 @@ fn selection_error(error: honk_outbound::group::SelectorError) -> ControlError {
     match error {
         honk_outbound::group::SelectorError::GroupNotFound => ControlError::NotFound,
         honk_outbound::group::SelectorError::RevisionExhausted => ControlError::Unavailable,
+        honk_outbound::group::SelectorError::IsSelector => ControlError::Conflict,
         _ => ControlError::Unsupported,
     }
 }

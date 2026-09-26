@@ -441,23 +441,28 @@ fn build_group_proxy_info(
     let node_names = group_manager.node_names_in_group(&group.name);
     let verification = (group.policy == GroupPolicy::Score)
         .then(|| score::verification(group_manager, &group.name));
-    let now = match group.policy {
-        GroupPolicy::Selector => group_manager
-            .get_selector_choice(&group.name, SelectionNetwork::Tcp)
-            .or_else(|| group.default.clone())
+    // An explicit Selector choice or an automatic group's pin wins.
+    let now = match (
+        group.policy,
+        group_manager.get_selector_choice(&group.name, SelectionNetwork::Tcp),
+    ) {
+        (_, Some(choice)) => choice,
+        (GroupPolicy::Selector, None) => group
+            .default
+            .clone()
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
-        GroupPolicy::URLTest => group_manager
+        (GroupPolicy::URLTest, None) => group_manager
             .get_urltest_selection(&group.name)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
         // Round-robin has no stable selection to display; show the first.
-        GroupPolicy::LoadBalance => node_names.first().cloned().unwrap_or_default(),
-        GroupPolicy::Fallback => group_manager
+        (GroupPolicy::LoadBalance, None) => node_names.first().cloned().unwrap_or_default(),
+        (GroupPolicy::Fallback, None) => group_manager
             .get_fallback_selection(&group.name)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
-        GroupPolicy::Score => verification
+        (GroupPolicy::Score, None) => verification
             .as_ref()
             .and_then(|(selected, _)| selected.clone())
             .or_else(|| {

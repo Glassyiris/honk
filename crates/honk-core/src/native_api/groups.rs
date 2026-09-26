@@ -439,22 +439,61 @@ pub(super) async fn select(
     if body.member_id.is_empty() || body.member_id.len() > 256 {
         return Err(invalid());
     }
-    let networks = match body.network {
-        SelectionNetwork::Tcp => honk_outbound::group::SelectorNetworks::Tcp,
-        SelectionNetwork::Udp => honk_outbound::group::SelectorNetworks::Udp,
-        SelectionNetwork::Both => honk_outbound::group::SelectorNetworks::Both,
+    let networks = body.network.into();
+    let selected = apply_selection(
+        state,
+        crate::control::client::SelectionRequest::Native {
+            group_id: group_id.to_owned(),
+            member_id: body.member_id.clone(),
+            networks,
+        },
+        id,
+    )
+    .await?;
+    let source = if selected.overridden {
+        "override"
+    } else {
+        "runtime"
     };
+    Ok(axum::Json(json!({"group_id":group_id,"member_id":body.member_id,"network":body.network,"source":source,"selection_revision":format!("{}:selection:{}",state.instance_id,selected.revision),"connections_interrupted":selected.interrupted})).into_response())
+}
+
+/// Unpin an automatic group; a Selector has no override to clear.
+pub(super) async fn clear_override(
+    state: &NativeState,
+    group_id: &str,
+    uri: &axum::http::Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let query = parse_query(uri, &["network"], id)?;
+    let network = match query.get("network").map(String::as_str) {
+        None | Some("both") => SelectionNetwork::Both,
+        Some("tcp") => SelectionNetwork::Tcp,
+        Some("udp") => SelectionNetwork::Udp,
+        Some(_) => return Err(super::invalid_query(id)),
+    };
+    state.require_running()?;
+    let cleared = apply_selection(
+        state,
+        crate::control::client::SelectionRequest::ClearOverride {
+            group_id: group_id.to_owned(),
+            networks: network.into(),
+        },
+        id,
+    )
+    .await?;
+    Ok(axum::Json(json!({"group_id":group_id,"network":network,"selection_revision":format!("{}:selection:{}",state.instance_id,cleared.revision),"connections_interrupted":cleared.interrupted,"selection":cleared.selection})).into_response())
+}
+
+async fn apply_selection(
+    state: &NativeState,
+    request: crate::control::client::SelectionRequest,
+    id: &RequestId,
+) -> Result<crate::control::client::SelectionResult, ApiError> {
     let (reply, response) = tokio::sync::oneshot::channel();
     state
         .control_tx
-        .try_send(crate::control::ControlCommand::SetSelector {
-            request: crate::control::client::SelectionRequest::Native {
-                group_id: group_id.to_owned(),
-                member_id: body.member_id.clone(),
-                networks,
-            },
-            reply,
-        })
+        .try_send(crate::control::ControlCommand::SetSelector { request, reply })
         .map_err(|_| {
             super::error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -463,7 +502,7 @@ pub(super) async fn select(
                 id,
             )
         })?;
-    let selected = response
+    response
         .await
         .map_err(|_| {
             super::error(
@@ -482,6 +521,9 @@ pub(super) async fn select(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     ErrorCode::UnsupportedValue,
                 ),
+                crate::control::client::ControlError::Conflict => {
+                    (StatusCode::CONFLICT, ErrorCode::StateConflict)
+                }
                 _ => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorCode::TemporarilyUnavailable,
@@ -493,8 +535,17 @@ pub(super) async fn select(
                 "Selection transition could not be confirmed",
                 id,
             )
-        })?;
-    Ok(axum::Json(json!({"group_id":group_id,"member_id":body.member_id,"network":body.network,"source":"runtime","selection_revision":format!("{}:selection:{}",state.instance_id,selected.revision),"connections_interrupted":selected.interrupted})).into_response())
+        })
+}
+
+impl From<SelectionNetwork> for honk_outbound::group::SelectorNetworks {
+    fn from(network: SelectionNetwork) -> Self {
+        match network {
+            SelectionNetwork::Tcp => Self::Tcp,
+            SelectionNetwork::Udp => Self::Udp,
+            SelectionNetwork::Both => Self::Both,
+        }
+    }
 }
 
 #[cfg(test)]

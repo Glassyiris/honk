@@ -683,11 +683,6 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
             "capability_not_supported",
         ),
         (
-            Method::DELETE,
-            "/api/v1/groups/group/selection",
-            "capability_not_supported",
-        ),
-        (
             Method::GET,
             "/api/v1/no-such-resource",
             "resource_not_found",
