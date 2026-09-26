@@ -150,6 +150,7 @@ impl NativeState {
                 .map(Arc::new)
         });
         let observation = control.native_observation();
+        observation.telemetry.discover().await;
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
         Ok(Self {
@@ -762,5 +763,70 @@ mod tests {
         assert!(state.sample.read().as_ref().unwrap().rates.is_none());
         stop.send(true).unwrap();
         sampler.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flow_capability_reports_runtime_limits() {
+        let state = state().await;
+        let request = axum::http::Request::patch("/api/v1/runtime/settings")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"flows":{"max_flows":64,"retention_seconds":60}}"#,
+            ))
+            .unwrap();
+        settings::patch(&state, request, &RequestId("test".into()))
+            .await
+            .unwrap();
+        let flows = &types::capabilities(&state).await["resources"]["flows"];
+        assert_eq!(flows["max_flows"], 64);
+        assert_eq!(flows["retention_seconds"], 60);
+    }
+
+    #[tokio::test]
+    async fn flow_capability_scopes_include_dns_intercept_coverage() {
+        let state = state().await;
+        let flows = &types::capabilities(&state).await["resources"]["flows"];
+        assert_eq!(
+            flows["scopes"],
+            serde_json::json!(["userspace_tcp", "userspace_udp", "dns_intercept"])
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_capability_lists_metrics_before_the_first_sample() {
+        let state = state().await;
+        let metrics = &types::capabilities(&state).await["resources"]["runtime_memory"]["metrics"];
+        assert!(
+            metrics
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("process.rss_bytes"))
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_at_uses_the_shared_millisecond_format() {
+        let state = state().await;
+        let response = settings::get(
+            &state,
+            &"/api/v1/runtime/settings".parse().unwrap(),
+            &RequestId("test".into()),
+        )
+        .await
+        .unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for observed in [
+            &types::capabilities(&state).await["observed_at"],
+            &settings["observed_at"],
+        ] {
+            let observed = observed.as_str().unwrap();
+            let parsed = chrono::DateTime::parse_from_rfc3339(observed).unwrap();
+            assert_eq!(observed, timestamp(parsed.into()));
+        }
     }
 }

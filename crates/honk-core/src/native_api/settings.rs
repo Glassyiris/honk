@@ -134,7 +134,7 @@ impl Values {
     fn json(self) -> Value {
         let active = self.active();
         let recorder = |index: usize| json!({"allowed": self.allowed[index], "mode": self.modes[index], "active": active[index]});
-        json!({"observed_at":chrono::Utc::now().to_rfc3339(),"source":if self.overridden {"runtime"} else {"config"},
+        json!({"observed_at":super::timestamp(std::time::SystemTime::now()),"source":if self.overridden {"runtime"} else {"config"},
             "log":{"level":self.level,"buffered_records":self.logs},"dns_log":{"max_records":self.dns},
             "flows":{"max_flows":self.flows,"retention_seconds":self.retention},
             "recording":{"flows":recorder(0),"logs":recorder(1),"dns_log":recorder(2),"events":{"active":self.events_active()},"grace_remaining_seconds":0}})
@@ -228,6 +228,10 @@ impl Settings {
     }
     pub(crate) fn flow_recording(&self) -> bool {
         self.values.lock().active()[0]
+    }
+    pub(crate) fn flow_limits(&self) -> (usize, u64) {
+        let values = self.values.lock();
+        (values.flows, values.retention)
     }
     fn snapshot(&self) -> Value {
         let current = self.values.lock();

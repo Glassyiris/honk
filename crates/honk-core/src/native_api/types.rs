@@ -349,8 +349,9 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let geodata = super::geodata::capability(state).await;
     let routing_trace = state.observation.trace.capability();
     let rules = super::routing::rules_capability();
+    let (max_flows, flow_retention) = state.observation.settings.flow_limits();
     json!({
-        "observed_at": chrono::Utc::now().to_rfc3339(),
+        "observed_at": super::timestamp(std::time::SystemTime::now()),
         "profiles": ["base"],
         "limits": {
             "max_request_target_bytes": 4096,
@@ -380,7 +381,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
                 "can_close": true,
                 "max_bulk_close": 1000,
             },
-            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":1024, "max_steps_per_flow":64, "retention_seconds":300, "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "max_flows":max_flows, "max_steps_per_flow":64, "retention_seconds":flow_retention, "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": routing_trace,
             "rules": rules,
             "events": {"available":true,"kinds":kinds,"retention_seconds":60,"max_buffered_events":512,"max_clients":16,"heartbeat_seconds":15},
