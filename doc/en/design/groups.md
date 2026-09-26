@@ -44,7 +44,7 @@ UDP selection first excludes forwarding leaves whose canonical protocol/configur
 
 Selector validation/publication is one shared transition; callbacks run after synchronous guards are released. `interrupt_connections` captures the pre-transition transport owners by their actual selected group path and network, then closes them outside manager/entry locks. The response reports interruption only after confirmed completion. TCP closes its exact UUID owner; UDP retires its token/generation-bound view and waits for backend/driver/reply fences. Shared XUDP siblings and the carrier remain alive. This path is independent of optional native flow recording, not a deletion of tracking metadata.
 
-Native group observations are non-mutating, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload—not a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. Automatic-policy pin/clear stays unavailable; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups-m3).
+Native group observations are non-mutating, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload—not a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. An automatic-policy pin lives only in the running GroupManager, so an activation drops it; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups-m3).
 
 ### Score scoring and lifecycle
 

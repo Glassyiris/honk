@@ -76,7 +76,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。配置读取返回已接受正文，仅遮蔽声明的监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持入口目录相对名称，`absolute_path` 提供规范化绝对路径。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
 
-`config_content` 与 `writable_includes` 仍可配置，但不产生作用。启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略 override 仍关闭。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
+`config_content` 与 `writable_includes` 仍可配置，但不产生作用。启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略的固定成员只在运行时生效，不写回来源。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
 
 
 ## `clash_api`
