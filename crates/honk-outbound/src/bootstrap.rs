@@ -92,6 +92,25 @@ pub async fn resolve_with(
             Err(e) => tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e),
         }
     }
+    #[cfg(feature = "native-api")]
+    let mut observation = LookupObservation::start(host, "UNKNOWN", None);
+    let result = resolve_system(host);
+    #[cfg(feature = "native-api")]
+    let result = match &observation {
+        Some(observation) => observation.child().scope(result).await,
+        None => result.await,
+    };
+    #[cfg(not(feature = "native-api"))]
+    let result = result.await;
+    #[cfg(feature = "native-api")]
+    if let Some(observation) = &mut observation {
+        observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
+    }
+    result
+}
+
+/// `/etc/hosts`, then bypass-marked queries to the first numeric system nameserver.
+async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
         let addrs = hosts_addresses(&contents, host);
         if !addrs.is_empty() {
@@ -561,7 +580,8 @@ impl LookupObservation {
             error: None,
         };
         if upstream.is_none() {
-            // libc/NSS supplies an outcome, not its hosts/cache/upstream decision path.
+            // libc/NSS or the system hosts/nameserver fallback supplies an
+            // outcome, not its hosts/cache/upstream decision path.
             observer.publish(FlowEvent::Gap("not_instrumented"));
         }
         observer.publish(FlowEvent::Dns(data.clone()));
