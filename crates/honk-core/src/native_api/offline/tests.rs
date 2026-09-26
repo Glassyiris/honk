@@ -614,6 +614,76 @@ fn cached_subscriptions_remain_inside_source_budgets() {
 }
 
 #[test]
+fn subscription_notices_name_the_file_that_declares_the_subscription() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config.d")).unwrap();
+    fs::write(
+        temp.path().join("config.d/providers.dae"),
+        "subscription {\n included: 'https://example.invalid/included'\n}\n",
+    )
+    .unwrap();
+    let loaded = fixture(
+        temp.path(),
+        "include {\n 'config.d/*.dae'\n}\nsubscription {\n entry: 'https://example.invalid/entry'\n}\n",
+    );
+    let included = loaded
+        .config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.name == "included")
+        .unwrap();
+    cache_body(
+        Path::new(&loaded.config.global.data_dir),
+        included,
+        "socks5://127.0.0.1:1080#first\nsocks5://127.0.0.1:1080#duplicate\n",
+    );
+    let path_of = |notice: &DetailedDiagnostic| {
+        notice.source.sources().metadata()[notice.source.index()]
+            .path
+            .clone()
+    };
+    let mut notices = Vec::new();
+    validate_with_data_dir(
+        loaded.clone(),
+        &loaded.config,
+        Path::new(&loaded.config.global.data_dir),
+        SourceLimits::default(),
+        &mut notices,
+    )
+    .unwrap();
+    let duplicate = notices
+        .iter()
+        .find(|notice| notice.code == "duplicate-subscription-entry")
+        .unwrap();
+    assert_eq!(path_of(duplicate), Some(loaded.sources[1].path.clone()));
+    assert_eq!((duplicate.line, duplicate.byte_column), (None, None));
+    let unfetched = notices
+        .iter()
+        .find(|notice| notice.code == "subscription-not-fetched")
+        .unwrap();
+    assert_eq!(path_of(unfetched), Some(loaded.sources[0].path.clone()));
+}
+
+#[test]
+fn an_invalid_included_subscription_names_its_file() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config.d")).unwrap();
+    fs::write(
+        temp.path().join("config.d/providers.dae"),
+        "subscription {\n included: 'ftp://example.invalid/nodes'\n}\n",
+    )
+    .unwrap();
+    let loaded = fixture(temp.path(), "include {\n 'config.d/*.dae'\n}\n");
+    let error = admit(loaded.clone(), &loaded.config).err().unwrap();
+    assert_eq!(error.diagnostic.code, "invalid-config-value");
+    let source = &error.diagnostic.source;
+    assert_eq!(
+        source.sources().metadata()[source.index()].path,
+        Some(loaded.sources[1].path.clone())
+    );
+}
+
+#[test]
 fn cached_presence_and_rebased_active_semantics_are_both_required() {
     let temp = tempfile::tempdir().unwrap();
     let mut loaded = fixture(temp.path(), "");

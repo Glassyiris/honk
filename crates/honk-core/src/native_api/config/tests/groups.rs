@@ -269,6 +269,41 @@ async fn group_patch_check_url_rewrites_the_source_and_reregisters_the_probe() {
 }
 
 #[tokio::test]
+async fn score_group_reports_and_accepts_no_tolerance() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let source_text = "# Explicitly writable include.\ngroup {\n S {\n  policy: score\n }\n}\n";
+    std::fs::write(fixture.path("editable.dae"), source_text).unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let detail = fixture
+        .get(&format!("/api/v1/groups/{}", group["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(detail["policy"]["kind"], "score");
+    assert_eq!(detail["config"]["tolerance"], Value::Null);
+    let mutable = detail["capabilities"]["mutable_config"].as_array().unwrap();
+    assert!(mutable.contains(&json!("policy")));
+    assert!(!mutable.contains(&json!("tolerance")));
+    let original = disk(fixture.directory.path());
+    error(
+        patch(
+            &fixture,
+            group,
+            detail["config_revision"].as_str().unwrap(),
+            &json!([{"op":"replace","path":"/config/tolerance","value":100}]),
+        )
+        .send()
+        .await
+        .unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    assert_eq!(disk(fixture.directory.path()), original);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn automatic_group_pin_is_reported_and_cleared_per_network() {
     let fixture = Fixture::new_custom(Access::Metadata, false, |_, files| {
         files.insert(

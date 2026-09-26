@@ -174,6 +174,11 @@ pub(super) fn normalized_check_url(value: &str) -> Option<String> {
     ))
 }
 
+/// Only URLTest switches on latency; other policies have no tolerance to report.
+pub(super) fn tolerance(group: &Group) -> Option<u64> {
+    (group.policy == honk_config::group::GroupPolicy::URLTest).then_some(group.tolerance)
+}
+
 pub(crate) fn revision_for(config: &Config) -> String {
     config_revision(
         config,
@@ -213,7 +218,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
                 group.final_outbound,
                 check_url(group),
                 group.check_interval,
-                group.tolerance,
+                tolerance(group),
                 group.idle_timeout,
                 group.interrupt_connections
             ])
@@ -694,7 +699,7 @@ fn group_value(
     result["config"] = json!({
         "default_member_id": default_id, "final_outbound": group.final_outbound,
         "check_url": check_url(group), "check_interval": group.check_interval.filter(|value| *value > 0),
-        "tolerance": group.tolerance, "idle_timeout": group.idle_timeout,
+        "tolerance": tolerance(group), "idle_timeout": group.idle_timeout,
         "interrupt_connections": group.interrupt_connections
     });
     result["runtime"] = json!({ "selection": { "tcp": tcp, "udp": udp }, "health": group_health(manager, group, identity, alive) });
@@ -766,7 +771,11 @@ pub(super) async fn group(
     let mut value = group_value(&manager, group, &identity, &state.alive_set, true);
     value["config_revision"] = json!(revision);
     if state.observation.configuration.group_writable(name) {
-        value["capabilities"]["mutable_config"] = json!(super::groups::MUTABLE_CONFIG);
+        let mutable: Vec<_> = super::groups::MUTABLE_CONFIG
+            .into_iter()
+            .filter(|field| *field != "tolerance" || tolerance(group).is_some())
+            .collect();
+        value["capabilities"]["mutable_config"] = json!(mutable);
     }
     let value = super::config::administrative_projection(state, value)?;
     Ok(([(header::ETAG, format!("\"{revision}\""))], Json(value)).into_response())

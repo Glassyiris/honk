@@ -348,6 +348,7 @@ fn parse_subscription_block<'d, 'a>(
 ) -> Subscription {
     let mut subscription = Subscription {
         name: canonical_tag(tag),
+        source: Some(segment.span().source),
         ..Default::default()
     };
     let mut fields = SubscriptionFields::default();
@@ -422,6 +423,7 @@ fn parse_subscription_entry(
             name,
             url,
             user_agent,
+            source: Some(text.span.source),
             ..Default::default()
         },
         text.source.span(text.span.start, end),

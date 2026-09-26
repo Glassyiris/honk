@@ -60,7 +60,11 @@ fn identities_survive_reordering_but_not_removal_or_restart() {
     assert_eq!(catalog.snapshot().revision, original.revision);
     assert_eq!(catalog.snapshot().groups, original.groups);
 
+    // Only URLTest reports a tolerance, so it is not part of this group's revision.
     config.groups[0].tolerance += 1;
+    catalog.install(&config);
+    assert_eq!(catalog.snapshot().revision, original.revision);
+    config.groups[0].interrupt_connections ^= true;
     catalog.install(&config);
     assert_ne!(catalog.snapshot().revision, original.revision);
     assert_eq!(catalog.snapshot().groups, original.groups);
@@ -90,7 +94,7 @@ fn revision_and_members_follow_effective_duplicate_and_cycle_rules() {
     config.groups[2].groups.push("parent".into());
     let catalog = Catalog::new(&config);
     let original = catalog.snapshot();
-    config.groups[0].tolerance += 1;
+    config.groups[0].interrupt_connections ^= true;
     catalog.install(&config);
     assert_eq!(catalog.snapshot().revision, original.revision);
     let manager = GroupManager::new(&config.groups, &config.nodes);
