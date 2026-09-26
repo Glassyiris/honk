@@ -1,1 +1,0 @@
-import{j as r}from"./vendor-react-Ey0dazfG.js";import{u as i,co as l,aF as n}from"./index-Cfspjh03.js";function u({value:o,onChange:s,isDisabled:t}){const e=i(),{selected:a,items:c}=l(o,e);return r.jsx(n,{label:e("arrange.policy"),value:a,onChange:s,items:c,isDisabled:t})}export{u as P};
