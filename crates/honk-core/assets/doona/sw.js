@@ -1,8 +1,10 @@
 const PREFIX = `doona-shell:${self.registration.scope}:`;
-const CACHE = PREFIX + '3c574bb09128b5d2';
-const PRECACHE = ["assets/Arrange-B2EsCycg.js","assets/Config-DNrHmV_s.js","assets/Connections-MW8lex31.js","assets/Dns-CeKZ0OKA.js","assets/Events-CDWszmsc.js","assets/Lifecycle-C8bF8LmW.js","assets/Login-BKmnYiUp.js","assets/Logs-DluHZ3AW.js","assets/Nodes-B9MamIES.js","assets/Overview-HGQ-odRJ.js","assets/Policies-Ctv3Hdi5.js","assets/PolicyPicker-B0IYDSNz.js","assets/Rules-BLjxjhO2.js","assets/SearchDialog-B45FEjU6.js","assets/Settings-DtnnyQuN.js","assets/Table-BdSFV9jo.js","assets/TimeCell-CbIEVvIf.js","assets/auth-Dvie0grX.js","assets/dns-C___Rd4S.js","assets/duck-night-CbKHyiul.webp","assets/files-BxEOxSF8.js","assets/index-BWDo9u7j.css","assets/index-Bk3oKdvG.js","assets/index-Cfspjh03.js","assets/layout--PvBvvCO.js","assets/link-fi2kv7ab.js","assets/logo-obi05X1B.svg","assets/names-D7Aa1Gga.js","assets/outbounds-CS2qjFRk.js","assets/query-CooI-_z8.js","assets/setup-CM9vnbAa.js","assets/useGridSelectionCheckbox-CURbcoLm.js","assets/vendor-charts-BSOgcWus.js","assets/vendor-editor-BYSNX95r.js","assets/vendor-react-Ey0dazfG.js","assets/view-8dZ9FUEp.js","assets/view-BY4tMdGa.js","assets/view-CeOG7rPl.js","assets/view-RJ2xeb5a.js","assets/view-i8VCwUqE.js","assets/vocab-BfgnwTNm.js","index.html"];
+const CACHE = PREFIX + '57c72ab1fc3fbaee';
+const PRECACHE = ["assets/ActionGroup-Dnx-uDce.js","assets/AreaChart-H0aol1Y4.js","assets/AreaCurve-BriPYJva.js","assets/Arrange-Dd3j3leY.css","assets/Arrange-XbctKUnF.js","assets/Beeswarm-DaZ1lrZt.js","assets/Config-BDFxt2fP.js","assets/Connections-msDgSkgE.js","assets/DaeCode-B4MDdwFy.js","assets/Dns-DNmu8OO_.js","assets/Donut-Bth6MRL6.js","assets/Events-UZoMc30b.js","assets/FactStrip-hvGewCyJ.js","assets/ListLayout-CLVedAkt.js","assets/Login-CEps4zQE.js","assets/Logs-DySc-3gQ.js","assets/NodeSearch-D4qJ7nks.js","assets/Nodes-q43Zmh-Y.js","assets/Overview-DB9WrBE0.js","assets/Policies-B5uX8xW_.js","assets/PolicyPicker-Q9KpmSed.js","assets/Rules-BC5pM3Z9.js","assets/Rules-l5FnUA9B.css","assets/SearchDialog-CuvbZ13F.js","assets/Settings-DY0dqEsS.js","assets/Sparkline-FWZkAQs1.js","assets/Table-p-wvZn_a.js","assets/TimeCell-CXLXmD7L.js","assets/Virtualizer-C1myNFDC.js","assets/array-C0P64tl-.js","assets/auth-0s-lLJcL.js","assets/dns-Zo5iZdc1.js","assets/duck-night-CbKHyiul.webp","assets/files-BxEOxSF8.js","assets/flows-ZSvAaHdt.js","assets/geodata-DprMPspn.js","assets/index-C0YvLycg.css","assets/index-CD6c9uGh.js","assets/layout-B2L5Bb91.js","assets/link-DtlAqE4Y.js","assets/logo-obi05X1B.svg","assets/logs-DWFIWc1I.js","assets/nav-BIpfWn6-.js","assets/nav-BeFLfZq8.js","assets/nav-BvJuez9p.js","assets/nav-D8tQgVSd.js","assets/outbounds-BFI_YzDA.js","assets/policyText-DSsimJRH.js","assets/probe-B7CPAVsH.js","assets/setup-B-F5OHit.js","assets/useFilter-DAAdlzDJ.js","assets/useGridSelectionCheckbox-DIX7rZI6.js","assets/vendor-editor-BYSNX95r.js","assets/vendor-react-Bf71BWbF.js","index.html"];
 // Each language's catalogue and stylesheets in this build, cached only for a language a reader uses.
-const LANGUAGES = {"zh-CN":["assets/fonts-sc-DWPGxLPK.css","assets/locale-zh-CN-CU2xf3QZ.js"],"zh-TW":["assets/fonts-tc-B6Zt5HQN.css","assets/locale-zh-TW-w6n_EnQ6.js"],"en":["assets/locale-en-ETYyIPe0.js"]};
+const LANGUAGES = {"zh-CN":["assets/fonts-sc-DWPGxLPK.css","assets/locale-zh-CN-B9zl3qNG.js"],"zh-TW":["assets/fonts-tc-B6Zt5HQN.css","assets/locale-zh-TW-Bz4uOCsq.js"],"en":["assets/locale-en-CUosNqmh.js"]};
+// The mock backend's chunk, cached only for a page that runs on it.
+const MOCK = ["assets/index-xpvGXtLQ.js"];
 const ROOT = new URL(self.registration.scope);
 
 // A new build takes over on the next online load, including open dashboard tabs.
@@ -17,13 +19,13 @@ self.addEventListener('install', event => {
       .then(() => self.skipWaiting())
   );
 });
-// A page loads its catalogue before this worker controls it, so it reports the language it shows to have it cached.
+// A page loads its catalogue and backend before this worker controls it, so it reports the language it shows and
+// whether it runs on the mock, to have them cached.
 self.addEventListener('message', event => {
   const lang = event.data?.language;
-  if (typeof lang !== 'string' || !Object.hasOwn(LANGUAGES, lang)) return;
-  event.waitUntil(
-    caches.open(CACHE).then(cache => Promise.all(LANGUAGES[lang].map(async url => (await cache.match(url, {ignoreVary: true})) ?? cache.add(url))))
-  );
+  const files = [...(typeof lang === 'string' && Object.hasOwn(LANGUAGES, lang) ? LANGUAGES[lang] : []), ...(event.data?.mock === true ? MOCK : [])];
+  if (!files.length) return;
+  event.waitUntil(caches.open(CACHE).then(cache => Promise.all(files.map(async url => (await cache.match(url, {ignoreVary: true})) ?? cache.add(url)))));
 });
 // The build just replaced stays: tabs still showing it load their remaining chunks from it until reloaded.
 self.addEventListener('activate', event => {
