@@ -31,7 +31,7 @@ async fn peer_eof(socket: &mut TcpStream) {
 }
 
 #[tokio::test]
-async fn completed_keepalive_is_closed_at_pause_and_resume_owns_a_fresh_client() {
+async fn completed_request_leaves_no_keepalive_and_resume_owns_a_fresh_client() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let network = Arc::new(SubscriptionNetwork::new().unwrap());
     network.ready().await.unwrap();
@@ -46,14 +46,9 @@ async fn completed_keepalive_is_closed_at_pause_and_resume_owns_a_fresh_client()
             .await
             .unwrap();
         assert_eq!(fetch.await.unwrap().unwrap(), b"body");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), socket.read_u8())
-                .await
-                .is_err(),
-            "the response really left an idle keepalive, not Connection: close"
-        );
-        network.pause().await.unwrap();
+        // The marked client owns one connection per request and keeps no idle pool.
         peer_eof(&mut socket).await;
+        network.pause().await.unwrap();
         assert!(network.fetch(&subscription(&listener)).await.is_err());
         if cycle < 2 {
             network.resume().await.unwrap();
