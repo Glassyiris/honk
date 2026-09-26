@@ -159,7 +159,7 @@ impl GroupPatch {
             json!({"kind":policy,"native":policy}),
             json!(default),
             json!(self.group.final_outbound),
-            json!(self.group.tolerance),
+            json!(super::catalog::tolerance(&self.group)),
             json!(self.group.idle_timeout),
             json!(self.group.interrupt_connections),
             json!(super::catalog::check_url(&self.group)),
@@ -236,6 +236,17 @@ impl GroupPatch {
                 }
                 _ => return Err(invalid()),
             }
+        }
+        let urltest = values[0]
+            .as_ref()
+            .and_then(|policy| policy["kind"].as_str())
+            == Some("urltest");
+        if !urltest
+            && values[3]
+                .as_ref()
+                .is_some_and(|value| !value.is_null() && *value != initial[3])
+        {
+            return Err(unsupported());
         }
         let mut changes = Vec::new();
         for (index, value) in values.iter().enumerate() {
@@ -558,7 +569,10 @@ mod tests {
             name: "G".into(),
             revision: "r".into(),
             expected: Ok("r".into()),
-            group: Group::default(),
+            group: Group {
+                policy: honk_config::group::GroupPolicy::URLTest,
+                ..Group::default()
+            },
             members: vec![("node".into(), "A".into())],
             operations,
         }
@@ -649,5 +663,52 @@ mod tests {
         patch.operations =
             json!([{"op":"replace","path":"/config/check_url","value":"http://example.test/"}]);
         assert!(patch.changes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tolerance_patch_applies_only_to_urltest() {
+        let score = |operations: Value| {
+            let mut patch = request(operations);
+            patch.group.policy = honk_config::group::GroupPolicy::Score;
+            patch.changes()
+        };
+        let to_score =
+            json!({"op":"replace","path":"/policy","value":{"kind":"score","native":"score"}});
+        let to_urltest =
+            json!({"op":"replace","path":"/policy","value":{"kind":"urltest","native":"urltest"}});
+        assert!(
+            score(json!([{"op":"test","path":"/config/tolerance","value":null}]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            score(json!([{"op":"remove","path":"/config/tolerance"}])).unwrap(),
+            vec![(GroupField::Tolerance, None)]
+        );
+        assert_eq!(
+            request(json!([to_score, {"op":"remove","path":"/config/tolerance"}]))
+                .changes()
+                .unwrap(),
+            vec![
+                (GroupField::Policy, Some("score".into())),
+                (GroupField::Tolerance, None)
+            ]
+        );
+        assert_eq!(
+            score(json!([to_urltest, {"op":"replace","path":"/config/tolerance","value":100}]))
+                .unwrap(),
+            vec![
+                (GroupField::Policy, Some("urltest".into())),
+                (GroupField::Tolerance, Some("100".into()))
+            ]
+        );
+        for patch in [
+            score(json!([{"op":"replace","path":"/config/tolerance","value":100}])),
+            score(json!([{"op":"add","path":"/config/tolerance","value":0}])),
+            request(json!([to_score, {"op":"replace","path":"/config/tolerance","value":100}]))
+                .changes(),
+        ] {
+            assert!(patch.is_err());
+        }
     }
 }
