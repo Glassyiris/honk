@@ -43,10 +43,10 @@ const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 const TERMINAL_TTL: Duration = Duration::from_secs(300);
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
-/// Records leave the ring one at a time as flows end or newer ones need the
-/// room, so a `flow.gap` per departure would shadow every flow under load.
-/// Room-making is reported at most once per interval, with the cumulative
-/// `dropped_records`; the count itself never skips.
+/// Records leave the ring one at a time as flows end, newer ones need the room
+/// or a revision runs out, so a `flow.gap` per departure would shadow every
+/// flow under load. Departures are reported at most once per interval, with
+/// the cumulative `dropped_records`; the count itself never skips.
 const EVICTED_GAP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 const MAX_TEXT: usize = 512;
@@ -174,7 +174,7 @@ impl FlowStore {
         store.max_records = max_records;
         store.retention = retention;
         self.recording.store(enabled, Ordering::Release);
-        self.gap(&store, None, "recording_changed");
+        self.gap(&store, "recording_changed");
     }
 
     pub(crate) fn set_limits(&self, max_records: usize, retention_seconds: u64) {
@@ -324,25 +324,20 @@ impl FlowStore {
             return false;
         }
         let old_bytes = record.bytes;
-        let overflow = record.overflow;
         if !change(record) {
             return false;
         }
         let revision = record.summary.revision;
         if revision == MAX_SAFE_UINT {
-            self.evict(&mut store, index, now, "buffer_overflow", false);
+            self.evict(&mut store, index, now, "buffer_overflow");
             return false;
         }
         record.summary.trace_status = record.trace_status();
         record.summary.revision += 1;
         record.bytes = record.retained_bytes();
         let new_bytes = record.bytes;
-        let lost_steps = record.overflow && !overflow;
         self.updated(record);
         store.record_bytes = store.record_bytes - old_bytes + new_bytes;
-        if lost_steps {
-            self.gap(&store, Some(id), "buffer_overflow");
-        }
         let previous_count = store.records.len();
         self.enforce_limit(&mut store, now);
         index
@@ -404,38 +399,29 @@ impl FlowStore {
             .flow_updated(record.id(), record.summary.revision);
     }
 
-    fn gap(&self, store: &Store, id: Option<&str>, reason: &'static str) {
+    /// Gaps are unscoped: they report lost continuity or records the store no
+    /// longer holds. A record that truncated its own steps shows that through
+    /// its `overflow` flag and `flow.updated` instead.
+    fn gap(&self, store: &Store, reason: &'static str) {
         self.events.publish(
             "flow.gap",
             json!({
-                "resource_id": id, "reason": reason, "dropped_records": store.dropped.to_string()
+                "resource_id": null, "reason": reason, "dropped_records": store.dropped.to_string()
             }),
-            id,
+            None,
         );
     }
 
-    /// A record that lost its own history (`routine` false) is named in its
-    /// gap; one that merely left the ring to make room is folded into the
-    /// interval notice.
-    fn evict(
-        &self,
-        store: &mut Store,
-        index: usize,
-        now: Instant,
-        reason: &'static str,
-        routine: bool,
-    ) {
+    fn evict(&self, store: &mut Store, index: usize, now: Instant, reason: &'static str) {
         let record = store.records.remove(index).expect("known record index");
         store.record_bytes -= record.bytes;
         store.dropped = store.dropped.saturating_add(1);
-        if !routine {
-            self.gap(store, Some(record.id()), reason);
-        } else if store
+        if store
             .evicted_gap_at
             .is_none_or(|at| now.saturating_duration_since(at) >= EVICTED_GAP_INTERVAL)
         {
             store.evicted_gap_at = Some(now);
-            self.gap(store, None, reason);
+            self.gap(store, reason);
         }
         if store.tombstones.len() == MAX_RECORDS {
             store.tombstones.pop_front();
@@ -456,7 +442,7 @@ impl FlowStore {
             if store.records.is_empty() {
                 break;
             }
-            self.evict(store, 0, now, "buffer_overflow", true);
+            self.evict(store, 0, now, "buffer_overflow");
         }
     }
 
@@ -478,7 +464,7 @@ impl FlowStore {
                 .ended
                 .is_some_and(|ended| now.saturating_duration_since(ended) >= store.retention)
             {
-                self.evict(store, index, now, "evicted", true);
+                self.evict(store, index, now, "evicted");
             } else {
                 index += 1;
             }
