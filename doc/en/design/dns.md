@@ -312,7 +312,7 @@ SIGHUP builds policy, `/etc/hosts`, groups, routing, upstream transports, projec
 
 Routing publication rejects stale queued DNS metadata before admission; already admitted queries keep their generation leases. The nonwrapping 20-bit carrier uses a persistent boot-lifetime allocator, including descriptor-only NFQUEUE fences. Failed reservations are not reused; ordinary restart does not reset exhaustion. See [routing publication](./routing.md#synchronous-slots-and-atomic-publication).
 
-Native suspend closes DNS admission, cancels/drains foreground leases and joins standalone listeners, background work and transport/runtime owners. The stable service/controller, cache, persister and projection bookkeeping remain. Resume creates fresh forwarder/transport owners using accepted routing/hosts artifacts and the same cache; it does not reread edited hosts/geodata or replay old queries. This lifecycle is distinct from ordinary generation retirement and does not shut down the retained cache/persistence owner.
+Engine suspension closes DNS admission, cancels/drains foreground leases and joins standalone listeners, background work and transport/runtime owners. The stable service/controller, cache, persister and projection bookkeeping remain. Resume creates fresh forwarder/transport owners using accepted routing/hosts artifacts and the same cache; it does not reread edited hosts/geodata or replay old queries. This lifecycle is distinct from ordinary generation retirement and does not shut down the retained cache/persistence owner.
 
 ## Observability
 

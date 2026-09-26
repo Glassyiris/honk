@@ -52,7 +52,6 @@
 | POST | `/api/v1/config/validate` | `syntax` 或离线 `full` 校验，不写盘、不 reload。 |
 | PUT | `/api/v1/config/sources/{source_id}` | 强 `If-Match` 保护的单源原文替换；写盘后排队真实 reload，返回 operation。 |
 | POST | `/api/v1/operations/reload` | 从磁盘重新加载，返回 daemon-owned operation；body 留空或为 `{}`。 |
-| POST | `/api/v1/operations/suspend`、`/api/v1/operations/resume` | 关闭连接的真实无网络负载暂停/恢复，返回 operation。 |
 | GET | `/api/v1/operations/{id}` | 真实排队、运行及终态结果。 |
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的连接数据。显示字段遮蔽监听凭据值。Connections 的 `detail` 默认 `summary`，`type` 默认 `all`，`limit` 默认 100、范围 1–1000。拒绝重复单值或未知 query 参数。先过滤，再统计总量与应用 TCP+UDP 合计 limit；按注册观测时间降序、相同时间按 ID 字典序升序排列。total 是匹配的完整可见数量。IPv4-mapped IPv6 来源按 IPv4 比较。summary 省略 `src/dst/domain`，full 包含它们，未知 domain 为 null；full 不表示更高权限。
@@ -61,7 +60,7 @@
 
 单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；批量关闭中任一退役无法确认时，等全部已选连接处理完再返回 503，`error.details` 带 `closed/skipped` 计数，这些连接不会回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
 
-TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 仍未知。`generation.activated_at` 是当前 generation 的发布时间，启动 generation 取引擎首次进入运行状态的时间。配置激活或挂起后重建进行期间，`generation.state` 为 `reloading`；引擎运行且健康时，`lifecycle.state` 同为 `reloading`。有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
+TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 仍未知。`generation.activated_at` 是当前 generation 的发布时间，启动 generation 取引擎首次进入运行状态的时间。配置激活进行期间，`generation.state` 为 `reloading`；引擎运行且健康时，`lifecycle.state` 同为 `reloading`。有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
 所有认证模式都公开 `GET /api` 及其等价别名 `/api/v1/discovery`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
@@ -266,7 +265,7 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 `resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted **主文件**可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。`resources.providers.create_options` 列出可选的 provider 字段及省略时采用的值：`update_interval`（秒，最多一年，`0` 表示只在请求时刷新，默认 `86400`）、`user_agent`（1 至 256 个可打印 ASCII 字符，默认 `honk/<version>`），以及仅在 `global.store_subscribe` 打开订阅存储时列出的 `cache`（默认 `true`）。带任一字段的 provider 以块形式写入，使用 `ua`、`interval` 和 `cache`；未列出或超出范围的值返回 `422 unsupported_value`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
 
-节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。重名返回 409，不支持的链接、身份或值返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始；相同 source specification 的延迟拉取状态在无关编辑、reload 和 suspend/resume 中保留，直到显式 refresh。修改该 specification 或重启恢复普通订阅启动行为。API 不创建 same-fetch 别名，歧义删除直接拒绝，不让 ID/节点悄悄转移。
+节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。重名返回 409，不支持的链接、身份或值返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始；相同 source specification 的延迟拉取状态在无关编辑和 reload 中保留，直到显式 refresh。修改该 specification 或重启恢复普通订阅启动行为。API 不创建 same-fetch 别名，歧义删除直接拒绝，不让 ID/节点悄悄转移。
 
 DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成功删除在激活后返回 `{"deleted":1}`；builtin、订阅派生节点、非主文件条目及不支持/歧义归属返回 `404 capability_not_supported`。静态 include 仍在 inline 下可见；固定客户端没有逐节点 writable 字段，因此显示的删除按钮仍可能被拒绝。仍被引用的条目须先修正引用，否则写前校验失败。编辑已有条目继续使用源 PUT，不新增 node/provider PATCH。
 
@@ -305,15 +304,11 @@ DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成
 
 ### 共用模式与数据面生命周期
 
-原生 `runtime_mode` 暂不可用：固定 PUT 契约未声明暂停冲突与 owner/backend 不可用的错误响应，capability 又不区分读写。GET/HEAD/PUT 均返回 `404 capability_not_supported`，不宣告接受任何 mode。内部共享的 `DatapathFlagsHandle` 及 Clash 控制仍保留；它不是 `dial_mode`，不覆盖 must/block 终态，也不合成网关规则。**仅 native 启用时**，mode/global target 是临时状态，不恢复或写入模式缓存；启动及成功显式配置激活（含 no-op）重置 rule，provider/network refresh 和 suspend/resume 保留。Global 绑定稳定身份，目标消失后新流量 fail closed，不回退普通路由或改投同名替代者。Native 未启用时保留原有 Clash 缓存行为。
+原生 `runtime_mode` 暂不可用：固定 PUT 契约未声明暂停冲突与 owner/backend 不可用的错误响应，capability 又不区分读写。GET/HEAD/PUT 均返回 `404 capability_not_supported`，不宣告接受任何 mode。内部共享的 `DatapathFlagsHandle` 及 Clash 控制仍保留；它不是 `dial_mode`，不覆盖 must/block 终态，也不合成网关规则。**仅 native 启用时**，mode/global target 是临时状态，不恢复或写入模式缓存；启动及成功显式配置激活（含 no-op）重置 rule，provider/network refresh 保留。Global 绑定稳定身份，目标消失后新流量 fail closed，不回退普通路由或改投同名替代者。Native 未启用时保留原有 Clash 缓存行为。
 
 显式激活的提交与模式 reset 是不同结果：若 routing/config 已提交但 backend mode 写入失败，settings 已恢复配置值，而 mode/source 保留先前值，控制面关闭准入并返回 committed-degraded，operation 失败。此时既不能声称 Rule 已生效，也不能声称配置回滚；通过 Clash `/configs`（启用时）与 operation 结果检查实际状态。正常 no-op 接受也触发 reset，provider/network 更新不触发。
 
-Suspend/resume 经现有配置协调器和 control owner 串行执行；202 和 HTTP 断连均不代表终态。Suspend 先关闭 datapath admission、完成 NFQUEUE fence/held-verdict 排空，再关闭可见及尚未产生 ID 的 TCP、精确 UDP views、独立 DNS listener，并停止/join probe、健康检查、预热、订阅网络、协议后台任务和接口扫描。只有这些 owner 完成停止才报告 suspended；不是仅暂停健康探测。API、accepted 配置/来源、同一 GroupManager 的策略状态、mode/settings、计数、缓存与已有内存历史保留（仍受留存期限约束）。程序、maps 与自有 hooks 可继续加载/附着，但 closed admission 下 TC 放行，不代表数据面 active。
-
-Resume 使用 accepted 内存配置与 artifact，不重读磁盘配置/geodata/hosts；保留 Selector/Fallback/轮询/Score 状态，重新绑定 listener、创建 fresh TCP/UDP/DNS/协议 transport owner，仍共享进程物理资源上限。重新检查真实拓扑、routing/listener/queue 就绪后才开放准入，不恢复旧连接或重放取消的数据。重复 suspend/resume，或已知暂停/转换状态下的新 probe/provider refresh、组变更与配置激活返回 409；owner 实际失败或不可用返回 503。DNS query 按固定端点契约，在所有不可用生命周期状态下均于联网前返回带 `Retry-After` 的 503。内存/缓存/历史读取仍可用，不涉及网络 owner 的 recorder settings 与缓存管理也可使用，并非一律禁止所有修改。安全清理完成的恢复失败保持 suspended；fence、队列或清理所有权不确定则进入 failed 并终止。若恢复已发布新代次后失败，operation 如实报告 committed/current generation，不声称旧代仍 active。
-
-暂停不是硬时间上限承诺：已开始的阻塞系统解析/NSS 不能被 Tokio 取消，仍须等真实 join；清理阶段超期不能丢弃 owner 或宣称暂停成功。终止关闭不同于 suspend：关闭准入并停止 watcher、detach hooks 后，健康运行中的连接有默认 5 秒 drain grace，随后强制取消并 join；故障退出不承诺该 grace。原生 HTTP 自身另有 5 秒 graceful drain，上述阻塞 join 仍可能延长总退出时间。
+终止关闭不是硬时间上限承诺：已开始的阻塞系统解析/NSS 不能被 Tokio 取消，仍须等真实 join；清理阶段超期不能丢弃 owner。关闭准入并停止 watcher、detach hooks 后，健康运行中的连接有默认 5 秒 drain grace，随后强制取消并 join；故障退出不承诺该 grace。原生 HTTP 自身另有 5 秒 graceful drain，上述阻塞 join 仍可能延长总退出时间。
 
 ## 启用与鉴权
 

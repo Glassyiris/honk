@@ -282,7 +282,7 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 
 ### 暂停、恢复与终止所有权
 
-Suspend/resume 与源写入共用 daemon-owned 配置协调器，再由唯一 control command owner 执行。暂停先关闭 datapath admission 和 NFQUEUE readiness，完成 epoch fence 与 held verdict 排空；停止/join TCP accept（含 pre-ID sniff/dial）、UDP initializer/view/source driver/退役 worker、独立 DNS listener、健康与按需探测、预热/预连接、协议 session 后台任务、订阅网络及接口 watcher 扫描。只有真实 owner 全部停止才发布 suspended，不能用暂停健康检查代替无负载状态。暂停期间拒绝新网络工作、模式/组修改和配置激活；API 的内存观测仍可用。
+Suspend/resume 是由唯一 control command owner 执行的引擎生命周期，原生 API 不提供该操作。暂停先关闭 datapath admission 和 NFQUEUE readiness，完成 epoch fence 与 held verdict 排空；停止/join TCP accept（含 pre-ID sniff/dial）、UDP initializer/view/source driver/退役 worker、独立 DNS listener、健康与按需探测、预热/预连接、协议 session 后台任务、订阅网络及接口 watcher 扫描。只有真实 owner 全部停止才发布 suspended，不能用暂停健康检查代替无负载状态。暂停期间拒绝新网络工作、模式/组修改和配置激活；API 的内存观测仍可用。
 
 `control/lifecycle/teardown.rs` 共用网络清理支持存在或不存在 listener epoch，涵盖部分启动和恢复失败。独立 DNS supervisor 保留已回收 child 的失败，并经 joined teardown 传播；主动关闭导致的取消是中性的，但 owner panic 不能产生成功暂停。
 
