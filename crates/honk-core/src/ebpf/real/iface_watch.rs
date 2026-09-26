@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::ebpf::{DynamicHooks, EbpfBackend, IfaceRole};
@@ -49,21 +49,9 @@ struct NetworkState {
     local_cidrs: Vec<String>,
 }
 
-enum WatcherAction {
-    Pause,
-    ReconcilePaused,
-    Resume,
-}
-
-struct WatcherRequest {
-    action: WatcherAction,
-    reply: oneshot::Sender<anyhow::Result<()>>,
-}
-
 pub struct IfaceWatcher {
     handle: tokio::task::JoinHandle<()>,
     stop: watch::Sender<bool>,
-    lifecycle: mpsc::Sender<WatcherRequest>,
 }
 
 impl IfaceWatcher {
@@ -86,36 +74,8 @@ impl IfaceWatcher {
             }
         };
         let (stop, rx) = watch::channel(false);
-        let (lifecycle, requests) = mpsc::channel(1);
-        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx, requests));
-        Some(Self {
-            handle,
-            stop,
-            lifecycle,
-        })
-    }
-
-    pub(crate) async fn pause(&self) -> anyhow::Result<()> {
-        self.request(WatcherAction::Pause).await
-    }
-
-    pub(crate) async fn reconcile_paused(&self) -> anyhow::Result<()> {
-        self.request(WatcherAction::ReconcilePaused).await
-    }
-
-    pub(crate) async fn resume(&self) -> anyhow::Result<()> {
-        self.request(WatcherAction::Resume).await
-    }
-
-    async fn request(&self, action: WatcherAction) -> anyhow::Result<()> {
-        let (reply, acknowledged) = oneshot::channel();
-        self.lifecycle
-            .send(WatcherRequest { action, reply })
-            .await
-            .map_err(|_| anyhow::anyhow!("interface watcher stopped before lifecycle request"))?;
-        acknowledged.await.map_err(|_| {
-            anyhow::anyhow!("interface watcher stopped before lifecycle acknowledgment")
-        })?
+        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx));
+        Some(Self { handle, stop })
     }
 
     pub async fn shutdown(self, timeout: Duration) {
@@ -151,7 +111,6 @@ async fn run(
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
-    mut lifecycle: mpsc::Receiver<WatcherRequest>,
 ) {
     let async_fd = match tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
     {
@@ -165,7 +124,6 @@ async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
     let mut network_state = read_network_state(&config).await;
-    let mut paused = false;
     let mut pending_notification = true;
     let mut netlink_retry_at = tokio::time::Instant::now();
 
@@ -184,55 +142,21 @@ async fn run(
         tokio::select! {
             biased;
             _ = stop.changed() => break,
-            request = lifecycle.recv() => {
-                let Some(WatcherRequest { action, reply }) = request else { break };
-                if reply.is_closed() {
-                    continue;
-                }
-                let result = match action {
-                    WatcherAction::Pause => {
-                        paused = true;
-                        Ok(())
-                    }
-                    WatcherAction::ReconcilePaused if paused => {
-                        pending_notification |= update_network_state(&config, &mut network_state).await;
-                        match reconcile(&ebpf, &config, &mut attached).await {
-                            Ok(changed) => {
-                                pending_notification |= changed;
-                                Ok(())
-                            }
-                            Err(error) => {
-                                pending_notification = true;
-                                Err(error)
-                            }
-                        }
-                    }
-                    WatcherAction::ReconcilePaused => {
-                        Err(anyhow::anyhow!("interface watcher must be paused before explicit reconciliation"))
-                    }
-                    WatcherAction::Resume => {
-                        paused = false;
-                        ticker.reset();
-                        Ok(())
-                    }
-                };
-                let _ = reply.send(result);
-            }
-            permit = commands.reserve(), if !paused && pending_notification => {
+            permit = commands.reserve(), if pending_notification => {
                 match permit {
                     Ok(permit) => { permit.send(crate::control::ControlCommand::NetworkChanged); }
                     Err(_) => debug!("control plane stopped before network-change refresh"),
                 }
                 pending_notification = false;
             }
-            _ = ticker.tick(), if !paused => {
+            _ = ticker.tick() => {
                 let changed = update_network_state(&config, &mut network_state).await;
                 reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed, &mut pending_notification).await;
             }
             guard = async {
                 tokio::time::sleep_until(netlink_retry_at).await;
                 async_fd.readable().await
-            }, if !paused => {
+            } => {
                 // A transient read failure (ENOBUFS after a burst) must not
                 // kill the watcher: the ticker keeps reconciling regardless.
                 let mut guard = match guard {
@@ -246,7 +170,7 @@ async fn run(
                 // Drain pending network events; their contents are irrelevant
                 // because reconcile re-derives state from /sys and /proc.
                 let drained = guard.try_io(|inner| {
-                    // Bound a burst so lifecycle requests cannot starve behind netlink traffic.
+                    // Bound a burst so stop and the ticker cannot starve behind netlink traffic.
                     for _ in 0..64 {
                         match recv(inner.as_raw_fd(), &mut buf, MsgFlags::empty()) {
                             Ok(_) => {}
@@ -482,24 +406,8 @@ mod tests {
         let (events, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         events.set_nonblocking(true).unwrap();
         let (stop, rx) = watch::channel(false);
-        let (lifecycle, requests) = mpsc::channel(1);
-        let handle = tokio::spawn(run(
-            events.into(),
-            ebpf,
-            config,
-            commands,
-            attached,
-            rx,
-            requests,
-        ));
-        (
-            IfaceWatcher {
-                handle,
-                stop,
-                lifecycle,
-            },
-            writer,
-        )
+        let handle = tokio::spawn(run(events.into(), ebpf, config, commands, attached, rx));
+        (IfaceWatcher { handle, stop }, writer)
     }
 
     #[test]
@@ -646,113 +554,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_control_queue_preserves_hint_without_blocking_pause() {
+    async fn full_control_queue_retains_hint_and_shutdown_joins_the_worker() {
         tokio::time::timeout(Duration::from_secs(1), async {
             let backend = crate::ebpf::mock::MockEbpfBackend::new();
-            let attach = backend.dynamic_attach_calls.clone();
-            let forget = backend.dynamic_forget_calls.clone();
-            let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-            let mut config = honk_config::Config::default();
-            config.global.lan_interface = vec!["lo".to_string()];
-            let config = Arc::new(RwLock::new(Arc::new(config)));
-            let mut attached = AttachedMap::new();
-            reconcile(&ebpf, &config, &mut attached).await.unwrap();
-            let (tx, mut rx) = mpsc::channel(1);
-            tx.try_send(crate::control::ControlCommand::NetworkChanged)
-                .unwrap();
-            let (watcher, _events) = watcher_fixture(ebpf, config, tx.clone(), attached);
-
-            watcher.pause().await.unwrap();
-            assert_eq!(attach.load(Ordering::Relaxed), 1);
-            assert_eq!(forget.load(Ordering::Relaxed), 0);
-            assert!(matches!(
-                rx.try_recv(),
-                Ok(crate::control::ControlCommand::NetworkChanged)
-            ));
-            watcher.reconcile_paused().await.unwrap();
-            assert!(matches!(
-                rx.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-
-            // Freeing capacity must deliver the retained hint without any new event.
-            tx.try_send(crate::control::ControlCommand::NetworkChanged)
-                .unwrap();
-            watcher.resume().await.unwrap();
-            assert!(matches!(
-                rx.try_recv(),
-                Ok(crate::control::ControlCommand::NetworkChanged)
-            ));
-            assert!(matches!(
-                rx.recv().await,
-                Some(crate::control::ControlCommand::NetworkChanged)
-            ));
-            watcher.pause().await.unwrap();
-            assert_eq!(attach.load(Ordering::Relaxed), 1);
-            assert_eq!(forget.load(Ordering::Relaxed), 0);
-            assert!(matches!(
-                rx.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-            watcher.shutdown(Duration::from_secs(1)).await;
-        })
-        .await
-        .expect("watcher lifecycle blocked on the full control queue");
-    }
-
-    #[tokio::test]
-    async fn paused_watcher_reconciles_only_on_request_and_joins_on_shutdown() {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let backend = crate::ebpf::mock::MockEbpfBackend::new();
-            let attach = backend.dynamic_attach_calls.clone();
-            let forget = backend.dynamic_forget_calls.clone();
             let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
             let retained_backend = Arc::downgrade(&ebpf);
             let mut config = honk_config::Config::default();
             config.global.lan_interface = vec!["lo".to_string()];
             let config = Arc::new(RwLock::new(Arc::new(config)));
             let (tx, mut rx) = mpsc::channel(1);
-            let (watcher, events) = watcher_fixture(ebpf, config.clone(), tx, AttachedMap::new());
-            watcher.pause().await.unwrap();
-            assert!(matches!(
-                rx.try_recv(),
-                Ok(crate::control::ControlCommand::NetworkChanged)
-            ));
+            tx.try_send(crate::control::ControlCommand::NetworkChanged)
+                .unwrap();
+            let (watcher, _events) = watcher_fixture(ebpf, config, tx, AttachedMap::new());
 
-            let mut config_guard = config.write().await;
-            Arc::make_mut(&mut config_guard).global.lan_interface =
-                vec!["honk-missing-interface".to_string()];
-            events.send(&[1]).unwrap();
-            tokio::task::yield_now().await;
-            // A paused event must not even start a scan waiting for this held config lock.
-            watcher.pause().await.unwrap();
-            assert_eq!(forget.load(Ordering::Relaxed), 0);
-            drop(config_guard);
-
-            watcher.reconcile_paused().await.unwrap();
-            assert_eq!(forget.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                attach.load(Ordering::Relaxed),
-                1,
-                "absent interfaces remain pending"
-            );
+            // Freeing capacity must deliver the startup hint the full queue held back.
             assert!(matches!(
-                rx.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
+                rx.recv().await,
+                Some(crate::control::ControlCommand::NetworkChanged)
             ));
-            Arc::make_mut(&mut *config.write().await)
-                .global
-                .lan_interface = vec!["lo".to_string()];
-            watcher.reconcile_paused().await.unwrap();
-            watcher.reconcile_paused().await.unwrap();
-            assert_eq!(
-                attach.load(Ordering::Relaxed),
-                2,
-                "unchanged owned hooks must be reused"
-            );
             assert!(matches!(
-                rx.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
+                rx.recv().await,
+                Some(crate::control::ControlCommand::NetworkChanged)
             ));
             watcher.shutdown(Duration::from_secs(1)).await;
             assert!(
@@ -761,41 +583,7 @@ mod tests {
             );
         })
         .await
-        .expect("paused watcher scanned or failed to acknowledge lifecycle work");
-    }
-
-    #[tokio::test]
-    async fn explicit_paused_reconcile_reports_attachment_failure() {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
-            backend.dynamic_attach_fault = true;
-            let attach = backend.dynamic_attach_calls.clone();
-            let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-            let config = Arc::new(RwLock::new(Arc::new(honk_config::Config::default())));
-            let (tx, mut rx) = mpsc::channel(1);
-            let (watcher, _events) = watcher_fixture(ebpf, config.clone(), tx, AttachedMap::new());
-            watcher.pause().await.unwrap();
-            assert!(matches!(
-                rx.try_recv(),
-                Ok(crate::control::ControlCommand::NetworkChanged)
-            ));
-            Arc::make_mut(&mut *config.write().await)
-                .global
-                .lan_interface = vec!["lo".to_string()];
-            watcher
-                .reconcile_paused()
-                .await
-                .expect_err("attachment failure must fail resume preparation");
-            watcher.pause().await.unwrap();
-            assert_eq!(attach.load(Ordering::Relaxed), 0);
-            assert!(matches!(
-                rx.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-            watcher.shutdown(Duration::from_secs(1)).await;
-        })
-        .await
-        .expect("failed paused reconcile did not acknowledge its result");
+        .expect("watcher did not deliver the retained hint or join on shutdown");
     }
 
     #[test]
