@@ -114,7 +114,8 @@ fn marked_downloads_netns() {
                     stream.write_all(response.as_bytes()).await.unwrap();
                 }
             });
-            let sub = honk_config::subscription::Subscription { url: format!("http://{target}/subscription"), ..Default::default() };
+            // An empty detour routes the fetch; this test covers the direct marked dial.
+            let sub = honk_config::subscription::Subscription { url: format!("http://{target}/subscription"), download_detour: "direct".into(), ..Default::default() };
             let nodes = crate::subscription::SubscriptionManager::new().unwrap().fetch(&sub).await.unwrap();
             assert_eq!(nodes[0].name, "marked");
             let url = reqwest::Url::parse(&format!("http://{target}/archive")).unwrap();
