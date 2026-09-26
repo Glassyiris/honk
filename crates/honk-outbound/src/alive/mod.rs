@@ -563,7 +563,7 @@ impl AliveDialerSet {
         cancel
             .run(cancel.scope_resolution(operation))
             .await
-            .ok_or(HealthCheckError::Paused)?
+            .ok_or(HealthCheckError::Stopped)?
     }
 
     async fn resolve_host_inner(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {

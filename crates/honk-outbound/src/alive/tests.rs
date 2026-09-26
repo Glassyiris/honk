@@ -38,6 +38,34 @@ fn test_merge_check_addrs_dedup() {
 }
 
 #[tokio::test]
+async fn resolution_cancelled_by_shutdown_reports_stopped_checks() {
+    let set = Arc::new(AliveDialerSet::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let hook: ResolveHook = Arc::new({
+        let started = Arc::clone(&started);
+        move |_, _| {
+            let started = Arc::clone(&started);
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending().await
+            })
+        }
+    });
+    set.set_resolver(hook);
+    let lookup = tokio::spawn({
+        let set = Arc::clone(&set);
+        async move { set.resolve_host("localhost", 80).await }
+    });
+    started.notified().await;
+    set.shutdown_health_checks().await.unwrap();
+    let error = lookup.await.unwrap().expect_err("cancelled lookup");
+    assert_eq!(
+        error.downcast_ref::<HealthCheckError>(),
+        Some(&HealthCheckError::Stopped)
+    );
+}
+
+#[tokio::test]
 async fn resolver_hook_rejection_skips_system_fallback_and_health_penalty() {
     let set = AliveDialerSet::new();
     let rejection: ResolveHook = Arc::new(|_, _| {

@@ -411,7 +411,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 按需 delay exchange 保留 Alive/API 延迟历史，但不报告业务结果，也不填充配置 Score 比较 cohort。实际的前置 server/session 准备可报告聚合预热 setup；不会把调用方 URL 虚构为预热自身目标，也不提供晋升证明。
 
-两个延迟接口都会持有已接纳的任务直到测量清理结束，即使 HTTP 客户端已经断开。owner 接纳失败的 `503` 响应会区分容量耗尽、检查已暂停或停止，以及 worker 失败。QUIC 探测超时或正常关闭等待属于测量结果，不代表健康检查 owner 失败：有限的对端通知宽限期结束后，会停止并 join packet-adapter worker 和 Quinn driver。真正的受管 worker 失败仍会关闭健康检查接纳。
+两个延迟接口都会持有已接纳的任务直到测量清理结束，即使 HTTP 客户端已经断开。owner 接纳失败的 `503` 响应会区分容量耗尽、检查已停止，以及 worker 失败。QUIC 探测超时或正常关闭等待属于测量结果，不代表健康检查 owner 失败：有限的对端通知宽限期结束后，会停止并 join packet-adapter worker 和 Quinn driver。真正的受管 worker 失败仍会关闭健康检查接纳。
 
 ### Score 组表示
 

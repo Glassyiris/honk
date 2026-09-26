@@ -19,8 +19,6 @@ pub(super) struct HealthControl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HealthCheckError {
-    #[error("health checks are paused")]
-    Paused,
     #[error("health checks are stopped")]
     Stopped,
     #[error("health probe capacity exhausted")]
@@ -197,7 +195,7 @@ impl AliveDialerSet {
             }
             tasks.spawn(async move {
                 let result = if cancel.is_cancelled() {
-                    Err(HealthCheckError::Paused)
+                    Err(HealthCheckError::Stopped)
                 } else {
                     Ok(make(cancel).await)
                 };

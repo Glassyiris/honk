@@ -435,7 +435,7 @@ Successful measurements update the node latency history. Failures return `503` f
 
 On-demand delay exchanges retain Alive/API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server/session preparation may report aggregate warm-up setup only; it does not fabricate the caller's URL as its own target or provide promotion proof.
 
-Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, paused or stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner: after the bounded peer-notification grace, packet-adapter workers and Quinn drivers are stopped and joined. Actual owned-worker failure still closes health admission.
+Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner: after the bounded peer-notification grace, packet-adapter workers and Quinn drivers are stopped and joined. Actual owned-worker failure still closes health admission.
 
 ### Score group representation
 
