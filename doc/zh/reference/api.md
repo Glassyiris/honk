@@ -209,7 +209,7 @@ PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_r
 
 PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST reload 入协调队列后返回 `202`。响应含 `operation_id`、`href`、相同的 `Location` 与 `Retry-After: 1`，不表示配置已经生效。操作由 daemon 持有，HTTP 断连不取消它或其 supervisor reconciliation。可选 `Idempotency-Key` 绑定 principal、method、path、instance 与原始 body：同 key 同 body 的并发/重试共用结果，不重复写入或 reload，丢失首个 202 后仍可用原 If-Match 重试；不同 body 返回 `409 idempotency_conflict`。总共最多 32 个预留/保留操作，终态最多保留 300 秒。存储已满时，新准入先淘汰最早结束的终态操作，该 ID 随后返回 404，其 `Idempotency-Key` 也不再重放。只有全部名额都是准备中或执行中的操作时，才返回 `503 temporarily_unavailable` 与 `Retry-After: 1`；重启后不保留。
 
-通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。配置 secret 或密码登录保护 listener 时，所有会话使用同一个管理员 operation principal，logout 不删除保留的 operation。
+通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。磁盘文件无法加载时，失败的 operation 与 `last_reload` 返回 `unsupported_value` 错误及 `details.diagnostics`，与写入同一内容时的响应相同，并标明 accepted 源 ID 与行号。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。配置 secret 或密码登录保护 listener 时，所有会话使用同一个管理员 operation principal，logout 不删除保留的 operation。
 
 ### 配置数据库（`--store db`）
 

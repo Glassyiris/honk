@@ -273,3 +273,34 @@ async fn request_bodies_name_the_failing_field_without_echoing_values() {
     assert_eq!(disk(fixture.directory.path()), before_disk);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn failed_reload_reports_the_diagnostics_of_the_file_on_disk() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    std::fs::write(
+        fixture.path("locked.dae"),
+        "group {\n  broken {\n    policy: honk\n  }\n}\n",
+    )
+    .unwrap();
+    let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed");
+    let error = &terminal["error"];
+    assert_eq!(error["code"], "unsupported_value");
+    assert_eq!(error["message"], "Configuration validation failed");
+    let rows = error["details"]["diagnostics"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["level"] == "error").unwrap();
+    assert_eq!(row["code"], "unsupported-policy", "{row}");
+    assert_eq!(row["line"], 3, "{row}");
+    assert_eq!(
+        row["source_id"],
+        source(&before, &fixture.originals["locked.dae"])["id"],
+        "{row}"
+    );
+    assert!(!error.to_string().contains(SECRET));
+    fixture.assert_last_reload(&terminal).await;
+    assert_eq!(fixture.get(CONFIG).await, before);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}

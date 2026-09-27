@@ -308,12 +308,10 @@ impl Worker {
                         )
                         .await;
                     }
-                    Err(_) => self.failed(
-                        &id,
-                        "reload_rejected",
-                        "Configuration reload was rejected",
-                        None,
-                    ),
+                    Err(error) => {
+                        let (code, message, details) = error.into_safe();
+                        self.failed(&id, code, message, details);
+                    }
                 }
                 drop(reservation);
             }
@@ -331,7 +329,16 @@ impl Worker {
                         .await;
                     completion::log_sighup(completion);
                 }
-                Err(_) => tracing::warn!("SIGHUP configuration admission rejected"),
+                Err(error) => {
+                    let (code, message, details) = error.into_safe();
+                    let details = details.map(|details| details.to_string());
+                    tracing::warn!(
+                        code,
+                        message,
+                        details = details.as_deref(),
+                        "SIGHUP configuration admission rejected"
+                    );
+                }
             },
         }
     }
@@ -560,26 +567,48 @@ impl Worker {
     ) -> Result<(Config, Option<SourceUpdate>, Vec<DetailedDiagnostic>), ApiError> {
         let store = self.store.clone().ok_or_else(unsupported)?;
         let source_managed = self.source_managed;
+        // Diagnostics name the accepted source IDs, as a write to the same file would.
+        let accepted = self
+            .service
+            .sources
+            .accepted
+            .read()
+            .as_ref()
+            .map(|accepted| {
+                let main = accepted
+                    .update
+                    .sources
+                    .first()
+                    .and_then(|main| accepted.ids.get(&main.path))
+                    .cloned();
+                (accepted.ids.clone(), main)
+            });
         tokio::task::spawn_blocking(move || {
+            let (ids, main) = accepted
+                .as_ref()
+                .map_or((None, None), |(ids, main)| (Some(ids), main.as_deref()));
+            let reject = |error, diagnostics: &[DetailedDiagnostic], sources: &[SourceSnapshot]| {
+                config_error(error, diagnostics, sources, main, ids)
+            };
             let mut diagnostics = Vec::new();
             if !source_managed {
                 let mut config = crate::load_operator_config(
                     store.entry().to_str().ok_or_else(invalid)?,
                     &mut diagnostics,
                 )
-                .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
+                .map_err(|error| reject(error, &diagnostics, &[]))?;
                 config.ensure_builtin_nodes();
                 return Ok((config, None, diagnostics));
             }
             let loaded = store
                 .load(&HashMap::new(), &mut diagnostics)
-                .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
+                .map_err(|error| reject(error, &diagnostics, &[]))?;
             let mut config = crate::admit_operator_config(
                 loaded.config,
                 loaded.sources[0].source.clone(),
                 &mut diagnostics,
             )
-            .map_err(|error| config_error(error, &diagnostics, &loaded.sources, None, None))?;
+            .map_err(|error| reject(error, &diagnostics, &loaded.sources))?;
             config.ensure_builtin_nodes();
             Ok((
                 config,
