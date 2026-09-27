@@ -548,6 +548,23 @@ async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
         };
         error(request.send().await.unwrap(), status, code).await;
     }
+    let malformed = error(
+        fixture
+            .request(Method::PUT, &source_path(main))
+            .header("if-match", "W/\"PRIVATE\"")
+            .json(&json!({"content":"routing { fallback: block }"}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+    )
+    .await;
+    assert_eq!(
+        malformed["error"]["details"],
+        json!({"header":"if-match","kind":"malformed"})
+    );
+    assert!(!malformed.to_string().contains("PRIVATE"), "{malformed}");
     let invalid = fixture.originals["main.dae"].replace(
         "nfqueue_enable: false",
         "nfqueue_enable: private-invalid-value",

@@ -385,7 +385,13 @@ async fn credential_media_types_are_case_insensitive_but_not_duplicated() {
             .send()
             .await
             .unwrap();
-        error_response(duplicate, StatusCode::BAD_REQUEST, "invalid_request").await;
+        error_response_details(
+            duplicate,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            json!({"header":"content-type","kind":"duplicate"}),
+        )
+        .await;
         let mixed_case = app
             .client
             .post(app.url(path))

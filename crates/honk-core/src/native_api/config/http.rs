@@ -20,7 +20,7 @@ fn if_match(request: &Request) -> Result<String, ApiError> {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid().with_details(json!({"header":"if-match","kind":"malformed"})))?;
     Ok(hash.to_owned())
 }
 
