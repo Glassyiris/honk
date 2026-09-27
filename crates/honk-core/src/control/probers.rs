@@ -377,7 +377,10 @@ impl QuicScoreProbeTarget {
             .resolved
             .get_or_try_init(|| resolve_quic_score_target(&self.url, self.resolver.clone()))
             .await?;
-        self.report();
+        // A usable target never becomes disabled, and `new` already published that.
+        if target.is_err() {
+            self.report();
+        }
         Ok(target.as_ref().ok())
     }
 

@@ -341,8 +341,8 @@ pub(crate) fn record_pname_routing(
 ) {
     use crate::degradations::{Component, Issue};
     let issue = match backend.pname_support() {
-        _ if !router.uses_process_name() => None,
         PnameSupport::Full => None,
+        _ if !router.uses_process_name() => None,
         PnameSupport::ThreadName => Some(Issue {
             code: "pname_routing_reduced",
             message: "Kernel argv capture is unavailable; process-name rules match the thread name.",
