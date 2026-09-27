@@ -111,13 +111,16 @@ pub(super) fn invalid() -> ApiError {
     )
 }
 
-pub(super) fn unsupported_value() -> ApiError {
+/// Details name the resource path and the rejected fields; submitted names,
+/// links and URLs can hold secrets and are never echoed.
+pub(super) fn unsupported_value(message: &'static str, details: serde_json::Value) -> ApiError {
     ApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
         ErrorCode::UnsupportedValue,
-        "The engine cannot represent or admit this name, share link or subscription URL",
+        message,
         None,
     )
+    .with_details(details)
 }
 
 pub(super) fn conflict() -> ApiError {
@@ -176,36 +179,76 @@ pub(super) async fn mutate(
             Action::DeleteProvider(target) => Mutation::DeleteProvider(target),
             Action::CreateNode => {
                 let input: NodeCreate = serde_json::from_slice(&body).map_err(|_| invalid())?;
-                if !(1..=64).contains(&input.name.chars().count())
-                    || !(1..=8192).contains(&input.link.chars().count())
-                {
-                    return Err(unsupported_value());
+                if !(1..=64).contains(&input.name.chars().count()) {
+                    return Err(unsupported_value(
+                        "Node name must be 1 to 64 characters",
+                        json!({"resource":"/nodes","field":"name"}),
+                    ));
+                }
+                if !(1..=8192).contains(&input.link.chars().count()) {
+                    return Err(unsupported_value(
+                        "Node share link must be 1 to 8192 characters",
+                        json!({"resource":"/nodes","field":"link"}),
+                    ));
                 }
                 Mutation::CreateNode(input)
             }
             Action::CreateProvider => {
                 let input: ProviderCreate = serde_json::from_slice(&body).map_err(|_| invalid())?;
-                if input.kind != "subscription"
-                    || !(1..=64).contains(&input.name.len())
+                let rejected = |message, field: &str| {
+                    Err(unsupported_value(
+                        message,
+                        json!({"resource":"/providers","field":field}),
+                    ))
+                };
+                if input.kind != "subscription" {
+                    return Err(unsupported_value(
+                        "Provider kind must be subscription",
+                        json!({"resource":"/providers","field":"kind","allowed":["subscription"]}),
+                    ));
+                }
+                if !(1..=64).contains(&input.name.len())
                     || !input
                         .name
                         .bytes()
                         .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
-                    || !(1..=4096).contains(&input.url.chars().count())
+                {
+                    return rejected(
+                        "Provider name must be 1 to 64 ASCII letters, digits, '_', '.' or '-'",
+                        "name",
+                    );
+                }
+                if !(1..=4096).contains(&input.url.chars().count())
                     || !(input.url.starts_with("http://") || input.url.starts_with("https://"))
                     || reqwest::Url::parse(&input.url)
                         .ok()
                         .is_none_or(|url| url.host_str().is_none())
-                    || input
-                        .update_interval
-                        .is_some_and(|seconds| seconds > MAX_UPDATE_INTERVAL)
-                    || input.user_agent.as_ref().is_some_and(|agent| {
-                        !(1..=256).contains(&agent.len())
-                            || !agent.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
-                    })
-                    || (input.cache.is_some() && !state.observation.providers.caches())
                 {
-                    return Err(unsupported_value());
+                    return rejected(
+                        "Provider URL must be an HTTP(S) URL with a host, at most 4096 characters",
+                        "url",
+                    );
+                }
+                if input
+                    .update_interval
+                    .is_some_and(|seconds| seconds > MAX_UPDATE_INTERVAL)
+                {
+                    return rejected(
+                        "Provider update interval must be at most one year in seconds",
+                        "update_interval",
+                    );
+                }
+                if input.user_agent.as_ref().is_some_and(|agent| {
+                    !(1..=256).contains(&agent.len())
+                        || !agent.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                }) {
+                    return rejected(
+                        "Provider user agent must be 1 to 256 printable ASCII characters",
+                        "user_agent",
+                    );
+                }
+                if input.cache.is_some() && !state.observation.providers.caches() {
+                    return rejected("Provider cache requires global.store_subscribe", "cache");
                 }
                 Mutation::CreateProvider(input)
             }

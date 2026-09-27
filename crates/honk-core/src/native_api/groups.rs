@@ -72,20 +72,47 @@ pub(super) fn read_only() -> ApiError {
     )
 }
 
-fn unsupported() -> ApiError {
+/// Details name schema fields and paths only; submitted pointers and values
+/// and configured member names can hold secrets and are never echoed.
+fn unsupported(message: &'static str, details: Value) -> ApiError {
     ApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
         ErrorCode::UnsupportedValue,
-        "Group patch field or value is unsupported",
+        message,
         None,
+    )
+    .with_details(details)
+}
+
+fn unsupported_value(index: usize) -> ApiError {
+    unsupported(
+        "Group patch value is unsupported",
+        json!({"field": MUTABLE_CONFIG[index]}),
     )
 }
 
-fn field(path: &str) -> Result<usize, ApiError> {
+fn tolerance_not_urltest() -> ApiError {
+    unsupported(
+        "Group tolerance applies only to URLTest groups",
+        json!({"field": MUTABLE_CONFIG[3]}),
+    )
+}
+
+/// The index of the supported path held by the operation's `key` pointer.
+fn field(operation: &serde_json::Map<String, Value>, key: &'static str) -> Result<usize, ApiError> {
+    let pointer = operation
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
     PATHS
         .iter()
-        .position(|candidate| *candidate == path)
-        .ok_or_else(unsupported)
+        .position(|candidate| *candidate == pointer)
+        .ok_or_else(|| {
+            unsupported(
+                "Group patch path is unsupported",
+                json!({"field": key, "allowed": PATHS}),
+            )
+        })
 }
 
 fn integer(value: &Value) -> Option<u64> {
@@ -170,6 +197,19 @@ impl GroupPatch {
             .as_array()
             .filter(|operations| !operations.is_empty())
             .ok_or_else(invalid)?;
+        // Without a policy write the group cannot become URLTest, so any
+        // tolerance write fails on the policy rule whatever its value.
+        let never_urltest = initial[0]["kind"] != "urltest"
+            && !operations
+                .iter()
+                .any(|operation| operation.get("path").and_then(Value::as_str) == Some(PATHS[0]));
+        let rejected = |op: &str, path: usize| {
+            if path == 3 && op != "test" && never_urltest {
+                tolerance_not_urltest()
+            } else {
+                unsupported_value(path)
+            }
+        };
         if operations.len() > 32 {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -184,18 +224,14 @@ impl GroupPatch {
                 .get("op")
                 .and_then(Value::as_str)
                 .ok_or_else(invalid)?;
-            let path = field(
-                operation
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or_else(invalid)?,
-            )?;
+            let path = field(operation, "path")?;
             match op {
                 "add" | "replace" | "test" => {
                     if operation.len() != 3 || !operation.contains_key("value") {
                         return Err(invalid());
                     }
-                    let value = normalized(path, &operation["value"]).ok_or_else(unsupported)?;
+                    let value =
+                        normalized(path, &operation["value"]).ok_or_else(|| rejected(op, path))?;
                     if op != "add" && values[path].is_none() {
                         return Err(invalid());
                     }
@@ -221,14 +257,9 @@ impl GroupPatch {
                     if operation.len() != 3 {
                         return Err(invalid());
                     }
-                    let from = field(
-                        operation
-                            .get("from")
-                            .and_then(Value::as_str)
-                            .ok_or_else(invalid)?,
-                    )?;
+                    let from = field(operation, "from")?;
                     let value = values[from].as_ref().ok_or_else(invalid)?;
-                    let value = normalized(path, value).ok_or_else(unsupported)?;
+                    let value = normalized(path, value).ok_or_else(|| rejected(op, path))?;
                     if op == "move" {
                         values[from] = None;
                     }
@@ -246,7 +277,7 @@ impl GroupPatch {
                 .as_ref()
                 .is_some_and(|value| !value.is_null() && *value != initial[3])
         {
-            return Err(unsupported());
+            return Err(tolerance_not_urltest());
         }
         let mut changes = Vec::new();
         for (index, value) in values.iter().enumerate() {
@@ -264,7 +295,12 @@ impl GroupPatch {
                         .members
                         .iter()
                         .find(|(member, _)| member == id)
-                        .ok_or_else(unsupported)?;
+                        .ok_or_else(|| {
+                            unsupported(
+                                "Group default member is not a direct member",
+                                json!({"field": MUTABLE_CONFIG[1]}),
+                            )
+                        })?;
                     // Dae defaults are names: reject identities shadowed by an earlier same-name member.
                     if self
                         .members
@@ -273,7 +309,10 @@ impl GroupPatch {
                         .map(|(member, _)| member.as_str())
                         != Some(id)
                     {
-                        return Err(unsupported());
+                        return Err(unsupported(
+                            "Group default member shares its name with an earlier member",
+                            json!({"field": MUTABLE_CONFIG[1]}),
+                        ));
                     }
                     Some(name.clone())
                 }
@@ -605,6 +644,87 @@ mod tests {
             ]),
         ] {
             assert!(request(operations).changes().is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_errors_name_the_schema_field_but_not_submitted_or_configured_values() {
+        let score = |operations: Value| {
+            let mut patch = request(operations);
+            patch.group.policy = honk_config::group::GroupPolicy::Score;
+            patch
+        };
+        let mut shadowed =
+            request(json!([{"op":"replace","path":"/config/default_member_id","value":"second"}]));
+        shadowed.members = vec![
+            ("first".into(), "PRIVATE".into()),
+            ("second".into(), "PRIVATE".into()),
+        ];
+        let allowed = |field| json!({"field":field,"allowed":PATHS});
+        for (patch, message, details) in [
+            (
+                request(json!([{"op":"replace","path":"/config/PRIVATE","value":1}])),
+                "Group patch path is unsupported",
+                allowed("path"),
+            ),
+            (
+                request(json!([{"op":"copy","from":"/PRIVATE","path":"/config/tolerance"}])),
+                "Group patch path is unsupported",
+                allowed("from"),
+            ),
+            (
+                request(
+                    json!([{"op":"replace","path":"/config/check_url","value":"https://u:PRIVATE@example.test/"}]),
+                ),
+                "Group patch value is unsupported",
+                json!({"field":"check_url"}),
+            ),
+            (
+                request(json!([{"op":"copy","path":"/policy","from":"/config/tolerance"}])),
+                "Group patch value is unsupported",
+                json!({"field":"policy"}),
+            ),
+            (
+                score(json!([{"op":"replace","path":"/config/tolerance","value":100}])),
+                "Group tolerance applies only to URLTest groups",
+                json!({"field":"tolerance"}),
+            ),
+            (
+                score(json!([{"op":"replace","path":"/config/tolerance","value":"PRIVATE"}])),
+                "Group tolerance applies only to URLTest groups",
+                json!({"field":"tolerance"}),
+            ),
+            (
+                score(json!([{"op":"test","path":"/config/tolerance","value":"PRIVATE"}])),
+                "Group patch value is unsupported",
+                json!({"field":"tolerance"}),
+            ),
+            (
+                score(json!([
+                    {"op":"replace","path":"/config/tolerance","value":"PRIVATE"},
+                    {"op":"replace","path":"/policy","value":{"kind":"urltest","native":"urltest"}}
+                ])),
+                "Group patch value is unsupported",
+                json!({"field":"tolerance"}),
+            ),
+            (
+                request(
+                    json!([{"op":"replace","path":"/config/default_member_id","value":"PRIVATE"}]),
+                ),
+                "Group default member is not a direct member",
+                json!({"field":"default_member_id"}),
+            ),
+            (
+                shadowed,
+                "Group default member shares its name with an earlier member",
+                json!({"field":"default_member_id"}),
+            ),
+        ] {
+            let error = serde_json::to_value(patch.changes().unwrap_err()).unwrap();
+            assert_eq!(error["error"]["code"], "unsupported_value");
+            assert_eq!(error["error"]["message"], message);
+            assert_eq!(error["error"]["details"], details);
+            assert!(!error.to_string().contains("PRIVATE"), "{error}");
         }
     }
 

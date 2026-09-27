@@ -64,10 +64,6 @@ const EXPIRED: Unmeasured = (
     "probe_deadline",
     "Probe deadline expired before measurement.",
 );
-const NOT_PERMITTED: Unmeasured = (
-    "unsupported_value",
-    "The configured probe target or protocol is not permitted.",
-);
 const ENGINE_UNAVAILABLE: Unmeasured = (
     "engine_unavailable",
     "Engine is not ready for this operation",
@@ -540,13 +536,16 @@ impl ProbeService {
         let id = &job.reservation.id;
         self.operations.running(id);
         let preparation = wire::bounded(job.deadline, stop.clone(), async {
-            state.require_running().map_err(|_| ENGINE_UNAVAILABLE)?;
+            state
+                .require_running()
+                .map_err(|_| (ENGINE_UNAVAILABLE, None))?;
+            // Preparation refuses only with unsupported_value; keep its safe message and details.
             prepare(&self.policy, job.plan)
                 .await
-                .map_err(|_| NOT_PERMITTED)
+                .map_err(|error| (("unsupported_value", error.message()), error.into_details()))
         })
         .await;
-        let (code, message) = match preparation {
+        let ((code, message), details) = match preparation {
             Ok(Ok(mut plan)) => {
                 let start = {
                     let gate = self.gate.lock();
@@ -571,14 +570,14 @@ impl ProbeService {
                             .succeed(id, OperationResult::Probe(plan.result));
                         return Ok(());
                     }
-                    Err(unmeasured) => unmeasured,
+                    Err(unmeasured) => (unmeasured, None),
                 }
             }
-            Ok(Err(unmeasured)) => unmeasured,
-            Err(_) if *stop.borrow() => CANCELLED,
-            Err(_) => EXPIRED,
+            Ok(Err(refusal)) => refusal,
+            Err(_) if *stop.borrow() => (CANCELLED, None),
+            Err(_) => (EXPIRED, None),
         };
-        self.operations.fail(id, code, message, None);
+        self.operations.fail(id, code, message, details);
         Ok(())
     }
 }
@@ -657,13 +656,16 @@ fn invalid() -> ApiError {
         None,
     )
 }
-fn unsupported() -> ApiError {
+/// Details name the request field with its allowed values, or the governing
+/// setting; configured targets, ports and addresses are never echoed.
+fn unsupported(message: &'static str, details: Value) -> ApiError {
     ApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
         ErrorCode::UnsupportedValue,
-        "The configured probe target or protocol is not permitted.",
+        message,
         None,
     )
+    .with_details(details)
 }
 fn not_found() -> ApiError {
     ApiError::new(

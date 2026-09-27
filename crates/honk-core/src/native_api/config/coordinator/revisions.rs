@@ -24,13 +24,20 @@ impl Worker {
                     diagnostics,
                 )
                 .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
-                let (overlay, _) =
-                    strip_tree(&originals.sources).map_err(|_| management::unsupported_value())?;
+                let (overlay, _) = strip_tree(&originals.sources).map_err(|_| {
+                    management::unsupported_value(
+                        "A listener secret also appears outside its secret field",
+                        json!({"resource":"/config/import","check":"secret_copy"}),
+                    )
+                })?;
                 let mut loaded =
                     Config::from_dae_sources_in_memory(entry, &overlay, limits(), &mut Vec::new())
                         .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
                 if !stripped_config_matches(&originals.config, &mut loaded.config) {
-                    return Err(management::unsupported_value());
+                    return Err(management::unsupported_value(
+                        "Removing listener secrets changes the configuration",
+                        json!({"resource":"/config/import","check":"stripped_config"}),
+                    ));
                 }
                 Ok(loaded)
             },

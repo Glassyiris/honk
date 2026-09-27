@@ -92,6 +92,10 @@ impl ApiError {
         self
     }
 
+    pub(crate) fn message(&self) -> &'static str {
+        self.error.message
+    }
+
     pub(crate) fn into_details(self) -> Option<Value> {
         self.error.details
     }

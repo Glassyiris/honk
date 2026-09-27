@@ -23,6 +23,16 @@ async fn created(response: Response, collection: &str) -> Value {
     value
 }
 
+/// The rejected resource and fields, without the shared management failure state.
+fn rejected(body: &Value) -> Value {
+    let mut details = body["error"]["details"].clone();
+    let details_map = details.as_object_mut().unwrap();
+    for key in ["stage", "written", "durability_confirmed", "committed"] {
+        details_map.remove(key);
+    }
+    details
+}
+
 async fn reload(fixture: &Fixture) {
     let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
@@ -279,7 +289,8 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
             .await
             .unwrap();
         assert_eq!(response.status(), status);
-        assert!(!response.text().await.unwrap().contains("secret-password"));
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("secret-password") && !text.contains("injected"));
     }
     error(
         fixture
@@ -574,7 +585,7 @@ async fn managed_provider_stays_unfetched_until_explicit_refresh_and_deletes_its
         "state_conflict",
     )
     .await;
-    error(
+    let file_url = error(
         fixture
             .request(Method::POST, PROVIDERS)
             .json(&json!({"name":"bad","kind":"subscription","url":"file:///private"}))
@@ -585,6 +596,11 @@ async fn managed_provider_stays_unfetched_until_explicit_refresh_and_deletes_its
         "unsupported_value",
     )
     .await;
+    assert_eq!(
+        rejected(&file_url),
+        json!({"resource":"/providers","field":"url"})
+    );
+    assert!(!file_url.to_string().contains("private"));
     created(
         create_node(&fixture, "unrelated", "socks5://127.0.0.1:11085")
             .send()
@@ -845,6 +861,25 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
             "{invalid} was accepted"
         );
     }
+    // Printable ASCII passes validation, but no dae quote can hold both quote characters.
+    let unquotable = fixture
+        .request(Method::POST, PROVIDERS)
+        .json(&json!({
+            "name": "optioned",
+            "kind": "subscription",
+            "url": "https://example.test/sub",
+            "user_agent": "PRIVATE'\"agent"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unquotable.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = unquotable.json().await.unwrap();
+    assert_eq!(
+        rejected(&body),
+        json!({"resource":"/providers","fields":["name","url","user_agent"]})
+    );
+    assert!(!body.to_string().contains("PRIVATE"), "{body}");
     assert!(
         !std::fs::read_to_string(fixture.path("main.dae"))
             .unwrap()

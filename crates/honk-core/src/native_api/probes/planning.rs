@@ -194,12 +194,12 @@ fn plan(
                         | honk_config::types::NodeProtocol::Block
                 )
             {
-                return Err(unsupported());
+                return Err(direct_or_block());
             }
             if request.transport.contains(&Transport::Udp)
                 && !(honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node)
             {
-                return Err(unsupported());
+                return Err(tcp_only());
             }
         }
         for &transport in &request.transport {
@@ -241,17 +241,20 @@ fn plan(
                                 | honk_config::types::NodeProtocol::Block
                         )
                     {
-                        return Err(unsupported());
+                        return Err(direct_or_block());
                     }
                     if request.kind != Kind::TcpConnect {
-                        let entry = state
-                            .proxy_registry
-                            .find(node.protocol())
-                            .ok_or_else(unsupported)?;
+                        let entry =
+                            state.proxy_registry.find(node.protocol()).ok_or_else(|| {
+                                unsupported(
+                                    "The probed node protocol has no HTTP or DNS probe path",
+                                    json!({"field":"kind","allowed":["tcp_connect"]}),
+                                )
+                            })?;
                         if transport == Transport::Udp
                             && (!(entry.descriptor.supports_udp)(node) || entry.packet.is_none())
                         {
-                            return Err(unsupported());
+                            return Err(tcp_only());
                         }
                     }
                     if let Some(&attempt) = unique.get(&(node.id, transport, family)) {
@@ -273,21 +276,27 @@ fn plan(
     let (http, destination) = match request.kind {
         Kind::TcpConnect => (None, None),
         Kind::Http => {
+            const URLS: [&str; 2] = ["check_url", "tcp_check_url"];
+            let unusable_url = || configured("The configured HTTP check URL is not usable", &URLS);
             let url = group
                 .as_ref()
                 .and_then(|name| manager.native_group(name))
                 .and_then(|group| group.check_url.as_deref())
                 .or_else(|| config.global.tcp_check_url.first().map(String::as_str))
-                .ok_or_else(unsupported)?;
-            let http = honk_outbound::urltest::health_http_probe_request(
-                url,
-                &config.global.tcp_check_http_method,
-            )
-            .map_err(|_| unsupported())?;
+                .ok_or_else(|| configured("No HTTP check URL is configured", &URLS))?;
+            let method = &config.global.tcp_check_http_method;
+            honk_outbound::urltest::probe_method(method).map_err(|_| {
+                configured(
+                    "The configured HTTP check method is not usable",
+                    &["tcp_check_http_method"],
+                )
+            })?;
+            let http = honk_outbound::urltest::health_http_probe_request(url, method)
+                .map_err(|_| unusable_url())?;
             let host = http
                 .uri()
                 .host()
-                .ok_or_else(unsupported)?
+                .ok_or_else(unusable_url)?
                 .trim_matches(['[', ']'])
                 .to_owned();
             let port =
@@ -301,9 +310,15 @@ fn plan(
             (Some(http), Some((host, port)))
         }
         Kind::Dns => {
+            let dns_check_target = || {
+                configured(
+                    "No usable DNS check target is configured",
+                    &["udp_check_dns"],
+                )
+            };
             match honk_config::check::select_dns_check_target(&config.global.udp_check_dns)
-                .map_err(|_| unsupported())?
-                .ok_or_else(unsupported)?
+                .map_err(|_| dns_check_target())?
+                .ok_or_else(dns_check_target)?
             {
                 honk_config::check::DnsCheckTarget::Literal(addr) => {
                     (None, Some((addr.ip().to_string(), addr.port())))
@@ -344,6 +359,32 @@ fn plan(
         result,
         candidates,
     })
+}
+
+fn direct_or_block() -> ApiError {
+    unsupported(
+        "TCP connect probes do not apply to direct or block nodes",
+        json!({"field":"kind","allowed":["http","dns"]}),
+    )
+}
+
+fn tcp_only() -> ApiError {
+    unsupported(
+        "The probed node does not carry UDP",
+        json!({"field":"transport","allowed":["tcp"]}),
+    )
+}
+
+/// The requested `kind` needs these settings, which do not yield a target.
+fn configured(message: &'static str, settings: &[&str]) -> ApiError {
+    unsupported(message, json!({"field":"kind","settings":settings}))
+}
+
+fn address() -> ApiError {
+    unsupported(
+        "The probe destination address is not permitted",
+        json!({"check":"address","settings":["probe_allowed_cidrs"]}),
+    )
 }
 
 fn member_id(member: NativeGroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
@@ -388,11 +429,20 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
             .map(|(host, port)| (host.as_str(), *port))
             .unwrap_or((candidate.node.host(), candidate.node.port));
         if !policy.port(context.spec.kind, port, https) {
-            return Err(unsupported());
+            return Err(unsupported(
+                "The probe destination port is not permitted",
+                json!({"check":"port","settings":["probe_allowed_ports"]}),
+            ));
         }
-        let ips = resolve(&context.dns, &mut resolved, host).await?;
+        let ips = resolve(
+            &context.dns,
+            &mut resolved,
+            host,
+            "Resolving the probe destination was refused locally",
+        )
+        .await?;
         if ips.iter().any(|&ip| !policy.address(ip)) {
-            return Err(unsupported());
+            return Err(address());
         }
         let addr = ips
             .iter()
@@ -402,9 +452,15 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
         let needs_server = context.spec.kind != Kind::TcpConnect
             && candidate.node.protocol() != honk_config::types::NodeProtocol::Direct;
         let server = if needs_server {
-            let ips = resolve(&context.dns, &mut resolved, candidate.node.host()).await?;
+            let ips = resolve(
+                &context.dns,
+                &mut resolved,
+                candidate.node.host(),
+                "Resolving the probed node's server was refused locally",
+            )
+            .await?;
             if ips.iter().any(|&ip| !policy.address(ip)) {
-                return Err(unsupported());
+                return Err(address());
             }
             ips.first().copied()
         } else {
@@ -413,7 +469,10 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
         if candidate.transport == Transport::Udp
             && !honk_outbound::descriptor::udp_target_allowed(&candidate.node, port)
         {
-            return Err(unsupported());
+            return Err(unsupported(
+                "The probed node does not carry UDP to the probe port",
+                json!({"field":"transport","allowed":["tcp"]}),
+            ));
         }
         match addr {
             Some(addr) if !needs_server || server.is_some() => {
@@ -441,6 +500,7 @@ async fn resolve<'a>(
     dns: &PinnedNameResolver,
     resolved: &'a mut HashMap<String, Vec<IpAddr>>,
     host: &str,
+    refused: &'static str,
 ) -> Result<&'a [IpAddr], ApiError> {
     if !resolved.contains_key(host) {
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
@@ -449,7 +509,7 @@ async fn resolve<'a>(
             match dns.resolve(host).await {
                 Ok(addresses) => addresses,
                 Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
-                    return Err(unsupported());
+                    return Err(unsupported(refused, json!({"check":"resolution"})));
                 }
                 Err(_) => Vec::new(),
             }
