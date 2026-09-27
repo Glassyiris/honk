@@ -379,11 +379,7 @@ async fn empty_body(request: Request, allow_object: bool, id: &RequestId) -> Res
             id,
         ));
     }
-    if serde_json::from_slice::<Value>(&body).ok() == Some(json!({})) {
-        Ok(())
-    } else {
-        Err(invalid_query(id))
-    }
+    super::body::no_inputs(&body, || invalid_query(id))
 }
 
 pub(super) async fn delete_name(

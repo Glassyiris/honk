@@ -181,7 +181,7 @@ pub(in crate::native_api) async fn import(
     let bytes = axum::body::to_bytes(request.into_body(), 65536)
         .await
         .map_err(|_| too_large())?;
-    let body: Import = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let body: Import = body::decode(&bytes, invalid)?;
     let initialized = store
         .database()
         .and_then(|database| database.cached_head())
@@ -233,13 +233,7 @@ pub(in crate::native_api) async fn activate(
     let bytes = axum::body::to_bytes(request.into_body(), 65536)
         .await
         .map_err(|_| too_large())?;
-    if !bytes.is_empty()
-        && !serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .is_some_and(|body| body.as_object().is_some_and(|object| object.is_empty()))
-    {
-        return Err(invalid());
-    }
+    body::no_inputs(&bytes, invalid)?;
     let exists = tokio::task::spawn_blocking(move || {
         store
             .database()

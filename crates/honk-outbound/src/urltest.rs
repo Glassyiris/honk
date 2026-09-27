@@ -103,7 +103,8 @@ fn build_http_probe_request(
         .context("failed to build HTTP probe request")
 }
 
-fn probe_method(method: &str) -> anyhow::Result<http::Method> {
+/// The configured probe method; empty means HEAD.
+pub fn probe_method(method: &str) -> anyhow::Result<http::Method> {
     if method.is_empty() {
         return Ok(http::Method::HEAD);
     }

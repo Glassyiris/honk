@@ -107,6 +107,7 @@ tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
+serde_path_to_error = { workspace = true, optional = true }
 
 # External UI auto-download (clash-api)
 zip = { workspace = true, optional = true }
@@ -117,7 +118,7 @@ default = ["clash-api", "mimalloc", "rprx", "native-api"]
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
-native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "honk-outbound/native-api"]
+native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/native-api"]
 # Embed the vendored doona distribution for experimental.native_api.ui: embedded.
 native-ui = ["native-api"]
 # Route the shipped binary's allocations through mimalloc (see main.rs)

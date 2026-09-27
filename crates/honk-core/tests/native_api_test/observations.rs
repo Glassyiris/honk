@@ -554,13 +554,22 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
         }
     }
     let before = response_json(app.get(path).send().await.unwrap()).await;
-    for patch in [
-        json!({"record_flows": true, "record_logs": true}),
-        json!({"record_flows": null}),
-        json!({"record_flows": "on"}),
-        json!({"recording": {"events": {"active": true}}}),
+    for (patch, details) in [
+        (
+            json!({"record_flows": true, "record_logs": true}),
+            Value::Null,
+        ),
+        (json!({"record_flows": null}), Value::Null),
+        (
+            json!({"record_flows": "on"}),
+            json!({"field":"record_flows","kind":"invalid_value"}),
+        ),
+        (
+            json!({"recording": {"events": {"active": true}}}),
+            json!({"field":"body","kind":"unknown_field"}),
+        ),
     ] {
-        error_response(
+        error_response_details(
             app.client
                 .patch(app.url(path))
                 .bearer_auth(SECRET)
@@ -570,6 +579,7 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
                 .unwrap(),
             StatusCode::BAD_REQUEST,
             "invalid_request",
+            details,
         )
         .await;
         let after = response_json(app.get(path).send().await.unwrap()).await;

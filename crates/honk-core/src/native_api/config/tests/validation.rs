@@ -232,3 +232,44 @@ async fn validation_ids_and_display_paths_cannot_expand_file_authority() {
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn request_bodies_name_the_failing_field_without_echoing_values() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before_disk = disk(fixture.directory.path());
+    for (method, path, body, details) in [
+        (
+            Method::POST,
+            VALIDATE,
+            json!({"mode":"syntax","sources":[{"content":["PRIVATE"]}]}),
+            json!({"field":"sources[0].content","kind":"wrong_type"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/nodes",
+            json!({"name":"PRIVATE"}),
+            json!({
+                "field":"link","kind":"missing","stage":"admission",
+                "written":false,"durability_confirmed":false,"committed":false
+            }),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/groups/PRIVATE/selection",
+            json!({"member_id":"PRIVATE","network":"PRIVATE"}),
+            json!({"field":"network","kind":"invalid_value"}),
+        ),
+    ] {
+        let response = fixture
+            .request(method, path)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let body = error(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+        assert_eq!(body["error"]["details"], details, "{path}");
+        assert!(!body.to_string().contains("PRIVATE"), "{body}");
+    }
+    assert_eq!(disk(fixture.directory.path()), before_disk);
+    fixture.shutdown().await;
+}

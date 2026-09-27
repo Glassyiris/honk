@@ -274,7 +274,7 @@ pub(super) async fn trace(
     .await
     .map_err(|_| unavailable(id))?
     .map_err(|_| too_large(id))?;
-    let request: TraceRequest = serde_json::from_slice(&bytes).map_err(|_| invalid(id))?;
+    let request: TraceRequest = super::body::decode(&bytes, || invalid(id))?;
     request.input.validate(id)?;
     if !matches!(request.resolve, Resolve::None) {
         return Err(error(

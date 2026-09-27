@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::native_api::types::RequestId;
 
-use crate::native_api::{ApiError, ErrorCode, NativeState, Peer, error};
+use crate::native_api::{ApiError, ErrorCode, NativeState, Peer, body, error};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,8 +42,8 @@ async fn credentials(request: Request, id: &RequestId) -> Result<Credentials, Ap
     // The boundary has already read the body into memory and bounded its size.
     let bytes = axum::body::to_bytes(request.into_body(), RECORD_LIMIT)
         .await
-        .map_err(|_| invalid(id))?;
-    let credentials: Credentials = serde_json::from_slice(&bytes).map_err(|_| invalid(id))?;
+        .map_err(|_| invalid(id).with_details(body::too_large()))?;
+    let credentials: Credentials = body::decode(&bytes, || invalid(id))?;
     if !valid_username(&credentials.username) || !valid_password(&credentials.password) {
         return Err(invalid(id));
     }

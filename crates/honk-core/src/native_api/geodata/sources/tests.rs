@@ -13,8 +13,12 @@ fn settings(geosite: &str) -> NativeApiConfig {
     }
 }
 
+fn invalid() -> ApiError {
+    crate::native_api::config::invalid()
+}
+
 fn patch(value: Value) -> Option<Patch> {
-    Patch::parse(value).expect("valid patch")
+    Patch::parse(value, invalid).expect("valid patch")
 }
 
 #[test]
@@ -138,7 +142,7 @@ fn patches_outside_the_url_and_interval_rules_are_refused() {
         json!({"auto_update": {"interval_hours": 169}}),
         json!({"source": "db"}),
     ] {
-        assert!(Patch::parse(value.clone()).is_err(), "{value}");
+        assert!(Patch::parse(value.clone(), invalid).is_err(), "{value}");
     }
 }
 
@@ -399,7 +403,7 @@ fn download_patches_name_a_group_only_for_the_group_route() {
         json!({"download": {"route": "proxy"}}),
         json!({"download": {}}),
     ] {
-        assert!(Patch::parse(value.clone()).is_err(), "{value}");
+        assert!(Patch::parse(value.clone(), invalid).is_err(), "{value}");
     }
     let mut unknown = patch(json!({"download": {"route": "group", "group_id": "gone"}})).unwrap();
     assert!(!unknown.resolve_group(|_| None));

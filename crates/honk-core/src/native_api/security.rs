@@ -16,6 +16,7 @@ use futures::StreamExt;
 use futures::future::poll_fn;
 use honk_config::experimental::{NativeApiConfig, parse_native_authority, parse_native_origin};
 use serde::de::IgnoredAny;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -223,7 +224,9 @@ impl Security {
         request_id: &str,
     ) -> Result<(), ApiError> {
         let Query(parameters) = Query::<Vec<(String, IgnoredAny)>>::try_from_uri(request.uri())
-            .map_err(|_| invalid_request(request_id))?;
+            .map_err(|_| {
+                invalid_request(request_id, json!({"field":"query","kind":"malformed"}))
+            })?;
         if parameters
             .iter()
             .any(|(name, _)| name == "token" || name == "access_token")
@@ -307,7 +310,10 @@ pub(super) async fn boundary(
             let (parts, body) = request.into_parts();
             let bytes = read_body(body, header_bytes, &request_id).await?;
             if matches!(method, Method::GET | Method::HEAD) && !bytes.is_empty() {
-                return Err(invalid_request(&request_id));
+                return Err(invalid_request(
+                    &request_id,
+                    json!({"field":"body","kind":"not_allowed"}),
+                ));
             }
             request = Request::from_parts(parts, Body::from(bytes.freeze()));
         }
@@ -447,22 +453,34 @@ fn check_bounds(request: &Request, request_id: &str) -> Result<usize, ApiError> 
     if target_bytes > MAX_TARGET_BYTES || header_bytes > MAX_HEADER_BYTES {
         return Err(too_large(request_id));
     }
-    if let Some(length) = single_header(request.headers(), "content-length")
-        .map_err(|()| invalid_request(request_id))?
-    {
-        let length = length.to_str().map_err(|_| invalid_request(request_id))?;
+    if let Some(length) = single_header(request.headers(), "content-length").map_err(|()| {
+        invalid_request(
+            request_id,
+            json!({"header":"content-length","kind":"duplicate"}),
+        )
+    })? {
+        let not_decimal = || {
+            invalid_request(
+                request_id,
+                json!({"header":"content-length","kind":"not_decimal"}),
+            )
+        };
+        let length = length.to_str().map_err(|_| not_decimal())?;
         if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid_request(request_id));
+            return Err(not_decimal());
         }
         if length
             .parse::<u64>()
             .map_or(true, |length| length > MAX_BODY_BYTES as u64)
         {
-            return Err(too_large(request_id));
+            return Err(too_large(request_id).with_details(super::body::too_large()));
         }
     }
     if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
-        return Err(invalid_request(request_id));
+        return Err(invalid_request(
+            request_id,
+            json!({"field":"target","kind":"not_origin_form"}),
+        ));
     }
     Ok(header_bytes)
 }
@@ -474,11 +492,12 @@ async fn read_body(
 ) -> Result<BytesMut, ApiError> {
     let mut bytes = BytesMut::new();
     while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-        let frame = frame.map_err(|_| invalid_request(request_id))?;
+        let frame = frame
+            .map_err(|_| invalid_request(request_id, json!({"field":"body","kind":"malformed"})))?;
         match frame.into_data() {
             Ok(data) => {
                 if data.len() > MAX_BODY_BYTES - bytes.len() {
-                    return Err(too_large(request_id));
+                    return Err(too_large(request_id).with_details(super::body::too_large()));
                 }
                 bytes.extend_from_slice(&data);
             }
@@ -500,12 +519,23 @@ pub(super) fn preflight(
     methods: &[&str],
     request_id: &str,
 ) -> Result<Response, ApiError> {
+    if !request.headers().contains_key(header::ORIGIN) {
+        return Err(invalid_request(
+            request_id,
+            json!({"header":"origin","kind":"missing"}),
+        ));
+    }
+    let method_error = |kind| {
+        invalid_request(
+            request_id,
+            json!({"header":"access-control-request-method","kind":kind}),
+        )
+    };
     let method = single_header(request.headers(), "access-control-request-method")
-        .ok()
-        .flatten()
-        .and_then(|value| value.to_str().ok())
-        .filter(|_| request.headers().contains_key(header::ORIGIN))
-        .ok_or_else(|| invalid_request(request_id))?;
+        .map_err(|()| method_error("duplicate"))?
+        .ok_or_else(|| method_error("missing"))?
+        .to_str()
+        .map_err(|_| method_error("not_text"))?;
     if !methods.contains(&method) && !(method == "HEAD" && methods.contains(&"GET")) {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -518,10 +548,18 @@ pub(super) fn preflight(
         .headers()
         .get_all(header::ACCESS_CONTROL_REQUEST_HEADERS)
     {
-        let value = value.to_str().map_err(|_| invalid_request(request_id))?;
+        let value = value.to_str().map_err(|_| {
+            invalid_request(
+                request_id,
+                json!({"header":"access-control-request-headers","kind":"not_text"}),
+            )
+        })?;
         for name in value.split(',').map(|name| name.trim_matches([' ', '\t'])) {
             if name.is_empty() {
-                return Err(invalid_request(request_id));
+                return Err(invalid_request(
+                    request_id,
+                    json!({"header":"access-control-request-headers","kind":"empty_name"}),
+                ));
             }
             if !ALLOW_HEADERS
                 .split(", ")
@@ -551,13 +589,16 @@ pub(super) fn preflight(
     Ok(response)
 }
 
-fn invalid_request(request_id: &str) -> ApiError {
+/// Details name the header or request part and the failed check; header and
+/// body values are never echoed.
+fn invalid_request(request_id: &str, details: Value) -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest,
         "The request is invalid.",
         Some(request_id.to_owned()),
     )
+    .with_details(details)
 }
 
 fn unauthorized(request_id: &str) -> ApiError {

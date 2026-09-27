@@ -133,14 +133,29 @@ fn api_headers(response: &Response) {
 }
 
 fn error_body(body: &Value, code: &str) {
+    error_details(body, code, Value::Null);
+}
+
+/// Boundary details name the header or request part, never a submitted value.
+fn error_details(body: &Value, code: &str, details: Value) {
     assert_eq!(body["error"]["code"], code);
     assert!(body["error"]["message"].is_string());
-    assert_eq!(body["error"].get("details"), Some(&Value::Null));
+    assert_eq!(body["error"].get("details"), Some(&details));
     uuid::Uuid::parse_str(body["request_id"].as_str().unwrap()).unwrap();
     assert!(!body.to_string().contains(SECRET));
+    assert!(!body.to_string().contains("PRIVATE"));
 }
 
 async fn error_response(response: Response, status: StatusCode, code: &str) {
+    error_response_details(response, status, code, Value::Null).await;
+}
+
+async fn error_response_details(
+    response: Response,
+    status: StatusCode,
+    code: &str,
+    details: Value,
+) {
     assert_eq!(response.status(), status);
     api_headers(&response);
     assert!(
@@ -152,7 +167,7 @@ async fn error_response(response: Response, status: StatusCode, code: &str) {
     if status == StatusCode::UNAUTHORIZED {
         assert_eq!(response.headers()["www-authenticate"], "Bearer");
     }
-    error_body(&response.json::<Value>().await.unwrap(), code);
+    error_details(&response.json::<Value>().await.unwrap(), code, details);
 }
 
 async fn response_json(response: Response) -> Value {
@@ -194,21 +209,24 @@ async fn routing_reads_that_cannot_pin_the_router_are_retryable_snapshot_unavail
 async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types() {
     let app = TestApp::new(|_| {}).await;
     for path in ["/api/v1/probes", "/api/v1/routing/trace"] {
-        for (content_types, status, code) in [
+        for (content_types, status, code, details) in [
             (
                 &["application/json", "application/json"][..],
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
+                json!({"header":"content-type","kind":"duplicate"}),
             ),
             (
                 &[][..],
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_media_type",
+                Value::Null,
             ),
             (
                 &["text/plain"][..],
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_media_type",
+                Value::Null,
             ),
         ] {
             let mut request = app
@@ -219,8 +237,51 @@ async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types()
             for content_type in content_types {
                 request = request.header("content-type", *content_type);
             }
-            error_response(request.send().await.unwrap(), status, code).await;
+            error_response_details(request.send().await.unwrap(), status, code, details).await;
         }
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn json_bodies_name_the_failing_field_without_echoing_values() {
+    let app = TestApp::new(|_| {}).await;
+    for (method, path, body, details) in [
+        (
+            Method::POST,
+            "/api/v1/routing/trace",
+            json!({"input":{"network":"tcp","dst_port":"PRIVATE"}}),
+            json!({"field":"input.dst_port","kind":"wrong_type"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/dns/cache/flush",
+            json!({"PRIVATE":1}),
+            json!({"field":"body","kind":"unknown_field"}),
+        ),
+        (
+            Method::PATCH,
+            "/api/v1/runtime/settings",
+            json!({"flows":{"max_flows":"PRIVATE"}}),
+            json!({"field":"flows.max_flows","kind":"wrong_type"}),
+        ),
+    ] {
+        let response = app
+            .client
+            .request(method, app.url(path))
+            .bearer_auth(SECRET)
+            .header("idempotency-key", "json-body")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        error_response_details(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            details,
+        )
+        .await;
     }
     app.shutdown().await;
 }
@@ -264,6 +325,10 @@ async fn raw_request(app: &TestApp, target: &str, headers: &str, body: &[u8]) ->
 }
 
 fn raw_error(response: RawResponse, status: u16, code: &str) {
+    raw_error_details(response, status, code, Value::Null);
+}
+
+fn raw_error_details(response: RawResponse, status: u16, code: &str, details: Value) {
     assert_eq!(response.status, status);
     assert!(response.headers.contains("\r\ncache-control: no-store"));
     assert!(
@@ -271,9 +336,10 @@ fn raw_error(response: RawResponse, status: u16, code: &str) {
             .headers
             .contains("\r\nx-content-type-options: nosniff")
     );
-    error_body(
+    error_details(
         &serde_json::from_slice::<Value>(&response.body).unwrap(),
         code,
+        details,
     );
 }
 
@@ -509,7 +575,7 @@ async fn host_origin_and_proxy_authorities_are_not_inferred_from_forwarded_heade
         403,
         "permission_denied",
     );
-    raw_error(
+    raw_error_details(
         raw_request(
             &app,
             &app.url("/api"),
@@ -519,6 +585,7 @@ async fn host_origin_and_proxy_authorities_are_not_inferred_from_forwarded_heade
         .await,
         400,
         "invalid_request",
+        json!({"field":"target","kind":"not_origin_form"}),
     );
     app.shutdown().await;
 }
@@ -659,6 +726,41 @@ async fn preflight_uses_route_methods_but_never_grants_authorization() {
         "permission_denied",
     )
     .await;
+    let options = || app.client.request(Method::OPTIONS, app.url("/api"));
+    for (request, details) in [
+        (
+            options().header("access-control-request-method", "GET"),
+            json!({"header":"origin","kind":"missing"}),
+        ),
+        (
+            options().header("origin", &origin),
+            json!({"header":"access-control-request-method","kind":"missing"}),
+        ),
+        (
+            preflight("/api", "GET").header("access-control-request-method", "POST"),
+            json!({"header":"access-control-request-method","kind":"duplicate"}),
+        ),
+        (
+            options().header("origin", &origin).header(
+                "access-control-request-method",
+                reqwest::header::HeaderValue::from_bytes(b"PRIVATE\xff").unwrap(),
+            ),
+            json!({"header":"access-control-request-method","kind":"not_text"}),
+        ),
+        (
+            preflight("/api", "GET")
+                .header("access-control-request-headers", "authorization,,PRIVATE"),
+            json!({"header":"access-control-request-headers","kind":"empty_name"}),
+        ),
+    ] {
+        error_response_details(
+            request.send().await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            details,
+        )
+        .await;
+    }
     app.shutdown().await;
 }
 
@@ -861,17 +963,29 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         "request_too_large",
     )
     .await;
-    error_response(
+    error_response_details(
         app.get("/api").body("x").send().await.unwrap(),
         StatusCode::BAD_REQUEST,
         "invalid_request",
+        json!({"field":"body","kind":"not_allowed"}),
     )
     .await;
-    for (size, status, code) in [
-        (65536, StatusCode::NOT_FOUND, "capability_not_supported"),
-        (65537, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+    let too_large = json!({"field":"body","kind":"too_large"});
+    for (size, status, code, details) in [
+        (
+            65536,
+            StatusCode::NOT_FOUND,
+            "capability_not_supported",
+            Value::Null,
+        ),
+        (
+            65537,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            too_large.clone(),
+        ),
     ] {
-        error_response(
+        error_response_details(
             app.client
                 .post(app.url("/api/v1/config/validate"))
                 .bearer_auth(SECRET)
@@ -881,10 +995,11 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
                 .unwrap(),
             status,
             code,
+            details,
         )
         .await;
     }
-    raw_error(
+    raw_error_details(
         raw_request(
             &app,
             "/api",
@@ -894,8 +1009,9 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         .await,
         413,
         "request_too_large",
+        too_large.clone(),
     );
-    raw_error(
+    raw_error_details(
         raw_request(
             &app,
             "/api",
@@ -905,9 +1021,10 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         .await,
         400,
         "invalid_request",
+        json!({"field":"body","kind":"not_allowed"}),
     );
     let body = format!("10001\r\n{}\r\n0\r\n\r\n", "x".repeat(65537));
-    raw_error(
+    raw_error_details(
         raw_request(
             &app,
             "/api",
@@ -917,6 +1034,7 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         .await,
         413,
         "request_too_large",
+        too_large,
     );
     let trailers = format!("0\r\nX-Padding: {}\r\n\r\n", "x".repeat(8192));
     raw_error(raw_request(&app, "/api", &format!("Authorization: Bearer {SECRET}\r\nTransfer-Encoding: chunked\r\nTrailer: X-Padding\r\nX-Initial: {}\r\n", "x".repeat(8192)), trailers.as_bytes()).await, 413, "request_too_large");

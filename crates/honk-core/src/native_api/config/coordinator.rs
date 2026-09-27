@@ -367,8 +367,12 @@ impl Worker {
                 if active.nodes.iter().any(|node| node.name == input.name) {
                     return Err(management::conflict());
                 }
-                append_node_source(main, &input.name, &input.link)
-                    .map_err(|_| management::unsupported_value())?
+                append_node_source(main, &input.name, &input.link).map_err(|_| {
+                    management::unsupported_value(
+                        "The main source cannot hold this node name and share link",
+                        json!({"resource":"/nodes","fields":["name","link"]}),
+                    )
+                })?
             }
             Mutation::CreateProvider(input) => {
                 if active
@@ -379,7 +383,12 @@ impl Worker {
                     return Err(management::conflict());
                 }
                 append_subscription_source(main, &input.name, &input.url, &input.options())
-                    .map_err(|_| management::unsupported_value())?
+                    .map_err(|_| {
+                        management::unsupported_value(
+                            "The main source cannot hold this provider name, URL or user agent",
+                            json!({"resource":"/providers","fields":["name","url","user_agent"]}),
+                        )
+                    })?
             }
             Mutation::DeleteNode(id) => {
                 let node = uuid::Uuid::parse_str(id)
@@ -728,11 +737,19 @@ impl Worker {
                     .subscriptions
                     .iter()
                     .find(|provider| provider.name == *name)
-                    .ok_or_else(management::unsupported_value)?;
+                    .ok_or_else(|| {
+                        management::unsupported_value(
+                            "The engine did not admit this provider name",
+                            json!({"resource":"/providers","field":"name"}),
+                        )
+                    })?;
                 if check.active.subscriptions.iter().any(|other| {
                     crate::subscription::same_subscription_fetch_identity(other, provider)
                 }) {
-                    return Err(management::unsupported_value());
+                    return Err(management::unsupported_value(
+                        "A provider with the same URL and user agent already exists",
+                        json!({"resource":"/providers","fields":["url","user_agent"]}),
+                    ));
                 }
                 check.deferred.push(provider.clone());
             }

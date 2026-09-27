@@ -791,6 +791,151 @@ fn restricted_addresses_require_cidr_even_with_allowed_ports() {
     assert!(Policy::new(&config).address("::ffff:127.0.0.1".parse().unwrap()));
 }
 
+#[tokio::test]
+async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
+    let proxy = Node::from_share_link("socks5://127.0.0.1:1080").unwrap();
+    let restricted = Node::from_share_link("socks5://10.9.8.7:1080").unwrap();
+    let (proxy, restricted_id) = (proxy.clone(), restricted.id.to_string());
+    let proxy_id = proxy.id.to_string();
+    let mut config = Config::default();
+    config.nodes.extend([proxy, restricted]);
+    config.global.tcp_check_url = vec!["http://127.0.0.1:8080/PRIVATE".into()];
+    config.global.udp_check_dns = Vec::new();
+    let state = state(config).await;
+    let direct = state
+        .config
+        .read()
+        .await
+        .nodes
+        .iter()
+        .find(|node| node.protocol() == honk_config::types::NodeProtocol::Direct)
+        .unwrap()
+        .id
+        .to_string();
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let node = |id: &str| json!({"type":"node","node_id":id});
+    for (index, (input, message, details)) in [
+        (
+            request(node(&direct), "tcp_connect", json!(["tcp"]), "ipv4"),
+            "TCP connect probes do not apply to direct or block nodes",
+            json!({"field":"kind","allowed":["http","dns"]}),
+        ),
+        (
+            request(node(&restricted_id), "tcp_connect", json!(["tcp"]), "ipv4"),
+            "The probe destination address is not permitted",
+            json!({"check":"address","settings":["probe_allowed_cidrs"]}),
+        ),
+        (
+            request(node(&proxy_id), "http", json!(["tcp"]), "ipv4"),
+            "The probe destination port is not permitted",
+            json!({"check":"port","settings":["probe_allowed_ports"]}),
+        ),
+        (
+            request(node(&proxy_id), "dns", json!(["tcp"]), "ipv4"),
+            "No usable DNS check target is configured",
+            json!({"field":"kind","settings":["udp_check_dns"]}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = refusal(&state, &input, index).await;
+        assert_eq!(error["error"]["code"], "unsupported_value", "{error}");
+        assert_eq!(error["error"]["message"], message);
+        assert_eq!(error["error"]["details"], details);
+        for private in ["PRIVATE", "10.9.8.7", "8080", "127.0.0.1"] {
+            assert!(!error.to_string().contains(private), "{error}");
+        }
+    }
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_requests_name_the_field_but_not_the_value() {
+    let state = state(Config::default()).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let input = request(json!({"type":"node"}), "http", json!(["tcp"]), "ipv4");
+    let key = "malformed".to_owned();
+    let error = create(&state, http_request(&input, &key), &RequestId(key))
+        .await
+        .unwrap_err();
+    let body = serde_json::to_value(&error).unwrap();
+    assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(
+        body["error"]["details"],
+        json!({"field":"target.node_id","kind":"missing"})
+    );
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+/// The admission error, or the operation's terminal error when planning passed.
+async fn refusal(state: &Arc<NativeState>, input: &Value, index: usize) -> Value {
+    let key = format!("refusal-{index}");
+    match create(state, http_request(input, &key), &RequestId(key)).await {
+        Ok(accepted) => {
+            let accepted = body(accepted).await;
+            terminal(state, accepted["operation_id"].as_str().unwrap()).await
+        }
+        Err(error) => serde_json::to_value(error).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn http_check_refusals_separate_a_missing_url_a_bad_url_and_a_bad_method() {
+    let proxy = Node::from_share_link("socks5://127.0.0.1:1080").unwrap();
+    let proxy_id = proxy.id.to_string();
+    let urls = json!({"field":"kind","settings":["check_url","tcp_check_url"]});
+    for (index, (url, method, message, details)) in [
+        (
+            None,
+            "HEAD",
+            "No HTTP check URL is configured",
+            urls.clone(),
+        ),
+        (
+            Some("ftp://PRIVATE.example/"),
+            "HEAD",
+            "The configured HTTP check URL is not usable",
+            urls,
+        ),
+        (
+            Some("http://example.test/"),
+            "PRIVATE METHOD",
+            "The configured HTTP check method is not usable",
+            json!({"field":"kind","settings":["tcp_check_http_method"]}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut config = Config::default();
+        config.nodes.push(proxy.clone());
+        config.global.tcp_check_url = url.into_iter().map(String::from).collect();
+        config.global.tcp_check_http_method = method.into();
+        let state = state(config).await;
+        let (stop, receiver) = watch::channel(false);
+        let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+        let input = request(
+            json!({"type":"node","node_id":proxy_id}),
+            "http",
+            json!(["tcp"]),
+            "ipv4",
+        );
+        let error = refusal(&state, &input, index).await;
+        assert_eq!(error["error"]["code"], "unsupported_value", "{error}");
+        assert_eq!(error["error"]["message"], message);
+        assert_eq!(error["error"]["details"], details);
+        assert!(!error.to_string().contains("PRIVATE"), "{error}");
+        stop.send(true).unwrap();
+        worker.await.unwrap();
+    }
+}
+
 #[test]
 fn probe_request_rejects_explicit_null_members_and_caller_urls() {
     let input = request(

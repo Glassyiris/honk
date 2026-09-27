@@ -20,7 +20,7 @@ fn if_match(request: &Request) -> Result<String, ApiError> {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid().with_details(json!({"header":"if-match","kind":"malformed"})))?;
     Ok(hash.to_owned())
 }
 
@@ -143,7 +143,7 @@ pub(in crate::native_api) async fn replace(
     let bytes = axum::body::to_bytes(request.into_body(), 65536)
         .await
         .map_err(|_| too_large())?;
-    let replacement: Replacement = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let replacement: Replacement = body::decode(&bytes, invalid)?;
     let reservation = state.observation.configuration.operations.reserve(
         state.principal(),
         "PUT",
@@ -185,7 +185,7 @@ pub(in crate::native_api) async fn create(
     let bytes = axum::body::to_bytes(request.into_body(), 65536)
         .await
         .map_err(|_| too_large())?;
-    let creation: Creation = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let creation: Creation = body::decode(&bytes, invalid)?;
     if !new_source_path(&creation.path) {
         return Err(invalid());
     }
@@ -225,12 +225,7 @@ pub(in crate::native_api) async fn reload(
     let bytes = axum::body::to_bytes(request.into_body(), 65536)
         .await
         .map_err(|_| too_large())?;
-    if !bytes.is_empty() {
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if !value.as_object().is_some_and(|object| object.is_empty()) {
-            return Err(invalid());
-        }
-    }
+    body::no_inputs(&bytes, invalid)?;
     let reservation = state.observation.configuration.operations.reserve(
         state.principal(),
         "POST",
@@ -262,7 +257,7 @@ pub(in crate::native_api) async fn validate(
     let bytes = axum::body::to_bytes(request.into_body(), 65536)
         .await
         .map_err(|_| too_large())?;
-    let request: ValidationRequest = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let request: ValidationRequest = body::decode(&bytes, invalid)?;
     if request.sources.is_empty() || request.sources.len() > MAX_SOURCES {
         return Err(if request.sources.is_empty() {
             invalid()

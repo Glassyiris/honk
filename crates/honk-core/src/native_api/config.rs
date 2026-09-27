@@ -32,7 +32,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::operations::{OperationStore, Reservation};
 use super::store::{SourceStore, StoreKind};
-use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
+use super::{
+    ApiError, ErrorCode, NativeState, body, error, parse_query, timestamp, types::RequestId,
+};
 use crate::configuration::{
     Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate, limits,
     same_dependencies,
@@ -698,13 +700,14 @@ pub(super) fn request_header<'a>(
     request: &'a Request,
     name: &str,
 ) -> Result<Option<&'a str>, ApiError> {
+    let rejected = |kind| invalid().with_details(json!({"header": name, "kind": kind}));
     let mut values = request.headers().get_all(name).iter();
     let first = values.next();
     if values.next().is_some() {
-        return Err(invalid());
+        return Err(rejected("duplicate"));
     }
     first
-        .map(|value| value.to_str().map_err(|_| invalid()))
+        .map(|value| value.to_str().map_err(|_| rejected("not_text")))
         .transpose()
 }
 pub(super) fn json_type(request: &Request) -> Result<(), ApiError> {
