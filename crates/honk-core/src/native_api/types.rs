@@ -34,6 +34,35 @@ pub enum ErrorCode {
     InvalidCredentials,
 }
 
+impl ErrorCode {
+    /// The wire spelling, for errors embedded in operations.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::AuthenticationRequired => "authentication_required",
+            Self::PermissionDenied => "permission_denied",
+            Self::ResourceNotFound => "resource_not_found",
+            Self::CapabilityNotSupported => "capability_not_supported",
+            Self::StateConflict => "state_conflict",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::EventCursorExpired => "event_cursor_expired",
+            Self::SnapshotUnavailable => "snapshot_unavailable",
+            Self::SnapshotExpired => "snapshot_expired",
+            Self::FlowExpired => "flow_expired",
+            Self::StaleRevision => "stale_revision",
+            Self::RequestTooLarge => "request_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::UnsupportedValue => "unsupported_value",
+            Self::PreconditionRequired => "precondition_required",
+            Self::RateLimited => "rate_limited",
+            Self::TemporarilyUnavailable => "temporarily_unavailable",
+            Self::SetupRequired => "setup_required",
+            Self::SetupAlreadyCompleted => "setup_already_completed",
+            Self::InvalidCredentials => "invalid_credentials",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
     #[serde(skip)]
@@ -98,6 +127,15 @@ impl ApiError {
 
     pub(crate) fn into_details(self) -> Option<Value> {
         self.error.details
+    }
+
+    /// Code, message and details for an operation that fails with this error.
+    pub(crate) fn into_safe(self) -> (&'static str, &'static str, Option<Value>) {
+        (
+            self.error.code.as_str(),
+            self.message(),
+            self.into_details(),
+        )
     }
 
     pub(crate) fn for_management(mut self, deleting: bool) -> Self {

@@ -555,6 +555,99 @@ pub(super) fn nfqueue_present(section: &[Segment<'_, '_>]) -> bool {
     })
 }
 
+const CLASH_API_KEYS: &[&str] = &[
+    "external_controller",
+    "external_ui",
+    "external_ui_download_url",
+    "external_ui_download_detour",
+    "secret",
+    "default_mode",
+];
+const CACHE_FILE_KEYS: &[&str] = &["enabled", "path", "cache_id", "store_fakeip", "store_dns"];
+const UDP_NFQUEUE_KEYS: &[&str] = &["enabled"];
+const NATIVE_API_KEYS: &[&str] = &[
+    "enabled",
+    "listen",
+    "secret",
+    "password_auth",
+    "allow_anonymous_loopback",
+    "allow_origins",
+    "allowed_hosts",
+    "ui",
+    "record_flows",
+    "record_traffic",
+    "record_memory",
+    "record_logs",
+    "record_dns_log",
+    "probe_allowed_cidrs",
+    "probe_allowed_ports",
+    "config_write",
+    "config_content",
+    "writable_includes",
+    "geosite_download_url",
+    "geoip_download_url",
+    "geodata_download_detour",
+];
+
+/// Experimental blocks, their keys, and the hint for a key only that block owns.
+const EXPERIMENTAL_BLOCKS: [(&str, &[&str], &str); 4] = [
+    (
+        "clash_api",
+        CLASH_API_KEYS,
+        "clash API setting belongs inside clash_api { }",
+    ),
+    (
+        "cache_file",
+        CACHE_FILE_KEYS,
+        "cache file setting belongs inside cache_file { }",
+    ),
+    (
+        "udp_nfqueue",
+        UDP_NFQUEUE_KEYS,
+        "NFQUEUE setting belongs inside udp_nfqueue { }",
+    ),
+    (
+        "native_api",
+        NATIVE_API_KEYS,
+        "native API setting belongs inside native_api { }",
+    ),
+];
+
+/// Diagnostics carry schema names only, so an unknown key is named back only
+/// when honk knows it from another section.
+fn schema_key(key: &str) -> Option<&'static str> {
+    EXPERIMENTAL_BLOCKS
+        .iter()
+        .map(|(_, keys, _)| *keys)
+        .chain([GLOBAL_KEYS])
+        .flatten()
+        .copied()
+        .find(|known| *known == key)
+}
+
+fn unknown_experimental_setting(
+    text: Text<'_, '_>,
+    key: &str,
+) -> crate::error::DetailedConfigError {
+    let mut error = scalar_error(
+        text,
+        "unknown-experimental-setting",
+        "experimental",
+        "unknown experimental setting",
+    );
+    if let Some(key) = schema_key(key) {
+        error.diagnostic.setting.0.push(SettingSegment::Field(key));
+        let mut owners = EXPERIMENTAL_BLOCKS
+            .iter()
+            .filter(|(_, keys, _)| keys.contains(&key));
+        // A key several blocks share (`enabled`, `secret`) has no single home.
+        if let (Some((_, _, hint)), None) = (owners.next(), owners.next()) {
+            error.diagnostic.message = hint;
+        }
+    }
+    error
+}
+
 pub(super) fn parse_experimental_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
@@ -568,63 +661,21 @@ pub(super) fn parse_experimental_section(
         for segment in body {
             diagnostics.at_text(Text::segment(&segment));
             let Some(header) = read::block_header(&segment) else {
-                return Err(scalar_error(
-                    Text::segment(&segment),
-                    "unknown-experimental-setting",
-                    "experimental",
-                    "unknown experimental setting",
-                )
-                .into());
+                let text = Text::segment(&segment);
+                let key = text.kv().map_or(text, |(key, _)| key).raw();
+                return Err(unknown_experimental_setting(text, key).into());
             };
             let name = header.raw();
             let mut values = HashMap::new();
-            let known_keys = match name {
-                "clash_api" => &[
-                    "external_controller",
-                    "external_ui",
-                    "external_ui_download_url",
-                    "external_ui_download_detour",
-                    "secret",
-                    "default_mode",
-                ][..],
-                "cache_file" => &["enabled", "path", "cache_id", "store_fakeip", "store_dns"][..],
-                "udp_nfqueue" => &["enabled"][..],
-                "native_api" => &[
-                    "enabled",
-                    "listen",
-                    "secret",
-                    "password_auth",
-                    "allow_anonymous_loopback",
-                    "allow_origins",
-                    "allowed_hosts",
-                    "ui",
-                    "record_flows",
-                    "record_traffic",
-                    "record_memory",
-                    "record_logs",
-                    "record_dns_log",
-                    "probe_allowed_cidrs",
-                    "probe_allowed_ports",
-                    "config_write",
-                    "config_content",
-                    "writable_includes",
-                    "geosite_download_url",
-                    "geoip_download_url",
-                    "geodata_download_detour",
-                ][..],
-                _ => {
-                    return Err(scalar_error(
-                        header,
-                        "unknown-experimental-setting",
-                        "experimental",
-                        "unknown experimental setting",
-                    )
-                    .into());
-                }
+            let Some(&(_, known_keys, _)) = EXPERIMENTAL_BLOCKS
+                .iter()
+                .find(|(block, _, _)| *block == name)
+            else {
+                return Err(unknown_experimental_setting(header, name).into());
             };
             let strict_section = matches!(name, "udp_nfqueue" | "native_api");
-            let strict_error = |text| {
-                if name == "native_api" {
+            let strict_error = |text, key: &str| {
+                let mut error = if name == "native_api" {
                     scalar_error(
                         text,
                         "unknown-native-api-setting",
@@ -638,7 +689,11 @@ pub(super) fn parse_experimental_section(
                         "experimental.udp_nfqueue",
                         "unknown NFQUEUE setting; only enabled is supported",
                     )
+                };
+                if let Some(key) = schema_key(key) {
+                    error.diagnostic.setting.0.push(SettingSegment::Field(key));
                 }
+                error
             };
             let lines = if strict_section {
                 let mut lines = Vec::new();
@@ -646,8 +701,8 @@ pub(super) fn parse_experimental_section(
                     for child in body {
                         let text = Text::segment(&child);
                         diagnostics.at_text(text);
-                        if read::block_header(&child).is_some() {
-                            return Err(strict_error(text).into());
+                        if let Some(header) = read::block_header(&child) {
+                            return Err(strict_error(text, header.raw()).into());
                         }
                         lines.push(text);
                     }
@@ -660,7 +715,7 @@ pub(super) fn parse_experimental_section(
                 diagnostics.at_text(line);
                 let Some((key, value)) = line.kv() else {
                     if strict_section {
-                        return Err(strict_error(line).into());
+                        return Err(strict_error(line, line.raw()).into());
                     }
                     line.notice(
                         diagnostics,
@@ -672,7 +727,7 @@ pub(super) fn parse_experimental_section(
                 };
                 if !known_keys.contains(&key.raw()) {
                     if strict_section {
-                        return Err(strict_error(line).into());
+                        return Err(strict_error(line, key.raw()).into());
                     }
                     key.notice(
                         diagnostics,

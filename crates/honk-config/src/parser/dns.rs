@@ -101,7 +101,7 @@ fn raw_fields<'d, 'a>(
                 diagnostics,
                 Severity::Warning,
                 "unknown-statement",
-                "unknown DNS statement ignored",
+                "unknown DNS statement ignored; expected key: value or an upstream, routing or fixed_domain_ttl block",
             );
             continue;
         };
@@ -122,7 +122,7 @@ fn raw_fields<'d, 'a>(
                 diagnostics,
                 Severity::Warning,
                 "unknown-key",
-                "unknown scalar key ignored",
+                "unknown DNS key ignored; expected bind, use_host, client_subnet, ipversion_prefer, optimistic_cache, optimistic_cache_ttl, optimistic_stale_reply_ttl or max_cache_size",
             );
             continue;
         }
