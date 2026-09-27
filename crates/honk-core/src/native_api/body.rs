@@ -18,6 +18,11 @@ pub(super) fn decode<T: DeserializeOwned>(
     from_slice(bytes).map_err(|details| invalid().with_details(details))
 }
 
+/// A JSON value with no schema: only its syntax can fail, so no path is tracked.
+pub(super) fn value(bytes: &[u8], invalid: impl FnOnce() -> ApiError) -> Result<Value, ApiError> {
+    serde_json::from_slice(bytes).map_err(|_| invalid().with_details(invalid_json()))
+}
+
 /// [`decode`] for part of a body already read as JSON; `at` names that part,
 /// or is empty for the whole body.
 pub(super) fn decode_value<T: DeserializeOwned>(

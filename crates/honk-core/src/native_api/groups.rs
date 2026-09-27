@@ -197,14 +197,16 @@ impl GroupPatch {
             .as_array()
             .filter(|operations| !operations.is_empty())
             .ok_or_else(invalid)?;
-        // Without a policy write the group cannot become URLTest, so any
-        // tolerance write fails on the policy rule whatever its value.
-        let never_urltest = initial[0]["kind"] != "urltest"
-            && !operations
-                .iter()
-                .any(|operation| operation.get("path").and_then(Value::as_str) == Some(PATHS[0]));
         let rejected = |op: &str, path: usize| {
-            if path == 3 && op != "test" && never_urltest {
+            // Without a policy write the group cannot become URLTest, so any
+            // tolerance write fails on the policy rule whatever its value.
+            let never_urltest = || {
+                initial[0]["kind"] != "urltest"
+                    && !operations.iter().any(|operation| {
+                        operation.get("path").and_then(Value::as_str) == Some(PATHS[0])
+                    })
+            };
+            if path == 3 && op != "test" && never_urltest() {
                 tolerance_not_urltest()
             } else {
                 unsupported_value(path)
@@ -388,7 +390,7 @@ pub(super) async fn patch(
                 None,
             )
         })?;
-    let operations: Value = super::body::decode(&bytes, invalid)?;
+    let operations = super::body::value(&bytes, invalid)?;
     let reservation = state.observation.operations.reserve(
         state.principal(),
         "PATCH",

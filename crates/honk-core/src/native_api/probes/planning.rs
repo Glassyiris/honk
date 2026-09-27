@@ -285,14 +285,17 @@ fn plan(
                 .or_else(|| config.global.tcp_check_url.first().map(String::as_str))
                 .ok_or_else(|| configured("No HTTP check URL is configured", &URLS))?;
             let method = &config.global.tcp_check_http_method;
-            honk_outbound::urltest::probe_method(method).map_err(|_| {
-                configured(
-                    "The configured HTTP check method is not usable",
-                    &["tcp_check_http_method"],
-                )
-            })?;
-            let http = honk_outbound::urltest::health_http_probe_request(url, method)
-                .map_err(|_| unusable_url())?;
+            let http =
+                honk_outbound::urltest::health_http_probe_request(url, method).map_err(|_| {
+                    if honk_outbound::urltest::probe_method(method).is_err() {
+                        configured(
+                            "The configured HTTP check method is not usable",
+                            &["tcp_check_http_method"],
+                        )
+                    } else {
+                        unusable_url()
+                    }
+                })?;
             let host = http
                 .uri()
                 .host()

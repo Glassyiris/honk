@@ -529,7 +529,7 @@ pub(super) async fn patch(
                 id,
             )
         })?;
-    let mut value: Value = super::body::decode(&bytes, || invalid(id))?;
+    let mut value = super::body::value(&bytes, || invalid(id))?;
     let geodata = value
         .as_object_mut()
         .and_then(|object| object.remove("geodata"))
