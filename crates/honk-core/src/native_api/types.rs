@@ -178,6 +178,17 @@ pub(super) struct Runtime {
     pub(super) traffic: TrafficSummary,
     pub(super) process: Process,
     pub(super) last_reload: Option<Value>,
+    pub(super) degradations: Vec<Degradation>,
+}
+
+/// A contract `SafeError` plus the reduced component and when it degraded.
+#[derive(Clone, Serialize)]
+pub(super) struct Degradation {
+    pub(super) code: &'static str,
+    pub(super) message: &'static str,
+    pub(super) details: Value,
+    pub(super) component: &'static str,
+    pub(super) since: String,
 }
 
 #[derive(Clone, Serialize)]

@@ -164,6 +164,8 @@ pub struct ControlPlane {
     /// The state database handed to `init_cache_db`.
     state_db: Option<Arc<crate::state::StateDb>>,
     state_tick: cache::StateTick,
+    /// Features running reduced; shared with startup and the native API.
+    degradations: Arc<crate::degradations::Degradations>,
     /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,

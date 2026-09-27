@@ -88,6 +88,20 @@ pub enum StateError {
     InUse,
 }
 
+impl StateError {
+    /// Stable cause code for the runtime degradation list.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Unsafe => "unsafe",
+            Self::Corrupt => "corrupt",
+            Self::Unsupported => "unsupported",
+            Self::Locked => "locked",
+            Self::InUse => "in_use",
+        }
+    }
+}
+
 /// Connection class; it decides `synchronous` and `foreign_keys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
