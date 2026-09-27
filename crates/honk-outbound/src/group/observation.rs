@@ -273,7 +273,7 @@ pub(super) fn score(id: Uuid, score: f64) {
     #[cfg(feature = "native-api")]
     captured::update(|state, index| {
         for row in &mut state.decisions[index].candidates {
-            if row.leaf_node_id == Some(id) {
+            if row.leaf_node_id == Some(id) && row.eligible == Some(true) {
                 row.score = score.is_finite().then_some(score);
             }
         }
@@ -285,7 +285,7 @@ pub(super) fn score_eligible(id: Uuid, eligible: bool) {
     #[cfg(feature = "native-api")]
     captured::update(|state, index| {
         for row in &mut state.decisions[index].candidates {
-            if row.leaf_node_id == Some(id) {
+            if row.leaf_node_id == Some(id) && row.eligible == Some(true) {
                 row.reason = if eligible {
                     "score_ordinary_eligible"
                 } else {

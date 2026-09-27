@@ -427,6 +427,18 @@ fn automatic_group_pins_act_as_selector_choices_until_replaced() {
                 Some(expected),
                 "{policy:?}"
             );
+            if policy == GroupPolicy::Score {
+                let context = ScoreSelectionContext::aggregate(
+                    SelectionNetwork::from_probe_domain(domain),
+                    domain,
+                    IpVersion::V4,
+                );
+                let plan = manager.selection_plan_for_target("auto", &context);
+                assert_eq!(plan.entries[0].node.id, expected);
+                let attempt = plan.entries[0].feedback.as_ref().unwrap();
+                let _admitted = attempt.begin().unwrap();
+                assert_eq!(attempt.attributions()[0].node_id, expected);
+            }
         }
         assert_eq!(
             manager.selection_chain_for_network("auto", SelectionNetwork::Udp),

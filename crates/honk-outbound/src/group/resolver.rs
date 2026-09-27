@@ -281,6 +281,7 @@ impl GroupManager {
             effects,
             score::selection::ScoreSelectionRules::default(),
         )
+        .0
     }
 
     pub(super) fn members<'a>(&'a self, group: &'a Group) -> impl Iterator<Item = GroupMember<'a>> {

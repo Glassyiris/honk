@@ -481,10 +481,6 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
             manager
                 .set_selector_choice("child", "a", crate::group::SelectorNetworks::Both)
                 .unwrap();
-            let parent = &manager.groups["parent"];
-            let selected_member = manager
-                .selector_member(parent, SelectionNetwork::from_probe_domain(domain))
-                .unwrap();
             let context = ScoreSelectionContext {
                 target: Some(ScoreTarget::domain("commit.example", 443)),
                 ..ScoreSelectionContext::aggregate(
@@ -493,42 +489,30 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
                     IpVersion::V4,
                 )
             };
-            let mut visited = Vec::new();
-            let candidates = if target_aware {
-                manager.flatten_candidates_for_target(
-                    parent,
-                    &context,
-                    &mut visited,
-                    0,
-                    SelectionEffects::Apply,
-                    super::super::selection::ScoreSelectionRules::default(),
-                )
-            } else {
-                manager.flatten_candidates(
-                    parent,
-                    context.probe_domain,
-                    context.health_family,
-                    &mut visited,
-                    0,
-                    SelectionEffects::Apply,
-                )
-            };
-
-            // A failed serving commit must not resurrect the child's old leaf.
+            assert_eq!(
+                manager
+                    .peek_selection_plan_for_domain("parent", domain, IpVersion::V4)
+                    .nodes[0]
+                    .id,
+                nodes[0].id
+            );
             manager
                 .set_selector_choice("child", "b", crate::group::SelectorNetworks::Both)
                 .unwrap();
-            let picked = GroupManager::pick_selector(&candidates, selected_member).unwrap();
-            let committed = manager.commit_selector_pick_for_target(
-                parent,
-                picked,
-                &context,
-                &mut visited,
-                0,
-                SelectionEffects::Apply,
-                super::super::selection::ScoreSelectionRules::default(),
-            );
-            results.push(committed.map(|candidate| candidate.node.id));
+            let committed = if target_aware {
+                manager
+                    .selection_plan_for_target("parent", &context)
+                    .entries
+                    .first()
+                    .map(|entry| entry.node.id)
+            } else {
+                manager
+                    .selection_plan_for_domain("parent", domain, IpVersion::V4)
+                    .nodes
+                    .first()
+                    .map(|node| node.id)
+            };
+            results.push(committed);
         }
     }
     assert_eq!(

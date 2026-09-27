@@ -3,15 +3,15 @@ use super::{
     AggregateKey, ExactKey, MIN_TRAINED_EVIDENCE, MetricSnapshot, PERFORMANCE_SWITCH_MARGIN,
     PerformanceBaseline, PerformanceSnapshot, RELIABILITY_CLOSE, RankedSelection,
     SCORE_EXPLORE_BACKOFF_BASE, SCORE_EXPLORE_BACKOFF_MAX, SCORE_FAIL_STREAK_EXCLUDE,
-    SCORE_SWITCH_FULL_EVIDENCE, ScoreAuthority, ScorePolicyState, ScoreSelectionContext,
-    ScoreSnapshot, SelectionCadenceKey, SelectionHistoryKey, SelectionReason, SelectionReasonKey,
-    StateInner, Stats, budget, comparison,
+    SCORE_SWITCH_FULL_EVIDENCE, ScoreSelectionContext, ScoreSnapshot, SelectionHistoryKey,
+    SelectionReason, SelectionReasonKey, StateInner, Stats, comparison,
 };
 use crate::group::observation;
 use honk_config::node::Node;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+mod dispatch;
 
 pub(super) fn explore_backoff(streak: u32) -> Duration {
     SCORE_EXPLORE_BACKOFF_BASE
@@ -26,8 +26,7 @@ pub(super) struct Decision {
     pub baseline: PerformanceBaseline,
     pub ordinary: RankedSelection,
     pub evaluation: Option<super::evaluation::EvaluationSet>,
-    /// Aligned with `scores`: members that may receive comparison pairs, evidence and optional
-    /// work.
+    /// Aligned with `scores`: the shared serving pool for ordinary and optional work.
     pub membership: Vec<bool>,
 }
 
@@ -36,14 +35,13 @@ pub(super) fn decision(
     group: &str,
     context: &ScoreSelectionContext,
     nodes: &[&Node],
+    origins: super::super::ScoreView<'_, '_>,
     now: Instant,
     apply: bool,
-) -> Decision {
+) -> Option<Decision> {
     let view = comparison::View::new(inner, group, context, nodes, now);
-    let (mut decision, evaluation) = ordinary_decision(&view, apply);
+    let (mut decision, evaluation) = ordinary_decision(&view, origins, apply)?;
     if decision.ordinary.index != decision.pairs.reference {
-        // The winner is always evaluated, even when it was outside the stored set.
-        decision.membership = evaluation.membership(nodes, decision.ordinary.index);
         decision.pairs = view.pairs(
             (&decision.scores, decision.baseline),
             (&decision.membership, decision.ordinary.index),
@@ -51,41 +49,94 @@ pub(super) fn decision(
     }
     decision.evidence = view.node_evidence(&decision.membership);
     decision.evaluation = apply.then(|| evaluation.into_owned());
-    decision
+    Some(decision)
 }
 
 /// The ordinary choice alone: no verification evidence, and pairs stay bound to the incumbent.
 fn ordinary_decision<'a>(
     view: &comparison::View<'a>,
+    origins: super::super::ScoreView<'_, '_>,
     apply: bool,
-) -> (
+) -> Option<(
     Decision,
     std::borrow::Cow<'a, super::evaluation::EvaluationSet>,
-) {
+)> {
     let (inner, group, context, nodes, now) =
         (view.inner, view.group, view.context, view.nodes, view.now);
-    let scores = score_snapshots(inner, group, context, nodes.iter().map(|node| node.id), now);
-    let baseline = performance_baseline(&scores);
+    let stored = inner.evaluation(group, context.network);
+    let mut failure_key = AggregateKey {
+        group: group.to_owned(),
+        network: context.network,
+        family: None,
+        node_id: Uuid::nil(),
+    };
+    let scores = score_snapshots(
+        inner,
+        &mut failure_key,
+        context,
+        nodes.iter().map(|node| node.id),
+        now,
+    );
+    failure_key.family = None;
+    let evaluation = super::evaluation::derive(
+        stored,
+        nodes,
+        &scores,
+        now,
+        apply,
+        origins.origins.iter().map(|candidate| {
+            (
+                candidate.node.id,
+                candidate.via.map(|group| group.name.as_str()),
+            )
+        }),
+        |(node, via)| {
+            failure_key.node_id = node;
+            origins
+                .health_filtered
+                .is_some_and(|ids| ids.contains(node))
+                || via.is_some_and(|owner| origins.withdrawn.contains(&owner))
+                || inner
+                    .aggregate
+                    .peek(&failure_key)
+                    .is_some_and(|stats| stats.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE)
+        },
+    );
+    let membership = evaluation.membership(nodes);
     let incumbent = inner
         .selection_history
         .peek(&SelectionHistoryKey::new(group, context))
         .inspect(|history| observation::previous_node(history.current))
-        .and_then(|history| nodes.iter().position(|node| node.id == history.current));
-    let reference = incumbent.unwrap_or_else(|| best_index(&scores, nodes, baseline).index);
-    let evaluation = super::evaluation::derive(
-        inner
-            .evaluation
-            .get(&SelectionReasonKey::new(group, context.network)),
-        nodes,
-        &scores,
-        baseline,
-        now,
-        apply,
+        .and_then(|history| nodes.iter().position(|node| node.id == history.current))
+        .filter(|index| membership[*index]);
+    if !membership.iter().any(|member| *member) {
+        if observation::active() {
+            for node in nodes {
+                observation::score_eligible(node.id, false);
+            }
+        }
+        return None;
+    }
+    let baseline = performance_baseline(
+        scores
+            .iter()
+            .zip(&membership)
+            .filter_map(|(score, member)| member.then_some(score)),
     );
-    let membership = evaluation.membership(nodes, reference);
+    if observation::active() {
+        for ((node, score), member) in nodes.iter().zip(&scores).zip(&membership) {
+            let eligible = *member && normal_eligible(score, baseline);
+            observation::score_eligible(node.id, eligible);
+            if eligible {
+                observation::score(node.id, utility(score, baseline));
+            }
+        }
+    }
+    let reference = incumbent
+        .unwrap_or_else(|| best_index(&scores, nodes, baseline, |index| membership[index]).index);
     let pairs = view.pairs((&scores, baseline), (&membership, reference));
-    let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
-    (
+    let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs, &membership);
+    Some((
         Decision {
             scores,
             evidence: Vec::new(),
@@ -96,220 +147,7 @@ fn ordinary_decision<'a>(
             membership,
         },
         evaluation,
-    )
-}
-
-impl ScorePolicyState {
-    pub(in crate::group) fn rank(
-        self: &Arc<Self>,
-        authority: &Arc<ScoreAuthority>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-        allow_trials: bool,
-    ) -> (usize, Option<Arc<budget::Work>>) {
-        self.rank_inner(
-            Some(authority),
-            group,
-            context,
-            nodes,
-            Instant::now(),
-            allow_trials,
-        )
-    }
-
-    pub(in crate::group) fn peek_rank(
-        self: &Arc<Self>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-    ) -> usize {
-        self.rank_inner(None, group, context, nodes, Instant::now(), false)
-            .0
-    }
-
-    #[cfg(test)]
-    pub(super) fn peek_rank_at(
-        self: &Arc<Self>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-        now: Instant,
-    ) -> usize {
-        self.rank_inner(None, group, context, nodes, now, false).0
-    }
-
-    #[cfg(test)]
-    pub(super) fn rank_at(
-        self: &Arc<Self>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-        now: Instant,
-    ) -> usize {
-        let authority = self
-            .inner
-            .lock()
-            .active_authority
-            .clone()
-            .unwrap_or_else(|| Arc::new(ScoreAuthority));
-        self.rank_inner(Some(&authority), group, context, nodes, now, true)
-            .0
-    }
-
-    #[cfg(test)]
-    pub(super) fn rank_plan_at(
-        self: &Arc<Self>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-        now: Instant,
-    ) -> (usize, super::ScoreAttempt) {
-        let authority = self
-            .inner
-            .lock()
-            .active_authority
-            .clone()
-            .expect("published test membership");
-        let (index, reservation) =
-            self.rank_inner(Some(&authority), group, context, nodes, now, true);
-        let feedback = super::ScoreAttempt::planned(
-            super::ScoreFeedback::new(
-                Arc::clone(self),
-                authority,
-                context.clone(),
-                vec![super::ScoreAttribution {
-                    group: group.to_owned(),
-                    node_id: nodes[index].id,
-                }],
-            ),
-            Arc::new(budget::Opportunity::default()),
-            reservation.into_iter().collect(),
-            super::ScoreTrialSource::None,
-        );
-        (index, feedback)
-    }
-
-    fn rank_inner(
-        self: &Arc<Self>,
-        authority: Option<&Arc<ScoreAuthority>>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-        now: Instant,
-        allow_trials: bool,
-    ) -> (usize, Option<Arc<budget::Work>>) {
-        if nodes.is_empty() {
-            return (0, None);
-        }
-        let mut inner = self.inner.lock();
-        observation::metric("score_utility", None);
-        let authorized = authority.is_some_and(|authority| {
-            inner
-                .active_authority
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(active, authority))
-        }) && inner.valid_groups.contains(group);
-        if !authorized {
-            let view = comparison::View::new(&inner, group, context, nodes, now);
-            let ordinary = ordinary_decision(&view, false).0.ordinary;
-            observe_reason(ordinary.reason);
-            return (ordinary.index, None);
-        }
-        let mut decision = decision(&inner, group, context, nodes, now, true);
-        let mut set = decision
-            .evaluation
-            .take()
-            .expect("Apply prepares membership");
-        let snapshots = &decision.scores;
-        let performance = decision.baseline;
-        let ordinary = decision.ordinary;
-        let cadence_key = SelectionCadenceKey::new(group, context);
-        set.anchor(nodes[ordinary.index].id);
-        inner
-            .evaluation
-            .insert(SelectionReasonKey::new(group, context.network), set);
-        let history_key = SelectionHistoryKey::new(group, context);
-        inner
-            .revalidated_at
-            .entry(cadence_key.clone())
-            .or_insert(now);
-        let mut selection = ordinary;
-        let mut reservation = None;
-        // An ordinary escape to a different leaf serves the business instead of a trial; a
-        // bypass label alone must not starve funded validation of alternatives.
-        let escaping = matches!(
-            ordinary.reason,
-            SelectionReason::IncumbentIneligible | SelectionReason::FreshFailureBypass
-        ) && inner
-            .selection_history
-            .peek(&history_key)
-            .is_some_and(|history| history.current != nodes[ordinary.index].id);
-        if allow_trials && context.target.is_some() && !escaping {
-            (selection, reservation) = super::verification::plan(
-                self,
-                &mut inner,
-                (group, context),
-                &decision,
-                nodes,
-                now,
-            );
-        }
-        if selection.reason.is_exploration() {
-            if snapshots[ordinary.index]
-                .carrier_pressure_at
-                .is_some_and(|at| {
-                    inner
-                        .revalidated_at
-                        .get(&cadence_key)
-                        .is_some_and(|revalidated_at| at > *revalidated_at)
-                })
-            {
-                let counts = inner
-                    .selection_reasons
-                    .entry(SelectionReasonKey::new(group, context.network))
-                    .or_default();
-                counts.carrier_validation = counts.carrier_validation.saturating_add(1);
-            }
-            if let Some(revalidated_at) = inner.revalidated_at.get_mut(&cadence_key) {
-                *revalidated_at = now;
-            }
-        }
-        Self::record_verification(
-            &mut inner,
-            &history_key,
-            super::verification::usable(&decision.evidence[selection.index]),
-            selection.reason.is_exploration(),
-        );
-        if nodes.len() > 1 {
-            let streak_excluded = snapshots
-                .iter()
-                .filter(|score| {
-                    performance.any_healthy && score.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE
-                })
-                .count() as u64;
-            let backed_off = snapshots
-                .iter()
-                .filter(|score| score.explore_backed_off)
-                .count() as u64;
-            let counts = inner
-                .selection_reasons
-                .entry(SelectionReasonKey::new(group, context.network))
-                .or_default();
-            counts.fail_streak_excluded =
-                counts.fail_streak_excluded.saturating_add(streak_excluded);
-            counts.explore_backed_off = counts.explore_backed_off.saturating_add(backed_off);
-            Self::record_selection_reason(&mut inner, group, context.network, selection);
-            Self::record_switch_flap(
-                &mut inner,
-                &history_key,
-                nodes[selection.index].id,
-                selection.reason,
-            );
-        }
-        observe_reason(selection.reason);
-        (selection.index, reservation)
-    }
+    ))
 }
 
 /// An admitted begin, not a plan, is a real opportunity; one tick covers every attribution.
@@ -337,9 +175,10 @@ pub(super) fn ordinary_selection(
     incumbent: Option<usize>,
     performance: PerformanceBaseline,
     pairs: &comparison::PairCohort,
+    membership: &[bool],
 ) -> RankedSelection {
-    let best = best_index(snapshots, nodes, performance);
-    let Some(index) = incumbent else {
+    let best = best_index(snapshots, nodes, performance, |index| membership[index]);
+    let Some(index) = incumbent.filter(|index| membership[*index]) else {
         return best;
     };
     let current = &snapshots[index];
@@ -364,7 +203,8 @@ pub(super) fn ordinary_selection(
     let mut directional_tradeoff = false;
     // Only pairs prepared against this fixed incumbent may compete.
     for (candidate_index, candidate) in snapshots.iter().enumerate() {
-        if candidate_index == index
+        if !membership[candidate_index]
+            || candidate_index == index
             || !normal_eligible(candidate, performance)
             || candidate.completed < MIN_TRAINED_EVIDENCE
             || pairs.reference != index
@@ -414,31 +254,27 @@ pub(super) fn best_index(
     snapshots: &[ScoreSnapshot],
     nodes: &[&Node],
     performance: PerformanceBaseline,
+    allowed: impl Fn(usize) -> bool,
 ) -> RankedSelection {
     let index = snapshots
         .iter()
         .enumerate()
-        .filter(|(index, score)| {
-            let eligible = normal_eligible(score, performance);
-            observation::score_eligible(nodes[*index].id, eligible);
-            eligible
-        })
+        .filter(|(index, score)| allowed(*index) && normal_eligible(score, performance))
         .max_by(|(left_index, left), (right_index, right)| {
-            let left_utility = utility(left, performance);
-            let right_utility = utility(right, performance);
-            observation::score(nodes[*left_index].id, left_utility);
-            observation::score(nodes[*right_index].id, right_utility);
-            left_utility
-                .total_cmp(&right_utility)
+            utility(left, performance)
+                .total_cmp(&utility(right, performance))
                 .then_with(|| right_index.cmp(left_index))
                 .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
         })
         .map(|(index, _)| index)
-        .unwrap_or(0);
-    let alternatives = snapshots
-        .iter()
-        .enumerate()
-        .any(|(other, score)| other != index && normal_eligible(score, performance));
+        .unwrap_or_else(|| {
+            (0..snapshots.len())
+                .find(|index| allowed(*index))
+                .expect("nonempty serving pool")
+        });
+    let alternatives = snapshots.iter().enumerate().any(|(other, score)| {
+        allowed(other) && other != index && normal_eligible(score, performance)
+    });
     RankedSelection {
         index,
         reason: if alternatives {
@@ -447,20 +283,6 @@ pub(super) fn best_index(
             SelectionReason::ReliabilityWinner
         },
     }
-}
-
-fn observe_reason(reason: SelectionReason) {
-    observation::reason(match reason {
-        SelectionReason::ColdExplore => "cold_explore",
-        SelectionReason::PeriodicExplore => "periodic_explore",
-        SelectionReason::ReliabilityWinner => "reliability_winner",
-        SelectionReason::PerformanceWinner => "performance_winner",
-        SelectionReason::IncumbentHeld => "incumbent_held",
-        SelectionReason::InsufficientEvidenceHeld => "insufficient_evidence_held",
-        SelectionReason::DirectionalTradeoffHeld => "directional_tradeoff_held",
-        SelectionReason::IncumbentIneligible => "incumbent_ineligible",
-        SelectionReason::FreshFailureBypass => "fresh_failure_bypass",
-    });
 }
 
 pub(super) fn normal_eligible(score: &ScoreSnapshot, baseline: PerformanceBaseline) -> bool {
@@ -589,27 +411,27 @@ pub(super) fn score_snapshot(
     node_id: Uuid,
     now: Instant,
 ) -> ScoreSnapshot {
-    score_snapshots(inner, group, context, [node_id], now).remove(0)
+    let mut key = AggregateKey {
+        group: group.to_owned(),
+        network: context.network,
+        family: None,
+        node_id,
+    };
+    score_snapshots(inner, &mut key, context, [node_id], now).remove(0)
 }
 
-pub(super) fn score_snapshots(
+fn score_snapshots(
     inner: &StateInner,
-    group: &str,
+    layer: &mut AggregateKey,
     context: &ScoreSelectionContext,
     nodes: impl IntoIterator<Item = Uuid>,
     now: Instant,
 ) -> Vec<ScoreSnapshot> {
-    let mut layer = AggregateKey {
-        group: group.to_owned(),
-        network: context.network,
-        family: None,
-        node_id: Uuid::nil(),
-    };
     let mut exact = context
         .target_family
         .zip(context.target.clone())
         .map(|(family, target)| ExactKey {
-            group: group.to_owned(),
+            group: layer.group.clone(),
             network: context.network,
             family,
             target,
@@ -630,14 +452,15 @@ pub(super) fn score_snapshots(
         .map(|node_id| {
             layer.node_id = node_id;
             layer.family = None;
-            let global_stats = inner.aggregate.peek(&layer);
+            let global_stats = inner.aggregate.peek(&*layer);
             let mut score = global_stats.map_or_else(
                 || snapshot(&Stats::default(), now),
                 |stats| snapshot(stats, now),
             );
+            score.node_fail_streak = score.fail_streak;
             let family_stats = context.target_family.and_then(|family| {
                 layer.family = Some(family);
-                inner.aggregate.peek(&layer)
+                inner.aggregate.peek(&*layer)
             });
             if let Some(stamp) =
                 family_stats.and_then(|stats| CellStamp::current(stats, global_stats))
@@ -776,24 +599,26 @@ fn prefer_specific(
     }
 }
 
-pub(super) fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBaseline {
+pub(super) fn performance_baseline<'a>(
+    snapshots: impl Clone + Iterator<Item = &'a ScoreSnapshot>,
+) -> PerformanceBaseline {
     let any_healthy = snapshots
-        .iter()
+        .clone()
         .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
     let healthy =
         |score: &&ScoreSnapshot| !any_healthy || score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE;
     let any_qualified = snapshots
-        .iter()
+        .clone()
         .filter(healthy)
         .any(|score| score.qualified());
     let best_reliability = snapshots
-        .iter()
+        .clone()
         .filter(healthy)
         .filter(|score| !any_qualified || score.qualified())
         .map(|score| score.reliability)
         .fold(0.0, f64::max);
     let best_observed_reliability = snapshots
-        .iter()
+        .clone()
         .filter(healthy)
         .filter(|score| !any_qualified || score.qualified())
         .map(|score| score.observed_reliability)
@@ -811,12 +636,12 @@ pub(super) fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBa
     };
     let eligible = |score: &&ScoreSnapshot| normal_eligible(score, baseline);
     baseline.probe_scope = snapshots
-        .iter()
+        .clone()
         .filter(eligible)
         .find(|score| {
             score.probe.value.is_some()
                 && snapshots
-                    .iter()
+                    .clone()
                     .filter(eligible)
                     .filter(|other| {
                         other.probe.value.is_some() && other.probe_scope == score.probe_scope
@@ -828,7 +653,7 @@ pub(super) fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBa
         .map_or(0, |score| score.probe_scope);
     let metric = |get: fn(&ScoreSnapshot) -> MetricSnapshot, larger: bool, scope: Option<u64>| {
         let mut values = snapshots
-            .iter()
+            .clone()
             .filter(|score| normal_eligible(score, baseline))
             .filter(|score| scope.is_none_or(|scope| score.probe_scope == scope))
             .filter_map(|score| get(score).value);

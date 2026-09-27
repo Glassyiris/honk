@@ -235,7 +235,56 @@ fn score_previous_leaf_is_not_reconstructed_as_a_subgroup_member() {
 }
 
 #[test]
-fn nested_peeks_empty_members_and_final_selection_remain_distinct() {
+fn score_does_not_attach_utility_to_a_health_filtered_alias() {
+    let node = make_node(nid("shared"), "shared");
+    let blocked = make_group("blocked", GroupPolicy::Selector, vec![node.id]);
+    let serving = make_group("serving", GroupPolicy::Selector, vec![node.id]);
+    let mut root = make_subgroup("root", GroupPolicy::Score, &["blocked", "serving"]);
+    let url = "http://probe.example/";
+    root.check_url = Some(url.into());
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_group_check_urls(&[("root".into(), url.into())]);
+    for _ in 0..3 {
+        alive.record_url_probe_failure("blocked", url);
+    }
+    let manager = GroupManager::with_alive_set(&[blocked, serving, root], &[node], Some(alive));
+    manager.publish_score_membership();
+    let plan = observer().sync_scope(|| {
+        manager.selection_plan_for_target("root", &context(SelectionNetwork::Tcp, IpVersion::V4))
+    });
+    let facts = plan.observation.unwrap();
+    let decision = facts
+        .decisions
+        .iter()
+        .find(|decision| decision.group_name == "root")
+        .unwrap();
+    assert_eq!(
+        decision.selected_member,
+        Some(ObservedMember::Group {
+            name: "serving".into()
+        })
+    );
+    let excluded = decision
+        .candidates
+        .iter()
+        .find(|row| {
+            row.member
+                == ObservedMember::Group {
+                    name: "blocked".into(),
+                }
+        })
+        .unwrap();
+    assert_eq!(excluded.eligible, Some(false));
+    assert!(!excluded.selected);
+    assert_eq!(excluded.score, None);
+    assert_eq!(excluded.reason, "custom_url_unavailable");
+    let selected = decision.candidates.iter().find(|row| row.selected).unwrap();
+    assert_eq!(selected.eligible, Some(true));
+    assert!(selected.score.is_some_and(f64::is_finite));
+}
+
+#[test]
+fn selected_subgroup_empty_members_and_final_selection_remain_distinct() {
     let nodes = [make_node(nid("a"), "a"), make_node(nid("b"), "b")];
     let chosen = make_group("chosen", GroupPolicy::Score, vec![nodes[0].id, nodes[1].id]);
     let unused = make_group("unused", GroupPolicy::Score, vec![nodes[1].id]);
@@ -256,7 +305,7 @@ fn nested_peeks_empty_members_and_final_selection_remain_distinct() {
         facts
             .decisions
             .iter()
-            .any(|decision| decision.group_name == "chosen" && !decision.applied)
+            .all(|decision| decision.group_name != "chosen" || decision.applied)
     );
     assert!(
         facts
@@ -268,22 +317,13 @@ fn nested_peeks_empty_members_and_final_selection_remain_distinct() {
         facts
             .decisions
             .iter()
-            .filter(|decision| decision.group_name == "unused")
-            .all(|decision| !decision.applied)
+            .all(|decision| !matches!(decision.group_name.as_str(), "unused" | "empty"))
     );
     assert_eq!(
         facts.decisions[0].selected_member,
         Some(ObservedMember::Group {
             name: "chosen".into()
         })
-    );
-    assert!(
-        facts.decisions[0]
-            .candidates
-            .iter()
-            .any(|row| row.reason == "empty_member"
-                && row.eligible == Some(false)
-                && row.leaf_node_id.is_none())
     );
     let plan = observer().sync_scope(|| manager.selection_plan_for_target("empty", &context));
     assert!(plan.entries.is_empty());
@@ -295,6 +335,14 @@ fn nested_peeks_empty_members_and_final_selection_remain_distinct() {
     assert_eq!(plan.entries[0].final_owners, ["final-root"]);
     let facts = plan.observation.unwrap();
     assert_eq!(facts.decisions[0].reason, "final_selected");
+    assert!(
+        facts.decisions[0]
+            .candidates
+            .iter()
+            .any(|row| row.reason == "empty_member"
+                && row.eligible == Some(false)
+                && row.leaf_node_id.is_none())
+    );
     assert_eq!(
         facts.decisions[0].selected_member,
         Some(ObservedMember::Group {
@@ -400,9 +448,12 @@ fn whole_plan_capture_caps_do_not_change_uncaptured_winner() {
             )
         })
         .collect();
-    let mut root = make_group("root", GroupPolicy::Selector, vec![]);
-    root.groups = groups.iter().map(|group| group.name.clone()).collect();
-    root.default = Some("child-69".into());
+    let mut root = make_group("root", GroupPolicy::Fallback, vec![]);
+    root.groups = groups
+        .iter()
+        .rev()
+        .map(|group| group.name.clone())
+        .collect();
     groups.push(root);
     let manager = GroupManager::new(&groups, &nodes);
     let context = context(SelectionNetwork::Tcp, IpVersion::V4);
