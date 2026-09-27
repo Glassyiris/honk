@@ -415,9 +415,28 @@ fn created_file_is_removed_only_while_its_name_holds_it() {
     assert!(!target.exists());
     assert!(created.remove(), "already gone");
 
-    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
-    fs::remove_file(&target).unwrap();
-    fs::write(&target, REPLACEMENT).unwrap();
-    assert!(!created.remove());
-    assert_eq!(fs::read_to_string(&target).unwrap(), REPLACEMENT);
+    // ext4 hands a freed inode number to the next file it creates; repeat to give it the chance.
+    for _ in 0..32 {
+        let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
+        let inode = fs::metadata(&target).unwrap().ino();
+        fs::remove_file(&target).unwrap();
+        assert!(holds_unlinked(&target));
+        fs::write(&target, REPLACEMENT).unwrap();
+        assert_ne!(fs::metadata(&target).unwrap().ino(), inode);
+        assert!(!created.remove());
+        assert_eq!(fs::read_to_string(&target).unwrap(), REPLACEMENT);
+        fs::remove_file(&target).unwrap();
+    }
+}
+
+/// Whether this process still has the unlinked file that was at `path` open.
+fn holds_unlinked(path: &Path) -> bool {
+    let parent = path.parent().unwrap().canonicalize().unwrap();
+    let deleted = format!(
+        "{} (deleted)",
+        parent.join(path.file_name().unwrap()).display()
+    );
+    fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+        fs::read_link(entry.unwrap().path()).is_ok_and(|link| link.as_os_str() == deleted.as_str())
+    })
 }

@@ -264,8 +264,8 @@ impl Target {
 pub(crate) struct CreatedFile {
     directory: File,
     name: OsString,
-    dev: u64,
-    ino: u64,
+    // Keeps the inode allocated after an external unlink, so no successor can reuse its number.
+    file: File,
 }
 
 impl CreatedFile {
@@ -279,8 +279,9 @@ impl CreatedFile {
         );
         match current.map(File::from) {
             Ok(current) => current.metadata().is_ok_and(|metadata| {
-                metadata.dev() == self.dev
-                    && metadata.ino() == self.ino
+                self.file
+                    .metadata()
+                    .is_ok_and(|created| same_inode(&metadata, &created))
                     && unlinkat(
                         &self.directory,
                         self.name.as_os_str(),
@@ -313,9 +314,9 @@ pub(crate) fn create_new(
             WriteError::Conflict => WriteError::Exists,
             error => error,
         })?;
-    let metadata = temporary
+    let file = temporary
         .file
-        .metadata()
+        .try_clone()
         .map_err(|_| WriteError::ChangedButNotDurable)?;
     if target.directory.sync_all().is_err() {
         return Err(WriteError::ChangedButNotDurable);
@@ -323,8 +324,7 @@ pub(crate) fn create_new(
     Ok(CreatedFile {
         directory: target.directory,
         name: target.filename,
-        dev: metadata.dev(),
-        ino: metadata.ino(),
+        file,
     })
 }
 
