@@ -390,6 +390,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
         config_revision,
         last_reload,
         datapath_observation,
+        degradations,
     ) = {
         let _config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
@@ -410,6 +411,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             state.observation.configuration.sources.revision(),
             state.observation.configuration.last_reload(),
             state.backend.read().await.observe_datapath(),
+            // Reload updates these under the config writer, like the generation.
+            state.observation.degradations.snapshot(),
         )
     };
     let lifecycle = match phase {
@@ -461,10 +464,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             cpu_percent: *state.cpu_percent.read(),
         },
         last_reload,
-        degradations: state
-            .observation
-            .degradations
-            .snapshot()
+        degradations: degradations
             .into_iter()
             .map(|entry| Degradation {
                 code: entry.issue.code,
