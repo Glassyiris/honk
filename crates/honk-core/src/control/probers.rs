@@ -343,8 +343,9 @@ pub(super) struct QuicScoreProbeTarget {
     /// `Err` holds the reason QUIC probes are disabled.
     resolved: tokio::sync::OnceCell<Result<QuicScoreTarget, &'static str>>,
     /// Whether the applied configuration has a Score group; the target is
-    /// built at startup, so a reload only changes this.
-    needed: std::sync::atomic::AtomicBool,
+    /// built at startup, so a reload only changes this. Held while
+    /// publishing, so a probe cannot republish what a reload just cleared.
+    needed: parking_lot::Mutex<bool>,
     degradations: Arc<crate::degradations::Degradations>,
 }
 
@@ -364,7 +365,7 @@ impl QuicScoreProbeTarget {
             port,
             resolver,
             resolved: tokio::sync::OnceCell::new(),
-            needed: std::sync::atomic::AtomicBool::new(true),
+            needed: parking_lot::Mutex::new(true),
             degradations,
         };
         target.report();
@@ -381,14 +382,19 @@ impl QuicScoreProbeTarget {
     }
 
     pub(super) fn set_needed(&self, needed: bool) {
-        self.needed
-            .store(needed, std::sync::atomic::Ordering::Relaxed);
-        self.report();
+        let mut current = self.needed.lock();
+        *current = needed;
+        self.publish(needed);
+    }
+
+    fn report(&self) {
+        let needed = self.needed.lock();
+        self.publish(*needed);
     }
 
     /// A URL that cannot carry a QUIC probe is never resolved, so it is known
     /// from the start; any other reason once resolution settles.
-    fn report(&self) {
+    fn publish(&self, needed: bool) {
         let component = crate::degradations::Component::QuicProbe;
         let disabled = if self.port.is_none() {
             Some("unsupported_url")
@@ -397,7 +403,7 @@ impl QuicScoreProbeTarget {
                 .get()
                 .and_then(|target| target.as_ref().err().copied())
         };
-        match disabled.filter(|_| self.needed.load(std::sync::atomic::Ordering::Relaxed)) {
+        match disabled.filter(|_| needed) {
             Some(reason) => self
                 .degradations
                 .set(component, quic_probe_disabled(reason)),
