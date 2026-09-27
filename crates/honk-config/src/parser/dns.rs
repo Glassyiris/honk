@@ -162,7 +162,7 @@ pub(super) fn parse_section(
                 *bind,
                 "invalid-config-value",
                 "bind",
-                "invalid configuration value",
+                "expected IP:port or a udp://, tcp:// or tcp+udp:// host:port",
             )
         })?;
     }
