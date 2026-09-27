@@ -15,6 +15,7 @@ pub mod config_diagnostics;
 pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
+pub(crate) mod degradations;
 pub mod dns;
 #[cfg(any(feature = "clash-api", feature = "native-api"))]
 pub(crate) mod download_route;
@@ -466,6 +467,7 @@ fn open_state_db(
     cli: &Cli,
     config: &Config,
     data_dir: &std::path::Path,
+    degradations: &degradations::Degradations,
 ) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
     let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
     if cli.store == ConfigStore::Db
@@ -488,6 +490,10 @@ fn open_state_db(
             | state::StateError::Locked),
         ) if !strict => {
             warn!(%error, "continuing without persistence");
+            degradations.set(
+                degradations::Component::Persistence,
+                persistence_lost(error.reason()),
+            );
             Ok((None, false))
         }
         Err(error) => Err(anyhow::anyhow!("state database: {error}")),
@@ -496,13 +502,31 @@ fn open_state_db(
 
 /// Moves a corrupt, non-strict state db aside; any failure, including another
 /// process still holding the db, leaves honk running without persistence.
-fn reset_non_strict(data_dir: &std::path::Path) -> Option<Arc<state::StateDb>> {
-    match state::reset_corrupt(data_dir) {
-        Ok(db) => db.map(Arc::new),
+fn reset_non_strict(
+    data_dir: &std::path::Path,
+    degradations: &degradations::Degradations,
+) -> Option<Arc<state::StateDb>> {
+    // `Ok(None)`: an earlier corrupt copy blocks the move, so the db stays corrupt.
+    let reason = match state::reset_corrupt(data_dir) {
+        Ok(Some(db)) => return Some(Arc::new(db)),
+        Ok(None) => state::StateError::Corrupt.reason(),
         Err(error) => {
             warn!(%error, "state database could not be reset; continuing without persistence");
-            None
+            error.reason()
         }
+    };
+    degradations.set(
+        degradations::Component::Persistence,
+        persistence_lost(reason),
+    );
+    None
+}
+
+fn persistence_lost(reason: &'static str) -> degradations::Issue {
+    degradations::Issue {
+        code: "persistence_unavailable",
+        message: "The state database is unavailable; runtime state is not kept across restarts.",
+        reason,
     }
 }
 
@@ -522,9 +546,10 @@ fn claim_state(
     config: &Config,
     data_dir: &std::path::Path,
     legacy_roots: impl IntoIterator<Item = PathBuf>,
+    degradations: &degradations::Degradations,
 ) -> ClaimedState {
     let state_db = if reset {
-        reset_non_strict(data_dir)
+        reset_non_strict(data_dir, degradations)
     } else {
         state_db
     };
@@ -1198,7 +1223,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
-    let (state_db, state_reset) = open_state_db(&cli, &config, honk_config::paths::data_dir())?;
+    let degradations = Arc::new(degradations::Degradations::default());
+    let (state_db, state_reset) =
+        open_state_db(&cli, &config, honk_config::paths::data_dir(), &degradations)?;
     #[cfg(feature = "native-api")]
     let state_db = database
         .as_ref()
@@ -1259,6 +1286,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config,
         honk_config::paths::data_dir(),
         subscription::legacy_store_roots(),
+        &degradations,
     );
     let state_db = claimed.state_db;
 
@@ -1562,6 +1590,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
     let router = routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources)?;
     info!("Router ready with {} compiled routes", router.route_count());
+    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1636,6 +1665,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_forwarder,
         dns_upstream_pool.clone(),
         resource_budget,
+        Arc::clone(&degradations),
     )?;
     control_plane
         .install_startup_diagnostics(startup_diagnostics)
@@ -1648,6 +1678,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.config_handle(),
             control_plane.command_sender(),
             attached_ifaces,
+            Arc::clone(&degradations),
         )
     } else {
         None
@@ -2702,7 +2733,13 @@ mod startup_lifecycle_tests {
         let directory = tempfile::tempdir().unwrap();
         drop(crate::state::StateDb::open(directory.path()).unwrap());
         let held = crate::state::StateDb::open(directory.path()).unwrap();
-        assert!(super::reset_non_strict(directory.path()).is_none());
+        let degradations = crate::degradations::Degradations::default();
+        assert!(super::reset_non_strict(directory.path(), &degradations).is_none());
+        let issue = degradations
+            .get(crate::degradations::Component::Persistence)
+            .expect("the failed reset is reported");
+        // The reset's own failure is the cause, not the corruption.
+        assert_eq!(issue.reason, "in_use");
         drop(held);
     }
 
@@ -2788,8 +2825,16 @@ mod startup_lifecycle_tests {
         let state = unsafe_dir.path().join(crate::state::STATE_DIR);
         std::fs::create_dir(&state).unwrap();
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (db, reset) = super::open_state_db(&cli, &config, unsafe_dir.path()).unwrap();
+        let reason = |degradations: &crate::degradations::Degradations| {
+            degradations
+                .get(crate::degradations::Component::Persistence)
+                .map(|issue| issue.reason)
+        };
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &degradations).unwrap();
         assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("unsafe"));
 
         let locked_dir = tempfile::tempdir().unwrap();
         drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
@@ -2798,13 +2843,18 @@ mod startup_lifecycle_tests {
             nix::fcntl::FlockArg::LockExclusiveNonblock,
         )
         .unwrap();
-        let (db, reset) = super::open_state_db(&cli, &config, locked_dir.path()).unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, locked_dir.path(), &degradations).unwrap();
         assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("locked"));
         drop(held);
 
         // Password mode makes the db strict: the same unsafe directory refuses startup.
         config.experimental.native_api.password_auth = true;
-        assert!(super::open_state_db(&cli, &config, unsafe_dir.path()).is_err());
+        assert!(
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &Default::default()).is_err()
+        );
 
         // A newer schema refuses startup either way.
         config.experimental.native_api.password_auth = false;
@@ -2822,7 +2872,9 @@ mod startup_lifecycle_tests {
             crate::state::SCHEMA_VERSION + 1
         ))
         .unwrap();
-        assert!(super::open_state_db(&cli, &config, newer_dir.path()).is_err());
+        assert!(
+            super::open_state_db(&cli, &config, newer_dir.path(), &Default::default()).is_err()
+        );
     }
 
     #[test]
@@ -3126,7 +3178,9 @@ mod state_claim_tests {
         let mut config = honk_config::Config::default();
         config.global.store_subscribe = true;
 
-        let (db, reset) = super::open_state_db(&cli, &config, directory.path()).unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, directory.path(), &degradations).unwrap();
         assert!(db.is_none() && reset);
         let claimed = super::claim_state(
             db,
@@ -3134,8 +3188,13 @@ mod state_claim_tests {
             &config,
             directory.path(),
             [directory.path().join(".sub")],
+            &degradations,
         );
         assert!(claimed.state_db.is_some());
+        assert!(
+            degradations.snapshot().is_empty(),
+            "a successful reset degrades nothing"
+        );
         assert!(claimed.subscriptions.is_some());
         assert!(state_dir.join("honk.db.corrupt").exists());
     }

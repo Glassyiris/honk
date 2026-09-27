@@ -21,6 +21,7 @@ pub(crate) struct NativeObservation {
     pub(crate) trace: super::routing::TraceState,
     pub(crate) settings: super::settings::Settings,
     pub(crate) providers: super::providers::ProviderApi,
+    pub(crate) degradations: Arc<crate::degradations::Degradations>,
     reloading: AtomicBool,
     activated: parking_lot::Mutex<Option<(u64, SystemTime)>>,
 }
@@ -35,7 +36,17 @@ impl Drop for ReloadGuard<'_> {
 }
 
 impl NativeObservation {
+    #[cfg(test)]
     pub(crate) fn new(config: &Config) -> Self {
+        Self::with_degradations(config, Arc::default())
+    }
+
+    /// `degradations` may already hold startup entries; every later change
+    /// publishes `runtime.updated`.
+    pub(crate) fn with_degradations(
+        config: &Config,
+        degradations: Arc<crate::degradations::Degradations>,
+    ) -> Self {
         let instance_id = uuid::Uuid::new_v4().to_string();
         let events = Arc::new(EventHub::new(instance_id.clone()));
         let flows = Arc::new(FlowStore::new(instance_id.clone(), Arc::clone(&events)));
@@ -64,6 +75,12 @@ impl NativeObservation {
             config.experimental.native_api.record_logs,
             level.as_str(),
         ));
+        let hub = Arc::downgrade(&events);
+        degradations.set_notify(Box::new(move || {
+            if let Some(hub) = hub.upgrade() {
+                hub.publish("runtime.updated", json!({}), None);
+            }
+        }));
         let owner = Self {
             instance_id,
             events,
@@ -81,6 +98,7 @@ impl NativeObservation {
             trace: super::routing::TraceState::new(),
             settings: super::settings::Settings::new(config),
             providers: super::providers::ProviderApi::new(),
+            degradations,
             reloading: AtomicBool::new(false),
             activated: parking_lot::Mutex::new(None),
         };

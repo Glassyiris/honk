@@ -66,6 +66,14 @@ impl ControlPlane {
             Ok(db) => Arc::new(db),
             Err(error) => {
                 warn!(%error, "state cache unavailable; continuing without persistence");
+                self.degradations.set(
+                    crate::degradations::Component::StateCache,
+                    crate::degradations::Issue {
+                        code: "state_cache_unavailable",
+                        message: "The state cache could not be opened; Selector choices and delay history are not kept across restarts.",
+                        reason: error.reason(),
+                    },
+                );
                 self.start_state_tick(state, None);
                 return;
             }
@@ -535,6 +543,31 @@ mod tests {
 
         let plane = restart(config(&[("a", 9), ("c", 11)])).await;
         assert_eq!(selected(&plane).as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn a_state_cache_that_cannot_open_is_reported() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.experimental.cache_file.enabled = Some(true);
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDb::open(directory.path()).unwrap());
+        // A new inode under the same name fails the identity check.
+        let file = directory
+            .path()
+            .join(crate::state::STATE_DIR)
+            .join(crate::state::DB_FILE);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        let mut plane = control_plane(config);
+        plane.init_cache_db(Some(state), None).await;
+        assert!(plane.cache_db().is_none());
+        assert!(
+            plane
+                .degradations
+                .get(crate::degradations::Component::StateCache)
+                .is_some()
+        );
     }
 
     #[cfg(feature = "clash-api")]

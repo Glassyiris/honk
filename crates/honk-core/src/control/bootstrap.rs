@@ -51,9 +51,11 @@ impl ControlPlane {
             dns_forwarder,
             dns_upstream_pool,
             ResourceBudget::for_nofile(MAX_EFFECTIVE_NOFILE),
+            Arc::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_upstream_pool_and_budget(
         config: Config,
         mut ebpf: Box<dyn EbpfBackend>,
@@ -62,6 +64,7 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
         dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
         resource_budget: ResourceBudget,
+        degradations: Arc<crate::degradations::Degradations>,
     ) -> anyhow::Result<Self> {
         config.validate_assembled()?;
         honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
@@ -153,9 +156,12 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         let native = config.experimental.native_api.enabled.then(|| {
             alive_set.enable_native_observations();
-            Arc::new(crate::native_api::observation::NativeObservation::new(
-                &config,
-            ))
+            Arc::new(
+                crate::native_api::observation::NativeObservation::with_degradations(
+                    &config,
+                    Arc::clone(&degradations),
+                ),
+            )
         });
         {
             let gm_cell = group_manager.clone();
@@ -335,6 +341,8 @@ impl ControlPlane {
             mode_db: None,
             state_db: None,
             state_tick: cache::StateTick::default(),
+            degradations,
+            quic_score_target: None,
             outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(

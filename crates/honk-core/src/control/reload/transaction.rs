@@ -730,7 +730,17 @@ impl ControlPlane {
                 }
                 publication.commit();
                 *router_guard = new_router;
+                crate::ebpf::record_pname_routing(&router_guard, &**ebpf, &self.degradations);
                 *config_guard = Arc::new(new_config);
+                match &self.quic_score_target {
+                    Some(target) => {
+                        target.set_needed(crate::control::probers::needs_quic_probe(&config_guard))
+                    }
+                    None => crate::control::probers::report_quic_probe_restart(
+                        &self.degradations,
+                        &config_guard,
+                    ),
+                }
                 {
                     let mut active_diagnostics = self.diagnostics.write();
                     #[cfg(feature = "native-api")]

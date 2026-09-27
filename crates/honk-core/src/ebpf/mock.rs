@@ -118,6 +118,8 @@ pub struct MockEbpfBackend {
     datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
     #[cfg(test)]
     pub datapath_observation_fixture: Option<super::DatapathObservation>,
+    #[cfg(test)]
+    pub pname_support: super::PnameSupport,
 }
 
 impl MockEbpfBackend {
@@ -416,6 +418,11 @@ impl EbpfBackend for MockEbpfBackend {
             return observation.clone();
         }
         super::DatapathObservation::unknown(super::DatapathKind::Mock)
+    }
+
+    #[cfg(test)]
+    fn pname_support(&self) -> super::PnameSupport {
+        self.pname_support
     }
 
     fn inject_routing_fault(

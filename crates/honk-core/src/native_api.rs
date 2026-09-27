@@ -461,6 +461,19 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             cpu_percent: *state.cpu_percent.read(),
         },
         last_reload,
+        degradations: state
+            .observation
+            .degradations
+            .snapshot()
+            .into_iter()
+            .map(|entry| Degradation {
+                code: entry.issue.code,
+                message: entry.issue.message,
+                details: serde_json::json!({ "reason": entry.issue.reason }),
+                component: entry.component.id(),
+                since: timestamp(entry.since),
+            })
+            .collect(),
     })
     .into_response())
 }
@@ -697,6 +710,44 @@ mod tests {
         assert_eq!(after["lifecycle"]["state"], "running");
         assert_eq!(after["generation"]["state"], "active");
         assert!(after["generation"]["activated_at"].as_str().unwrap() >= started.as_str());
+    }
+
+    #[tokio::test]
+    async fn runtime_lists_degradations_and_announces_changes() {
+        use crate::degradations::{Component, Issue};
+        let state = state().await;
+        state.observation.attach_for_test();
+        assert_eq!(
+            runtime_body(&state).await["degradations"],
+            serde_json::json!([])
+        );
+        let updates = || {
+            state
+                .observation
+                .events
+                .buffered_kinds()
+                .into_iter()
+                .filter(|kind| *kind == "runtime.updated")
+                .count()
+        };
+        let before = updates();
+        state.observation.degradations.set(
+            Component::Persistence,
+            Issue {
+                code: "persistence_unavailable",
+                message: "Lost.",
+                reason: "unsafe",
+            },
+        );
+        assert_eq!(updates(), before + 1);
+        let body = runtime_body(&state).await;
+        let entry = &body["degradations"][0];
+        assert_eq!(entry["component"], "persistence");
+        assert_eq!(entry["code"], "persistence_unavailable");
+        assert_eq!(entry["message"], "Lost.");
+        assert_eq!(entry["details"]["reason"], "unsafe");
+        assert!(chrono::DateTime::parse_from_rfc3339(entry["since"].as_str().unwrap()).is_ok());
+        assert_eq!(body["lifecycle"]["state"], "running");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

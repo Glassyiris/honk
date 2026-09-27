@@ -703,9 +703,13 @@ async fn test_cp() -> ControlPlane {
 }
 
 async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
+    test_cp_with_backend(MockEbpfBackend::new(), nfqueue).await
+}
+
+async fn test_cp_with_backend(backend: MockEbpfBackend, nfqueue: bool) -> ControlPlane {
     let mut control_plane = ControlPlane::new(
         Config::default(),
-        Box::new(MockEbpfBackend::new()),
+        Box::new(backend),
         Router::new(&[], "direct").unwrap(),
         std::sync::Arc::new(ProxyRegistry::default_resolver().unwrap()),
         DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
@@ -3636,4 +3640,98 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
     assert_eq!(cp.config_handle().read().await.as_ref(), &current);
     assert_eq!(log.matches("noncanonical-node-id").count(), 1, "{log}");
     assert!(!log.contains("192.0.2.11"), "{log}");
+}
+
+#[tokio::test]
+async fn pname_routing_is_reported_only_while_an_applied_rule_uses_pname() {
+    let mut backend = MockEbpfBackend::new();
+    backend.pname_support = crate::ebpf::PnameSupport::Unavailable;
+    let cp = test_cp_with_backend(backend, false).await;
+    let pname = || {
+        cp.degradations
+            .get(crate::degradations::Component::PnameRouting)
+    };
+    let without = changed_routing_config();
+    let mut with = without.clone();
+    with.routing.rules[0].condition.process_name = vec!["curl".into()];
+    for (config, degraded) in [(&with, true), (&without, false)] {
+        let outcome = cp
+            .apply_resolved_runtime_config_locked(
+                config.clone(),
+                &DrainTracker::new(),
+                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.accepted());
+        assert_eq!(
+            pname().map(|issue| issue.reason),
+            degraded.then_some("cgroup_unavailable")
+        );
+    }
+}
+
+#[tokio::test]
+async fn quic_probe_is_reported_only_while_an_applied_score_group_needs_it() {
+    let mut cp = test_cp().await;
+    cp.quic_score_target = Some(Arc::new(probers::QuicScoreProbeTarget::new(
+        "http://quic.example/".into(),
+        None,
+        Arc::clone(&cp.degradations),
+    )));
+    let quic = || {
+        cp.degradations
+            .get(crate::degradations::Component::QuicProbe)
+    };
+    for (config, degraded) in [
+        (changed_routing_config(), false),
+        (score_reload_config(1), true),
+    ] {
+        let outcome = cp
+            .apply_resolved_runtime_config_locked(
+                config,
+                &DrainTracker::new(),
+                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.accepted());
+        assert_eq!(quic().is_some(), degraded);
+    }
+}
+
+#[tokio::test]
+async fn score_group_added_by_reload_reports_quic_probe_until_restart() {
+    // Startup without a Score group builds no QUIC target.
+    let cp = test_cp().await;
+    assert!(cp.quic_score_target.is_none());
+    let quic = || {
+        cp.degradations
+            .get(crate::degradations::Component::QuicProbe)
+            .map(|issue| issue.reason)
+    };
+    for (config, reason) in [
+        (score_reload_config(1), Some("restart_required")),
+        (changed_routing_config(), None),
+    ] {
+        let outcome = cp
+            .apply_resolved_runtime_config_locked(
+                config,
+                &DrainTracker::new(),
+                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.accepted());
+        assert_eq!(quic(), reason);
+    }
 }

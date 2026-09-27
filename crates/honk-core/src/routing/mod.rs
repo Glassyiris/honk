@@ -571,6 +571,16 @@ impl Router {
                 .any(|route| route.action.outbound == "direct" && route.action.mark.is_some())
     }
 
+    /// Whether any rule has a `pname()` condition, positive or negated.
+    pub(crate) fn uses_process_name(&self) -> bool {
+        self.routes.iter().any(|route| {
+            route
+                .conditions
+                .iter()
+                .any(|condition| matches!(condition.predicate, CompiledPredicate::ProcessName(_)))
+        })
+    }
+
     pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
         self.routes.geo_fingerprint
     }

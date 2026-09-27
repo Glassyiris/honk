@@ -429,8 +429,11 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
         Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
     });
-    let quic_target =
-        probers::QuicScoreProbeTarget::new(config.global.tcp_check_url[0].clone(), Some(resolver));
+    let quic_target = probers::QuicScoreProbeTarget::new(
+        config.global.tcp_check_url[0].clone(),
+        Some(resolver),
+        Arc::default(),
+    );
     let context =
         probers::quic_probe_context(quic_target.resolve().await.unwrap().as_ref().unwrap());
     assert_eq!(context.network, SelectionNetwork::Udp);
@@ -449,7 +452,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         runtime,
         cp.stats_handle(),
         probers::UdpDnsProbeTarget::new(vec!["127.0.0.1:53".into()], None),
-        Some(quic_target),
+        Some(Arc::new(quic_target)),
         manager.clone(),
     );
     let mut candidate = config.clone();
@@ -527,6 +530,7 @@ async fn quic_probe_still_runs_when_dns_target_resolution_is_refused() {
     let quic_target = probers::QuicScoreProbeTarget::new(
         "https://quic.example.test:9443/generate_204".into(),
         Some(resolver),
+        Arc::default(),
     );
     let prober = probers::ProxyUdpProber::new(
         Arc::new(RwLock::new(Arc::new(config))),
@@ -543,7 +547,7 @@ async fn quic_probe_still_runs_when_dns_target_resolution_is_refused() {
                 })
             })),
         ),
-        Some(quic_target),
+        Some(Arc::new(quic_target)),
         manager.clone(),
     );
 
