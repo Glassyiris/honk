@@ -8,8 +8,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug)]
 pub enum ErrorCode {
     InvalidRequest,
     AuthenticationRequired,
@@ -35,7 +34,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// The wire spelling, for errors embedded in operations.
+    /// The wire spelling, also used in errors embedded in operations.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
@@ -60,6 +59,12 @@ impl ErrorCode {
             Self::SetupAlreadyCompleted => "setup_already_completed",
             Self::InvalidCredentials => "invalid_credentials",
         }
+    }
+}
+
+impl Serialize for ErrorCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
