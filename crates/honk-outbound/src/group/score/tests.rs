@@ -7,6 +7,7 @@ mod attribution;
 mod availability;
 mod budget;
 mod budget_projection;
+mod budget_yield;
 mod cadence;
 mod comparison;
 mod directional;
@@ -14,10 +15,12 @@ mod evaluation;
 mod evidence;
 mod live;
 mod performance;
+mod pool_admission;
 mod pressure;
 mod progress;
 mod reasons;
 mod selection;
+mod serving;
 mod verification;
 mod verification_boundaries;
 
@@ -267,7 +270,7 @@ fn decision_at(
         .iter()
         .map(|node| score_snapshot(inner, "score", target, node.id, now))
         .collect::<Vec<_>>();
-    let baseline = ranking::performance_baseline(&scores);
+    let baseline = ranking::performance_baseline(scores.iter());
     // Comparison unit tests exercise every member; bounding is covered by evaluation tests.
     let membership = vec![true; nodes.len()];
     let evidence =
@@ -280,7 +283,14 @@ fn decision_at(
         (&membership, reference),
         now,
     );
-    let ordinary = ranking::ordinary_selection(&scores, &refs, Some(reference), baseline, &pairs);
+    let ordinary = ranking::ordinary_selection(
+        &scores,
+        &refs,
+        Some(reference),
+        baseline,
+        &pairs,
+        &membership,
+    );
     ranking::Decision {
         scores,
         evidence,

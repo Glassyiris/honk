@@ -1,4 +1,4 @@
-use crate::group::GroupMember;
+use crate::group::{GroupMember, ScoreView};
 
 use super::*;
 
@@ -182,7 +182,7 @@ impl super::GroupManager {
             };
         }
         let mut visited = Vec::new();
-        let candidates = self.flatten_candidates_for_target(
+        let (candidates, _) = self.flatten_candidates_for_target(
             group,
             context,
             &mut visited,
@@ -283,7 +283,8 @@ impl super::GroupManager {
                                     Arc::clone(&self.score_authority),
                                     context.clone(),
                                     attributions,
-                                ),
+                                )
+                                .with_pool_bound(candidate.pool_bound),
                                 Arc::clone(opportunity.get_or_insert_with(|| {
                                     Arc::new(budget::Opportunity::default())
                                 })),
@@ -374,6 +375,7 @@ impl super::GroupManager {
         }
         let (mut mode, mut candidates) =
             self.normal_candidates_for_target(group, context, visited, depth, effects, rules);
+        let mut ordinary = true;
         if candidates.is_empty()
             && let Some(member) = self.final_member(group)
             && rules.excluded.is_none_or(|excluded| {
@@ -381,6 +383,7 @@ impl super::GroupManager {
                     && excluded.final_owners.contains(&group.name)
             })
         {
+            ordinary = false;
             // A business IPv6 target may use an IPv4 proxy. Defer this final
             // until the outer health-family retry has tried that ordinary path.
             if effects.health_fallback() && context.health_family == IpVersion::V6 {
@@ -392,7 +395,11 @@ impl super::GroupManager {
                         &ipv4,
                         visited,
                         depth,
-                        effects.peek(),
+                        if effects.prepares_score() {
+                            super::SelectionEffects::Preview
+                        } else {
+                            effects.peek()
+                        },
                         rules,
                     )
                     .1
@@ -417,6 +424,7 @@ impl super::GroupManager {
                             via: None,
                             node,
                             attribution: Vec::new(),
+                            pool_bound: 0,
                             selection_chain: vec![node.name.as_str()],
                             final_owners: Vec::new(),
                             score_work: Vec::new(),
@@ -446,6 +454,7 @@ impl super::GroupManager {
         }
         for candidate in &mut candidates {
             if group.policy == honk_config::group::GroupPolicy::Score {
+                candidate.pool_bound = (candidate.pool_bound << 1) | u8::from(ordinary);
                 candidate.attribution.insert(0, group.name.as_str());
             }
             candidate.selection_chain.insert(0, group.name.as_str());
@@ -463,9 +472,38 @@ impl super::GroupManager {
         rules: ScoreSelectionRules<'_>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
         let selected_member = self.selector_member(group);
-        let mut candidates =
-            self.flatten_candidates_for_target(group, context, visited, depth, effects, rules);
-        let before_filter = (effects.applies()
+        let (mut candidates, withdrawn) = if group.policy
+            == honk_config::group::GroupPolicy::Selector
+            && let Some(GroupMember::Group(subgroup)) = selected_member
+        {
+            if effects.applies() {
+                self.mark_used(&subgroup.name);
+            }
+            // Apply must reach the chosen child even when its committed readonly view is empty.
+            visited.push(group.name.as_str());
+            let candidate = self.pick_candidate_for_target(
+                subgroup,
+                context,
+                visited,
+                depth + 1,
+                effects,
+                rules,
+            );
+            visited.pop();
+            (
+                candidate
+                    .into_iter()
+                    .map(|mut candidate| {
+                        candidate.via = Some(subgroup);
+                        candidate
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        } else {
+            self.flatten_candidates_for_target(group, context, visited, depth, effects, rules)
+        };
+        let before_filter = (effects.prepares_score()
             && group.policy == honk_config::group::GroupPolicy::Score
             && self.score_state.is_current_authority(&self.score_authority))
         .then(|| super::unique_candidate_ids(&candidates))
@@ -476,11 +514,15 @@ impl super::GroupManager {
             context.health_family,
             group.check_url.as_deref(),
         );
-        if let Some(before_filter) = before_filter {
+        let health_filtered =
+            before_filter.and_then(|before| super::removed_unique_candidates(before, &candidates));
+        if effects.applies()
+            && let Some(filtered) = &health_filtered
+        {
             self.score_state.record_dead_filtered(
                 &self.score_authority,
                 SelectionReasonKey::new(&group.name, context.network),
-                super::removed_unique_candidate_count(before_filter, &candidates),
+                filtered.len(),
             );
         }
         if candidates.is_empty() {
@@ -493,6 +535,23 @@ impl super::GroupManager {
                     )
                 })
                 .flatten();
+            let candidate = candidate.and_then(|candidate| {
+                if group.policy == honk_config::group::GroupPolicy::Score {
+                    self.pick_score(
+                        ScoreView {
+                            origins: &[candidate],
+                            preview: effects == super::SelectionEffects::Preview,
+                            ..Default::default()
+                        },
+                        group,
+                        context,
+                        effects,
+                        false,
+                    )
+                } else {
+                    Some(candidate)
+                }
+            });
             let mode = if candidate.is_none()
                 && rules.cold_urltest
                 && group.policy == honk_config::group::GroupPolicy::URLTest
@@ -526,13 +585,9 @@ impl super::GroupManager {
             );
         }
         let candidate = match group.policy {
-            honk_config::group::GroupPolicy::Selector => selected_member
-                .and_then(|member| Self::pick_selector(&candidates, member))
-                .and_then(|picked| {
-                    self.commit_selector_pick_for_target(
-                        group, picked, context, visited, depth, effects, rules,
-                    )
-                }),
+            honk_config::group::GroupPolicy::Selector => {
+                selected_member.and_then(|member| Self::pick_selector(&candidates, member))
+            }
             honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
                 &candidates,
                 group,
@@ -546,9 +601,18 @@ impl super::GroupManager {
             honk_config::group::GroupPolicy::Fallback => {
                 Some(self.pick_fallback(&candidates, group, context.network, effects))
             }
-            honk_config::group::GroupPolicy::Score => {
-                Some(self.pick_score(&candidates, group, context, effects, rules.allow_trials))
-            }
+            honk_config::group::GroupPolicy::Score => self.pick_score(
+                ScoreView {
+                    origins: &candidates,
+                    health_filtered: health_filtered.as_ref(),
+                    withdrawn: &withdrawn,
+                    preview: effects == super::SelectionEffects::Preview,
+                },
+                group,
+                context,
+                effects,
+                rules.allow_trials,
+            ),
         };
         (
             super::SelectionPlanMode::Authoritative,
@@ -583,6 +647,7 @@ impl super::GroupManager {
                 via: None,
                 node,
                 attribution: Vec::new(),
+                pool_bound: 0,
                 selection_chain: vec![node.name.as_str()],
                 final_owners: Vec::new(),
                 score_work: Vec::new(),
@@ -633,31 +698,6 @@ impl super::GroupManager {
         .next()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::group) fn commit_selector_pick_for_target<'a>(
-        &'a self,
-        group: &'a honk_config::group::Group,
-        picked: super::Candidate<'a>,
-        context: &ScoreSelectionContext,
-        visited: &mut Vec<&'a str>,
-        depth: usize,
-        effects: super::SelectionEffects,
-        rules: ScoreSelectionRules<'_>,
-    ) -> Option<super::Candidate<'a>> {
-        let Some(sub) = picked.via.filter(|_| effects.applies()) else {
-            return Some(picked);
-        };
-        self.mark_used(&sub.name);
-        visited.push(group.name.as_str());
-        let committed =
-            self.pick_candidate_for_target(sub, context, visited, depth + 1, effects, rules);
-        visited.pop();
-        committed.map(|mut committed| {
-            committed.via = picked.via;
-            committed
-        })
-    }
-
     pub(in crate::group) fn flatten_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -666,9 +706,9 @@ impl super::GroupManager {
         depth: usize,
         effects: super::SelectionEffects,
         rules: ScoreSelectionRules<'_>,
-    ) -> Vec<super::Candidate<'a>> {
+    ) -> (Vec<super::Candidate<'a>>, Vec<&'a str>) {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         visited.push(group.name.as_str());
         // Only the serving Selector member may advance nested policy state.
@@ -691,11 +731,13 @@ impl super::GroupManager {
                 via: None,
                 node,
                 attribution: Vec::new(),
+                pool_bound: 0,
                 selection_chain: vec![node.name.as_str()],
                 final_owners: Vec::new(),
                 score_work: Vec::new(),
             })
             .collect();
+        let mut withdrawn = Vec::new();
         for tag in &group.groups {
             let Some(subgroup) = self.groups.get(tag.as_str()) else {
                 continue;
@@ -713,10 +755,16 @@ impl super::GroupManager {
             ) {
                 candidate.via = Some(subgroup);
                 candidates.push(candidate);
+            } else if effects.prepares_score()
+                && group.policy == honk_config::group::GroupPolicy::Score
+                && rules.excluded.is_none()
+            {
+                // A full child resolution is authoritative; a retry-only absence is not.
+                withdrawn.push(subgroup.name.as_str());
             }
         }
         visited.pop();
-        candidates
+        (candidates, withdrawn)
     }
 
     /// Inspect the ordinary aggregate choice without reserving validation work.
@@ -730,7 +778,7 @@ impl super::GroupManager {
             return None;
         }
         let context = Self::aggregate_score_context(network);
-        let candidates = self.flatten_candidates_for_target(
+        let (candidates, _) = self.flatten_candidates_for_target(
             group,
             &context,
             &mut Vec::new(),
@@ -755,9 +803,13 @@ impl super::GroupManager {
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
         let names: Vec<_> = unique.iter().map(|candidate| candidate.tag()).collect();
-        let (index, snapshot) = self
-            .score_state
-            .verification_selection(group_name, &context, &nodes, &names)?;
+        let (index, snapshot) = self.score_state.verification_selection(
+            group_name,
+            &context,
+            &nodes,
+            &names,
+            &candidates,
+        )?;
         Some((names[index].to_owned(), snapshot))
     }
 

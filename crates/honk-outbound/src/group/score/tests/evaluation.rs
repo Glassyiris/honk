@@ -1,5 +1,4 @@
 use super::super::evaluation::{self, EvaluationSet};
-use super::super::ranking::performance_baseline;
 use super::*;
 
 fn members(count: usize) -> Vec<Node> {
@@ -8,21 +7,22 @@ fn members(count: usize) -> Vec<Node> {
         .collect()
 }
 
-fn idle_scores(count: usize) -> (Vec<ScoreSnapshot>, PerformanceBaseline) {
-    let scores = vec![ScoreSnapshot::default(); count];
-    let baseline = performance_baseline(&scores);
-    (scores, baseline)
+fn idle_scores(count: usize) -> Vec<ScoreSnapshot> {
+    vec![ScoreSnapshot::default(); count]
 }
 
 #[test]
 fn evaluation_limit_follows_offered_business_only_at_refresh() {
-    let nodes = members(40);
+    let nodes = members(1024);
     let refs: Vec<_> = nodes.iter().collect();
-    let (scores, baseline) = idle_scores(nodes.len());
+    let scores = idle_scores(nodes.len());
     let now = Instant::now();
-    let idle = evaluation::derive(None, &refs, &scores, baseline, now, true).into_owned();
-    let idle_membership = idle.membership(&refs, 0);
-    assert_eq!(idle_membership.iter().filter(|v| **v).count(), 4);
+    let idle = evaluation::derive(None, &refs, &scores, now, true, std::iter::empty(), |_| {
+        false
+    })
+    .into_owned();
+    let idle_membership = idle.membership(&refs);
+    assert_eq!(idle_membership.iter().filter(|v| **v).count(), 3);
     let mut busy = idle;
     for second in 0..240 {
         busy.record_demand(now + Duration::from_secs(second));
@@ -31,18 +31,19 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
         Some(&busy),
         &refs,
         &scores,
-        baseline,
         now + Duration::from_secs(240),
         true,
+        std::iter::empty(),
+        |_| false,
     )
     .into_owned();
     assert_eq!(
         before_refresh
-            .membership(&refs, 0)
+            .membership(&refs)
             .iter()
             .filter(|v| **v)
             .count(),
-        4,
+        3,
         "growth waits for the refresh period"
     );
     for second in 240..600 {
@@ -52,30 +53,52 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
         Some(&busy),
         &refs,
         &scores,
-        baseline,
         now + Duration::from_secs(600),
         true,
+        std::iter::empty(),
+        |_| false,
     )
     .into_owned();
-    let evaluated = refreshed
-        .membership(&refs, 0)
-        .iter()
-        .filter(|v| **v)
-        .count();
+    let evaluated = refreshed.membership(&refs).iter().filter(|v| **v).count();
     // 600 one-per-second starts decay to 324 under the five-minute half-life, sizing 16
-    // members; undecayed demand would reach the 25-member cap.
+    // members below this group's √n cap; undecayed demand would reach the 25-member cap.
     assert_eq!(evaluated, 16);
+    let mut saturated = refreshed;
+    let at = now + Duration::from_secs(900);
+    for _ in 0..10_000 {
+        saturated.record_demand(at);
+    }
+    let saturated = evaluation::derive(
+        Some(&saturated),
+        &refs,
+        &scores,
+        at,
+        true,
+        std::iter::empty(),
+        |_| false,
+    );
+    assert_eq!(
+        saturated
+            .membership(&refs)
+            .iter()
+            .filter(|member| **member)
+            .count(),
+        25
+    );
 }
 
 #[test]
 fn members_missing_from_one_view_keep_their_place() {
     let nodes = members(12);
     let refs: Vec<_> = nodes.iter().collect();
-    let (scores, baseline) = idle_scores(nodes.len());
+    let scores = idle_scores(nodes.len());
     let now = Instant::now();
-    let set = evaluation::derive(None, &refs, &scores, baseline, now, true).into_owned();
+    let set = evaluation::derive(None, &refs, &scores, now, true, std::iter::empty(), |_| {
+        false
+    })
+    .into_owned();
     let ranked = set
-        .membership(&refs, usize::MAX)
+        .membership(&refs)
         .iter()
         .position(|evaluated| *evaluated)
         .unwrap();
@@ -85,14 +108,15 @@ fn members_missing_from_one_view_keep_their_place() {
         .copied()
         .filter(|node| node.id != absent)
         .collect();
-    let (view_scores, view_baseline) = idle_scores(view.len());
+    let view_scores = idle_scores(view.len());
     let later = evaluation::derive(
         Some(&set),
         &view,
         &view_scores,
-        view_baseline,
         now + Duration::from_secs(600),
         true,
+        std::iter::empty(),
+        |_| false,
     )
     .into_owned();
     assert!(
@@ -105,7 +129,7 @@ fn members_missing_from_one_view_keep_their_place() {
 fn rotation_visits_every_member_outside_the_ranked_set() {
     let nodes = members(10);
     let refs: Vec<_> = nodes.iter().collect();
-    let (scores, baseline) = idle_scores(nodes.len());
+    let scores = idle_scores(nodes.len());
     let start = Instant::now();
     let mut set: Option<EvaluationSet> = None;
     let mut visited = std::collections::HashSet::new();
@@ -114,12 +138,13 @@ fn rotation_visits_every_member_outside_the_ranked_set() {
             set.as_ref(),
             &refs,
             &scores,
-            baseline,
             start + Duration::from_secs(600 * slot),
             true,
+            std::iter::empty(),
+            |_| false,
         )
         .into_owned();
-        let membership = derived.membership(&refs, usize::MAX);
+        let membership = derived.membership(&refs);
         assert_eq!(membership.iter().filter(|v| **v).count(), 3);
         for (index, node) in refs.iter().enumerate() {
             if membership[index] {
@@ -160,7 +185,7 @@ fn unevaluated_members_keep_probes_out_of_comparison_cells() {
     let key = SelectionReasonKey::new("score", SelectionNetwork::Tcp);
     let (inside, outside) = {
         let inner = state.inner.lock();
-        let set = &inner.evaluation[&key];
+        let set = inner.evaluation(&key.group, key.network).unwrap();
         (
             nodes
                 .iter()
@@ -231,7 +256,7 @@ fn a_hundred_members_reach_bounded_comparisons_at_moderate_traffic() {
     }
     let snapshot = compared.expect("a bounded evaluation set must be able to compare");
     assert!(snapshot.evaluated_count < snapshot.candidate_count);
-    assert!(widest <= 26, "{widest}");
+    assert!(widest <= 11, "{widest}");
     let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     assert!(
         budget.trial_starts
@@ -253,7 +278,7 @@ fn filtered_views_cannot_disable_evaluation_bounds() {
         .verification_snapshot_at("score", &target, &all, now + Duration::from_secs(1))
         .unwrap();
     assert_eq!(report.candidate_count, 100);
-    assert!(report.evaluated_count <= 4);
+    assert_eq!(report.evaluated_count, 2);
 }
 
 #[test]
@@ -270,9 +295,7 @@ fn readonly_refresh_does_not_replace_committed_participants() {
         state
             .inner
             .lock()
-            .evaluation
-            .get_mut(&key)
-            .unwrap()
+            .evaluation_mut(&key.group, key.network)
             .record_demand(now + Duration::from_secs(second));
     }
     let at = now + Duration::from_secs(600);
@@ -280,12 +303,98 @@ fn readonly_refresh_does_not_replace_committed_participants() {
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
     assert!(
-        report.evaluated_count <= 4,
+        report.evaluated_count <= 3,
         "GET cannot expand committed coverage"
     );
     rank_at(&manager, &nodes, &target, at);
     let applied = state
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
-    assert_eq!(applied.evaluated_count, 17);
+    // Demand sizes 16 members, but a hundred-member group caps at ⌈√100⌉ + 1 = 11.
+    assert_eq!(applied.evaluated_count, 11);
+}
+
+#[test]
+fn only_node_failure_streaks_replace_shared_evaluation_members() {
+    let mut nodes = members(12);
+    nodes.sort_by_key(|node| node.id);
+    let refs: Vec<_> = nodes.iter().collect();
+    let good = context("healthy.example", IpVersion::V4);
+    let bad = context("failing.example", IpVersion::V6);
+    let start = Instant::now();
+    let key = SelectionReasonKey::new("score", SelectionNetwork::Tcp);
+    for outcome in [ScoreOutcome::TargetFailure, ScoreOutcome::NodeFailure] {
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let state = manager.score_state();
+        state.rank_at("score", &good, &refs, start);
+        let retained = || {
+            state
+                .inner
+                .lock()
+                .evaluation(&key.group, key.network)
+                .unwrap()
+                .evaluates(nodes[1].id)
+        };
+        assert!(retained());
+        for streak in 1..=SCORE_FAIL_STREAK_EXCLUDE {
+            let at = start + Duration::from_secs(u64::from(streak));
+            let reporter = manager
+                .feedback_for_group_node("score", nodes[1].id, bad.clone())
+                .unwrap()
+                .start_at(at);
+            reporter.setup_succeeded_at(at);
+            reporter.finish_at(outcome, true, at);
+            state.peek_rank_at("score", &bad, &refs, at);
+            assert!(retained(), "readonly cannot commit failure substitution");
+            state.rank_at("score", &bad, &refs, at);
+            assert_eq!(
+                retained(),
+                outcome == ScoreOutcome::TargetFailure || streak < SCORE_FAIL_STREAK_EXCLUDE,
+                "{outcome:?}, streak {streak}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_short_retry_view_cannot_reduce_funded_capacity() {
+    let nodes = members(100);
+    let refs: Vec<_> = nodes.iter().collect();
+    let scores = idle_scores(nodes.len());
+    let start = Instant::now();
+    let mut set = EvaluationSet::default();
+    for _ in 0..4096 {
+        set.record_demand(start);
+    }
+    let set = evaluation::derive(
+        Some(&set),
+        &refs,
+        &scores,
+        start,
+        true,
+        std::iter::empty(),
+        |_| false,
+    )
+    .into_owned();
+    let retry_scores = idle_scores(1);
+    let retry = evaluation::derive(
+        Some(&set),
+        &refs[..1],
+        &retry_scores,
+        start + Duration::from_secs(300),
+        true,
+        std::iter::empty(),
+        |_| false,
+    )
+    .into_owned();
+    // The funded hundred-member view retains ten ranked members plus its rotation slot.
+    // A one-member retry cannot remove those ranked identities merely by hiding them.
+    assert!(
+        retry
+            .membership(&refs)
+            .iter()
+            .filter(|&&value| value)
+            .count()
+            >= 10
+    );
 }

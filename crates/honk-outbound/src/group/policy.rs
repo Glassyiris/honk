@@ -98,12 +98,13 @@ impl GroupManager {
 
     pub(super) fn pick_score<'a>(
         &self,
-        candidates: &[Candidate<'a>],
+        view: ScoreView<'_, 'a>,
         group: &Group,
         context: &ScoreSelectionContext,
         effects: SelectionEffects,
         allow_trials: bool,
-    ) -> Candidate<'a> {
+    ) -> Option<Candidate<'a>> {
+        let candidates = view.origins;
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if !unique
@@ -114,17 +115,19 @@ impl GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        let (index, work) = if effects.applies() {
+        let (index, work) = if effects.prepares_score() {
             self.score_state.rank(
                 &self.score_authority,
                 &group.name,
                 context,
                 &nodes,
+                view,
                 allow_trials,
-            )
+            )?
         } else {
             (
-                self.score_state.peek_rank(&group.name, context, &nodes),
+                self.score_state
+                    .peek_rank(&group.name, context, &nodes, view)?,
                 None,
             )
         };
@@ -132,7 +135,7 @@ impl GroupManager {
         if let Some(work) = work {
             candidate.score_work.push(work);
         }
-        candidate
+        Some(candidate)
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based
