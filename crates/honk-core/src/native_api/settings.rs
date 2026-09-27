@@ -529,7 +529,7 @@ pub(super) async fn patch(
                 id,
             )
         })?;
-    let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid(id))?;
+    let mut value: Value = super::body::decode(&bytes, || invalid(id))?;
     let geodata = value
         .as_object_mut()
         .and_then(|object| object.remove("geodata"))
@@ -545,7 +545,7 @@ pub(super) async fn patch(
                     id,
                 ));
             }
-            let mut patch = super::geodata::SourcesPatch::parse(patch).map_err(|()| invalid(id))?;
+            let mut patch = super::geodata::SourcesPatch::parse(patch, || invalid(id))?;
             let groups = state.observation.catalog.snapshot();
             if let Some(patch) = patch.as_mut()
                 && !patch.resolve_group(|id| {
@@ -593,7 +593,7 @@ pub(super) async fn patch(
         _ => Ok(()),
     };
     let settings = if others {
-        let patch: Patch = serde_json::from_value(value).map_err(|_| invalid(id))?;
+        let patch: Patch = super::body::decode_value(value, "", || invalid(id))?;
         state.observation.settings.patch_with(
             &state.observation,
             &state.settings,

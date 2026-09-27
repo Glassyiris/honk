@@ -10,6 +10,7 @@ use rusqlite::{OptionalExtension as _, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::native_api::ApiError;
 use crate::state::StateDb;
 
 pub(crate) const KINDS: [&str; 2] = ["geosite", "geoip"];
@@ -238,14 +239,17 @@ struct AutoUpdatePatch {
 
 impl Patch {
     /// `None` for `"geodata": null`, which deletes what is stored.
-    pub(crate) fn parse(value: Value) -> Result<Option<Self>, ()> {
+    pub(crate) fn parse(
+        value: Value,
+        invalid: impl Fn() -> ApiError,
+    ) -> Result<Option<Self>, ApiError> {
         if value.is_null() {
             return Ok(None);
         }
         if contains_null(&value) {
-            return Err(());
+            return Err(invalid());
         }
-        let patch: Self = serde_json::from_value(value).map_err(|_| ())?;
+        let patch: Self = crate::native_api::body::decode_value(value, "geodata", &invalid)?;
         let urls_valid = [&patch.geosite, &patch.geoip]
             .into_iter()
             .flatten()
@@ -263,7 +267,7 @@ impl Patch {
         if any && urls_valid && auto_valid {
             Ok(Some(patch))
         } else {
-            Err(())
+            Err(invalid())
         }
     }
 }

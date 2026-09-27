@@ -620,7 +620,7 @@ pub(super) async fn create(
             if guard.cancel.as_ref().is_none_or(|cancel| *cancel.borrow()) {
                 return Err(unavailable());
             }
-            let request: ProbeRequest = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            let request: ProbeRequest = super::body::decode(&bytes, invalid)?;
             let plan = capture(state, request).await?;
             state.require_running()?;
             service.rate.admit(id)?;

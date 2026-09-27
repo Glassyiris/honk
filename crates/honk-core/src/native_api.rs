@@ -1,6 +1,7 @@
 //! Independent, opt-in native observation API.
 
 pub(crate) mod auth;
+mod body;
 pub(crate) mod catalog;
 pub(crate) mod config;
 mod config_write;

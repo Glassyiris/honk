@@ -243,6 +243,49 @@ async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types()
     app.shutdown().await;
 }
 
+#[tokio::test]
+async fn json_bodies_name_the_failing_field_without_echoing_values() {
+    let app = TestApp::new(|_| {}).await;
+    for (method, path, body, details) in [
+        (
+            Method::POST,
+            "/api/v1/routing/trace",
+            json!({"input":{"network":"tcp","dst_port":"PRIVATE"}}),
+            json!({"field":"input.dst_port","kind":"wrong_type"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/dns/cache/flush",
+            json!({"PRIVATE":1}),
+            json!({"field":"body","kind":"unknown_field"}),
+        ),
+        (
+            Method::PATCH,
+            "/api/v1/runtime/settings",
+            json!({"flows":{"max_flows":"PRIVATE"}}),
+            json!({"field":"flows.max_flows","kind":"wrong_type"}),
+        ),
+    ] {
+        let response = app
+            .client
+            .request(method, app.url(path))
+            .bearer_auth(SECRET)
+            .header("idempotency-key", "json-body")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        error_response_details(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            details,
+        )
+        .await;
+    }
+    app.shutdown().await;
+}
+
 struct RawResponse {
     status: u16,
     headers: String,
@@ -927,11 +970,22 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         json!({"field":"body","kind":"not_allowed"}),
     )
     .await;
-    for (size, status, code) in [
-        (65536, StatusCode::NOT_FOUND, "capability_not_supported"),
-        (65537, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+    let too_large = json!({"field":"body","kind":"too_large"});
+    for (size, status, code, details) in [
+        (
+            65536,
+            StatusCode::NOT_FOUND,
+            "capability_not_supported",
+            Value::Null,
+        ),
+        (
+            65537,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            too_large.clone(),
+        ),
     ] {
-        error_response(
+        error_response_details(
             app.client
                 .post(app.url("/api/v1/config/validate"))
                 .bearer_auth(SECRET)
@@ -941,10 +995,11 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
                 .unwrap(),
             status,
             code,
+            details,
         )
         .await;
     }
-    raw_error(
+    raw_error_details(
         raw_request(
             &app,
             "/api",
@@ -954,6 +1009,7 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         .await,
         413,
         "request_too_large",
+        too_large.clone(),
     );
     raw_error_details(
         raw_request(
@@ -968,7 +1024,7 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         json!({"field":"body","kind":"not_allowed"}),
     );
     let body = format!("10001\r\n{}\r\n0\r\n\r\n", "x".repeat(65537));
-    raw_error(
+    raw_error_details(
         raw_request(
             &app,
             "/api",
@@ -978,6 +1034,7 @@ async fn authenticated_request_limits_cover_declared_and_chunked_bodies() {
         .await,
         413,
         "request_too_large",
+        too_large,
     );
     let trailers = format!("0\r\nX-Padding: {}\r\n\r\n", "x".repeat(8192));
     raw_error(raw_request(&app, "/api", &format!("Authorization: Bearer {SECRET}\r\nTransfer-Encoding: chunked\r\nTrailer: X-Padding\r\nX-Initial: {}\r\n", "x".repeat(8192)), trailers.as_bytes()).await, 413, "request_too_large");

@@ -303,14 +303,31 @@ async fn credentials_are_rejected_before_they_reach_the_store() {
         "unsupported_media_type",
     )
     .await;
-    let unknown = app
-        .client
-        .post(app.url("/api/v1/auth/setup"))
-        .json(&serde_json::json!({"username": USER, "password": PASSWORD, "role": "admin"}))
-        .send()
-        .await
-        .unwrap();
-    error_response(unknown, StatusCode::BAD_REQUEST, "invalid_request").await;
+    for (body, details) in [
+        (
+            json!({"username": USER, "password": PASSWORD, "role": "PRIVATE"}),
+            json!({"field":"body","kind":"unknown_field"}),
+        ),
+        (
+            json!({"username": USER, "password": "PRIVATE".repeat(600)}),
+            json!({"field":"body","kind":"too_large"}),
+        ),
+    ] {
+        let response = app
+            .client
+            .post(app.url("/api/v1/auth/setup"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        error_response_details(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            details,
+        )
+        .await;
+    }
     error_response(
         post_credentials(&app, "/api/v1/auth/setup", USER, "short").await,
         StatusCode::BAD_REQUEST,

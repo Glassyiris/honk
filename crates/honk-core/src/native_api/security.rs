@@ -473,7 +473,7 @@ fn check_bounds(request: &Request, request_id: &str) -> Result<usize, ApiError> 
             .parse::<u64>()
             .map_or(true, |length| length > MAX_BODY_BYTES as u64)
         {
-            return Err(too_large(request_id));
+            return Err(too_large(request_id).with_details(super::body::too_large()));
         }
     }
     if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
@@ -497,7 +497,7 @@ async fn read_body(
         match frame.into_data() {
             Ok(data) => {
                 if data.len() > MAX_BODY_BYTES - bytes.len() {
-                    return Err(too_large(request_id));
+                    return Err(too_large(request_id).with_details(super::body::too_large()));
                 }
                 bytes.extend_from_slice(&data);
             }

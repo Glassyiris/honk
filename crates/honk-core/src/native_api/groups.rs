@@ -388,7 +388,7 @@ pub(super) async fn patch(
                 None,
             )
         })?;
-    let operations: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let operations: Value = super::body::decode(&bytes, invalid)?;
     let reservation = state.observation.operations.reserve(
         state.principal(),
         "PATCH",
@@ -485,7 +485,7 @@ pub(super) async fn select(
                 id,
             )
         })?;
-    let body: SelectionBody = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let body: SelectionBody = super::body::decode(&bytes, invalid)?;
     if body.member_id.is_empty() || body.member_id.len() > 256 {
         return Err(invalid());
     }

@@ -852,6 +852,27 @@ async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
     worker.await.unwrap();
 }
 
+#[tokio::test]
+async fn malformed_requests_name_the_field_but_not_the_value() {
+    let state = state(Config::default()).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let input = request(json!({"type":"node"}), "http", json!(["tcp"]), "ipv4");
+    let key = "malformed".to_owned();
+    let error = create(&state, http_request(&input, &key), &RequestId(key))
+        .await
+        .unwrap_err();
+    let body = serde_json::to_value(&error).unwrap();
+    assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(
+        body["error"]["details"],
+        json!({"field":"target.node_id","kind":"missing"})
+    );
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
 /// The admission error, or the operation's terminal error when planning passed.
 async fn refusal(state: &Arc<NativeState>, input: &Value, index: usize) -> Value {
     let key = format!("refusal-{index}");

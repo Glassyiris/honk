@@ -178,7 +178,7 @@ pub(super) async fn mutate(
             Action::DeleteNode(target) => Mutation::DeleteNode(target),
             Action::DeleteProvider(target) => Mutation::DeleteProvider(target),
             Action::CreateNode => {
-                let input: NodeCreate = serde_json::from_slice(&body).map_err(|_| invalid())?;
+                let input: NodeCreate = super::body::decode(&body, invalid)?;
                 if !(1..=64).contains(&input.name.chars().count()) {
                     return Err(unsupported_value(
                         "Node name must be 1 to 64 characters",
@@ -194,7 +194,7 @@ pub(super) async fn mutate(
                 Mutation::CreateNode(input)
             }
             Action::CreateProvider => {
-                let input: ProviderCreate = serde_json::from_slice(&body).map_err(|_| invalid())?;
+                let input: ProviderCreate = super::body::decode(&body, invalid)?;
                 let rejected = |message, field: &str| {
                     Err(unsupported_value(
                         message,
