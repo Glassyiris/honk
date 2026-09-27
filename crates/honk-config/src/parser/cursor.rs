@@ -20,6 +20,9 @@ pub enum Root {
     Experimental,
 }
 
+/// Names the valid roots; the ignored header itself may carry operator text.
+const UNKNOWN_BLOCK: &str = "unknown top-level block ignored; expected include, global, node, group, subscription, routing, dns or experimental";
+
 impl Root {
     pub const ALL: [Root; 8] = [
         Root::Include,
@@ -197,7 +200,7 @@ impl<'a> Document<'a> {
                         token.span,
                         Severity::Warning,
                         "unknown-block",
-                        "unknown top-level block ignored",
+                        UNKNOWN_BLOCK,
                     ));
                 } else if name == "include" {
                     saw_include = true;
@@ -249,7 +252,7 @@ impl<'a> Document<'a> {
                             token.span,
                             Severity::Warning,
                             "unknown-block",
-                            "unknown top-level block ignored",
+                            UNKNOWN_BLOCK,
                         ));
                     }
                     frames.push(Frame {

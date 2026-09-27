@@ -1380,10 +1380,14 @@ fn test_vless_udp_query_coalesces_equal_claims_and_rejects_bad_values() {
 #[test]
 fn test_rejects_vless_mode_on_other_protocols() {
     for query in ["vless_mode=h2mux", "packetEncoding=xudp"] {
-        assert!(
-            Node::from_share_link(&format!("trojan://password@example.com:443?{query}#node"))
-                .is_err()
-        );
+        let link = format!("trojan://password@example.com:443?{query}#node");
+        assert!(Node::from_share_link(&link).is_err());
+        // The link parses; only the parameter is misplaced, so the message
+        // must not claim a syntax error.
+        let mut diagnostics = Vec::new();
+        let error =
+            Node::from_share_link_with_detailed_diagnostics(&link, &mut diagnostics).unwrap_err();
+        assert_eq!(error.diagnostic.message, "invalid configuration", "{query}");
     }
 }
 
