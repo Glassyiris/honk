@@ -91,6 +91,110 @@ mod parser_warnings {
     }
 
     #[test]
+    fn misplaced_experimental_keys_are_named_by_schema_name_only() {
+        let native = "native API setting belongs inside native_api { }";
+        let unknown = "unknown experimental setting";
+        let nfqueue = "unknown NFQUEUE setting; only enabled is supported";
+        for (input, code, setting, message) in [
+            (
+                "experimental {\n config_write: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.config_write",
+                native,
+            ),
+            (
+                "experimental {\n record_logs: false\n}\n",
+                "unknown-experimental-setting",
+                "experimental.record_logs",
+                native,
+            ),
+            (
+                "experimental {\n external_ui: PRIVATE_UI\n}\n",
+                "unknown-experimental-setting",
+                "experimental.external_ui",
+                "clash API setting belongs inside clash_api { }",
+            ),
+            (
+                "experimental {\n store_dns: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.store_dns",
+                "cache file setting belongs inside cache_file { }",
+            ),
+            (
+                "experimental {\n secret: PRIVATE_SECRET\n}\n",
+                "unknown-experimental-setting",
+                "experimental.secret",
+                unknown,
+            ),
+            (
+                "experimental {\n enabled: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.enabled",
+                unknown,
+            ),
+            (
+                "experimental {\n nfqueue_enable: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental.nfqueue_enable",
+                unknown,
+            ),
+            (
+                "experimental {\n PRIVATE_KEY: true\n}\n",
+                "unknown-experimental-setting",
+                "experimental",
+                unknown,
+            ),
+            (
+                "experimental {\n PRIVATE_BLOCK {\n }\n}\n",
+                "unknown-experimental-setting",
+                "experimental",
+                unknown,
+            ),
+            (
+                "experimental {\n native_api {\n external_ui: PRIVATE_UI\n }\n}\n",
+                "unknown-native-api-setting",
+                "experimental.native_api.external_ui",
+                "unknown native API setting",
+            ),
+            (
+                "experimental {\n native_api {\n PRIVATE_KEY: true\n }\n}\n",
+                "unknown-native-api-setting",
+                "experimental.native_api",
+                "unknown native API setting",
+            ),
+            (
+                "experimental {\n udp_nfqueue {\n nfqueue_enable: true\n }\n}\n",
+                "unknown-nfqueue-setting",
+                "experimental.udp_nfqueue.nfqueue_enable",
+                nfqueue,
+            ),
+            (
+                "experimental {\n udp_nfqueue {\n PRIVATE_KEY: true\n }\n}\n",
+                "unknown-nfqueue-setting",
+                "experimental.udp_nfqueue",
+                nfqueue,
+            ),
+        ] {
+            let mut detailed = Vec::new();
+            let error = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+                input,
+                &mut detailed,
+            )
+            .unwrap_err();
+            assert_eq!(
+                (
+                    error.diagnostic.code,
+                    error.diagnostic.setting.to_string().as_str(),
+                    error.diagnostic.message,
+                ),
+                (code, setting, message),
+                "{input}"
+            );
+            assert!(!format!("{error:?} {detailed:?}").contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
     fn removed_settings_retain_safe_migration_causes() {
         for (input, path, code, replacement) in [
             (
