@@ -86,9 +86,12 @@ fn details(at: &str, path: &Path, error: &serde_json::Error) -> Value {
     } else if let Some(name) = named("duplicate field `") {
         (&segments[..], Some(name), "duplicate")
     } else if text.starts_with("unknown field `") {
-        // The path ends at the submitted key; name the object that holds it.
+        // The path ends at the submitted key, except inside an internally
+        // tagged enum, whose buffered fields leave it at the enclosing field.
+        let key_tracked = matches!(segments.last(), Some(Segment::Map { key })
+            if text.starts_with(&format!("unknown field `{key}`")));
         (
-            &segments[..segments.len().saturating_sub(1)],
+            &segments[..segments.len() - usize::from(key_tracked)],
             None,
             "unknown_field",
         )
@@ -146,6 +149,16 @@ mod tests {
         inner: Option<Inner>,
         list: Option<Vec<Inner>>,
         mode: Option<Mode>,
+        target: Option<Target>,
+    }
+
+    /// Internally tagged like the probe target: serde buffers its fields,
+    /// so the tracked path stops at the enclosing field.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum Target {
+        Node { node_id: String },
     }
 
     #[derive(Debug, Deserialize)]
@@ -200,6 +213,14 @@ mod tests {
         assert_eq!(
             fails(r#"{"name":"n","inner":{"port":1,"secret":1}}"#),
             json!({"field":"inner","kind":"unknown_field"})
+        );
+        assert_eq!(
+            fails(r#"{"name":"n","se`cret":1}"#),
+            json!({"field":"body","kind":"unknown_field"})
+        );
+        assert_eq!(
+            fails(r#"{"name":"n","target":{"type":"node","node_id":"n","secret":1}}"#),
+            json!({"field":"target","kind":"unknown_field"})
         );
     }
 
