@@ -304,3 +304,25 @@ async fn failed_reload_reports_the_diagnostics_of_the_file_on_disk() {
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn failed_reload_keeps_the_error_rows_when_warnings_overflow_details() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let ignored: String = (0..20)
+        .map(|index| format!("ignored{index} {{\n}}\n"))
+        .collect();
+    std::fs::write(
+        fixture.path("locked.dae"),
+        format!("{ignored}group {{\n  broken {{\n    policy: honk\n  }}\n}}\n"),
+    )
+    .unwrap();
+    let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    let rows = terminal["error"]["details"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{terminal}"));
+    assert!(rows.iter().all(|row| row["level"] == "error"), "{rows:?}");
+    assert!(rows.iter().any(|row| row["code"] == "unsupported-policy"));
+    fixture.assert_last_reload(&terminal).await;
+    fixture.shutdown().await;
+}

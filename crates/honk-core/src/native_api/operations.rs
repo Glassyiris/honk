@@ -369,10 +369,7 @@ impl OperationStore {
         message: &'static str,
         details: Option<Value>,
     ) -> bool {
-        let details = details.filter(|value| {
-            value.is_object()
-                && serde_json::to_writer(DetailsBudget(MAX_ERROR_DETAILS), value).is_ok()
-        });
+        let details = details.filter(error_details_fit);
         self.finish(
             id,
             Err(SafeError {
@@ -525,6 +522,11 @@ fn not_found() -> ApiError {
         "The requested operation was not found.",
         None,
     )
+}
+
+/// Whether `details` is an object that fits an operation error.
+pub(crate) fn error_details_fit(details: &Value) -> bool {
+    details.is_object() && serde_json::to_writer(DetailsBudget(MAX_ERROR_DETAILS), details).is_ok()
 }
 
 struct DetailsBudget(usize);

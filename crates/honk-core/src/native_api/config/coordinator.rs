@@ -309,7 +309,19 @@ impl Worker {
                         .await;
                     }
                     Err(error) => {
-                        let (code, message, details) = error.into_safe();
+                        let (code, message, mut details) = error.into_safe();
+                        // Every warning of the files rides along; when they overflow the
+                        // operation's details, keep the rows that explain the failure.
+                        if let Some(rows) = details
+                            .as_mut()
+                            .filter(|details| {
+                                !crate::native_api::operations::error_details_fit(details)
+                            })
+                            .and_then(|details| details.get_mut("diagnostics"))
+                            .and_then(Value::as_array_mut)
+                        {
+                            rows.retain(|row| row["level"] == "error");
+                        }
                         self.failed(&id, code, message, details);
                     }
                 }

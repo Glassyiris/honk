@@ -235,6 +235,8 @@ impl Worker {
         message: &'static str,
         details: Option<Value>,
     ) {
+        // `last_reload` reports only what the operation keeps.
+        let details = details.filter(crate::native_api::operations::error_details_fit);
         self.service
             .operations
             .fail(id, code, message, details.clone());
