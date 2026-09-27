@@ -500,10 +500,11 @@ async fn udp_capability_and_policy_gates_skip_target_resolution_and_health_feedb
             generation,
             Arc::new(StatsManager::new()),
             UdpDnsProbeTarget::new(vec!["denied.example:443".into()], Some(resolver.clone())),
-            Some(QuicScoreProbeTarget::new(
+            Some(Arc::new(QuicScoreProbeTarget::new(
                 "https://denied.example/".into(),
                 Some(resolver),
-            )),
+                Arc::default(),
+            ))),
             manager,
         );
 
@@ -596,7 +597,11 @@ async fn quic_target_refusal_is_retried_by_later_udp_probe() {
                 })
             })
         };
-        let target = QuicScoreProbeTarget::new("https://quic.example:9443/".into(), Some(resolver));
+        let target = QuicScoreProbeTarget::new(
+            "https://quic.example:9443/".into(),
+            Some(resolver),
+            Arc::default(),
+        );
         let error = target.resolve().await.err().expect("initial refusal");
         assert!(honk_outbound::proxy::is_packet_rejection(&error));
         let prober = ProxyUdpProber::new(
@@ -609,7 +614,7 @@ async fn quic_target_refusal_is_retried_by_later_udp_probe() {
             generation,
             Arc::new(StatsManager::new()),
             UdpDnsProbeTarget::new(vec!["127.0.0.1:53".into()], None),
-            Some(target),
+            Some(Arc::new(target)),
             manager,
         );
 
@@ -814,4 +819,51 @@ async fn health_shutdown_closes_real_http_probe_without_failure_evidence() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn disabled_quic_probes_are_reported_while_a_score_group_needs_them() {
+    use crate::degradations::{Component, Degradations};
+    let degradations = Arc::new(Degradations::default());
+    let reason = || {
+        degradations
+            .get(Component::QuicProbe)
+            .map(|issue| issue.reason)
+    };
+
+    let plain = QuicScoreProbeTarget::new(
+        "http://quic.example/".into(),
+        None,
+        Arc::clone(&degradations),
+    );
+    assert_eq!(reason(), Some("unsupported_url"));
+    // A reload that drops the last Score group clears it; one that adds a
+    // Score group back reports it again.
+    plain.set_needed(false);
+    assert_eq!(reason(), None);
+    plain.set_needed(true);
+    assert_eq!(reason(), Some("unsupported_url"));
+    drop(plain);
+
+    let unresolved: crate::outbound::ResolveHook =
+        Arc::new(|_, _| Box::pin(async { Err(anyhow::anyhow!("no answer")) }));
+    let target = QuicScoreProbeTarget::new(
+        "https://quic.example/".into(),
+        Some(unresolved),
+        Arc::clone(&degradations),
+    );
+    assert!(target.resolve().await.unwrap().is_none());
+    assert_eq!(reason(), Some("resolution_failed"));
+    target.set_needed(false);
+    assert_eq!(reason(), None);
+    assert!(target.resolve().await.unwrap().is_none());
+    assert_eq!(reason(), None, "an unneeded target stays unlisted");
+
+    let literal = QuicScoreProbeTarget::new(
+        "https://127.0.0.1:9443/".into(),
+        None,
+        Arc::clone(&degradations),
+    );
+    assert!(literal.resolve().await.unwrap().is_some());
+    assert_eq!(reason(), None);
 }

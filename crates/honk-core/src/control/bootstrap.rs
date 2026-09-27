@@ -342,6 +342,7 @@ impl ControlPlane {
             state_db: None,
             state_tick: cache::StateTick::default(),
             degradations,
+            quic_score_target: None,
             outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(

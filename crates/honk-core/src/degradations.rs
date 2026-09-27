@@ -12,16 +12,18 @@ use parking_lot::Mutex;
 pub(crate) enum Component {
     Persistence,
     StateCache,
+    QuicProbe,
 }
 
 impl Component {
-    const COUNT: usize = 2;
+    const COUNT: usize = 3;
 
     #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
     pub(crate) fn id(self) -> &'static str {
         match self {
             Self::Persistence => "persistence",
             Self::StateCache => "state_cache",
+            Self::QuicProbe => "quic_probe",
         }
     }
 }
@@ -75,6 +77,12 @@ impl Degradations {
         }
     }
 
+    pub(crate) fn clear(&self, component: Component) {
+        if self.entries.lock()[component as usize].take().is_some() {
+            self.changed();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn get(&self, component: Component) -> Option<Issue> {
         self.entries.lock()[component as usize].map(|(issue, _)| issue)
@@ -85,6 +93,7 @@ impl Degradations {
         const ALL: [Component; Component::COUNT] = [
             Component::Persistence,
             Component::StateCache,
+            Component::QuicProbe,
         ];
         let entries = self.entries.lock();
         ALL.into_iter()
@@ -143,5 +152,9 @@ mod tests {
         assert_eq!(notified.load(Ordering::Relaxed), 2);
         let entry = &registry.snapshot()[0];
         assert_eq!((entry.issue, entry.since), (changed, since));
+        registry.clear(Component::Persistence);
+        registry.clear(Component::Persistence);
+        assert_eq!(notified.load(Ordering::Relaxed), 3);
+        assert!(registry.snapshot().is_empty());
     }
 }

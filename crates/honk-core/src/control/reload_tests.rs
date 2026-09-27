@@ -3637,3 +3637,65 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
     assert_eq!(log.matches("noncanonical-node-id").count(), 1, "{log}");
     assert!(!log.contains("192.0.2.11"), "{log}");
 }
+
+#[tokio::test]
+async fn quic_probe_is_reported_only_while_an_applied_score_group_needs_it() {
+    let mut cp = test_cp().await;
+    cp.quic_score_target = Some(Arc::new(probers::QuicScoreProbeTarget::new(
+        "http://quic.example/".into(),
+        None,
+        Arc::clone(&cp.degradations),
+    )));
+    let quic = || {
+        cp.degradations
+            .get(crate::degradations::Component::QuicProbe)
+    };
+    for (config, degraded) in [
+        (changed_routing_config(), false),
+        (score_reload_config(1), true),
+    ] {
+        let outcome = cp
+            .apply_resolved_runtime_config_locked(
+                config,
+                &DrainTracker::new(),
+                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.accepted());
+        assert_eq!(quic().is_some(), degraded);
+    }
+}
+
+#[tokio::test]
+async fn score_group_added_by_reload_reports_quic_probe_until_restart() {
+    // Startup without a Score group builds no QUIC target.
+    let cp = test_cp().await;
+    assert!(cp.quic_score_target.is_none());
+    let quic = || {
+        cp.degradations
+            .get(crate::degradations::Component::QuicProbe)
+            .map(|issue| issue.reason)
+    };
+    for (config, reason) in [
+        (score_reload_config(1), Some("restart_required")),
+        (changed_routing_config(), None),
+    ] {
+        let outcome = cp
+            .apply_resolved_runtime_config_locked(
+                config,
+                &DrainTracker::new(),
+                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.accepted());
+        assert_eq!(quic(), reason);
+    }
+}

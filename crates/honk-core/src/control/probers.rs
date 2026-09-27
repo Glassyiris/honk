@@ -340,27 +340,110 @@ pub(super) struct QuicScoreProbeTarget {
     url: String,
     port: Option<u16>,
     resolver: Option<crate::outbound::ResolveHook>,
-    resolved: tokio::sync::OnceCell<Option<QuicScoreTarget>>,
+    /// `Err` holds the reason QUIC probes are disabled.
+    resolved: tokio::sync::OnceCell<Result<QuicScoreTarget, &'static str>>,
+    /// Whether the applied configuration has a Score group; the target is
+    /// built at startup, so a reload only changes this.
+    needed: std::sync::atomic::AtomicBool,
+    degradations: Arc<crate::degradations::Degradations>,
 }
 
 impl QuicScoreProbeTarget {
-    pub(super) fn new(url: String, resolver: Option<crate::outbound::ResolveHook>) -> Self {
+    /// Lists `quic_probe` in `degradations` while the probes are disabled.
+    pub(super) fn new(
+        url: String,
+        resolver: Option<crate::outbound::ResolveHook>,
+        degradations: Arc<crate::degradations::Degradations>,
+    ) -> Self {
         let port = honk_config::check::decode_health_http_target(&url)
             .ok()
             .filter(|_| url.trim().starts_with("https://"))
             .map(|target| target.port());
-        Self {
+        let target = Self {
             url,
             port,
             resolver,
             resolved: tokio::sync::OnceCell::new(),
-        }
+            needed: std::sync::atomic::AtomicBool::new(true),
+            degradations,
+        };
+        target.report();
+        target
     }
 
-    pub(super) async fn resolve(&self) -> anyhow::Result<&Option<QuicScoreTarget>> {
-        self.resolved
+    pub(super) async fn resolve(&self) -> anyhow::Result<Option<&QuicScoreTarget>> {
+        let target = self
+            .resolved
             .get_or_try_init(|| resolve_quic_score_target(&self.url, self.resolver.clone()))
-            .await
+            .await?;
+        self.report();
+        Ok(target.as_ref().ok())
+    }
+
+    pub(super) fn set_needed(&self, needed: bool) {
+        self.needed
+            .store(needed, std::sync::atomic::Ordering::Relaxed);
+        self.report();
+    }
+
+    /// A URL that cannot carry a QUIC probe is never resolved, so it is known
+    /// from the start; any other reason once resolution settles.
+    fn report(&self) {
+        let component = crate::degradations::Component::QuicProbe;
+        let disabled = if self.port.is_none() {
+            Some("unsupported_url")
+        } else {
+            self.resolved
+                .get()
+                .and_then(|target| target.as_ref().err().copied())
+        };
+        match disabled.filter(|_| self.needed.load(std::sync::atomic::Ordering::Relaxed)) {
+            Some(reason) => self
+                .degradations
+                .set(component, quic_probe_disabled(reason)),
+            None => self.degradations.clear(component),
+        }
+    }
+}
+
+/// QUIC probes feed Score groups only.
+pub(super) fn needs_quic_probe(config: &Config) -> bool {
+    config
+        .groups
+        .iter()
+        .any(|group| group.policy == honk_config::node::GroupPolicy::Score)
+}
+
+/// The URL a QUIC probe target is built from at startup, if any: QUIC probes
+/// feed Score groups only and follow the first `tcp_check_url`.
+pub(super) fn quic_probe_url(config: &Config) -> Option<String> {
+    config
+        .global
+        .tcp_check_url
+        .first()
+        .filter(|url| !url.is_empty() && needs_quic_probe(config))
+        .cloned()
+}
+
+/// Without a startup target, a reload that adds a Score group cannot start
+/// QUIC probes; that stays listed until a restart builds the target.
+pub(super) fn report_quic_probe_restart(
+    degradations: &crate::degradations::Degradations,
+    config: &Config,
+) {
+    let component = crate::degradations::Component::QuicProbe;
+    if quic_probe_url(config).is_some() {
+        degradations.set(component, quic_probe_disabled("restart_required"));
+    } else {
+        degradations.clear(component);
+    }
+}
+
+fn quic_probe_disabled(reason: &'static str) -> crate::degradations::Issue {
+    crate::degradations::Issue {
+        code: "quic_probe_disabled",
+        message: "Score QUIC probes are disabled; node scores use other probes only.",
+        reason,
     }
 }
 
@@ -436,7 +519,7 @@ impl ProxyUdpProber {
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         stats: Arc<StatsManager>,
         dns_probe: UdpDnsProbeTarget,
-        quic_score_target: Option<QuicScoreProbeTarget>,
+        quic_score_target: Option<Arc<QuicScoreProbeTarget>>,
         group_manager: SharedGroupManager,
     ) -> Self {
         Self {
@@ -446,7 +529,7 @@ impl ProxyUdpProber {
             stats,
             dns_probe: Arc::new(dns_probe),
             group_manager,
-            quic_score_target: quic_score_target.map(Arc::new),
+            quic_score_target,
         }
     }
 
@@ -884,19 +967,21 @@ pub(super) fn udp_probe_identity(raws: &[String], resolved: SocketAddr) -> Score
     }
 }
 
-pub(super) async fn resolve_quic_score_target(
+/// `Ok(Err(reason))` disables QUIC probes; an error is a packet refusal the
+/// next probe retries.
+async fn resolve_quic_score_target(
     url: &str,
     resolver: Option<crate::outbound::ResolveHook>,
-) -> anyhow::Result<Option<QuicScoreTarget>> {
+) -> anyhow::Result<Result<QuicScoreTarget, &'static str>> {
     if !url.trim().starts_with("https://") {
         warn!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
-        return Ok(None);
+        return Ok(Err("unsupported_url"));
     }
     let target = match honk_config::check::decode_health_http_target(url) {
         Ok(target) => target,
         Err(_) => {
             warn!("Score QUIC probe disabled: invalid tcp_check_url");
-            return Ok(None);
+            return Ok(Err("unsupported_url"));
         }
     };
     let host = target.host().to_owned();
@@ -912,7 +997,7 @@ pub(super) async fn resolve_quic_score_target(
                 }
                 Err(_) => {
                     warn!("Score QUIC probe disabled: tcp_check_url host resolution failed");
-                    return Ok(None);
+                    return Ok(Err("resolution_failed"));
                 }
             },
             None => honk_outbound::bootstrap::resolve(&host)
@@ -929,7 +1014,7 @@ pub(super) async fn resolve_quic_score_target(
         Some(addr) => addr,
         None => {
             warn!("Score QUIC probe disabled: tcp_check_url host did not resolve");
-            return Ok(None);
+            return Ok(Err("resolution_failed"));
         }
     };
     let identity = host
@@ -961,11 +1046,11 @@ pub(super) async fn resolve_quic_score_target(
         Ok(config) => config,
         Err(error) => {
             warn!("Score QUIC probe disabled: failed to build QUIC client: {error:#}");
-            return Ok(None);
+            return Ok(Err("client_unavailable"));
         }
     };
     debug!(host, %addr, "Score QUIC probe enabled");
-    Ok(Some(QuicScoreTarget {
+    Ok(Ok(QuicScoreTarget {
         addr,
         host,
         identity,
