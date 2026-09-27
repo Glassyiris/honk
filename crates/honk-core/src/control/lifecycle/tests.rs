@@ -334,3 +334,33 @@ async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> any
     assert_eq!(plane.drain_tracker.active_count(), 0);
     Ok(())
 }
+
+#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[tokio::test]
+async fn a_socket_without_any_receive_trace_is_untraced() {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    // A pipe refuses `SO_RCVPRIORITY` on every kernel, and the mock backend has no eBPF trace.
+    let (read, _write) = nix::unistd::pipe().unwrap();
+    let socket = unsafe { std::net::UdpSocket::from_raw_fd(read.into_raw_fd()) };
+    socket.set_nonblocking(true).unwrap();
+    let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
+    let ebpf: RwLock<Box<dyn EbpfBackend>> =
+        RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
+    let mut batch = sockets::UdpRecvBatch::new().unwrap();
+    assert!(!super::enable_receive_trace(&ebpf, &mut batch, &socket, "v4").await);
+}
+
+#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[test]
+fn udp_trace_is_reported_until_a_listener_generation_traces() {
+    let degradations = crate::degradations::Degradations::default();
+    let traced = || {
+        degradations
+            .get(crate::degradations::Component::UdpTrace)
+            .is_none()
+    };
+    super::record_udp_trace(&degradations, true);
+    assert!(!traced());
+    super::record_udp_trace(&degradations, false);
+    assert!(traced());
+}

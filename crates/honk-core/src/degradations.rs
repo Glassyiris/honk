@@ -12,17 +12,23 @@ use parking_lot::Mutex;
 pub(crate) enum Component {
     Persistence,
     StateCache,
+    IfaceWatch,
+    PnameRouting,
+    UdpTrace,
     QuicProbe,
 }
 
 impl Component {
-    const COUNT: usize = 3;
+    const COUNT: usize = 6;
 
     #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
     pub(crate) fn id(self) -> &'static str {
         match self {
             Self::Persistence => "persistence",
             Self::StateCache => "state_cache",
+            Self::IfaceWatch => "iface_watch",
+            Self::PnameRouting => "pname_routing",
+            Self::UdpTrace => "udp_trace",
             Self::QuicProbe => "quic_probe",
         }
     }
@@ -93,6 +99,9 @@ impl Degradations {
         const ALL: [Component; Component::COUNT] = [
             Component::Persistence,
             Component::StateCache,
+            Component::IfaceWatch,
+            Component::PnameRouting,
+            Component::UdpTrace,
             Component::QuicProbe,
         ];
         let entries = self.entries.lock();

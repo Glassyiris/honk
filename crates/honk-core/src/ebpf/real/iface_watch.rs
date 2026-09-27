@@ -62,6 +62,7 @@ impl IfaceWatcher {
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
         attached: AttachedMap,
+        degradations: Arc<crate::degradations::Degradations>,
     ) -> Option<Self> {
         let fd = match subscribe_network_events() {
             Ok(fd) => fd,
@@ -70,11 +71,15 @@ impl IfaceWatcher {
                     "interface watcher disabled; subscribe network events failed: {}",
                     e
                 );
+                degradations.set(
+                    crate::degradations::Component::IfaceWatch,
+                    watcher_disabled("subscribe_failed"),
+                );
                 return None;
             }
         };
         let (stop, rx) = watch::channel(false);
-        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx));
+        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx, degradations));
         Some(Self { handle, stop })
     }
 
@@ -88,6 +93,14 @@ impl IfaceWatcher {
             handle.abort();
             let _ = (&mut handle).await;
         }
+    }
+}
+
+fn watcher_disabled(reason: &'static str) -> crate::degradations::Issue {
+    crate::degradations::Issue {
+        code: "interface_watcher_disabled",
+        message: "The interface watcher is not running; interface changes take effect after a restart.",
+        reason,
     }
 }
 
@@ -111,12 +124,17 @@ async fn run(
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
+    degradations: Arc<crate::degradations::Degradations>,
 ) {
     let async_fd = match tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
     {
         Ok(f) => f,
         Err(e) => {
             warn!("interface watcher disabled: AsyncFd setup failed: {}", e);
+            degradations.set(
+                crate::degradations::Component::IfaceWatch,
+                watcher_disabled("poll_setup_failed"),
+            );
             return;
         }
     };
@@ -406,8 +424,45 @@ mod tests {
         let (events, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         events.set_nonblocking(true).unwrap();
         let (stop, rx) = watch::channel(false);
-        let handle = tokio::spawn(run(events.into(), ebpf, config, commands, attached, rx));
+        let handle = tokio::spawn(run(
+            events.into(),
+            ebpf,
+            config,
+            commands,
+            attached,
+            rx,
+            Arc::default(),
+        ));
         (IfaceWatcher { handle, stop }, writer)
+    }
+
+    #[tokio::test]
+    async fn a_watcher_that_cannot_poll_is_reported() {
+        let degradations = Arc::new(crate::degradations::Degradations::default());
+        // epoll refuses regular files.
+        let file = tempfile::tempfile().unwrap();
+        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        )));
+        let config = Arc::new(RwLock::new(Arc::new(honk_config::Config::default())));
+        let (commands, _receiver) = mpsc::channel(1);
+        let (_stop, rx) = watch::channel(false);
+        run(
+            file.into(),
+            ebpf,
+            config,
+            commands,
+            AttachedMap::default(),
+            rx,
+            Arc::clone(&degradations),
+        )
+        .await;
+        assert_eq!(
+            degradations
+                .get(crate::degradations::Component::IfaceWatch)
+                .map(|issue| issue.reason),
+            Some("poll_setup_failed")
+        );
     }
 
     #[test]

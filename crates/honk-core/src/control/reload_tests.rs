@@ -703,9 +703,13 @@ async fn test_cp() -> ControlPlane {
 }
 
 async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
+    test_cp_with_backend(MockEbpfBackend::new(), nfqueue).await
+}
+
+async fn test_cp_with_backend(backend: MockEbpfBackend, nfqueue: bool) -> ControlPlane {
     let mut control_plane = ControlPlane::new(
         Config::default(),
-        Box::new(MockEbpfBackend::new()),
+        Box::new(backend),
         Router::new(&[], "direct").unwrap(),
         std::sync::Arc::new(ProxyRegistry::default_resolver().unwrap()),
         DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
@@ -3636,6 +3640,38 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
     assert_eq!(cp.config_handle().read().await.as_ref(), &current);
     assert_eq!(log.matches("noncanonical-node-id").count(), 1, "{log}");
     assert!(!log.contains("192.0.2.11"), "{log}");
+}
+
+#[tokio::test]
+async fn pname_routing_is_reported_only_while_an_applied_rule_uses_pname() {
+    let mut backend = MockEbpfBackend::new();
+    backend.pname_support = crate::ebpf::PnameSupport::Unavailable;
+    let cp = test_cp_with_backend(backend, false).await;
+    let pname = || {
+        cp.degradations
+            .get(crate::degradations::Component::PnameRouting)
+    };
+    let without = changed_routing_config();
+    let mut with = without.clone();
+    with.routing.rules[0].condition.process_name = vec!["curl".into()];
+    for (config, degraded) in [(&with, true), (&without, false)] {
+        let outcome = cp
+            .apply_resolved_runtime_config_locked(
+                config.clone(),
+                &DrainTracker::new(),
+                crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.accepted());
+        assert_eq!(
+            pname().map(|issue| issue.reason),
+            degraded.then_some("cgroup_unavailable")
+        );
+    }
 }
 
 #[tokio::test]

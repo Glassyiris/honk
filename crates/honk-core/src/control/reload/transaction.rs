@@ -730,6 +730,7 @@ impl ControlPlane {
                 }
                 publication.commit();
                 *router_guard = new_router;
+                crate::ebpf::record_pname_routing(&router_guard, &**ebpf, &self.degradations);
                 *config_guard = Arc::new(new_config);
                 match &self.quic_score_target {
                     Some(target) => {

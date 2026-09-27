@@ -321,6 +321,45 @@ pub struct DatapathFlagsWriteTrace {
     pub failed: bool,
 }
 
+/// How far the datapath can match `pname()` rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PnameSupport {
+    #[default]
+    Full,
+    /// Kernel argv capture is unavailable; rules see the thread name.
+    ThreadName,
+    /// The cgroup hooks are not attached; `pname()` never matches and
+    /// `!pname()` always does.
+    Unavailable,
+}
+
+/// Lists `pname_routing` while `router` has a `pname()` rule that `backend` reduces.
+pub(crate) fn record_pname_routing(
+    router: &crate::routing::Router,
+    backend: &dyn EbpfBackend,
+    degradations: &crate::degradations::Degradations,
+) {
+    use crate::degradations::{Component, Issue};
+    let issue = match backend.pname_support() {
+        _ if !router.uses_process_name() => None,
+        PnameSupport::Full => None,
+        PnameSupport::ThreadName => Some(Issue {
+            code: "pname_routing_reduced",
+            message: "Kernel argv capture is unavailable; process-name rules match the thread name.",
+            reason: "comm_fallback",
+        }),
+        PnameSupport::Unavailable => Some(Issue {
+            code: "pname_routing_disabled",
+            message: "cgroup v2 is unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match.",
+            reason: "cgroup_unavailable",
+        }),
+    };
+    match issue {
+        Some(issue) => degradations.set(Component::PnameRouting, issue),
+        None => degradations.clear(Component::PnameRouting),
+    }
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
@@ -620,6 +659,10 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(feature = "ebpf")]
     fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
         None
+    }
+
+    fn pname_support(&self) -> PnameSupport {
+        PnameSupport::Full
     }
 
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;

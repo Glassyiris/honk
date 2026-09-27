@@ -1590,6 +1590,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
     let router = routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources)?;
     info!("Router ready with {} compiled routes", router.route_count());
+    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1677,6 +1678,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.config_handle(),
             control_plane.command_sender(),
             attached_ifaces,
+            Arc::clone(&degradations),
         )
     } else {
         None

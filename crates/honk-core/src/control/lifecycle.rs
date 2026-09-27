@@ -378,6 +378,8 @@ impl ControlPlane {
                     .experimental
                     .native_api
                     .record_flows;
+            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            let mut trace_unavailable = false;
             let state = UdpLoopState::new(self, daens_netns_exists());
             for (socket, family) in epoch
                 .listeners
@@ -392,11 +394,10 @@ impl ControlPlane {
                 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
                 let mut batch = batch;
                 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-                if record_flows && batch.enable_trace(&socket, None).is_err() {
-                    let trace = self.ebpf.write().await.receive_trace();
-                    if let Err(error) = batch.enable_trace(&socket, trace) {
-                        warn!(family, %error, "UDP receive trace unavailable");
-                    }
+                if record_flows
+                    && !enable_receive_trace(&self.ebpf, &mut batch, &socket, family).await
+                {
+                    trace_unavailable = true;
                 }
                 let mut stopping = epoch.stop.subscribe();
                 let mut exit = CriticalTaskExit {
@@ -412,6 +413,8 @@ impl ControlPlane {
                     }
                 });
             }
+            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            record_udp_trace(&self.degradations, trace_unavailable);
             epoch.removals = Some(spawn_udp_removal_worker(
                 self.udp_pool.clone(),
                 self.ebpf.clone(),
@@ -539,6 +542,46 @@ impl ControlPlane {
 #[derive(Debug, thiserror::Error)]
 #[error("runtime candidate cleanup failed: {0}")]
 struct EpochCleanupFailure(#[source] anyhow::Error);
+
+/// Whether `socket` records kernel UDP receive traces: `SO_RCVPRIORITY` where
+/// the kernel has it, otherwise the eBPF receive trace.
+#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+async fn enable_receive_trace(
+    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    batch: &mut sockets::UdpRecvBatch,
+    socket: &tokio::net::UdpSocket,
+    family: &str,
+) -> bool {
+    if batch.enable_trace(socket, None).is_ok() {
+        return true;
+    }
+    let trace = ebpf.write().await.receive_trace();
+    match batch.enable_trace(socket, trace) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(family, %error, "UDP receive trace unavailable");
+            false
+        }
+    }
+}
+
+/// Kernel UDP receive tracing is only needed while flows are recorded.
+#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+fn record_udp_trace(degradations: &crate::degradations::Degradations, unavailable: bool) {
+    let component = crate::degradations::Component::UdpTrace;
+    if unavailable {
+        degradations.set(
+            component,
+            crate::degradations::Issue {
+                code: "udp_trace_unavailable",
+                message: "Kernel UDP receive tracing is unavailable; recorded UDP flows may lack kernel route evidence.",
+                reason: "unavailable",
+            },
+        );
+    } else {
+        degradations.clear(component);
+    }
+}
 
 async fn cleanup_stage<T>(future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     tokio::pin!(future);

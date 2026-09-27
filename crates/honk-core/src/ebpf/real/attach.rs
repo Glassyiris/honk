@@ -539,6 +539,7 @@ impl RealEbpfBackend {
             interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,
+            pname_mode,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
