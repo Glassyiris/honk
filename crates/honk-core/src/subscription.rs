@@ -37,7 +37,7 @@ pub(crate) use supervisor::{
     SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
 };
 #[cfg(feature = "native-api")]
-pub(crate) use supervisor::{ProviderLoad, RefreshRefusal};
+pub(crate) use supervisor::{ProviderLoad, RefreshRefusal, RefreshReport};
 
 /// Bounds what a hostile or broken origin can make honk buffer before parsing.
 const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;

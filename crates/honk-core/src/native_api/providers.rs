@@ -30,7 +30,8 @@ use super::{
 use crate::{
     control::ReloadOutcome,
     subscription::{
-        ProviderLoad, RefreshRefusal, SubscriptionMergeReply, SubscriptionSupervisorHandle,
+        ProviderLoad, RefreshRefusal, RefreshReport, SubscriptionMergeReply,
+        SubscriptionSupervisorHandle,
     },
 };
 
@@ -466,14 +467,14 @@ pub(super) async fn refresh(
         match prepared {
             Ok((subscription, supervisor, display)) => supervisor.refresh(
                 subscription,
-                RefreshOperation {
+                Box::new(RefreshOperation {
                     reservation,
                     operations: Arc::clone(operations),
                     instance: state.observation.instance_id.clone(),
                     display_name: display.name,
                     display_url: display.url_redacted.expect("subscription URL is present"),
                     display_download: display.download,
-                },
+                }),
             )?,
             Err(error) => {
                 operations.reject(&reservation.id, error.clone());
@@ -493,19 +494,19 @@ pub(crate) struct RefreshOperation {
     pub(crate) display_download: Option<Value>,
 }
 
-impl RefreshOperation {
-    pub(crate) fn accept(&self) {
+impl RefreshReport for RefreshOperation {
+    fn accept(&self) {
         self.operations.accept(&self.reservation.id);
     }
-    pub(crate) fn running(&self) {
+    fn running(&self) {
         self.operations.running(&self.reservation.id);
     }
-    pub(crate) fn reject(self, refusal: RefreshRefusal) {
+    fn reject(self: Box<Self>, refusal: RefreshRefusal) {
         self.operations.reject(&self.reservation.id, refusal.into());
     }
 
-    pub(crate) fn finish(
-        self,
+    fn finish(
+        self: Box<Self>,
         subscription: &Subscription,
         load: ProviderLoad,
         result: Result<SubscriptionMergeReply, &'static str>,

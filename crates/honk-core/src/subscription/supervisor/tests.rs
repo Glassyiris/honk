@@ -211,14 +211,14 @@ async fn refresh_queue_refusal_wakes_idempotent_waiters_and_shutdown_settles_acc
             .unwrap();
         state.refresh(
             authorized.subscription.clone(),
-            RefreshOperation {
+            Box::new(RefreshOperation {
                 display_name: authorized.subscription.name.clone(),
                 display_url: authorized.subscription.url.clone(),
                 display_download: None,
                 reservation,
                 operations: Arc::clone(&operations),
                 instance: instance.clone(),
-            },
+            }),
         );
         if index == MAX_REFRESH_QUEUE {
             assert_eq!(
@@ -419,14 +419,14 @@ async fn shutdown_cancels_periodic_and_explicit_fetches_without_losing_replay() 
         let id = reservation.id.clone();
         state.refresh(
             subscription.subscription.clone(),
-            RefreshOperation {
+            Box::new(RefreshOperation {
                 display_name: subscription.subscription.name.clone(),
                 display_url: subscription.subscription.url.clone(),
                 display_download: None,
                 reservation,
                 operations: Arc::clone(&operations),
                 instance: instance.clone(),
-            },
+            }),
         );
         admitted.push((path, id));
         if subscription.subscription.id == explicit.subscription.id {

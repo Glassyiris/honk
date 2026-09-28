@@ -45,6 +45,21 @@ pub(crate) enum RefreshRefusal {
     Unavailable,
 }
 
+/// Receives the lifecycle of one explicit provider refresh, so the supervisor
+/// reports progress without depending on the API that asked for it.
+#[cfg(feature = "native-api")]
+pub(crate) trait RefreshReport: Send + Sync {
+    fn accept(&self);
+    fn running(&self);
+    fn reject(self: Box<Self>, refusal: RefreshRefusal);
+    fn finish(
+        self: Box<Self>,
+        subscription: &Subscription,
+        load: ProviderLoad,
+        result: Result<SubscriptionMergeReply, &'static str>,
+    );
+}
+
 struct ObservedProvider {
     subscription: Subscription,
     load: ProviderLoad,
@@ -210,7 +225,7 @@ async fn fetch_once(
 struct Flight {
     authorized: AuthorizedSubscription,
     #[cfg(feature = "native-api")]
-    operation: Option<crate::native_api::providers::RefreshOperation>,
+    operation: Option<Box<dyn RefreshReport>>,
 }
 
 enum ProviderSchedule {
@@ -489,11 +504,7 @@ impl SupervisorState {
     }
 
     #[cfg(feature = "native-api")]
-    fn refresh(
-        &mut self,
-        subscription: Subscription,
-        operation: crate::native_api::providers::RefreshOperation,
-    ) {
+    fn refresh(&mut self, subscription: Subscription, operation: Box<dyn RefreshReport>) {
         let id = subscription.id;
         let Some(provider) = self.providers.get_mut(&id) else {
             operation.reject(RefreshRefusal::NotRefreshable);
@@ -714,7 +725,7 @@ enum SupervisorCommand {
     #[cfg(feature = "native-api")]
     Refresh {
         subscription: Subscription,
-        operation: crate::native_api::providers::RefreshOperation,
+        operation: Box<dyn RefreshReport>,
     },
     Shutdown {
         done: oneshot::Sender<anyhow::Result<usize>>,
@@ -756,7 +767,7 @@ impl SubscriptionSupervisorHandle {
     pub(crate) fn refresh(
         &self,
         subscription: Subscription,
-        operation: crate::native_api::providers::RefreshOperation,
+        operation: Box<dyn RefreshReport>,
     ) -> Result<(), RefreshRefusal> {
         if let Err(error) = self.command_tx.try_send(SupervisorCommand::Refresh {
             subscription,
