@@ -4,7 +4,7 @@ impl CapturedConfig {
     /// Drops the captured asset bytes that [`Self::with_geo`] replaces, so a
     /// geodata update does not hold the loaded files beside the downloads.
     pub(crate) fn release_geo(&mut self) {
-        self.geo = GeoSourceSet::unused();
+        self.geo = GeoSourceSet::load(&GeoRequirements::default());
     }
 
     pub(crate) fn with_geo(mut self, geo: GeoSourceSet) -> Result<Self, DetailedConfigError> {
