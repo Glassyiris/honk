@@ -347,7 +347,11 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     let ebpf: RwLock<Box<dyn EbpfBackend>> =
         RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
     let mut batch = sockets::UdpRecvBatch::new().unwrap();
-    assert!(!super::enable_receive_trace(&ebpf, &mut batch, &socket, "v4").await);
+    assert!(
+        super::enable_receive_trace(&ebpf, &mut batch, &socket)
+            .await
+            .is_err()
+    );
 }
 
 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
