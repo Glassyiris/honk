@@ -37,7 +37,6 @@ pub(crate) struct Outbounds<'a> {
 }
 
 /// The owned handles behind [`Outbounds`], for a download that outlives one borrow.
-#[cfg(feature = "native-api")]
 #[derive(Clone)]
 pub(crate) struct SharedOutbounds {
     pub(crate) router: std::sync::Arc<RwLock<Router>>,
@@ -47,7 +46,6 @@ pub(crate) struct SharedOutbounds {
     pub(crate) runtime_registry: SharedRuntimeRegistry,
 }
 
-#[cfg(feature = "native-api")]
 impl SharedOutbounds {
     pub(crate) fn outbounds(&self) -> Outbounds<'_> {
         Outbounds {
@@ -71,11 +69,19 @@ pub(crate) struct NoUsableNode {
 /// Where the download goes.
 pub(crate) enum Route {
     Direct {
+        #[cfg_attr(
+            not(feature = "clash-api"),
+            allow(dead_code, reason = "only the Clash UI download reports Score feedback")
+        )]
         feedback: Option<ScoreAttempt>,
     },
     Block,
     Proxy {
         node: Box<Node>,
+        #[cfg_attr(
+            not(feature = "clash-api"),
+            allow(dead_code, reason = "only the Clash UI download reports Score feedback")
+        )]
         feedback: Option<ScoreAttempt>,
     },
 }
@@ -83,6 +89,10 @@ pub(crate) enum Route {
 /// A route, and the group the detour or the routing rules chose, if any.
 pub(crate) struct Decision {
     pub(crate) route: Route,
+    #[cfg_attr(
+        not(feature = "native-api"),
+        allow(dead_code, reason = "only native geodata status reports the group")
+    )]
     pub(crate) group: Option<String>,
 }
 
@@ -301,9 +311,8 @@ impl Tunnel {
 }
 
 /// The answer to one GET. `body` is empty unless the caller wanted it.
-#[cfg(feature = "native-api")]
 pub(crate) struct Reply {
-    pub(crate) status: axum::http::StatusCode,
+    pub(crate) status: http::StatusCode,
     /// Unchecked, so a caller that follows it can reject one that is not text.
     pub(crate) location: Option<http::HeaderValue>,
     pub(crate) body: std::sync::Arc<[u8]>,
@@ -313,14 +322,12 @@ pub(crate) struct Reply {
 /// Without `idle` the body has to be complete by then as well; with
 /// `idle: Some((pause, end))` it may run until `end`, as long as no wait for
 /// more of it lasts `pause`.
-#[cfg(feature = "native-api")]
 #[derive(Clone, Copy)]
 pub(crate) struct Deadline {
     pub(crate) headers: tokio::time::Instant,
     pub(crate) idle: Option<(Duration, tokio::time::Instant)>,
 }
 
-#[cfg(feature = "native-api")]
 impl From<tokio::time::Instant> for Deadline {
     fn from(at: tokio::time::Instant) -> Self {
         Self {
@@ -334,7 +341,6 @@ impl From<tokio::time::Instant> for Deadline {
 /// The body is read only when `wants_body` accepts the answer's status and
 /// headers, so an unwanted answer is neither waited for nor size checked.
 /// Errors name the stage that failed.
-#[cfg(feature = "native-api")]
 pub(crate) async fn get<S>(
     stream: S,
     url: &reqwest::Url,
@@ -365,7 +371,6 @@ where
     }
 }
 
-#[cfg(feature = "native-api")]
 async fn receive<S>(
     stream: S,
     url: &reqwest::Url,
@@ -377,15 +382,15 @@ async fn receive<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    use axum::body::{Body, HttpBody};
-    use axum::http::{Request, Uri};
+    use http::{Request, Uri};
+    use hyper::body::Body as _;
     use tokio::time::timeout_at;
     let (mut sender, connection) = timeout_at(
         deadline.headers,
         hyper::client::conn::http1::Builder::new()
             .max_headers(64)
             .max_buf_size(32768)
-            .handshake::<_, Body>(hyper_util::rt::TokioIo::new(stream)),
+            .handshake::<_, String>(hyper_util::rt::TokioIo::new(stream)),
     )
     .await
     .map_err(|_| "download_timeout")?
@@ -414,7 +419,7 @@ where
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        let request = request.body(Body::empty()).map_err(|_| "invalid_source")?;
+        let request = request.body(String::new()).map_err(|_| "invalid_source")?;
         let mut response = timeout_at(deadline.headers, sender.send_request(request))
             .await
             .map_err(|_| "download_timeout")?

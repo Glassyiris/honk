@@ -483,7 +483,6 @@ impl SubscriptionManager {
     }
 
     /// Hands routed fetches the outbounds user traffic uses.
-    #[cfg(feature = "native-api")]
     pub(crate) fn route_through(&self, routing: route::Routing) {
         let _ = self.routing.set(routing);
     }

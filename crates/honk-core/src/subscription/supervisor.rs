@@ -845,7 +845,6 @@ impl SubscriptionSupervisor {
         })
     }
     /// Routed fetches wait for this, so it hands over routing before `start`.
-    #[cfg(feature = "native-api")]
     pub(crate) fn route_through(&self, routing: crate::download_route::SharedOutbounds) {
         self.prepared
             .as_ref()

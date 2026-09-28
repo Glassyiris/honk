@@ -18,7 +18,9 @@ use tokio::sync::RwLock;
 use super::super::failure_code;
 use crate::download_route::SharedOutbounds;
 use crate::routing::Router;
-use crate::subscription::{SubscriptionManager, SubscriptionStore, SubscriptionSupervisor};
+use crate::subscription::SubscriptionManager;
+#[cfg(feature = "native-api")]
+use crate::subscription::{SubscriptionStore, SubscriptionSupervisor};
 
 const BODY: &str = "socks5://127.0.0.1:1080#node";
 
@@ -257,6 +259,7 @@ async fn a_route_with_no_usable_node_fails_specifically_and_never_goes_direct() 
 /// Routing starts after the first fetch grace period, so a routed
 /// subscription restores its cache there and fetches once routing is handed
 /// over. A failure then is recorded for the provider and the cache stays.
+#[cfg(feature = "native-api")]
 #[tokio::test]
 async fn cached_content_keeps_working_while_the_route_cannot_carry_the_fetch() {
     let (address, requests) = server().await;

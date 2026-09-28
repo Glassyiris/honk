@@ -4,24 +4,11 @@
 
 use honk_config::subscription::Subscription;
 
-#[cfg(feature = "native-api")]
 pub(crate) type Routing = crate::download_route::SharedOutbounds;
-#[cfg(not(feature = "native-api"))]
-pub(crate) type Routing = std::convert::Infallible;
 
 /// The subscription is fetched straight from its host, outside routing.
 pub(crate) fn direct(subscription: &Subscription) -> bool {
-    resolves_direct(&subscription.download_detour, cfg!(feature = "native-api"))
-}
-
-/// Without a routed transport the default keeps the direct fetch; an
-/// explicit `routing` or group still fails rather than going direct.
-fn resolves_direct(detour: &str, routed_transport: bool) -> bool {
-    match detour {
-        "direct" => true,
-        "" => !routed_transport,
-        _ => false,
-    }
+    subscription.download_detour == "direct"
 }
 
 /// The route chosen for a subscription has no node that can carry it, as when
@@ -44,24 +31,11 @@ pub(crate) fn failure_code(error: &anyhow::Error) -> &'static str {
     }
 }
 
-#[cfg(not(feature = "native-api"))]
-pub(super) async fn fetch(
-    subscription: &Subscription,
-    _routing: Option<&Routing>,
-) -> anyhow::Result<Vec<u8>> {
-    anyhow::bail!(
-        "subscription '{}': this build cannot route subscription downloads; set download_detour: direct or leave it empty",
-        subscription.name
-    )
-}
-
-#[cfg(feature = "native-api")]
 pub(super) use routed::fetch;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg(feature = "native-api")]
 mod routed {
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;

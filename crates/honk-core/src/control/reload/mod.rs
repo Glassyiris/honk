@@ -33,7 +33,6 @@ pub(in crate::control) use connectivity::{
     urltest_group_registrations,
 };
 
-#[cfg(any(feature = "clash-api", feature = "native-api"))]
 pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,

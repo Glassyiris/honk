@@ -281,6 +281,8 @@ async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
         url: source,
         sub_type: SubscriptionType::Custom,
         user_agent: args.ua.clone(),
+        // A one-off probe has no routing to follow.
+        download_detour: "direct".into(),
         ..Default::default()
     };
     if args.source != "-" && std::path::Path::new(&sub.url).exists() {

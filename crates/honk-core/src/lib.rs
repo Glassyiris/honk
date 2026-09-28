@@ -17,7 +17,6 @@ pub mod connection_tracker;
 pub mod control;
 pub(crate) mod degradations;
 pub mod dns;
-#[cfg(any(feature = "clash-api", feature = "native-api"))]
 pub(crate) mod download_route;
 pub mod ebpf;
 mod marked_http;
@@ -1875,7 +1874,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
-    #[cfg(feature = "native-api")]
     subscription_supervisor.route_through(download_route::SharedOutbounds {
         router: control_plane.traffic_router(),
         config: control_plane.config_handle(),
