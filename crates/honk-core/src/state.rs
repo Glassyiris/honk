@@ -7,6 +7,7 @@
 
 pub mod cache;
 pub(crate) mod import;
+pub(crate) mod startup;
 
 use std::fs::File;
 use std::os::fd::AsRawFd as _;

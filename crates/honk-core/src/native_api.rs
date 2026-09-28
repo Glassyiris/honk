@@ -24,12 +24,14 @@ pub(crate) mod routing;
 mod security;
 mod server;
 mod settings;
+mod startup;
 pub(crate) mod store;
 pub(crate) mod telemetry;
 mod types;
 mod ui;
 
 pub use server::NativeServer;
+pub(crate) use startup::NativeRuntime;
 pub use types::{ApiError, ErrorCode};
 
 use std::collections::{BinaryHeap, HashMap};
