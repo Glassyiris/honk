@@ -120,7 +120,9 @@ fn marked_downloads_netns() {
             assert_eq!(nodes[0].name, "marked");
             let url = reqwest::Url::parse(&format!("http://{target}/archive")).unwrap();
             let response = super::Client::new().unwrap().get(&url, &http::HeaderMap::new(), Duration::from_secs(1)).await.unwrap();
-            assert_eq!(response.bytes().await.unwrap().as_ref(), b"socks5://127.0.0.1:1080#marked");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let reply = super::read(response, |_, _| true, deadline.into(), 64).await.unwrap();
+            assert_eq!(&*reply.body, b"socks5://127.0.0.1:1080#marked");
             server.await.unwrap();
         }
     });
@@ -186,4 +188,52 @@ async fn explicit_authorization_overrides_url_credentials() {
         .filter_map(|line| line.strip_prefix("authorization: "))
         .collect();
     assert_eq!(authorization, ["Bearer explicit"]);
+}
+
+/// Answers one GET over an in-memory stream with `response`, read with a
+/// four-byte cap.
+async fn capped(response: &'static [u8]) -> Result<std::sync::Arc<[u8]>, &'static str> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let Ok(byte) = server.read_u8().await else {
+                return;
+            };
+            head.push(byte);
+        }
+        let _ = server.write_all(response).await;
+    });
+    let url = reqwest::Url::parse("http://capped.example/file").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let response = super::Client::new()
+        .unwrap()
+        .get_over(Box::new(client), &url, &http::HeaderMap::new(), deadline)
+        .await?;
+    Ok(super::read(response, |_, _| true, deadline.into(), 4)
+        .await?
+        .body)
+}
+
+/// Declared and chunked bodies alike may fill the cap but not pass it.
+#[tokio::test]
+async fn a_body_may_fill_the_cap_but_not_pass_it() {
+    for (response, expected) in [
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n1234".as_slice(), Ok(b"1234".as_slice())),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345".as_slice(), Err("asset_too_large")),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n1234\r\n0\r\n\r\n".as_slice(),
+            Ok(b"1234".as_slice()),
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n1234\r\n1\r\n5\r\n0\r\n\r\n"
+                .as_slice(),
+            Err("asset_too_large"),
+        ),
+    ] {
+        let body = capped(response).await;
+        let body = body.as_deref().map_err(|stage| *stage);
+        assert_eq!(body, expected, "{}", String::from_utf8_lossy(response));
+    }
 }

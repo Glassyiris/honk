@@ -44,6 +44,9 @@ const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 
 const MAX_SUBSCRIPTION_REDIRECTS: usize = 5;
 
+/// How long a whole subscription fetch, its redirects included, may take.
+const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One source entry retained only until the common admission pass consumes it.
 #[derive(Debug)]
 struct IndexedOutcome {
@@ -359,22 +362,6 @@ fn effective_subscription_user_agent(sub: &Subscription) -> &str {
         .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT)
 }
 
-/// `Response::text` buffers the whole body before anything can check its size.
-async fn read_capped_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(reqwest::Error::without_url)?
-    {
-        if body.len() + chunk.len() > MAX_SUBSCRIPTION_BYTES {
-            anyhow::bail!("subscription body exceeds {MAX_SUBSCRIPTION_BYTES} bytes");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 fn subscription_client() -> anyhow::Result<crate::marked_http::Client> {
     crate::marked_http::Client::new()
 }
@@ -383,13 +370,7 @@ async fn fetch_body(
     client: &crate::marked_http::Client,
     sub: &Subscription,
 ) -> anyhow::Result<Vec<u8>> {
-    let url = reqwest::Url::parse(&sub.url)?;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        fetch_url_body(client, url, subscription_request_headers(sub)?),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("subscription HTTP request timed out"))?
+    fetch_following(sub, route::Hop::Direct(client)).await
 }
 
 /// The User-Agent and configured headers every subscription request sends.
@@ -408,26 +389,25 @@ fn subscription_request_headers(sub: &Subscription) -> anyhow::Result<http::Head
     Ok(headers)
 }
 
-/// Redirects are followed here, not by the client, so each hop is checked
-/// against the original origin and cross-origin hops drop credentials.
-async fn fetch_url_body(
-    client: &crate::marked_http::Client,
-    mut url: reqwest::Url,
-    mut headers: http::HeaderMap,
-) -> anyhow::Result<Vec<u8>> {
-    use http::header;
-
+/// Fetches the subscription over `hop`, direct or routed alike. Redirects
+/// are followed here, not by the client, so each hop is checked against the
+/// original origin and cross-origin hops drop credentials.
+async fn fetch_following(sub: &Subscription, hop: route::Hop<'_>) -> anyhow::Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + SUBSCRIPTION_TIMEOUT;
+    let mut url = reqwest::Url::parse(&sub.url)?;
+    let mut headers = subscription_request_headers(sub)?;
+    // Userinfo becomes Basic auth unless a configured Authorization wins.
     crate::marked_http::normalize_url(&mut url, &mut headers)?;
     let origin = url.clone();
-    for hop in 0..=MAX_SUBSCRIPTION_REDIRECTS {
-        let response = client
-            .get(&url, &headers, std::time::Duration::from_secs(30))
-            .await?;
-        if crate::marked_http::followed_redirect(response.status())
-            && let Some(location) = response.headers().get(header::LOCATION)
+    for redirects in 0..=MAX_SUBSCRIPTION_REDIRECTS {
+        let reply = hop.get(sub, &url, &headers, deadline).await?;
+        if crate::marked_http::followed_redirect(reply.status)
+            && let Some(location) = reply.location
         {
+            // The bound comes first, so a hop past it fails the same way
+            // whatever its Location holds.
             anyhow::ensure!(
-                hop < MAX_SUBSCRIPTION_REDIRECTS,
+                redirects < MAX_SUBSCRIPTION_REDIRECTS,
                 "subscription redirected too many times"
             );
             let mut next = url.join(location.to_str()?)?;
@@ -441,12 +421,12 @@ async fn fetch_url_body(
             url = next;
             continue;
         }
-        return read_capped_body(
-            response
-                .error_for_status()
-                .map_err(reqwest::Error::without_url)?,
-        )
-        .await;
+        anyhow::ensure!(
+            !reply.status.is_client_error() && !reply.status.is_server_error(),
+            "subscription server answered HTTP {}",
+            reply.status
+        );
+        return Ok(reply.body.to_vec());
     }
     unreachable!("redirect bound checked before following");
 }
@@ -537,7 +517,10 @@ impl SubscriptionManager {
                 SubscriptionHttp::Owned(network) => network.fetch(sub).await?,
             }
         } else {
-            route::fetch(sub, self.routing.get()).await?
+            let routing = self.routing.get().ok_or_else(|| {
+                anyhow::anyhow!("subscription '{}': routing is not ready yet", sub.name)
+            })?;
+            fetch_following(sub, route::Hop::Routed(routing)).await?
         };
         let content = finish_attempt(
             String::from_utf8(body).map_err(|_| {

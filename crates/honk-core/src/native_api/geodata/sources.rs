@@ -68,12 +68,12 @@ impl Route {
     /// The configuration file's `geodata_download_detour`; `None` when empty,
     /// which leaves the stored route or the routing default in force.
     pub(crate) fn from_detour(detour: &str) -> Option<Self> {
-        match detour {
-            "" => None,
-            "direct" => Some(Self::Direct),
-            "routing" => Some(Self::Routing),
-            group => Some(Self::Group(group.to_owned())),
-        }
+        use crate::download_route::Detour;
+        (!detour.is_empty()).then(|| match Detour::parse(detour) {
+            Detour::Direct => Self::Direct,
+            Detour::Routing => Self::Routing,
+            Detour::Group(group) => Self::Group(group.to_owned()),
+        })
     }
 
     /// `{route, group_id}`, the group named by the id `group_id` finds, or null.

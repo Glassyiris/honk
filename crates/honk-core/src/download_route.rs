@@ -5,6 +5,7 @@
 //! A configured detour forces the node or group it names. Otherwise the
 //! target follows the routing rules: `direct` and `block` are returned for the
 //! caller to handle, and any other result is a node to dial through its tunnel.
+//! [`Outbounds::fetch`] makes the whole download that way.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -22,8 +23,10 @@ use honk_outbound::runtime::{
     EphemeralRuntimeGuard, NodeRuntime, OutboundRuntimeRegistry, SharedRuntimeRegistry,
 };
 use tokio::sync::RwLock;
-use tracing::info;
+use tokio::time::{Instant, timeout_at};
+use tracing::{debug, info, warn};
 
+use crate::marked_http::{self, Deadline, Reply};
 use crate::routing::{ConnectionInfo, Router};
 
 /// What a download needs to be routed like user traffic.
@@ -92,17 +95,34 @@ pub(crate) enum Route {
     },
 }
 
+/// A download's `download_detour` setting.
+pub(crate) enum Detour<'a> {
+    /// Straight to the host, outside the routing rules.
+    Direct,
+    /// The routing rules decide.
+    Routing,
+    /// Always through the named node or group.
+    Group(&'a str),
+}
+
+impl<'a> Detour<'a> {
+    /// `direct`, `routing` or empty for the rules, and any other name forces that outbound.
+    pub(crate) fn parse(setting: &'a str) -> Self {
+        match setting {
+            "direct" => Self::Direct,
+            "" | "routing" => Self::Routing,
+            group => Self::Group(group),
+        }
+    }
+}
+
 /// A route, and the group the detour or the routing rules chose, if any.
 pub(crate) struct Decision {
     pub(crate) route: Route,
-    #[cfg_attr(
-        not(feature = "native-api"),
-        allow(dead_code, reason = "only native geodata status reports the group")
-    )]
     pub(crate) group: Option<String>,
 }
 
-pub(crate) fn parse_host_ip(host: &str) -> Option<IpAddr> {
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
     host.parse()
         .ok()
         .or_else(|| host.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
@@ -307,201 +327,174 @@ impl Tunnel {
     }
 }
 
-/// The answer to one GET. `body` is empty unless the caller wanted it.
-pub(crate) struct Reply {
-    pub(crate) status: http::StatusCode,
-    /// Unchecked, so a caller that follows it can reject one that is not text.
-    pub(crate) location: Option<http::HeaderValue>,
-    pub(crate) body: std::sync::Arc<[u8]>,
+/// One GET a download makes, and the addresses it may reach.
+pub(crate) struct Request<'a> {
+    pub(crate) url: &'a reqwest::Url,
+    pub(crate) headers: &'a http::HeaderMap,
+    /// Which answers' bodies are read, as in [`marked_http::read`].
+    pub(crate) wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
+    pub(crate) deadline: Deadline,
+    pub(crate) max_bytes: usize,
+    /// The only resolver a direct host name is resolved with; `None` uses the
+    /// process bootstrap resolver and its system fallback.
+    pub(crate) bootstrap: Option<&'a str>,
+    /// Whether an address may be reached: every direct one, and a proxied
+    /// host written as an address. The node's egress resolves a proxied domain.
+    pub(crate) admits: &'a (dyn Fn(IpAddr) -> bool + Sync),
 }
 
-/// When a GET gives up. The answer's headers have to arrive by `headers`.
-/// Without `idle` the body has to be complete by then as well; with
-/// `idle: Some((pause, end))` it may run until `end`, as long as no wait for
-/// more of it lasts `pause`.
-#[derive(Clone, Copy)]
-pub(crate) struct Deadline {
-    pub(crate) headers: tokio::time::Instant,
-    pub(crate) idle: Option<(Duration, tokio::time::Instant)>,
+/// Why a routed download failed.
+pub(crate) enum Failed {
+    /// The detour names no outbound, or the chosen one has no usable node.
+    Route(anyhow::Error),
+    /// The stage that failed.
+    Stage(&'static str),
 }
 
-impl From<tokio::time::Instant> for Deadline {
-    fn from(at: tokio::time::Instant) -> Self {
-        Self {
-            headers: at,
-            idle: None,
-        }
+impl From<&'static str> for Failed {
+    fn from(stage: &'static str) -> Self {
+        Self::Stage(stage)
     }
 }
 
-/// TLS for https, then one HTTP/1.1 GET of `url` with `headers` added.
-/// The body is read only when `wants_body` accepts the answer's status and
-/// headers, so an unwanted answer is neither waited for nor size checked.
-/// Errors name the stage that failed.
-pub(crate) async fn get<S>(
-    stream: S,
-    url: &reqwest::Url,
-    headers: &http::HeaderMap,
-    wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
-    deadline: impl Into<Deadline>,
-    max_bytes: usize,
-) -> Result<Reply, &'static str>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    use tokio::time::timeout_at;
-    let deadline = deadline.into();
-    if url.scheme() == "https" {
-        let host = url
-            .host_str()
-            .ok_or("invalid_source")?
-            .trim_matches(['[', ']']);
-        let connector = honk_outbound::tls::build_dns_connector(false, b"\x08http/1.1")
-            .map_err(|_| "tls_failed")?;
-        let stream = timeout_at(deadline.headers, connector.connect(host, stream))
-            .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "tls_failed")?;
-        receive(stream, url, headers, wants_body, deadline, max_bytes).await
-    } else {
-        receive(stream, url, headers, wants_body, deadline, max_bytes).await
-    }
-}
-
-async fn receive<S>(
-    stream: S,
-    url: &reqwest::Url,
-    headers: &http::HeaderMap,
-    wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
-    deadline: Deadline,
-    max_bytes: usize,
-) -> Result<Reply, &'static str>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    use http::{Request, Uri};
-    use hyper::body::Body as _;
-    use tokio::time::timeout_at;
-    let (mut sender, connection) = timeout_at(
-        deadline.headers,
-        hyper::client::conn::http1::Builder::new()
-            .max_headers(64)
-            .max_buf_size(32768)
-            .handshake::<_, String>(hyper_util::rt::TokioIo::new(stream)),
-    )
-    .await
-    .map_err(|_| "download_timeout")?
-    .map_err(|_| "http_failed")?;
-    let mut drivers = tokio::task::JoinSet::new();
-    drivers.spawn(connection);
-    let result = async {
-        let uri: Uri = url.as_str().parse().map_err(|_| "invalid_source")?;
-        // Host is host[:port] only; userinfo in the URL never goes on the wire here.
-        let host = url.host_str().ok_or("invalid_source")?;
-        let host = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
+impl Outbounds<'_> {
+    /// Makes `request` through `detour`: straight to its host, or through the
+    /// node the detour or the routing rules choose, whose tunnel is closed
+    /// after. Also returns the group the route went through. `setting` and
+    /// `purpose` are as in [`Self::decide`]. Setup has to finish by the
+    /// deadline's `headers`.
+    pub(crate) async fn fetch(
+        &self,
+        detour: Detour<'_>,
+        setting: &str,
+        purpose: &str,
+        request: &Request<'_>,
+    ) -> Result<(Reply, Option<String>), Failed> {
+        let detour = match detour {
+            Detour::Direct => return Ok((fetch_direct(request).await?, None)),
+            Detour::Routing => None,
+            Detour::Group(group) => Some(group),
         };
-        let mut request =
-            Request::builder().uri(uri.path_and_query().ok_or("invalid_source")?.clone());
-        for (name, value) in [
-            ("host", host.as_str()),
-            ("connection", "close"),
-            ("accept-encoding", "identity"),
-        ] {
-            if !headers.contains_key(name) {
-                request = request.header(name, value);
-            }
-        }
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        let request = request.body(String::new()).map_err(|_| "invalid_source")?;
-        let mut response = timeout_at(deadline.headers, sender.send_request(request))
-            .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "http_failed")?;
-        let status = response.status();
-        let location = response.headers().get("location").cloned();
-        if !wants_body(status, response.headers()) {
-            return Ok(Reply {
-                status,
-                location,
-                body: std::sync::Arc::from([]),
-            });
-        }
-        // The request asks for identity, so only identity may come back.
-        if response
-            .headers()
-            .get_all("content-encoding")
-            .iter()
-            .any(|value| {
-                !value
-                    .to_str()
-                    .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity"))
-            })
-        {
-            return Err("content_encoding_rejected");
-        }
-        if response
-            .body()
-            .size_hint()
-            .upper()
-            .is_some_and(|size| size > max_bytes as u64)
-        {
-            return Err("asset_too_large");
-        }
-        // A declared length fills one buffer of that size, so a large body is
-        // neither grown in steps nor copied once more into an `Arc`.
-        let mut sized: Option<std::sync::Arc<[u8]>> = response
-            .body()
-            .size_hint()
-            .exact()
-            .map(|length| std::iter::repeat_n(0, length as usize).collect());
-        let mut grown = Vec::new();
-        let mut received = 0;
-        let next_bytes = || {
-            deadline.idle.map_or(deadline.headers, |(pause, end)| {
-                end.min(tokio::time::Instant::now() + pause)
-            })
-        };
-        while let Some(frame) = timeout_at(
-            next_bytes(),
-            std::future::poll_fn(|cx| std::pin::Pin::new(response.body_mut()).poll_frame(cx)),
+        let host = request.url.host_str().ok_or("invalid_source")?;
+        let port = request
+            .url
+            .port_or_known_default()
+            .ok_or("invalid_source")?;
+        let by = request.deadline.headers;
+        let decision = timeout_at(
+            by,
+            self.decide(detour, setting, purpose, (host, port), None),
         )
         .await
         .map_err(|_| "download_timeout")?
-        {
-            let frame = frame.map_err(|_| "http_failed")?;
-            if let Ok(data) = frame.into_data() {
-                if data.len() > max_bytes.saturating_sub(received) {
-                    return Err("asset_too_large");
+        .map_err(Failed::Route)?;
+        let reply = match decision.route {
+            Route::Block => return Err("route_blocked".into()),
+            Route::Direct { .. } => fetch_direct(request).await?,
+            Route::Proxy { node, .. } => {
+                if parse_host_ip(host).is_some_and(|ip| !(request.admits)(ip)) {
+                    return Err("destination_rejected".into());
                 }
-                match sized.as_mut() {
-                    Some(buffer) => std::sync::Arc::get_mut(buffer)
-                        .expect("a new buffer is unshared")
-                        .get_mut(received..received + data.len())
-                        .ok_or("http_failed")?
-                        .copy_from_slice(&data),
-                    None => grown.extend_from_slice(&data),
+                let tunnel = match timeout_at(by, self.tunnel(&node, (host, port))).await {
+                    Err(_) => return Err("download_timeout".into()),
+                    Ok(Err(error)) => {
+                        debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
+                        return Err("connection_failed".into());
+                    }
+                    Ok(Ok(tunnel)) => tunnel,
+                };
+                let reply = match timeout_at(by, tunnel.dial()).await {
+                    Err(_) => Err("download_timeout"),
+                    Ok(Err(error)) => {
+                        debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
+                        Err("connection_failed")
+                    }
+                    Ok(Ok(stream)) => get(stream, request).await,
+                };
+                if let Err(error) = tunnel.close().await {
+                    warn!(%error, "{purpose} tunnel did not close cleanly");
                 }
-                received += data.len();
+                reply?
             }
-        }
-        let body = match sized {
-            Some(buffer) if buffer.len() == received => buffer,
-            Some(_) => return Err("http_failed"),
-            None => grown.into(),
         };
-        Ok(Reply {
-            status,
-            location,
-            body,
-        })
+        Ok((reply, decision.group))
     }
-    .await;
-    drop(sender);
-    drivers.abort_all();
-    while drivers.join_next().await.is_some() {}
-    result
+}
+
+/// Makes `request` straight to its host over the bypass mark, on the first
+/// admitted address that accepts the connection.
+pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'static str> {
+    let by = request.deadline.headers;
+    let host = request
+        .url
+        .host_str()
+        .ok_or("invalid_source")?
+        .trim_matches(['[', ']']);
+    let port = request
+        .url
+        .port_or_known_default()
+        .ok_or("invalid_source")?;
+    let addresses = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => {
+            let resolved = match request.bootstrap {
+                Some(bootstrap) => {
+                    let resolver = honk_outbound::bootstrap::BootstrapResolver::parse(bootstrap)
+                        .ok_or("bootstrap_unavailable")?;
+                    timeout_at(by, resolver.query(host)).await
+                }
+                None => timeout_at(by, honk_outbound::bootstrap::resolve(host)).await,
+            };
+            resolved
+                .map_err(|_| "download_timeout")?
+                .map_err(|_| "resolution_failed")?
+        }
+    };
+    let mut rejected = false;
+    for ip in addresses {
+        if !(request.admits)(ip) {
+            rejected = true;
+            continue;
+        }
+        let connected = timeout_at(
+            by,
+            honk_outbound::util::connect_marked_addr(
+                SocketAddr::new(ip, port),
+                Some(honk_outbound::util::bypass_mark()),
+                by.saturating_duration_since(Instant::now()),
+            ),
+        )
+        .await
+        .map_err(|_| "download_timeout")?;
+        if let Ok(stream) = connected {
+            return get(Box::new(stream), request).await;
+        }
+    }
+    Err(if rejected {
+        "destination_rejected"
+    } else {
+        "connection_failed"
+    })
+}
+
+async fn get(
+    stream: Box<dyn AsyncReadWrite>,
+    request: &Request<'_>,
+) -> Result<Reply, &'static str> {
+    let response = marked_http::Client::new()
+        .map_err(|_| "tls_failed")?
+        .get_over(
+            stream,
+            request.url,
+            request.headers,
+            request.deadline.headers,
+        )
+        .await?;
+    marked_http::read(
+        response,
+        request.wants_body,
+        request.deadline,
+        request.max_bytes,
+    )
+    .await
 }
