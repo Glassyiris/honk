@@ -165,12 +165,13 @@ impl ConnectionObservation {
         self.recorded.as_ref().map(|record| &record.flow)
     }
 
+    /// Reads `generation` only for a recorded connection.
     pub(in crate::control) fn observer(
         &self,
-        generation: u64,
+        generation: impl FnOnce() -> u64,
         purpose: &'static str,
     ) -> Option<FlowObserver> {
-        self.flow()?.observer(generation, None, purpose)
+        self.flow()?.observer(generation(), None, purpose)
     }
 
     pub(super) fn routing_started(&self) {

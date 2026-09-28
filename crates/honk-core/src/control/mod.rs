@@ -208,7 +208,6 @@ pub struct ControlPlane {
     phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
     #[cfg(feature = "native-api")]
     configuration: Option<Arc<crate::configuration::AcceptedSources>>,
-    #[cfg(feature = "native-api")]
     native: Option<Arc<crate::observe::Observation>>,
     #[cfg(feature = "native-api")]
     native_owner: Option<Arc<dyn crate::observe::Owner>>,

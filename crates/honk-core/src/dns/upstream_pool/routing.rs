@@ -17,7 +17,6 @@ pub(super) struct DnsDialRoute {
     pub(super) target: SocketAddr,
     pub(super) node: Option<Node>,
     pub(super) feedback: Option<ScoreAttempt>,
-    #[cfg(feature = "native-api")]
     pub(super) observation: Option<crate::observe::flows::record::OutboundAttempt>,
 }
 
@@ -25,8 +24,7 @@ pub(super) struct DnsDialRoute {
 struct SelectedLeaf {
     node: Option<Node>,
     feedback: Option<ScoreAttempt>,
-    #[cfg(feature = "native-api")]
-    path: Vec<crate::observe::flows::record::Selection>,
+    path: crate::observe::flows::dns::SelectionPath,
 }
 
 impl SelectedLeaf {
@@ -92,16 +90,11 @@ fn select_group_leaf_for_target(
             original,
         )
     };
-    #[cfg(feature = "native-api")]
     let plan = match honk_outbound::runtime::flow_observation::current() {
         Some(observer) => observer.sync_scope(select),
         None => select(),
     };
-    #[cfg(not(feature = "native-api"))]
-    let plan = select();
-    #[cfg(feature = "native-api")]
     let selections = crate::observe::flows::dns::selection_evaluated(plan.observation.as_deref());
-    #[cfg(feature = "native-api")]
     let family = plan.health_family;
     plan.entries
         .into_iter()
@@ -109,7 +102,6 @@ fn select_group_leaf_for_target(
         .map(|selected| SelectedLeaf {
             node: Some(selected.node.clone()),
             feedback: selected.feedback,
-            #[cfg(feature = "native-api")]
             path: crate::observe::flows::dns::selection_path(
                 &selections,
                 &selected.selection_chain,
@@ -201,13 +193,11 @@ impl UpstreamPool {
     ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
             if tag.eq_ignore_ascii_case("block") {
-                #[cfg(feature = "native-api")]
                 crate::observe::flows::dns::decision("rejected", Some("policy_block"));
                 anyhow::bail!("DNS upstream outbound 'block' rejected the dial");
             }
             let selected = self.resolve_outbound_for_target(tag, entry, target, original);
             if selected.node.is_none() && !tag.eq_ignore_ascii_case("direct") {
-                #[cfg(feature = "native-api")]
                 crate::observe::flows::dns::decision("rejected", Some("no_available_outbound"));
                 anyhow::bail!("DNS upstream outbound '{tag}' has no available node");
             }
@@ -217,7 +207,6 @@ impl UpstreamPool {
                 selected.node.as_ref().map(|node| node.name.as_str())
             );
             return Ok(DnsDialRoute {
-                #[cfg(feature = "native-api")]
                 observation: crate::observe::flows::dns::outbound_evidence(
                     tag,
                     "forced",
@@ -248,26 +237,21 @@ impl UpstreamPool {
             mac: None,
             dscp: None,
         };
-        let (outbound_name, _evaluation_id) =
+        let (outbound_name, evaluation_id) =
             if let Some(router) = self.traffic_router_snapshot.read().as_ref() {
-                #[cfg(feature = "native-api")]
-                let outbound = crate::observe::flows::dns::route_upstream(router, &connection);
-                #[cfg(not(feature = "native-api"))]
-                let outbound = (router.route(&connection).to_string(), None::<String>);
-                outbound
+                crate::observe::flows::dns::route_upstream(router, &connection)
             } else {
                 let router_cell = self.traffic_router.read().clone();
                 let Some(router) = router_cell else {
                     debug!("DNS dial leaf (no traffic router): direct");
                     return Ok(DnsDialRoute {
-                        #[cfg(feature = "native-api")]
                         observation: crate::observe::flows::dns::outbound_evidence(
                             "direct",
                             "builtin",
                             None,
                             None,
                             target,
-                            Vec::new(),
+                            Default::default(),
                         ),
                         target,
                         node: None,
@@ -275,11 +259,7 @@ impl UpstreamPool {
                     });
                 };
                 let router = router.read().await;
-                #[cfg(feature = "native-api")]
-                let outbound = crate::observe::flows::dns::route_upstream(&router, &connection);
-                #[cfg(not(feature = "native-api"))]
-                let outbound = (router.route(&connection).to_string(), None::<String>);
-                outbound
+                crate::observe::flows::dns::route_upstream(&router, &connection)
             };
         debug!(
             "DNS dial route: {} {}:{} (host={}) l4={} → outbound '{}'",
@@ -291,20 +271,18 @@ impl UpstreamPool {
             outbound_name
         );
         if outbound_name.eq_ignore_ascii_case("block") {
-            #[cfg(feature = "native-api")]
             crate::observe::flows::dns::decision("rejected", Some("policy_block"));
             anyhow::bail!("DNS dial route selected block");
         }
         if outbound_name.eq_ignore_ascii_case("direct") {
             return Ok(DnsDialRoute {
-                #[cfg(feature = "native-api")]
                 observation: crate::observe::flows::dns::outbound_evidence(
                     &outbound_name,
                     "evaluation",
-                    _evaluation_id,
+                    evaluation_id,
                     None,
                     target,
-                    Vec::new(),
+                    Default::default(),
                 ),
                 target,
                 node: None,
@@ -313,7 +291,6 @@ impl UpstreamPool {
         }
         let selected = self.resolve_outbound_for_target(&outbound_name, entry, target, original);
         if selected.node.is_none() {
-            #[cfg(feature = "native-api")]
             crate::observe::flows::dns::decision("rejected", Some("no_available_outbound"));
             anyhow::bail!(
                 "DNS dial route selected outbound '{outbound_name}' but no leaf node is available"
@@ -325,11 +302,10 @@ impl UpstreamPool {
             selected.node.as_ref().map(|node| node.name.as_str())
         );
         Ok(DnsDialRoute {
-            #[cfg(feature = "native-api")]
             observation: crate::observe::flows::dns::outbound_evidence(
                 &outbound_name,
                 "evaluation",
-                _evaluation_id,
+                evaluation_id,
                 selected.node.as_ref(),
                 target,
                 selected.path,

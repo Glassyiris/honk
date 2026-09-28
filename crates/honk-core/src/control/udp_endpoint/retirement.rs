@@ -5,103 +5,6 @@ const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RELEASED: u8 = 1;
 const DRIVER_RELEASED: u8 = 2;
 
-#[cfg(feature = "native-api")]
-pub(in crate::control) struct NativeUdpTerminal {
-    flow: Arc<crate::observe::flows::FlowGuard>,
-    state: Mutex<NativeUdpState>,
-}
-
-#[cfg(feature = "native-api")]
-struct NativeUdpState {
-    outcome: Option<(&'static str, &'static str)>,
-    cleaned: Option<bool>,
-    initializer_done: bool,
-}
-
-#[cfg(feature = "native-api")]
-pub(in crate::control) struct NativeInitializerGuard {
-    terminal: Arc<NativeUdpTerminal>,
-    pub(in crate::control) completed: bool,
-}
-
-#[cfg(feature = "native-api")]
-impl Drop for NativeInitializerGuard {
-    fn drop(&mut self) {
-        let mut state = self.terminal.state.lock();
-        if !self.completed {
-            state
-                .outcome
-                .get_or_insert(("failed", "initializer_cancelled"));
-        }
-        state.initializer_done = true;
-        self.terminal.publish(&state);
-    }
-}
-
-#[cfg(feature = "native-api")]
-impl NativeUdpTerminal {
-    pub(super) fn new(
-        flow: Arc<crate::observe::flows::FlowGuard>,
-        initializer_done: bool,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            flow,
-            state: Mutex::new(NativeUdpState {
-                outcome: None,
-                cleaned: None,
-                initializer_done,
-            }),
-        })
-    }
-
-    pub(in crate::control) fn initializer(self: &Arc<Self>) -> NativeInitializerGuard {
-        self.state.lock().initializer_done = false;
-        NativeInitializerGuard {
-            terminal: Arc::clone(self),
-            completed: false,
-        }
-    }
-
-    pub(super) fn packet_drop(&self, reason: &'static str) {
-        self.flow.step(
-            None,
-            crate::observe::flows::record::StepData::Datapath {
-                plane: "userspace",
-                action: "drop",
-                reason,
-                error: None,
-            },
-        );
-    }
-
-    pub(in crate::control) fn outcome(&self, state: &'static str, reason: &'static str) {
-        let mut terminal = self.state.lock();
-        if reason == "cleanup_failed" {
-            terminal.outcome = Some((state, reason));
-        } else {
-            terminal.outcome.get_or_insert((state, reason));
-        }
-        self.publish(&terminal);
-    }
-
-    fn cleaned(&self, success: bool) {
-        let mut terminal = self.state.lock();
-        terminal.cleaned = Some(terminal.cleaned.unwrap_or(true) && success);
-        self.publish(&terminal);
-    }
-
-    fn publish(&self, terminal: &NativeUdpState) {
-        if !terminal.initializer_done {
-            return;
-        }
-        match (terminal.outcome, terminal.cleaned) {
-            (_, Some(false)) => self.flow.finish("failed", "cleanup_failed"),
-            (Some((state, reason)), Some(true)) => self.flow.finish(state, reason),
-            _ => {}
-        }
-    }
-}
-
 pub(super) struct RetirementIo {
     released: watch::Sender<u8>,
     failed: AtomicBool,
@@ -413,7 +316,7 @@ impl UdpEndpointPool {
                     EndpointEntry::Initializing(initializing) => {
                         initializing.native_terminal.get().cloned()
                     }
-                    EndpointEntry::Ready(ready) => ready.endpoint.native_terminal.clone(),
+                    EndpointEntry::Ready(ready) => ready.endpoint.native.terminal().cloned(),
                     EndpointEntry::Retiring { .. } => None,
                 };
                 occupied.insert(EndpointEntry::Retiring {

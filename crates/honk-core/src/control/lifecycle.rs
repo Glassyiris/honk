@@ -367,9 +367,7 @@ impl ControlPlane {
                     self.concurrency_limit.clone(),
                     self.stats.clone(),
                     self.drain_tracker.clone(),
-                    #[cfg(feature = "native-api")]
                     self.native.clone(),
-                    #[cfg(feature = "native-api")]
                     self.diagnostics.clone(),
                 )?);
             }

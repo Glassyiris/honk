@@ -258,8 +258,7 @@ pub(super) struct UdpDriverContext {
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
-        #[cfg(feature = "native-api")]
-        self.endpoint.finish_native("failed", "driver_cancelled");
+        self.endpoint.native.finish("failed", "driver_cancelled");
         self.endpoint
             .finish_score(if self.pool.terminal.load(Ordering::Acquire) {
                 ScoreOutcome::Shutdown
@@ -379,7 +378,7 @@ impl UdpEndpoint {
                 Err(error) if is_reply_idle_timeout(error) => {
                     if self.has_reply() {
                         ("closed", "reply_idle")
-                    } else if self.native_received_reply.load(Ordering::Relaxed) {
+                    } else if self.native.received_reply() {
                         ("failed", "timeout_after_reply")
                     } else {
                         ("failed", "timeout_before_reply")
@@ -396,7 +395,7 @@ impl UdpEndpoint {
                 Ok(()) => ("unknown", "driver_completed"),
             }
         };
-        self.finish_native(state, reason);
+        self.native.finish(state, reason);
     }
 }
 
@@ -756,16 +755,18 @@ async fn send_one(
         if first {
             stats.record_udp_first_send_failure();
         }
-        #[cfg(feature = "native-api")]
-        endpoint.native_drop("queue_expired", Some("queue_expired"));
+        endpoint
+            .native
+            .dropped("queue_expired", Some("queue_expired"));
         return Err(PacketSendFailure::Congestion(io::Error::new(
             io::ErrorKind::TimedOut,
             QUEUED_PACKET_EXPIRED,
         )));
     }
     if let Err(error) = endpoint.begin_send_attempt() {
-        #[cfg(feature = "native-api")]
-        endpoint.native_drop("endpoint_retired", Some("send_cancelled"));
+        endpoint
+            .native
+            .dropped("endpoint_retired", Some("send_cancelled"));
         return Err(PacketSendFailure::Transport(error));
     }
     let attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
@@ -782,10 +783,9 @@ async fn send_one(
             "UDP PacketTransport send timed out",
         )),
     };
-    #[cfg(feature = "native-api")]
     if matches!(&sent, Ok(Ok(_)))
         && !packet.data.is_empty()
-        && let Some(flow) = endpoint.native_flow()
+        && let Some(flow) = endpoint.native.flow()
     {
         flow.accepted_send();
     }
@@ -850,8 +850,7 @@ async fn send_one(
             Ok(())
         }
         Err(failure) => {
-            #[cfg(feature = "native-api")]
-            endpoint.native_drop(
+            endpoint.native.dropped(
                 if first {
                     "first_send_failed"
                 } else {
@@ -918,16 +917,14 @@ async fn receive_loop(
             && !transport.allows_full_cone_replies()
             && !endpoint.validate_reply_peer(source)
         {
-            #[cfg(feature = "native-api")]
-            endpoint.native_drop("unexpected_reply_peer", None);
+            endpoint.native.dropped("unexpected_reply_peer", None);
             debug!(
                 "UDP endpoint driver rejecting unexpected reply peer {}",
                 source
             );
             continue;
         }
-        #[cfg(feature = "native-api")]
-        endpoint.native_reply_received();
+        endpoint.native.reply_received();
         // Remote DNS may choose another address or family for the same logical peer.
         let source = if endpoint.target_is_domain {
             client_dst
@@ -935,11 +932,10 @@ async fn receive_loop(
             source
         };
         if source.is_ipv4() != client_addr.is_ipv4() {
-            #[cfg(feature = "native-api")]
-            {
-                endpoint.native_drop("reply_family_mismatch", Some("reply_family_mismatch"));
-                endpoint.finish_native("failed", "reply_family_mismatch");
-            }
+            endpoint
+                .native
+                .dropped("reply_family_mismatch", Some("reply_family_mismatch"));
+            endpoint.native.finish("failed", "reply_family_mismatch");
             return Err(local_reply_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -958,11 +954,10 @@ async fn receive_loop(
                 Some(index) => index,
                 None => {
                     if alternate_reply_sockets.len() >= MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 {
-                        #[cfg(feature = "native-api")]
-                        {
-                            endpoint.native_drop("reply_socket_capacity", Some("capacity"));
-                            endpoint.finish_native("failed", "reply_socket_capacity");
-                        }
+                        endpoint
+                            .native
+                            .dropped("reply_socket_capacity", Some("capacity"));
+                        endpoint.native.finish("failed", "reply_socket_capacity");
                         return Err(local_reply_error(io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
                             "UDP endpoint reply-source socket cache is full",
@@ -976,19 +971,16 @@ async fn receive_loop(
                         Ok(socket) => socket,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             debug!("UDP reply socket capacity exhausted for {}", source);
-                            #[cfg(feature = "native-api")]
-                            endpoint.native_drop("reply_socket_capacity", Some("capacity"));
+                            endpoint
+                                .native
+                                .dropped("reply_socket_capacity", Some("capacity"));
                             continue;
                         }
                         Err(error) => {
-                            #[cfg(feature = "native-api")]
-                            {
-                                endpoint.native_drop(
-                                    "reply_socket_failed",
-                                    Some("reply_socket_failed"),
-                                );
-                                endpoint.finish_native("failed", "reply_socket_failed");
-                            }
+                            endpoint
+                                .native
+                                .dropped("reply_socket_failed", Some("reply_socket_failed"));
+                            endpoint.native.finish("failed", "reply_socket_failed");
                             return Err(local_reply_error(error));
                         }
                     };
@@ -999,10 +991,11 @@ async fn receive_loop(
             &alternate_reply_sockets[index].1
         };
         let delivered = reply_socket.send_to(&buf[..n], client_addr).await;
-        #[cfg(feature = "native-api")]
         if delivered.is_err() {
-            endpoint.native_drop("client_delivery_failed", Some("client_send_failed"));
-            endpoint.finish_native("failed", "client_delivery_failed");
+            endpoint
+                .native
+                .dropped("client_delivery_failed", Some("client_send_failed"));
+            endpoint.native.finish("failed", "client_delivery_failed");
         }
         delivered.map_err(local_reply_error)?;
         endpoint.mark_reply();

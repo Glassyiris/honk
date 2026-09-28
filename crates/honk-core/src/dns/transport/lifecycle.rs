@@ -288,7 +288,6 @@ impl<T> LifecycleSlot<T> {
 }
 
 pub(super) fn attached() {
-    #[cfg(feature = "native-api")]
     if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
         observer.publish(
             honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
@@ -300,7 +299,6 @@ pub(super) fn attached() {
 }
 
 pub(super) struct SessionObservation {
-    #[cfg(feature = "native-api")]
     observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
     finished: bool,
 }
@@ -308,20 +306,15 @@ pub(super) struct SessionObservation {
 impl SessionObservation {
     pub(super) fn start() -> Self {
         Self {
-            #[cfg(feature = "native-api")]
             observer: honk_outbound::runtime::flow_observation::current(),
             finished: false,
         }
     }
 
-    pub(super) fn record(&self, _reason: &'static str, _error: Option<&'static str>) {
-        #[cfg(feature = "native-api")]
+    pub(super) fn record(&self, reason: &'static str, error: Option<&'static str>) {
         if let Some(observer) = &self.observer {
             observer.publish(
-                honk_outbound::runtime::flow_observation::FlowEvent::Session {
-                    reason: _reason,
-                    error: _error,
-                },
+                honk_outbound::runtime::flow_observation::FlowEvent::Session { reason, error },
             );
         }
     }
@@ -329,9 +322,8 @@ impl SessionObservation {
     pub(super) fn finish<T>(
         mut self,
         result: anyhow::Result<T>,
-        _success: &'static str,
+        success: &'static str,
     ) -> anyhow::Result<T> {
-        #[cfg(feature = "native-api")]
         if self.observer.is_some() {
             let cancelled = result.as_ref().err().is_some_and(|error| {
                 error.chain().any(|cause| {
@@ -343,7 +335,7 @@ impl SessionObservation {
             });
             self.record(
                 if result.is_ok() {
-                    _success
+                    success
                 } else if cancelled {
                     "dns_session_ready_cancelled"
                 } else {

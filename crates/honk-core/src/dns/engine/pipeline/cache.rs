@@ -17,7 +17,6 @@ pub(super) async fn lookup(
         return Ok(None);
     }
     let cache = context.forwarder.cache_service().await;
-    #[cfg(feature = "native-api")]
     crate::observe::flows::dns::cache_state("miss");
     let (entry, revision) = match cache.lookup_exact(
         &context.cache_key,
@@ -27,7 +26,6 @@ pub(super) async fn lookup(
             hit,
             revision: _revision,
         } => {
-            #[cfg(feature = "native-api")]
             crate::observe::flows::dns::cache_state("hit");
             #[cfg(feature = "native-api")]
             let entry_id = cache.entry_id_for_revision(&context.cache_key, _revision);
@@ -69,7 +67,6 @@ pub(super) async fn lookup(
                 });
         }
         ExactLookup::Positive { entry, revision } => {
-            #[cfg(feature = "native-api")]
             crate::observe::flows::dns::cache_state("hit");
             (entry, revision)
         }

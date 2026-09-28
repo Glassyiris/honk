@@ -290,7 +290,6 @@ impl ControlPlane {
             phase: None,
             #[cfg(feature = "native-api")]
             configuration: None,
-            #[cfg(feature = "native-api")]
             native: None,
             #[cfg(feature = "native-api")]
             native_owner: None,

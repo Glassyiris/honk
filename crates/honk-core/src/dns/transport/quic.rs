@@ -156,7 +156,6 @@ async fn quic_connect(
         direct = direct_endpoint.get(addr.is_ipv6()).await?;
         &direct
     };
-    #[cfg(feature = "native-api")]
     let mut observation =
         honk_outbound::runtime::flow_observation::TransportAttempt::start(Some(addr), "unknown");
     let handshake = async {
@@ -175,7 +174,6 @@ async fn quic_connect(
             })
     }
     .await;
-    #[cfg(feature = "native-api")]
     if let Some(observation) = &mut observation {
         observation.finish(
             if handshake.is_ok() {

@@ -26,7 +26,7 @@ pub mod mode;
 pub mod native_api;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;
-#[cfg(feature = "native-api")]
+#[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
 pub(crate) mod observe;
 pub mod pool;
 pub mod relay;

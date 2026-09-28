@@ -449,9 +449,7 @@ impl ControlPlane {
         self.connection_tracker.enable();
         ControlPlaneHandle {
             config: self.config.clone(),
-            #[cfg(feature = "native-api")]
             diagnostics: self.diagnostics.clone(),
-            #[cfg(feature = "native-api")]
             native: self.native.clone(),
             router: self.router.clone(),
             proxy_registry: self.proxy_registry.clone(),

@@ -193,7 +193,7 @@ pub(super) struct InitializingEndpoint {
     pub(super) cancelled: AtomicBool,
     pub(super) cancel_notify: Notify,
     #[cfg(feature = "native-api")]
-    pub(super) native_terminal: std::sync::OnceLock<Arc<retirement::NativeUdpTerminal>>,
+    pub(super) native_terminal: std::sync::OnceLock<observation::SharedTerminal>,
 }
 
 impl InitializingEndpoint {
@@ -254,7 +254,7 @@ pub(super) enum EndpointEntry {
         token: u32,
         io: Option<Arc<RetirementIo>>,
         #[cfg(feature = "native-api")]
-        native_terminal: Option<Arc<retirement::NativeUdpTerminal>>,
+        native_terminal: Option<observation::SharedTerminal>,
     },
 }
 
@@ -367,12 +367,12 @@ impl UdpInitLease {
     pub(in crate::control) fn set_native_flow(
         &self,
         flow: Option<Arc<crate::observe::flows::FlowGuard>>,
-    ) -> Option<Arc<retirement::NativeUdpTerminal>> {
+    ) -> Option<observation::SharedTerminal> {
         let flow = flow?;
         let terminal = Arc::clone(
             self.initializer
                 .native_terminal
-                .get_or_init(|| retirement::NativeUdpTerminal::new(Arc::clone(&flow), false)),
+                .get_or_init(|| observation::NativeUdpTerminal::new(Arc::clone(&flow), false)),
         );
         if let Some(mut entry) = self.pool.endpoints.get_mut(&self.key) {
             if let EndpointEntry::Retiring {
@@ -392,9 +392,20 @@ impl UdpInitLease {
         Some(terminal)
     }
 
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn native_terminal(&self) -> Option<Arc<retirement::NativeUdpTerminal>> {
-        self.initializer.native_terminal.get().cloned()
+    #[cfg(not(feature = "native-api"))]
+    #[inline]
+    pub(in crate::control) fn set_native_flow(
+        &self,
+        _flow: Option<Arc<crate::observe::flows::FlowGuard>>,
+    ) -> Option<observation::SharedTerminal> {
+        None
+    }
+
+    pub(in crate::control) fn native_terminal(&self) -> Option<observation::SharedTerminal> {
+        #[cfg(feature = "native-api")]
+        return self.initializer.native_terminal.get().cloned();
+        #[cfg(not(feature = "native-api"))]
+        None
     }
 
     pub(in crate::control) fn client_addr(&self) -> SocketAddr {
@@ -736,7 +747,7 @@ impl UdpEndpointPool {
         data: DatagramPayload<'_>,
         enqueued_at: u32,
         stats: &StatsManager,
-        #[cfg(feature = "native-api")] native_terminal: Option<&Arc<retirement::NativeUdpTerminal>>,
+        #[cfg(feature = "native-api")] native_terminal: Option<&observation::SharedTerminal>,
     ) -> EndpointReservation {
         let result = (|| {
             if sender.is_closed() {
@@ -983,7 +994,7 @@ impl UdpEndpointPool {
                                 enqueued_at,
                                 stats,
                                 #[cfg(feature = "native-api")]
-                                ready.endpoint.native_terminal.as_ref(),
+                                ready.endpoint.native.terminal(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (ready.decision_token, ready.generation)
@@ -1098,7 +1109,7 @@ impl UdpEndpointPool {
                             enqueued_at,
                             stats,
                             #[cfg(feature = "native-api")]
-                            ready.endpoint.native_terminal.as_ref(),
+                            ready.endpoint.native.terminal(),
                         )
                     }
                     EndpointEntry::Ready(_) | EndpointEntry::Retiring { .. } => {
@@ -1199,7 +1210,7 @@ impl UdpEndpointPool {
                         enqueued_at,
                         stats,
                         #[cfg(feature = "native-api")]
-                        ready.endpoint.native_terminal.as_ref(),
+                        ready.endpoint.native.terminal(),
                     ),
                 )
             }
@@ -1271,7 +1282,7 @@ impl UdpEndpointPool {
                         enqueued_at,
                         stats,
                         #[cfg(feature = "native-api")]
-                        ready.endpoint.native_terminal.as_ref(),
+                        ready.endpoint.native.terminal(),
                     ),
                     (ready.decision_token, ready.generation),
                 )

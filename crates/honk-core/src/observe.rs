@@ -6,7 +6,7 @@ mod dns;
 pub(crate) mod flows;
 pub(crate) mod rules;
 
-pub(crate) use dns::{DnsLog, DnsRecorder};
+pub(crate) use dns::{DnsLog, DnsObserver, DnsOperation, DnsRecorder};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -120,3 +120,13 @@ impl Observation {
 pub(crate) fn timestamp(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
+
+/// Pins `$future` in place for a scope hook, which borrows it so the hook's
+/// own state stays small. Inert hooks take the future by value, so their twin
+/// of this macro leaves it unpinned and adds nothing to the caller's state.
+macro_rules! scope_pin {
+    ($future:ident) => {
+        let $future = std::pin::pin!($future);
+    };
+}
+pub(crate) use scope_pin;

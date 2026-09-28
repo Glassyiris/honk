@@ -747,9 +747,12 @@ pub(crate) fn route_upstream(
     (outbound.to_owned(), Some(evaluation_id))
 }
 
+/// The group selections a DNS dial took on its way to the leaf.
+pub(crate) type SelectionPath = Vec<super::record::Selection>;
+
 pub(crate) fn selection_evaluated(
     observation: Option<&honk_outbound::group::observation::SelectionObservation>,
-) -> Vec<super::record::Selection> {
+) -> SelectionPath {
     let Some((observer, api)) = authority() else {
         return Vec::new();
     };
@@ -788,7 +791,7 @@ pub(crate) fn selection_path(
     chain: &[String],
     node: &honk_config::node::Node,
     family: honk_outbound::alive::IpVersion,
-) -> Vec<super::record::Selection> {
+) -> SelectionPath {
     let Some(observer) = flow_observation::current() else {
         return Vec::new();
     };
@@ -853,7 +856,7 @@ pub(crate) fn outbound_evidence(
     evaluation_id: Option<String>,
     node: Option<&honk_config::node::Node>,
     target: SocketAddr,
-    selection_path: Vec<super::record::Selection>,
+    selection_path: SelectionPath,
 ) -> Option<super::record::OutboundAttempt> {
     let observer = flow_observation::current()?;
     Some(super::record::OutboundAttempt {

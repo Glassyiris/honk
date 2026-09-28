@@ -94,19 +94,14 @@ impl DnsEndpoint {
 
     /// Resolve host to the first address allowed by the configured strategy.
     pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
-        let resolve = self.resolve_addrs();
-        #[cfg(feature = "native-api")]
-        let (addresses, witness) = crate::observe::flows::dns::scope_purpose(
-            "proxy_server",
-            std::pin::pin!(honk_outbound::runtime::flow_observation::observe_resolution(resolve)),
-        )
-        .await;
-        #[cfg(not(feature = "native-api"))]
-        let addresses = resolve.await;
+        let resolve =
+            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve_addrs());
+        crate::observe::scope_pin!(resolve);
+        let (addresses, witness) =
+            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
         let selected = addresses?.into_iter().next().ok_or_else(|| {
             anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
         })?;
-        #[cfg(feature = "native-api")]
         if let Some(witness) = witness {
             witness.selected_ip(selected.ip());
         }

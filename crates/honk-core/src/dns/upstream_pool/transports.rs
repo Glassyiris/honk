@@ -49,17 +49,14 @@ impl PooledTransport {
         raw_query: &[u8],
         feedback: Option<ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        #[cfg(feature = "native-api")]
-        {
-            let (upstream, carrier) = match self {
-                Self::Tcp(_) => ("tcp", "tcp"),
-                Self::Dot(_) => ("dot", "tcp"),
-                Self::Doh(_) => ("doh", "tcp"),
-                Self::Doq(_) => ("doq", "udp"),
-                Self::Doh3(_) => ("doh3", "udp"),
-            };
-            crate::observe::flows::dns::transport(upstream, carrier);
-        }
+        let (upstream, carrier) = match self {
+            Self::Tcp(_) => ("tcp", "tcp"),
+            Self::Dot(_) => ("dot", "tcp"),
+            Self::Doh(_) => ("doh", "tcp"),
+            Self::Doq(_) => ("doq", "udp"),
+            Self::Doh3(_) => ("doh3", "udp"),
+        };
+        crate::observe::flows::dns::transport(upstream, carrier);
         match self {
             Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,
             Self::Dot(transport) => transport.exchange(raw_query, feedback).await,

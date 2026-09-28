@@ -48,7 +48,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             },
         ));
         let mut endpoint = UdpEndpoint::new(transport, dst, TEST_NODE_ID);
-        endpoint.set_native_flow(Some(flow), &pool, None);
+        endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let death_called = Arc::new(AtomicBool::new(false));
@@ -466,7 +466,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut endpoint =
             UdpEndpoint::new(transport(socket, destination), destination, TEST_NODE_ID);
-        endpoint.set_native_flow(Some(flow), &pool, None);
+        endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         let mut driver = pool.spawn_driver(
             client,

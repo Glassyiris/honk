@@ -674,7 +674,6 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
-                #[cfg(feature = "native-api")]
                 if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
                     observer.publish(
                         honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
@@ -697,7 +696,6 @@ impl ControlPlaneHandle {
             {
                 scope.start();
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-                #[cfg(feature = "native-api")]
                 if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
                     observer.publish(
                         honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {

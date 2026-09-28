@@ -25,6 +25,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch}
 use tracing::debug;
 
 mod admission;
+#[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
+mod observation;
 mod retirement;
 #[cfg(feature = "rprx")]
 mod source;
@@ -99,16 +101,7 @@ pub struct UdpEndpoint {
     #[cfg(all(test, feature = "rprx"))]
     source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<String>>,
-    #[cfg(feature = "native-api")]
-    native_flow: Option<Arc<crate::observe::flows::FlowGuard>>,
-    #[cfg(feature = "native-api")]
-    native_pool: std::sync::Weak<UdpEndpointPool>,
-    #[cfg(feature = "native-api")]
-    native_observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
-    #[cfg(feature = "native-api")]
-    native_terminal: Option<Arc<retirement::NativeUdpTerminal>>,
-    #[cfg(feature = "native-api")]
-    native_received_reply: AtomicBool,
+    pub(in crate::control) native: observation::EndpointObservation,
     retirement: EndpointIoGuard,
 }
 
@@ -212,89 +205,8 @@ impl UdpEndpoint {
             tracker_id: Mutex::new(None),
             score_reporter,
             health_family,
-            #[cfg(feature = "native-api")]
-            native_flow: None,
-            #[cfg(feature = "native-api")]
-            native_pool: std::sync::Weak::new(),
-            #[cfg(feature = "native-api")]
-            native_observer: None,
-            #[cfg(feature = "native-api")]
-            native_terminal: None,
-            #[cfg(feature = "native-api")]
-            native_received_reply: AtomicBool::new(false),
+            native: Default::default(),
             retirement: EndpointIoGuard(RetirementIo::new()),
-        }
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn set_native_flow(
-        &mut self,
-        flow: Option<Arc<crate::observe::flows::FlowGuard>>,
-        pool: &Arc<UdpEndpointPool>,
-        terminal: Option<Arc<retirement::NativeUdpTerminal>>,
-    ) {
-        self.native_terminal = terminal.or_else(|| {
-            flow.clone()
-                .map(|flow| retirement::NativeUdpTerminal::new(flow, true))
-        });
-        self.native_flow = flow;
-        self.native_pool = Arc::downgrade(pool);
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn set_native_observer(
-        &mut self,
-        observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
-    ) {
-        self.native_observer = observer;
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn native_drop(
-        &self,
-        reason: &'static str,
-        error: Option<&'static str>,
-    ) {
-        if let Some(flow) = &self.native_flow {
-            flow.step(
-                None,
-                crate::observe::flows::record::StepData::Datapath {
-                    plane: "userspace",
-                    action: "drop",
-                    reason,
-                    error: error.map(crate::observe::flows::record::FlowError::Code),
-                },
-            );
-        }
-    }
-
-    #[cfg(feature = "native-api")]
-    fn native_reply_received(&self) {
-        if let Some(flow) = &self.native_flow {
-            self.native_received_reply.store(true, Ordering::Relaxed);
-            if flow.first_reply() {
-                flow.transition("active", "reply_received", "first_reply", Some(true));
-            }
-        }
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn native_flow(&self) -> Option<&Arc<crate::observe::flows::FlowGuard>> {
-        self.native_flow.as_ref()
-    }
-
-    #[cfg(feature = "native-api")]
-    fn finish_native(&self, state: &'static str, reason: &'static str) {
-        if let Some(terminal) = &self.native_terminal {
-            let shutdown = self
-                .native_pool
-                .upgrade()
-                .is_some_and(|pool| pool.terminal.load(Ordering::Acquire));
-            if shutdown {
-                terminal.outcome("closed", "shutdown");
-            } else {
-                terminal.outcome(state, reason);
-            }
         }
     }
 
@@ -304,9 +216,7 @@ impl UdpEndpoint {
             SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.has_reply() => {
                 ("closed", "reply_idle")
             }
-            SourceRetirement::Neutral(ScoreOutcome::Timeout)
-                if self.native_received_reply.load(Ordering::Relaxed) =>
-            {
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.native.received_reply() => {
                 ("failed", "timeout_after_reply")
             }
             SourceRetirement::Neutral(ScoreOutcome::Timeout) => ("failed", "timeout_before_reply"),
@@ -316,7 +226,7 @@ impl UdpEndpoint {
             ) => ("failed", "transport_timeout"),
             SourceRetirement::Failure(_) => ("failed", "transport_error"),
         };
-        self.finish_native(state, reason);
+        self.native.finish(state, reason);
     }
 
     /// Bind the clash-API tracker entry to this endpoint: the entry shares
@@ -385,12 +295,9 @@ impl UdpEndpoint {
 
     pub fn mark_reply(&self) {
         let first = !self.has_reply.swap(true, Ordering::Relaxed);
-        #[cfg(feature = "native-api")]
-        if first && let Some(flow) = &self.native_flow {
+        if first && let Some(flow) = self.native.flow() {
             flow.transition("active", "client_delivery_succeeded", "unknown", Some(true));
         }
-        #[cfg(not(feature = "native-api"))]
-        let _ = first;
         self.refresh();
         self.reply_epoch.fetch_add(1, Ordering::Release);
         self.reply_notify.notify_waiters();
@@ -514,8 +421,7 @@ impl UdpEndpoint {
                 }
             }
         };
-        #[cfg(feature = "native-api")]
-        if let Some(observer) = &self.native_observer {
+        if let Some(observer) = self.native.observer() {
             return observer.scope(operation).await;
         }
         operation.await

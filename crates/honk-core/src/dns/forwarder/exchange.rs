@@ -30,22 +30,17 @@ impl DnsForwarder {
             }
             RequestScope::AsIs(destination) => {
                 let query = self.query_asis(raw_query, *destination, ingress);
-                #[cfg(feature = "native-api")]
                 let observation = crate::observe::flows::dns::outbound_evidence(
                     "direct",
                     "builtin",
                     None,
                     None,
                     *destination,
-                    Vec::new(),
+                    Default::default(),
                 );
-                #[cfg(feature = "native-api")]
-                let query = std::pin::pin!(query);
-                #[cfg(feature = "native-api")]
+                crate::observe::scope_pin!(query);
                 let query = crate::observe::flows::dns::outbound_scope(observation.as_ref(), query);
-                #[cfg(feature = "native-api")]
-                let query = std::pin::pin!(query);
-                #[cfg(feature = "native-api")]
+                crate::observe::scope_pin!(query);
                 let query = crate::observe::flows::dns::exchange_scope(raw_query, "asis", query);
                 query.await
             }
@@ -256,15 +251,12 @@ impl DnsForwarder {
         match ingress {
             IngressProfile::Udp { .. } => {
                 let query = self.query_asis_udp(raw_query, destination);
-                #[cfg(feature = "native-api")]
-                let query = std::pin::pin!(query);
-                #[cfg(feature = "native-api")]
+                crate::observe::scope_pin!(query);
                 let query = crate::observe::flows::dns::transport_exchange_scope(raw_query, query);
                 let response = query.await?;
                 if !crate::dns::response::is_truncated(&response) {
                     return Ok(response);
                 }
-                #[cfg(feature = "native-api")]
                 crate::observe::flows::dns::tcp_fallback();
                 debug!(
                     destination = %destination,
@@ -277,9 +269,7 @@ impl DnsForwarder {
             }
         }
         let query = self.query_asis_tcp(raw_query, destination);
-        #[cfg(feature = "native-api")]
-        let query = std::pin::pin!(query);
-        #[cfg(feature = "native-api")]
+        crate::observe::scope_pin!(query);
         let query = crate::observe::flows::dns::transport_exchange_scope(raw_query, query);
         query.await
     }
@@ -290,9 +280,7 @@ impl DnsForwarder {
         destination: SocketAddr,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis UDP dial");
-        #[cfg(feature = "native-api")]
         crate::observe::flows::dns::transport("udp", "udp");
-        #[cfg(feature = "native-api")]
         let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
             Some(destination),
             "original_ip",
@@ -321,7 +309,6 @@ impl DnsForwarder {
             Ok::<_, anyhow::Error>(socket)
         }
         .await;
-        #[cfg(feature = "native-api")]
         if let Some(observation) = &mut observation {
             observation.finish(
                 if socket.is_ok() {
@@ -352,7 +339,6 @@ impl DnsForwarder {
         destination: SocketAddr,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis TCP dial");
-        #[cfg(feature = "native-api")]
         crate::observe::flows::dns::transport("tcp", "tcp");
         let mut stream = honk_outbound::util::connect_marked_addr(
             destination,

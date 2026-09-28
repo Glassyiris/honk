@@ -543,8 +543,8 @@ impl UdpLoopState {
                     observation.packet_route(capture);
                 }
                 #[cfg(feature = "native-api")]
-                let observer =
-                    observation.observer(self.handle.diagnostics.read().generation, "client_dns");
+                let observer = observation
+                    .observer(|| self.handle.diagnostics.read().generation, "client_dns");
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let operation = async {
@@ -597,15 +597,14 @@ impl UdpLoopState {
                     observation.packet_route(capture);
                 }
                 #[cfg(feature = "native-api")]
-                let observer =
-                    observation.observer(self.handle.diagnostics.read().generation, "client_dns");
+                let observer = observation
+                    .observer(|| self.handle.diagnostics.read().generation, "client_dns");
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let _permit = udp_permit;
                     #[cfg(feature = "native-api")]
                     let started = std::time::Instant::now();
                     let operation = async {
-                        #[cfg(feature = "native-api")]
                         crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
                         let result = runtime
                             .run_reply(send_udp_reply_from_orig_dst(
@@ -614,17 +613,12 @@ impl UdpLoopState {
                                 original_dst,
                             ))
                             .await;
-                        #[cfg(feature = "native-api")]
-                        {
-                            let (status, error) = match result {
-                                Ok(Ok(length)) if length == response.len() => ("delivered", None),
-                                Ok(_) => ("delivery_failed", Some("client_send_failed")),
-                                Err(_) => ("cancelled", Some("runtime_retired")),
-                            };
-                            crate::observe::flows::dns::delivery(status, error);
-                        }
-                        #[cfg(not(feature = "native-api"))]
-                        let _ = result;
+                        let (status, error) = match result {
+                            Ok(Ok(length)) if length == response.len() => ("delivered", None),
+                            Ok(_) => ("delivery_failed", Some("client_send_failed")),
+                            Err(_) => ("cancelled", Some("runtime_retired")),
+                        };
+                        crate::observe::flows::dns::delivery(status, error);
                     };
                     #[cfg(feature = "native-api")]
                     if let Some(raw) = query.as_deref() {

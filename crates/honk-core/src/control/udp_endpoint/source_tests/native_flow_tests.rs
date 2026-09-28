@@ -57,8 +57,10 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             honk_outbound::alive::IpVersion::V4,
             None,
         );
-        endpoint.set_native_observer(flow.observer(7, None, "dial_target"));
-        endpoint.set_native_flow(Some(flow), &pool, None);
+        endpoint
+            .native
+            .set_observer(flow.observer(7, None, "dial_target"));
+        endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         owner_ids.push(endpoint.source_owner_id().unwrap());

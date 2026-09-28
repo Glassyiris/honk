@@ -118,7 +118,6 @@ impl DnsForwarder {
         mode: ResolveMode,
         evidence: Option<&mut crate::dns::outcome::RouteSource>,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        #[cfg(feature = "native-api")]
         let mut observation =
             crate::observe::flows::dns::LookupGuard::start(raw_query, ingress, metadata);
         let publication_epoch = self.cache_service().await.publication_epoch();
@@ -132,14 +131,10 @@ impl DnsForwarder {
             publication_epoch,
             evidence,
         );
-        #[cfg(feature = "native-api")]
         let result = match &observation {
             Some(observation) => observation.scope(resolve).await,
             None => resolve.await,
         };
-        #[cfg(not(feature = "native-api"))]
-        let result = resolve.await;
-        #[cfg(feature = "native-api")]
         if let Some(observation) = &mut observation {
             observation.outcome(&result);
         }

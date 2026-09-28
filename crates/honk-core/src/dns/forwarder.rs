@@ -665,9 +665,7 @@ mod strategy {
                 mode,
                 None,
             ));
-            #[cfg(feature = "native-api")]
-            let sibling = std::pin::pin!(sibling);
-            #[cfg(feature = "native-api")]
+            crate::observe::scope_pin!(sibling);
             let sibling = crate::observe::flows::dns::scope_purpose("family_preference", sibling);
             let sibling = sibling.await.map_err(anyhow::Error::from);
             Ok(match sibling {

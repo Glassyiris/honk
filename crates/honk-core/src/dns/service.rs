@@ -22,8 +22,7 @@ pub(crate) use name_resolution::PinnedNameResolver;
 pub struct DnsService {
     backend: Arc<DnsServiceBackend>,
     flush_generation: watch::Sender<u64>,
-    #[cfg(feature = "native-api")]
-    observer: Arc<parking_lot::RwLock<std::sync::Weak<crate::observe::DnsRecorder>>>,
+    observer: crate::observe::DnsObserver,
 }
 
 enum DnsServiceBackend {
@@ -34,8 +33,7 @@ enum DnsServiceBackend {
 struct OperationToken {
     generation: u64,
     updates: watch::Receiver<u64>,
-    #[cfg(feature = "native-api")]
-    observer: std::sync::Weak<crate::observe::DnsRecorder>,
+    observer: crate::observe::DnsOperation,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,8 +52,7 @@ impl OperationToken {
                 generation: self.generation,
             });
         }
-        #[cfg(feature = "native-api")]
-        let operation = crate::observe::flows::dns::scope_api(self.observer.clone(), operation);
+        let operation = self.observer.scope(operation);
         tokio::pin!(operation);
         tokio::select! {
             biased;
@@ -70,15 +67,12 @@ impl OperationToken {
 impl DnsService {
     #[cfg(feature = "native-api")]
     pub(crate) fn attach_observer(&self, observer: std::sync::Weak<crate::observe::DnsRecorder>) {
-        *self.observer.write() = observer;
+        self.observer.attach(observer);
     }
 
     #[cfg(feature = "native-api")]
     pub(crate) fn observation_enabled(&self) -> bool {
-        self.observer
-            .read()
-            .upgrade()
-            .is_some_and(|observer| observer.recording())
+        self.observer.recording()
     }
 
     #[cfg(feature = "native-api")]
@@ -91,10 +85,8 @@ impl DnsService {
         response: &[u8],
         elapsed: std::time::Duration,
     ) {
-        let observer = self.observer.read().upgrade();
-        if let Some(observer) = observer {
-            observer.observe_client(query, ingress, source, outcome, response, elapsed);
-        }
+        self.observer
+            .observe_client(query, ingress, source, outcome, response, elapsed);
     }
 
     pub fn with_forwarder(forwarder: Arc<DnsForwarder>) -> Self {
@@ -102,8 +94,7 @@ impl DnsService {
         Self {
             backend: Arc::new(DnsServiceBackend::Standalone(forwarder)),
             flush_generation,
-            #[cfg(feature = "native-api")]
-            observer: Arc::new(parking_lot::RwLock::new(std::sync::Weak::new())),
+            observer: Default::default(),
         }
     }
 
@@ -112,8 +103,7 @@ impl DnsService {
         Self {
             backend: Arc::new(DnsServiceBackend::Runtime(provider)),
             flush_generation,
-            #[cfg(feature = "native-api")]
-            observer: Arc::new(parking_lot::RwLock::new(std::sync::Weak::new())),
+            observer: Default::default(),
         }
     }
 
@@ -219,12 +209,7 @@ impl DnsService {
         OperationToken {
             generation,
             updates,
-            #[cfg(feature = "native-api")]
-            observer: if honk_outbound::runtime::flow_observation::current().is_some() {
-                self.observer.read().clone()
-            } else {
-                std::sync::Weak::new()
-            },
+            observer: self.observer.operation(),
         }
     }
 }
