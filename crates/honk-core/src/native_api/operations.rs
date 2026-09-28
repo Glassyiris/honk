@@ -75,7 +75,8 @@ pub(crate) struct OperationStore {
 
 #[derive(Default)]
 struct State {
-    // ponytail: at most 32 entries; an index only helps if this ceiling grows.
+    // ponytail: linear scans over at most 32 records and 1024 tombstones; index by
+    // scope only if these ceilings grow.
     records: Vec<Record>,
     /// Evicted keyed operations, kept only to answer replays for their retention window.
     tombstones: VecDeque<Tombstone>,
