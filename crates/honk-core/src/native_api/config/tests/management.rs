@@ -249,10 +249,21 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
             .send()
             .await
             .unwrap(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "temporarily_unavailable",
+        StatusCode::CONFLICT,
+        "state_conflict",
     )
     .await;
+    let pinned = fixture.get("/api/v1/groups").await;
+    let pinned = pinned
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["name"] == "pinned")
+        .unwrap();
+    assert_eq!(
+        referenced["error"]["details"]["groups"],
+        json!([pinned["id"]])
+    );
     assert_eq!(referenced["error"]["details"]["written"], false);
     error(
         create_node(&fixture, "managed", "socks5://127.0.0.1:11082")
@@ -361,6 +372,91 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
 }
 
 #[tokio::test]
+async fn delete_request_errors_and_source_drift_are_not_retryable() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    for path in [format!("{NODES}/unknown"), format!("{PROVIDERS}/unknown")] {
+        for (request, status, code) in [
+            (
+                fixture.request(Method::DELETE, &format!("{path}?x=1")),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                fixture.request(Method::DELETE, &path).body("{}"),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                fixture
+                    .request(Method::DELETE, &path)
+                    .body(" ".repeat(65537)),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+            ),
+        ] {
+            let response = request.send().await.unwrap();
+            assert!(response.headers().get("retry-after").is_none());
+            error(response, status, code).await;
+        }
+    }
+    let node = created(
+        create_node(&fixture, "drifted", LINK).send().await.unwrap(),
+        "nodes",
+    )
+    .await;
+    let path = format!("{NODES}/{}", node["id"].as_str().unwrap());
+    let (entered, release) = fixture.pause_before_replace();
+    let request = fixture.request(Method::DELETE, &path).send();
+    let drift = async {
+        entered.await.unwrap();
+        let main = fixture.path("main.dae");
+        let text = std::fs::read_to_string(&main).unwrap();
+        std::fs::write(&main, format!("{text}\n")).unwrap();
+        release.send(()).unwrap();
+    };
+    let (response, ()) = tokio::join!(request, drift);
+    let response = response.unwrap();
+    assert!(response.headers().get("retry-after").is_none());
+    error(response, StatusCode::PRECONDITION_FAILED, "stale_revision").await;
+    reload(&fixture).await;
+
+    let (entered, release) = fixture.pause_before_replace();
+    let request = fixture.request(Method::DELETE, &path).send();
+    let full = async {
+        entered.await.unwrap();
+        let state = fixture.state.upgrade().unwrap();
+        let mut queued = Vec::new();
+        loop {
+            let (response, wait) = oneshot::channel();
+            let work = super::super::Work::Manage {
+                mutation: crate::native_api::management::Mutation::DeleteNode("unknown".into()),
+                catalog: Arc::clone(&state.observation.catalog),
+                group_manager: Arc::clone(&state.group_manager),
+                alive_set: Arc::clone(&state.alive_set),
+                response,
+            };
+            if fixture.service.enqueue(work).is_err() {
+                break;
+            }
+            queued.push(wait);
+        }
+        let response = fixture.request(Method::DELETE, &path).send().await.unwrap();
+        assert!(response.headers().get("retry-after").is_some());
+        error(
+            response,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+        )
+        .await;
+        release.send(()).unwrap();
+        queued
+    };
+    let (response, _queued) = tokio::join!(request, full);
+    assert_eq!(ok(response.unwrap()).await, json!({"deleted":1}));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn management_waits_for_activation_and_survives_http_disconnect() {
     let mut fixture = Fixture::new(Access::Admin, true).await;
     let before = fixture.get(CONFIG).await;
@@ -425,8 +521,8 @@ async fn management_fences_disk_and_activation_and_reports_written_state() {
             .send()
             .await
             .unwrap(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "temporarily_unavailable",
+        StatusCode::PRECONDITION_FAILED,
+        "stale_revision",
     )
     .await;
     assert_eq!(response["error"]["details"]["written"], false);

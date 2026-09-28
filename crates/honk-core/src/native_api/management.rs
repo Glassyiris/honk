@@ -132,6 +132,16 @@ pub(super) fn conflict() -> ApiError {
     )
 }
 
+pub(super) fn referenced(groups: &[&String]) -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        ErrorCode::StateConflict,
+        "Groups still name this node as their final outbound",
+        None,
+    )
+    .with_details(json!({"groups":groups}))
+}
+
 pub(super) fn activation_error(
     stage: &'static str,
     written: Option<bool>,
@@ -158,23 +168,23 @@ pub(super) async fn mutate(
         return Err(unsupported());
     }
     let deleting = matches!(action, Action::DeleteNode(_) | Action::DeleteProvider(_));
+    parse_query(request.uri(), &[], id)?;
+    if !deleting {
+        config::json_type(&request)?;
+    }
+    let body = to_bytes(request.into_body(), 65536).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "Management request body exceeds its limit",
+            None,
+        )
+    })?;
+    if deleting && !body.is_empty() {
+        return Err(invalid());
+    }
     let result = async {
-        parse_query(request.uri(), &[], id)?;
-        if !deleting {
-            config::json_type(&request)?;
-        }
-        let body = to_bytes(request.into_body(), 65536).await.map_err(|_| {
-            ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Management request body exceeds its limit",
-                None,
-            )
-        })?;
         let mutation = match action {
-            Action::DeleteNode(_) | Action::DeleteProvider(_) if !body.is_empty() => {
-                return Err(invalid());
-            }
             Action::DeleteNode(target) => Mutation::DeleteNode(target),
             Action::DeleteProvider(target) => Mutation::DeleteProvider(target),
             Action::CreateNode => {

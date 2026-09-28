@@ -61,10 +61,17 @@ fn validate(request: &ProbeRequest) -> Result<(), ApiError> {
     {
         return Err(invalid());
     }
-    if (request.kind == Kind::Dns) != (request.purpose == Purpose::Dns)
-        || request.kind != Kind::Dns && request.transport != [Transport::Tcp]
-    {
-        return Err(invalid());
+    if (request.kind == Kind::Dns) != (request.purpose == Purpose::Dns) {
+        return Err(unsupported(
+            "The probe purpose does not match its kind",
+            json!({"field":"purpose"}),
+        ));
+    }
+    if request.kind != Kind::Dns && request.transport != [Transport::Tcp] {
+        return Err(unsupported(
+            "This probe kind runs over TCP only",
+            json!({"field":"transport","allowed":["tcp"]}),
+        ));
     }
     if let Some(Members::Ids(ids)) = &request.members {
         if ids.is_empty()

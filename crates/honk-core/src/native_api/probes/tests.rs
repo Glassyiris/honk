@@ -873,6 +873,40 @@ async fn malformed_requests_name_the_field_but_not_the_value() {
     worker.await.unwrap();
 }
 
+#[tokio::test]
+async fn unsupported_kind_pairings_name_the_field() {
+    let state = state(Config::default()).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let node = json!({"type":"node","node_id":"node"});
+    let mut dns_data = request(node.clone(), "dns", json!(["udp"]), "ipv4");
+    dns_data["purpose"] = json!("data");
+    for (index, (input, field)) in [
+        (
+            request(node, "tcp_connect", json!(["udp"]), "ipv4"),
+            "transport",
+        ),
+        (dns_data, "purpose"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = format!("pairing-{index}");
+        let error = create(&state, http_request(&input, &key), &RequestId(key))
+            .await
+            .unwrap_err();
+        let body = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(body["error"]["code"], "unsupported_value", "{body}");
+        assert_eq!(body["error"]["details"]["field"], field, "{body}");
+    }
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
 /// The admission error, or the operation's terminal error when planning passed.
 async fn refusal(state: &Arc<NativeState>, input: &Value, index: usize) -> Value {
     let key = format!("refusal-{index}");
