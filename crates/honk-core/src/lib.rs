@@ -2024,7 +2024,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 
-    info!("honk-core is running. Press Ctrl+C to stop.");
+    // Under a service manager nobody is at a terminal to press it.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        info!("honk-core is running. Press Ctrl+C to stop.");
+    } else {
+        info!("honk-core is running.");
+    }
     let control_result = control_plane.run().await;
     #[cfg(feature = "native-api")]
     if let Some(coordinator) = config_coordinator {
