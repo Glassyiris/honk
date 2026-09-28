@@ -406,7 +406,7 @@ fn declaring_source<'a>(
     sources: &'a [SourceSnapshot],
     subscription: &honk_config::subscription::Subscription,
 ) -> Option<&'a SourceRef> {
-    let index = subscription.source?;
+    let index = subscription.source.as_ref()?.0.index();
     sources
         .iter()
         .map(|snapshot| &snapshot.source)

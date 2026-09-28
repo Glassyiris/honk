@@ -23,6 +23,10 @@ impl SupervisorState {
             {
                 Ok(Some(nodes)) => {
                     honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
+                    crate::config_diagnostics::declare_provider_diagnostics(
+                        subscription,
+                        &mut diagnostics,
+                    );
                     startup_diagnostics.replace_provider(subscription.id, diagnostics);
                     info!(
                         subscription = %subscription.name,

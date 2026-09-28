@@ -3,7 +3,7 @@ use super::*;
 use crate::config_diagnostics::{DiagnosticBuckets, DiagnosticSnapshot};
 use crate::subscription::{SubscriptionAuthorizations, SubscriptionSupervisor};
 use honk_config::diagnostic::{DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath};
-use honk_config::subscription::Subscription;
+use honk_config::subscription::{DeclaringSource, Subscription};
 
 fn warning(code: &'static str, line: usize) -> Vec<DetailedDiagnostic> {
     let mut diagnostic = DetailedDiagnostic::warning(
@@ -447,6 +447,78 @@ async fn c14_unchanged_authorized_refresh_replaces_provenance() {
     assert_eq!(after.diagnostics[1].line, Some(9));
     assert_eq!(after.diagnostics[0], before.diagnostics[0]);
     assert_eq!(after.diagnostics[2], before.diagnostics[2]);
+}
+
+async fn provider_diagnostic(cp: &ControlPlane, id: uuid::Uuid) -> DetailedDiagnostic {
+    let diagnostics = cp.diagnostics.read();
+    let (_, provider) = diagnostics
+        .buckets
+        .providers
+        .iter()
+        .find(|(provider, _)| *provider == id)
+        .unwrap();
+    provider[0].clone()
+}
+
+#[tokio::test]
+async fn c14_provider_diagnostics_follow_the_declaring_file_across_reloads() {
+    let declaring = |sources: &DiagnosticSources| {
+        Some(DeclaringSource(
+            sources.add(Some("/private/providers.dae".into()), Some(0)),
+        ))
+    };
+    let main = DiagnosticSources::new(Some("/private/config.dae".into()));
+    let (mut config, buckets) = provider_config();
+    config.subscriptions[0].source = Some(DeclaringSource(main.root()));
+    let provider = config.subscriptions[0].clone();
+    let node = config.nodes[0].clone();
+    let cp = fixture(config.clone(), buckets).await;
+
+    assert!(
+        refresh(
+            &cp,
+            &provider,
+            vec![node.clone()],
+            warning("first", 9),
+            false
+        )
+        .await
+        .unwrap()
+    );
+    let diagnostic = provider_diagnostic(&cp, provider.id).await;
+    assert_eq!(diagnostic.source, main.root());
+    assert_eq!(diagnostic.line, None);
+
+    // Moving the declaration into an include changes the configuration.
+    let moved = DiagnosticSources::new(Some("/private/config.dae".into()));
+    let mut candidate = config.clone();
+    candidate.subscriptions[0].source = declaring(&moved);
+    assert!(reload(&cp, candidate, warning("static", 2)).await);
+    let included = cp.config.read().await.subscriptions[0].source.clone();
+    assert_eq!(included.as_ref().unwrap().0.index(), 1);
+    assert_eq!(
+        provider_diagnostic(&cp, provider.id).await.source,
+        included.unwrap().0
+    );
+
+    // Shifting it within that file leaves the configuration equal.
+    let shifted = DiagnosticSources::new(Some("/private/config.dae".into()));
+    let mut candidate = cp.config.read().await.as_ref().clone();
+    candidate.subscriptions[0].source = declaring(&shifted);
+    let expected = candidate.subscriptions[0].source.clone().unwrap().0;
+    let generation = snapshot(&cp).await.generation;
+    assert!(reload(&cp, candidate, warning("static", 3)).await);
+    assert_eq!(snapshot(&cp).await.generation, generation);
+    assert_eq!(provider_diagnostic(&cp, provider.id).await.source, expected);
+
+    assert!(
+        refresh(&cp, &provider, vec![node], warning("first", 4), false)
+            .await
+            .unwrap()
+    );
+    let diagnostic = provider_diagnostic(&cp, provider.id).await;
+    assert_eq!(diagnostic.source, expected);
+    assert_eq!(diagnostic.line, None);
 }
 
 #[tokio::test]

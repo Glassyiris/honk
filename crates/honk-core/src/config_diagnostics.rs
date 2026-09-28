@@ -16,6 +16,7 @@ pub(crate) enum DiagnosticUpdate {
     Rebase {
         static_diagnostics: Vec<DetailedDiagnostic>,
         retained_provider_ids: std::collections::HashSet<Uuid>,
+        declared: Vec<Subscription>,
     },
     ReplaceProvider {
         id: Uuid,
@@ -44,10 +45,16 @@ impl DiagnosticBuckets {
             DiagnosticUpdate::Rebase {
                 static_diagnostics,
                 retained_provider_ids,
+                declared,
             } => {
                 self.static_diagnostics = static_diagnostics;
                 self.providers
                     .retain(|(id, _)| retained_provider_ids.contains(id));
+                for (id, diagnostics) in &mut self.providers {
+                    if let Some(subscription) = declared.iter().find(|sub| sub.id == *id) {
+                        declare_provider_diagnostics(subscription, diagnostics);
+                    }
+                }
             }
             DiagnosticUpdate::ReplaceProvider { id, diagnostics } => {
                 self.replace_provider(id, diagnostics);
@@ -74,6 +81,23 @@ impl DiagnosticBuckets {
             }
         }
         projection.finish(generation)
+    }
+}
+
+/// Point body diagnostics at the file that declares the subscription. Their
+/// lines and columns count in the fetched body, not in that file.
+pub(crate) fn declare_provider_diagnostics(
+    subscription: &Subscription,
+    diagnostics: &mut [DetailedDiagnostic],
+) {
+    let Some(declared) = &subscription.source else {
+        return;
+    };
+    for diagnostic in diagnostics {
+        diagnostic.source = declared.0.clone();
+        diagnostic.span = None;
+        diagnostic.line = None;
+        diagnostic.byte_column = None;
     }
 }
 
