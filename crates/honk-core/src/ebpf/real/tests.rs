@@ -619,6 +619,8 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         );
         assert_eq!(checked.admission, Some(true));
         assert_eq!(checked.listeners_published, Some(true));
+        // Both lo hooks are verified, but the fixture's required dae0 and
+        // daens hooks are not, so no attached claim is made.
         assert_eq!(checked.hooks, DatapathCheck::Unknown);
         assert_eq!(checked.attachments.len(), 2);
         assert!(checked.attachments.iter().all(|attachment| {

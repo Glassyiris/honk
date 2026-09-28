@@ -300,6 +300,20 @@ impl DatapathObservation {
             self.errors.push(error);
         }
     }
+
+    /// Claims hooks only when each of the `required` hooks was checked and found
+    /// attached. A required hook that cannot be checked keeps `hooks` unknown.
+    pub fn verify_required_hooks(&mut self, required: usize) {
+        if required > 0
+            && self.attachments.len() == required
+            && self
+                .attachments
+                .iter()
+                .all(|attachment| attachment.state == DatapathCheck::Verified)
+        {
+            self.hooks = DatapathCheck::Verified;
+        }
+    }
 }
 
 #[cfg(test)]

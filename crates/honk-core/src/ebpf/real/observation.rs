@@ -64,8 +64,9 @@ impl RealEbpfBackend {
             Err(_) => result.record_error(DatapathObservationError::Maps),
         }
         // A retained link FD alone does not prove its hook is still installed.
-        // TCX queries below check host interfaces; cgroup/sk_lookup and the peer
-        // namespace remain unverified, so no aggregate healthy/active claim.
+        // TCX queries below check the host interfaces and dae0. aya exposes no
+        // query for the cgroup and sk_lookup hooks, and dae0peer sits in daens,
+        // so those required hooks stay unchecked and `hooks` stays unknown.
         if self.interface_links.is_empty()
             && self.cgroup_sock_links.is_empty()
             && self.cgroup_sock_addr_links.is_empty()
@@ -75,8 +76,21 @@ impl RealEbpfBackend {
         {
             result.hooks = DatapathCheck::Absent;
         }
-        for (ifindex, egress, link) in self.interface_links.iter().take(MAX_DATAPATH_ATTACHMENTS) {
-            let Ok(interface) = nix::net::if_::if_indextoname(*ifindex) else {
+        // ifindex 0 fails the name lookup below and records the hook error.
+        let dae0 = self.dae0_ingress_link.iter().map(|link| {
+            (
+                nix::net::if_::if_nametoindex("dae0").unwrap_or(0),
+                false,
+                link,
+            )
+        });
+        let tcx_links = self
+            .interface_links
+            .iter()
+            .map(|(ifindex, egress, link)| (*ifindex, *egress, link))
+            .chain(dae0);
+        for (ifindex, egress, link) in tcx_links.take(MAX_DATAPATH_ATTACHMENTS) {
+            let Ok(interface) = nix::net::if_::if_indextoname(ifindex) else {
                 result.record_error(DatapathObservationError::Hooks);
                 continue;
             };
@@ -84,7 +98,7 @@ impl RealEbpfBackend {
                 result.record_error(DatapathObservationError::Hooks);
                 continue;
             };
-            match observe_tc_hook(link, &interface, *ifindex, *egress, &result.loaded_programs) {
+            match observe_tc_hook(link, &interface, ifindex, egress, &result.loaded_programs) {
                 Ok(attachment) => {
                     if attachment.state != DatapathCheck::Verified {
                         result.record_error(DatapathObservationError::Hooks);
@@ -94,9 +108,18 @@ impl RealEbpfBackend {
                 Err(_) => result.record_error(DatapathObservationError::Hooks),
             }
         }
-        if self.interface_links.len() > MAX_DATAPATH_ATTACHMENTS {
+        let tracked = self.interface_links.len() + usize::from(self.dae0_ingress_link.is_some());
+        if tracked > MAX_DATAPATH_ATTACHMENTS {
             result.record_error(DatapathObservationError::Limit);
         }
+        // Every hook the real datapath owns is required: the configured TCX
+        // hooks, the cgroup hooks when cgroup v2 is present, and dae0_ingress,
+        // dae0peer_ingress and tproxy_sk_lookup, which startup always attaches.
+        let required = self.interface_links.len()
+            + self.cgroup_sock_links.len()
+            + self.cgroup_sock_addr_links.len()
+            + 3;
+        result.verify_required_hooks(required);
         result.checked_at = std::time::SystemTime::now();
         result
     }

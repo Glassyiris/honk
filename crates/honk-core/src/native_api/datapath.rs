@@ -173,7 +173,7 @@ pub(super) fn summary(
                 _ if observation
                     .attachments
                     .iter()
-                    .any(|attachment| attachment.state == DatapathCheck::Verified) =>
+                    .any(|attachment| attachment.state == DatapathCheck::Absent) =>
                 {
                     "partially_attached"
                 }
@@ -283,7 +283,7 @@ pub(super) fn capability() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
+    use crate::ebpf::{DatapathAttachment, EbpfBackend, mock::MockEbpfBackend};
 
     #[test]
     fn mock_admission_never_claims_kernel_activity() {
@@ -365,5 +365,85 @@ mod tests {
         assert!(body["ebpf"]["routing"]["generation_id"].is_null());
         assert_eq!(body["errors"][0]["code"], "routing_observation_failed");
         assert!(!body.to_string().contains("/sys/fs/bpf"));
+    }
+
+    fn tcx_observation(states: &[DatapathCheck]) -> DatapathObservation {
+        let mut observation = DatapathObservation::unknown(DatapathKind::Real);
+        observation.programs = DatapathCheck::Verified;
+        observation.routing = DatapathCheck::Verified;
+        observation.routing_generation = Some(1);
+        observation.admission = Some(true);
+        observation.listeners_published = Some(true);
+        observation.conn_state_capacity = Some(1);
+        for (index, state) in states.iter().enumerate() {
+            if *state != DatapathCheck::Verified {
+                observation.record_error(DatapathObservationError::Hooks);
+            }
+            observation.attachments.push(DatapathAttachment {
+                program: "tc_ingress".to_owned(),
+                interface: format!("eth{index}"),
+                egress: false,
+                state: *state,
+            });
+        }
+        observation
+    }
+
+    #[test]
+    fn every_required_hook_verified_reports_active() {
+        let mut observation = tcx_observation(&[DatapathCheck::Verified; 2]);
+        observation.verify_required_hooks(2);
+        let summary = summary(&observation, "instance", true);
+        let ebpf = summary.ebpf.unwrap();
+        assert_eq!(summary.state, "active");
+        assert_eq!(summary.visibility, "partial");
+        assert_eq!(ebpf.hooks, "attached");
+        assert_eq!(ebpf.health, "healthy");
+    }
+
+    #[test]
+    fn unchecked_required_hook_keeps_hooks_unknown() {
+        let mut observation = tcx_observation(&[DatapathCheck::Verified; 2]);
+        observation.verify_required_hooks(5);
+        let unchecked = summary(&observation, "instance", true);
+        let ebpf = unchecked.ebpf.unwrap();
+        assert_eq!(unchecked.state, "unknown");
+        assert_eq!(ebpf.hooks, "unknown");
+        assert_eq!(ebpf.health, "unknown");
+
+        let mut unqueried = tcx_observation(&[DatapathCheck::Verified]);
+        unqueried.record_error(DatapathObservationError::Hooks);
+        unqueried.verify_required_hooks(2);
+        let summary = summary(&unqueried, "instance", true);
+        let ebpf = summary.ebpf.unwrap();
+        assert_eq!(summary.state, "degraded");
+        assert_eq!(ebpf.hooks, "unknown");
+        assert_eq!(ebpf.health, "degraded");
+    }
+
+    #[test]
+    fn absent_required_hook_reports_partially_attached() {
+        for required in [2, 5] {
+            let mut observation =
+                tcx_observation(&[DatapathCheck::Verified, DatapathCheck::Absent]);
+            observation.verify_required_hooks(required);
+            let summary = summary(&observation, "instance", true);
+            let ebpf = summary.ebpf.unwrap();
+            assert_eq!(summary.state, "degraded");
+            assert_eq!(ebpf.hooks, "partially_attached");
+            assert_eq!(ebpf.health, "degraded");
+        }
+    }
+
+    #[test]
+    fn no_owned_hook_reports_detached() {
+        let mut observation = tcx_observation(&[]);
+        observation.hooks = DatapathCheck::Absent;
+        observation.verify_required_hooks(0);
+        let summary = summary(&observation, "instance", true);
+        let ebpf = summary.ebpf.unwrap();
+        assert_eq!(summary.state, "detached");
+        assert_eq!(ebpf.hooks, "detached");
+        assert_eq!(ebpf.health, "unknown");
     }
 }
