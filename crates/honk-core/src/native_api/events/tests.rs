@@ -282,7 +282,7 @@ async fn body_drop_releases_client_capacity_even_before_polling() {
     let error = hub.subscribe(all(), None, &request_id()).err().unwrap();
     assert_eq!(
         error.into_response().status(),
-        StatusCode::TOO_MANY_REQUESTS
+        StatusCode::SERVICE_UNAVAILABLE
     );
     bodies.pop();
     let replacement = Body::from_stream(subscribe(&hub, all(), None));
@@ -295,7 +295,7 @@ async fn body_drop_releases_client_capacity_even_before_polling() {
             .unwrap()
             .into_response()
             .status(),
-        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
     );
     drop(replacement);
     let mut fresh = subscribe(&hub, all(), None);

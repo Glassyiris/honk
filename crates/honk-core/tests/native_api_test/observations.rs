@@ -802,10 +802,14 @@ async fn native_rejected_flow_streams_cannot_activate_capture() {
         next_event(&mut stream, &mut String::new()).await;
         streams.push(stream);
     }
-    assert_eq!(
-        app.get(path).send().await.unwrap().status(),
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    let full = app.get(path).send().await.unwrap();
+    assert!(full.headers().contains_key("retry-after"));
+    error_response(
+        full,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
     let settings = response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
     assert_eq!(settings["recording"]["flows"]["active"], false);
     assert_eq!(settings["recording"]["events"]["active"], true);

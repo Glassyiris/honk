@@ -492,8 +492,8 @@ impl EventHub {
             .position(Option::is_none)
             .ok_or_else(|| {
                 error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    ErrorCode::RateLimited,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::TemporarilyUnavailable,
                     "Event subscriber limit reached",
                     id,
                 )
