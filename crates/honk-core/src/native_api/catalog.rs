@@ -177,9 +177,19 @@ pub(super) fn normalized_check_url(value: &str) -> Option<String> {
     ))
 }
 
-/// Only URLTest switches on latency; other policies have no tolerance to report.
+/// Only URLTest switches on latency; other policies have no tolerance to report,
+/// and a URLTest group that sets none inherits `global.check_tolerance`.
 pub(super) fn tolerance(group: &Group) -> Option<u64> {
-    (group.policy == honk_config::group::GroupPolicy::URLTest).then_some(group.tolerance)
+    (group.policy == honk_config::group::GroupPolicy::URLTest && group.own.tolerance)
+        .then_some(group.tolerance)
+}
+
+/// Null when the group leaves it to the default.
+pub(super) fn interrupt_connections(group: &Group) -> Option<bool> {
+    group
+        .own
+        .interrupt_connections
+        .then_some(group.interrupt_connections)
 }
 
 pub(crate) fn revision_for(config: &Config) -> String {
@@ -223,7 +233,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
                 group.check_interval,
                 tolerance(group),
                 group.idle_timeout,
-                group.interrupt_connections
+                interrupt_connections(group)
             ])
         })
         .collect();
@@ -705,7 +715,7 @@ fn group_value(
         "default_member_id": default_id, "final_outbound": group.final_outbound,
         "check_url": check_url(group), "check_interval": group.check_interval.filter(|value| *value > 0),
         "tolerance": tolerance(group), "idle_timeout": group.idle_timeout,
-        "interrupt_connections": group.interrupt_connections
+        "interrupt_connections": interrupt_connections(group)
     });
     result["runtime"] = json!({ "selection": { "tcp": tcp, "udp": udp }, "health": group_health(manager, group, identity, alive) });
     result["capabilities"] = json!({

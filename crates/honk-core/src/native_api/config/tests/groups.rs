@@ -392,3 +392,56 @@ async fn automatic_group_pin_is_reported_and_cleared_per_network() {
     }
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn group_config_reports_unset_options_as_null_and_null_clears_them() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let source_text = "# Explicitly writable include.\ngroup {\n U {\n  policy: urltest\n }\n}\n";
+    std::fs::write(fixture.path("editable.dae"), source_text).unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let path = format!("/api/v1/groups/{}", group["id"].as_str().unwrap());
+    let edit = |body: Value| {
+        let (fixture, group, path) = (&fixture, group, &path);
+        async move {
+            let revision = fixture.get(path).await["config_revision"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let operation = accepted(
+                patch(fixture, group, &revision, &body)
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+            fixture.get(path).await["config"].take()
+        }
+    };
+    // Honk still applies its defaults; the group itself sets neither option.
+    let config = fixture.get(&path).await["config"].take();
+    assert_eq!(config["tolerance"], Value::Null);
+    assert_eq!(config["interrupt_connections"], Value::Null);
+    let config = edit(json!([
+        {"op":"test","path":"/config/interrupt_connections","value":null},
+        {"op":"replace","path":"/config/interrupt_connections","value":false},
+        {"op":"test","path":"/config/tolerance","value":null},
+        {"op":"replace","path":"/config/tolerance","value":50}
+    ]))
+    .await;
+    assert_eq!(config["interrupt_connections"], false);
+    assert_eq!(config["tolerance"], 50);
+    let config = edit(json!([
+        {"op":"replace","path":"/config/interrupt_connections","value":null},
+        {"op":"copy","from":"/config/interrupt_connections","path":"/config/tolerance"}
+    ]))
+    .await;
+    assert_eq!(config["interrupt_connections"], Value::Null);
+    assert_eq!(config["tolerance"], Value::Null);
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("editable.dae")).unwrap(),
+        source_text
+    );
+}
