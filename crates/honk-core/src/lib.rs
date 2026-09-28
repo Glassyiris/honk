@@ -486,6 +486,8 @@ fn acquire_instance_lock(
         .open(path)
         .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
     let deadline = std::time::Instant::now() + wait;
+    let holder =
+        || running_instance_pid(path).map_or_else(|_| String::new(), |pid| format!(" (PID {pid})"));
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -498,8 +500,10 @@ fn acquire_instance_lock(
                 if !logged {
                     // Logging is not set up yet.
                     eprintln!(
-                        "honk-core: another honk-core instance is shutting down; \
-                         waiting for the datapath lock at {}",
+                        "honk-core: another honk-core instance{} is shutting down; \
+                         waiting up to {}s for the datapath lock at {}",
+                        holder(),
+                        wait.as_secs(),
                         path.display()
                     );
                     logged = true;
@@ -508,8 +512,11 @@ fn acquire_instance_lock(
             }
             Err((_, e)) => {
                 anyhow::bail!(
-                    "another honk-core instance holds {} ({}); refusing to start",
+                    "another honk-core instance{} did not release {} within {}s ({}); \
+                     refusing to start",
+                    holder(),
                     path.display(),
+                    wait.as_secs(),
                     e
                 )
             }
@@ -2299,9 +2306,9 @@ fn is_mountpoint(path: &str) -> bool {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, RotatingLogFile, load_operator_config, prepare_nfqueue_startup,
-        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
-        running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, acquire_instance_lock, load_operator_config,
+        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
+        publish_instance_pid, running_instance_pid,
     };
     use crate::logging::open_log_file;
     use clap::Parser;
@@ -2621,6 +2628,21 @@ mod startup_lifecycle_tests {
         drop(lock);
         assert!(running_instance_pid(&path).is_err());
     }
+
+    #[test]
+    fn a_refused_instance_lock_names_the_holder_and_the_wait() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("honk-core.lock");
+        let wait = std::time::Duration::ZERO;
+        let _held = acquire_instance_lock(&path, wait).expect("take instance lock");
+        let error = acquire_instance_lock(&path, wait).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("PID {}", std::process::id())),
+            "{error}"
+        );
+        assert!(error.contains("within 0s"), "{error}");
+    }
+
     #[test]
     fn startup_load_reports_duplicate_node_identity() {
         let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
