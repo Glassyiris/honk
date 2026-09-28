@@ -177,6 +177,7 @@ async fn failed_activation_removes_the_created_file() {
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["code"], "reload_rejected");
     assert_eq!(failed["error"]["details"]["written"], false);
+    assert_eq!(failed["error"]["details"]["committed"], false);
     assert!(!fixture.path(NEW).exists());
     assert_eq!(fixture.get(CONFIG).await, before);
 
@@ -186,6 +187,8 @@ async fn failed_activation_removes_the_created_file() {
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["details"]["written"], true);
+    assert_eq!(failed["error"]["details"]["committed"], true);
+    assert!(failed["error"]["details"]["active_generation_id"].is_string());
     assert!(fixture.path(NEW).exists());
     fixture.shutdown().await;
 }

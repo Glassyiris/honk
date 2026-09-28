@@ -173,9 +173,6 @@ impl ApiError {
         if let Some(details) = details.as_object_mut() {
             details.entry("stage").or_insert(json!(stage));
             details.entry("written").or_insert(json!(false));
-            details
-                .entry("durability_confirmed")
-                .or_insert(json!(false));
             details.entry("committed").or_insert(json!(false));
         }
         self

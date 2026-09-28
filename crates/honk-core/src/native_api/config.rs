@@ -411,7 +411,7 @@ impl ConfigService {
         })
         .map_err(|error| error.for_management(deleting))?;
         wait.await.map_err(|_| {
-            super::management::activation_error("coordinator_stopped", None, None, None)
+            super::management::activation_error("coordinator_stopped", None, None, None, None)
         })?
     }
 
