@@ -95,16 +95,11 @@ impl Worker {
         group: Option<&str>,
         committed: Committed,
     ) {
-        // A created source leaves the store only when the new generation never became active.
-        let mut removed = false;
         self.begin_record(&committed);
         let pending = match self.activation.dispatch(request).await {
             Ok(pending) => pending,
             Err(failure) => {
-                if let Committed::Created(file) = &committed {
-                    removed = file.remove();
-                }
-                let written = committed.written() && !removed;
+                let written = committed.written();
                 let mut details = failure.details(Some(written), &self.service.instance_id);
                 details["stage"] = json!(failure.reason().0);
                 let error = unavailable().with_details(details);
@@ -121,11 +116,6 @@ impl Worker {
         self.service.operations.accept(id);
         self.service.operations.running(id);
         let completion = self.activation.complete(pending).await;
-        if let (Committed::Created(file), Err(failure)) = (&committed, &completion)
-            && failure.committed() == Some(false)
-        {
-            removed = file.remove();
-        }
         let stored = match self.record(committed, &completion).await {
             Ok(stored) => stored,
             Err(details) => {
@@ -134,7 +124,7 @@ impl Worker {
                 return;
             }
         };
-        self.publish_operation(id, completion, group, Some(stored && !removed));
+        self.publish_operation(id, completion, group, Some(stored));
     }
 
     pub(super) fn begin_record(&self, committed: &Committed) {

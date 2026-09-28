@@ -399,7 +399,7 @@ fn create_new_never_replaces_and_refuses_a_swapped_directory() {
     let parent = directory.path().join("config.d");
     fs::create_dir(&parent).unwrap();
     let target = parent.join("new.dae");
-    let created = create_new(&target, REPLACEMENT.as_bytes(), 0o100640, || Ok(())).unwrap();
+    create_new(&target, REPLACEMENT.as_bytes(), 0o100640, || Ok(())).unwrap();
     assert_eq!(fs::read(&target).unwrap(), REPLACEMENT.as_bytes());
     assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o640);
     assert_eq!(
@@ -425,51 +425,4 @@ fn create_new_never_replaces_and_refuses_a_swapped_directory() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names, [OsString::from("new.dae")]);
-    drop(created);
-}
-
-#[test]
-fn created_file_is_removed_only_while_its_name_holds_it() {
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("new.dae");
-    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
-    assert!(created.remove());
-    assert!(!target.exists());
-    assert!(created.remove(), "already gone");
-
-    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&target)
-        .unwrap()
-        .write_all(b"# edited\n")
-        .unwrap();
-    assert!(!created.remove(), "edited in place");
-    assert!(target.exists());
-    fs::remove_file(&target).unwrap();
-
-    // ext4 hands a freed inode number to the next file it creates; repeat to give it the chance.
-    for _ in 0..32 {
-        let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
-        let inode = fs::metadata(&target).unwrap().ino();
-        fs::remove_file(&target).unwrap();
-        assert!(holds_unlinked(&target));
-        fs::write(&target, REPLACEMENT).unwrap();
-        assert_ne!(fs::metadata(&target).unwrap().ino(), inode);
-        assert!(!created.remove());
-        assert_eq!(fs::read_to_string(&target).unwrap(), REPLACEMENT);
-        fs::remove_file(&target).unwrap();
-    }
-}
-
-/// Whether this process still has the unlinked file that was at `path` open.
-fn holds_unlinked(path: &Path) -> bool {
-    let parent = path.parent().unwrap().canonicalize().unwrap();
-    let deleted = format!(
-        "{} (deleted)",
-        parent.join(path.file_name().unwrap()).display()
-    );
-    fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
-        fs::read_link(entry.unwrap().path()).is_ok_and(|link| link.as_os_str() == deleted.as_str())
-    })
 }
