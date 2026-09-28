@@ -3741,3 +3741,51 @@ async fn score_group_added_by_reload_reports_quic_probe_until_restart() {
         assert_eq!(quic(), reason);
     }
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
+    let native_config = |rules: usize| {
+        let mut source = String::from("routing {\n");
+        for rule in 0..rules {
+            let prefixes: Vec<String> = (0..60)
+                .map(|host| format!("10.{rule}.{host}.0/24"))
+                .collect();
+            source.push_str(&format!("dip({}) -> direct\n", prefixes.join(", ")));
+        }
+        source.push_str("fallback: direct\n}\n");
+        let mut config = honk_config::parser::parse_dae_config(&source).unwrap();
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.record_flows = true;
+        config.experimental.native_api.secret = "trace-dictionary-token".into();
+        config
+    };
+    let plane = |config: Config| {
+        let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+        ControlPlane::new(
+            config,
+            Box::new(MockEbpfBackend::new()),
+            router,
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+            test_dns_forwarder(),
+        )
+        .unwrap()
+    };
+    let tracing = |cp: &ControlPlane| cp.active_routing_plan.read().trace_enabled();
+
+    let mut cp = plane(native_config(1));
+    let _native = crate::native_api::observation::NativeObservation::attach(&mut cp).await;
+    assert!(tracing(&cp));
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "Proxy"),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
+    assert!(
+        cp.apply_runtime_config(native_config(80), Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    assert!(!tracing(&cp), "reload");
+}
