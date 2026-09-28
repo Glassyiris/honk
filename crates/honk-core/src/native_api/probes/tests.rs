@@ -209,7 +209,7 @@ async fn duplicate_group_members_share_execution_but_keep_both_associations() {
         .groups
         .push(serde_json::from_value(json!({"name":"root","groups":["left","right"]})).unwrap());
     let state = state(config).await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let input = request(
         json!({"type":"group","group_id":identity.groups["root"]}),
         "tcp_connect",
@@ -271,7 +271,7 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
             .unwrap(),
         );
         let state = state(config).await;
-        let identity = state.observation.catalog.snapshot();
+        let identity = state.observation.core.catalog.snapshot();
         let peer = tokio::spawn(async move {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -547,7 +547,7 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
         config.groups.push(serde_json::from_value(json!({"name":format!("group-{index}"),"nodes":[honk_config::config::DIRECT_NODE_ID]})).unwrap());
     }
     let state = state(config).await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let (stop, receiver) = watch::channel(false);
     let worker = state.observation.probes.start(Arc::clone(&state), receiver);
     let mut held = Vec::new();

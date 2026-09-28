@@ -123,9 +123,7 @@ impl BoundDnsListener {
         connection_limit: Arc<Semaphore>,
         stats: Arc<StatsManager>,
         drain: Arc<DrainTracker>,
-        #[cfg(feature = "native-api")] native: Option<
-            Arc<crate::native_api::observation::NativeObservation>,
-        >,
+        #[cfg(feature = "native-api")] native: Option<Arc<crate::observe::Observation>>,
         #[cfg(feature = "native-api")] diagnostics: crate::config_diagnostics::SharedDiagnostics,
     ) -> io::Result<DnsListener> {
         let Self { tcp, udp, .. } = self;
@@ -361,9 +359,7 @@ async fn run_udp_supervisor(
     stats: Arc<StatsManager>,
     drain: Arc<DrainTracker>,
     mut phase: watch::Receiver<ListenerPhase>,
-    #[cfg(feature = "native-api")] native: Option<
-        Arc<crate::native_api::observation::NativeObservation>,
-    >,
+    #[cfg(feature = "native-api")] native: Option<Arc<crate::observe::Observation>>,
     #[cfg(feature = "native-api")] diagnostics: crate::config_diagnostics::SharedDiagnostics,
 ) -> anyhow::Result<()> {
     let mut buffer = [0u8; MAX_UDP_DNS_MESSAGE];
@@ -582,9 +578,7 @@ async fn run_tcp_supervisor(
     standalone_tcp_limit: Arc<Semaphore>,
     drain: Arc<DrainTracker>,
     mut phase: watch::Receiver<ListenerPhase>,
-    #[cfg(feature = "native-api")] native: Option<
-        Arc<crate::native_api::observation::NativeObservation>,
-    >,
+    #[cfg(feature = "native-api")] native: Option<Arc<crate::observe::Observation>>,
     #[cfg(feature = "native-api")] diagnostics: crate::config_diagnostics::SharedDiagnostics,
 ) -> anyhow::Result<()> {
     let mut children = JoinSet::new();
@@ -1151,8 +1145,8 @@ mod tests {
             .await
             .unwrap(),
         );
+        let native = Arc::clone(&state.observation);
         let api_server = crate::native_api::NativeServer::start(api_listener, state);
-        let native = plane.native_observation();
         native.attach_for_test();
         let (controller, calls) = controller([192, 0, 2, 10]);
         controller
@@ -1169,7 +1163,7 @@ mod tests {
                 Arc::new(Semaphore::new(16)),
                 Arc::new(StatsManager::new()),
                 Arc::clone(&drain),
-                Some(Arc::clone(&native)),
+                Some(Arc::clone(&native.core)),
                 plane.diagnostics.clone(),
             )
             .unwrap();
@@ -1200,7 +1194,7 @@ mod tests {
                 Arc::new(Semaphore::new(16)),
                 Arc::new(StatsManager::new()),
                 Arc::clone(&drain),
-                Some(Arc::clone(&native)),
+                Some(Arc::clone(&native.core)),
                 plane.diagnostics.clone(),
             )
             .unwrap();

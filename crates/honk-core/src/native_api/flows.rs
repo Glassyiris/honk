@@ -52,6 +52,7 @@ pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Res
     );
     match state
         .observation
+        .core
         .flows
         .page(filters, query.get("cursor").map(String::as_str))
     {
@@ -79,6 +80,7 @@ pub(super) fn detail(
     parse_query(uri, &[], id)?;
     let flow = state
         .observation
+        .core
         .flows
         .get(flow_id)
         .map_err(|missing| missing_error(missing, id))?;

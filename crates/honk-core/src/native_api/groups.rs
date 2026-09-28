@@ -394,7 +394,7 @@ pub(super) async fn patch(
     if reservation.fresh {
         let captured = async {
             let _config = state.config.read().await;
-            let identity = state.observation.catalog.snapshot();
+            let identity = state.observation.core.catalog.snapshot();
             let name = identity
                 .groups
                 .iter()

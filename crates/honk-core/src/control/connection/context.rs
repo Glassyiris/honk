@@ -26,7 +26,7 @@ pub(in crate::control) struct ControlPlaneHandle {
     #[cfg(feature = "native-api")]
     pub(in crate::control) diagnostics: crate::config_diagnostics::SharedDiagnostics,
     #[cfg(feature = "native-api")]
-    pub(in crate::control) native: Option<Arc<crate::native_api::observation::NativeObservation>>,
+    pub(in crate::control) native: Option<Arc<crate::observe::Observation>>,
     pub(in crate::control) router: Arc<RwLock<Router>>,
     pub(in crate::control) proxy_registry: Arc<ProxyRegistry>,
     pub(in crate::control) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,

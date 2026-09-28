@@ -89,7 +89,7 @@ pub(super) async fn capture(state: &NativeState, request: ProbeRequest) -> Resul
     let config = Arc::clone(&config_guard);
     let manager = state.group_manager.read().clone();
     let registry = state.runtime_registry.read().clone();
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let dns = state
         .dns
         .pin_name_resolution()

@@ -10,6 +10,7 @@ use tracing::info;
 
 use super::config::ConfigService;
 use super::logs::{EngineLevel, LogBinding};
+use super::observation::NativeObservation;
 use super::store::{DatabaseStartup, SourceStore};
 use super::{NativeServer, NativeState};
 use crate::configuration::SourceUpdate;
@@ -19,6 +20,7 @@ use crate::subscription::SubscriptionSupervisorHandle;
 /// The native listener and, once started, the configuration coordinator.
 pub(crate) struct NativeRuntime {
     server: NativeServer,
+    observation: Arc<NativeObservation>,
     /// The coordinator's shutdown; its type is private to `config`.
     stop_configuration: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
@@ -27,6 +29,7 @@ impl NativeRuntime {
     /// Binds the native listener and serves it.
     pub(crate) async fn start(
         control_plane: &mut ControlPlane,
+        observation: Arc<NativeObservation>,
         started_at: SystemTime,
         started: Instant,
         engine_level: EngineLevel,
@@ -44,14 +47,22 @@ impl NativeRuntime {
             .await
             .map_err(|_| anyhow::anyhow!("native API listener bind failed"))?;
         let listen = listener.local_addr()?;
-        let state = NativeState::new(control_plane, listen, started_at, started).await?;
-        let logs = &control_plane.native_observation().logs;
+        let state = NativeState::with_observation(
+            control_plane,
+            Arc::clone(&observation),
+            listen,
+            started_at,
+            started,
+        )
+        .await?;
+        let logs = &observation.logs;
         logs.attach_engine_level(engine_level);
         log_binding.bind(Arc::downgrade(logs));
         let server = NativeServer::start(listener, Arc::new(state));
         info!(%listen, message = "native API listener ready");
         Ok(Self {
             server,
+            observation,
             stop_configuration: None,
         })
     }
@@ -66,7 +77,7 @@ impl NativeRuntime {
         commands: mpsc::Sender<ControlCommand>,
         subscriptions: SubscriptionSupervisorHandle,
     ) -> Arc<ConfigService> {
-        let observation = control_plane.native_observation();
+        let observation = &self.observation;
         observation.providers.attach(subscriptions.clone());
         let service = observation.configuration.clone();
         let store = match database {

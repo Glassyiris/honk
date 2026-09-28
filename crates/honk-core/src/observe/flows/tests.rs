@@ -813,9 +813,9 @@ fn room_making_evicts_ended_records_before_the_oldest_live_one() {
 fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
     let owner =
         crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
-    assert!(!owner.flows.recording.load(Ordering::Acquire));
-    let inner = owner.flows.inner.lock();
-    let guard = begin(&owner.flows, "tcp");
+    assert!(!owner.core.flows.recording.load(Ordering::Acquire));
+    let inner = owner.core.flows.inner.lock();
+    let guard = begin(&owner.core.flows, "tcp");
     assert!(guard.id().is_empty());
     assert_eq!(guard.id.capacity(), 0);
     assert!(guard.store.upgrade().is_none());

@@ -255,7 +255,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         .await
         .unwrap(),
     );
-    control.native_observation().attach_for_test();
+    state.observation.attach_for_test();
     let server = NativeServer::start(listener, state);
     let handle = control.spawn_handle();
     let hello = crate::control::quic::test_utils::build_client_hello(Some("original-target.test"));
@@ -586,11 +586,12 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             2,
             Arc::new(UdpTestReplySocketFactory),
         ));
-        let native = plane.native_observation();
+        let native = crate::native_api::observation::NativeObservation::attach(&mut plane).await;
         native.attach_for_test();
         let state = Arc::new(
-            crate::native_api::NativeState::new(
+            crate::native_api::NativeState::with_observation(
                 &mut plane,
+                Arc::clone(&native),
                 api_addr,
                 std::time::SystemTime::now(),
                 Instant::now(),
@@ -611,7 +612,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
         backend.publish_routing_plan(&plan, &[]).unwrap();
         backend.bind_kernel_trace_dictionary(
             crate::observe::flows::kernel::KernelTraceDictionary::prepare(
-                &native.instance_id,
+                &native.core.instance_id,
                 17,
                 &router,
                 &config,
@@ -765,7 +766,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             assert_eq!(kernel_routes[0]["data"]["rules"][0]["result"], "matched");
             assert_eq!(
                 kernel_routes[0]["data"]["evaluation_id"],
-                format!("{}:kernel:{first_id}", native.instance_id)
+                format!("{}:kernel:{first_id}", native.core.instance_id)
             );
         }
         assert!(plane.udp_pool.shutdown().await.joined);

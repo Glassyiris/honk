@@ -29,7 +29,7 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
             _ = stop.changed() => break,
             _ = interval.tick() => {
                 state.observation.settings.maintain(&state.observation);
-                state.observation.flows.maintain();
+                state.observation.core.flows.maintain();
                 let now = Instant::now();
                 let totals = state.stats.traffic_totals();
                 let rates = previous.and_then(|(instant, old)| {

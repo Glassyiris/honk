@@ -166,7 +166,7 @@ impl Fixture {
         )
         .await?;
         let phase = plane.observe_phase();
-        let native = plane.native_observation();
+        let native = Arc::clone(&state.observation);
         let commands = plane.command_sender();
         let backend = plane.ebpf_handle();
         let shutdown = plane.shutdown_requested.clone();

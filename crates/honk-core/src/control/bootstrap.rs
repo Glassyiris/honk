@@ -153,91 +153,20 @@ impl ControlPlane {
         );
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
-        #[cfg(feature = "native-api")]
-        let native = config.experimental.native_api.enabled.then(|| {
-            alive_set.enable_native_observations();
-            Arc::new(
-                crate::native_api::observation::NativeObservation::with_degradations(
-                    &config,
-                    Arc::clone(&degradations),
-                ),
-            )
-        });
-        {
-            let gm_cell = group_manager.clone();
+        install_url_member_resolver(
+            &alive_set,
+            group_manager.clone(),
             #[cfg(feature = "native-api")]
-            let native = native.clone();
-            alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
-                let manager = gm_cell.read();
-                #[cfg(feature = "native-api")]
-                if let Some(native) = &native {
-                    let identity = native.catalog.snapshot();
-                    let group_id = identity
-                        .groups
-                        .get(group)
-                        .and_then(|id| uuid::Uuid::parse_str(id).ok());
-                    return manager
-                        .native_delay_test_members(group)
-                        .into_iter()
-                        .map(|(member, node)| {
-                            let (tag, member_id) = match member {
-                                honk_outbound::group::GroupMember::Node(member) => {
-                                    (member.name.clone(), Some(member.id))
-                                }
-                                honk_outbound::group::GroupMember::Group(member) => (
-                                    member.name.clone(),
-                                    identity
-                                        .groups
-                                        .get(&member.name)
-                                        .and_then(|id| uuid::Uuid::parse_str(id).ok()),
-                                ),
-                            };
-                            honk_outbound::alive::UrlProbeMember {
-                                tag,
-                                leaf: node.id,
-                                native: group_id.zip(member_id).map(|(group_id, member_id)| {
-                                    honk_outbound::alive::NativeGroupProbeContext {
-                                        group_id,
-                                        member_id,
-                                    }
-                                }),
-                            }
-                        })
-                        .collect();
-                }
-                manager
-                    .delay_test_members(group)
-                    .into_iter()
-                    .map(|(tag, node)| honk_outbound::alive::UrlProbeMember {
-                        tag,
-                        leaf: node.id,
-                        native: None,
-                    })
-                    .collect()
-            })));
-        }
+            None,
+        );
 
         let pinned_router = Arc::new(router.clone());
         let pinned_groups = group_manager.read().clone();
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
-        #[cfg(feature = "native-api")]
-        let initial_dictionary = native.as_ref().and_then(|native| {
-            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
-                &native.instance_id,
-                0,
-                &router,
-                &config,
-                &initial_routing_plan,
-            )
-        });
         ebpf.publish_routing_plan(&initial_routing_plan, &[])
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
-        #[cfg(feature = "native-api")]
-        if let Some(dictionary) = initial_dictionary {
-            ebpf.bind_kernel_trace_dictionary(dictionary);
-        }
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
@@ -254,19 +183,10 @@ impl ControlPlane {
                 outbound_runtime: Some(outbound_runtime),
                 transport: dns_upstream_pool,
             });
-        #[cfg(feature = "native-api")]
-        if let Some(native) = &native {
-            initial_runtime.bind_flow_catalog(native.catalog.snapshot());
-        }
         let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
             initial_runtime,
         ));
         let dns_service = crate::dns::DnsService::with_provider(Arc::clone(&runtime_provider));
-        #[cfg(feature = "native-api")]
-        if let Some(native) = &native {
-            runtime_provider.enable_lifecycle();
-            dns_service.attach_observer(Arc::downgrade(&native.dns.recorder));
-        }
         let dns_resolver = Arc::new(DnsResolver::with_service(dns_service.clone()));
 
         let dns_controller = Arc::new(
@@ -369,11 +289,11 @@ impl ControlPlane {
             #[cfg(feature = "native-api")]
             phase: None,
             #[cfg(feature = "native-api")]
-            configuration: native
-                .as_ref()
-                .map(|native| Arc::clone(&native.configuration.sources)),
+            configuration: None,
             #[cfg(feature = "native-api")]
-            native,
+            native: None,
+            #[cfg(feature = "native-api")]
+            native_owner: None,
             #[cfg(feature = "native-api")]
             subscriptions: None,
             #[cfg(feature = "native-api")]
@@ -398,7 +318,7 @@ impl ControlPlane {
             &control_plane.diagnostics,
             0,
             #[cfg(feature = "native-api")]
-            control_plane.native.as_ref(),
+            None,
         );
         install_selector_warm_callback(
             &control_plane.group_manager.read(),
@@ -444,4 +364,107 @@ impl ControlPlane {
             },
         )));
     }
+
+    /// Makes the engine record into `native`; runs before the engine serves traffic.
+    #[cfg(feature = "native-api")]
+    pub(crate) async fn attach_observation(
+        &mut self,
+        native: Arc<crate::observe::Observation>,
+        owner: Arc<dyn crate::observe::Owner>,
+    ) {
+        self.alive_set.enable_native_observations();
+        install_url_member_resolver(
+            &self.alive_set,
+            self.group_manager.clone(),
+            Some(Arc::clone(&native)),
+        );
+        let config = Arc::clone(&*self.config.read().await);
+        let provider = self.dns_controller.runtime_provider();
+        let dictionary = crate::observe::flows::kernel::KernelTraceDictionary::prepare(
+            &native.instance_id,
+            provider.current_generation().get(),
+            &*self.router.read().await,
+            &config,
+            &self.active_routing_plan.read(),
+        );
+        if let Some(dictionary) = dictionary {
+            self.ebpf
+                .write()
+                .await
+                .bind_kernel_trace_dictionary(dictionary);
+        }
+        provider
+            .current()
+            .bind_flow_catalog(native.catalog.snapshot());
+        provider.enable_lifecycle();
+        self.dns_controller
+            .dns_service()
+            .attach_observer(Arc::downgrade(&native.dns));
+        install_interrupt_callback(
+            &self.group_manager.read(),
+            &config.groups,
+            &self.connection_tracker,
+            &self.diagnostics,
+            self.diagnostics.read().generation,
+            Some(&native),
+        );
+        self.configuration = Some(Arc::clone(&native.sources));
+        self.native = Some(native);
+        self.native_owner = Some(owner);
+    }
+}
+
+fn install_url_member_resolver(
+    alive_set: &crate::outbound::AliveDialerSet,
+    group_manager: SharedGroupManager,
+    #[cfg(feature = "native-api")] native: Option<Arc<crate::observe::Observation>>,
+) {
+    alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
+        let manager = group_manager.read();
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native {
+            let identity = native.catalog.snapshot();
+            let group_id = identity
+                .groups
+                .get(group)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok());
+            return manager
+                .native_delay_test_members(group)
+                .into_iter()
+                .map(|(member, node)| {
+                    let (tag, member_id) = match member {
+                        honk_outbound::group::GroupMember::Node(member) => {
+                            (member.name.clone(), Some(member.id))
+                        }
+                        honk_outbound::group::GroupMember::Group(member) => (
+                            member.name.clone(),
+                            identity
+                                .groups
+                                .get(&member.name)
+                                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+                        ),
+                    };
+                    honk_outbound::alive::UrlProbeMember {
+                        tag,
+                        leaf: node.id,
+                        native: group_id.zip(member_id).map(|(group_id, member_id)| {
+                            honk_outbound::alive::NativeGroupProbeContext {
+                                group_id,
+                                member_id,
+                            }
+                        }),
+                    }
+                })
+                .collect();
+        }
+        manager
+            .delay_test_members(group)
+            .into_iter()
+            .map(|(tag, node)| honk_outbound::alive::UrlProbeMember {
+                tag,
+                leaf: node.id,
+                native: None,
+            })
+            .collect()
+    })));
 }

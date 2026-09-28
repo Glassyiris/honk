@@ -9,8 +9,8 @@ use honk_outbound::{alive::IpVersion, runtime::flow_observation::FlowObserver};
 
 use super::{handoff::HandoffResult, routing::RoutingDecision};
 use crate::{
-    native_api::observation::NativeObservation,
     observe::{
+        Observation,
         catalog::CatalogIdentity,
         flows::{
             FlowGuard,
@@ -131,7 +131,7 @@ struct SelectionGeneration {
 
 impl ConnectionObservation {
     pub(in crate::control) fn begin(
-        native: Option<&NativeObservation>,
+        native: Option<&Observation>,
         network: &'static str,
         source: SocketAddr,
         destination: SocketAddr,
@@ -936,9 +936,9 @@ mod tests {
 
     #[test]
     fn detached_connection_begin_has_no_recorded_guard() {
-        let native = NativeObservation::new(&Config::default());
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
         let observation = ConnectionObservation::begin(
-            Some(&native),
+            Some(&native.core),
             "tcp",
             "127.0.0.1:31000".parse().unwrap(),
             "127.0.0.2:443".parse().unwrap(),

@@ -72,7 +72,7 @@ pub struct NativeState {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     stats: Arc<StatsManager>,
     tracker: Arc<ConnectionTracker>,
-    observation: Arc<observation::NativeObservation>,
+    pub(crate) observation: Arc<observation::NativeObservation>,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     group_manager: honk_outbound::group::SharedGroupManager,
     dns: crate::dns::DnsService,
@@ -92,6 +92,17 @@ pub struct NativeState {
 impl NativeState {
     pub async fn new(
         control: &mut ControlPlane,
+        listen: SocketAddr,
+        started_at: SystemTime,
+        started: Instant,
+    ) -> anyhow::Result<Self> {
+        let observation = observation::NativeObservation::attach(control).await;
+        Self::with_observation(control, observation, listen, started_at, started).await
+    }
+
+    pub(crate) async fn with_observation(
+        control: &mut ControlPlane,
+        observation: Arc<observation::NativeObservation>,
         listen: SocketAddr,
         started_at: SystemTime,
         started: Instant,
@@ -154,7 +165,6 @@ impl NativeState {
                 .ok()
                 .map(Arc::new)
         });
-        let observation = control.native_observation();
         observation.telemetry.discover().await;
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
@@ -165,7 +175,7 @@ impl NativeState {
             ui: ui::load(&settings.ui).await?,
             settings,
             clash_secret,
-            instance_id: observation.instance_id.clone(),
+            instance_id: observation.core.instance_id.clone(),
             observation,
             alive_set: control.alive_set(),
             group_manager: control.group_manager(),
@@ -397,8 +407,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             generation,
             phase,
             state.healthy.load(Ordering::Acquire),
-            state.observation.reloading(),
-            state.observation.activated_at(generation),
+            state.observation.core.reloading(),
+            state.observation.core.activated_at(generation),
             state.observation.configuration.sources.revision(),
             state.observation.configuration.last_reload(),
             state.backend.read().await.observe_datapath(),
@@ -501,7 +511,7 @@ fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Conne
     let evidence = entry
         .native_flow_id
         .as_deref()
-        .and_then(|id| state.observation.flows.connection_evidence(id));
+        .and_then(|id| state.observation.core.flows.connection_evidence(id));
     Connection {
         id: entry.id.clone(),
         flow_id: entry.native_flow_id.clone(),
@@ -685,7 +695,7 @@ mod tests {
             .as_str()
             .expect("startup generation has an activation time")
             .to_owned();
-        let reloading = state.observation.begin_reload();
+        let reloading = state.observation.core.begin_reload();
         let during = runtime_body(&state).await;
         assert_eq!(during["lifecycle"]["state"], "reloading");
         assert_eq!(during["generation"]["state"], "reloading");
@@ -699,7 +709,8 @@ mod tests {
         assert!(uncommitted["generation"]["activated_at"].is_null());
         state
             .observation
-            .committed(state.observation.catalog.snapshot(), 0, 1);
+            .core
+            .committed(state.observation.core.catalog.snapshot(), 0, 1);
         let after = runtime_body(&state).await;
         assert_eq!(after["lifecycle"]["state"], "running");
         assert_eq!(after["generation"]["state"], "active");

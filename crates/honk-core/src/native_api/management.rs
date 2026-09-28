@@ -250,7 +250,7 @@ pub(super) async fn mutate(
             .configuration
             .manage(
                 mutation,
-                Arc::clone(&state.observation.catalog),
+                Arc::clone(&state.observation.core.catalog),
                 Arc::clone(&state.group_manager),
                 Arc::clone(&state.alive_set),
             )

@@ -1359,6 +1359,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     info!("DNS forwarder ready");
 
+    #[cfg(feature = "native-api")]
+    let native_enabled = config.experimental.native_api.enabled;
     let mut control_plane = control::ControlPlane::new_with_upstream_pool_and_budget(
         config,
         ebpf_backend,
@@ -1369,6 +1371,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
         Arc::clone(&degradations),
     )?;
+    #[cfg(feature = "native-api")]
+    let native_observation = if native_enabled {
+        Some(native_api::observation::NativeObservation::attach(&mut control_plane).await)
+    } else {
+        None
+    };
     control_plane
         .install_startup_diagnostics(startup_diagnostics)
         .await;
@@ -1456,19 +1464,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     control_plane.start_datapath_flags_coordinator()?;
 
     #[cfg(feature = "native-api")]
-    let mut native = if native_mode {
-        Some(
+    let mut native = match native_observation {
+        Some(observation) => Some(
             native_api::NativeRuntime::start(
                 &mut control_plane,
+                observation,
                 started_at,
                 started,
                 engine_level,
                 &native_log_binding,
             )
             .await?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
     // Starts only when external_controller is configured; bind/parse

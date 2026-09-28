@@ -297,7 +297,7 @@ pub(super) async fn get(
         state.geodata.as_deref(),
         &active,
         &state.observation.configuration,
-        |name| group_id(&state.observation.catalog, name),
+        |name| group_id(&state.observation.core.catalog, name),
     ))
     .into_response())
 }
@@ -364,7 +364,7 @@ async fn queue(state: &Arc<NativeState>, reservation: Reservation) -> bool {
             group_manager: Arc::clone(&state.group_manager),
             proxy_registry: Arc::clone(&state.proxy_registry),
             runtime_registry: Arc::clone(&state.runtime_registry),
-            catalog: Arc::clone(&state.observation.catalog),
+            catalog: Arc::clone(&state.observation.core.catalog),
             assets,
             revision,
             policy: Arc::new(Policy::new(&state.settings)),

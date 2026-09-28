@@ -146,7 +146,7 @@ impl Values {
             .set_engine_level(self.level_overridden.then(|| self.level.as_str()));
         owner.logs.set_limit(self.logs);
         owner.dns.set_log_limit(self.dns);
-        owner.flows.set_limits(self.flows, self.retention);
+        owner.core.flows.set_limits(self.flows, self.retention);
         self.apply_recording(owner);
     }
     fn apply_recording(self, owner: &NativeObservation) {
@@ -154,7 +154,7 @@ impl Values {
         if self.events_active() {
             owner.events.set_recording(true);
         }
-        owner.flows.set_recording(active[0]);
+        owner.core.flows.set_recording(active[0]);
         owner.logs.set_recording(active[1]);
         owner.dns.set_recording(active[2]);
         if !self.events_active() {
@@ -488,7 +488,7 @@ fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value
                     super::geodata::redact_fully(url, &secrets, &state.observation.configuration)
                 }
             },
-            |name| super::geodata::group_id(&state.observation.catalog, name),
+            |name| super::geodata::group_id(&state.observation.core.catalog, name),
         );
     }
     value
@@ -519,7 +519,7 @@ pub(super) async fn patch(
                 ));
             }
             let mut patch = super::geodata::SourcesPatch::parse(patch, || invalid(id))?;
-            let groups = state.observation.catalog.snapshot();
+            let groups = state.observation.core.catalog.snapshot();
             if let Some(patch) = patch.as_mut()
                 && !patch.resolve_group(|id| {
                     groups
@@ -848,12 +848,12 @@ mod tests {
         assert!(!owner.settings.flow_recording());
         let first = stream(&owner, true);
         let second = stream(&owner, true);
-        let flow = owner.flows.begin(
+        let flow = owner.core.flows.begin(
             "tcp",
             "127.0.0.1:31000".parse().unwrap(),
             "127.0.0.2:443".parse().unwrap(),
         );
-        assert!(owner.flows.connection_evidence(flow.id()).is_some());
+        assert!(owner.core.flows.connection_evidence(flow.id()).is_some());
         drop(first);
         tokio::time::advance(Duration::from_secs(61)).await;
         owner.settings.maintain(&owner);
@@ -862,11 +862,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(59)).await;
         owner.settings.renew(&owner, false);
         owner.settings.maintain(&owner);
-        assert!(owner.flows.connection_evidence(flow.id()).is_some());
+        assert!(owner.core.flows.connection_evidence(flow.id()).is_some());
         tokio::time::advance(Duration::from_secs(1)).await;
         owner.settings.maintain(&owner);
         assert!(!owner.settings.flow_recording());
-        assert!(owner.flows.connection_evidence(flow.id()).is_none());
+        assert!(owner.core.flows.connection_evidence(flow.id()).is_none());
         let settings = owner.settings.snapshot();
         for recorder in ["logs", "dns_log", "events"] {
             assert_eq!(settings["recording"][recorder]["active"], true);

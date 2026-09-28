@@ -1,21 +1,16 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
 
+use futures::future::BoxFuture;
 use honk_config::Config;
 use serde_json::json;
 
 use super::{catalog::NodePages, events::EventHub};
-use crate::observe::{
-    catalog::{Catalog, CatalogIdentity},
-    flows::FlowStore,
-};
+use crate::control::ControlPlane;
+use crate::observe::{Observation, Owner, catalog::Catalog, flows::FlowStore};
 
 pub(crate) struct NativeObservation {
-    pub(crate) instance_id: String,
+    pub(crate) core: Arc<Observation>,
     pub(crate) events: Arc<EventHub>,
-    pub(crate) flows: Arc<FlowStore>,
-    pub(crate) catalog: Arc<Catalog>,
     pub(crate) node_pages: NodePages,
     pub(crate) telemetry: super::telemetry::Telemetry,
     pub(crate) configuration: Arc<super::config::ConfigService>,
@@ -27,23 +22,28 @@ pub(crate) struct NativeObservation {
     pub(crate) settings: super::settings::Settings,
     pub(crate) providers: super::providers::ProviderApi,
     pub(crate) degradations: Arc<crate::degradations::Degradations>,
-    reloading: AtomicBool,
-    activated: parking_lot::Mutex<Option<(u64, SystemTime)>>,
-}
-
-/// Marks a configuration activation in progress until dropped.
-pub(crate) struct ReloadGuard<'a>(&'a AtomicBool);
-
-impl Drop for ReloadGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 impl NativeObservation {
     #[cfg(test)]
     pub(crate) fn new(config: &Config) -> Self {
         Self::with_degradations(config, Arc::default())
+    }
+
+    /// Builds the observation for `control` and wires the engine to record into it.
+    pub(crate) async fn attach(control: &mut ControlPlane) -> Arc<Self> {
+        let config = Arc::clone(&*control.config_handle().read().await);
+        let native = Arc::new(Self::with_degradations(
+            &config,
+            control.degradations_handle(),
+        ));
+        control
+            .attach_observation(
+                Arc::clone(&native.core),
+                Arc::clone(&native) as Arc<dyn Owner>,
+            )
+            .await;
+        native
     }
 
     /// `degradations` may already hold startup entries; every later change
@@ -89,11 +89,17 @@ impl NativeObservation {
                 hub.publish("runtime.updated", json!({}), None);
             }
         }));
-        let owner = Self {
+        let core = Arc::new(Observation::new(
             instance_id,
-            events,
             flows,
-            catalog: Arc::new(Catalog::new(config)),
+            Arc::new(Catalog::new(config)),
+            Arc::clone(&dns.recorder),
+            Arc::clone(&events) as Arc<dyn crate::observe::Events>,
+            Arc::clone(&configuration.sources),
+        ));
+        let owner = Self {
+            core,
+            events,
             node_pages: NodePages::default(),
             telemetry: super::telemetry::Telemetry::new(
                 config.experimental.native_api.record_traffic,
@@ -108,8 +114,6 @@ impl NativeObservation {
             settings: super::settings::Settings::new(config),
             providers: super::providers::ProviderApi::new(),
             degradations,
-            reloading: AtomicBool::new(false),
-            activated: parking_lot::Mutex::new(None),
         };
         owner.settings.activate(&owner, config);
         owner
@@ -122,46 +126,19 @@ impl NativeObservation {
         self.settings.pin_for_test(self);
         self.settings.renew(self, true);
     }
+}
 
-    pub(crate) fn begin_reload(&self) -> ReloadGuard<'_> {
-        self.reloading.store(true, Ordering::Release);
-        ReloadGuard(&self.reloading)
+impl Owner for NativeObservation {
+    fn activate(&self, config: &Config) {
+        self.settings.activate(self, config);
     }
 
-    pub(crate) fn reloading(&self) -> bool {
-        self.reloading.load(Ordering::Acquire)
-    }
-
-    /// The startup generation has no commit; it becomes active when the engine first runs.
-    pub(crate) fn started(&self, generation: u64) {
-        self.activated
-            .lock()
-            .get_or_insert((generation, SystemTime::now()));
-    }
-
-    pub(crate) fn activated_at(&self, generation: u64) -> Option<SystemTime> {
-        self.activated
-            .lock()
-            .filter(|(activated, _)| *activated == generation)
-            .map(|(_, at)| at)
-    }
-
-    pub(crate) fn committed(&self, identity: Arc<CatalogIdentity>, previous: u64, generation: u64) {
-        self.catalog.install_prepared(Arc::clone(&identity));
-        self.configuration
-            .sources
-            .generation_committed(&identity.revision, generation);
-        if previous != generation {
-            *self.activated.lock() = Some((generation, SystemTime::now()));
-            self.events.publish(
-                "generation.changed",
-                json!({
-                    "previous_generation_id": format!("{}:{previous}", self.instance_id),
-                    "generation_id": format!("{}:{generation}", self.instance_id),
-                }),
-                None,
-            );
-        }
-        self.events.publish("runtime.updated", json!({}), None);
+    fn pause_probes(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async {
+            match self.probes.pause().await {
+                Ok(()) | Err(super::probes::ProbeLifecycleError::Unavailable) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        })
     }
 }

@@ -358,7 +358,7 @@ pub(super) async fn nodes(
             .resume(cursor, group_id, limit, id);
     }
     let config = state.config.read().await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let manager = state.group_manager.read().clone();
     let secrets = listener_secrets(state);
     let snapshot = node_snapshot(
@@ -382,7 +382,7 @@ pub(super) async fn node(
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
     let config = state.config.read().await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let manager = state.group_manager.read().clone();
     Uuid::parse_str(node_id)
         .ok()
@@ -536,7 +536,7 @@ pub(super) async fn groups(
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
     let _config = state.config.read().await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let manager = state.group_manager.read().clone();
     let mut names: Vec<_> = identity.groups.keys().collect();
     names.sort_unstable();
@@ -570,7 +570,7 @@ pub(super) async fn group(
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
     let _config = state.config.read().await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let manager = state.group_manager.read().clone();
     let name = identity
         .groups

@@ -751,11 +751,15 @@ async fn native_generation_is_reloading_until_the_activation_returns() {
     let native = Arc::new(crate::native_api::observation::NativeObservation::new(
         &Config::default(),
     ));
-    cp.native = Some(Arc::clone(&native));
+    cp.native = Some(Arc::clone(&native.core));
+    cp.native_owner = Some(Arc::clone(&native) as _);
     let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (observer, witness) = (Arc::clone(&native), Arc::clone(&seen));
     let _hook_guard = cp.set_pre_dns_publication_hook(move |_| {
-        witness.store(observer.reloading(), std::sync::atomic::Ordering::SeqCst);
+        witness.store(
+            observer.core.reloading(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
     });
     assert!(
         cp.apply_runtime_config(
@@ -767,9 +771,9 @@ async fn native_generation_is_reloading_until_the_activation_returns() {
         .accepted()
     );
     assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(!native.reloading());
+    assert!(!native.core.reloading());
     let generation = cp.diagnostics.read().generation;
-    assert!(native.activated_at(generation).is_some());
+    assert!(native.core.activated_at(generation).is_some());
 }
 
 #[cfg(feature = "native-api")]
@@ -801,7 +805,8 @@ async fn group_patch_revision_rejects_same_named_provider_replacement_before_act
     let native = Arc::new(crate::native_api::observation::NativeObservation::new(
         &config,
     ));
-    cp.native = Some(Arc::clone(&native));
+    cp.native = Some(Arc::clone(&native.core));
+    cp.native_owner = Some(Arc::clone(&native) as _);
     native.attach_for_test();
     cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let sources =
@@ -869,7 +874,8 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
     let native = Arc::new(crate::native_api::observation::NativeObservation::new(
         &config,
     ));
-    cp.native = Some(Arc::clone(&native));
+    cp.native = Some(Arc::clone(&native.core));
+    cp.native_owner = Some(Arc::clone(&native) as _);
     native.attach_for_test();
     cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
@@ -992,7 +998,8 @@ async fn first_subscription_publication_invalidates_source_revision() {
     let native = Arc::new(crate::native_api::observation::NativeObservation::new(
         &config,
     ));
-    cp.native = Some(Arc::clone(&native));
+    cp.native = Some(Arc::clone(&native.core));
+    cp.native_owner = Some(Arc::clone(&native) as _);
     native.attach_for_test();
     cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let mut subscriptions =
@@ -1273,17 +1280,17 @@ async fn failed_reload_keeps_old_score_authority() {
 async fn post_publication_datapath_failure_is_committed_degraded() {
     let cp = test_cp_with_nfq(true).await;
     #[cfg(feature = "native-api")]
-    let cp = {
+    let (cp, native) = {
         let mut cp = cp;
         let config = cp.config.read().await.as_ref().clone();
-        cp.native = Some(Arc::new(
-            crate::native_api::observation::NativeObservation::new(&config),
+        let native = Arc::new(crate::native_api::observation::NativeObservation::new(
+            &config,
         ));
-        cp.native.as_ref().unwrap().attach_for_test();
-        cp.configuration = Some(Arc::clone(
-            &cp.native.as_ref().unwrap().configuration.sources,
-        ));
-        cp
+        cp.native = Some(Arc::clone(&native.core));
+        cp.native_owner = Some(Arc::clone(&native) as _);
+        native.attach_for_test();
+        cp.configuration = Some(Arc::clone(&native.core.sources));
+        (cp, native)
     };
     let first_revision = 1;
     assert!(
@@ -1328,13 +1335,7 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
     assert_ne!(provider.current_generation(), before_dns);
     #[cfg(feature = "native-api")]
     {
-        let snapshot = cp
-            .native
-            .as_ref()
-            .unwrap()
-            .configuration
-            .snapshot()
-            .unwrap();
+        let snapshot = native.configuration.snapshot().unwrap();
         assert_eq!(
             snapshot["sources"][0]["content_sha256"],
             crate::configuration::digest(sources.sources[0].content.as_bytes())
@@ -2078,7 +2079,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
         manager: &GroupManager,
         active_generation: u64,
     ) -> (u64, String) {
-        let flow = Arc::new(native.flows.begin(
+        let flow = Arc::new(native.core.flows.begin(
             "tcp",
             "127.0.0.1:31000".parse().unwrap(),
             "192.0.2.17:443".parse().unwrap(),
@@ -2130,13 +2131,14 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
         ],
         ..Default::default()
     });
-    let cp = control_plane(config.clone());
-    let native = cp.native.as_ref().unwrap();
+    let mut cp = control_plane(config.clone());
+    let native = crate::native_api::observation::NativeObservation::attach(&mut cp).await;
+    let native = &*native;
     native.attach_for_test();
     let provider = cp.dns_controller.runtime_provider();
     let old_lease = provider.try_acquire().unwrap();
     let old_manager = cp.group_manager.read().clone();
-    let old_id = native.catalog.snapshot().groups["catalog-root"].clone();
+    let old_id = native.core.catalog.snapshot().groups["catalog-root"].clone();
     assert_eq!(
         observed_selection(native, &old_lease, &config, &old_manager, 0).await,
         (0, old_id.clone()),
@@ -2171,7 +2173,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
     let active_generation = provider.current_generation().get();
     let current_lease = provider.try_acquire().unwrap();
     let current_manager = cp.group_manager.read().clone();
-    let current_id = native.catalog.snapshot().groups["catalog-root"].clone();
+    let current_id = native.core.catalog.snapshot().groups["catalog-root"].clone();
     assert_ne!(current_id, old_id);
     assert_eq!(
         observed_selection(native, &old_lease, &config, &old_manager, active_generation).await,

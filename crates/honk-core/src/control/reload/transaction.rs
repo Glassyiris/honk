@@ -195,7 +195,7 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         let _reloading = native
             .as_deref()
-            .map(crate::native_api::observation::NativeObservation::begin_reload);
+            .map(crate::observe::Observation::begin_reload);
         #[cfg(feature = "native-api")]
         let replaces_sources = matches!(
             &diagnostic_update,
@@ -325,10 +325,10 @@ impl ControlPlane {
                     }
                 }
                 #[cfg(feature = "native-api")]
-                if let Some(native) = &self.native
+                if let Some(owner) = &self.native_owner
                     && replaces_sources
                 {
-                    native.settings.activate(native, &new_config);
+                    owner.activate(&new_config);
                 }
                 if declaring_sources_replaced(current_config.as_ref(), &new_config) {
                     *config = Arc::new(new_config);
@@ -763,8 +763,8 @@ impl ControlPlane {
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
                         self.alive_set.invalidate_native_group_observations();
-                        if replaces_sources {
-                            native.settings.activate(native, &config_guard);
+                        if replaces_sources && let Some(owner) = &self.native_owner {
+                            owner.activate(&config_guard);
                         }
                         native.committed(
                             prepared_catalog.expect("native candidate catalog"),

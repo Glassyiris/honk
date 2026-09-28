@@ -286,7 +286,7 @@ pub(super) async fn list(
     }
     let service = &state.observation.providers;
     if let Some(cursor) = query.get("cursor") {
-        return service.resume(cursor, &state.observation.instance_id, limit, id);
+        return service.resume(cursor, &state.observation.core.instance_id, limit, id);
     }
     let config = state.config.read().await;
     if config
@@ -314,7 +314,7 @@ pub(super) async fn list(
     let supervisor = service.supervisor.read().clone();
     let inline = Provider::inline(inline_count);
     let mut bytes =
-        size_of::<Snapshot>() + state.observation.instance_id.len() + inline.retained_bytes();
+        size_of::<Snapshot>() + state.observation.core.instance_id.len() + inline.retained_bytes();
     let mut rows = Vec::with_capacity(config.subscriptions.len() + 1);
     rows.push(inline);
     for subscription in &config.subscriptions {
@@ -324,7 +324,7 @@ pub(super) async fn list(
             .unwrap_or_default();
         let row = Provider::observed(subscription, load, counts[&subscription.id])
             .routed(subscription, |name| {
-                super::geodata::group_id(&state.observation.catalog, name)
+                super::geodata::group_id(&state.observation.core.catalog, name)
             })
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
@@ -337,7 +337,7 @@ pub(super) async fn list(
     service.page(
         Snapshot {
             id: Uuid::new_v4(),
-            instance: state.observation.instance_id.clone(),
+            instance: state.observation.core.instance_id.clone(),
             created: Instant::now(),
             rows,
             bytes,
@@ -370,7 +370,7 @@ pub(super) async fn detail(
         state.observation.providers.supervisor.read().as_ref(),
         provider_id,
         Some(&state.observation.configuration),
-        |name| super::geodata::group_id(&state.observation.catalog, name),
+        |name| super::geodata::group_id(&state.observation.core.catalog, name),
     )
     .map(|value| Json(value).into_response())
     .ok_or_else(not_found)
@@ -458,7 +458,7 @@ pub(super) async fn refresh(
                 .ok_or_else(not_refreshable)?;
             let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
                 .routed(&subscription, |name| {
-                    super::geodata::group_id(&state.observation.catalog, name)
+                    super::geodata::group_id(&state.observation.core.catalog, name)
                 })
                 .mask_listener_secrets(&config, Some(&state.observation.configuration));
             Ok((subscription, supervisor, display))
@@ -470,7 +470,7 @@ pub(super) async fn refresh(
                 Box::new(RefreshOperation {
                     reservation,
                     operations: Arc::clone(operations),
-                    instance: state.observation.instance_id.clone(),
+                    instance: state.observation.core.instance_id.clone(),
                     display_name: display.name,
                     display_url: display.url_redacted.expect("subscription URL is present"),
                     display_download: display.download,

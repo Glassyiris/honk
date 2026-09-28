@@ -193,21 +193,8 @@ impl ControlPlane {
         }
         retain_error(&mut fatal, joined(&mut self.health_task).await);
         #[cfg(feature = "native-api")]
-        if let Some(native) = &self.native {
-            retain_error(
-                &mut fatal,
-                cleanup_stage(async {
-                    // A worker that never started or already stopped has nothing to pause.
-                    match native.probes.pause().await {
-                        Ok(())
-                        | Err(crate::native_api::probes::ProbeLifecycleError::Unavailable) => {
-                            Ok(())
-                        }
-                        Err(error) => Err(error.into()),
-                    }
-                })
-                .await,
-            );
+        if let Some(owner) = &self.native_owner {
+            retain_error(&mut fatal, cleanup_stage(owner.pause_probes()).await);
         }
         #[cfg(feature = "clash-api")]
         {

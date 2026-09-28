@@ -162,7 +162,7 @@ async fn queued_delete_cannot_change_committed_creation_response() {
                 .service
                 .enqueue(super::super::Work::Manage {
                     mutation,
-                    catalog: Arc::clone(&state.observation.catalog),
+                    catalog: Arc::clone(&state.observation.core.catalog),
                     group_manager: Arc::clone(&state.group_manager),
                     alive_set: Arc::clone(&state.alive_set),
                     response,

@@ -144,7 +144,7 @@ async fn pause_drains_started_and_disconnected_queued_jobs() {
     let state = state(config).await;
     let service = &state.observation.probes;
     assert_eq!(service.pause().await, Err(ProbeLifecycleError::Unavailable));
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let (stop, receiver) = watch::channel(false);
     let worker = service.start(Arc::clone(&state), receiver);
     let mut held = Vec::new();

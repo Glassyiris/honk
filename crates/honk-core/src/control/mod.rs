@@ -209,7 +209,9 @@ pub struct ControlPlane {
     #[cfg(feature = "native-api")]
     configuration: Option<Arc<crate::configuration::AcceptedSources>>,
     #[cfg(feature = "native-api")]
-    native: Option<Arc<crate::native_api::observation::NativeObservation>>,
+    native: Option<Arc<crate::observe::Observation>>,
+    #[cfg(feature = "native-api")]
+    native_owner: Option<Arc<dyn crate::observe::Owner>>,
     #[cfg(feature = "native-api")]
     subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
     #[cfg(feature = "native-api")]
@@ -255,14 +257,8 @@ impl ControlPlane {
     }
 
     #[cfg(feature = "native-api")]
-    pub(crate) fn native_observation(
-        &mut self,
-    ) -> Arc<crate::native_api::observation::NativeObservation> {
-        Arc::clone(
-            self.native
-                .as_ref()
-                .expect("native observation configured at control-plane construction"),
-        )
+    pub(crate) fn degradations_handle(&self) -> Arc<crate::degradations::Degradations> {
+        Arc::clone(&self.degradations)
     }
 
     #[cfg(feature = "native-api")]
