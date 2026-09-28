@@ -1,6 +1,7 @@
 //! Bounded daemon operations. Reservation admission precedes coordinator side effects.
 
 use std::{
+    collections::VecDeque,
     io::{self, Write},
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
@@ -22,6 +23,7 @@ use super::{ApiError, ErrorCode, events::EventHub, timestamp};
 
 const MAX_OPERATIONS: usize = 32;
 const RETENTION: Duration = Duration::from_secs(300);
+const MAX_TOMBSTONES: usize = 1024;
 const MAX_ERROR_DETAILS: usize = 4096;
 const MAX_RESULT_BYTES: usize = 262144;
 
@@ -68,8 +70,15 @@ type Admission = Option<Result<OperationAcceptedResponse, ApiError>>;
 pub(crate) struct OperationStore {
     instance_id: String,
     events: Arc<EventHub>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
     // ponytail: at most 32 entries; an index only helps if this ceiling grows.
-    records: Mutex<Vec<Record>>,
+    records: Vec<Record>,
+    /// Evicted keyed operations, kept only to answer replays for their retention window.
+    tombstones: VecDeque<Tombstone>,
 }
 
 struct Record {
@@ -79,6 +88,13 @@ struct Record {
     admission: watch::Sender<Admission>,
     operation: Option<Operation>,
     terminal_at: Option<Instant>,
+}
+
+struct Tombstone {
+    id: String,
+    kind: OperationKind,
+    replay: Replay,
+    terminal_at: Instant,
 }
 
 struct Replay {
@@ -182,7 +198,7 @@ impl OperationStore {
         Self {
             instance_id,
             events,
-            records: Mutex::new(Vec::new()),
+            state: Mutex::default(),
         }
     }
 
@@ -218,21 +234,35 @@ impl OperationStore {
                 scope,
             }
         });
-        let mut records = self.records.lock();
-        prune(&mut records);
+        let mut state = self.state.lock();
+        state.prune();
+        let State {
+            records,
+            tombstones,
+        } = &mut *state;
         if let Some(replay) = &replay
-            && let Some(record) = records.iter().find(|record| {
-                record
-                    .replay
-                    .as_ref()
-                    .is_some_and(|old| old.scope == replay.scope)
-            })
+            && let Some((id, body, admission)) = records
+                .iter()
+                .find_map(|record| {
+                    let old = record
+                        .replay
+                        .as_ref()
+                        .filter(|old| old.scope == replay.scope)?;
+                    Some((&record.id, old.body, record.admission.subscribe()))
+                })
+                .or_else(|| {
+                    let old = tombstones
+                        .iter()
+                        .find(|old| old.replay.scope == replay.scope)?;
+                    let accepted = accepted(&old.id, old.kind);
+                    Some((
+                        &old.id,
+                        old.replay.body,
+                        watch::channel(Some(Ok(accepted))).1,
+                    ))
+                })
         {
-            if record
-                .replay
-                .as_ref()
-                .is_some_and(|old| old.body != replay.body)
-            {
+            if body != replay.body {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     ErrorCode::IdempotencyConflict,
@@ -241,10 +271,10 @@ impl OperationStore {
                 ));
             }
             return Ok(Reservation {
-                id: record.id.clone(),
+                id: id.clone(),
                 fresh: false,
                 principal: requester,
-                admission: record.admission.subscribe(),
+                admission,
                 owner: None,
             });
         }
@@ -268,7 +298,18 @@ impl OperationStore {
                 .min()
                 .map(|(_, index)| index)
                 .ok_or_else(unavailable)?;
-            records.remove(oldest);
+            let evicted = records.remove(oldest);
+            if let (Some(replay), Some(terminal_at)) = (evicted.replay, evicted.terminal_at) {
+                if tombstones.len() == MAX_TOMBSTONES {
+                    tombstones.pop_front();
+                }
+                tombstones.push_back(Tombstone {
+                    id: evicted.id,
+                    kind: evicted.kind,
+                    replay,
+                    terminal_at,
+                });
+            }
         }
         let id = Uuid::new_v4().to_string();
         let (sender, receiver) = watch::channel(None);
@@ -291,8 +332,8 @@ impl OperationStore {
 
     /// Call only after durable source replacement (when needed) and real reload queue admission.
     pub(crate) fn accept(&self, id: &str) -> bool {
-        let mut records = self.records.lock();
-        let Some(record) = records.iter_mut().find(|record| record.id == id) else {
+        let mut state = self.state.lock();
+        let Some(record) = state.records.iter_mut().find(|record| record.id == id) else {
             return false;
         };
         if record.operation.is_some() {
@@ -309,31 +350,28 @@ impl OperationStore {
         self.publish(id, Status::Queued);
         record
             .admission
-            .send_replace(Some(Ok(OperationAcceptedResponse {
-                operation_id: id.into(),
-                kind: record.kind,
-                status: "queued",
-                href: format!("/api/v1/operations/{id}"),
-            })));
+            .send_replace(Some(Ok(accepted(id, record.kind))));
         true
     }
 
     pub(crate) fn reject(&self, id: &str, error: ApiError) -> bool {
-        let mut records = self.records.lock();
-        let Some(index) = records
+        let mut state = self.state.lock();
+        let Some(index) = state
+            .records
             .iter()
             .position(|record| record.id == id && record.operation.is_none())
         else {
             return false;
         };
-        let record = records.swap_remove(index);
+        let record = state.records.swap_remove(index);
         record.admission.send_replace(Some(Err(error)));
         true
     }
 
     pub(crate) fn running(&self, id: &str) -> bool {
-        let mut records = self.records.lock();
-        let Some(operation) = records
+        let mut state = self.state.lock();
+        let Some(operation) = state
+            .records
             .iter_mut()
             .find(|record| record.id == id)
             .and_then(|record| record.operation.as_mut())
@@ -403,8 +441,8 @@ impl OperationStore {
     }
 
     fn finish(&self, id: &str, result: Result<OperationResult, SafeError>) -> bool {
-        let mut records = self.records.lock();
-        let Some(record) = records.iter_mut().find(|record| record.id == id) else {
+        let mut state = self.state.lock();
+        let Some(record) = state.records.iter_mut().find(|record| record.id == id) else {
             return false;
         };
         let Some(operation) = record.operation.as_mut() else {
@@ -441,9 +479,9 @@ impl OperationStore {
     }
 
     pub(crate) fn get(&self, id: &str) -> Result<Response, ApiError> {
-        let mut records = self.records.lock();
-        prune(&mut records);
-        let record = records.iter().find(|record| record.id == id);
+        let mut state = self.state.lock();
+        state.prune();
+        let record = state.records.iter().find(|record| record.id == id);
         let (record, operation) = record
             .and_then(|record| {
                 record
@@ -488,13 +526,24 @@ impl OperationStore {
     }
 }
 
-fn prune(records: &mut Vec<Record>) {
-    let now = Instant::now();
-    records.retain(|record| {
-        record
-            .terminal_at
-            .is_none_or(|terminal| now.duration_since(terminal) < RETENTION)
-    });
+impl State {
+    fn prune(&mut self) {
+        let now = Instant::now();
+        let retained = |terminal: Instant| now.duration_since(terminal) < RETENTION;
+        self.records
+            .retain(|record| record.terminal_at.is_none_or(retained));
+        self.tombstones
+            .retain(|tombstone| retained(tombstone.terminal_at));
+    }
+}
+
+fn accepted(id: &str, kind: OperationKind) -> OperationAcceptedResponse {
+    OperationAcceptedResponse {
+        operation_id: id.into(),
+        kind,
+        status: "queued",
+        href: format!("/api/v1/operations/{id}"),
+    }
 }
 
 fn digest(parts: &[&[u8]]) -> [u8; 32] {

@@ -564,12 +564,7 @@ async fn geodata_replay_precedes_exclusivity_and_capacity() {
         "resource_not_found",
     )
     .await;
-    assert_error(
-        geodata("first").err().unwrap(),
-        StatusCode::CONFLICT,
-        "state_conflict",
-    )
-    .await;
+    assert_eq!(geodata("first").unwrap().id, first.id);
     assert_error(
         store
             .reserve(
@@ -586,4 +581,104 @@ async fn geodata_replay_precedes_exclusivity_and_capacity() {
         "temporarily_unavailable",
     )
     .await;
+}
+
+fn finish_failed(store: &Arc<OperationStore>, key: &str) -> String {
+    let reservation = reserve(store, key);
+    assert!(store.accept(&reservation.id));
+    assert!(store.running(&reservation.id));
+    assert!(store.fail(&reservation.id, "reload_failed", "Reload failed.", None));
+    reservation.id.clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn evicted_keyed_operation_replays_until_retention_after_it_finished() {
+    let store = store();
+    let original = reserve(&store, "kept");
+    assert!(store.accept(&original.id));
+    let envelope = serde_json::to_value(original.admission().await.unwrap()).unwrap();
+    assert!(store.running(&original.id));
+    assert!(store.fail(&original.id, "reload_failed", "Reload failed.", None));
+    tokio::time::advance(Duration::from_secs(100)).await;
+    let fillers: Vec<_> = (0..MAX_OPERATIONS)
+        .map(|number| reserve(&store, &format!("filler-{number}")))
+        .collect();
+    assert!(fillers.iter().all(|filler| filler.fresh));
+    drop(fillers);
+    // The original owner may outlive eviction; dropping it must not touch the kept key.
+    drop(original);
+    let id = envelope["operation_id"].as_str().unwrap().to_owned();
+    assert_error(
+        store.get(&id).unwrap_err(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    )
+    .await;
+
+    let replay = reserve(&store, "kept");
+    assert!(!replay.fresh);
+    assert_eq!(replay.id, id);
+    let accepted = replay.admission().await.unwrap();
+    assert_eq!(serde_json::to_value(&accepted).unwrap(), envelope);
+    let response = accepted.into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response.headers()["location"],
+        format!("/api/v1/operations/{id}")
+    );
+    let conflict = store
+        .reserve(
+            "owner",
+            "POST",
+            "/api/v1/operations/reload",
+            Some("kept"),
+            b"{ }",
+            OperationKind::Reload,
+        )
+        .err()
+        .unwrap();
+    assert_error(conflict, StatusCode::CONFLICT, "idempotency_conflict").await;
+
+    // An evicted operation takes no further transitions.
+    assert!(!store.accept(&id));
+    assert!(!store.reject(&id, unavailable()));
+    assert!(!store.running(&id));
+    assert!(!store.fail(&id, "reload_failed", "Reload failed.", None));
+    assert!(!store.succeed(
+        &id,
+        OperationResult::Reload {
+            active_generation_id: None,
+            datapath_generation_id: None
+        }
+    ));
+    assert_error(
+        store.get(&id).unwrap_err(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    )
+    .await;
+
+    // Expiry counts from the original finish; a late replay does not extend it.
+    tokio::time::advance(RETENTION - Duration::from_secs(101)).await;
+    let late = reserve(&store, "kept");
+    assert!(!late.fresh);
+    assert_eq!(late.id, id);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let expired = reserve(&store, "kept");
+    assert!(expired.fresh);
+    assert_ne!(expired.id, id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn evicted_keys_never_refuse_admission_and_drop_the_oldest_past_their_cap() {
+    let store = store();
+    let ids: Vec<_> = (0..MAX_OPERATIONS + MAX_TOMBSTONES + 1)
+        .map(|number| finish_failed(&store, &number.to_string()))
+        .collect();
+    let kept = reserve(&store, "1");
+    assert!(!kept.fresh);
+    assert_eq!(kept.id, ids[1]);
+    let forgotten = reserve(&store, "0");
+    assert!(forgotten.fresh);
+    assert_ne!(forgotten.id, ids[0]);
 }
