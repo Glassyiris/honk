@@ -237,31 +237,8 @@ impl OperationStore {
         });
         let mut state = self.state.lock();
         state.prune();
-        let State {
-            records,
-            tombstones,
-        } = &mut *state;
         if let Some(replay) = &replay
-            && let Some((id, body, admission)) = records
-                .iter()
-                .find_map(|record| {
-                    let old = record
-                        .replay
-                        .as_ref()
-                        .filter(|old| old.scope == replay.scope)?;
-                    Some((&record.id, old.body, record.admission.subscribe()))
-                })
-                .or_else(|| {
-                    let old = tombstones
-                        .iter()
-                        .find(|old| old.replay.scope == replay.scope)?;
-                    let accepted = accepted(&old.id, old.kind);
-                    Some((
-                        &old.id,
-                        old.replay.body,
-                        watch::channel(Some(Ok(accepted))).1,
-                    ))
-                })
+            && let Some((id, body, admission)) = state.replay(&replay.scope)
         {
             if body != replay.body {
                 return Err(ApiError::new(
@@ -272,7 +249,7 @@ impl OperationStore {
                 ));
             }
             return Ok(Reservation {
-                id: id.clone(),
+                id: id.to_owned(),
                 fresh: false,
                 principal: requester,
                 admission,
@@ -280,7 +257,8 @@ impl OperationStore {
             });
         }
         if kind == OperationKind::GeodataUpdate
-            && records
+            && state
+                .records
                 .iter()
                 .any(|record| record.kind == kind && record.terminal_at.is_none())
         {
@@ -291,30 +269,12 @@ impl OperationStore {
                 None,
             ));
         }
-        if records.len() == MAX_OPERATIONS {
-            let oldest = records
-                .iter()
-                .enumerate()
-                .filter_map(|(index, record)| record.terminal_at.map(|at| (at, index)))
-                .min()
-                .map(|(_, index)| index)
-                .ok_or_else(unavailable)?;
-            let evicted = records.remove(oldest);
-            if let (Some(replay), Some(terminal_at)) = (evicted.replay, evicted.terminal_at) {
-                if tombstones.len() == MAX_TOMBSTONES {
-                    tombstones.pop_front();
-                }
-                tombstones.push_back(Tombstone {
-                    id: evicted.id,
-                    kind: evicted.kind,
-                    replay,
-                    terminal_at,
-                });
-            }
+        if state.records.len() == MAX_OPERATIONS {
+            state.evict_oldest_terminal()?;
         }
         let id = Uuid::new_v4().to_string();
         let (sender, receiver) = watch::channel(None);
-        records.push(Record {
+        state.records.push(Record {
             id: id.clone(),
             kind,
             replay,
@@ -535,6 +495,53 @@ impl State {
             .retain(|record| record.terminal_at.is_none_or(retained));
         self.tombstones
             .retain(|tombstone| retained(tombstone.terminal_at));
+    }
+
+    /// The earlier admission under `scope`, live or evicted: its id, body digest and result.
+    fn replay(&self, scope: &[u8; 32]) -> Option<(&str, [u8; 32], watch::Receiver<Admission>)> {
+        self.records
+            .iter()
+            .find_map(|record| {
+                let old = record.replay.as_ref().filter(|old| &old.scope == scope)?;
+                Some((record.id.as_str(), old.body, record.admission.subscribe()))
+            })
+            .or_else(|| {
+                let old = self
+                    .tombstones
+                    .iter()
+                    .find(|old| &old.replay.scope == scope)?;
+                let accepted = accepted(&old.id, old.kind);
+                Some((
+                    old.id.as_str(),
+                    old.replay.body,
+                    watch::channel(Some(Ok(accepted))).1,
+                ))
+            })
+    }
+
+    /// Frees the slot of the earliest-finished operation; a keyed one leaves a tombstone.
+    fn evict_oldest_terminal(&mut self) -> Result<(), ApiError> {
+        let oldest = self
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| record.terminal_at.map(|at| (at, index)))
+            .min()
+            .map(|(_, index)| index)
+            .ok_or_else(unavailable)?;
+        let evicted = self.records.remove(oldest);
+        if let (Some(replay), Some(terminal_at)) = (evicted.replay, evicted.terminal_at) {
+            if self.tombstones.len() == MAX_TOMBSTONES {
+                self.tombstones.pop_front();
+            }
+            self.tombstones.push_back(Tombstone {
+                id: evicted.id,
+                kind: evicted.kind,
+                replay,
+                terminal_at,
+            });
+        }
+        Ok(())
     }
 }
 
