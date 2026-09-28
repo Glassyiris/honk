@@ -309,3 +309,157 @@ async fn supplied_geo_bytes_drive_reload_and_rejection_retains_live_metadata() {
     provider.finish_pause().await.unwrap();
     assert_eq!(service.geo_assets(), live_assets);
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn shared_geoip_matchers_follow_reload_ownership() {
+    use crate::configuration::SourceUpdate;
+    use crate::dns::routing::{DnsResponseDecision, DnsRouter};
+    use crate::routing::{
+        CompiledPredicate, GeoAssetSnapshot, GeoRequirements, GeoSourceSet, IpMatcher,
+    };
+
+    let mut cp = crate::control::tests::support::control_plane(Config::default());
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", ""),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
+    let mut config = honk_config::parser::parse_dae_config(
+        "routing {\n dip(geoip:lab) -> block\n fallback: direct\n }\n\
+         dns { routing { response {\n ip(geoip:lab) -> reject\n fallback: accept\n } } }",
+    )
+    .unwrap();
+    config.ensure_builtin_nodes();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("geoip.dat");
+    // `lab` holds 198.51.100.0/24, then 203.0.113.0/24.
+    let old = b"\x0a\x0f\x0a\x03lab\x12\x08\x0a\x04\xc6\x33\x64\x00\x10\x18";
+    let new = b"\x0a\x0f\x0a\x03lab\x12\x08\x0a\x04\xcb\x00\x71\x00\x10\x18";
+    let update = |bytes: &[u8]| SourceUpdate {
+        sources: Vec::new(),
+        dependencies: Vec::new(),
+        geo_sources: Some(
+            GeoSourceSet::from_assets(
+                &requirements,
+                vec![(
+                    GeoAssetSnapshot {
+                        kind: "geoip",
+                        path: Some(path.clone()),
+                        sha256: crate::configuration::digest(bytes),
+                        size_bytes: bytes.len() as u64,
+                        modified_at: None,
+                    },
+                    Arc::from(bytes),
+                )],
+            )
+            .unwrap(),
+        ),
+    };
+    let (initial, replacement) = (update(old), update(new));
+    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
+    let drain = DrainTracker::new();
+    let mut apply = async |config: &Config, update: &SourceUpdate| {
+        cp.apply_sighup_config(
+            config.clone(),
+            Vec::new(),
+            &drain,
+            &mut authorizations,
+            Some(update),
+            None,
+        )
+        .await
+        .unwrap()
+    };
+    let live = async |cp: &ControlPlane| {
+        let router = cp.router.read().await.clone();
+        let dns = cp.dns_controller.forwarder().routing_snapshot();
+        let routed = router.compiled_routes()[0].conditions[0].predicate.clone();
+        let CompiledPredicate::DestinationIp(routed) = routed else {
+            panic!("expected a destination IP condition");
+        };
+        let answered = Arc::clone(dns.answer_ip_matchers()[0]);
+        (router, dns, routed, answered)
+    };
+    let blocks = |router: &Router, ip: &str| {
+        router.route(&crate::routing::ConnectionInfo {
+            domain: None,
+            dst_ip: ip.parse().unwrap(),
+            dst_port: 443,
+            src_ip: "192.0.2.1".parse().unwrap(),
+            src_port: 12345,
+            protocol: "tcp",
+            process_name: None,
+            mac: None,
+            dscp: None,
+        }) == "block"
+    };
+    let rejects = |dns: &DnsRouter, ip: &str| {
+        dns.select_response("lab.test", 1, &[ip.parse().unwrap()], "")
+            == DnsResponseDecision::Reject
+    };
+    let shared = |a: &Arc<IpMatcher>, b: &Arc<IpMatcher>| Arc::ptr_eq(a, b);
+
+    assert!(matches!(
+        apply(&config, &initial).await,
+        ReloadOutcome::Committed { .. }
+    ));
+    let (old_router, old_dns, old_routed, answered) = live(&cp).await;
+    assert!(shared(&old_routed, &answered));
+
+    // Same path, changed bytes: the new build shares its own matcher while
+    // readers of the old generation keep deciding with the old one.
+    assert!(matches!(
+        apply(&config, &replacement).await,
+        ReloadOutcome::Committed { .. }
+    ));
+    let (router, dns, routed, answered) = live(&cp).await;
+    assert!(shared(&routed, &answered));
+    assert!(!shared(&routed, &old_routed));
+    assert!(blocks(&router, "203.0.113.1") && !blocks(&router, "198.51.100.1"));
+    assert!(rejects(&dns, "203.0.113.1") && !rejects(&dns, "198.51.100.1"));
+    assert!(blocks(&old_router, "198.51.100.1") && !blocks(&old_router, "203.0.113.1"));
+    assert!(rejects(&old_dns, "198.51.100.1") && !rejects(&old_dns, "203.0.113.1"));
+    drop((old_router, old_dns));
+
+    // A DNS build failure after the traffic router was rebuilt keeps both
+    // live routers and their shared matcher.
+    let mut failing = config.clone();
+    failing.routing.rules.push(failing.routing.rules[0].clone());
+    failing
+        .dns
+        .routing
+        .response
+        .rules
+        .push(honk_config::dns::DnsResponseRule {
+            conditions: vec![honk_config::dns::DnsCond::Sip {
+                not: false,
+                cidrs: vec!["192.0.2.0/24".into()],
+            }],
+            action: honk_config::dns::DnsResponseAction::Reject,
+        });
+    assert_eq!(apply(&failing, &replacement).await, ReloadOutcome::Rejected);
+    let (_, _, live_routed, live_answered) = live(&cp).await;
+    assert!(shared(&live_routed, &routed) && shared(&live_answered, &routed));
+
+    // Only DNS rebuilds: the reused traffic router does not seed the build,
+    // so this generation decides correctly without cross-router sharing.
+    let mut dns_only = config.clone();
+    dns_only
+        .dns
+        .routing
+        .response
+        .rules
+        .push(dns_only.dns.routing.response.rules[0].clone());
+    assert!(matches!(
+        apply(&dns_only, &replacement).await,
+        ReloadOutcome::Committed { .. }
+    ));
+    let (router, dns, live_routed, live_answered) = live(&cp).await;
+    assert!(shared(&live_routed, &routed));
+    assert!(!shared(&live_answered, &routed));
+    assert!(blocks(&router, "203.0.113.1") && rejects(&dns, "203.0.113.1"));
+    assert!(!rejects(&dns, "198.51.100.1"));
+}

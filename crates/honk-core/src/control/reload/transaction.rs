@@ -401,11 +401,16 @@ impl ControlPlane {
         let old_has_direct_marks = current_router.has_direct_marks();
         let reuse_routing_state = routing_state_reusable(&current_config, &new_config)
             && current_router.geo_fingerprint() == traffic_geo_fingerprint;
-        // Build the candidate completely before mutating live state.
+        // Build the candidate completely before mutating live state; reused routers share nothing.
+        let mut shared = crate::routing::SharedMatchers::default();
         let new_router = if reuse_routing_state {
             current_router
         } else {
-            match Router::from_config_with_geo_sources(&new_config.routing, geo_sources) {
+            match Router::from_config_with_geo_sources(
+                &new_config.routing,
+                geo_sources,
+                &mut shared,
+            ) {
                 Ok(router) => router,
                 Err(error) => {
                     error!(%error, "Failed to build new router");
@@ -455,8 +460,11 @@ impl ControlPlane {
         let dns_router = if reuse_dns_router {
             current_dns_router
         } else {
-            match crate::dns::routing::DnsRouter::new_with_geo_sources(&new_config.dns, geo_sources)
-            {
+            match crate::dns::routing::DnsRouter::new_with_geo_sources(
+                &new_config.dns,
+                geo_sources,
+                &mut shared,
+            ) {
                 Ok(router) => Arc::new(router),
                 Err(error) => {
                     error!(%error, "Failed to build DNS router");
