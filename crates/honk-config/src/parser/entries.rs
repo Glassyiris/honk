@@ -5,7 +5,7 @@ use super::read::Text;
 use crate::ConfigDiagnostic;
 use crate::diagnostic::Severity;
 use crate::node::Node;
-use crate::subscription::Subscription;
+use crate::subscription::{DeclaringSource, Subscription};
 
 pub(super) fn parse_node_section(
     section: &[Segment<'_, '_>],
@@ -348,7 +348,7 @@ fn parse_subscription_block<'d, 'a>(
 ) -> Subscription {
     let mut subscription = Subscription {
         name: canonical_tag(tag),
-        source: Some(segment.span().source),
+        source: Some(DeclaringSource(Text::segment(segment).source.reference())),
         ..Default::default()
     };
     let mut fields = SubscriptionFields::default();
@@ -423,7 +423,7 @@ fn parse_subscription_entry(
             name,
             url,
             user_agent,
-            source: Some(text.span.source),
+            source: Some(DeclaringSource(text.source.reference())),
             ..Default::default()
         },
         text.source.span(text.span.start, end),

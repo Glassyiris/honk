@@ -54,7 +54,7 @@ impl ControlPlane {
         &self,
         subscription_id: uuid::Uuid,
         mut nodes: Vec<Node>,
-        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
+        mut diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         if nodes.is_empty() {
@@ -83,6 +83,13 @@ impl ControlPlane {
         let incoming_len = nodes.len();
         let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
         new_config.validate_assembled()?;
+        if let Some(subscription) = current
+            .subscriptions
+            .iter()
+            .find(|subscription| subscription.id == subscription_id)
+        {
+            crate::config_diagnostics::declare_provider_diagnostics(subscription, &mut diagnostics);
+        }
         let diagnostic_update = DiagnosticUpdate::ReplaceProvider {
             id: subscription_id,
             diagnostics,

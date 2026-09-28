@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::SourceRef;
 use crate::types::SubscriptionType;
 
 /// A proxy subscription (e.g., subscription link).
@@ -37,11 +38,23 @@ pub struct Subscription {
     /// Created at
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
-    /// Diagnostic source-table index of the dae file that declared this
-    /// subscription (`SourceRef::index`); `None` when it was not parsed from one.
+    /// The dae file that declared this subscription; `None` when it was not
+    /// parsed from one.
     #[serde(skip)]
-    pub source: Option<usize>,
+    pub source: Option<DeclaringSource>,
 }
+
+/// Reparsing an unchanged document yields a fresh source table, so equality
+/// compares only the table index and an identical reload stays unchanged.
+#[derive(Debug, Clone)]
+pub struct DeclaringSource(pub SourceRef);
+
+impl PartialEq for DeclaringSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.index() == other.0.index()
+    }
+}
+impl Eq for DeclaringSource {}
 
 fn default_update_interval() -> u64 {
     86400 // 24 hours

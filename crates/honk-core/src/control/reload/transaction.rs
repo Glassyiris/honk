@@ -138,12 +138,14 @@ impl ControlPlane {
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
         drop(current_guard);
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
+        let declared = new_config.subscriptions.clone();
         self.apply_resolved_runtime_config_locked(
             new_config,
             drain,
             DiagnosticUpdate::Rebase {
                 static_diagnostics: diagnostics,
                 retained_provider_ids: retained_providers,
+                declared,
             },
             Some(authorizations),
             #[cfg(feature = "native-api")]
@@ -285,7 +287,7 @@ impl ControlPlane {
                     policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
                 })
             {
-                let _config = self.config.write().await;
+                let mut config = self.config.write().await;
                 #[cfg(feature = "native-api")]
                 if let Some(prepared) = &prepared_sources
                     && self
@@ -328,6 +330,9 @@ impl ControlPlane {
                 {
                     native.settings.activate(native, &new_config);
                 }
+                // Equal configurations may still come from a fresh source table;
+                // later refresh diagnostics name their declaring file through it.
+                *config = Arc::new(new_config);
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(ReloadOutcome::Noop { generation });
             }
