@@ -315,7 +315,7 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 ### 内嵌 doona 来源
 
-默认关闭的 `native-ui` 隐含 `native-api`，内嵌 doona `0.1.0-beta.6`、提交 `ad130fbd88a279531667601a059d999eecf195ed` 的真实产物、字体与 notices。`crates/honk-core/assets/doona-provenance.json` 记录源码/程序/字体包 SHA-256、构建身份及逐文件摘要；`doona-source.tar.gz` 保留对应 GPL-3.0-only 源码，位于 HTTP/内嵌目录之外。分发二进制/资产时须一并保留对应源码与 notices，不能只给接收者不可访问的私有上游链接。
+默认关闭的 `native-ui` 隐含 `native-api`，内嵌 doona `0.1.0-beta.6`、提交 `ad130fbd88a279531667601a059d999eecf195ed` 的构建产物与 notices，不含 Noto Sans TC 与 SC 字体。doona 的 CSS 以 `font-display: optional` 声明这些字体，因此字体请求返回 404 时浏览器使用系统字体。需要 Noto Sans 时，将 [doona 发布页](https://github.com/Zakkaus/doona/releases)的 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz` 解压到同一目录并让 `ui` 指向该目录，或安装 `doona` 与 `doona-fonts` 软件包并设置 `ui: /usr/share/doona`。`crates/honk-core/assets/doona-provenance.json` 记录源码/程序/字体包 SHA-256、构建身份及逐文件摘要。对应的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-beta.6`](https://github.com/Zakkaus/doona/tree/v0.1.0-beta.6)；在 doona 克隆中执行 `git archive --format=tar --prefix=doona/ v0.1.0-beta.6 | gzip -n`（GNU gzip）可复现 `source_sha256` 记录的源码包。honk 的发布流程不发布 `native-ui` 二进制；分发此类二进制时须按 GPL-3.0 第 6 条一并提供该源码包与 notices。
 
 复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 运行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1790423166 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。普通 Cargo 构建只使用已检入资产，不调用前端 build/下载。真实 checker 在该源码的 `tools/conformance.mjs`；live walk 只读，主动跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器动作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
 
