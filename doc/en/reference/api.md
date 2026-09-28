@@ -38,7 +38,8 @@ The base contract is [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](
 | GET | `/api/v1/geodata` | Read retained metadata of the assets actually loaded by traffic/DNS routing. |
 | POST | `/api/v1/geodata/update` | Download configured assets, validate all candidates and activate verified bytes through an operation. |
 | DELETE | `/api/v1/connections/{id}`, `/api/v1/connections` | Close exact userspace owners; bulk requires a filter or `all=true`. |
-| GET | `/api/v1/dns/query`, `/api/v1/dns/cache`, `/api/v1/dns/log` | Live diagnostic query, exact cache inspection and retained client outcomes. |
+| POST | `/api/v1/dns/query` | Live diagnostic query. |
+| GET | `/api/v1/dns/cache`, `/api/v1/dns/log` | Exact cache inspection and retained client outcomes. |
 | DELETE | `/api/v1/dns/cache/{entry_id}`, `/api/v1/dns/cache` | Invalidate one exact incarnation, or a name and optional types. |
 | POST | `/api/v1/dns/cache/flush` | Invalidate the DNS cache with acknowledged persistence fencing. |
 | POST | `/api/v1/routing/trace` | Generation-pinned simulation with `resolve: "none"`. |
@@ -235,7 +236,7 @@ Limits are 64 member associations, 256 projected rows, four active jobs, 16 queu
 
 ### DNS query, cache and outcome history
 
-`GET /dns/query` requires `domain`; repeat `type` for up to eight distinct record types (default A); more types return `413 request_too_large`. Supported types are A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS and CAA. Optional fields are `detail=summary|full`, `cache_mode=normal|bypass` and a configured `upstream` name, including an otherwise unreferenced upstream. One generation and ten-second deadline cover all types; the rate ceiling is 30/minute for the sole principal and globally. Forced upstream replaces request-stage routing, not hosts/strategy precedence or response policy: a local-host answer still reports default route and no upstream. `bypass` neither reads nor writes positive/negative/stale cache, joins a writing singleflight, supersedes entries, nor starts refresh work. Full detail projects validated answer records; per-type timeout/refusal/error remains an actual outcome.
+`POST /dns/query` takes a strict JSON body (`Content-Type: application/json`, otherwise `415`) with a required `domain` and an optional `type` array of up to eight distinct record types (default `["A"]`); more types return `413 request_too_large`. Supported types are A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS and CAA. Optional body fields are `cache_mode` (`normal` or `bypass`) and a configured `upstream` name, including an otherwise unreferenced upstream; `detail=summary|full` stays in the query string. One generation and ten-second deadline cover all types; the rate ceiling is 30/minute for the sole principal and globally. Forced upstream replaces request-stage routing, not hosts/strategy precedence or response policy: a local-host answer still reports default route and no upstream. `bypass` neither reads nor writes positive/negative/stale cache, joins a writing singleflight, supersedes entries, nor starts refresh work. Full detail projects validated answer records; per-type timeout/refusal/error remains an actual outcome.
 
 Literal `.` names the DNS root and works for live queries, exact cache listing and name-based deletion. Ordinary input names are case-insensitive with an optional trailing dot; presented names retain their canonical trailing dot. Valid root wire questions also use the ordinary strict DNS path; non-UTF-8 labels remain outside that consumer contract.
 

@@ -539,12 +539,12 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
         .route(
             "/api/v1/dns/query",
             resource(
-                get(
-                    |State(state): App, Extension(id): Id, uri: Uri| async move {
-                        respond(dns::query(&state, &uri, &id).await, id)
+                post(
+                    |State(state): App, Extension(id): Id, request: Request| async move {
+                        respond(dns::query(&state, request, &id).await, id)
                     },
                 ),
-                &["GET"],
+                &["POST"],
             ),
         )
         .route(
