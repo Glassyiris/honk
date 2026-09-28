@@ -10,7 +10,9 @@ use aya_ebpf::bindings::__sk_buff;
 use aya_ebpf_cty::c_long;
 use honk_ebpf_common::{KernelRouteOutput, KernelRouteWitness};
 use honk_ebpf_common::{
-    L4ProtoType, ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
+    L4ProtoType, ROUTE_TRACE_AMBIGUOUS, ROUTE_TRACE_DNS_OVERRIDE, ROUTE_TRACE_ENABLED,
+    ROUTE_TRACE_LOST, ROUTE_TRACE_VERSION, ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN,
+    RoutingDecision, RoutingInput,
 };
 
 use crate::{
@@ -160,7 +162,7 @@ fn evaluate_policy(
         }
     }
     if policy_id != 0 {
-        output.flags = (1 << 24) | 1;
+        output.flags = ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED;
     }
     let status = match descriptor.slot {
         0 => unsafe { honk_route_slot0(input, output) },
@@ -192,7 +194,7 @@ fn evaluate_policy(
     {
         decision.outbound = OUTBOUND_CONTROL_PLANE_ROUTING as u32;
         if policy_id != 0 {
-            output.flags |= 16;
+            output.flags |= ROUTE_TRACE_DNS_OVERRIDE;
         }
     }
     (status, decision, generation)
@@ -243,25 +245,25 @@ pub fn capture(
     token: u32,
     ambiguous: bool,
 ) -> u32 {
-    if witness.output.flags & 1 == 0 {
+    if witness.output.flags & ROUTE_TRACE_ENABLED == 0 {
         return 0;
     }
     if witness.output.policy_id == u32::MAX {
-        return u32::MAX;
+        return ROUTE_TRACE_LOST;
     }
     let Some(sequence) = crate::maps::ROUTE_TRACE_SEQUENCE.get_ptr_mut(0) else {
-        return u32::MAX;
+        return ROUTE_TRACE_LOST;
     };
     let sequence = unsafe { &mut *sequence };
     unsafe { aya_ebpf_bindings::helpers::bpf_spin_lock(&mut sequence.lock) };
-    let id = if sequence.next >= u32::MAX - 1 {
-        u32::MAX
+    let id = if sequence.next >= ROUTE_TRACE_LOST - 1 {
+        ROUTE_TRACE_LOST
     } else {
         sequence.next += 1;
         sequence.next
     };
     unsafe { aya_ebpf_bindings::helpers::bpf_spin_unlock(&mut sequence.lock) };
-    if id == u32::MAX {
+    if id == ROUTE_TRACE_LOST {
         return id;
     }
     // Copy the initialized tuple padding as well as its fields.
@@ -270,13 +272,13 @@ pub fn capture(
     witness.decision_token = token;
     witness.observed_ns = unsafe { aya_ebpf_bindings::helpers::bpf_ktime_get_ns() };
     if ambiguous {
-        witness.output.flags |= 8;
+        witness.output.flags |= ROUTE_TRACE_AMBIGUOUS;
     }
     if crate::maps::ROUTE_TRACE_MAP
         .insert(&id, &*witness, 1)
         .is_err()
     {
-        u32::MAX
+        ROUTE_TRACE_LOST
     } else {
         id
     }
@@ -284,7 +286,7 @@ pub fn capture(
 
 #[inline(always)]
 pub fn captured_generation(trace_id: u32) -> u64 {
-    if trace_id == 0 || trace_id == u32::MAX {
+    if trace_id == 0 || trace_id == ROUTE_TRACE_LOST {
         return 0;
     }
     crate::maps::ROUTE_TRACE_MAP

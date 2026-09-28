@@ -438,7 +438,7 @@ fn do_tproxy_wan_egress_tcp(
             };
 
         let pname_bytes: Option<&[u8; TASK_COMM_LEN]> = handoff_pname;
-        let ambiguous = pkt.route_witness.output.flags & 1 != 0
+        let ambiguous = pkt.route_witness.output.flags & honk_ebpf_common::ROUTE_TRACE_ENABLED != 0
             && (crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
                 || ROUTING_HANDOFF_MAP.get_ptr(&tuples.five).is_some());
         trace_id = if outbound == OUTBOUND_BLOCK

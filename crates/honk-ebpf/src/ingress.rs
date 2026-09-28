@@ -763,11 +763,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         && !offload_direct
         && !(outbound == OUTBOUND_DIRECT && must != 0)
     {
-        let ambiguous = pkt.route_witness.output.flags & 1 != 0
+        let ambiguous = pkt.route_witness.output.flags & honk_ebpf_common::ROUTE_TRACE_ENABLED != 0
             && pkt.l4proto == IPPROTO_TCP
             && (tcp_state
                 .as_ref()
-                .is_some_and(|state| state.trace_id == u32::MAX)
+                .is_some_and(|state| state.trace_id == honk_ebpf_common::ROUTE_TRACE_LOST)
                 || ROUTING_HANDOFF_MAP.get_ptr(&pkt.tuples.five).is_some());
         pkt.trace_id =
             crate::route::capture(&mut pkt.route_witness, &pkt.tuples.five, 0, ambiguous);
