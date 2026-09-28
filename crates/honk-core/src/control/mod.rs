@@ -94,8 +94,10 @@ pub use client::ControlClient;
 pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
+pub(crate) use reload::LogFiles;
+#[cfg(feature = "native-api")]
+pub(crate) use reload::restart_required_fields;
 use reload::*;
-pub(crate) use reload::{LogFiles, restart_required_fields};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 
@@ -314,6 +316,7 @@ impl ControlPlane {
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
     }
+    #[cfg(feature = "native-api")]
     pub(crate) fn log_files(&self) -> LogFiles {
         self.log_files.clone()
     }
