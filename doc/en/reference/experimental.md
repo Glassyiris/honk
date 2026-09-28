@@ -14,7 +14,7 @@ This reference describes the current nested sections under `experimental { ... }
 
 ## `native_api`
 
-Requires the default-on `native-api` Cargo feature; it does not require `clash-api`, and the listener remains default-off. Enabling it without that feature fails startup. All effective fields are restart-required: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
+Requires the opt-in `native-api` Cargo feature (build with `--features native-api` or `native-ui`; release builds include it); it does not require `clash-api`, and the listener remains default-off. Enabling it without that feature fails startup. All effective fields are restart-required: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
 
 | Field | Default | Meaning |
 | --- | --- | --- |

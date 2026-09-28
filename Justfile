@@ -60,7 +60,7 @@ check:
 
 # Clippy lint all
 lint:
-    cargo clippy --all --all-targets -- -D warnings
+    cargo clippy --all --all-targets --features honk-core/native-ui -- -D warnings
 
 # Format all
 fmt:
@@ -78,8 +78,8 @@ test:
 
 # Workspace CI gate (requires cargo-nextest).
 test-ci:
-    # Without nextest: cargo test --workspace --no-fail-fast
-    cargo nextest run --workspace --profile ci
+    # Without nextest: cargo test --workspace --features honk-core/native-ui --no-fail-fast
+    cargo nextest run --workspace --features honk-core/native-ui --profile ci
 
 # Run core + outbound tests
 test-core:
