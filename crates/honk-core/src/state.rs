@@ -218,7 +218,7 @@ impl StateDb {
     }
 
     fn open_with_ceiling(data_dir: &Path, max_page_count: i64) -> Result<Self, StateError> {
-        let directory = state_directory(data_dir, true)?;
+        let directory = state_directory(data_dir, true, tighten)?;
         let directory = Flock::lock(directory, FlockArg::LockSharedNonblock).map_err(
             |(_, error)| match error {
                 Errno::EWOULDBLOCK => StateError::Locked,
@@ -235,7 +235,7 @@ impl StateDb {
             Err(Errno::EEXIST) => (existing(&directory)?, false),
             Err(error) => return Err(path_error(Target::Database, error)),
         };
-        private(&file, Target::Database)?;
+        tighten(&file, Target::Database)?;
         let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
         let identity = (metadata.dev(), metadata.ino());
         // A newly created file is a regular descriptor: closed before SQLite
@@ -302,7 +302,7 @@ impl StateDb {
 /// there was neither. Refused while any process has the db open through
 /// `StateDb`, because each holds a shared lock on `state/`.
 pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
-    let directory = state_directory(data_dir, true)?;
+    let directory = state_directory(data_dir, true, tighten)?;
     let directory = Flock::lock(directory, FlockArg::LockExclusiveNonblock).map_err(
         |(_, error)| match error {
             Errno::EWOULDBLOCK => StateError::InUse,
@@ -320,7 +320,7 @@ pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
         Ok(_) => {}
     }
     let file = existing(&directory)?;
-    private(&file, Target::Database)?;
+    tighten(&file, Target::Database)?;
     let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
     drop(file);
     let path = resolved(&directory)?.join(DB_FILE);
@@ -449,7 +449,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
     const CORRUPT: &str = "honk.db.corrupt";
     // Exclusive for the renames: no other process may have the file open.
     let directory = Flock::lock(
-        state_directory(data_dir, false)?,
+        state_directory(data_dir, false, private)?,
         FlockArg::LockExclusiveNonblock,
     )
     .map_err(|(_, error)| match error {
@@ -520,7 +520,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
 /// that fails `quick_check`.
 #[cfg(feature = "native-api")]
 pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), StateError> {
-    let directory = state_directory(data_dir, false)?;
+    let directory = state_directory(data_dir, false, private)?;
     let file = existing(&directory)?;
     private(&file, Target::Database)?;
     let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
@@ -549,7 +549,11 @@ pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), Stat
     Ok((directory, connection))
 }
 
-fn state_directory(data_dir: &Path, create: bool) -> Result<File, StateError> {
+fn state_directory(
+    data_dir: &Path,
+    create: bool,
+    check: fn(&File, Target) -> Result<(), StateError>,
+) -> Result<File, StateError> {
     let parent =
         File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StateError::Unavailable)?);
     if create {
@@ -573,7 +577,7 @@ fn state_directory(data_dir: &Path, create: bool) -> Result<File, StateError> {
         }
         Err(error) => return Err(path_error(Target::StateDir, error)),
     };
-    private(&directory, Target::StateDir)?;
+    check(&directory, Target::StateDir)?;
     if create {
         // Also cover another creator or a previous failed sync: strict commits
         // cannot make this directory's entry durable in its parent.
@@ -769,10 +773,18 @@ pub(crate) fn pragma(connection: &Connection, name: &str) -> Result<i64, StateEr
 }
 
 /// A directory or regular file owned by the euid with no group or other bits.
-/// The state directory and database lose group and other bits that grant no
-/// write; writable ones are refused, because someone else may already have
-/// put a `-wal` beside the database.
 fn private(file: &File, target: Target) -> Result<(), StateError> {
+    match check_private(file, target)? {
+        Some((rule, _)) => Err(Refusal::new(target, rule).into()),
+        None => Ok(()),
+    }
+}
+
+/// [`private`] for writers, where the state directory and database lose group
+/// and other bits that grant no write; writable ones are refused, because
+/// someone else may already have put a `-wal` beside the database. Readers such
+/// as `config export` leave permissions alone.
+fn tighten(file: &File, target: Target) -> Result<(), StateError> {
     let Some((rule, mode)) = check_private(file, target)? else {
         return Ok(());
     };

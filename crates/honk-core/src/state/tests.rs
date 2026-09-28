@@ -170,6 +170,40 @@ fn created_directory_and_file_are_private() {
     );
 }
 
+#[cfg(feature = "native-api")]
+#[test]
+fn readers_refuse_readable_modes_and_leave_them() {
+    let directory = tempfile::tempdir().unwrap();
+    drop(StateDb::open(directory.path()).unwrap());
+    let state = directory.path().join(STATE_DIR);
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(
+        open_read_only(directory.path()).err(),
+        Some(StateError::Unsafe(Refusal::new(
+            Target::StateDir,
+            Rule::GroupOrOtherBits
+        )))
+    );
+    assert_eq!(mode(&state), 0o750);
+
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(db_path(directory.path()), fs::Permissions::from_mode(0o640)).unwrap();
+    assert_eq!(
+        open_read_only(directory.path()).err(),
+        Some(StateError::Unsafe(Refusal::new(
+            Target::Database,
+            Rule::GroupOrOtherBits
+        )))
+    );
+    assert_eq!(mode(&db_path(directory.path())), 0o640);
+
+    drop(StateDb::open(directory.path()).unwrap());
+    assert_eq!(mode(&db_path(directory.path())), 0o600);
+    assert!(open_read_only(directory.path()).is_ok());
+}
+
 #[test]
 fn symlinked_state_directory_is_refused() {
     let directory = tempfile::tempdir().unwrap();
@@ -403,7 +437,7 @@ fn reset_refuses_while_another_process_holds_the_directory() {
     let directory = tempfile::tempdir().unwrap();
     corrupt_with_wal(directory.path());
     let held = Flock::lock(
-        state_directory(directory.path(), false).unwrap(),
+        state_directory(directory.path(), false, private).unwrap(),
         FlockArg::LockSharedNonblock,
     )
     .unwrap();
@@ -436,7 +470,7 @@ fn admin_reset_refuses_startup_before_the_database_exists() {
     fs::write(&record, b"legacy administrator").unwrap();
     fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
     let startup = Flock::lock(
-        state_directory(data.path(), true).unwrap(),
+        state_directory(data.path(), true, private).unwrap(),
         FlockArg::LockSharedNonblock,
     )
     .unwrap();
