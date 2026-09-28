@@ -14,7 +14,7 @@ use tokio::time::{Instant, timeout_at};
 use super::operations::{OperationKind, Reservation};
 use super::probes::Policy;
 use super::{ApiError, ErrorCode, NativeState, config, parse_query, timestamp, types::RequestId};
-use crate::download_route::{self, Outbounds};
+use crate::download_route::{self, Deadline, Outbounds};
 use crate::routing::{GeoAssetSnapshot, GeoRequirements};
 
 mod sources;
@@ -23,11 +23,15 @@ mod tests;
 
 pub(crate) use sources::{Fetched, Patch as SourcesPatch, Route, Sources};
 
-pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a file download may wait for any progress: the setup up to the
+/// answer's headers, and then each wait for more of the body.
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a file download may take in all, so a trickle cannot hold the
+/// update forever.
+pub(crate) const DOWNLOAD_LIMIT: Duration = Duration::from_secs(600);
 /// The checksum request gets its own deadline instead of whatever a slow file
-/// download left of `NETWORK_TIMEOUT`. It covers the whole request: a fresh
-/// route decision, resolution, the tunnel, TLS and a body of at most
-/// `MAX_CHECKSUM_BYTES`.
+/// download left. It covers the whole request: a fresh route decision,
+/// resolution, the tunnel, TLS and a body of at most `MAX_CHECKSUM_BYTES`.
 const CHECKSUM_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_PATH: &str = "/api/v1/geodata/update";
 const MAX_CHECKSUM_BYTES: usize = 1024;
@@ -452,8 +456,9 @@ impl From<&'static str> for Failure {
 /// Downloads `kind` from the first URL that yields a usable file. A URL is
 /// skipped on any download failure, and when fetching the sha256 published
 /// beside it fails with anything but a 404 or the digest does not match; the
-/// error of the last URL tried is returned. The file has `NETWORK_TIMEOUT`
-/// and its checksum a separate `CHECKSUM_TIMEOUT` that starts after the file
+/// error of the last URL tried is returned. The file fails when it makes no
+/// progress for `IDLE_TIMEOUT` or takes longer than `DOWNLOAD_LIMIT`, and its
+/// checksum has a separate `CHECKSUM_TIMEOUT` that starts after the file
 /// arrives. Every request takes the route in
 /// `egress`; one it cannot carry fails like a connection and never goes
 /// direct instead. `policy` applies to every URL but `exempt`, the one the
@@ -471,7 +476,11 @@ pub(crate) async fn fetch(
     let mut last = Failure::from("invalid_source");
     for url in urls {
         let policy = (url != exempt).then_some(policy);
-        let deadline = Instant::now() + NETWORK_TIMEOUT;
+        let started = Instant::now();
+        let deadline = Deadline {
+            headers: started + IDLE_TIMEOUT,
+            idle: Some((IDLE_TIMEOUT, started + DOWNLOAD_LIMIT)),
+        };
         let (bytes, group) = match download(url, egress, deadline, max_bytes, policy).await {
             Ok(downloaded) => downloaded,
             Err(error) => {
@@ -489,7 +498,7 @@ pub(crate) async fn fetch(
             let published = download(
                 checksum.as_str(),
                 egress,
-                Instant::now() + CHECKSUM_TIMEOUT,
+                (Instant::now() + CHECKSUM_TIMEOUT).into(),
                 MAX_CHECKSUM_BYTES,
                 policy,
             )
@@ -543,7 +552,7 @@ const PURPOSE: &str = "geodata download";
 async fn download(
     url: &str,
     egress: &Egress<'_>,
-    deadline: Instant,
+    deadline: Deadline,
     max_bytes: usize,
     policy: Option<&Policy>,
 ) -> Result<(Arc<[u8]>, Option<String>), Failure> {
@@ -563,7 +572,7 @@ async fn download(
         Route::Group(group) => Some(group.as_str()),
     };
     let decision = timeout_at(
-        deadline,
+        deadline.headers,
         egress
             .outbounds
             .decide(detour, DETOUR_SETTING, PURPOSE, (host, port), None),
@@ -585,11 +594,14 @@ async fn download(
             {
                 return Err("destination_rejected".into());
             }
-            let tunnel = timeout_at(deadline, egress.outbounds.tunnel(&node, (host, port)))
-                .await
-                .map_err(|_| "download_timeout")?
-                .map_err(|_| "connection_failed")?;
-            let result = match timeout_at(deadline, tunnel.dial()).await {
+            let tunnel = timeout_at(
+                deadline.headers,
+                egress.outbounds.tunnel(&node, (host, port)),
+            )
+            .await
+            .map_err(|_| "download_timeout")?
+            .map_err(|_| "connection_failed")?;
+            let result = match timeout_at(deadline.headers, tunnel.dial()).await {
                 Err(_) => Err("download_timeout".into()),
                 Ok(Err(_)) => Err("connection_failed".into()),
                 Ok(Ok(stream)) => exchange(stream, &url, deadline, max_bytes).await,
@@ -607,7 +619,7 @@ async fn download(
 pub(crate) async fn download_direct(
     url: &str,
     bootstrap: &str,
-    deadline: Instant,
+    deadline: Deadline,
     max_bytes: usize,
     policy: Option<&Policy>,
 ) -> Result<Arc<[u8]>, Failure> {
@@ -625,7 +637,7 @@ pub(crate) async fn download_direct(
     } else {
         let resolver = honk_outbound::bootstrap::BootstrapResolver::parse(bootstrap)
             .ok_or("bootstrap_unavailable")?;
-        timeout_at(deadline, resolver.query(host))
+        timeout_at(deadline.headers, resolver.query(host))
             .await
             .map_err(|_| "download_timeout")?
             .map_err(|_| "resolution_failed")?
@@ -637,9 +649,9 @@ pub(crate) async fn download_direct(
             rejected = true;
             continue;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.headers.saturating_duration_since(Instant::now());
         let result = timeout_at(
-            deadline,
+            deadline.headers,
             honk_outbound::util::connect_marked_addr(
                 SocketAddr::new(ip, port),
                 Some(honk_outbound::util::bypass_mark()),
@@ -665,7 +677,7 @@ pub(crate) async fn download_direct(
 async fn exchange<S>(
     stream: S,
     url: &reqwest::Url,
-    deadline: Instant,
+    deadline: Deadline,
     max_bytes: usize,
 ) -> Result<Arc<[u8]>, Failure>
 where

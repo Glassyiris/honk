@@ -323,6 +323,31 @@ fn capture_inner(
     })
 }
 
+/// Reads `reader` to its end into one buffer of the `expected` length, so a
+/// large asset is neither grown in steps nor copied once more into an `Arc`.
+/// A file whose length changed after it was measured is read as it is now.
+fn read_sized(mut reader: impl io::Read, expected: usize) -> io::Result<Arc<[u8]>> {
+    let mut buffer: Arc<[u8]> = std::iter::repeat_n(0, expected).collect();
+    let slots = Arc::get_mut(&mut buffer).expect("a new buffer is unshared");
+    let mut filled = 0;
+    while filled < expected {
+        match reader.read(&mut slots[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest)?;
+    if filled == expected && rest.is_empty() {
+        return Ok(buffer);
+    }
+    let mut bytes = slots[..filled].to_vec();
+    bytes.append(&mut rest);
+    Ok(bytes.into())
+}
+
 fn geo_dependencies(
     geo: &GeoSourceSet,
     requirements: &GeoRequirements,
@@ -574,9 +599,7 @@ impl Capture {
             if metadata.len() > remaining as u64 {
                 return Err(io::ErrorKind::FileTooLarge.into());
             }
-            let mut bytes = Vec::new();
-            file.take(remaining as u64 + 1).read_to_end(&mut bytes)?;
-            Ok(bytes.into())
+            read_sized(file.take(remaining as u64 + 1), metadata.len() as usize)
         })
     }
 

@@ -308,12 +308,14 @@ async fn a_group_not_ready_at_startup_fails_every_url_without_going_direct() {
 /// A tunnel whose far end is an in-memory server, so paused time never
 /// races real sockets: the file comes after `file_delay` and its correct
 /// checksum after `checksum_delay`, or `status` with no body when one is given.
-/// `dials` counts the requests.
+/// With `pace: Some((size, pause))` the file's body follows its headers in
+/// pieces of `size` bytes, each after `pause`. `dials` counts the requests.
 struct Slow {
     body: &'static [u8],
     file_delay: Duration,
     checksum_delay: Duration,
     status: Option<&'static str>,
+    pace: Option<(usize, Duration)>,
     dials: Arc<AtomicUsize>,
 }
 
@@ -333,6 +335,7 @@ impl TcpOutbound for Slow {
             file_delay,
             checksum_delay,
             status,
+            pace,
             ..
         } = *self;
         tokio::spawn(async move {
@@ -359,7 +362,17 @@ impl TcpOutbound for Slow {
                 reply.len()
             );
             let _ = server.write_all(head.as_bytes()).await;
-            let _ = server.write_all(&reply).await;
+            match pace.filter(|_| !checksum) {
+                Some((size, pause)) => {
+                    for piece in reply.chunks(size) {
+                        tokio::time::sleep(pause).await;
+                        let _ = server.write_all(piece).await;
+                    }
+                }
+                None => {
+                    let _ = server.write_all(&reply).await;
+                }
+            }
             let _ = server.shutdown().await;
         });
         Ok(ProxyStream {
@@ -383,9 +396,10 @@ async fn fetch_slow(slow: Slow) -> Result<(Arc<[u8]>, Fetched), Failure> {
 async fn a_slow_file_leaves_its_checksum_a_deadline_of_its_own() {
     let (bytes, fetched) = fetch_slow(Slow {
         body: b"slow file",
-        file_delay: NETWORK_TIMEOUT - Duration::from_secs(5),
+        file_delay: IDLE_TIMEOUT - Duration::from_secs(5),
         checksum_delay: CHECKSUM_TIMEOUT - Duration::from_secs(2),
         status: None,
+        pace: None,
         dials: Arc::default(),
     })
     .await
@@ -401,6 +415,7 @@ async fn a_checksum_still_has_to_arrive_within_its_deadline() {
         file_delay: Duration::ZERO,
         checksum_delay: CHECKSUM_TIMEOUT + Duration::from_secs(1),
         status: None,
+        pace: None,
         dials: Arc::default(),
     })
     .await
@@ -415,6 +430,7 @@ async fn a_rejected_status_is_kept_with_the_failure() {
         file_delay: Duration::ZERO,
         checksum_delay: Duration::ZERO,
         status: Some("429 Too Many Requests"),
+        pace: None,
         dials: Arc::default(),
     })
     .await
@@ -435,6 +451,7 @@ async fn without_verification_no_checksum_is_requested() {
         file_delay: Duration::ZERO,
         checksum_delay: Duration::ZERO,
         status: None,
+        pace: None,
         dials: Arc::default(),
     };
     let dials = Arc::clone(&slow.dials);
@@ -448,4 +465,55 @@ async fn without_verification_no_checksum_is_requested() {
     assert_eq!(dials.load(Ordering::SeqCst), 1, "the file only");
     assert!(!fetched.verified);
     assert_eq!(fetched.sha256, crate::configuration::digest(b"unverified"));
+}
+
+/// Paces `body` in pieces of `size` bytes, each after `pause`.
+async fn fetch_paced(
+    body: &'static [u8],
+    size: usize,
+    pause: Duration,
+) -> Result<(Arc<[u8]>, Fetched), Failure> {
+    fetch_slow(Slow {
+        body,
+        file_delay: Duration::ZERO,
+        checksum_delay: Duration::ZERO,
+        status: None,
+        pace: Some((size, pause)),
+        dials: Arc::default(),
+    })
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_that_keeps_arriving_may_take_longer_than_the_idle_timeout() {
+    let body = b"one piece, two pieces, three pieces";
+    let pause = IDLE_TIMEOUT - Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let (bytes, fetched) = fetch_paced(body, 12, pause).await.unwrap();
+    assert!(started.elapsed() > IDLE_TIMEOUT, "{:?}", started.elapsed());
+    assert_eq!(&*bytes, body);
+    assert!(fetched.verified);
+    assert_eq!(fetched.sha256, crate::configuration::digest(body));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_that_stalls_for_the_idle_timeout_fails() {
+    let started = tokio::time::Instant::now();
+    let failure = fetch_paced(b"stalled", 3, IDLE_TIMEOUT + Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert_eq!(failure, Failure::from("download_timeout"));
+    assert!(started.elapsed() < IDLE_TIMEOUT + Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trickle_ends_at_the_download_limit() {
+    // One byte every 20 seconds needs 800 seconds for the whole file.
+    let body = &[b'x'; 40];
+    let started = tokio::time::Instant::now();
+    let failure = fetch_paced(body, 1, Duration::from_secs(20))
+        .await
+        .unwrap_err();
+    assert_eq!(failure, Failure::from("download_timeout"));
+    assert_eq!(started.elapsed(), DOWNLOAD_LIMIT);
 }

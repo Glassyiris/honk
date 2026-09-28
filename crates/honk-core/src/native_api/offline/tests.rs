@@ -878,3 +878,12 @@ fn a_stored_body_over_the_budget_is_refused_before_it_is_read() {
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
 }
+
+#[test]
+fn a_sized_read_keeps_whatever_the_file_holds_when_its_length_changed() {
+    let bytes = b"geodata bytes";
+    assert_eq!(&*read_sized(&bytes[..], bytes.len()).unwrap(), bytes);
+    assert_eq!(&*read_sized(&bytes[..], 4).unwrap(), bytes);
+    assert_eq!(&*read_sized(&bytes[..], 64).unwrap(), bytes);
+    assert!(read_sized(&[][..], 0).unwrap().is_empty());
+}
