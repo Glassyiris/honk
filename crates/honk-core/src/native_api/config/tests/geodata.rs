@@ -1247,3 +1247,31 @@ async fn an_update_replaces_the_resolved_copy_of_an_unchanged_loaded_file() {
     fixture.shutdown().await;
     server.close().await;
 }
+
+/// OpenWrt's default data directory `/var/lib/honk` sits under `/var -> tmp`.
+#[tokio::test]
+async fn an_update_writes_through_a_linked_data_directory_prefix() {
+    let server = AssetServer::new(geosite("new.example"), geoip(198), false).await;
+    let fixture = Fixture::new_custom(Access::Admin, false, |root, files| {
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        std::os::unix::fs::symlink("tmp", root.join("state")).unwrap();
+        setup(root, files, server.address)
+    })
+    .await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(
+        std::fs::read(fixture.path("tmp/geosite.dat")).unwrap(),
+        geosite("new.example")
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.path("state"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "block");
+    fixture.shutdown().await;
+    server.close().await;
+}

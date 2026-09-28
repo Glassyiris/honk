@@ -388,6 +388,7 @@ fn prepare_and_replace(
     let mut assets: std::collections::VecDeque<StagedAsset> =
         std::collections::VecDeque::with_capacity(downloads.len());
     let mut kept: Vec<KeptAsset> = Vec::new();
+    let resolved_data_dir = std::fs::canonicalize(data_dir);
     for download in downloads {
         let original = download.original;
         let recorded = original
@@ -414,7 +415,10 @@ fn prepare_and_replace(
         } else {
             dependency.path.clone()
         };
-        let file = SourceFile::open_binary(&path, offline::MAX_ASSET_BYTES)
+        // `path` may pass through symlinks, as packaged assets and a data
+        // directory under `/var -> tmp` do on OpenWrt. The canonical path names
+        // the same file and is the one the capture read.
+        let file = SourceFile::open_binary(&dependency.path, offline::MAX_ASSET_BYTES)
             .map_err(|_| failure("asset_path_unavailable", &writes))?;
         if file.sha256() != original.sha256 {
             return Err(failure("asset_conflict", &writes));
@@ -440,19 +444,28 @@ fn prepare_and_replace(
             });
             continue;
         }
-        let target = update_target(
-            &path,
+        let name = recorded.file_name().unwrap_or_default();
+        let (staged, target) = match update_target(
+            &dependency.path,
+            name,
             data_dir,
             std::env::var_os("DAE_LOCATION_ASSET")
                 .as_deref()
                 .map(Path::new),
-        );
-        let staged = if target == path {
-            file.stage(&original.sha256, &download.bytes)
-        } else {
-            file.stage_beside(&original.sha256, &target, &download.bytes)
-        }
-        .map_err(|_| failure("staging_failed", &writes))?;
+        ) {
+            None => (file.stage(&original.sha256, &download.bytes), path),
+            // The operator configures the data directory, so its symlinks are
+            // resolved; staging still refuses any symlink below it.
+            Some(target) => (
+                resolved_data_dir
+                    .as_ref()
+                    .map_or(Err(WriteError::Unavailable), |directory| {
+                        file.stage_beside(&original.sha256, &directory.join(name), &download.bytes)
+                    }),
+                target,
+            ),
+        };
+        let staged = staged.map_err(|_| failure("staging_failed", &writes))?;
         let snapshot = GeoAssetSnapshot {
             kind: original.kind,
             path: Some(target),
@@ -625,25 +638,30 @@ fn prepare_and_replace(
     }))
 }
 
-/// Where an update writes the replacement for the loaded file at `loaded`:
-/// in place when that file is in the data directory or in the explicit asset
-/// directory that outranks it, otherwise as a new file in the data directory.
-/// The new file shadows the old one in the lookup order, so a file a package
-/// manager installed is never overwritten.
-fn update_target(loaded: &Path, data_dir: &Path, explicit: Option<&Path>) -> PathBuf {
+/// Where an update writes the replacement for the loaded file at `resolved`,
+/// a canonical path: `None` replaces it in place, which happens only when that
+/// file is in the data directory or in the explicit asset directory that
+/// outranks it. Otherwise the new file goes into the data directory under the
+/// lookup's `name` and shadows the old one in the lookup order, so a file a
+/// package manager installed is never overwritten. Because `resolved` has no
+/// symlinks, a link from a packaged directory is judged by the file it names,
+/// and an update never writes through it.
+fn update_target(
+    resolved: &Path,
+    name: &std::ffi::OsStr,
+    data_dir: &Path,
+    explicit: Option<&Path>,
+) -> Option<PathBuf> {
     let same = |directory: &Path| {
-        loaded.parent().is_some_and(|parent| {
+        resolved.parent().is_some_and(|parent| {
             parent == directory
-                || std::fs::canonicalize(parent)
-                    .ok()
-                    .zip(std::fs::canonicalize(directory).ok())
-                    .is_some_and(|(parent, directory)| parent == directory)
+                || std::fs::canonicalize(directory).is_ok_and(|directory| parent == directory)
         })
     };
     if same(data_dir) || explicit.is_some_and(same) {
-        return loaded.to_owned();
+        return None;
     }
-    data_dir.join(loaded.file_name().unwrap_or_default())
+    Some(data_dir.join(name))
 }
 
 #[cfg(test)]
@@ -655,23 +673,110 @@ mod settled_tests {
     fn updates_write_to_the_data_directory_instead_of_a_packaged_file() {
         let data = Path::new("/var/lib/honk");
         let explicit = Some(Path::new("/opt/assets"));
+        let name = std::ffi::OsStr::new("geosite.dat");
         for packaged in ["/usr/share/honk/geosite.dat", "/usr/share/dae/geosite.dat"] {
             assert_eq!(
-                update_target(Path::new(packaged), data, None),
-                data.join("geosite.dat")
+                update_target(Path::new(packaged), name, data, None),
+                Some(data.join("geosite.dat"))
             );
             assert_eq!(
-                update_target(Path::new(packaged), data, explicit),
-                data.join("geosite.dat")
+                update_target(Path::new(packaged), name, data, explicit),
+                Some(data.join("geosite.dat"))
             );
         }
         assert_eq!(
-            update_target(&data.join("geoip.dat"), data, None),
-            data.join("geoip.dat")
+            update_target(&data.join("geosite.dat"), name, data, None),
+            None
         );
         assert_eq!(
-            update_target(Path::new("/opt/assets/geoip.dat"), data, explicit),
-            PathBuf::from("/opt/assets/geoip.dat")
+            update_target(Path::new("/opt/assets/geosite.dat"), name, data, explicit),
+            None
+        );
+    }
+
+    /// OpenWrt links `/usr/share/dae/geo*.dat` to `../v2ray/geo*.dat` and
+    /// links `/var` to `tmp`, the data directory's parent.
+    #[test]
+    fn updates_read_through_symlinks_and_write_only_into_the_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let vendor = root.join("usr/share/v2ray");
+        let packaged = root.join("usr/share/dae");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::create_dir_all(&packaged).unwrap();
+        std::fs::create_dir_all(root.join("tmp/lib/honk")).unwrap();
+        std::os::unix::fs::symlink("tmp", root.join("var")).unwrap();
+        std::fs::write(vendor.join("geoip.dat"), b"old").unwrap();
+        std::os::unix::fs::symlink("../v2ray/geoip.dat", packaged.join("geoip.dat")).unwrap();
+        let data_dir = root.join("var/lib/honk");
+        let recorded = packaged.join("geoip.dat");
+        let resolved = std::fs::canonicalize(&recorded).unwrap();
+        assert_eq!(resolved, vendor.join("geoip.dat"));
+
+        let name = recorded.file_name().unwrap();
+        let target = update_target(&resolved, name, &data_dir, None);
+        assert_eq!(target, Some(data_dir.join("geoip.dat")));
+        let file = SourceFile::open_binary(&resolved, 1024).unwrap();
+        let directory = std::fs::canonicalize(&data_dir).unwrap();
+        let hash = file.sha256();
+        let installed = file
+            .stage_beside(&hash, &directory.join(name), b"new")
+            .unwrap()
+            .replace(|| Ok(()))
+            .unwrap();
+        assert!(installed.durability_confirmed);
+        assert_eq!(std::fs::read(data_dir.join("geoip.dat")).unwrap(), b"new");
+        assert_eq!(std::fs::read(vendor.join("geoip.dat")).unwrap(), b"old");
+        assert!(
+            std::fs::symlink_metadata(&recorded)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // The next update finds the new file through the linked prefix and
+        // replaces it in place.
+        let recorded = data_dir.join("geoip.dat");
+        let resolved = std::fs::canonicalize(&recorded).unwrap();
+        assert_eq!(resolved, root.join("tmp/lib/honk/geoip.dat"));
+        assert_eq!(update_target(&resolved, name, &data_dir, None), None);
+        let file = SourceFile::open_binary(&resolved, 1024).unwrap();
+        let hash = file.sha256();
+        file.stage(&hash, b"newer")
+            .unwrap()
+            .replace(|| Ok(()))
+            .unwrap();
+        assert_eq!(std::fs::read(&recorded).unwrap(), b"newer");
+        assert_eq!(std::fs::read(vendor.join("geoip.dat")).unwrap(), b"old");
+    }
+
+    /// A link inside the data directory to a packaged file is judged by its
+    /// target: the update never writes through it and never replaces the link.
+    #[test]
+    fn a_link_in_the_data_directory_is_neither_written_through_nor_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("geoip.dat"), b"old").unwrap();
+        std::os::unix::fs::symlink(root.join("geoip.dat"), data_dir.join("geoip.dat")).unwrap();
+        let resolved = std::fs::canonicalize(data_dir.join("geoip.dat")).unwrap();
+        let name = std::ffi::OsStr::new("geoip.dat");
+        let target = update_target(&resolved, name, &data_dir, None).unwrap();
+        let file = SourceFile::open_binary(&resolved, 1024).unwrap();
+        let hash = file.sha256();
+        assert!(
+            file.stage_beside(&hash, &target, b"new")
+                .unwrap()
+                .replace(|| Ok(()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(root.join("geoip.dat")).unwrap(), b"old");
+        assert!(
+            std::fs::symlink_metadata(data_dir.join("geoip.dat"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
