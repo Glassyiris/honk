@@ -73,7 +73,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 错误的 `details` 只指出被拒绝的对象，不回显提交或配置的值。请求边界错误给出 `header` 或请求部分（`field`：`query`、`body` 或 `target`）及 `kind`。JSON 请求体无法解析或不符合 schema 时，该端点返回 `400 invalid_request`，`details` 为 `{field,kind}`：`field` 是出错成员的点分路径（如 `sources[0].content`）、含未知键的对象或 `body`；`kind` 为 `invalid_json`、`missing`、`wrong_type`、`unknown_field`、`duplicate`、`invalid_value` 或 `too_large`。422 `unsupported_value` 给出被拒绝的 `field` 或 `fields`，并视情况给出受管条目的 `resource` 路径、`allowed` 可选值或路径、未通过的 `check`，或可放行该请求的 `settings`。
 
-原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
+原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。30 秒读空闲期限仅在连接没有进行中请求时生效（自请求 body 结束至响应完成），停滞写入另受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
 密码模式先关闭凭据准入，再执行上述 HTTP grace，随后等待真实的阻塞凭据任务结束。五秒 HTTP 预算不限制最后的 KDF/数据库 join。
 

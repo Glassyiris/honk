@@ -86,7 +86,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL。空值使用内建 zashboard URL。 |
 | `external_ui_download_detour` | `""` | 下载使用的节点或组 tag。空值遵循普通流量路由。 |
 | `secret` | `""` | API 鉴权 secret。空值关闭鉴权。短于 8 字节的值在原生 API 响应里不遮蔽。 |
-| `default_mode` | `"Rule"` | 启动模式：`Rule`、`Global` 或 `Direct`。`cache_file.enabled: true` 时有效的缓存模式优先。 |
+| `default_mode` | `"Rule"` | native API 未启用时的启动模式：`Rule`、`Global` 或 `Direct`；`cache_file.enabled: true` 时有效的缓存模式优先。启用 native 时启动改用共享的临时 rule 模式。 |
 
 所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。
 
