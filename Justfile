@@ -120,17 +120,17 @@ test-ebpf:
 # Real generated-policy goldens and atomic publication failures (Linux 6.12+, root).
 test-routing:
     cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +{{ebpf_toolchain}} build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test
-    HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::routing::tests -- --ignored --test-threads=1
+    HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::routing::tests -- --ignored --test-threads=1
 # Root-gated netlink/netns integration tests (NFQUEUE + netkit/veth/route/rule roundtrip)
 test-netns: test-routing
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --list --format terse)" = "ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription: test"
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
-    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --list --format terse)" = "control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks: test"
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib netns -- --ignored --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --list --format terse)" = "ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::tests -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --test ebpf_datapath_test -- --ignored --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --list --format terse)" = "control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --test-threads=1
     @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-outbound --lib proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation -- --ignored --exact --list --format terse)" = "proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation: test"
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-outbound --lib proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation -- --ignored --exact --test-threads=1
 
