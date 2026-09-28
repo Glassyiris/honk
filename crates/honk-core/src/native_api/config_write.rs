@@ -409,6 +409,7 @@ impl StagedFile {
                 durability_confirmed,
             });
         };
+        recheck_directory(&target.directory, &target.parent_path)?;
         target.install(&mut self.temporary)?;
         let file = self
             .temporary

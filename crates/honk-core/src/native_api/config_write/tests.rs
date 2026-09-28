@@ -372,6 +372,28 @@ fn staging_beside_creates_a_new_file_and_never_replaces_one() {
 }
 
 #[test]
+fn staging_beside_refuses_a_swapped_target_directory() {
+    let (_packaged, path) = fixture();
+    let data = tempfile::tempdir().unwrap();
+    let parent = data.path().join("config.d");
+    fs::create_dir(&parent).unwrap();
+    let source = SourceFile::open_binary(&path, LIMIT).unwrap();
+    let hash = source.sha256();
+    let staged = source
+        .stage_beside(&hash, &parent.join("config.dae"), REPLACEMENT.as_bytes())
+        .unwrap();
+    let moved = data.path().join("moved.d");
+    let result = staged.replace(|| {
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&moved, &parent).unwrap();
+        Ok(())
+    });
+    assert_eq!(result.err(), Some(WriteError::UnsafePath));
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    assert_eq!(fs::read(&path).unwrap(), ORIGINAL.as_bytes());
+}
+
+#[test]
 fn create_new_never_replaces_and_refuses_a_swapped_directory() {
     let directory = tempfile::tempdir().unwrap();
     let parent = directory.path().join("config.d");
