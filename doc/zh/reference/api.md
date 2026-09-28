@@ -192,7 +192,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 Full 校验先按 include 顺序合并，再判定有效配置语义。未进入实际 include 树的提交文档只检查结构（包含 lexer 恢复后保留的错误），其设置和告警不影响有效候选；其字节与源数量仍和每次依赖物化共用同一预算。
 
-PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_redacted`；其他未知字段返回 `400 invalid_request`。PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是**单个带双引号、含 64 个小写十六进制字符的 SHA-256 强标签**，可将读取到的 `content_sha256` 加双引号使用；它比较磁盘当前原始字节，不是 config revision 或 runtime generation。源 GET 仍是 accepted 快照，因此外部编辑后可能需要本地处理或显式 reload，而不是用旧快照覆盖磁盘。
+PUT 与校验请求体含未知字段（包括 `secrets_redacted`）时返回 `400 invalid_request`。PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是**单个带双引号、含 64 个小写十六进制字符的 SHA-256 强标签**，可将读取到的 `content_sha256` 加双引号使用；它比较磁盘当前原始字节，不是 config revision 或 runtime generation。源 GET 仍是 accepted 快照，因此外部编辑后可能需要本地处理或显式 reload，而不是用旧快照覆盖磁盘。
 
 | 写入条件/结果 | HTTP 语义 |
 | --- | --- |
@@ -286,7 +286,7 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`、`written`、`durability_confirmed`、`committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409，写入期间磁盘上的源被修改时返回 `412 stale_revision`；DELETE 的其他校验失败仍映射为 503。已耐久写入但激活被拒绝报告 written true/committed false；`--store db` 在激活前不写入，被拒绝时报告 written false；提交后降级报告 committed true，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
 
-获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 geodata。Geodata GET 按既有 router-before-config 锁序读取流量/DNS 保留元数据，不扫描磁盘、不联网；hash/大小属于已加载字节，不属于后来的磁盘外部编辑。未记录或不一致的修改时间为 null；`source_redacted` 保留字段名，在 GET 与成功操作结果中返回第一个下载 URL，并遮蔽监听凭据；没有 URL 的资产为 null。未使用资产不列出；互相冲突的已加载快照报告不可用，不任取其一。
+获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 geodata。Geodata GET 按既有 router-before-config 锁序读取流量/DNS 保留元数据，不扫描磁盘、不联网；hash/大小属于已加载字节，不属于后来的磁盘外部编辑。未记录或不一致的修改时间为 null；`source_redacted` 保留字段名，在 GET 与成功操作结果中返回第一个下载 URL，去掉 userinfo、query 和 fragment，可能含凭据的路径段替换为 `[redacted]`，并遮蔽监听凭据；没有 URL 的资产或无法安全显示的 URL 为 null。未使用资产不列出；互相冲突的已加载快照报告不可用，不任取其一。
 
 更新需要 `config_write`、来源权威，以及**每个已加载资产**都有下载 URL：来自配置文件的 `geosite_download_url`/`geoip_download_url`，或在来源可配置时来自已存储或内置的 URL（见下节）。URL 不作为请求参数。只接受最终直达 HTTP(S) URL，拒绝 userinfo、fragment、redirect 和 content encoding；HTTPS 验证证书。直连请求只用配置的数字地址 `global.bootstrap_resolver` 解析域名，不回退系统 DNS；`routing` 匹配路由规则时先用该解析器查询域名，未配置或查询失败时再查 `/etc/hosts` 和系统 nameserver。请求经由下节所述的下载路由发出，默认为 `routing`。一次更新最多两个各 256 MiB 的资产；每个 URL 的文件须在请求发出后 30 秒内返回响应头，正文的每次停顿不得超过 30 秒，整个下载最长 10 分钟；校验文件请求在文件下载完成后另有 10 秒期限，涵盖路由决策、域名解析、隧道和 TLS 在内的整个请求；校验、磁盘操作与必须等待的 owner join 不承诺硬总期限。
 
@@ -303,13 +303,13 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 `download.route` 决定每个 geodata 请求（包括校验文件）的出口。`routing` 为默认值，与用户流量一样遵循路由规则，因为 honk 自身发起的下载除非另行配置，一律经过路由；`group` 始终经过 `group_id` 指定的组，该 ID 即 `GET /groups` 返回的 ID；`direct` 使用 bootstrap resolver 解析并带绕过标记直连主机。经规则或组的请求与外部 UI 下载共用同一套路由决策和隧道。路由无法承载的请求按连接错误处理，使这个 URL 失败：组不存在或没有可选成员时 `last_error.code` 为 `group_unavailable`，规则指向 `block` 时为 `route_blocked`，隧道建立失败时为 `connection_failed`。随后 honk 改试下一个 URL，不会回退到直连。启动后不久，路由或规则选中的组尚无可达节点时，更新就按此处理。经节点下载时，域名由节点出口解析，因此探测目标策略只检查端口和字面 IP 地址。`experimental.native_api.geodata_download_detour` 在启动时按与 URL 相同的规则写入路由：`direct`、`routing` 或组名覆盖通过 API 修改的路由。空值与 `external_ui_download_detour` 为空时相同，遵循路由规则；若已通过 API 存储路由，则保留该路由。空值还会删除先前配置文件写入的路由。路由不影响 `source`。
 
-`PATCH /runtime/settings` 合并并存储 `geodata`，不触发下载。`urls` 列表含 1–4 个互不相同的 HTTP(S) URL，每个最长 4096 字节，不含 userinfo 或 fragment，按回退顺序整体替换原列表；修改任一资产都会存储两个列表，无论原来的 `source` 是什么，都随之变为 `db`。`auto_update` 单独存储，`interval_hours` 取 6–168，配置文件不设置它。`download` 单独存储；`group` 路由必须带 `group_id`，其他路由不能带；ID 不对应当前任何组时返回 `422 unsupported_value`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`verify_checksum` 单独存储，配置文件不设置它。`"geodata": null` 删除已存储的设置；配置文件中的 URL 在下次启动时重新写入。顶层 `source` 不受影响。`geodata` 与其他字段在同一请求中一起校验，任一部分失败则全部不变。匿名 loopback 主体不能修改 `geodata`（`403 permission_denied`），读到的 URL 去掉 userinfo、query 和 fragment，并遮蔽监听凭据；已认证调用方读到原始 URL，仅遮蔽监听凭据。
+`PATCH /runtime/settings` 合并并存储 `geodata`，不触发下载。`urls` 列表含 1–4 个互不相同的 HTTP(S) URL，每个最长 4096 字节，不含 userinfo 或 fragment，按回退顺序整体替换原列表；修改任一资产都会存储两个列表，无论原来的 `source` 是什么，都随之变为 `db`。`auto_update` 单独存储，`interval_hours` 取 6–168，配置文件不设置它。`download` 单独存储；`group` 路由必须带 `group_id`，其他路由不能带；ID 不对应当前任何组时返回 `422 unsupported_value`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`verify_checksum` 单独存储，配置文件不设置它。`"geodata": null` 删除已存储的设置；配置文件中的 URL 在下次启动时重新写入。顶层 `source` 不受影响。`geodata` 与其他字段在同一请求中一起校验，任一部分失败则全部不变。匿名 loopback 主体不能修改 `geodata`（`403 permission_denied`），读到的 URL 与 `source_redacted` 的显示方式相同；已认证调用方读到原始 URL，仅遮蔽监听凭据。
 
 更新按顺序尝试资产的各个 URL，遇到连接错误、非 200 状态、超时或校验失败时改试下一个。校验文件的 URL 是在原 URL 的路径末尾加 `.sha256sum`，保留 query。返回 200 时，其第一个字段必须等于文件的 SHA-256；返回 404 视为未发布校验文件，文件按未校验使用；其他状态或失败都使这个 URL 失败。某个资产的所有 URL 都失败时，失败详情描述最后尝试的 URL，给出 `stage`、失败的资产 `asset`（`geosite` 或 `geoip`）；该 URL 因服务器响应而失败时，还给出该响应的 `http_status`，即文件的非 200 状态，或校验文件的非 200、非 404 状态。`asset: geoip, stage: checksum_unavailable, http_status: 403` 表示服务器拒绝的是 `.sha256sum`，而不是文件。已存储和内置的 URL 遵循探测目标策略：只允许默认端口，除非 `probe_allowed_ports` 另行列出；解析出的受限地址需由 `probe_allowed_cidrs` 放行。与当前配置文件所设 URL 相同的 URL 由管理员自行设置，不受此限制。
 
 `verify_checksum` 默认为 `true`。设为 `false` 后，手动和自动更新都不请求 `.sha256sum`，下载的文件一律按未校验使用：`verified` 为 `false`，`sha256` 照常报告。此设置用于缺少校验文件时返回非 404 状态或返回非校验内容页面的镜像。以 `checksum_unavailable` 或 `checksum_mismatch` 失败时，日志中的警告会指出此设置；校验不会被自动关闭。
 
-此时 `GET /geodata` 还为每个资产报告 `fetched_url_redacted`（已加载文件的下载 URL，去掉 userinfo、query 和 fragment，并遮蔽监听凭据）、`verified` 与 `download_route`（`route` 为该次下载时设置的路由，`group_id` 为请求经过的组，包括规则选中的组，否则为 null），并在顶层报告 `last_checked_at`、`last_updated_at`、`next_check_at`、`last_error` 和 `required_codes`；后者按资产列出当前配置引用的分类，已排序。`last_error.code` 为失败阶段，例如 `http_status_rejected`、`checksum_mismatch` 或 `asset_validation_failed`。这些状态只存于内存，因此重启后在下一次尝试前为 null，`verified` 为 false。
+此时 `GET /geodata` 还为每个资产报告 `fetched_url_redacted`（已加载文件的下载 URL，显示方式与 `source_redacted` 相同）、`verified` 与 `download_route`（`route` 为该次下载时设置的路由，`group_id` 为请求经过的组，包括规则选中的组，否则为 null），并在顶层报告 `last_checked_at`、`last_updated_at`、`next_check_at`、`last_error` 和 `required_codes`；后者按资产列出当前配置引用的分类，已排序。`last_error.code` 为失败阶段，例如 `http_status_rejected`、`checksum_mismatch` 或 `asset_validation_failed`。这些状态只存于内存，因此重启后在下一次尝试前为 null，`verified` 为 false。
 
 自动更新默认开启，间隔 24 小时；将 `auto_update.enabled` 设为 `false` 即关闭。启动后的首次检查在一个间隔加随机延迟之后执行，与已加载文件的新旧无关，因此升级或重启不会立即触发下载；需要立即更新时调用 `POST /geodata/update`。自动更新使用同一个 `geodata_update` operation，因此自动更新执行期间的手动更新返回 `409 state_conflict`；自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔；成功后恢复正常间隔。
 
