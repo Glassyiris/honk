@@ -575,7 +575,7 @@ async fn cleanup_stage<T>(future: impl Future<Output = anyhow::Result<T>>) -> an
         .map_err(|_| anyhow::anyhow!("runtime cleanup exceeded its stop deadline"))?
 }
 
-async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
+pub(super) async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
     let Some(handle) = task.as_mut() else {
         return Ok(());
     };

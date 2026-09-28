@@ -22,7 +22,7 @@ impl ControlPlane {
 
     /// Stop the retained DNS/persistence owners and clean up backend state.
     pub(super) async fn finalize_shutdown(&mut self) -> anyhow::Result<()> {
-        let state_tick = self.state_tick.abort_and_join().await;
+        let state_tick = self.state_tick.stop_and_join().await;
         info!("shutdown: stopping DNS controller");
         self.dns_controller.shutdown(STAGE_TIMEOUT).await;
         let dns_cache = self.dns_controller.cache().await;
