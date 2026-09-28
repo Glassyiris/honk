@@ -126,21 +126,21 @@ impl GeositeMatcher {
     }
 
     pub(crate) fn matches(&self, domain: &str) -> bool {
-        self.matches_bounded::<false>(domain, None)
+        self.matches_bounded::<false>(domain, &domain.to_lowercase(), None)
     }
 
     fn matches_bounded<const BOUNDED: bool>(
         &self,
         domain: &str,
+        lower: &str,
         deadline: Option<std::time::Instant>,
     ) -> bool {
-        let lower = domain.to_lowercase();
-        if self.full.contains(lower.as_str()) {
+        if self.full.contains(lower) {
             return true;
         }
         // Dot-boundary suffix walk: check the host itself, then each parent.
         if !self.suffix.is_empty() {
-            let mut d = lower.as_str();
+            let mut d = lower;
             loop {
                 if self.suffix.contains(d) {
                     return true;
@@ -165,6 +165,7 @@ impl GeositeMatcher {
 #[derive(Default)]
 pub(crate) struct SharedMatchers {
     ip: Vec<Arc<IpMatcher>>,
+    geosite: std::collections::HashMap<String, Arc<GeositeMatcher>>,
 }
 
 impl SharedMatchers {
@@ -175,6 +176,12 @@ impl SharedMatchers {
         let matcher = Arc::new(IpMatcher::new(nets));
         self.ip.push(Arc::clone(&matcher));
         matcher
+    }
+
+    /// One matcher per selector (a category plus its attribute filter).
+    pub(crate) fn geosite(&mut self, code: &str, domains: &[GeositeDomain]) -> Arc<GeositeMatcher> {
+        let matcher = self.geosite.entry(code.trim().to_lowercase());
+        Arc::clone(matcher.or_insert_with(|| Arc::new(GeositeMatcher::build(domains))))
     }
 }
 
@@ -194,7 +201,8 @@ enum DomainMatcher {
     },
     Geosite {
         key: DomainMatcherKey,
-        matcher: GeositeMatcher,
+        /// One matcher per configured selector, matched as their union.
+        matchers: Vec<Arc<GeositeMatcher>>,
     },
 }
 
@@ -238,7 +246,7 @@ impl DomainMatcher {
         })
     }
 
-    fn geosite(domains: Vec<GeositeDomain>) -> Self {
+    fn geosite(domains: &[GeositeDomain], matchers: Vec<Arc<GeositeMatcher>>) -> Self {
         let mut alternatives = domains
             .iter()
             .map(|domain| match domain {
@@ -255,7 +263,7 @@ impl DomainMatcher {
                 class: 1,
                 alternatives,
             },
-            matcher: GeositeMatcher::build(&domains),
+            matchers,
         }
     }
 
@@ -289,7 +297,12 @@ impl DomainMatcher {
                         domain.contains(keyword)
                     })
             }
-            Self::Geosite { matcher, .. } => matcher.matches_bounded::<BOUNDED>(domain, deadline),
+            Self::Geosite { matchers, .. } => {
+                let lower = domain.to_lowercase();
+                matchers
+                    .iter()
+                    .any(|matcher| matcher.matches_bounded::<BOUNDED>(domain, &lower, deadline))
+            }
         }
     }
 }
@@ -631,6 +644,18 @@ impl Router {
         self.policy_fingerprint
     }
 
+    #[cfg(test)]
+    pub(crate) fn geosite_matchers(&self) -> Vec<&Arc<GeositeMatcher>> {
+        self.domain_matchers
+            .iter()
+            .filter_map(|matcher| match matcher {
+                DomainMatcher::Geosite { matchers, .. } => Some(matchers),
+                DomainMatcher::Ordinary { .. } => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     pub fn domain_predicate_count(&self) -> usize {
         self.domain_matchers.len()
     }
@@ -873,7 +898,13 @@ fn append_conditions(
         });
     }
     if !geosites.is_empty() {
-        let id = registry.intern(DomainMatcher::geosite(assets.geosite_domains(geosites)))?;
+        let (mut domains, mut matchers) = (Vec::new(), Vec::new());
+        for code in geosites {
+            let selected = assets.geosite_domains(std::slice::from_ref(code));
+            matchers.push(shared.geosite(code, &selected));
+            domains.extend(selected);
+        }
+        let id = registry.intern(DomainMatcher::geosite(&domains, matchers))?;
         conditions.push(CompiledCondition {
             not,
             predicate: CompiledPredicate::Domain(id),

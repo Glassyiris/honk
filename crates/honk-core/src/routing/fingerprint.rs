@@ -243,13 +243,14 @@ mod tests {
     #[test]
     fn semantic_encoder_preserves_domain_class_tags_and_registry_order() {
         let ordinary = DomainMatcher::ordinary(&[], &[], &["example.com".into()], &[]).unwrap();
-        let geosite = DomainMatcher::geosite(vec![GeositeDomain::Keyword("example.com".into())]);
+        let geosite =
+            DomainMatcher::geosite(&[GeositeDomain::Keyword("example.com".into())], Vec::new());
         assert_ne!(
             digest(&[], std::slice::from_ref(&ordinary)),
             digest(&[], std::slice::from_ref(&geosite))
         );
 
-        let full = DomainMatcher::geosite(vec![GeositeDomain::Full("example.com".into())]);
+        let full = DomainMatcher::geosite(&[GeositeDomain::Full("example.com".into())], Vec::new());
         assert_ne!(
             digest(&[], std::slice::from_ref(&geosite)),
             digest(&[], &[full])
