@@ -338,12 +338,8 @@ impl FlowStore {
         let new_bytes = record.bytes;
         self.updated(record);
         store.record_bytes = store.record_bytes - old_bytes + new_bytes;
-        let previous_count = store.records.len();
         self.enforce_limit(&mut store, now);
-        index
-            .checked_sub(previous_count - store.records.len())
-            .and_then(|index| store.records.get(index))
-            .is_some_and(|record| record.id() == id)
+        store.records.iter().any(|record| record.id() == id)
     }
 
     pub(crate) fn record_step(&self, id: &str, generation: Option<u64>, data: StepData) -> bool {
@@ -429,7 +425,8 @@ impl FlowStore {
         store.tombstones.push_back((record.id().to_owned(), now));
     }
 
-    /// Expired records give way before a live one is evicted for room.
+    /// Expired records give way first, then ended ones, before a live one is
+    /// evicted for room.
     fn enforce_limit(&self, store: &mut Store, now: Instant) {
         let over = |store: &Store| {
             store.records.len() > store.max_records
@@ -442,7 +439,12 @@ impl FlowStore {
             if store.records.is_empty() {
                 break;
             }
-            self.evict(store, 0, now, "buffer_overflow");
+            let index = store
+                .records
+                .iter()
+                .position(|record| record.ended.is_some())
+                .unwrap_or(0);
+            self.evict(store, index, now, "buffer_overflow");
         }
     }
 

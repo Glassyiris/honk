@@ -775,7 +775,7 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
         inner
             .records
             .iter()
-            .all(|record| record.id() != original_id)
+            .any(|record| record.id() == original_id)
     );
     drop(inner);
     // The ring at its own limit still leaves the listing its reserved share:
@@ -832,6 +832,36 @@ fn room_making_prunes_expired_records_before_evicting_live_ones() {
     assert!(store.get(live.id(), &request_id()).is_ok());
     assert!(store.get(newcomer.id(), &request_id()).is_ok());
     assert_eq!(store.inner.lock().records.len(), 2);
+}
+
+#[test]
+fn a_step_survives_pruning_an_expired_record_behind_it() {
+    let store = store();
+    store.set_limits(64, 0);
+    let live = begin(&store, "tcp");
+    begin(&store, "tcp").finish("closed", "relay_finished");
+    store.inner.lock().max_records = 1;
+    assert!(store.record_step(live.id(), Some(1), dial_mode()));
+    assert_eq!(store.inner.lock().records.len(), 1);
+}
+
+#[test]
+fn room_making_evicts_ended_records_before_the_oldest_live_one() {
+    let store = store();
+    store.set_limits(3, 3600);
+    let live = begin(&store, "tcp");
+    let ended: Vec<String> = (0..3)
+        .map(|_| {
+            let flow = begin(&store, "tcp");
+            flow.finish("closed", "relay_finished");
+            flow.id().to_owned()
+        })
+        .collect();
+    let newcomer = begin(&store, "tcp");
+    assert!(store.get(live.id(), &request_id()).is_ok());
+    let inner = store.inner.lock();
+    let retained: Vec<&str> = inner.records.iter().map(|record| record.id()).collect();
+    assert_eq!(retained, [live.id(), ended[2].as_str(), newcomer.id()]);
 }
 
 #[test]
