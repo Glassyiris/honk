@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -12,11 +13,61 @@ use super::{
 
 struct ProviderState {
     current: Arc<DnsRuntime>,
-    retired: VecDeque<Arc<DnsRuntime>>,
+    retired: VecDeque<Arc<RetiredRuntime>>,
     paused: bool,
     pausing: bool,
     stopped: bool,
     failure: Option<DnsPauseError>,
+}
+
+/// Owns a retired generation's outbound shutdown after its supervisor has
+/// released the runtime, so reloads do not pin old forwarders and routers.
+struct RetiredRuntime {
+    generation: RuntimeGeneration,
+    outbound: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
+    cleanup_failed: AtomicBool,
+    runtime: Mutex<Option<Arc<DnsRuntime>>>,
+}
+
+impl RetiredRuntime {
+    fn new(runtime: Arc<DnsRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            generation: runtime.generation(),
+            outbound: runtime.parts.outbound_runtime.clone(),
+            cleanup_failed: AtomicBool::new(false),
+            runtime: Mutex::new(Some(runtime)),
+        })
+    }
+
+    fn runtime(&self) -> Option<Arc<DnsRuntime>> {
+        self.runtime.lock().clone()
+    }
+
+    fn release(&self, cleanup: Result<(), DnsPauseError>) {
+        self.cleanup_failed
+            .store(cleanup.is_err(), Ordering::Release);
+        // Run the runtime destructors outside the entry lock.
+        let released = self.runtime.lock().take();
+        drop(released);
+    }
+
+    async fn force_shutdown_outbound(&self) -> Result<(), DnsPauseError> {
+        if let Some(outbound) = &self.outbound {
+            outbound.shutdown().await;
+        }
+        match self.runtime() {
+            Some(runtime) => runtime.cleanup_result(),
+            None if self.cleanup_failed.load(Ordering::Acquire)
+                || self
+                    .outbound
+                    .as_ref()
+                    .is_some_and(|outbound| outbound.tasks_failed()) =>
+            {
+                Err(DnsPauseError::TaskFailed)
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 pub(crate) struct DnsServiceProvider {
@@ -56,20 +107,25 @@ impl PreparedPublication<'_> {
         if self.state.paused {
             retired.request_cancellation();
         }
-        self.state.retired.push_back(Arc::clone(&retired));
+        let entry = RetiredRuntime::new(Arc::clone(&retired));
+        self.state.retired.push_back(Arc::clone(&entry));
         if self.state.retired.len() > MAX_RETIRED_RUNTIMES
             && let Some(oldest) = self.state.retired.pop_front()
         {
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::RuntimeForcedClose);
             tracing::warn!(
-                generation = oldest.generation().get(),
+                generation = oldest.generation.get(),
                 reason = "retired_runtime_limit",
                 "DNS runtime forced close"
             );
-            oldest.request_cancellation();
+            let runtime = oldest.runtime();
+            if let Some(runtime) = &runtime {
+                runtime.request_cancellation();
+            }
             if !self.state.paused
-                || oldest.state() != RuntimeState::Closed
-                || oldest.lease_count() != 0
+                || runtime.is_some_and(|runtime| {
+                    runtime.state() != RuntimeState::Closed || runtime.lease_count() != 0
+                })
             {
                 self.supervisors
                     .spawn(async move { oldest.force_shutdown_outbound().await });
@@ -81,8 +137,12 @@ impl PreparedPublication<'_> {
                 Arc::clone(&retired).retire(deadline).await;
                 // Keep even cap-evicted generations owned until their last caller exits.
                 retired.wait_for_zero_leases().await;
-                retired.cleanup_result()
+                let cleanup = retired.cleanup_result();
+                entry.release(cleanup);
+                cleanup
             });
+        } else {
+            entry.release(retired.cleanup_result());
         }
     }
 }
@@ -169,10 +229,10 @@ impl DnsServiceProvider {
             return;
         }
         state.pausing = true;
-        let runtimes = std::iter::once(Arc::clone(&state.current))
-            .chain(state.retired.iter().cloned())
-            .collect::<Vec<_>>();
-        for runtime in &runtimes {
+        let current = Arc::clone(&state.current);
+        let retired = state.retired.iter().cloned().collect::<Vec<_>>();
+        current.request_cancellation();
+        for runtime in retired.iter().filter_map(|entry| entry.runtime()) {
             runtime.request_cancellation();
         }
         let mut supervisors = std::mem::take(&mut *self.supervisors.lock());
@@ -192,9 +252,13 @@ impl DnsServiceProvider {
             while let Some(result) = supervisors.join_next().await {
                 failed |= !matches!(result, Ok(Ok(())));
             }
-            for runtime in runtimes {
-                runtime.wait_for_zero_leases().await;
-                failed |= runtime.force_shutdown_outbound().await.is_err();
+            current.wait_for_zero_leases().await;
+            failed |= current.force_shutdown_outbound().await.is_err();
+            for entry in retired {
+                if let Some(runtime) = entry.runtime() {
+                    runtime.wait_for_zero_leases().await;
+                }
+                failed |= entry.force_shutdown_outbound().await.is_err();
             }
             if failed {
                 Err(DnsPauseError::TaskFailed)
