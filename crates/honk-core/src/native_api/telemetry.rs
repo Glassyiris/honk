@@ -65,15 +65,18 @@ struct MemoryPoint {
     sampled_at: String,
     rss_bytes: Option<String>,
     cgroup_current_bytes: Option<String>,
+    kernel_ebpf_bytes: Option<String>,
 }
 
 #[derive(Default)]
 struct MemoryReading {
     rss: Option<u64>,
     cgroup: Option<CgroupReading>,
+    ebpf: Option<(u64, SystemTime)>,
 }
 
 struct CgroupReading {
+    scope: &'static str,
     current: Option<u64>,
     limit: Option<u64>,
     limit_readable: bool,
@@ -167,6 +170,7 @@ impl Telemetry {
                             .as_ref()
                             .and_then(|cgroup| cgroup.current)
                             .map(|value| value.to_string()),
+                        kernel_ebpf_bytes: reading.ebpf.map(|(bytes, _)| bytes.to_string()),
                     },
                 },
             );
@@ -289,15 +293,18 @@ pub(super) async fn memory(
     let samples = state.observation.telemetry.state.lock();
     let reading = &samples.latest;
     let cgroup = reading.cgroup.as_ref().map(|value| json!({
-        "scope": "unknown",
+        "scope": value.scope,
         "current_bytes": value.current.map(|value| value.to_string()),
         "limit_bytes": value.limit.map(|value| value.to_string()),
         "events": {"high": value.events[0].map(|value| value.to_string()), "oom": value.events[1].map(|value| value.to_string()), "oom_kill": value.events[2].map(|value| value.to_string())},
     }));
+    let kernel = reading
+        .ebpf
+        .map(|(bytes, at)| json!({"ebpf_bytes": bytes.to_string(), "sampled_at": timestamp(at)}));
     Ok(Json(json!({
         "observed_at": timestamp(SystemTime::now()),
         "process": {"rss_bytes": reading.rss.map(|value| value.to_string())},
-        "cgroup": cgroup, "kernel": null,
+        "cgroup": cgroup, "kernel": kernel,
     }))
     .into_response())
 }
@@ -346,6 +353,7 @@ impl MemoryReading {
             cgroup
                 .is_some_and(|group| group.events[2].is_some())
                 .then_some("cgroup.events.oom_kill"),
+            self.ebpf.is_some().then_some("kernel.ebpf_bytes"),
         ]
         .into_iter()
         .flatten()
@@ -451,15 +459,79 @@ fn cgroup_events(contents: &str) -> [Option<u64>; 3] {
     result
 }
 
+/// `service` only when honk is alone in a leaf cgroup, so the cgroup's memory is honk's own.
+async fn cgroup_scope(directory: &Path) -> &'static str {
+    let Ok(file) = tokio::fs::File::open(directory.join("cgroup.procs")).await else {
+        return "unknown";
+    };
+    // A lone PID line fits in 16 bytes; a longer file already lists another process.
+    let mut head = Vec::new();
+    if file.take(16).read_to_end(&mut head).await.is_err() || head.is_empty() {
+        return "unknown";
+    }
+    if head != format!("{}\n", std::process::id()).into_bytes() {
+        return "shared";
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return "unknown";
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) => {
+                return "shared";
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return "service",
+            Err(_) => return "unknown",
+        }
+    }
+}
+
+fn bpf_memlock(fdinfo: &str) -> Option<u64> {
+    let bpf = fdinfo
+        .lines()
+        .any(|line| line.starts_with("map_type:") || line.starts_with("prog_type:"));
+    bpf.then(|| {
+        fdinfo
+            .lines()
+            .find_map(|line| unsigned(line.strip_prefix("memlock:")?))
+    })?
+}
+
+/// Sums the memlock charged to this process's own BPF maps and programs; needs no BTF.
+fn ebpf_bytes(proc_self: &Path) -> Option<u64> {
+    let fdinfo = proc_self.join("fdinfo");
+    std::fs::read_dir(proc_self.join("fd"))
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            std::fs::read_link(entry.path()).is_ok_and(|target| {
+                matches!(
+                    target.to_str(),
+                    Some("anon_inode:bpf-map" | "anon_inode:bpf-prog")
+                )
+            })
+        })
+        .filter_map(|entry| {
+            bpf_memlock(&std::fs::read_to_string(fdinfo.join(entry.file_name())).ok()?)
+        })
+        .reduce(u64::saturating_add)
+}
+
 async fn read_memory(proc_self: &Path) -> MemoryReading {
-    let (status, membership, mounts) = tokio::join!(
+    let fds = proc_self.to_path_buf();
+    let (status, membership, mounts, ebpf) = tokio::join!(
         bounded_read(proc_self.join("status"), 64 * 1024),
         bounded_read(proc_self.join("cgroup"), 64 * 1024),
         bounded_read(proc_self.join("mountinfo"), 256 * 1024),
+        tokio::task::spawn_blocking(
+            move || ebpf_bytes(&fds).map(|bytes| (bytes, SystemTime::now()))
+        ),
     );
     let mut reading = MemoryReading {
         rss: status.as_deref().and_then(rss),
         cgroup: None,
+        ebpf: ebpf.ok().flatten(),
     };
     let Some(directory) = membership
         .as_deref()
@@ -468,10 +540,11 @@ async fn read_memory(proc_self: &Path) -> MemoryReading {
     else {
         return reading;
     };
-    let (current, limit, events) = tokio::join!(
+    let (current, limit, events, scope) = tokio::join!(
         bounded_read(directory.join("memory.current"), 128),
         bounded_read(directory.join("memory.max"), 128),
         bounded_read(directory.join("memory.events"), 16 * 1024),
+        cgroup_scope(&directory),
     );
     let current = current.as_deref().and_then(unsigned);
     let limit_value = limit.as_deref().and_then(unsigned);
@@ -480,6 +553,7 @@ async fn read_memory(proc_self: &Path) -> MemoryReading {
     let events = events.as_deref().map(cgroup_events).unwrap_or([None; 3]);
     if current.is_some() || limit_readable || events.iter().any(Option::is_some) {
         reading.cgroup = Some(CgroupReading {
+            scope,
             current,
             limit: limit_value,
             limit_readable,
