@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    body::to_bytes,
     extract::Request,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -163,14 +162,7 @@ pub(super) async fn mutate(
         if !deleting {
             config::json_type(&request)?;
         }
-        let body = to_bytes(request.into_body(), 65536).await.map_err(|_| {
-            ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Management request body exceeds its limit",
-                None,
-            )
-        })?;
+        let body = super::body::buffered(request.into_body()).await;
         let mutation = match action {
             Action::DeleteNode(_) | Action::DeleteProvider(_) if !body.is_empty() => {
                 return Err(invalid());

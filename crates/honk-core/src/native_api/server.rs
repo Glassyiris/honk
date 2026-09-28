@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::types::{TrafficBytes, TrafficConnections, TrafficRates, TrafficSummary};
-use super::{NativeState, Peer, canonical_ip, router, timestamp};
+use super::{NativeState, Peer, router, timestamp};
 use crate::connection_tracker::ConnectionTracker;
 
 pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Receiver<bool>) {
@@ -384,7 +384,7 @@ async fn supervise(
                         continue;
                     }
                 };
-                let peer = Peer(canonical_ip(peer.ip()));
+                let peer = Peer(peer.ip().to_canonical());
                 let service = tower::Layer::layer(&Extension(peer), router.clone());
                 children.spawn(serve(stream, service, connection_receiver.clone()));
             }

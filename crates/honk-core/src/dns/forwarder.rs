@@ -501,19 +501,6 @@ mod response {
         })
     }
 
-    /// Human-readable qtype name for logging.
-    pub(crate) fn qtype_name(qtype: u16) -> &'static str {
-        match qtype {
-            1 => "A",
-            28 => "AAAA",
-            5 => "CNAME",
-            15 => "MX",
-            16 => "TXT",
-            2 => "NS",
-            _ => "OTHER",
-        }
-    }
-
     /// Build a NODATA response while preserving the exact question bytes.
     pub(crate) fn make_empty_response(raw_query: &[u8], query: &QueryContext) -> Vec<u8> {
         make_address_response(raw_query, query, &[], 0)
@@ -602,8 +589,9 @@ mod strategy {
     use crate::dns::query::{DnsRequestMeta, QueryContext};
     use honk_config::dns::DnsStrategy;
 
-    use super::response::{make_empty_response, qtype_name, response_has_family_ips};
+    use super::response::{make_empty_response, response_has_family_ips};
     use super::{DnsForwarder, ResolveMode, ResolveOptions};
+    use honk_outbound::bootstrap::qtype_name;
 
     impl DnsForwarder {
         /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
@@ -709,6 +697,51 @@ pub(crate) use ttl::{
     extract_min_ttl, extract_min_ttl_including_zero, extract_soa_negative_ttl, rewrite_answer_ttls,
     traversal_strings,
 };
+
+/// DNS health probe query: one A question for google.com with a random
+/// transaction id, so a stale or foreign answer cannot pass validation.
+pub fn dns_probe_query() -> Vec<u8> {
+    let mut query = build_dns_query("google.com", 1);
+    query[..2].copy_from_slice(&rand::random::<u16>().to_be_bytes());
+    query
+}
+
+/// Accept only a successful answer to exactly `query` (id and question).
+pub fn validate_dns_probe_response(query: &[u8], response: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        response.get(..2) == query.get(..2),
+        "DNS response transaction mismatch"
+    );
+    let context = crate::dns::query::QueryContext::parse_with_profile(
+        query,
+        crate::dns::query::IngressProfile::Tcp,
+    )?;
+    crate::dns::response::ResponseTemplate::check(&context, response)?;
+    anyhow::ensure!(response[3] & 15 == 0, "DNS response reports failure");
+    Ok(())
+}
+
+/// One validated DNS probe exchange through a UDP relay; the answer must
+/// come from the relay's own address.
+pub async fn udp_dns_probe(
+    transport: &dyn honk_outbound::proxy::PacketTransport,
+) -> anyhow::Result<honk_outbound::alive::ProbeMeasurement> {
+    let query = dns_probe_query();
+    let start = std::time::Instant::now();
+    transport.send_packet_confirmed(&query).await?;
+    let mut response = vec![0; 65535];
+    let (length, source) = transport.recv_packet(&mut response).await?;
+    let relay = transport.relay_addr();
+    anyhow::ensure!(
+        source.ip().to_canonical() == relay.ip().to_canonical() && source.port() == relay.port(),
+        "DNS response peer mismatch"
+    );
+    validate_dns_probe_response(&query, &response[..length])?;
+    Ok(honk_outbound::alive::ProbeMeasurement {
+        latency: start.elapsed(),
+        observed_at: std::time::SystemTime::now(),
+    })
+}
 
 #[cfg(test)]
 pub(crate) use tests::make_nxdomain_response;

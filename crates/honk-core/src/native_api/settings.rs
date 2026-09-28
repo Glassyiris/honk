@@ -500,35 +500,8 @@ pub(super) async fn patch(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
-    let mut types = request.headers().get_all("content-type").iter();
-    if !types
-        .next()
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
-        })
-        || types.next().is_some()
-    {
-        return Err(super::error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ErrorCode::UnsupportedMediaType,
-            "Expected application/json",
-            id,
-        ));
-    }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| {
-            super::error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Request body exceeds its limit",
-                id,
-            )
-        })?;
+    super::config::json_type(&request)?;
+    let bytes = super::body::buffered(request.into_body()).await;
     let mut value = super::body::value(&bytes, || invalid(id))?;
     let geodata = value
         .as_object_mut()

@@ -1,5 +1,6 @@
 use super::*;
 use crate::dns::PinnedNameResolver;
+use crate::native_api::catalog::member_id;
 
 pub(super) struct Specification {
     pub(super) target: Target,
@@ -130,7 +131,7 @@ fn plan(
             Some(Members::Scope(MemberScope::Leaves)) => manager
                 .native_probe_leaves(group, MAX_MEMBERS + 1)
                 .into_iter()
-                .map(NativeGroupMember::Node)
+                .map(GroupMember::Node)
                 .collect(),
             _ => {
                 let mut members = Vec::new();
@@ -158,7 +159,7 @@ fn plan(
         let Target::Node { node_id } = &request.target else {
             unreachable!()
         };
-        vec![NativeGroupMember::Node(
+        vec![GroupMember::Node(
             config
                 .nodes
                 .iter()
@@ -186,7 +187,7 @@ fn plan(
     let mut unique: HashMap<(Uuid, Transport, Family), usize> = HashMap::new();
     for member in members {
         let member_id = member_id(member, &identity).ok_or_else(not_found)?;
-        if let NativeGroupMember::Node(node) = member {
+        if let GroupMember::Node(node) = member {
             if request.kind == Kind::TcpConnect
                 && matches!(
                     node.protocol(),
@@ -390,12 +391,6 @@ fn address() -> ApiError {
     )
 }
 
-fn member_id(member: NativeGroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
-    match member {
-        NativeGroupMember::Node(node) => Some(node.id.to_string()),
-        NativeGroupMember::Group(group) => identity.groups.get(&group.name).cloned(),
-    }
-}
 pub(super) fn selections(
     manager: &GroupManager,
     identity: &CatalogIdentity,
@@ -506,8 +501,8 @@ async fn resolve<'a>(
     refused: &'static str,
 ) -> Result<&'a [IpAddr], ApiError> {
     if !resolved.contains_key(host) {
-        let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
-            vec![canonical_ip(ip)]
+        let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            vec![ip]
         } else {
             match dns.resolve(host).await {
                 Ok(addresses) => addresses,
@@ -518,7 +513,7 @@ async fn resolve<'a>(
             }
         };
         let mut unique = Vec::with_capacity(addresses.len());
-        for ip in addresses.into_iter().map(canonical_ip) {
+        for ip in addresses.into_iter().map(|ip| ip.to_canonical()) {
             if !unique.contains(&ip) {
                 unique.push(ip);
             }

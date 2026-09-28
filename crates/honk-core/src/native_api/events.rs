@@ -31,13 +31,13 @@ use uuid::Uuid;
 
 use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
 
-const MAX_EVENTS: usize = 512;
-const MAX_CLIENTS: usize = 16;
+pub(super) const MAX_EVENTS: usize = 512;
+pub(super) const MAX_CLIENTS: usize = 16;
 const CLIENT_QUEUE: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 4096;
 const MAX_RETAINED_BYTES: usize = MAX_EVENTS * MAX_PAYLOAD_BYTES;
 pub(super) const RETENTION: Duration = Duration::from_secs(60);
-const HEARTBEAT: Duration = Duration::from_secs(15);
+pub(super) const HEARTBEAT: Duration = Duration::from_secs(15);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 // Signed cursors distinguish an after-record checkpoint from the record itself.
 const CHECKPOINT_BIT: u64 = 1 << 63;

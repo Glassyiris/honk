@@ -20,7 +20,7 @@ use honk_config::{
 };
 use honk_outbound::{
     alive::{AliveDialerSet, IpVersion, NativeHealthObservation},
-    group::{GroupManager, NativeGroupMember, SelectionNetwork},
+    group::{GroupManager, GroupMember, SelectionNetwork},
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
@@ -385,7 +385,7 @@ pub(super) fn node_value(
         .filter_map(|(name, id)| {
             manager
                 .native_members(name)
-                .any(|member| matches!(member, NativeGroupMember::Node(node) if node.id == node_id))
+                .any(|member| matches!(member, GroupMember::Node(node) if node.id == node_id))
                 .then_some(id)
         })
         .collect();
@@ -418,8 +418,8 @@ fn node_snapshot(
         manager
             .native_members(name)
             .filter_map(|member| match member {
-                NativeGroupMember::Node(node) => Some(node.id),
-                NativeGroupMember::Group(_) => None,
+                GroupMember::Node(node) => Some(node.id),
+                GroupMember::Group(_) => None,
             })
             .collect()
     });
@@ -453,7 +453,7 @@ fn node_snapshot(
     let mut membership: HashMap<Uuid, Vec<&String>> = HashMap::new();
     for (name, group_id) in &identity.groups {
         for member in manager.native_members(name) {
-            if let NativeGroupMember::Node(node) = member {
+            if let GroupMember::Node(node) = member {
                 membership.entry(node.id).or_default().push(group_id);
             }
         }
@@ -562,10 +562,10 @@ fn listener_secrets(state: &NativeState) -> ListenerSecrets {
         .with_clash(&state.clash_secret)
 }
 
-fn member_id(member: NativeGroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
+pub(crate) fn member_id(member: GroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
     match member {
-        NativeGroupMember::Node(node) => Some(node.id.to_string()),
-        NativeGroupMember::Group(group) => identity.groups.get(&group.name).cloned(),
+        GroupMember::Node(node) => Some(node.id.to_string()),
+        GroupMember::Group(group) => identity.groups.get(&group.name).cloned(),
     }
 }
 
@@ -631,7 +631,7 @@ fn group_health(
     if group.check_url.is_none() {
         let mut seen = HashSet::new();
         for member in manager.native_members(&group.name) {
-            let NativeGroupMember::Node(node) = member else {
+            let GroupMember::Node(node) = member else {
                 continue;
             };
             if !seen.insert(node.id) {
@@ -689,8 +689,8 @@ fn group_value(
         .filter_map(|member| {
             let id = member_id(member, identity)?;
             let (name, kind) = match member {
-                NativeGroupMember::Node(node) => (&node.name, "node"),
-                NativeGroupMember::Group(group) => (&group.name, "group"),
+                GroupMember::Node(node) => (&node.name, "node"),
+                GroupMember::Group(group) => (&group.name, "group"),
             };
             Some(json!({ "id": id, "name": name, "kind": kind }))
         })

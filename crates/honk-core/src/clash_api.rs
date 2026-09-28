@@ -1363,20 +1363,12 @@ fn spawn_connection_sampler(
 }
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
-    use futures::StreamExt;
-    let selected = s
+    let summary = s
         .connection_tracker
-        .snapshot_close(None, None, usize::MAX)
+        .close_matching(None, None, usize::MAX)
+        .await
         .expect("all current tracked entries fit usize");
-    let mut pending: futures::stream::FuturesUnordered<_> = selected
-        .into_iter()
-        .map(|entry| s.connection_tracker.start_close(entry).wait())
-        .collect();
-    let mut failed = false;
-    while let Some(outcome) = pending.next().await {
-        failed |= outcome == crate::connection_tracker::CloseOutcome::Failed;
-    }
-    if failed {
+    if summary.failed {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::NO_CONTENT

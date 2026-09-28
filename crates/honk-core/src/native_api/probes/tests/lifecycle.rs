@@ -282,7 +282,7 @@ async fn pause_drains_started_and_disconnected_queued_jobs() {
 }
 
 #[tokio::test]
-async fn pause_cancels_body_and_reserved_capture_without_late_enqueue() {
+async fn pause_cancels_reserved_capture_without_late_enqueue() {
     let state = state(Config::default()).await;
     let service = &state.observation.probes;
     let (stop, receiver) = watch::channel(false);
@@ -325,37 +325,12 @@ async fn pause_cancels_body_and_reserved_capture_without_late_enqueue() {
         )
         .unwrap();
     assert!(!waiter.fresh);
-    let body = tokio::spawn({
-        let state = Arc::clone(&state);
-        async move {
-            let request = Request::builder()
-                .method("POST")
-                .uri("/api/v1/probes")
-                .header("content-type", "application/json")
-                .body(Body::from_stream(futures::stream::pending::<
-                    Result<bytes::Bytes, std::io::Error>,
-                >()))
-                .unwrap();
-            create(&state, request, &RequestId("body".into())).await
-        }
-    });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while service.gate.lock().requests != 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
     tokio::time::timeout(Duration::from_secs(1), service.pause())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
         capture.await.unwrap().unwrap_err().into_response().status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(
-        body.await.unwrap().unwrap_err().into_response().status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(

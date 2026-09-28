@@ -319,7 +319,8 @@ fn repeated_credential_failures_lock_logins_briefly() {
 
 #[test]
 fn setup_peers_are_loopback_or_private_only() {
-    use crate::native_api::{Peer, canonical_ip};
+    use crate::native_api::Peer;
+    use std::net::IpAddr;
     let allow = [
         "127.0.0.1",
         "::1",
@@ -343,19 +344,19 @@ fn setup_peers_are_loopback_or_private_only() {
     ];
     for ip in allow {
         assert!(
-            Peer(canonical_ip(ip.parse().unwrap())).may_set_up(),
+            Peer(ip.parse::<IpAddr>().unwrap().to_canonical()).may_set_up(),
             "{ip} may set up"
         );
     }
     for ip in deny {
         assert!(
-            !Peer(canonical_ip(ip.parse().unwrap())).may_set_up(),
+            !Peer(ip.parse::<IpAddr>().unwrap().to_canonical()).may_set_up(),
             "{ip} may not set up"
         );
     }
     // An IPv4-mapped peer is judged as the IPv4 address it carries.
-    assert!(Peer(canonical_ip("::ffff:10.0.0.1".parse().unwrap())).may_set_up());
-    assert!(!Peer(canonical_ip("::ffff:8.8.8.8".parse().unwrap())).may_set_up());
+    assert!(Peer("::ffff:10.0.0.1".parse::<IpAddr>().unwrap().to_canonical()).may_set_up());
+    assert!(!Peer("::ffff:8.8.8.8".parse::<IpAddr>().unwrap().to_canonical()).may_set_up());
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::{
 };
 
 use axum::{
-    body::{Body, to_bytes},
+    body::Body,
     extract::{Query, Request},
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
@@ -351,36 +351,15 @@ pub(super) async fn log(
 }
 
 async fn empty_body(request: Request, allow_object: bool, id: &RequestId) -> Result<(), ApiError> {
-    let content_types = request.headers().get_all(header::CONTENT_TYPE);
-    let json_type = content_types.iter().count() == 1
-        && content_types
-            .iter()
-            .next()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
-    let body = to_bytes(request.into_body(), 65_536).await.map_err(|_| {
-        error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::RequestTooLarge,
-            "DNS request body is too large",
-            id,
-        )
-    })?;
+    let json_type = super::config::json_type(&request);
+    let body = super::body::buffered(request.into_body()).await;
     if body.is_empty() {
         return Ok(());
     }
     if !allow_object {
         return Err(invalid_query(id));
     }
-    if !json_type {
-        return Err(error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ErrorCode::UnsupportedMediaType,
-            "Expected application/json",
-            id,
-        ));
-    }
+    json_type?;
     super::body::no_inputs(&body, || invalid_query(id))
 }
 

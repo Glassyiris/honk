@@ -484,10 +484,14 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
     }
 }
 
-#[cfg(feature = "native-api")]
-fn qtype_name(qtype: u16) -> &'static str {
+/// Human-readable qtype name for logs and flow observations.
+pub fn qtype_name(qtype: u16) -> &'static str {
     match qtype {
         1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        15 => "MX",
+        16 => "TXT",
         28 => "AAAA",
         65 => "HTTPS",
         _ => "UNKNOWN",

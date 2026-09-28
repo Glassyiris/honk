@@ -181,10 +181,10 @@ impl ControlPlane {
                         .into_iter()
                         .map(|(member, node)| {
                             let (tag, member_id) = match member {
-                                honk_outbound::group::NativeGroupMember::Node(member) => {
+                                honk_outbound::group::GroupMember::Node(member) => {
                                     (member.name.clone(), Some(member.id))
                                 }
-                                honk_outbound::group::NativeGroupMember::Group(member) => (
+                                honk_outbound::group::GroupMember::Group(member) => (
                                     member.name.clone(),
                                     identity
                                         .groups

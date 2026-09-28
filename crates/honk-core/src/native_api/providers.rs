@@ -9,7 +9,6 @@ use std::{
 
 use axum::{
     Json,
-    body::to_bytes,
     extract::Request,
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -419,14 +418,7 @@ pub(super) async fn refresh(
     if keys.next().is_some() {
         return Err(invalid_query(id));
     }
-    let body = to_bytes(request.into_body(), 65536).await.map_err(|_| {
-        ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::RequestTooLarge,
-            "Refresh request body exceeds its limit.",
-            Some(id.0.clone()),
-        )
-    })?;
+    let body = super::body::buffered(request.into_body()).await;
     let operations = &state.observation.operations;
     let path = format!("/api/v1/providers/{provider_id}/refresh");
     let reservation = operations.reserve(

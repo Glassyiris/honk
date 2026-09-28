@@ -121,9 +121,7 @@ pub(in crate::native_api) async fn import(
     json_type(&request)?;
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
     let key = key.ok_or_else(precondition_required)?;
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     let body: Import = body::decode(&bytes, invalid)?;
     let initialized = store.cached_head().is_some();
     if initialized && !body.replace {
@@ -172,9 +170,7 @@ pub(in crate::native_api) async fn activate(
     if request.body().size_hint().upper() != Some(0) {
         json_type(&request)?;
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     body::no_inputs(&bytes, invalid)?;
     let exists = tokio::task::spawn_blocking(move || store.revision_exists(number))
         .await

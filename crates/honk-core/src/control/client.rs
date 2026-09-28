@@ -161,12 +161,12 @@ impl super::ControlPlane {
                 let selected = manager
                     .native_members(&name)
                     .find_map(|member| match member {
-                        honk_outbound::group::NativeGroupMember::Node(node)
+                        honk_outbound::group::GroupMember::Node(node)
                             if node.id.to_string() == member_id =>
                         {
                             Some(SelectorMember::Node(node.id))
                         }
-                        honk_outbound::group::NativeGroupMember::Group(group)
+                        honk_outbound::group::GroupMember::Group(group)
                             if catalog.groups.get(&group.name) == Some(&member_id) =>
                         {
                             Some(SelectorMember::Group(group.name.clone()))
@@ -208,18 +208,7 @@ impl super::ControlPlane {
                 (honk_outbound::group::SelectionNetwork::Tcp, "tcp"),
                 (honk_outbound::group::SelectionNetwork::Udp, "udp"),
             ] {
-                if matches!(
-                    (networks, network),
-                    (SelectorNetworks::Both, _)
-                        | (
-                            SelectorNetworks::Tcp,
-                            honk_outbound::group::SelectionNetwork::Tcp
-                        )
-                        | (
-                            SelectorNetworks::Udp,
-                            honk_outbound::group::SelectionNetwork::Udp
-                        )
-                ) {
+                if networks.contains(network) {
                     selected.push((
                         network,
                         self.connection_tracker

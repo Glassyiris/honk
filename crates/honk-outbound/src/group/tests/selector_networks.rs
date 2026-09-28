@@ -307,10 +307,10 @@ fn exact_selector_identity_survives_duplicate_tags_and_reload() {
     #[cfg(feature = "native-api")]
     {
         assert!(
-            matches!(manager.native_selection("parent", SelectionNetwork::Tcp).unwrap().member, NativeGroupMember::Node(node) if node.id == second.id)
+            matches!(manager.native_selection("parent", SelectionNetwork::Tcp).unwrap().member, GroupMember::Node(node) if node.id == second.id)
         );
         assert!(
-            matches!(manager.native_selection("parent", SelectionNetwork::Udp).unwrap().member, NativeGroupMember::Group(group) if group.name == "same")
+            matches!(manager.native_selection("parent", SelectionNetwork::Udp).unwrap().member, GroupMember::Group(group) if group.name == "same")
         );
     }
     parent.nodes.reverse();
@@ -446,7 +446,7 @@ fn automatic_group_pins_act_as_selector_choices_until_replaced() {
         );
         #[cfg(feature = "native-api")]
         assert!(
-            matches!(manager.native_selection("auto", SelectionNetwork::Tcp).unwrap().member, NativeGroupMember::Node(node) if node.id == b.id)
+            matches!(manager.native_selection("auto", SelectionNetwork::Tcp).unwrap().member, GroupMember::Node(node) if node.id == b.id)
         );
 
         alive.report_unavailable_forced(b.id, ProbeDomain::Tcp, IpVersion::V4);

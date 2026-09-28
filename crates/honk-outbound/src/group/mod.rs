@@ -36,7 +36,7 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use state::{SelectorState, UrlTestSelections};
 
 #[cfg(feature = "native-api")]
-pub use resolver::{NativeGroupMember, NativeGroupSelection};
+pub use resolver::NativeGroupSelection;
 pub use score::{
     ScoreAttempt, ScoreAttribution, ScoreBudgetCounters, ScoreBusinessGuard, ScoreCacheSnapshot,
     ScoreChallenger, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceQuestion, ScoreFeedback,
@@ -170,7 +170,7 @@ pub type SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>;
 
 /// Display tags may be shared by distinct nodes; retain the concrete member.
 #[derive(Clone, Copy)]
-enum GroupMember<'a> {
+pub enum GroupMember<'a> {
     Node(&'a Node),
     Group(&'a Group),
 }

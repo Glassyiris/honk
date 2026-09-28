@@ -282,13 +282,7 @@ pub(super) async fn trace(
     parse_query(request.uri(), &[], id)?;
     state.observation.trace.rate.admit(id)?;
     super::config::json_type(&request)?;
-    let bytes = tokio::time::timeout_at(
-        deadline.into(),
-        axum::body::to_bytes(request.into_body(), 65536),
-    )
-    .await
-    .map_err(|_| unavailable(id))?
-    .map_err(|_| too_large(id))?;
+    let bytes = super::body::buffered(request.into_body()).await;
     let request: TraceRequest = super::body::decode(&bytes, || invalid(id))?;
     request.input.validate(id)?;
     if !matches!(request.resolve, Resolve::None) {

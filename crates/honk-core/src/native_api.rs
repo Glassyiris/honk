@@ -254,14 +254,6 @@ impl Peer {
     }
 }
 
-/// An IPv4-mapped IPv6 peer is the IPv4 address it carries, so one rule covers both stacks.
-pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        other => other,
-    }
-}
-
 pub fn router(state: Arc<NativeState>) -> Router {
     let router = handlers::routes();
     let router = if state.settings.ui.is_empty() {

@@ -177,19 +177,16 @@ fn embedded_response(path: &str, navigation: bool, head: bool) -> Response {
 }
 
 fn decode_path(path: &str) -> Option<Cow<'_, str>> {
-    if !path.as_bytes().contains(&b'%') {
-        return Some(Cow::Borrowed(path));
+    // percent_decode passes a malformed escape through literally; reject it instead.
+    let malformed = path.split('%').skip(1).any(|escape| {
+        !escape
+            .get(..2)
+            .is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    });
+    if malformed {
+        return None;
     }
-    let mut bytes = path.bytes();
-    let mut decoded = Vec::with_capacity(path.len());
-    while let Some(byte) = bytes.next() {
-        decoded.push(if byte == b'%' {
-            let high = char::from(bytes.next()?).to_digit(16)?;
-            let low = char::from(bytes.next()?).to_digit(16)?;
-            ((high << 4) | low) as u8
-        } else {
-            byte
-        });
-    }
-    String::from_utf8(decoded).ok().map(Cow::Owned)
+    percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()
 }

@@ -51,7 +51,7 @@ pub enum SelectorNetworks {
 }
 
 impl SelectorNetworks {
-    fn contains(self, network: SelectionNetwork) -> bool {
+    pub fn contains(self, network: SelectionNetwork) -> bool {
         matches!(
             (self, network),
             (Self::Both, _)

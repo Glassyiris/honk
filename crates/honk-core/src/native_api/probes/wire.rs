@@ -261,7 +261,7 @@ async fn attempt_wire(
                                 connect_timeout,
                             )
                             .await?;
-                        udp_dns(transport.as_ref()).await
+                        crate::dns::forwarder::udp_dns_probe(transport.as_ref()).await
                     }
                 }
             })
@@ -288,28 +288,10 @@ async fn attempt_wire(
     outcome
 }
 
-fn dns_query() -> Vec<u8> {
-    let mut query = crate::dns::forwarder::build_dns_query("google.com", 1);
-    query[..2].copy_from_slice(&Uuid::new_v4().as_bytes()[..2]);
-    query
-}
-fn validate_dns(query: &[u8], response: &[u8]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        response.get(..2) == query.get(..2),
-        "DNS response transaction mismatch"
-    );
-    let context = crate::dns::query::QueryContext::parse_with_profile(
-        query,
-        crate::dns::query::IngressProfile::Tcp,
-    )?;
-    crate::dns::response::ResponseTemplate::check(&context, response)?;
-    anyhow::ensure!(response[3] & 15 == 0, "DNS response reports failure");
-    Ok(())
-}
 async fn tcp_dns<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
 ) -> anyhow::Result<ProbeMeasurement> {
-    let query = dns_query();
+    let query = crate::dns::forwarder::dns_probe_query();
     let start = std::time::Instant::now();
     stream.write_u16(u16::try_from(query.len())?).await?;
     stream.write_all(&query).await?;
@@ -317,26 +299,7 @@ async fn tcp_dns<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     let length = usize::from(stream.read_u16().await?);
     let mut response = vec![0; length];
     stream.read_exact(&mut response).await?;
-    validate_dns(&query, &response)?;
-    Ok(ProbeMeasurement {
-        latency: start.elapsed(),
-        observed_at: SystemTime::now(),
-    })
-}
-async fn udp_dns(
-    transport: &dyn honk_outbound::proxy::PacketTransport,
-) -> anyhow::Result<ProbeMeasurement> {
-    let query = dns_query();
-    let start = std::time::Instant::now();
-    transport.send_packet_confirmed(&query).await?;
-    let mut response = vec![0; 65535];
-    let (length, source) = transport.recv_packet(&mut response).await?;
-    anyhow::ensure!(
-        canonical_ip(source.ip()) == canonical_ip(transport.relay_addr().ip())
-            && source.port() == transport.relay_addr().port(),
-        "DNS response peer mismatch"
-    );
-    validate_dns(&query, &response[..length])?;
+    crate::dns::forwarder::validate_dns_probe_response(&query, &response)?;
     Ok(ProbeMeasurement {
         latency: start.elapsed(),
         observed_at: SystemTime::now(),
@@ -386,7 +349,11 @@ mod tests {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(address).await.unwrap();
         let transport = honk_outbound::proxy::UdpSocketTransport::new(Arc::new(socket), address);
-        assert!(udp_dns(&transport).await.is_err());
+        assert!(
+            crate::dns::forwarder::udp_dns_probe(&transport)
+                .await
+                .is_err()
+        );
         udp.await.unwrap();
     }
 }

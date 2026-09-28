@@ -19,6 +19,14 @@ pub(crate) enum CloseOutcome {
     Failed,
 }
 
+/// Tally of one bulk close; `failed` means some retirement could not be confirmed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CloseSummary {
+    pub(crate) closed: usize,
+    pub(crate) skipped: usize,
+    pub(crate) failed: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClosePhase {
     Active,
@@ -375,6 +383,32 @@ impl ConnectionTracker {
             });
         }
         Ok(selected)
+    }
+
+    /// Closes every connection `snapshot_close` selects and tallies the outcomes.
+    pub(crate) async fn close_matching(
+        &self,
+        network: Option<&str>,
+        source: Option<IpAddr>,
+        maximum: usize,
+    ) -> Result<CloseSummary, ()> {
+        use futures::StreamExt;
+        // All claims precede the first wait; caller cancellation cannot abandon a suffix.
+        let mut pending: futures::stream::FuturesUnordered<_> = self
+            .snapshot_close(network, source, maximum)?
+            .into_iter()
+            .map(|selected| self.start_close(selected).wait())
+            .collect();
+        let mut summary = CloseSummary::default();
+        while let Some(outcome) = pending.next().await {
+            match outcome {
+                CloseOutcome::Closed => summary.closed += 1,
+                CloseOutcome::NotClosable => summary.skipped += 1,
+                CloseOutcome::Gone => {}
+                CloseOutcome::Failed => summary.failed = true,
+            }
+        }
+        Ok(summary)
     }
 
     pub(crate) fn snapshot_group(

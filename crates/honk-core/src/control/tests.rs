@@ -258,15 +258,6 @@ async fn startup_failure_drops_saturated_control_receiver() {
     );
 }
 
-#[test]
-fn test_build_dns_probe_query() {
-    let q = build_dns_probe_query();
-    assert_eq!(&q[..2], &[0x12, 0x34]); // fixed id, validated on the response
-    assert_eq!(q[2], 0x01); // RD (recursion desired)
-    assert_eq!(q[5], 1); // QDCOUNT = 1
-    assert_eq!(&q[q.len() - 4..], &[0, 1, 0, 1]); // QTYPE A / QCLASS IN
-}
-
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();

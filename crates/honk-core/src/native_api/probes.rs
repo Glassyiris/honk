@@ -12,7 +12,7 @@ use honk_outbound::{
         NativeGroupProbeContext, NativeHealthObservation, NativeProbeTicket, ProbeDomain,
         ProbeMeasurement,
     },
-    group::{GroupManager, NativeGroupMember, SelectionNetwork},
+    group::{GroupManager, GroupMember, SelectionNetwork},
     runtime::OutboundRuntimeRegistry,
 };
 use ipnet::IpNet;
@@ -33,7 +33,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    ApiError, ErrorCode, NativeState, canonical_ip,
+    ApiError, ErrorCode, NativeState,
     catalog::CatalogIdentity,
     config,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
@@ -307,7 +307,7 @@ impl Policy {
         }
     }
     pub(crate) fn address(&self, ip: IpAddr) -> bool {
-        let ip = canonical_ip(ip);
+        let ip = ip.to_canonical();
         let restricted = self.restricted.iter().any(|net| net.contains(&ip))
             || match ip {
                 IpAddr::V4(_) => false,
@@ -593,17 +593,7 @@ pub(super) async fn create(
     config::json_type(&request)?;
     let service = &state.observation.probes;
     let guard = service.request();
-    let body = axum::body::to_bytes(request.into_body(), 65536);
-    let bytes = if let Some(cancel) = &guard.cancel {
-        wire::bounded(deadline, cancel.clone(), body)
-            .await
-            .map_err(|_| unavailable())?
-    } else {
-        tokio::time::timeout_at(deadline, body)
-            .await
-            .map_err(|_| unavailable())?
-    }
-    .map_err(|_| too_large())?;
+    let bytes = super::body::buffered(request.into_body()).await;
     let reservation = service.operations.reserve(
         state.principal(),
         "POST",

@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use honk_config::{group::Group, parser::source_edit::GroupField};
-use honk_outbound::group::NativeGroupMember;
+use honk_outbound::group::GroupMember;
 use serde_json::{Value, json};
 
 use super::{
@@ -380,16 +380,7 @@ pub(super) async fn patch(
     });
     let key = config::request_header(&request, "idempotency-key")?.map(str::to_owned);
     let path = request.uri().path().to_owned();
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Group patch exceeds its body limit",
-                None,
-            )
-        })?;
+    let bytes = super::body::buffered(request.into_body()).await;
     let operations = super::body::value(&bytes, invalid)?;
     let reservation = state.observation.operations.reserve(
         state.principal(),
@@ -422,8 +413,8 @@ pub(super) async fn patch(
             let members = manager
                 .native_members(name)
                 .filter_map(|member| match member {
-                    NativeGroupMember::Node(node) => Some((node.id.to_string(), node.name.clone())),
-                    NativeGroupMember::Group(group) => identity
+                    GroupMember::Node(node) => Some((node.id.to_string(), node.name.clone())),
+                    GroupMember::Group(group) => identity
                         .groups
                         .get(&group.name)
                         .map(|id| (id.clone(), group.name.clone())),
@@ -477,16 +468,7 @@ pub(super) async fn select(
     if config::request_header(&request, "idempotency-key")?.is_some_and(str::is_empty) {
         return Err(invalid());
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| {
-            super::error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Selection request exceeds its limit",
-                id,
-            )
-        })?;
+    let bytes = super::body::buffered(request.into_body()).await;
     let body: SelectionBody = super::body::decode(&bytes, invalid)?;
     if body.member_id.is_empty() || body.member_id.len() > 256 {
         return Err(invalid());

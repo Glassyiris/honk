@@ -70,22 +70,13 @@ impl ControlPlane {
             }
         }
         // The tracker covers published UUIDs; the epoch also owns pre-ID TCP work.
-        if let Ok(selected) = self
+        if let Ok(summary) = self
             .connection_tracker
-            .snapshot_close(Some("tcp"), None, usize::MAX)
+            .close_matching(Some("tcp"), None, usize::MAX)
+            .await
+            && summary.failed
         {
-            use futures::StreamExt;
-            let mut closing: futures::stream::FuturesUnordered<_> = selected
-                .into_iter()
-                .map(|selected| self.connection_tracker.start_close(selected).wait())
-                .collect();
-            while let Some(outcome) = closing.next().await {
-                if matches!(outcome, crate::connection_tracker::CloseOutcome::Failed) {
-                    error.get_or_insert_with(|| {
-                        anyhow::anyhow!("TCP retirement could not be confirmed")
-                    });
-                }
-            }
+            error.get_or_insert_with(|| anyhow::anyhow!("TCP retirement could not be confirmed"));
         }
         if let Some(epoch) = epoch.as_mut() {
             epoch.tcp.abort_all();
