@@ -471,7 +471,9 @@ fn observed_route_preserves_empty_rule_miss_and_fallback() {
     assert!(observed.rules[0].conditions.is_empty());
     let evaluated = observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(evaluated[2].rule_id, rule_id("instance", 7, None));
-    assert_eq!(evaluated[2].expression, "fallback");
+    assert_eq!(evaluated[2].expression, "fallback: fallback");
+    let dictionary = rules(&router);
+    assert_eq!(dictionary.rules[2].expression, "fallback: fallback");
     let empty = Router::new(&[], "direct").unwrap();
     let observed = empty.route_full_observed(&connection(), None, 1);
     assert!(observed.matched.is_none());

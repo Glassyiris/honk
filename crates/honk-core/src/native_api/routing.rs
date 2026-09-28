@@ -51,6 +51,11 @@ pub(crate) fn rules_capability(router: &Router) -> Value {
     json!({"available":true,"max_rules":MAX_RULES.max(router.route_count() + 1)})
 }
 
+/// The fallback's display text when its source text is not retained, as DNS renders its own.
+fn fallback_expression(router: &Router) -> String {
+    format!("fallback: {}", router.fallback().outbound)
+}
+
 /// `None` identifies an evaluated fallback, never unknown kernel provenance.
 pub(crate) fn rule_id(instance: &str, generation: u64, compiled_id: Option<u32>) -> String {
     match compiled_id {
@@ -354,10 +359,15 @@ pub(super) async fn rules(
                 }
             }
         }
-        result.fallback.source = source(None).map(|(source, _)| source);
-        if let Some(fallback) = result.rules.last_mut() {
-            fallback.source = result.fallback.source.clone();
+        if let (Some(fallback), Some((source, expression))) =
+            (result.rules.last_mut(), source(None))
+        {
+            fallback.source = Some(source);
+            if !expression.is_empty() {
+                fallback.expression = expression;
+            }
         }
+        result.fallback.source = result.rules.last().and_then(|rule| rule.source.clone());
         Ok::<_, ApiError>(result)
     })
     .await
@@ -392,7 +402,7 @@ fn dictionary(
     rules.push(RoutingRule {
         rule_id: rule_id(instance, generation, None),
         index: rules.len(),
-        expression: "fallback".into(),
+        expression: fallback_expression(router),
         outbound: router.fallback().outbound.clone(),
         must: router.fallback().must,
         source: None,
@@ -505,7 +515,7 @@ fn rule_evaluation(
         rule_id,
         expression: compiled
             .map(|rule| rule.expression.clone())
-            .unwrap_or_else(|| "fallback".into()),
+            .unwrap_or_else(|| fallback_expression(router)),
         result: result_name(evaluated.result),
         missing_inputs: missing,
         conditions,
