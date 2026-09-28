@@ -137,21 +137,52 @@ fn created_directory_and_file_are_private() {
     assert_eq!(state.permissions().mode() & 0o777, 0o700);
     assert_eq!(file.permissions().mode() & 0o777, 0o600);
 
+    // Owned and only readable by others: tightened in place.
     fs::set_permissions(db_path(directory.path()), fs::Permissions::from_mode(0o640)).unwrap();
+    drop(StateDb::open(directory.path()).unwrap());
+    let file = fs::metadata(db_path(directory.path())).unwrap();
+    assert_eq!(file.permissions().mode() & 0o777, 0o600);
+    let state = directory.path().join(STATE_DIR);
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+    drop(StateDb::open(directory.path()).unwrap());
+    let mode = fs::metadata(&state).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    // Writable by others: refused and left alone.
+    fs::set_permissions(db_path(directory.path()), fs::Permissions::from_mode(0o660)).unwrap();
     assert_eq!(
         StateDb::open(directory.path()).err(),
-        Some(StateError::Unsafe)
+        Some(StateError::Unsafe(Refusal::new(
+            Target::Database,
+            Rule::GroupOrOtherBits
+        )))
     );
+    let file = fs::metadata(db_path(directory.path())).unwrap();
+    assert_eq!(file.permissions().mode() & 0o777, 0o660);
     fs::set_permissions(db_path(directory.path()), fs::Permissions::from_mode(0o600)).unwrap();
-    fs::set_permissions(
-        directory.path().join(STATE_DIR),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o775)).unwrap();
     assert_eq!(
         StateDb::open(directory.path()).err(),
-        Some(StateError::Unsafe)
+        Some(StateError::Unsafe(Refusal::new(
+            Target::StateDir,
+            Rule::GroupOrOtherBits
+        )))
     );
+}
+
+#[test]
+fn symlinked_state_directory_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), directory.path().join(STATE_DIR)).unwrap();
+    assert_eq!(
+        StateDb::open(directory.path()).err(),
+        Some(StateError::Unsafe(Refusal::new(
+            Target::StateDir,
+            Rule::Symlink
+        )))
+    );
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -166,7 +197,10 @@ fn symlinked_database_is_refused() {
     std::os::unix::fs::symlink(&target, db_path(directory.path())).unwrap();
     assert_eq!(
         StateDb::open(directory.path()).err(),
-        Some(StateError::Unsafe)
+        Some(StateError::Unsafe(Refusal::new(
+            Target::Database,
+            Rule::Symlink
+        )))
     );
     assert_eq!(fs::read(&target).unwrap(), b"");
 }
@@ -426,14 +460,26 @@ fn admin_reset_preserves_unsafe_legacy_credentials() {
     let record = legacy.join("admin.json");
     fs::write(&record, b"untrusted").unwrap();
     fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(reset_admin(data.path()), Err(StateError::Unsafe));
+    assert_eq!(
+        reset_admin(data.path()),
+        Err(StateError::Unsafe(Refusal::new(
+            Target::LegacyDir,
+            Rule::GroupOrOtherBits
+        )))
+    );
     assert_eq!(fs::read(&record).unwrap(), b"untrusted");
 
     fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
     let target = data.path().join("target");
     fs::rename(&record, &target).unwrap();
     std::os::unix::fs::symlink(&target, &record).unwrap();
-    assert_eq!(reset_admin(data.path()), Err(StateError::Unsafe));
+    assert_eq!(
+        reset_admin(data.path()),
+        Err(StateError::Unsafe(Refusal::new(
+            Target::LegacyRecord,
+            Rule::Symlink
+        )))
+    );
     assert!(
         fs::symlink_metadata(&record)
             .unwrap()

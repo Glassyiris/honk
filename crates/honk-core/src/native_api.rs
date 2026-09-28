@@ -469,7 +469,10 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             .map(|entry| Degradation {
                 code: entry.issue.code,
                 message: entry.issue.message,
-                details: serde_json::json!({ "reason": entry.issue.reason }),
+                details: match entry.rule {
+                    Some(rule) => serde_json::json!({ "reason": entry.issue.reason, "rule": rule }),
+                    None => serde_json::json!({ "reason": entry.issue.reason }),
+                },
                 component: entry.component.id(),
                 since: timestamp(entry.since),
             })

@@ -55,7 +55,7 @@ impl From<StateError> for StoreError {
     fn from(error: StateError) -> Self {
         match error {
             StateError::Unavailable => Self::Unavailable,
-            StateError::Unsafe => Self::Unsafe,
+            StateError::Unsafe(_) => Self::Unsafe,
             StateError::Corrupt => Self::Corrupt,
             StateError::Unsupported => Self::Unsupported,
             StateError::Locked | StateError::InUse => Self::Locked,
