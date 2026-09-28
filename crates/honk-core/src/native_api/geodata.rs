@@ -24,6 +24,9 @@ mod tests;
 pub(crate) use sources::{Fetched, Patch as SourcesPatch, Route, Sources};
 
 pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+/// The checksum is at most `MAX_CHECKSUM_BYTES`, so it gets its own short
+/// deadline instead of whatever a slow file download left of `NETWORK_TIMEOUT`.
+const CHECKSUM_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_PATH: &str = "/api/v1/geodata/update";
 const MAX_CHECKSUM_BYTES: usize = 1024;
 
@@ -425,10 +428,25 @@ fn unsupported() -> ApiError {
     )
 }
 
+/// Why a URL failed: the stage code, and the status of a rejected HTTP reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub(crate) code: &'static str,
+    pub(crate) status: Option<u16>,
+}
+
+impl From<&'static str> for Failure {
+    fn from(code: &'static str) -> Self {
+        Self { code, status: None }
+    }
+}
+
 /// Downloads `kind` from the first URL that yields a usable file. A URL is
 /// skipped on any download failure, and when fetching the sha256 published
 /// beside it fails with anything but a 404 or the digest does not match; the
-/// error of the last URL tried is returned. Every request takes the route in
+/// error of the last URL tried is returned. The file has `NETWORK_TIMEOUT`
+/// and its checksum a separate `CHECKSUM_TIMEOUT` that starts after the file
+/// arrives. Every request takes the route in
 /// `egress`; one it cannot carry fails like a connection and never goes
 /// direct instead. `policy` applies to every URL but `exempt`, the one the
 /// administrator wrote in the configuration file.
@@ -439,8 +457,8 @@ pub(crate) async fn fetch(
     max_bytes: usize,
     policy: &Policy,
     exempt: &str,
-) -> Result<(Arc<[u8]>, Fetched), &'static str> {
-    let mut last = "invalid_source";
+) -> Result<(Arc<[u8]>, Fetched), Failure> {
+    let mut last = Failure::from("invalid_source");
     for url in urls {
         let policy = (url != exempt).then_some(policy);
         let deadline = Instant::now() + NETWORK_TIMEOUT;
@@ -453,14 +471,14 @@ pub(crate) async fn fetch(
         };
         let sha256 = crate::configuration::digest(&bytes);
         let Some(mut checksum) = parse_geodata_url(url) else {
-            last = "invalid_source";
+            last = "invalid_source".into();
             continue;
         };
         checksum.set_path(&format!("{}.sha256sum", checksum.path()));
         let published = download(
             checksum.as_str(),
             egress,
-            deadline,
+            Instant::now() + CHECKSUM_TIMEOUT,
             MAX_CHECKSUM_BYTES,
             policy,
         )
@@ -472,14 +490,20 @@ pub(crate) async fn fetch(
                     .and_then(|text| text.split_whitespace().next())
                     .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha256));
                 if !matches {
-                    last = "checksum_mismatch";
+                    last = "checksum_mismatch".into();
                     continue;
                 }
                 true
             }
-            Err("http_not_found") => false,
-            Err(_) => {
-                last = "checksum_unavailable";
+            Err(Failure {
+                code: "http_not_found",
+                ..
+            }) => false,
+            Err(error) => {
+                last = Failure {
+                    code: "checksum_unavailable",
+                    status: error.status,
+                };
                 continue;
             }
         };
@@ -508,12 +532,12 @@ async fn download(
     deadline: Instant,
     max_bytes: usize,
     policy: Option<&Policy>,
-) -> Result<(Arc<[u8]>, Option<String>), &'static str> {
+) -> Result<(Arc<[u8]>, Option<String>), Failure> {
     let url = parse_geodata_url(url).ok_or("invalid_source")?;
     let host = url.host_str().ok_or("invalid_source")?;
     let port = url.port_or_known_default().ok_or("invalid_source")?;
     if policy.is_some_and(|policy| !policy.http_port(port, url.scheme() == "https")) {
-        return Err("destination_rejected");
+        return Err("destination_rejected".into());
     }
     let detour = match egress.route {
         Route::Direct => {
@@ -534,7 +558,7 @@ async fn download(
     .map_err(|_| "download_timeout")?
     .map_err(|_| "group_unavailable")?;
     match decision.route {
-        download_route::Route::Block => Err("route_blocked"),
+        download_route::Route::Block => Err("route_blocked".into()),
         download_route::Route::Direct { .. } => {
             download_direct(url.as_str(), egress.bootstrap, deadline, max_bytes, policy)
                 .await
@@ -545,15 +569,15 @@ async fn download(
             if let Some(ip) = download_route::parse_host_ip(host)
                 && policy.is_some_and(|policy| !policy.address(ip))
             {
-                return Err("destination_rejected");
+                return Err("destination_rejected".into());
             }
             let tunnel = timeout_at(deadline, egress.outbounds.tunnel(&node, (host, port)))
                 .await
                 .map_err(|_| "download_timeout")?
                 .map_err(|_| "connection_failed")?;
             let result = match timeout_at(deadline, tunnel.dial()).await {
-                Err(_) => Err("download_timeout"),
-                Ok(Err(_)) => Err("connection_failed"),
+                Err(_) => Err("download_timeout".into()),
+                Ok(Err(_)) => Err("connection_failed".into()),
                 Ok(Ok(stream)) => exchange(stream, &url, deadline, max_bytes).await,
             };
             if let Err(error) = tunnel.close().await {
@@ -572,7 +596,7 @@ pub(crate) async fn download_direct(
     deadline: Instant,
     max_bytes: usize,
     policy: Option<&Policy>,
-) -> Result<Arc<[u8]>, &'static str> {
+) -> Result<Arc<[u8]>, Failure> {
     let url = parse_geodata_url(url).ok_or("invalid_source")?;
     let host = url
         .host_str()
@@ -580,7 +604,7 @@ pub(crate) async fn download_direct(
         .trim_matches(['[', ']']);
     let port = url.port_or_known_default().ok_or("invalid_source")?;
     if policy.is_some_and(|policy| !policy.http_port(port, url.scheme() == "https")) {
-        return Err("destination_rejected");
+        return Err("destination_rejected".into());
     }
     let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![ip]
@@ -623,13 +647,13 @@ pub(crate) async fn download_direct(
     exchange(stream, &url, deadline, max_bytes).await
 }
 
-/// One GET that only a 200 answers.
+/// One GET that only a 200 answers; another status is kept for the failure.
 async fn exchange<S>(
     stream: S,
     url: &reqwest::Url,
     deadline: Instant,
     max_bytes: usize,
-) -> Result<Arc<[u8]>, &'static str>
+) -> Result<Arc<[u8]>, Failure>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -644,7 +668,10 @@ where
     .await?;
     match reply.status {
         StatusCode::OK => Ok(reply.body),
-        StatusCode::NOT_FOUND => Err("http_not_found"),
-        _ => Err("http_status_rejected"),
+        StatusCode::NOT_FOUND => Err("http_not_found".into()),
+        status => Err(Failure {
+            code: "http_status_rejected",
+            status: Some(status.as_u16()),
+        }),
     }
 }
