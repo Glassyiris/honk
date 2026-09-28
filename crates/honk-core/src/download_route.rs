@@ -71,7 +71,10 @@ pub(crate) enum Route {
     Direct {
         #[cfg_attr(
             not(feature = "clash-api"),
-            allow(dead_code, reason = "only the Clash UI download reports Score feedback")
+            allow(
+                dead_code,
+                reason = "only the Clash UI download reports Score feedback"
+            )
         )]
         feedback: Option<ScoreAttempt>,
     },
@@ -80,7 +83,10 @@ pub(crate) enum Route {
         node: Box<Node>,
         #[cfg_attr(
             not(feature = "clash-api"),
-            allow(dead_code, reason = "only the Clash UI download reports Score feedback")
+            allow(
+                dead_code,
+                reason = "only the Clash UI download reports Score feedback"
+            )
         )]
         feedback: Option<ScoreAttempt>,
     },
@@ -116,24 +122,15 @@ impl Outbounds<'_> {
         original: Option<&ScoreContinuation>,
     ) -> anyhow::Result<Decision> {
         let host_ip = parse_host_ip(host);
-        let resolved_ip = if let Some(ip) = host_ip {
-            Some(ip)
-        } else {
-            honk_outbound::bootstrap::resolve(host)
+        let resolved_ip = match host_ip {
+            Some(ip) => Some(ip),
+            None => honk_outbound::bootstrap::resolve(host)
                 .await
                 .ok()
-                .and_then(|addresses| addresses.into_iter().next())
+                .and_then(|addresses| addresses.into_iter().next()),
         };
-        let (dst_ip, domain) = match host_ip {
-            Some(ip) => (
-                ip,
-                (!host.parse::<IpAddr>().is_ok()).then(|| host.to_string()),
-            ),
-            None => (
-                resolved_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-                Some(host.to_string()),
-            ),
-        };
+        let dst_ip = resolved_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let domain = host_ip.is_none().then(|| host.to_string());
         let info = ConnectionInfo {
             domain: domain.clone(),
             dst_ip,
