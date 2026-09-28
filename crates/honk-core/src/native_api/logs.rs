@@ -19,6 +19,7 @@ use tracing::{
 };
 use tracing_subscriber::{
     EnvFilter, Layer,
+    filter::LevelFilter,
     layer::{Context, Filter},
     registry::LookupSpan,
     reload,
@@ -129,6 +130,19 @@ impl LogStore {
             && !self.stopped.load(Ordering::Acquire)
             && metadata.is_event()
             && severity(metadata.level()) <= self.level.load(Ordering::Acquire)
+    }
+
+    fn max_level(&self) -> LevelFilter {
+        if !self.recording.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+            return LevelFilter::OFF;
+        }
+        match self.level.load(Ordering::Acquire) {
+            1 => LevelFilter::ERROR,
+            2 => LevelFilter::WARN,
+            3 => LevelFilter::INFO,
+            4 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        }
     }
 
     fn capture(&self, event: &Event<'_>) {
@@ -289,6 +303,13 @@ impl LogBinding {
             .upgrade()
             .is_some_and(|store| store.accepts(metadata))
     }
+
+    fn max_level(&self) -> LevelFilter {
+        self.0
+            .read()
+            .upgrade()
+            .map_or(LevelFilter::OFF, |store| store.max_level())
+    }
 }
 
 struct CaptureLayer(LogBinding);
@@ -310,6 +331,12 @@ impl<S: Subscriber> Filter<S> for CaptureFilter {
         } else {
             tracing::subscriber::Interest::never()
         }
+    }
+
+    // A filter without a hint raises the global max level to TRACE, which makes
+    // every disabled span elsewhere (e.g. quinn's per-poll spans) reach the registry.
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(self.0.max_level())
     }
 }
 
