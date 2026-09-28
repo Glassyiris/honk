@@ -11,7 +11,11 @@ use tokio::task::JoinSet;
 
 mod teardown;
 
-const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for shutdown stages that have no natural deadline (watcher join,
+/// runtime-generation retirement, DNS controller/persistence close). The
+/// datapath hooks are already detached by then, so a hung stage must time
+/// out and log rather than leave the process half-torn-down forever.
+pub(super) const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BoundListeners {
     tcp4: tokio::io::unix::AsyncFd<std::net::TcpListener>,
@@ -582,29 +586,19 @@ fn record_udp_trace(degradations: &crate::degradations::Degradations, unavailabl
 }
 
 async fn cleanup_stage<T>(future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    tokio::pin!(future);
-    match tokio::time::timeout(STAGE_TIMEOUT, &mut future).await {
-        Ok(result) => result,
-        Err(_) => {
-            // Retain the same future: its blocking tasks and transport joins
-            // remain owned even when the transition can no longer succeed.
-            let _ = future.await?;
-            anyhow::bail!("runtime cleanup exceeded its stop deadline")
-        }
-    }
+    tokio::time::timeout(STAGE_TIMEOUT, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("runtime cleanup exceeded its stop deadline"))?
 }
 
 async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
     let Some(handle) = task.as_mut() else {
         return Ok(());
     };
-    let result = tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await;
-    let result = match result {
+    let result = match tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await {
         Ok(result) => result.map_err(anyhow::Error::from),
         Err(_) => {
-            // A timeout is a failed transition, not permission to detach a
-            // blocking child. The epoch keeps ownership until its join settles.
-            let _ = handle.await;
+            handle.abort();
             Err(anyhow::anyhow!(
                 "owned runtime task exceeded its stop deadline"
             ))
