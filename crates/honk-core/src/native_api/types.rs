@@ -153,12 +153,14 @@ impl ApiError {
         };
         if !matches!(
             self.status,
-            StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::NOT_FOUND
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::CONFLICT
+                | StatusCode::PRECONDITION_FAILED
         ) && (deleting
             || !matches!(
                 self.status,
-                StatusCode::CONFLICT
-                    | StatusCode::UNPROCESSABLE_ENTITY
+                StatusCode::UNPROCESSABLE_ENTITY
                     | StatusCode::BAD_REQUEST
                     | StatusCode::PAYLOAD_TOO_LARGE
                     | StatusCode::UNSUPPORTED_MEDIA_TYPE
