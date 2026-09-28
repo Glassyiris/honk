@@ -97,6 +97,8 @@ struct Stored {
     auto_update: Option<AutoUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download: Option<StoredRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verify_checksum: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +159,8 @@ pub(crate) struct Effective {
     pub(crate) urls: [Vec<String>; 2],
     pub(crate) auto_update: AutoUpdate,
     pub(crate) download: Route,
+    /// Each file has to match the sha256 published beside it, unless none is.
+    pub(crate) verify_checksum: bool,
 }
 
 impl Effective {
@@ -176,7 +180,8 @@ impl Effective {
             "geosite": {"urls": list(&self.urls[0])},
             "geoip": {"urls": list(&self.urls[1])},
             "auto_update": self.auto_update,
-            "download": self.download.json(group_id)})
+            "download": self.download.json(group_id),
+            "verify_checksum": self.verify_checksum})
     }
 }
 
@@ -189,6 +194,7 @@ pub(crate) struct Patch {
     /// A group route holds the group id until `resolve_group` names the group.
     #[serde(deserialize_with = "route_patch", default)]
     download: Option<Route>,
+    verify_checksum: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -263,7 +269,8 @@ impl Patch {
         let any = patch.geosite.is_some()
             || patch.geoip.is_some()
             || patch.auto_update.is_some()
-            || patch.download.is_some();
+            || patch.download.is_some()
+            || patch.verify_checksum.is_some();
         if any && urls_valid && auto_valid {
             Ok(Some(patch))
         } else {
@@ -442,6 +449,9 @@ impl Sources {
                         from_config: false,
                     });
                 }
+                if let Some(verify) = patch.verify_checksum {
+                    next.verify_checksum = Some(verify);
+                }
                 next
             }
         };
@@ -580,6 +590,7 @@ fn effective(stored: &Stored) -> Effective {
             .download
             .as_ref()
             .map_or_else(Route::default, |stored| stored.route.clone()),
+        verify_checksum: stored.verify_checksum.unwrap_or(true),
     }
 }
 

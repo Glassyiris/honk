@@ -153,6 +153,15 @@ fn world_with(outbound: Arc<impl TcpOutbound + 'static>, dials: Arc<AtomicUsize>
 
 impl World {
     async fn fetch(&self, route: Route, urls: &[String]) -> Result<(Arc<[u8]>, Fetched), Failure> {
+        self.fetch_with(route, urls, true).await
+    }
+
+    async fn fetch_with(
+        &self,
+        route: Route,
+        urls: &[String],
+        verify_checksum: bool,
+    ) -> Result<(Arc<[u8]>, Fetched), Failure> {
         // Loopback servers are private destinations, so the policy has to allow them.
         let ports: Vec<u16> = urls
             .iter()
@@ -174,7 +183,7 @@ impl World {
                 runtime_registry: &self.runtime_registry,
             },
         };
-        fetch("geosite", urls, &egress, 1024, &policy, "").await
+        fetch("geosite", urls, &egress, 1024, &policy, "", verify_checksum).await
     }
 }
 
@@ -299,11 +308,13 @@ async fn a_group_not_ready_at_startup_fails_every_url_without_going_direct() {
 /// A tunnel whose far end is an in-memory server, so paused time never
 /// races real sockets: the file comes after `file_delay` and its correct
 /// checksum after `checksum_delay`, or `status` with no body when one is given.
+/// `dials` counts the requests.
 struct Slow {
     body: &'static [u8],
     file_delay: Duration,
     checksum_delay: Duration,
     status: Option<&'static str>,
+    dials: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -315,12 +326,14 @@ impl TcpOutbound for Slow {
         target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let Slow {
             body,
             file_delay,
             checksum_delay,
             status,
+            ..
         } = *self;
         tokio::spawn(async move {
             let mut head = Vec::new();
@@ -358,7 +371,8 @@ impl TcpOutbound for Slow {
 }
 
 async fn fetch_slow(slow: Slow) -> Result<(Arc<[u8]>, Fetched), Failure> {
-    let world = world_with(Arc::new(slow), Arc::new(AtomicUsize::new(0)));
+    let dials = Arc::clone(&slow.dials);
+    let world = world_with(Arc::new(slow), dials);
     let address = SocketAddr::from(([127, 0, 0, 1], 8080));
     world
         .fetch(Route::Group("proxy".into()), &[url(address)])
@@ -372,6 +386,7 @@ async fn a_slow_file_leaves_its_checksum_a_deadline_of_its_own() {
         file_delay: NETWORK_TIMEOUT - Duration::from_secs(5),
         checksum_delay: CHECKSUM_TIMEOUT - Duration::from_secs(2),
         status: None,
+        dials: Arc::default(),
     })
     .await
     .unwrap();
@@ -386,6 +401,7 @@ async fn a_checksum_still_has_to_arrive_within_its_deadline() {
         file_delay: Duration::ZERO,
         checksum_delay: CHECKSUM_TIMEOUT + Duration::from_secs(1),
         status: None,
+        dials: Arc::default(),
     })
     .await
     .unwrap_err();
@@ -399,6 +415,7 @@ async fn a_rejected_status_is_kept_with_the_failure() {
         file_delay: Duration::ZERO,
         checksum_delay: Duration::ZERO,
         status: Some("429 Too Many Requests"),
+        dials: Arc::default(),
     })
     .await
     .unwrap_err();
@@ -409,4 +426,26 @@ async fn a_rejected_status_is_kept_with_the_failure() {
             status: Some(429),
         }
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_verification_no_checksum_is_requested() {
+    let slow = Slow {
+        body: b"unverified",
+        file_delay: Duration::ZERO,
+        checksum_delay: Duration::ZERO,
+        status: None,
+        dials: Arc::default(),
+    };
+    let dials = Arc::clone(&slow.dials);
+    let world = world_with(Arc::new(slow), Arc::clone(&dials));
+    let address = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let (bytes, fetched) = world
+        .fetch_with(Route::Group("proxy".into()), &[url(address)], false)
+        .await
+        .unwrap();
+    assert_eq!(&*bytes, b"unverified");
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "the file only");
+    assert!(!fetched.verified);
+    assert_eq!(fetched.sha256, crate::configuration::digest(b"unverified"));
 }
