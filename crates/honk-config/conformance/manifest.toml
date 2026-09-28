@@ -1574,7 +1574,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-configuration-03"
-source = { file = "doc/en/configuration.md", lines = "126-195" }
+source = { file = "doc/en/configuration.md", lines = "126-194" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1586,7 +1586,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-configuration-04"
-source = { file = "doc/en/configuration.md", lines = "240-252" }
+source = { file = "doc/en/configuration.md", lines = "239-251" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1710,7 +1710,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
-source = { file = "doc/en/reference/experimental.md", lines = "69-85" }
+source = { file = "doc/en/reference/experimental.md", lines = "149-162" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1834,7 +1834,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-subscription-01"
-source = { file = "doc/en/reference/subscription.md", lines = "10-19" }
+source = { file = "doc/en/reference/subscription.md", lines = "10-20" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1869,7 +1869,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-03"
-source = { file = "doc/zh/configuration.md", lines = "125-193" }
+source = { file = "doc/zh/configuration.md", lines = "125-192" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1881,7 +1881,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-04"
-source = { file = "doc/zh/configuration.md", lines = "240-252" }
+source = { file = "doc/zh/configuration.md", lines = "239-251" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2005,7 +2005,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
-source = { file = "doc/zh/reference/experimental.md", lines = "69-85" }
+source = { file = "doc/zh/reference/experimental.md", lines = "152-165" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2129,7 +2129,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-subscription-01"
-source = { file = "doc/zh/reference/subscription.md", lines = "10-19" }
+source = { file = "doc/zh/reference/subscription.md", lines = "10-20" }
 wrap = ""
 layer = "structure"
 honk = "accept"
