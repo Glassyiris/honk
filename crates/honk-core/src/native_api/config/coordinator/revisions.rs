@@ -1,20 +1,19 @@
 //! `import` and revision activation: whole-tree candidates recorded as new revisions.
 
 use super::*;
+use crate::native_api::store::DbStore;
 use crate::native_api::store::db::Origin;
 use crate::native_api::store::startup::{strip_tree, stripped_config_matches};
 
 impl Worker {
     /// Reads the `-c` tree, strips its listener secrets and validates it as the next revision.
     pub(super) async fn prepare_import(&self, principal: &str) -> Result<Prepared, ApiError> {
-        let store = self.store.clone().ok_or_else(unsupported)?;
         self.prepare_tree(
             principal,
             Some(Origin::Import),
-            move |store, diagnostics| {
-                let database = store.database().ok_or_else(unsupported)?;
+            move |database, diagnostics| {
                 let entry = database.import_entry();
-                if entry != store.entry() {
+                if entry != database.entry() {
                     return Err(denied());
                 }
                 let originals = Config::from_dae_file_with_sources(
@@ -41,7 +40,6 @@ impl Worker {
                 }
                 Ok(loaded)
             },
-            store,
         )
         .await
     }
@@ -54,18 +52,15 @@ impl Worker {
         principal: &str,
         resync: bool,
     ) -> Result<Prepared, ApiError> {
-        let store = self.store.clone().ok_or_else(unsupported)?;
         self.prepare_tree(
             principal,
             (!resync).then_some(Origin::Activate),
-            move |store, diagnostics| {
-                let database = store.database().ok_or_else(unsupported)?;
+            move |database, diagnostics| {
                 database
                     .load_revision(number, diagnostics)
                     .map_err(|_| unavailable().with_details(json!({"stage":"store"})))?
                     .ok_or_else(not_found)
             },
-            store,
         )
         .await
     }
@@ -74,14 +69,13 @@ impl Worker {
         &self,
         principal: &str,
         origin: Option<Origin>,
-        read: impl FnOnce(
-            &dyn SourceStore,
-            &mut Vec<DetailedDiagnostic>,
-        ) -> Result<LoadedConfig, ApiError>
+        read: impl FnOnce(&DbStore, &mut Vec<DetailedDiagnostic>) -> Result<LoadedConfig, ApiError>
         + Send
         + 'static,
-        store: Arc<dyn SourceStore>,
     ) -> Result<Prepared, ApiError> {
+        let SourceStore::Db(database) = self.store.clone() else {
+            return Err(unsupported());
+        };
         let active = self.active.read().await.clone();
         let log_files = self.log_files.clone();
         let data_dir = self.data_dir.clone();
@@ -93,11 +87,11 @@ impl Worker {
         let principal = principal.to_owned();
         tokio::task::spawn_blocking(move || {
             let mut diagnostics = Vec::new();
-            let loaded = read(&*store, &mut diagnostics)?;
+            let loaded = read(&database, &mut diagnostics)?;
             let parsed_sources = loaded.sources.clone();
             let validated = offline::validate_for_coordinator(
                 loaded,
-                store.dependency_root(),
+                None,
                 &active,
                 &data_dir,
                 limits(),
@@ -141,12 +135,11 @@ impl Worker {
                     None,
                 ));
             }
-            let database = store.database().ok_or_else(unsupported)?;
             let committed = match origin {
                 Some(origin) => Committed::Pending(
                     database
                         .stage(&validated.sources, &principal, origin)
-                        .map_err(|error| store_write_error(StoreKind::Database, error))?,
+                        .map_err(db_write_error)?,
                 ),
                 None => Committed::Resync,
             };

@@ -1910,18 +1910,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .enabled;
         if enabled {
             let service = control_plane.native_observation().configuration.clone();
-            let store: std::sync::Arc<dyn native_api::store::SourceStore> = match database.take() {
-                Some(database) => database.store,
-                None => std::sync::Arc::new(native_api::store::FileStore::new(
+            let store = match database.take() {
+                Some(database) => native_api::store::SourceStore::Db(database.store),
+                None => native_api::store::SourceStore::File(
                     native_sources
                         .as_ref()
                         .and_then(|sources| sources.sources.first())
-                        .map_or_else(|| cli.config.clone(), |source| source.path.clone()),
-                )),
+                        .map_or_else(|| cli.config.clone(), |source| source.path.clone())
+                        .into(),
+                ),
             };
             let owner = service
                 .start(
-                    Some(store),
+                    store,
                     native_sources,
                     honk_config::paths::data_dir().to_path_buf(),
                     control_plane.config_handle(),

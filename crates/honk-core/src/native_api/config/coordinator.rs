@@ -9,7 +9,7 @@ use super::super::management::{self, Completion, Mutation};
 use super::super::{
     config_write::WriteError,
     offline,
-    store::{Committed, SourceStore, StoreKind},
+    store::{Committed, SourceStore},
 };
 use super::*;
 use crate::configuration::{Activation, ActivationRequest};
@@ -27,7 +27,7 @@ pub(crate) struct ConfigCoordinator {
 
 struct Worker {
     service: Arc<ConfigService>,
-    store: Option<Arc<dyn SourceStore>>,
+    store: SourceStore,
     data_dir: PathBuf,
     source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -42,7 +42,7 @@ impl ConfigService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start(
         self: &Arc<Self>,
-        store: Option<Arc<dyn SourceStore>>,
+        store: SourceStore,
         initial: Option<SourceUpdate>,
         data_dir: PathBuf,
         active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -59,7 +59,7 @@ impl ConfigService {
             self.sources
                 .generation_committed(&super::super::catalog::revision_for(&config), generation);
         }
-        *self.store.write() = store.clone();
+        *self.store.write() = Some(store.clone());
         let (sender, mut receiver) = mpsc::channel(16);
         *self.sender.lock() = Some(sender);
         let (stop, mut stopping) = watch::channel(false);
@@ -259,16 +259,13 @@ impl Worker {
                 reservation,
             } => {
                 let id = reservation.id.clone();
-                let (head, blocked) = self
-                    .store
-                    .as_ref()
-                    .and_then(|store| store.database())
-                    .map_or((None, false), |database| {
-                        (
-                            database.cached_head().map(|(head, _)| head),
-                            database.blocked(),
-                        )
-                    });
+                let (head, blocked) = match &self.store {
+                    SourceStore::Db(database) => (
+                        database.cached_head().map(|(head, _)| head),
+                        database.blocked(),
+                    ),
+                    SourceStore::File(_) => (None, false),
+                };
                 let current = head == Some(number);
                 if current && !blocked {
                     self.service.operations.accept(&id);
@@ -579,7 +576,7 @@ impl Worker {
     async fn load(
         &self,
     ) -> Result<(Config, Option<SourceUpdate>, Vec<DetailedDiagnostic>), ApiError> {
-        let store = self.store.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone();
         let source_managed = self.source_managed;
         // Diagnostics name the accepted source IDs, as a write to the same file would.
         let accepted = self
@@ -674,7 +671,7 @@ impl Worker {
         )
         .map_err(|_| invalid())?;
         if content == accepted.update.sources[index].content.as_ref() {
-            let store = self.store.clone().ok_or_else(unsupported)?;
+            let store = self.store.clone();
             let service = Arc::clone(&self.service);
             tokio::task::spawn_blocking(move || {
                 let mut diagnostics = Vec::new();
@@ -741,12 +738,11 @@ impl Worker {
         let before_replace = self.service.before_replace.lock().take();
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
-            let store = Arc::clone(&check.store);
+            let store = check.store.clone();
             let accepted = &check.accepted;
-            let kind = store.kind();
             let pin = store
                 .pin(&target)
-                .map_err(|error| store_write_error(kind, error))?;
+                .map_err(|error| store_write_error(&store, error))?;
             if pin.sha256() != expected {
                 return Err(stale());
             }
@@ -817,9 +813,9 @@ impl Worker {
                 }
                 check.recheck(&overlay, &validated)
             });
-            let committed = store
-                .commit(pin, &content, &validated.sources, &principal, recheck)
-                .map_err(|error| store_write_error(kind, error))?;
+            let committed = pin
+                .commit(&content, &validated.sources, &principal, recheck)
+                .map_err(|error| store_write_error(&store, error))?;
             Ok(prepared(validated, diagnostics, committed))
         })
         .await
@@ -851,7 +847,7 @@ impl Worker {
             let accepted = &check.accepted;
             let target = store.resolve(&label)?;
             if accepted.ids.contains_key(&target)
-                || (store.kind() == StoreKind::File && target.symlink_metadata().is_ok())
+                || (matches!(store, SourceStore::File(_)) && target.symlink_metadata().is_ok())
             {
                 return Err(exists());
             }
@@ -894,7 +890,7 @@ impl Worker {
                     WriteError::Conflict => changed(),
                     // The parent became a symlink after resolution: still a path outside the root.
                     WriteError::UnsafePath => invalid(),
-                    error => store_write_error(store.kind(), error),
+                    error => store_write_error(store, error),
                 })?;
             Ok(prepared(validated, diagnostics, committed))
         })
@@ -904,7 +900,7 @@ impl Worker {
 
     async fn candidate_check(&self, accepted: Accepted) -> Result<CandidateCheck, ApiError> {
         Ok(CandidateCheck {
-            store: self.store.clone().ok_or_else(unsupported)?,
+            store: self.store.clone(),
             active: self.active.read().await.clone(),
             log_files: self.log_files.clone(),
             data_dir: self.data_dir.clone(),
@@ -920,7 +916,7 @@ impl Worker {
 
 /// What a source write validates its candidate against, captured before blocking work.
 struct CandidateCheck {
-    store: Arc<dyn SourceStore>,
+    store: SourceStore,
     active: Arc<Config>,
     log_files: LogFiles,
     data_dir: PathBuf,
@@ -968,7 +964,7 @@ impl CandidateCheck {
         if validated.config.experimental.native_api != active.experimental.native_api
             || validated.config.experimental.clash_api.secret
                 != active.experimental.clash_api.secret
-            || (self.store.kind() == StoreKind::Database
+            || (matches!(self.store, SourceStore::Db(_))
                 && validated.config.global.data_dir != active.global.data_dir)
         {
             return Err(denied());
@@ -1066,12 +1062,17 @@ fn prepared(
 
 type Prepared = (Config, SourceUpdate, Vec<DetailedDiagnostic>, Committed);
 
-fn store_write_error(kind: StoreKind, error: WriteError) -> ApiError {
-    match (kind, error) {
-        (StoreKind::Database, WriteError::Unavailable) => {
-            unavailable().with_details(json!({"stage":"store"}))
-        }
-        (_, error) => write_error(error),
+fn store_write_error(store: &SourceStore, error: WriteError) -> ApiError {
+    match store {
+        SourceStore::Db(_) => db_write_error(error),
+        SourceStore::File(_) => write_error(error),
+    }
+}
+
+fn db_write_error(error: WriteError) -> ApiError {
+    match error {
+        WriteError::Unavailable => unavailable().with_details(json!({"stage":"store"})),
+        error => write_error(error),
     }
 }
 

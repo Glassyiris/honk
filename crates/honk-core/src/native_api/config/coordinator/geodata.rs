@@ -191,10 +191,7 @@ impl Worker {
             fetched.push(origin);
         }
         let service = Arc::clone(&self.service);
-        let store = self
-            .store
-            .clone()
-            .ok_or_else(|| failure("source_authority_lost", &writes))?;
+        let store = self.store.clone();
         let revision = plan.revision.clone();
         let data_dir = self.data_dir.clone();
         let deferred = self
@@ -204,7 +201,7 @@ impl Worker {
             .map_err(|_| failure("subscription_owner_unavailable", &writes))?;
         let prepared = tokio::task::spawn_blocking(move || {
             prepare_and_replace(
-                &service, &*store, &active, &accepted, downloads, &revision, &data_dir, &deferred,
+                &service, &store, &active, &accepted, downloads, &revision, &data_dir, &deferred,
             )
         })
         .await
@@ -335,7 +332,7 @@ fn same_settled_dependencies(
 #[allow(clippy::too_many_arguments)]
 fn prepare_and_replace(
     service: &ConfigService,
-    store: &dyn SourceStore,
+    store: &SourceStore,
     active: &Config,
     accepted: &Accepted,
     downloads: Vec<DownloadedAsset>,
@@ -560,7 +557,7 @@ fn prepare_and_replace(
                 return Err(WriteError::Conflict);
             }
             for pin in &source_pins {
-                store.recheck(pin)?;
+                pin.recheck()?;
             }
             for guard in guards.iter().chain(kept.iter().map(|asset| &asset.file)) {
                 guard.recheck()?;
@@ -620,7 +617,7 @@ fn prepare_and_replace(
     }));
     installed.sort_by_key(|asset| asset.snapshot.kind != "geosite");
     for pin in &source_pins {
-        store.recheck(pin).map_err(|_| {
+        pin.recheck().map_err(|_| {
             failure(
                 "postwrite_conflict",
                 installed.iter().map(|asset| &asset.receipt),

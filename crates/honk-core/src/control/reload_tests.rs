@@ -1004,9 +1004,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
     let owner = native
         .configuration
         .start(
-            Some(std::sync::Arc::new(
-                crate::native_api::store::FileStore::new(initial.sources[0].path.clone()),
-            )),
+            crate::native_api::store::SourceStore::File(initial.sources[0].path.clone().into()),
             Some(initial),
             honk_config::paths::data_dir().to_path_buf(),
             cp.config_handle(),

@@ -137,22 +137,19 @@ impl Worker {
         if committed.written() {
             return Ok(true);
         }
-        let Some(store) = &self.store else {
-            return Ok(false);
-        };
         let result = match completion {
             Ok(_) | Err(ActivationFailure::Degraded(_) | ActivationFailure::Reconciliation(_)) => {
-                let writer = Arc::clone(store);
+                let writer = self.store.clone();
                 match tokio::task::spawn_blocking(move || writer.promote(committed)).await {
                     Ok(Ok(())) => Ok(true),
                     _ => {
-                        store.block();
+                        self.store.block();
                         Err(json!({"stage":"store","committed":true,"durable":false}))
                     }
                 }
             }
             Err(ActivationFailure::Unconfirmed) => {
-                store.block();
+                self.store.block();
                 Err(json!({"stage":"store","committed":null}))
             }
             Err(_) => Ok(false),

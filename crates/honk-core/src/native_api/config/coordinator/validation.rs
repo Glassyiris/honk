@@ -7,7 +7,7 @@ impl Worker {
         let log_files = self.log_files.clone();
         let generation = self.diagnostics.read().generation;
         let instance = self.service.instance_id.clone();
-        let store = self.store.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone();
         let accepted = self.service.sources.accepted.read().clone();
         let data_dir = self.data_dir.clone();
         let deferred = if request.mode == "syntax" {

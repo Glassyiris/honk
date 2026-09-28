@@ -18,7 +18,7 @@ use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
 use crate::dns::routing::DnsRouter;
 use crate::ebpf::mock::MockEbpfBackend;
-use crate::native_api::store::{DatabaseStartup, DbStore, FileStore, SourceStore};
+use crate::native_api::store::{DatabaseStartup, DbStore, SourceStore};
 use crate::native_api::{NativeServer, NativeState};
 use crate::routing::Router;
 use crate::subscription::SubscriptionSupervisor;
@@ -77,7 +77,7 @@ struct Fixture {
     reloads: Arc<AtomicUsize>,
     gates: Option<mpsc::UnboundedReceiver<oneshot::Sender<()>>>,
     database: Option<Arc<DbStore>>,
-    /// 1: the engine answers every reload `Rejected`; 2: it drops the reply. Neither applies it.
+    /// A [`ReloadBehavior`] stored as `u8`.
     reject_reloads: Arc<AtomicU8>,
 }
 
@@ -166,7 +166,7 @@ impl Fixture {
             (
                 startup.config,
                 startup.sources,
-                Arc::clone(&store) as Arc<dyn SourceStore>,
+                SourceStore::Db(Arc::clone(&store)),
                 Some(store),
             )
         } else {
@@ -177,13 +177,13 @@ impl Fixture {
                 &mut diagnostics,
             )
             .unwrap();
-            let store = Arc::new(FileStore::new(loaded.sources[0].path.clone()));
+            let store = SourceStore::File(loaded.sources[0].path.clone().into());
             let initial = SourceUpdate {
                 sources: loaded.sources,
                 dependencies: Vec::new(),
                 geo_sources: None,
             };
-            (loaded.config, initial, store as Arc<dyn SourceStore>, None)
+            (loaded.config, initial, store, None)
         };
         config.validate_detailed().unwrap();
         config.ensure_builtin_nodes();
@@ -244,7 +244,7 @@ impl Fixture {
         control_plane.attach_subscriptions(subscriptions.handle());
         let coordinator = service
             .start(
-                Some(store),
+                store,
                 Some(initial),
                 directory.path().join("state"),
                 control_plane.config_handle(),

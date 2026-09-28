@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::operations::{OperationStore, Reservation};
-use super::store::{SourceStore, StoreKind};
+use super::store::{SourceStore, db::MAX_REVISIONS};
 use super::{
     ApiError, ErrorCode, NativeState, body, error, parse_query, timestamp, types::RequestId,
 };
@@ -283,7 +283,7 @@ pub(crate) struct ConfigService {
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
     /// The secret set for the accepted sources, keyed by the `SourceUpdate` it was built from.
     secrets: Mutex<Option<(Arc<SourceUpdate>, Arc<ListenerSecrets>)>>,
-    store: RwLock<Option<Arc<dyn SourceStore>>>,
+    store: RwLock<Option<SourceStore>>,
     recording: RwLock<RecordState>,
     #[cfg(test)]
     before_replace: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -376,6 +376,48 @@ impl ConfigService {
             && self.settings.credentialed()
             && self.sender.lock().is_some()
     }
+
+    /// True when the running configuration may differ from the recorded `head`.
+    pub(crate) fn store_blocked(&self) -> bool {
+        self.store.read().as_ref().is_some_and(SourceStore::blocked)
+    }
+
+    /// `store` of `GET /config`; reads only cached state.
+    pub(crate) fn store_value(&self) -> Value {
+        let Some(SourceStore::Db(store)) = self.store.read().clone() else {
+            return json!({"kind":"file","revision":null,"parent":null,"recorded":true});
+        };
+        let recording = self.recording.read();
+        let recorded = !store.blocked()
+            && match &*recording {
+                RecordState::Idle => true,
+                RecordState::Pending(previous) => self
+                    .sources
+                    .accepted
+                    .read()
+                    .as_ref()
+                    .is_some_and(|accepted| previous.as_ref() == Some(&accepted.revision)),
+            };
+        let head = store.cached_head();
+        json!({"kind":"db","revision":head.map(|(number,_)|number),"parent":head.and_then(|(_,parent)|parent),"recorded":recorded})
+    }
+
+    /// `writable` as advertised: false while a failed record blocks writes.
+    pub(crate) fn editable(&self) -> bool {
+        self.writable() && !self.store_blocked()
+    }
+
+    pub(crate) fn import_capability(&self) -> Value {
+        let database = matches!(*self.store.read(), Some(SourceStore::Db(_)));
+        json!({"available":database && self.editable(),"replace_required":true})
+    }
+
+    pub(crate) fn revisions_capability(&self) -> Value {
+        let database = matches!(*self.store.read(), Some(SourceStore::Db(_)));
+        // Activating `head` stays possible while blocked: it is the way back in sync.
+        json!({"available":database,"can_activate":database && self.writable(),"max_revisions":MAX_REVISIONS})
+    }
+
     pub(crate) fn can_manage(&self) -> bool {
         self.sender
             .lock()
@@ -454,9 +496,7 @@ impl ConfigService {
         }
         let mut secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
         // Db sources are stripped, so the stored values are the only record of them.
-        if let Some(store) = self.store.read().as_ref()
-            && let Some(database) = store.database()
-        {
+        if let Some(SourceStore::Db(database)) = &*self.store.read() {
             secrets = secrets.with_all(&database.listener_secrets());
         }
         let secrets = Arc::new(secrets);
@@ -579,7 +619,7 @@ impl ConfigService {
             "line_count":source.content.lines().count(), "content":content,
         });
         // Database source paths are labels, not files an operator could open.
-        if self.store_kind() == StoreKind::File {
+        if !matches!(*self.store.read(), Some(SourceStore::Db(_))) {
             let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
             value["absolute_path"] = Value::String(absolute_path);
             redacted |= absolute_redacted;
