@@ -440,3 +440,23 @@ fn log_capability_advertises_the_replay_age_limit() {
     assert_eq!(capability["retention_seconds"], 60);
     assert_eq!(capability["max_buffered_records"], 512);
 }
+
+#[test]
+fn native_server_failures_are_admitted_at_their_emitting_module() {
+    let project = |message| Projection {
+        message: audited_message(message),
+        ..Projection::default()
+    };
+    for message in [
+        "native HTTP supervisor failed",
+        "native HTTP sampler stopped unexpectedly",
+        "native HTTP connection task failed",
+        "native HTTP listener failed",
+    ] {
+        assert_eq!(
+            project(message).finish("honk_core::native_api::server").0,
+            message
+        );
+        assert_eq!(project(message).finish("honk_core::native_api").0, WITHHELD);
+    }
+}
