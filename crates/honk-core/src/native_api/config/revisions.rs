@@ -234,19 +234,7 @@ pub(in crate::native_api) async fn activate(
         .await
         .map_err(|_| too_large())?;
     body::no_inputs(&bytes, invalid)?;
-    let exists = tokio::task::spawn_blocking(move || {
-        store
-            .database()
-            .map(|database| database.revision_exists(number))
-    })
-    .await
-    .map_err(|_| unavailable())?;
-    match exists {
-        Some(Ok(true)) => {}
-        Some(Ok(false)) => return Err(not_found()),
-        None => return Err(unsupported()),
-        Some(Err(_)) => return Err(unavailable().with_details(json!({"stage":"store"}))),
-    }
+    // A replay answers even after retention pruned the revision.
     let reservation = service.operations.reserve(
         state.principal(),
         "POST",
@@ -257,10 +245,28 @@ pub(in crate::native_api) async fn activate(
     )?;
     let admission = reservation.admission();
     if reservation.fresh {
-        service.enqueue(Work::ActivateRevision {
-            number,
-            reservation,
-        })?;
+        let exists = tokio::task::spawn_blocking(move || {
+            store
+                .database()
+                .map(|database| database.revision_exists(number))
+        })
+        .await
+        .map_err(|_| unavailable())?;
+        let error = match exists {
+            Some(Ok(true)) => None,
+            Some(Ok(false)) => Some(not_found()),
+            None => Some(unsupported()),
+            Some(Err(_)) => Some(unavailable().with_details(json!({"stage":"store"}))),
+        };
+        match error {
+            None => service.enqueue(Work::ActivateRevision {
+                number,
+                reservation,
+            })?,
+            Some(error) => {
+                service.operations.reject(&reservation.id, error);
+            }
+        }
     }
     Ok(admission.await?.into_response())
 }

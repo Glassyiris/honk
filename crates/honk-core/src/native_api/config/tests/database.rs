@@ -534,6 +534,40 @@ async fn disconnected_management_and_shutdown_retain_pending_record() {
 }
 
 #[tokio::test]
+async fn activation_replay_outlives_the_pruned_revision() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();
+    let terminal = operation(
+        &fixture,
+        "/api/v1/x-honk/config/import",
+        "replace",
+        json!({"replace":true}),
+    )
+    .await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    let activate = || {
+        fixture
+            .request(Method::POST, "/api/v1/x-honk/config/revisions/1/activate")
+            .header("idempotency-key", "rollback")
+            .json(&json!({}))
+            .send()
+    };
+    let first = accepted(activate().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&first).await["status"], "succeeded");
+    // Retention pruned the source revision before the client retried.
+    store
+        .state()
+        .strict()
+        .execute("DELETE FROM revision WHERE number = 1", [])
+        .unwrap();
+    let replay = accepted(activate().await.unwrap()).await;
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_record_blocks_writes_until_head_is_activated_again() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());
