@@ -67,7 +67,7 @@ async fn discovery_reports_the_mode_and_setup_state() {
     assert_eq!(
         body,
         serde_json::json!({
-            "name": "dae/honk-native",
+            "name": "daeuniverse/native",
             "api_major": 1,
             "links": {"auth_setup": "/api/v1/auth/setup", "auth_login": "/api/v1/auth/login"},
             "auth": {"mode": "password", "setup_required": true},

@@ -358,7 +358,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
     // Discovery is public; a caller that is not admitted learns only how to sign in.
     if !admitted {
         return json!({
-            "name": "dae/honk-native",
+            "name": "daeuniverse/native",
             "api_major": 1,
             "links": {
                 "auth_setup": link("/api/v1/auth/setup"),
@@ -371,7 +371,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
         });
     }
     json!({
-        "name": "dae/honk-native",
+        "name": "daeuniverse/native",
         "status": "draft",
         "api_major": 1,
         "base_path": "/api/v1",
@@ -407,7 +407,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
 pub(super) fn version() -> Value {
     let optional = |value: &str| (!value.is_empty()).then(|| Value::from(value));
     json!({
-        "api": {"name": "dae/honk-native", "major": 1, "status": "draft"},
+        "api": {"name": "daeuniverse/native", "major": 1, "status": "draft"},
         "engine": {"name": "honk", "version": crate::VERSION},
         // No build timestamp: the binary carries none, and inventing one would mislead.
         "build": {"revision": optional(crate::REVISION), "target": optional(crate::TARGET), "built_at": null},

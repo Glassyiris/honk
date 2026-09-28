@@ -426,7 +426,7 @@ async fn discovery_withholds_detail_from_callers_without_a_credential() {
         assert_eq!(
             public,
             serde_json::json!({
-                "name": "dae/honk-native",
+                "name": "daeuniverse/native",
                 "api_major": 1,
                 "links": {"auth_setup": null, "auth_login": null},
                 "auth": {"mode": "token", "setup_required": false},
@@ -435,7 +435,11 @@ async fn discovery_withholds_detail_from_callers_without_a_credential() {
         );
     }
     let full = response_json(app.get("/api").send().await.unwrap()).await;
+    assert_eq!(full["name"], "daeuniverse/native");
     assert_eq!(full["status"], "draft");
+    let version = response_json(app.get("/api/v1/version").send().await.unwrap()).await;
+    assert_eq!(version["api"]["name"], "daeuniverse/native");
+    assert_eq!(version["engine"]["name"], "honk");
     assert_eq!(full["links"]["version"], "/api/v1/version");
     assert_eq!(full["auth"]["anonymous_loopback"], false);
     app.shutdown().await;
