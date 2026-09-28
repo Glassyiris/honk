@@ -534,8 +534,34 @@ fn a_display_url_keeps_nothing_that_may_hold_a_credential() {
             Some("https://example.com/token/[redacted]/geoip.dat"),
         ),
         (
-            "https://example.com/d/0f3c9a7e-51b2-4c1d-9e8f-2a6b7c8d9e0f/geoip.dat",
+            "https://raw.githubusercontent.com/o/r/0123456789abcdef0123456789abcdef01234567/geoip.dat",
+            Some(
+                "https://raw.githubusercontent.com/o/r/0123456789abcdef0123456789abcdef01234567/geoip.dat",
+            ),
+        ),
+        (
+            "https://example.com/release-2026-09-29/geoip.dat",
+            Some("https://example.com/release-2026-09-29/geoip.dat"),
+        ),
+        (
+            "https://example.com/20260929120000123/geoip.dat",
+            Some("https://example.com/20260929120000123/geoip.dat"),
+        ),
+        (
+            "https://example.com/d/Xk7pQ2mZ9vLb4RtY8wNc3HsJ/geoip.dat",
             Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/d/ghp_16C7e42F292c6912E7710c838347Ae178B4a/geoip.dat",
+            Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/auth_token/v4lue/geoip.dat",
+            Some("https://example.com/auth_token/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/token/",
+            Some("https://example.com/token/"),
         ),
         (
             "https://example.com/bot123:abc/geoip.dat",

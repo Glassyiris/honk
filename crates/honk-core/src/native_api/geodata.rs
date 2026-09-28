@@ -191,9 +191,10 @@ fn display_url(url: &str) -> Option<String> {
         .path()
         .split('/')
         .map(|segment| {
-            let hidden = CREDENTIAL_NAMES
-                .iter()
-                .any(|name| previous.eq_ignore_ascii_case(name))
+            let hidden = !segment.is_empty()
+                && CREDENTIAL_NAMES
+                    .iter()
+                    .any(|name| previous.eq_ignore_ascii_case(name))
                 || segment.contains([':', '='])
                 || looks_like_token(segment);
             previous = segment;
@@ -205,25 +206,39 @@ fn display_url(url: &str) -> Option<String> {
     Some(parsed.into())
 }
 
-const CREDENTIAL_NAMES: [&str; 8] = [
+const CREDENTIAL_NAMES: [&str; 15] = [
+    "access_key",
     "access_token",
     "api_key",
     "apikey",
     "auth",
+    "auth_token",
+    "client_secret",
+    "credential",
     "key",
     "password",
+    "private_token",
     "secret",
+    "sig",
+    "signature",
     "token",
 ];
 
-/// Hex, UUID and base64url tokens; release names such as `meta-rules-dat` stay.
+/// Random tokens mix cases and digits, or run long without separators. Git
+/// commit hashes (lower-case hex) and dash-separated release tags stay.
 fn looks_like_token(segment: &str) -> bool {
-    segment.len() >= 16
-        && segment
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        && segment.bytes().any(|byte| byte.is_ascii_digit())
-        && segment.bytes().any(|byte| byte.is_ascii_alphabetic())
+    let has = |class: fn(&u8) -> bool| segment.bytes().any(|byte| class(&byte));
+    let url_safe = segment
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    let mixed =
+        has(u8::is_ascii_uppercase) && has(u8::is_ascii_lowercase) && has(u8::is_ascii_digit);
+    let lower_hex = segment
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    url_safe
+        && (segment.len() >= 16 && mixed
+            || segment.len() >= 32 && !segment.contains('-') && !lower_hex)
 }
 
 pub(crate) fn project(
