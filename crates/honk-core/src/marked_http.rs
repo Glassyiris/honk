@@ -58,7 +58,8 @@ impl ResponseBody {
 
 /// reqwest has no socket-mark hook; keep Hyper's framing on our marked dialer.
 pub(crate) struct Client {
-    tls: TlsConnector,
+    /// `None` only for [`Client::plain`], which never dials `https`.
+    tls: Option<TlsConnector>,
 }
 
 impl Client {
@@ -76,8 +77,13 @@ impl Client {
             .with_no_client_auth();
         config.alpn_protocols.push(b"http/1.1".to_vec());
         Ok(Self {
-            tls: TlsConnector::from(Arc::new(config)),
+            tls: Some(TlsConnector::from(Arc::new(config))),
         })
+    }
+
+    /// A client for `http` only: no TLS config, so no system CA store.
+    pub(crate) fn plain() -> Self {
+        Self { tls: None }
     }
 
     async fn connect(&self, uri: &http::Uri, timeout: Duration) -> anyhow::Result<Stream> {
@@ -105,7 +111,11 @@ impl Client {
                 let name = rustls::pki_types::ServerName::try_from(
                     host.trim_matches(['[', ']']).to_owned(),
                 )?;
-                Ok(Box::new(self.tls.connect(name, stream).await?))
+                let tls = self
+                    .tls
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("HTTPS needs a TLS client"))?;
+                Ok(Box::new(tls.connect(name, stream).await?))
             }
             Some("http") => Ok(stream),
             _ => anyhow::bail!("unsupported HTTP URL scheme"),

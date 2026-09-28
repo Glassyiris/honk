@@ -481,8 +481,22 @@ async fn get(
     stream: Box<dyn AsyncReadWrite>,
     request: &Request<'_>,
 ) -> Result<Reply, &'static str> {
-    let response = marked_http::Client::new()
-        .map_err(|_| "tls_failed")?
+    // Built once, and only for https: plain http must not load the CA store.
+    static TLS: std::sync::OnceLock<marked_http::Client> = std::sync::OnceLock::new();
+    let plain;
+    let client = if request.url.scheme() == "https" {
+        match TLS.get() {
+            Some(client) => client,
+            None => {
+                let client = marked_http::Client::new().map_err(|_| "tls_failed")?;
+                TLS.get_or_init(|| client)
+            }
+        }
+    } else {
+        plain = marked_http::Client::plain();
+        &plain
+    };
+    let response = client
         .get_over(
             stream,
             request.url,
