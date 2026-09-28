@@ -100,8 +100,10 @@ fn marked_downloads_netns() {
             let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
             let target = std::net::SocketAddr::new(address.parse().unwrap(), listener.local_addr().unwrap().port());
             assert!(tokio::net::TcpStream::connect(target).await.is_err(), "unmarked dial must have no route");
+            // The direct fetch, the routed fetch when built, and the archive download.
+            let requests = if cfg!(feature = "native-api") { 3 } else { 2 };
             let server = tokio::spawn(async move {
-                for _ in 0..2 {
+                for _ in 0..requests {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut headers = Vec::new();
                     let mut byte = [0];
@@ -114,16 +116,42 @@ fn marked_downloads_netns() {
                     stream.write_all(response.as_bytes()).await.unwrap();
                 }
             });
-            // An empty detour routes the fetch; this test covers the direct marked dial.
             let sub = honk_config::subscription::Subscription { url: format!("http://{target}/subscription"), download_detour: "direct".into(), ..Default::default() };
             let nodes = crate::subscription::SubscriptionManager::new().unwrap().fetch(&sub).await.unwrap();
             assert_eq!(nodes[0].name, "marked");
+            // An empty detour leaves the fetch to routing, whose fallback here is `direct`.
+            #[cfg(feature = "native-api")]
+            {
+                let manager = crate::subscription::SubscriptionManager::new().unwrap();
+                manager.route_through(direct_routing());
+                let sub = honk_config::subscription::Subscription { download_detour: String::new(), ..sub };
+                assert_eq!(manager.fetch(&sub).await.unwrap()[0].name, "marked");
+            }
             let url = reqwest::Url::parse(&format!("http://{target}/archive")).unwrap();
             let response = super::Client::new().unwrap().get(&url, &http::HeaderMap::new(), Duration::from_secs(1)).await.unwrap();
             assert_eq!(response.bytes().await.unwrap().as_ref(), b"socks5://127.0.0.1:1080#marked");
             server.await.unwrap();
         }
     });
+}
+
+#[cfg(all(target_os = "linux", feature = "native-api"))]
+fn direct_routing() -> crate::download_route::SharedOutbounds {
+    use std::sync::Arc;
+    let config = honk_config::Config::default();
+    crate::download_route::SharedOutbounds {
+        router: Arc::new(tokio::sync::RwLock::new(
+            crate::routing::Router::new(&[], "direct").unwrap(),
+        )),
+        group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::group::GroupManager::new(&config.groups, &config.nodes),
+        ))),
+        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
+        proxy_registry: Arc::new(honk_outbound::proxy::ProxyRegistry::new()),
+        runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
+        ))),
+    }
 }
 
 async fn credential_request(headers: &http::HeaderMap) -> String {

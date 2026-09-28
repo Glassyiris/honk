@@ -23,6 +23,10 @@ impl SupervisorState {
             {
                 Ok(Some(nodes)) => {
                     honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
+                    let count = nodes.len();
+                    if !self.add_startup_nodes(&mut config.nodes, subscription, nodes, true) {
+                        continue;
+                    }
                     crate::config_diagnostics::declare_provider_diagnostics(
                         subscription,
                         &mut diagnostics,
@@ -30,23 +34,9 @@ impl SupervisorState {
                     startup_diagnostics.replace_provider(subscription.id, diagnostics);
                     info!(
                         subscription = %subscription.name,
-                        nodes = nodes.len(),
+                        nodes = count,
                         "Restored subscription"
                     );
-                    config
-                        .nodes
-                        .retain(|node| node.subscription_id != Some(subscription.id));
-                    config.nodes.extend(nodes);
-                    self.observations
-                        .write()
-                        .get_mut(&subscription.id)
-                        .unwrap()
-                        .load = ProviderLoad {
-                        updated_at: Some(SystemTime::now()),
-                        cached: true,
-                        error: None,
-                        rejection: None,
-                    };
                 }
                 Ok(None) => {
                     requires_network.insert(subscription.id);
@@ -111,20 +101,18 @@ impl SupervisorState {
                         let subscription = authorized.subscription;
                         match result {
                             Some(Ok(nodes)) => {
-                                startup_diagnostics
-                                    .replace_provider(subscription.id, diagnostics);
-                                info!(
-                                    nodes = nodes.len(),
-                                    "Subscription body accepted; startup publication pending"
-                                );
-                                config.nodes.retain(|node| {
-                                    node.subscription_id != Some(subscription.id)
-                                });
-                                config.nodes.extend(nodes);
-                                self.observations.write().get_mut(&subscription.id).unwrap().load = ProviderLoad { updated_at: Some(SystemTime::now()), cached: false, error: None, rejection: None };
+                                let count = nodes.len();
+                                if self.add_startup_nodes(&mut config.nodes, &subscription, nodes, false) {
+                                    startup_diagnostics
+                                        .replace_provider(subscription.id, diagnostics);
+                                    info!(
+                                        nodes = count,
+                                        "Subscription body accepted; startup publication pending"
+                                    );
+                                }
                             }
                             Some(Err(error)) => {
-                                self.observations.write().get_mut(&subscription.id).unwrap().load.error = Some(super::super::failure_code(&error));
+                                self.fail_startup_load(subscription.id, super::super::failure_code(&error));
                                 warn!(subscription = %subscription.name, %error, "Failed to fetch subscription");
                             }
                             None => {}
@@ -135,7 +123,7 @@ impl SupervisorState {
                         if let Some(id) = self.fetch_ids.remove(&error.id()) {
                             self.flights.remove(&id);
                             requires_network.remove(&id);
-                            self.observations.write().get_mut(&id).unwrap().load.error = Some("fetch_failed");
+                            self.fail_startup_load(id, "fetch_failed");
                         }
                         warn!(%error, "Subscription startup task failed");
                     }
@@ -159,5 +147,49 @@ impl SupervisorState {
             );
         }
         startup_diagnostics
+    }
+
+    /// Replaces the provider's nodes unless one of the new IDs is already
+    /// taken, which a runtime publication would reject as well. The check
+    /// runs before removal, so a rejection keeps the nodes accepted earlier.
+    fn add_startup_nodes(
+        &self,
+        current: &mut Vec<Node>,
+        subscription: &Subscription,
+        nodes: Vec<Node>,
+        cached: bool,
+    ) -> bool {
+        let mut ids: HashSet<_> = current
+            .iter()
+            .filter(|node| node.subscription_id != Some(subscription.id))
+            .map(|node| node.id)
+            .collect();
+        let mut observations = self.observations.write();
+        let load = &mut observations.get_mut(&subscription.id).unwrap().load;
+        if nodes.iter().any(|node| !ids.insert(node.id)) {
+            warn!(
+                subscription = %subscription.name,
+                "Subscription node ID duplicates another node; provider rejected"
+            );
+            load.error = Some("publication_rejected");
+            load.rejection = Some("duplicate-node-id");
+            return false;
+        }
+        current.retain(|node| node.subscription_id != Some(subscription.id));
+        current.extend(nodes);
+        *load = ProviderLoad {
+            updated_at: Some(SystemTime::now()),
+            cached,
+            error: None,
+            rejection: None,
+        };
+        true
+    }
+
+    fn fail_startup_load(&self, id: uuid::Uuid, error: &'static str) {
+        let mut observations = self.observations.write();
+        let load = &mut observations.get_mut(&id).unwrap().load;
+        load.error = Some(error);
+        load.rejection = None;
     }
 }
