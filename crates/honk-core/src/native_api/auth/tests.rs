@@ -141,7 +141,7 @@ fn two_stores_racing_setup_yield_one_winner() {
 }
 
 #[test]
-fn a_failed_write_blocks_the_store() {
+fn a_refused_insert_leaves_setup_available() {
     let data = temp_data_dir();
     let db = Arc::new(StateDb::open(data.path()).unwrap());
     let store = CredentialStore::open(Arc::clone(&db), data.path()).unwrap();
@@ -153,9 +153,37 @@ fn a_failed_write_blocks_the_store() {
         .unwrap();
     assert_eq!(
         store.setup("admin", "correct horse battery"),
-        Err(SetupError::NotDurable)
+        Err(SetupError::Unavailable)
     );
     db.strict().execute_batch("DROP TRIGGER refuse").unwrap();
+    assert!(store.setup_required());
+    store.setup("admin", "correct horse battery").unwrap();
+    assert!(store.verify("admin", "correct horse battery"));
+}
+
+/// The INSERT succeeds and leaves a deferred foreign key violation that fails COMMIT.
+fn fail_commit(db: &StateDb) {
+    db.strict()
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TEMP TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE child (id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TEMP TRIGGER orphan AFTER INSERT ON admin BEGIN INSERT INTO child VALUES (1); END;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_failed_commit_blocks_the_store() {
+    let data = temp_data_dir();
+    let db = Arc::new(StateDb::open(data.path()).unwrap());
+    let store = CredentialStore::open(Arc::clone(&db), data.path()).unwrap();
+    fail_commit(&db);
+    assert_eq!(
+        store.setup("admin", "correct horse battery"),
+        Err(SetupError::NotDurable)
+    );
+    db.strict().execute_batch("DROP TRIGGER orphan").unwrap();
     assert!(
         !store.setup_required(),
         "an uncertain write must not offer setup"
@@ -591,11 +619,7 @@ async fn an_unconfirmed_setup_write_is_not_retryable() {
     let auth = Arc::new(Auth::open(Arc::clone(&db), data.path()).unwrap());
     let mut state = crate::native_api::tests::state().await;
     Arc::get_mut(&mut state).unwrap().auth = Some(auth);
-    db.strict()
-        .execute_batch(
-            "CREATE TEMP TRIGGER refuse BEFORE INSERT ON admin BEGIN SELECT RAISE(ABORT, 'refused'); END;",
-        )
-        .unwrap();
+    fail_commit(&db);
     let response = router(state)
         .layer(axum::Extension(Peer("127.0.0.1".parse().unwrap())))
         .oneshot(

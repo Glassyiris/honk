@@ -197,26 +197,33 @@ impl CredentialStore {
             *self.state.lock() = StoreState::Uninitialized;
             return Err(SetupError::Unavailable);
         };
+        // The flag says whether a rollback confirmed that nothing was written.
         let result = (move || {
-            transaction.execute("INSERT INTO admin (id, record) VALUES (1, ?1)", [&json])?;
-            transaction.commit()
+            if let Err(error) =
+                transaction.execute("INSERT INTO admin (id, record) VALUES (1, ?1)", [&json])
+            {
+                return Err((error, transaction.rollback().is_ok()));
+            }
+            transaction.commit().map_err(|error| (error, false))
         })();
         match result {
             Ok(()) => {
                 *self.state.lock() = StoreState::Ready(Arc::new(record));
                 Ok(())
             }
-            Err(error)
+            Err((error, _))
                 if error.sqlite_error().is_some_and(|error| {
                     error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
                 }) =>
             {
                 Err(SetupError::AlreadyCompleted)
             }
-            Err(_) => {
-                // Failing at the statement or at COMMIT leaves the row's durability unknown.
-                Err(SetupError::NotDurable)
+            Err((_, true)) => {
+                *self.state.lock() = StoreState::Uninitialized;
+                Err(SetupError::Unavailable)
             }
+            // A failed COMMIT leaves the row's durability unknown.
+            Err((_, false)) => Err(SetupError::NotDurable),
         }
     }
 }
