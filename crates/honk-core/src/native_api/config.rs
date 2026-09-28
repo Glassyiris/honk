@@ -44,6 +44,13 @@ use crate::configuration::{
 /// occurrence of that byte from every response.
 pub(crate) const MIN_MASKED_SECRET: usize = 8;
 
+/// A rule's source id, redacted display file and masked location.
+pub(crate) type LocatedRule = (
+    String,
+    String,
+    honk_config::parser::source_edit::RuleSourceLocation,
+);
+
 /// The listener secret values a response must not carry. Building one parses every source that
 /// holds an API secret, so `ConfigService` keeps the set for the accepted sources and rebuilds it
 /// only when they change.
@@ -507,20 +514,41 @@ impl ConfigService {
         })
     }
 
-    pub(crate) fn rule_source(
+    pub(crate) fn rule_source(&self, index: Option<usize>) -> Option<LocatedRule> {
+        self.located_rule(|sources| match index {
+            Some(index) => sources.rules.get(index),
+            None => sources.fallback.as_ref(),
+        })
+    }
+
+    /// `response` selects the DNS response list; `None` is that list's fallback.
+    pub(crate) fn dns_rule_source(
         &self,
+        response: bool,
         index: Option<usize>,
-    ) -> Option<(
-        String,
-        String,
-        honk_config::parser::source_edit::RuleSourceLocation,
-    )> {
+    ) -> Option<LocatedRule> {
+        self.located_rule(|sources| {
+            let list = if response {
+                &sources.dns_response
+            } else {
+                &sources.dns_request
+            };
+            match index {
+                Some(index) => list.rules.get(index),
+                None => list.fallback.as_ref(),
+            }
+        })
+    }
+
+    fn located_rule(
+        &self,
+        pick: impl FnOnce(
+            &honk_config::parser::source_edit::RuleSourceIndex,
+        ) -> Option<&honk_config::parser::source_edit::RuleSourceLocation>,
+    ) -> Option<LocatedRule> {
         let guard = self.sources.accepted.read();
         let accepted = guard.as_ref()?;
-        let location = match index {
-            Some(index) => accepted.rule_sources.rules.get(index)?,
-            None => accepted.rule_sources.fallback.as_ref()?,
-        };
+        let location = pick(&accepted.rule_sources)?;
         let source = &accepted.update.sources[location.source_index];
         let secrets = self.secrets(Some(accepted));
         let mut location = location.clone();

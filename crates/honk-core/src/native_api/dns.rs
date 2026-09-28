@@ -32,10 +32,12 @@ use crate::dns::{
 mod cache;
 mod log;
 mod records;
+mod rules;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use records::record_type;
+pub(crate) use rules::capability as rules_capability;
 
 pub(super) const MAX_RESPONSE_BYTES: usize = 262_144;
 const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
@@ -339,6 +341,13 @@ pub(super) async fn cache(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     cache::serve(state, uri, id).await
+}
+pub(super) async fn rules(
+    state: &NativeState,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    rules::serve(state, uri, id).await
 }
 pub(super) async fn log(
     state: &NativeState,

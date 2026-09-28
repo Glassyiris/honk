@@ -138,6 +138,21 @@ pub(crate) struct RuleSource {
     column: usize,
 }
 
+/// Split an accepted rule location into its public source and its expression.
+pub(crate) fn located(
+    (source_id, file, location): super::config::LocatedRule,
+) -> (RuleSource, String) {
+    (
+        RuleSource {
+            file,
+            source_id,
+            line: location.line,
+            column: location.column,
+        },
+        location.expression,
+    )
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct RoutingRule {
     pub(crate) rule_id: String,
@@ -312,22 +327,13 @@ pub(super) async fn rules(
         let config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
         let mut result = dictionary(&router, &state.instance_id, generation, deadline, id)?;
-        let source =
-            |index| {
-                state.observation.configuration.rule_source(index).map(
-                    |(source_id, file, location)| {
-                        (
-                            RuleSource {
-                                file,
-                                source_id,
-                                line: location.line,
-                                column: location.column,
-                            },
-                            location.expression,
-                        )
-                    },
-                )
-            };
+        let source = |index| {
+            state
+                .observation
+                .configuration
+                .rule_source(index)
+                .map(located)
+        };
         let mut order: Vec<_> = config.routing.rules.iter().enumerate().collect();
         order.sort_by_key(|(_, rule)| rule.priority);
         for (rule, (source_index, configured)) in result

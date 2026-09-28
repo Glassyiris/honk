@@ -2,6 +2,7 @@
 
 mod creation;
 mod database;
+mod dns_rules;
 mod geodata;
 mod groups;
 mod management;
