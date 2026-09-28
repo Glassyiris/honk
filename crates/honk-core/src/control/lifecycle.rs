@@ -668,13 +668,21 @@ impl RuntimeEpoch {
                 { std::future::pending::<EpochEvent>().await }
             } => event,
             command = commands.recv() => EpochEvent::Command(command),
-            result = self.tcp.join_next(), if !self.tcp.is_empty() => match result {
-                Some(Err(error)) if !error.is_cancelled() => EpochEvent::Fatal(error.into()),
-                _ => EpochEvent::Reaped,
-            },
+            result = self.tcp.join_next(), if !self.tcp.is_empty() => reap_tcp(result),
             result = accept_tcp_with_admission(&self.listeners.tcp4, self.listeners.tcp6.as_ref(), plane.concurrency_limit.clone(), plane.stats.clone()), if !plane.drain_tracker.should_reject() => EpochEvent::Accepted(result),
         }
     }
+}
+
+/// A connection task owns one flow; its panic must end that flow only,
+/// never the runtime epoch.
+fn reap_tcp(result: Option<Result<(), tokio::task::JoinError>>) -> EpochEvent {
+    if let Some(Err(error)) = result
+        && !error.is_cancelled()
+    {
+        error!(%error, "TCP connection task panicked");
+    }
+    EpochEvent::Reaped
 }
 
 impl ControlPlane {
@@ -850,3 +858,23 @@ impl ControlPlane {
 
 #[cfg(all(test, feature = "native-api"))]
 mod tests;
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_panicked_or_cancelled_connection_task_is_reaped_not_fatal() {
+        let mut tasks = JoinSet::<()>::new();
+        tasks.spawn(async { panic!("connection bug") });
+        let panicked = tasks.join_next().await;
+        assert!(matches!(&panicked, Some(Err(error)) if error.is_panic()));
+        assert!(matches!(reap_tcp(panicked), EpochEvent::Reaped));
+
+        tasks.spawn(std::future::pending::<()>());
+        tasks.abort_all();
+        let cancelled = tasks.join_next().await;
+        assert!(matches!(&cancelled, Some(Err(error)) if error.is_cancelled()));
+        assert!(matches!(reap_tcp(cancelled), EpochEvent::Reaped));
+    }
+}
