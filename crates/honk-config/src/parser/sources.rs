@@ -56,14 +56,16 @@ pub struct SourceLimits {
 
 impl Default for SourceLimits {
     fn default() -> Self {
-        Self {
-            max_bytes: 8 * 1024 * 1024,
-            max_sources: 32,
-        }
+        Self::DEFAULT
     }
 }
 
 impl SourceLimits {
+    pub const DEFAULT: Self = Self {
+        max_bytes: 8 * 1024 * 1024,
+        max_sources: 32,
+    };
+
     pub(super) const UNLIMITED: Self = Self {
         max_bytes: usize::MAX,
         max_sources: usize::MAX,
