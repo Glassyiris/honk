@@ -224,9 +224,16 @@ const CREDENTIAL_NAMES: [&str; 15] = [
     "token",
 ];
 
-/// Random tokens mix cases and digits, or run long without separators. Git
-/// commit hashes (lower-case hex) and dash-separated release tags stay.
+/// Random tokens mix cases and digits, or run long without separators; UUIDs
+/// and 32-digit hex are subscription tokens. Git commit hashes (40-digit
+/// lower-case hex) and dash-separated release tags stay.
 fn looks_like_token(segment: &str) -> bool {
+    let hex = |part: &str| part.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let uuid =
+        segment.split('-').map(str::len).eq([8, 4, 4, 4, 12]) && hex(&segment.replace('-', ""));
+    if uuid || segment.len() == 32 && hex(segment) {
+        return true;
+    }
     let has = |class: fn(&u8) -> bool| segment.bytes().any(|byte| class(&byte));
     let url_safe = segment
         .bytes()

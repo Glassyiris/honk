@@ -540,6 +540,14 @@ fn a_display_url_keeps_nothing_that_may_hold_a_credential() {
             ),
         ),
         (
+            "https://example.com/d/0F3C9A7E-51b2-4c1d-9e8f-2a6b7c8d9e0f/geoip.dat",
+            Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/s/0123456789abcdef0123456789abcdef/geoip.dat",
+            Some("https://example.com/s/[redacted]/geoip.dat"),
+        ),
+        (
             "https://example.com/release-2026-09-29/geoip.dat",
             Some("https://example.com/release-2026-09-29/geoip.dat"),
         ),
