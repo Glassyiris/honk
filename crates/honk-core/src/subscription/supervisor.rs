@@ -33,6 +33,18 @@ pub(crate) struct ProviderLoad {
     pub(crate) rejection: Option<&'static str>,
 }
 
+/// Why the supervisor refused an explicit provider refresh.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RefreshRefusal {
+    /// No supervised worker owns the provider.
+    NotRefreshable,
+    /// A refresh is in flight or the provider's worker spec is changing.
+    Busy,
+    /// The refresh queue is full or the supervisor has stopped.
+    Unavailable,
+}
+
 struct ObservedProvider {
     subscription: Subscription,
     load: ProviderLoad,
@@ -484,19 +496,19 @@ impl SupervisorState {
     ) {
         let id = subscription.id;
         let Some(provider) = self.providers.get_mut(&id) else {
-            operation.reject(crate::native_api::providers::not_refreshable());
+            operation.reject(RefreshRefusal::NotRefreshable);
             return;
         };
         if !same_worker_spec(&provider.authorized.subscription, &subscription) {
-            operation.reject(crate::native_api::providers::busy());
+            operation.reject(RefreshRefusal::Busy);
             return;
         }
         if self.flights.contains_key(&id) {
-            operation.reject(crate::native_api::providers::busy());
+            operation.reject(RefreshRefusal::Busy);
             return;
         }
         if self.pending.len() >= MAX_REFRESH_QUEUE {
-            operation.reject(crate::native_api::providers::unavailable());
+            operation.reject(RefreshRefusal::Unavailable);
             return;
         }
         operation.accept();
@@ -745,15 +757,15 @@ impl SubscriptionSupervisorHandle {
         &self,
         subscription: Subscription,
         operation: crate::native_api::providers::RefreshOperation,
-    ) -> Result<(), crate::native_api::ApiError> {
+    ) -> Result<(), RefreshRefusal> {
         if let Err(error) = self.command_tx.try_send(SupervisorCommand::Refresh {
             subscription,
             operation,
         }) {
             if let SupervisorCommand::Refresh { operation, .. } = error.into_inner() {
-                operation.reject(crate::native_api::providers::unavailable());
+                operation.reject(RefreshRefusal::Unavailable);
             }
-            return Err(crate::native_api::providers::unavailable());
+            return Err(RefreshRefusal::Unavailable);
         }
         Ok(())
     }

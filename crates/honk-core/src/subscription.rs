@@ -29,8 +29,6 @@ pub(crate) use store::same_subscription_fetch_identity;
 pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies};
 
 pub(crate) use route::failure_code;
-#[cfg(feature = "native-api")]
-pub(crate) use supervisor::ProviderLoad;
 pub(crate) use supervisor::SubscriptionMergeReply;
 #[cfg(feature = "native-api")]
 pub(crate) use supervisor::same_subscription_source_spec;
@@ -38,6 +36,8 @@ pub(crate) use supervisor::{
     AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
     SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
 };
+#[cfg(feature = "native-api")]
+pub(crate) use supervisor::{ProviderLoad, RefreshRefusal};
 
 /// Bounds what a hostile or broken origin can make honk buffer before parsing.
 const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;

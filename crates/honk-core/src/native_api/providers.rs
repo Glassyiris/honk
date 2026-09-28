@@ -30,7 +30,9 @@ use super::{
 };
 use crate::{
     control::ReloadOutcome,
-    subscription::{ProviderLoad, SubscriptionMergeReply, SubscriptionSupervisorHandle},
+    subscription::{
+        ProviderLoad, RefreshRefusal, SubscriptionMergeReply, SubscriptionSupervisorHandle,
+    },
 };
 
 const MAX_PAGE_SIZE: usize = 1000;
@@ -506,8 +508,8 @@ impl RefreshOperation {
     pub(crate) fn running(&self) {
         self.operations.running(&self.reservation.id);
     }
-    pub(crate) fn reject(self, error: ApiError) {
-        self.operations.reject(&self.reservation.id, error);
+    pub(crate) fn reject(self, refusal: RefreshRefusal) {
+        self.operations.reject(&self.reservation.id, refusal.into());
     }
 
     pub(crate) fn finish(
@@ -549,7 +551,17 @@ impl RefreshOperation {
     }
 }
 
-pub(crate) fn unavailable() -> ApiError {
+impl From<RefreshRefusal> for ApiError {
+    fn from(refusal: RefreshRefusal) -> Self {
+        match refusal {
+            RefreshRefusal::NotRefreshable => not_refreshable(),
+            RefreshRefusal::Busy => busy(),
+            RefreshRefusal::Unavailable => unavailable(),
+        }
+    }
+}
+
+fn unavailable() -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::TemporarilyUnavailable,
@@ -558,7 +570,7 @@ pub(crate) fn unavailable() -> ApiError {
     )
     .with_retry_after(1)
 }
-pub(crate) fn busy() -> ApiError {
+fn busy() -> ApiError {
     ApiError::new(
         StatusCode::CONFLICT,
         ErrorCode::StateConflict,
@@ -566,7 +578,7 @@ pub(crate) fn busy() -> ApiError {
         None,
     )
 }
-pub(crate) fn not_refreshable() -> ApiError {
+fn not_refreshable() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         ErrorCode::CapabilityNotSupported,
