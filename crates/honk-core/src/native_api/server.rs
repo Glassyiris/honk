@@ -1,14 +1,16 @@
 //! HTTP connection, observer and credential-worker ownership.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::Extension;
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -101,20 +103,83 @@ impl NativeServer {
         }
     }
 }
+
+const RECEIVING: u8 = 0;
+const ANSWERING: u8 = 1;
+const ANSWERED: u8 = 2;
+
+/// Marks one request busy from its last body byte until its response resolves.
+struct Busy {
+    state: AtomicU8,
+    connection: Arc<AtomicUsize>,
+}
+
+impl Busy {
+    fn received(&self) {
+        if self
+            .state
+            .compare_exchange(RECEIVING, ANSWERING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.connection.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn answered(&self) {
+        if self.state.swap(ANSWERED, Ordering::AcqRel) == ANSWERING {
+            self.connection.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+// Busy starts only after the body ends, so read idleness still bounds peers that stall mid-body.
+struct Tracked {
+    body: Incoming,
+    busy: Arc<Busy>,
+}
+
+impl Body for Tracked {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let frame = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(frame, std::task::Poll::Ready(None)) || self.body.is_end_stream() {
+            self.busy.received();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
 struct NativeIo {
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     idle: std::pin::Pin<Box<tokio::time::Sleep>>,
     write_idle: std::pin::Pin<Box<tokio::time::Sleep>>,
     write_pending: bool,
+    busy: Arc<AtomicUsize>,
+    was_busy: bool,
 }
 
 impl NativeIo {
-    fn new(stream: tokio::net::TcpStream) -> Self {
+    fn new(stream: TcpStream, busy: Arc<AtomicUsize>) -> Self {
         Self {
             stream,
             idle: Box::pin(tokio::time::sleep(Duration::from_secs(30))),
             write_idle: Box::pin(tokio::time::sleep(Duration::from_secs(30))),
             write_pending: false,
+            busy,
+            was_busy: false,
         }
     }
 
@@ -155,6 +220,14 @@ impl tokio::io::AsyncRead for NativeIo {
         if matches!(result, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
             self.progress();
         }
+        // hyper keeps a read pending while a handler runs; the peer owes nothing until it answers.
+        if self.busy.load(Ordering::Acquire) > 0 {
+            self.was_busy = true;
+            return result;
+        }
+        if std::mem::take(&mut self.was_busy) {
+            self.progress();
+        }
         if result.is_pending() && self.idle.as_mut().poll(cx).is_ready() {
             return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
         }
@@ -192,6 +265,59 @@ impl tokio::io::AsyncWrite for NativeIo {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+async fn serve<S>(stream: TcpStream, service: S, mut stop: watch::Receiver<bool>)
+where
+    S: tower::Service<
+            hyper::Request<Tracked>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    let busy = Arc::new(AtomicUsize::new(0));
+    let io = NativeIo::new(stream, Arc::clone(&busy));
+    let service = TowerToHyperService::new(service);
+    let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+        let request_busy = Arc::new(Busy {
+            state: AtomicU8::new(RECEIVING),
+            connection: Arc::clone(&busy),
+        });
+        if request.body().is_end_stream() {
+            request_busy.received();
+        }
+        let tracked = Arc::clone(&request_busy);
+        let response = hyper::service::Service::call(
+            &service,
+            request.map(|body| Tracked {
+                body,
+                busy: tracked,
+            }),
+        );
+        async move {
+            let response = response.await;
+            request_busy.answered();
+            response
+        }
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(5))
+        .max_headers(100)
+        .max_buf_size(32768);
+    let connection = builder.serve_connection(TokioIo::new(io), service);
+    tokio::pin!(connection);
+    tokio::select! {
+        result = &mut connection => { let _ = result; }
+        _ = stop.changed() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
     }
 }
 
@@ -241,32 +367,26 @@ async fn supervise(
             child = children.join_next(), if !children.is_empty() => {
                 if child.is_some_and(|result| result.is_err()) {
                     tracing::error!(message = "native HTTP connection task failed");
-                    break;
                 }
             }
             accepted = listener.accept(), if children.len() < 64 => {
-                let Ok((stream, peer)) = accepted else {
-                    tracing::error!(message = "native HTTP listener failed");
-                    break;
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(message = "native HTTP listener failed");
+                        // Resource exhaustion persists across retries; back off instead of spinning.
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                        ) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
                 };
                 let peer = Peer(canonical_ip(peer.ip()));
-                let service = TowerToHyperService::new(
-                    tower::Layer::layer(&Extension(peer), router.clone()),
-                );
-                let mut stop = connection_receiver.clone();
-                children.spawn(async move {
-                    let mut builder = hyper::server::conn::http1::Builder::new();
-                    builder.timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(5)).max_headers(100).max_buf_size(32768);
-                    let connection = builder.serve_connection(TokioIo::new(NativeIo::new(stream)), service);
-                    tokio::pin!(connection);
-                    tokio::select! {
-                        result = &mut connection => { let _ = result; }
-                        _ = stop.changed() => {
-                            connection.as_mut().graceful_shutdown();
-                            let _ = connection.await;
-                        }
-                    }
-                });
+                let service = tower::Layer::layer(&Extension(peer), router.clone());
+                children.spawn(serve(stream, service, connection_receiver.clone()));
             }
         }
     }
@@ -301,5 +421,62 @@ async fn supervise(
     }
     if let Some(auth) = &state.auth {
         auth.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn connect(router: axum::Router) -> (TcpStream, JoinHandle<()>, watch::Sender<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (stop, receiver) = watch::channel(false);
+        (client, tokio::spawn(serve(stream, router, receiver)), stop)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_handler_outlives_read_idle() {
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                "done"
+            }),
+        );
+        let (mut client, _server, _stop) = connect(router).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: honk\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        while !response.ends_with(b"done") {
+            let read = client.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "connection closed before the response");
+            response.extend_from_slice(&chunk[..read]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_request_body_still_times_out() {
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(|body: Bytes| async move { body.len().to_string() }),
+        );
+        let (mut client, server, _stop) = connect(router).await;
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: honk\r\nContent-Length: 10\r\n\r\nabc")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), server)
+            .await
+            .expect("a peer stalling mid-body must be disconnected")
+            .unwrap();
     }
 }
