@@ -17,6 +17,8 @@ pub static RECEIVE_SOCK_COOKIE_OFFSET: Global<u32> = Global::new(0);
 pub static RECEIVE_SKB_PRIORITY_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 pub static RECEIVE_SKB_MARK_OFFSET: Global<u32> = Global::new(0);
+#[unsafe(no_mangle)]
+pub static RECEIVE_OWNER_TGID: Global<u32> = Global::new(0);
 
 #[map]
 pub static RECEIVE_TRACE: HashMap<u64, ReceiveTraceBatch> =
@@ -24,7 +26,8 @@ pub static RECEIVE_TRACE: HashMap<u64, ReceiveTraceBatch> =
 
 #[inline(always)]
 fn state(sk: *const u8) -> Option<*mut ReceiveTraceBatch> {
-    if sk.is_null() {
+    // The hooks run for every UDP receive on the host.
+    if sk.is_null() || (bpf_get_current_pid_tgid() >> 32) as u32 != RECEIVE_OWNER_TGID.load() {
         return None;
     }
     let cookie = unsafe {
