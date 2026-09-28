@@ -12,7 +12,7 @@ mod validation;
 use super::ConfigService;
 use super::coordinator::ConfigCoordinator;
 use crate::configuration::SourceUpdate;
-use crate::control::{ControlCommand, ControlPlane};
+use crate::control::{ControlCommand, ControlPlane, ReloadBehavior};
 use crate::dns::DnsResolver;
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};

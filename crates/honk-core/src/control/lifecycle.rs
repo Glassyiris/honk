@@ -26,7 +26,7 @@ struct BoundListeners {
     nfqueue_enabled: bool,
 }
 
-struct RuntimeEpoch {
+pub(super) struct RuntimeEpoch {
     listeners: BoundListeners,
     stop: watch::Sender<bool>,
     ingress: JoinSet<()>,
@@ -710,7 +710,7 @@ impl ControlPlane {
         }
     }
 
-    pub(super) async fn run_lifecycle(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut commands = self
             .command_rx
             .take()
@@ -798,61 +798,7 @@ impl ControlPlane {
                 }
             }
         }
-        if fatal.is_some() {
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-        #[cfg(feature = "native-api")]
-        self.publish_phase(if fatal.is_some() {
-            EnginePhase::Failed
-        } else {
-            EnginePhase::Draining
-        });
-        retain_error(&mut fatal, self.fence_runtime().await);
-        #[cfg(feature = "ebpf")]
-        if let Some(watcher) = self.iface_watcher.take() {
-            watcher.shutdown(STAGE_TIMEOUT).await;
-        }
-        // No watcher can reattach after this terminal boundary.
-        retain_error(&mut fatal, self.ebpf.write().await.detach_hooks());
-        if self.health_task.is_some() {
-            retain_error(
-                &mut fatal,
-                cleanup_stage(async {
-                    self.alive_set
-                        .shutdown_health_checks()
-                        .await
-                        .map_err(anyhow::Error::from)
-                })
-                .await,
-            );
-        }
-        retain_error(&mut fatal, joined(&mut self.health_task).await);
-        #[cfg(feature = "native-api")]
-        if let Some(native) = &self.native {
-            retain_error(
-                &mut fatal,
-                cleanup_stage(async { native.probes.pause().await.map_err(anyhow::Error::from) })
-                    .await,
-            );
-        }
-        #[cfg(feature = "clash-api")]
-        {
-            let mut slot = self.ui_download.lock().await;
-            if let Some(download) = slot.as_mut() {
-                retain_error(&mut fatal, cleanup_stage(download.stop_and_join()).await);
-            }
-            slot.take();
-        }
-        if fatal.is_none() && self.is_datapath_healthy() && epoch.is_some() {
-            retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
-        }
-        retain_error(&mut fatal, self.stop_network_epoch(epoch.as_mut()).await);
-        if let Some(flags) = &self.datapath_flags {
-            retain_error(&mut fatal, flags.disable().await);
-        }
-        retain_error(&mut fatal, self.finalize_shutdown().await);
-        fatal.map_or(Ok(()), Err)
+        self.shutdown_runtime(epoch.as_mut(), fatal).await
     }
 }
 

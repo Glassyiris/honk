@@ -34,29 +34,6 @@ pub(crate) enum ModeTarget {
 
 #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
 impl ModeTarget {
-    #[cfg(test)]
-    pub(crate) fn from_id(
-        id: &str,
-        config: &honk_config::Config,
-        groups: &std::collections::HashMap<String, String>,
-    ) -> Option<Self> {
-        if let Ok(node_id) = uuid::Uuid::parse_str(id)
-            && let Some(node) = config.nodes.iter().find(|node| node.id == node_id)
-        {
-            return Some(Self::Node {
-                id: node.id,
-                name: node.name.clone(),
-            });
-        }
-        groups
-            .iter()
-            .find(|(_, current)| current.as_str() == id)
-            .map(|(name, id)| Self::Group {
-                id: id.clone(),
-                name: name.clone(),
-            })
-    }
-
     #[cfg(any(feature = "clash-api", test))]
     pub(crate) fn from_name(
         name: &str,
@@ -248,7 +225,7 @@ impl ModeState {
 }
 
 /// Apply a request under the command owner's reload lock and config read barrier.
-#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[cfg(all(feature = "native-api", feature = "clash-api"))]
 pub(crate) async fn apply_mode_request(
     config: &honk_config::Config,
     groups: &std::collections::HashMap<String, String>,
@@ -258,25 +235,12 @@ pub(crate) async fn apply_mode_request(
     use crate::control::client::{ControlError, ModeRequest};
 
     match request {
-        #[cfg(test)]
-        ModeRequest::Runtime { mode, target } => {
-            if !flags.snapshot().native_enabled {
-                return Err(ControlError::Unsupported);
-            }
-            let target = target
-                .as_deref()
-                .map(|id| ModeTarget::from_id(id, config, groups).ok_or(ControlError::NotFound))
-                .transpose()?;
-            flags.set_native_mode(mode, target, config, groups).await
-        }
-        #[cfg(feature = "clash-api")]
         ModeRequest::ClashMode(mode) => {
             if ModeState::normalize(&mode).is_none() {
                 return Err(ControlError::Unsupported);
             }
             flags.set_clash_mode(&mode, config, groups).await
         }
-        #[cfg(feature = "clash-api")]
         ModeRequest::ClashSelection(selection) => {
             if flags.snapshot().native_enabled
                 && ModeTarget::from_name(&selection, config, groups).is_none()
@@ -358,43 +322,6 @@ impl DatapathFlagsHandle {
 
     pub fn snapshot(&self) -> ModeState {
         self.mode_state.read().clone()
-    }
-
-    /// The control owner retains the config read barrier through this transition.
-    #[cfg(all(test, feature = "native-api"))]
-    pub(crate) async fn set_native_mode(
-        &self,
-        mode: &str,
-        target: Option<ModeTarget>,
-        config: &honk_config::Config,
-        groups: &std::collections::HashMap<String, String>,
-    ) -> anyhow::Result<ModeState> {
-        let mode = ModeState::normalize(mode).context("invalid mode")?;
-        anyhow::ensure!(
-            (mode == "Global") == target.is_some(),
-            "global mode requires exactly one target"
-        );
-        anyhow::ensure!(
-            target
-                .as_ref()
-                .is_none_or(|target| target.present(config, groups)),
-            "mode target is unavailable"
-        );
-        self.update(false, move |state, current| {
-            anyhow::ensure!(
-                state.initialized && current.native_enabled,
-                "native mode is unavailable"
-            );
-            current.mode = mode;
-            current.global_selection = target
-                .as_ref()
-                .map(|target| target.name().to_owned())
-                .unwrap_or_default();
-            current.target = target;
-            current.source = ModeSource::Runtime;
-            Ok(Persistence::None)
-        })
-        .await
     }
 
     /// Clash participates in the same transient identity owner when native is enabled.

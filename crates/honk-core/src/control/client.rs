@@ -6,7 +6,7 @@ use honk_outbound::group::SelectorMember;
 use honk_outbound::group::SelectorNetworks;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-#[cfg(feature = "clash-api")]
+#[cfg(any(feature = "native-api", feature = "clash-api"))]
 use tokio::sync::oneshot;
 
 #[derive(Clone)]
@@ -14,17 +14,10 @@ pub struct ControlClient {
     sender: mpsc::Sender<super::ControlCommand>,
 }
 
-#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[cfg(all(feature = "native-api", feature = "clash-api"))]
 #[derive(Debug)]
 pub(crate) enum ModeRequest {
-    #[cfg(test)]
-    Runtime {
-        mode: &'static str,
-        target: Option<String>,
-    },
-    #[cfg(feature = "clash-api")]
     ClashMode(String),
-    #[cfg(feature = "clash-api")]
     ClashSelection(String),
 }
 
@@ -88,7 +81,7 @@ impl ControlClient {
         Self { sender }
     }
 
-    #[cfg(feature = "clash-api")]
+    #[cfg(any(feature = "native-api", feature = "clash-api"))]
     pub(crate) async fn select(
         &self,
         request: SelectionRequest,

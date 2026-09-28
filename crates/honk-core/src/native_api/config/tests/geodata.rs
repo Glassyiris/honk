@@ -1173,7 +1173,9 @@ async fn the_download_route_names_a_current_group_by_id() {
 async fn rejected_activation_records_failed_last_reload() {
     let server = AssetServer::new(geosite("new.example"), geoip(203), false).await;
     let fixture = fixture(server.address, false).await;
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
     let terminal = fixture.terminal(&operation).await;
     assert_eq!(terminal["status"], "failed", "{terminal}");

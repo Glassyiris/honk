@@ -778,7 +778,9 @@ async fn managed_provider_aliases_cannot_transfer_existing_runtime_identity() {
 #[tokio::test]
 async fn db_store_rejected_management_reports_nothing_written() {
     let fixture = Fixture::new_db(Access::Admin).await;
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let failure = error(
         create_node(&fixture, "not-recorded", LINK)
             .send()
@@ -804,7 +806,9 @@ async fn db_store_rejected_management_reports_nothing_written() {
 #[tokio::test]
 async fn db_store_degraded_management_reports_recorded_write() {
     let fixture = Fixture::new_db(Access::Admin).await;
-    fixture.reject_reloads.store(3, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
     let failure = error(
         create_node(&fixture, "degraded", LINK)
             .send()

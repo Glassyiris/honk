@@ -291,7 +291,9 @@ async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
     let rejected = fixture.terminal(&operation).await;
     assert_eq!(rejected["status"], "failed");
@@ -304,7 +306,9 @@ async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
     assert_eq!(fixture.get(CONFIG).await, before);
     assert_eq!(fixture.get(&source_path(main)).await, *main);
     fixture.assert_last_reload(&rejected).await;
-    fixture.reject_reloads.store(0, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Apply as u8, Ordering::SeqCst);
     let repaired = format!("{}# repaired locally\n", fixture.originals["main.dae"]);
     std::fs::write(fixture.path("main.dae"), &repaired).unwrap();
     let recovery = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;

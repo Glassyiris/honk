@@ -100,6 +100,8 @@ pub(crate) use reload::restart_required_fields;
 use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
+#[cfg(all(test, feature = "native-api"))]
+pub(crate) use tests::reload_harness::ReloadBehavior;
 
 /// Re-send `NetworkChanged` with bounded backoff after a rejected refresh.
 /// Duplicate deliveries after the interface-dependent state converges are

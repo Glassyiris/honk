@@ -171,7 +171,9 @@ async fn directory_swapped_before_the_rename_writes_nothing() {
 async fn failed_activation_removes_the_created_file() {
     let fixture = Fixture::new_custom(Access::Admin, false, with_include).await;
     let before = fixture.get(CONFIG).await;
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
@@ -181,7 +183,9 @@ async fn failed_activation_removes_the_created_file() {
     assert_eq!(fixture.get(CONFIG).await, before);
 
     // A degraded commit is active, so the file stays and the failure says so.
-    fixture.reject_reloads.store(3, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
     let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");

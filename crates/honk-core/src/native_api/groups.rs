@@ -542,28 +542,9 @@ async fn apply_selection(
     request: crate::control::client::SelectionRequest,
     id: &RequestId,
 ) -> Result<crate::control::client::SelectionResult, ApiError> {
-    let (reply, response) = tokio::sync::oneshot::channel();
-    state
-        .control_tx
-        .try_send(crate::control::ControlCommand::SetSelector { request, reply })
-        .map_err(|_| {
-            super::error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::TemporarilyUnavailable,
-                "Control queue is unavailable",
-                id,
-            )
-        })?;
-    response
+    crate::control::ControlClient::new(state.control_tx.clone())
+        .select(request)
         .await
-        .map_err(|_| {
-            super::error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::TemporarilyUnavailable,
-                "Control owner is unavailable",
-                id,
-            )
-        })?
         .map_err(|reason| {
             let (status, code) = match reason {
                 crate::control::client::ControlError::NotFound => {

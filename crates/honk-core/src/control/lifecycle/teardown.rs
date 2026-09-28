@@ -164,27 +164,76 @@ impl ControlPlane {
         self.network_refresh_retry.take();
         error.map_or(Ok(()), Err)
     }
-    #[cfg(test)]
-    pub(in crate::control) async fn shutdown_datapath(
+
+    // Tests enter without an epoch, like a startup that failed before binding.
+    pub(in crate::control) async fn shutdown_runtime(
         &mut self,
-        drain: &Arc<DrainTracker>,
-        udp_removal_task: &mut tokio::task::JoinHandle<()>,
+        epoch: Option<&mut RuntimeEpoch>,
+        mut fatal: Option<anyhow::Error>,
     ) -> anyhow::Result<()> {
-        let fenced = self.ebpf.write().await.set_datapath_ready(false);
-        drain.start_rejecting();
+        if fatal.is_some() {
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(feature = "native-api")]
+        self.publish_phase(if fatal.is_some() {
+            EnginePhase::Failed
+        } else {
+            EnginePhase::Draining
+        });
+        retain_error(&mut fatal, self.fence_runtime().await);
         #[cfg(feature = "ebpf")]
         if let Some(watcher) = self.iface_watcher.take() {
             watcher.shutdown(STAGE_TIMEOUT).await;
         }
-        let detached = self.ebpf.write().await.detach_hooks();
-        let drained = drain.drain().await;
-        let stopped = self.stop_network_epoch(None).await;
-        let removed = udp_removal_task.await;
-        fenced?;
-        detached?;
-        drained?;
-        stopped?;
-        removed?;
-        Ok(())
+        // No watcher can reattach after this terminal boundary.
+        retain_error(&mut fatal, self.ebpf.write().await.detach_hooks());
+        if self.health_task.is_some() {
+            retain_error(
+                &mut fatal,
+                cleanup_stage(async {
+                    self.alive_set
+                        .shutdown_health_checks()
+                        .await
+                        .map_err(anyhow::Error::from)
+                })
+                .await,
+            );
+        }
+        retain_error(&mut fatal, joined(&mut self.health_task).await);
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &self.native {
+            retain_error(
+                &mut fatal,
+                cleanup_stage(async {
+                    // A worker that never started or already stopped has nothing to pause.
+                    match native.probes.pause().await {
+                        Ok(())
+                        | Err(crate::native_api::probes::ProbeLifecycleError::Unavailable) => {
+                            Ok(())
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                })
+                .await,
+            );
+        }
+        #[cfg(feature = "clash-api")]
+        {
+            let mut slot = self.ui_download.lock().await;
+            if let Some(download) = slot.as_mut() {
+                retain_error(&mut fatal, cleanup_stage(download.stop_and_join()).await);
+            }
+            slot.take();
+        }
+        if fatal.is_none() && self.is_datapath_healthy() && epoch.is_some() {
+            retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
+        }
+        retain_error(&mut fatal, self.stop_network_epoch(epoch).await);
+        if let Some(flags) = &self.datapath_flags {
+            retain_error(&mut fatal, flags.disable().await);
+        }
+        retain_error(&mut fatal, self.finalize_shutdown().await);
+        fatal.map_or(Ok(()), Err)
     }
 }
