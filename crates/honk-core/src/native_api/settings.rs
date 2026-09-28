@@ -474,8 +474,8 @@ pub(super) async fn get(
 }
 
 /// Adds the geodata sources: URLs as written, apart from listener secrets, for
-/// an authenticated caller, who may edit them, and without userinfo, query and
-/// fragment for the anonymous loopback caller.
+/// an authenticated caller, who may edit them, and as `source_redacted` shows
+/// them for the anonymous loopback caller.
 fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value {
     if let Some(sources) = state.geodata.as_ref() {
         let secrets = super::config::ListenerSecrets::from_config(active);
@@ -485,7 +485,8 @@ fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value
                 if reveal {
                     secrets.mask(url).0
                 } else {
-                    super::geodata::redact_fully(url, &secrets, &state.observation.configuration)
+                    super::geodata::redact(url, &secrets, &state.observation.configuration)
+                        .unwrap_or_else(|| "[redacted]".to_owned())
                 }
             },
             |name| super::geodata::group_id(&state.observation.catalog, name),

@@ -170,33 +170,60 @@ fn route(settings: &NativeApiConfig, sources: Option<&Sources>) -> Route {
     }
 }
 
-/// A URL as `source_redacted` shows it.
+/// A URL as `source_redacted` and `fetched_url_redacted` show it, listener
+/// secrets masked; None when it cannot be shown safely.
 pub(crate) fn redact(
     url: &str,
     secrets: &config::ListenerSecrets,
     service: &config::ConfigService,
-) -> String {
-    service.mask_text(&secrets.mask(url).0).0
+) -> Option<String> {
+    display_url(url).map(|url| service.mask_text(&secrets.mask(&url).0).0)
 }
 
-/// A URL without userinfo, query and fragment, then masked like
-/// `source_redacted`, for `fetched_url_redacted` and callers without control.
-pub(crate) fn redact_fully(
-    url: &str,
-    secrets: &config::ListenerSecrets,
-    service: &config::ConfigService,
-) -> String {
-    let stripped = match parse_geodata_url(url) {
-        Some(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string()
-        }
-        None => url.split(['?', '#']).next().unwrap_or_default().to_owned(),
-    };
-    redact(&stripped, secrets, service)
+/// The URL without query and fragment, and with every path segment that may
+/// hold a credential replaced. A URL with userinfo does not parse.
+fn display_url(url: &str) -> Option<String> {
+    let mut parsed = parse_geodata_url(url)?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut previous = "";
+    let path = parsed
+        .path()
+        .split('/')
+        .map(|segment| {
+            let hidden = CREDENTIAL_NAMES
+                .iter()
+                .any(|name| previous.eq_ignore_ascii_case(name))
+                || segment.contains([':', '='])
+                || looks_like_token(segment);
+            previous = segment;
+            if hidden { "[redacted]" } else { segment }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    parsed.set_path(&path);
+    Some(parsed.into())
+}
+
+const CREDENTIAL_NAMES: [&str; 8] = [
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "key",
+    "password",
+    "secret",
+    "token",
+];
+
+/// Hex, UUID and base64url tokens; release names such as `meta-rules-dat` stay.
+fn looks_like_token(segment: &str) -> bool {
+    segment.len() >= 16
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && segment.bytes().any(|byte| byte.is_ascii_digit())
+        && segment.bytes().any(|byte| byte.is_ascii_alphabetic())
 }
 
 pub(crate) fn project(
@@ -226,7 +253,7 @@ pub(crate) fn project(
             .map(|asset| {
                 let source_redacted = urls(&active.experimental.native_api, geodata, asset.kind)
                     .first()
-                    .map(|url| redact(url, &secrets, sources));
+                    .and_then(|url| redact(url, &secrets, sources));
                 let origin = geodata.map(|geodata| {
                     let fetched = geodata.fetched(asset.kind, &asset.sha256);
                     Origin {
@@ -237,7 +264,7 @@ pub(crate) fn project(
                             route
                         }),
                         fetched_url_redacted: fetched
-                            .map(|fetched| redact_fully(&fetched.url, &secrets, sources)),
+                            .and_then(|fetched| redact(&fetched.url, &secrets, sources)),
                     }
                 });
                 GeoAsset {

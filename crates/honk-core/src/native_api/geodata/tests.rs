@@ -517,3 +517,33 @@ async fn a_trickle_ends_at_the_download_limit() {
     assert_eq!(failure, Failure::from("download_timeout"));
     assert_eq!(started.elapsed(), DOWNLOAD_LIMIT);
 }
+
+#[test]
+fn a_display_url_keeps_nothing_that_may_hold_a_credential() {
+    for (url, shown) in [
+        (
+            "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat",
+            Some("https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"),
+        ),
+        (
+            "https://example.com/geoip.dat?sig=abc&key=xyz",
+            Some("https://example.com/geoip.dat"),
+        ),
+        (
+            "https://example.com/token/abc123/geoip.dat",
+            Some("https://example.com/token/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/d/0f3c9a7e-51b2-4c1d-9e8f-2a6b7c8d9e0f/geoip.dat",
+            Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/bot123:abc/geoip.dat",
+            Some("https://example.com/[redacted]/geoip.dat"),
+        ),
+        ("https://user:pass@example.com/geoip.dat", None),
+        ("https://user@example.com/geoip.dat", None),
+    ] {
+        assert_eq!(display_url(url).as_deref(), shown, "{url}");
+    }
+}

@@ -293,7 +293,7 @@ async fn updates_verified_bytes_and_keeps_loaded_metadata_after_disk_edits() {
     );
     assert_eq!(
         old["assets"][0]["source_redacted"],
-        format!("http://{}/geosite/PRIVATE?token=PRIVATE", server.address)
+        format!("http://{}/geosite/PRIVATE", server.address)
     );
     assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "block");
     assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "direct");
@@ -744,8 +744,12 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
         ("/tampered/geosite.dat.sha256sum", OK, checksum(b"other")),
         ("/moved/geosite.dat", OK, site.clone()),
         ("/moved/geosite.dat.sha256sum", "302 Found", Vec::new()),
-        ("/good/geosite.dat?token=abc", OK, site.clone()),
-        ("/good/geosite.dat.sha256sum?token=abc", OK, checksum(&site)),
+        ("/token/abc123/geosite.dat?sig=abc", OK, site.clone()),
+        (
+            "/token/abc123/geosite.dat.sha256sum?sig=abc",
+            OK,
+            checksum(&site),
+        ),
         ("/good/geoip.dat", OK, ip.clone()),
     ])
     .await;
@@ -755,10 +759,10 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     })
     .await;
     let geosite_urls = [
-        mirror.url("/missing/geosite.dat"),
+        mirror.url("/missing/key/abc123/geosite.dat?token=abc"),
         mirror.url("/tampered/geosite.dat"),
         mirror.url("/moved/geosite.dat"),
-        mirror.url("/good/geosite.dat?token=abc"),
+        mirror.url("/token/abc123/geosite.dat?sig=abc"),
     ];
     let settings = ok(patch_settings(
         &fixture,
@@ -782,10 +786,13 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     let data = fixture.get(GEO).await;
     assert_eq!(data["assets"], terminal["result"]["assets"]);
     let assets = &data["assets"];
-    assert_eq!(assets[0]["source_redacted"], geosite_urls[0]);
+    assert_eq!(
+        assets[0]["source_redacted"],
+        mirror.url("/missing/key/[redacted]/geosite.dat")
+    );
     assert_eq!(
         assets[0]["fetched_url_redacted"],
-        mirror.url("/good/geosite.dat")
+        mirror.url("/token/[redacted]/geosite.dat")
     );
     assert_eq!(assets[0]["verified"], true);
     assert_eq!(
@@ -810,13 +817,13 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     assert_eq!(
         *mirror.requests.lock(),
         [
-            "/missing/geosite.dat",
+            "/missing/key/abc123/geosite.dat?token=abc",
             "/tampered/geosite.dat",
             "/tampered/geosite.dat.sha256sum",
             "/moved/geosite.dat",
             "/moved/geosite.dat.sha256sum",
-            "/good/geosite.dat?token=abc",
-            "/good/geosite.dat.sha256sum?token=abc",
+            "/token/abc123/geosite.dat?sig=abc",
+            "/token/abc123/geosite.dat.sha256sum?sig=abc",
             "/good/geoip.dat",
             "/good/geoip.dat.sha256sum",
         ]
