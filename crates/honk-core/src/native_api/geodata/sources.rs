@@ -14,8 +14,8 @@ use crate::native_api::ApiError;
 use crate::state::StateDb;
 
 pub(crate) const KINDS: [&str; 2] = ["geosite", "geoip"];
-const MAX_URLS: usize = 4;
-const INTERVAL_HOURS: std::ops::RangeInclusive<u64> = 6..=168;
+pub(super) const MAX_URLS: usize = 4;
+pub(super) const INTERVAL_HOURS: std::ops::RangeInclusive<u64> = 6..=168;
 const MAX_JITTER_SECS: u64 = 3600;
 const FIRST_BACKOFF: Duration = Duration::from_secs(3600);
 /// MetaCubeX full, raw first; jsDelivr serves the same bytes where GitHub is slow.
@@ -148,7 +148,7 @@ fn valid_urls(urls: &[String]) -> bool {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Source {
     Config,
-    Db,
+    Override,
     Default,
 }
 
@@ -570,7 +570,7 @@ fn effective(stored: &Stored) -> Effective {
     } else if lists.all(|list| list.from_config) {
         Source::Config
     } else {
-        Source::Db
+        Source::Override
     };
     Effective {
         source,

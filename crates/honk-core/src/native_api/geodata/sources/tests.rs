@@ -31,7 +31,7 @@ fn the_file_seeds_the_stored_urls_at_startup_over_a_patch() {
             "geoip": {"urls": ["https://patched.example/geoip.dat"]}}),
         ))
         .unwrap();
-    assert_eq!(sources.effective().source, Source::Db);
+    assert_eq!(sources.effective().source, Source::Override);
     drop(sources);
     let sources = Sources::open(
         db(directory.path()),
@@ -39,7 +39,7 @@ fn the_file_seeds_the_stored_urls_at_startup_over_a_patch() {
     )
     .unwrap();
     let seeded = sources.effective();
-    assert_eq!(seeded.source, Source::Db);
+    assert_eq!(seeded.source, Source::Override);
     assert_eq!(
         seeded.urls,
         [
@@ -52,12 +52,12 @@ fn the_file_seeds_the_stored_urls_at_startup_over_a_patch() {
             json!({"geosite": {"urls": ["https://patched.example/geosite.dat"]}}),
         ))
         .unwrap();
-    assert_eq!(patched.source, Source::Db);
+    assert_eq!(patched.source, Source::Override);
     assert_eq!(patched.urls[0], ["https://patched.example/geosite.dat"]);
     let auto = sources
         .apply(patch(json!({"auto_update": {"enabled": true}})))
         .unwrap();
-    assert_eq!(auto.source, Source::Db);
+    assert_eq!(auto.source, Source::Override);
     assert!(auto.auto_update.enabled);
 }
 
@@ -128,7 +128,7 @@ fn a_url_patch_is_stored_and_null_deletes_everything() {
             "auto_update": {"interval_hours": 48}}),
         ))
         .unwrap();
-    assert_eq!(stored.source, Source::Db);
+    assert_eq!(stored.source, Source::Override);
     assert_eq!(stored.urls[1], DEFAULT_URLS[1].map(str::to_owned).to_vec());
     assert_eq!(stored.auto_update.interval_hours, 48);
     drop(sources);
@@ -164,7 +164,7 @@ fn patches_outside_the_url_and_interval_rules_are_refused() {
         json!({"auto_update": {}}),
         json!({"auto_update": {"interval_hours": 5}}),
         json!({"auto_update": {"interval_hours": 169}}),
-        json!({"source": "db"}),
+        json!({"source": "override"}),
     ] {
         assert!(Patch::parse(value.clone(), invalid).is_err(), "{value}");
     }
