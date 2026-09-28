@@ -26,6 +26,7 @@ pub(super) struct Summary {
     pub chain: Vec<String>,
     pub chain_source: &'static str,
     pub rule_id: Option<String>,
+    pub rule_generation_id: Option<String>,
     pub rule_expression: Option<String>,
     pub rule_source: &'static str,
     pub ingress: (),
@@ -46,6 +47,7 @@ impl Summary {
                 &self.connection_id,
                 &self.outbound,
                 &self.rule_id,
+                &self.rule_generation_id,
                 &self.rule_expression,
                 &self.ended_at,
             ])
