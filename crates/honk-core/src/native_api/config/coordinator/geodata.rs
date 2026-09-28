@@ -88,6 +88,7 @@ impl Worker {
                 }
             }
             Err(details) => {
+                tracing::warn!(%details, "geodata update failed");
                 if let Some(sources) = &plan.sources {
                     sources.record(Err(details["stage"]
                         .as_str()
