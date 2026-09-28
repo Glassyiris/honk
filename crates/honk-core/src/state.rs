@@ -76,8 +76,8 @@ const MIGRATIONS: [&str; 1] = [
 pub enum StateError {
     #[error("state database is unavailable")]
     Unavailable,
-    #[error("state database path is unsafe")]
-    Unsafe,
+    #[error("state database path is unsafe: {0}")]
+    Unsafe(Refusal),
     #[error("state database is corrupt")]
     Corrupt,
     #[error("state database has a foreign application id or a newer schema")]
@@ -93,12 +93,99 @@ impl StateError {
     pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
-            Self::Unsafe => "unsafe",
+            Self::Unsafe(_) => "unsafe",
             Self::Corrupt => "corrupt",
             Self::Unsupported => "unsupported",
             Self::Locked => "locked",
             Self::InUse => "in_use",
         }
+    }
+}
+
+/// Which check refused which path. The path is relative to the data directory,
+/// so the API can report the rule without the operator's local paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refusal {
+    pub(crate) target: Target,
+    pub(crate) rule: Rule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Target {
+    StateDir,
+    Database,
+    LegacyDir,
+    LegacyRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rule {
+    NotOwner,
+    GroupOrOtherBits,
+    NotDirectory,
+    NotFile,
+    Symlink,
+    /// The file SQLite opened is not the inode that was checked.
+    IdentityChanged,
+}
+
+impl Target {
+    /// Relative to the data directory.
+    pub(crate) fn relative_path(self) -> &'static str {
+        match self {
+            Self::StateDir => STATE_DIR,
+            Self::Database => "state/honk.db",
+            Self::LegacyDir => "native-api",
+            Self::LegacyRecord => "native-api/admin.json",
+        }
+    }
+
+    fn directory(self) -> bool {
+        matches!(self, Self::StateDir | Self::LegacyDir)
+    }
+}
+
+impl Rule {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotOwner => "not_owner",
+            Self::GroupOrOtherBits => "group_or_other_bits",
+            Self::NotDirectory => "not_directory",
+            Self::NotFile => "not_file",
+            Self::Symlink => "symlink",
+            Self::IdentityChanged => "identity_changed",
+        }
+    }
+}
+
+impl Refusal {
+    fn new(target: Target, rule: Rule) -> Self {
+        Self { target, rule }
+    }
+
+    /// How an operator fixes `path`, the refused path, for the log.
+    pub(crate) fn fix(&self, path: &Path) -> String {
+        let path = path.display();
+        match (self.rule, self.target.directory()) {
+            (Rule::GroupOrOtherBits, true) => format!("chmod 700 {path}"),
+            (Rule::GroupOrOtherBits, false) => format!("chmod 600 {path}"),
+            (Rule::NotOwner, _) => format!("chown {} {path}", effective_uid()),
+            (Rule::IdentityChanged, _) => format!("stop whatever replaces {path}"),
+            (_, true) => format!("replace {path} with a directory"),
+            (_, false) => format!("replace {path} with a regular file"),
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.target.relative_path(), self.rule.as_str())
+    }
+}
+
+impl From<Refusal> for StateError {
+    fn from(refusal: Refusal) -> Self {
+        Self::Unsafe(refusal)
     }
 }
 
@@ -131,7 +218,7 @@ impl StateDb {
     }
 
     fn open_with_ceiling(data_dir: &Path, max_page_count: i64) -> Result<Self, StateError> {
-        let directory = state_directory(data_dir, true)?;
+        let directory = state_directory(data_dir, true, tighten)?;
         let directory = Flock::lock(directory, FlockArg::LockSharedNonblock).map_err(
             |(_, error)| match error {
                 Errno::EWOULDBLOCK => StateError::Locked,
@@ -146,9 +233,9 @@ impl StateDb {
         ) {
             Ok(fd) => (File::from(fd), true),
             Err(Errno::EEXIST) => (existing(&directory)?, false),
-            Err(error) => return Err(path_error(error)),
+            Err(error) => return Err(path_error(Target::Database, error)),
         };
-        private(&file, false)?;
+        tighten(&file, Target::Database)?;
         let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
         let identity = (metadata.dev(), metadata.ino());
         // A newly created file is a regular descriptor: closed before SQLite
@@ -215,7 +302,7 @@ impl StateDb {
 /// there was neither. Refused while any process has the db open through
 /// `StateDb`, because each holds a shared lock on `state/`.
 pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
-    let directory = state_directory(data_dir, true)?;
+    let directory = state_directory(data_dir, true, tighten)?;
     let directory = Flock::lock(directory, FlockArg::LockExclusiveNonblock).map_err(
         |(_, error)| match error {
             Errno::EWOULDBLOCK => StateError::InUse,
@@ -229,11 +316,11 @@ pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
         nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
     ) {
         Err(Errno::ENOENT) => return remove_legacy_admin(data_dir),
-        Err(error) => return Err(path_error(error)),
+        Err(error) => return Err(path_error(Target::Database, error)),
         Ok(_) => {}
     }
     let file = existing(&directory)?;
-    private(&file, false)?;
+    tighten(&file, Target::Database)?;
     let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
     drop(file);
     let path = resolved(&directory)?.join(DB_FILE);
@@ -266,9 +353,9 @@ fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
     let directory = match openat(&parent, LEGACY_DIR, DIR_FLAGS, Mode::empty()) {
         Ok(fd) => File::from(fd),
         Err(Errno::ENOENT) => return Ok(false),
-        Err(error) => return Err(path_error(error)),
+        Err(error) => return Err(path_error(Target::LegacyDir, error)),
     };
-    private(&directory, true)?;
+    private(&directory, Target::LegacyDir)?;
     let record = match openat(
         &directory,
         "admin.json",
@@ -277,9 +364,9 @@ fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
     ) {
         Ok(fd) => File::from(fd),
         Err(Errno::ENOENT) => return Ok(false),
-        Err(error) => return Err(path_error(error)),
+        Err(error) => return Err(path_error(Target::LegacyRecord, error)),
     };
-    private(&record, false)?;
+    private(&record, Target::LegacyRecord)?;
     match nix::unistd::unlinkat(
         &directory,
         "admin.json",
@@ -287,7 +374,7 @@ fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
     ) {
         Ok(()) => {}
         Err(Errno::ENOENT) => return Ok(false),
-        Err(error) => return Err(path_error(error)),
+        Err(error) => return Err(path_error(Target::LegacyRecord, error)),
     }
     nix::unistd::fsync(&directory).map_err(|_| StateError::Unavailable)?;
     // Fails while anything else is left in it.
@@ -362,7 +449,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
     const CORRUPT: &str = "honk.db.corrupt";
     // Exclusive for the renames: no other process may have the file open.
     let directory = Flock::lock(
-        state_directory(data_dir, false)?,
+        state_directory(data_dir, false, private)?,
         FlockArg::LockExclusiveNonblock,
     )
     .map_err(|(_, error)| match error {
@@ -384,7 +471,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
             return Ok(None);
         }
         Err(Errno::ENOENT) => {}
-        Err(error) => return Err(path_error(error)),
+        Err(error) => return Err(path_error(Target::Database, error)),
     }
     // The `-wal` moves first: a crash in between must not leave it beside a new file.
     for (from, to) in [("honk.db-wal", "honk.db.corrupt-wal"), (DB_FILE, CORRUPT)] {
@@ -405,7 +492,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
                 );
                 return Ok(None);
             }
-            Err(error) => return Err(path_error(error)),
+            Err(error) => return Err(path_error(Target::Database, error)),
         }
     }
     match nix::unistd::unlinkat(
@@ -414,7 +501,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
         nix::unistd::UnlinkatFlags::NoRemoveDir,
     ) {
         Ok(()) | Err(Errno::ENOENT) => {}
-        Err(error) => return Err(path_error(error)),
+        Err(error) => return Err(path_error(Target::Database, error)),
     }
     nix::unistd::fsync(&*directory).map_err(|_| StateError::Unavailable)?;
     tracing::warn!(
@@ -433,9 +520,9 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
 /// that fails `quick_check`.
 #[cfg(feature = "native-api")]
 pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), StateError> {
-    let directory = state_directory(data_dir, false)?;
+    let directory = state_directory(data_dir, false, private)?;
     let file = existing(&directory)?;
-    private(&file, false)?;
+    private(&file, Target::Database)?;
     let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
     drop(file);
     let path = resolved(&directory)?.join(DB_FILE);
@@ -462,7 +549,11 @@ pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), Stat
     Ok((directory, connection))
 }
 
-fn state_directory(data_dir: &Path, create: bool) -> Result<File, StateError> {
+fn state_directory(
+    data_dir: &Path,
+    create: bool,
+    check: fn(&File, Target) -> Result<(), StateError>,
+) -> Result<File, StateError> {
     let parent =
         File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StateError::Unavailable)?);
     if create {
@@ -471,9 +562,22 @@ fn state_directory(data_dir: &Path, create: bool) -> Result<File, StateError> {
             Err(_) => return Err(StateError::Unavailable),
         }
     }
-    let directory =
-        File::from(openat(&parent, STATE_DIR, DIR_FLAGS, Mode::empty()).map_err(path_error)?);
-    private(&directory, true)?;
+    let directory = match openat(&parent, STATE_DIR, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        // `O_DIRECTORY | O_NOFOLLOW` also reports a symlink as `ENOTDIR`.
+        Err(Errno::ENOTDIR)
+            if nix::sys::stat::fstatat(
+                &parent,
+                STATE_DIR,
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFLNK) =>
+        {
+            return Err(Refusal::new(Target::StateDir, Rule::Symlink).into());
+        }
+        Err(error) => return Err(path_error(Target::StateDir, error)),
+    };
+    check(&directory, Target::StateDir)?;
     if create {
         // Also cover another creator or a previous failed sync: strict commits
         // cannot make this directory's entry durable in its parent.
@@ -495,7 +599,7 @@ fn existing(directory: &File) -> Result<File, StateError> {
         Mode::empty(),
     )
     .map(File::from)
-    .map_err(path_error)
+    .map_err(|error| path_error(Target::Database, error))
 }
 
 // SQLite resolves `/proc/self/fd` itself, so NOFOLLOW would refuse it; the
@@ -517,7 +621,7 @@ fn open_checked(
     .map_err(sql)?;
     let opened = std::fs::symlink_metadata(path).map_err(|_| StateError::Unavailable)?;
     if (opened.dev(), opened.ino()) != identity {
-        return Err(StateError::Unsafe);
+        return Err(Refusal::new(Target::Database, Rule::IdentityChanged).into());
     }
     // Before the first read: `quick_check` would otherwise fill the default cache.
     connection.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
@@ -543,7 +647,7 @@ fn check_read_only(path: &Path, identity: (u64, u64)) -> Result<bool, StateError
     };
     let opened = std::fs::symlink_metadata(path).map_err(|_| StateError::Unavailable)?;
     if (opened.dev(), opened.ino()) != identity {
-        return Err(StateError::Unsafe);
+        return Err(Refusal::new(Target::Database, Rule::IdentityChanged).into());
     }
     let quick = (|| -> rusqlite::Result<String> {
         connection.busy_timeout(BUSY_TIMEOUT)?;
@@ -669,17 +773,61 @@ pub(crate) fn pragma(connection: &Connection, name: &str) -> Result<i64, StateEr
 }
 
 /// A directory or regular file owned by the euid with no group or other bits.
-pub(crate) fn private(file: &File, directory: bool) -> Result<(), StateError> {
-    let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
-    let kind = if directory {
-        metadata.is_dir()
-    } else {
-        metadata.is_file()
-    };
-    if !kind || metadata.uid() != effective_uid() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(StateError::Unsafe);
+fn private(file: &File, target: Target) -> Result<(), StateError> {
+    match check_private(file, target)? {
+        Some((rule, _)) => Err(Refusal::new(target, rule).into()),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// [`private`] for writers, where the state directory and database lose group
+/// and other bits that grant no write; writable ones are refused, because
+/// someone else may already have put a `-wal` beside the database. Readers such
+/// as `config export` leave permissions alone.
+fn tighten(file: &File, target: Target) -> Result<(), StateError> {
+    let Some((rule, mode)) = check_private(file, target)? else {
+        return Ok(());
+    };
+    if rule == Rule::GroupOrOtherBits
+        && mode & 0o022 == 0
+        && matches!(target, Target::StateDir | Target::Database)
+        // `fchmod` refuses the `O_PATH` descriptor of the database, while
+        // `/proc/self/fd` reaches the same checked inode without a path lookup.
+        && std::fs::set_permissions(
+            format!("/proc/self/fd/{}", file.as_raw_fd()),
+            std::fs::Permissions::from_mode(mode & 0o700),
+        )
+        .is_ok()
+        && check_private(file, target)?.is_none()
+    {
+        tracing::warn!(
+            path = %resolved(file).unwrap_or_default().display(),
+            from = %format_args!("{mode:04o}"),
+            to = %format_args!("{:04o}", mode & 0o700),
+            "removed group and other permissions from the state database path"
+        );
+        return Ok(());
+    }
+    Err(Refusal::new(target, rule).into())
+}
+
+fn check_private(file: &File, target: Target) -> Result<Option<(Rule, u32)>, StateError> {
+    let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    let rule = if metadata.file_type().is_symlink() {
+        Rule::Symlink
+    } else if target.directory() && !metadata.is_dir() {
+        Rule::NotDirectory
+    } else if !target.directory() && !metadata.is_file() {
+        Rule::NotFile
+    } else if metadata.uid() != effective_uid() {
+        Rule::NotOwner
+    } else if mode & 0o077 != 0 {
+        Rule::GroupOrOtherBits
+    } else {
+        return Ok(None);
+    };
+    Ok(Some((rule, mode)))
 }
 
 pub(crate) fn effective_uid() -> u32 {
@@ -687,9 +835,10 @@ pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn path_error(error: Errno) -> StateError {
+fn path_error(target: Target, error: Errno) -> StateError {
     match error {
-        Errno::ELOOP | Errno::ENOTDIR => StateError::Unsafe,
+        Errno::ELOOP => Refusal::new(target, Rule::Symlink).into(),
+        Errno::ENOTDIR => Refusal::new(target, Rule::NotDirectory).into(),
         _ => StateError::Unavailable,
     }
 }
@@ -705,7 +854,9 @@ pub(crate) fn sql(error: rusqlite::Error) -> StateError {
         Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => {
             StateError::Corrupt
         }
-        Some(rusqlite::ErrorCode::CannotOpen) if is_symlink_refusal(&error) => StateError::Unsafe,
+        Some(rusqlite::ErrorCode::CannotOpen) if is_symlink_refusal(&error) => {
+            Refusal::new(Target::Database, Rule::Symlink).into()
+        }
         _ => StateError::Unavailable,
     }
 }

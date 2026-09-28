@@ -48,32 +48,49 @@ pub(crate) struct Issue {
 pub(crate) struct Degradation {
     pub(crate) component: Component,
     pub(crate) issue: Issue,
+    /// A stable code for the check that failed, when `reason` names a class.
+    pub(crate) rule: Option<&'static str>,
     pub(crate) since: SystemTime,
 }
 
 type Notify = Box<dyn Fn() + Send + Sync>;
 
+/// An issue, its rule and its `since`.
+type Entry = (Issue, Option<&'static str>, SystemTime);
+
 /// One entry per component, so the list is bounded by `Component::COUNT`.
 #[derive(Default)]
 pub(crate) struct Degradations {
-    entries: Mutex<[Option<(Issue, SystemTime)>; Component::COUNT]>,
+    entries: Mutex<[Option<Entry>; Component::COUNT]>,
     notify: Mutex<Option<Notify>>,
 }
 
 impl Degradations {
     /// Records `issue`; a component that is already degraded keeps its `since`.
     pub(crate) fn set(&self, component: Component, issue: Issue) {
+        self.set_with_rule(component, issue, None);
+    }
+
+    /// `set` with the failed check, reported beside `reason`.
+    pub(crate) fn set_with_rule(
+        &self,
+        component: Component,
+        issue: Issue,
+        rule: Option<&'static str>,
+    ) {
         let changed = {
             let mut entries = self.entries.lock();
             let slot = &mut entries[component as usize];
             match slot {
-                Some((current, _)) if *current == issue => false,
-                Some((current, _)) => {
-                    *current = issue;
+                Some((current, current_rule, _)) if (*current, *current_rule) == (issue, rule) => {
+                    false
+                }
+                Some((current, current_rule, _)) => {
+                    (*current, *current_rule) = (issue, rule);
                     true
                 }
                 None => {
-                    *slot = Some((issue, SystemTime::now()));
+                    *slot = Some((issue, rule, SystemTime::now()));
                     true
                 }
             }
@@ -91,7 +108,7 @@ impl Degradations {
 
     #[cfg(test)]
     pub(crate) fn get(&self, component: Component) -> Option<Issue> {
-        self.entries.lock()[component as usize].map(|(issue, _)| issue)
+        self.entries.lock()[component as usize].map(|(issue, _, _)| issue)
     }
 
     #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
@@ -107,9 +124,10 @@ impl Degradations {
         let entries = self.entries.lock();
         ALL.into_iter()
             .filter_map(|component| {
-                entries[component as usize].map(|(issue, since)| Degradation {
+                entries[component as usize].map(|(issue, rule, since)| Degradation {
                     component,
                     issue,
+                    rule,
                     since,
                 })
             })

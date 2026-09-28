@@ -486,14 +486,11 @@ fn open_state_db(
         }
         Err(
             error @ (state::StateError::Unavailable
-            | state::StateError::Unsafe
+            | state::StateError::Unsafe(_)
             | state::StateError::Locked),
         ) if !strict => {
             warn!(%error, "continuing without persistence");
-            degradations.set(
-                degradations::Component::Persistence,
-                persistence_lost(error.reason()),
-            );
+            persistence_lost(data_dir, degradations, error);
             Ok((None, false))
         }
         Err(error) => Err(anyhow::anyhow!("state database: {error}")),
@@ -507,27 +504,45 @@ fn reset_non_strict(
     degradations: &degradations::Degradations,
 ) -> Option<Arc<state::StateDb>> {
     // `Ok(None)`: an earlier corrupt copy blocks the move, so the db stays corrupt.
-    let reason = match state::reset_corrupt(data_dir) {
+    let error = match state::reset_corrupt(data_dir) {
         Ok(Some(db)) => return Some(Arc::new(db)),
-        Ok(None) => state::StateError::Corrupt.reason(),
+        Ok(None) => state::StateError::Corrupt,
         Err(error) => {
             warn!(%error, "state database could not be reset; continuing without persistence");
-            error.reason()
+            error
         }
     };
-    degradations.set(
-        degradations::Component::Persistence,
-        persistence_lost(reason),
-    );
+    persistence_lost(data_dir, degradations, error);
     None
 }
 
-fn persistence_lost(reason: &'static str) -> degradations::Issue {
-    degradations::Issue {
-        code: "persistence_unavailable",
-        message: "The state database is unavailable; runtime state is not kept across restarts.",
-        reason,
-    }
+fn persistence_lost(
+    data_dir: &std::path::Path,
+    degradations: &degradations::Degradations,
+    error: state::StateError,
+) {
+    let rule = match error {
+        state::StateError::Unsafe(refusal) => {
+            let path = data_dir.join(refusal.target.relative_path());
+            warn!(
+                path = %path.display(),
+                rule = refusal.rule.as_str(),
+                fix = %refusal.fix(&path),
+                "state database path is unsafe"
+            );
+            Some(refusal.rule.as_str())
+        }
+        _ => None,
+    };
+    degradations.set_with_rule(
+        degradations::Component::Persistence,
+        degradations::Issue {
+            code: "persistence_unavailable",
+            message: "The state database is unavailable; runtime state is not kept across restarts.",
+            reason: error.reason(),
+        },
+        rule,
+    );
 }
 
 /// The state db and subscription store for this run.
@@ -2857,7 +2872,8 @@ mod startup_lifecycle_tests {
         let unsafe_dir = tempfile::tempdir().unwrap();
         let state = unsafe_dir.path().join(crate::state::STATE_DIR);
         std::fs::create_dir(&state).unwrap();
-        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Only a writable directory is still refused; readable ones are tightened.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
         let reason = |degradations: &crate::degradations::Degradations| {
             degradations
                 .get(crate::degradations::Component::Persistence)
@@ -2868,6 +2884,8 @@ mod startup_lifecycle_tests {
             super::open_state_db(&cli, &config, unsafe_dir.path(), &degradations).unwrap();
         assert!(db.is_none() && !reset);
         assert_eq!(reason(&degradations), Some("unsafe"));
+        let entry = degradations.snapshot().pop().unwrap();
+        assert_eq!(entry.rule, Some("group_or_other_bits"));
 
         let locked_dir = tempfile::tempdir().unwrap();
         drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
