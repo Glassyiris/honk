@@ -795,7 +795,11 @@ pub(super) fn parse_experimental_section(
                         config.cache_file.legacy_store_fakeip =
                             Some(strict_bool(value.unquote().raw()).unwrap_or(false));
                     }
-                    for key in config.cache_file.legacy_keys() {
+                    for key in config
+                        .cache_file
+                        .legacy_keys()
+                        .filter(|key| values.contains_key(key))
+                    {
                         diagnostics.emit(crate::diagnostic::legacy_cache_file_warning(
                             diagnostics.source(),
                             key,
