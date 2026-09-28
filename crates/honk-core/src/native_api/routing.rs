@@ -46,8 +46,9 @@ impl TraceState {
     }
 }
 
-pub(crate) fn rules_capability() -> Value {
-    json!({"available":true,"max_rules":MAX_RULES})
+/// Never below the running dictionary, fallback included, so it is always served whole.
+pub(crate) fn rules_capability(router: &Router) -> Value {
+    json!({"available":true,"max_rules":MAX_RULES.max(router.route_count() + 1)})
 }
 
 /// `None` identifies an evaluated fallback, never unknown kernel provenance.
@@ -375,15 +376,6 @@ fn dictionary(
     deadline: Instant,
     id: &RequestId,
 ) -> Result<RuleList, ApiError> {
-    if router.route_count() >= MAX_RULES {
-        return Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::TemporarilyUnavailable,
-            "The complete rule dictionary exceeds its limit",
-            id,
-        )
-        .with_retry_after(1));
-    }
     let mut rules = Vec::with_capacity(router.route_count() + 1);
     for (index, rule) in router.compiled_routes().iter().enumerate() {
         check_deadline(deadline, id)?;

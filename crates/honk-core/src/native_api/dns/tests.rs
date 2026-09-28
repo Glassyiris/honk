@@ -429,6 +429,28 @@ async fn query_type_count_over_limit_is_too_large() {
 }
 
 #[tokio::test]
+async fn rule_limit_never_hides_a_running_list() {
+    let state = crate::native_api::tests::state().await;
+    let rule = honk_config::dns::DnsResponseRule {
+        conditions: Vec::new(),
+        action: honk_config::dns::DnsResponseAction::Accept,
+    };
+    let mut config = (**state.config.read().await).clone();
+    config.dns.routing.response.rules = vec![rule; 4096];
+    *state.config.write().await = std::sync::Arc::new(config);
+    let list = rules::snapshot(
+        &state,
+        std::time::Instant::now() + Duration::from_secs(5),
+        &RequestId("test".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(json!(list)["response"].as_array().unwrap().len(), 4097);
+    let routing = &state.config.read().await.dns.routing;
+    assert_eq!(rules_capability(routing)["max_rules"], 4097);
+}
+
+#[tokio::test]
 async fn rules_lock_wait_past_deadline_is_retryable_snapshot_unavailable() {
     let state = crate::native_api::tests::state().await;
     let _reload = state.config.write().await;

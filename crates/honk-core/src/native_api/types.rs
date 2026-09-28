@@ -432,7 +432,8 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     providers["create_unfetched"] = json!(true);
     let geodata = super::geodata::capability(state).await;
     let routing_trace = state.observation.trace.capability();
-    let rules = super::routing::rules_capability();
+    let rules = super::routing::rules_capability(&*state.traffic_router.read().await);
+    let dns_rules = super::dns::rules_capability(&state.config.read().await.dns.routing);
     json!({
         "observed_at": super::timestamp(std::time::SystemTime::now()),
         "profiles": ["base"],
@@ -474,7 +475,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "dns_query": state.observation.dns.query_capability(),
             "dns_cache": state.observation.dns.cache_capability(),
             "dns_log": state.observation.dns.log_capability(),
-            "dns_rules": super::dns::rules_capability(),
+            "dns_rules": dns_rules,
             "runtime_settings": super::settings::capability(&state.settings, state.geodata.as_ref().is_some()),
             "operations": {"available":true,"retention_seconds":300,"max_replay_keys":super::operations::MAX_TOMBSTONES},
             "reload": {"available":config.running()},
