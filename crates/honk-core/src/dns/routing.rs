@@ -11,7 +11,7 @@ mod compiler {
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
     use crate::routing::{
-        BinaryLpmTrie, GeoAssets, GeoRequirements, GeositeMatcher, parse_ip_net_str,
+        GeoAssets, GeoRequirements, GeositeMatcher, SharedMatchers, parse_ip_net_str,
     };
 
     #[derive(Clone)]
@@ -55,13 +55,14 @@ mod compiler {
         request: &DnsRequestRouting,
         response: &DnsResponseRouting,
         assets: &GeoAssets,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<CompiledRouting> {
         let request_rules = request
             .rules
             .iter()
             .map(|rule| {
                 Ok(CompiledRequestRule {
-                    conditions: compile_conditions(&rule.conditions, assets, true)?,
+                    conditions: compile_conditions(&rule.conditions, assets, shared, true)?,
                     action: rule.action.clone(),
                     #[cfg(feature = "native-api")]
                     source_conditions: rule.conditions.clone(),
@@ -73,7 +74,7 @@ mod compiler {
             .iter()
             .map(|rule| {
                 Ok(CompiledResponseRule {
-                    conditions: compile_conditions(&rule.conditions, assets, false)?,
+                    conditions: compile_conditions(&rule.conditions, assets, shared, false)?,
                     action: rule.action.clone(),
                     #[cfg(feature = "native-api")]
                     source_conditions: rule.conditions.clone(),
@@ -109,6 +110,7 @@ mod compiler {
     fn compile_conditions(
         conditions: &[DnsCond],
         assets: &GeoAssets,
+        shared: &mut SharedMatchers,
         allow_sip: bool,
     ) -> anyhow::Result<Vec<CompiledCond>> {
         conditions
@@ -156,7 +158,7 @@ mod compiler {
                     nets.extend(assets.geoip_nets(geoip));
                     Ok(CompiledCond::Ip {
                         not: *not,
-                        trie: BinaryLpmTrie::from_nets(&nets),
+                        matcher: shared.ip(nets),
                     })
                 }
             })
@@ -205,8 +207,9 @@ mod config {
 }
 mod matcher {
     use std::net::IpAddr;
+    use std::sync::Arc;
 
-    use crate::routing::{BinaryLpmTrie, GeositeMatcher};
+    use crate::routing::{GeositeMatcher, IpMatcher};
 
     #[derive(Clone)]
     pub(super) enum CompiledDomainMatcher {
@@ -257,7 +260,7 @@ mod matcher {
         },
         Ip {
             not: bool,
-            trie: BinaryLpmTrie,
+            matcher: Arc<IpMatcher>,
         },
     }
 
@@ -322,8 +325,8 @@ mod matcher {
                 CompiledCond::Upstream { not, names } => {
                     (names.iter().any(|name| name == value.from_upstream), *not)
                 }
-                CompiledCond::Ip { not, trie } => {
-                    (value.answer_ips.iter().any(|ip| trie.matches(ip)), *not)
+                CompiledCond::Ip { not, matcher } => {
+                    (value.answer_ips.iter().any(|ip| matcher.matches(ip)), *not)
                 }
             };
             let result = matched != negated;
@@ -347,7 +350,7 @@ use tracing::debug;
 use self::compiler::{CompiledRequestRule, CompiledResponseRule, compile, requirements};
 use self::config::{request_upstream, response_upstream};
 use self::matcher::{Evaluation, ResponseContext, eval_conditions};
-use crate::routing::{GeoAssets, GeoRequirements, GeoSourceSet};
+use crate::routing::{GeoAssets, GeoRequirements, GeoSourceSet, SharedMatchers};
 
 /// Output of request routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +401,7 @@ impl DnsRouter {
             fixed_domain_ttl,
             &requirements,
             &sources,
+            &mut SharedMatchers::default(),
         )
     }
 
@@ -411,6 +415,7 @@ impl DnsRouter {
             &dns_config.fixed_domain_ttl,
             &requirements,
             &sources,
+            &mut SharedMatchers::default(),
         )
     }
 
@@ -422,6 +427,7 @@ impl DnsRouter {
     pub(crate) fn new_with_geo_sources(
         dns_config: &DnsConfig,
         geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let request = dns_config.routing.effective_request();
         let requirements = requirements(&request, &dns_config.routing.response);
@@ -431,6 +437,7 @@ impl DnsRouter {
             &dns_config.fixed_domain_ttl,
             &requirements,
             geo_sources,
+            shared,
         )
     }
 
@@ -440,9 +447,10 @@ impl DnsRouter {
         fixed_domain_ttl: &HashMap<String, u32>,
         requirements: &GeoRequirements,
         geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let assets = GeoAssets::from_sources(requirements, geo_sources);
-        let compiled = compile(request, response, &assets)?;
+        let compiled = compile(request, response, &assets, shared)?;
         Ok(Self {
             rule_count: compiled.request_rules.len() + compiled.response_rules.len(),
             request_rules: compiled.request_rules,
@@ -646,6 +654,18 @@ impl DnsRouter {
 
     pub(crate) fn geo_requirements_snapshot(&self) -> &GeoRequirements {
         &self.geo_requirements
+    }
+
+    #[cfg(test)]
+    pub(crate) fn answer_ip_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::IpMatcher>> {
+        self.response_rules
+            .iter()
+            .flat_map(|rule| &rule.conditions)
+            .filter_map(|condition| match condition {
+                matcher::CompiledCond::Ip { matcher, .. } => Some(matcher),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn select_upstream_normalized(&self, domain: &str) -> &str {

@@ -1406,7 +1406,12 @@ mod scan_tests {
             "routing {\n domain(geosite:test) -> block\n fallback: direct\n }",
         )
         .unwrap();
-        let router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+        let router = Router::from_config_with_geo_sources(
+            &config.routing,
+            &sources,
+            &mut Default::default(),
+        )
+        .unwrap();
         let asset = &router.geo_assets()[0];
         assert_eq!(asset.kind, "geosite");
         assert_eq!(asset.path, Some(std::path::absolute(&path).unwrap()));
@@ -1906,7 +1911,9 @@ mod scan_tests {
             GeoSourceSet::from_sources(GeoSource::present(geosite), GeoSource::present(geoip));
         let mut routing = honk_config::routing::RoutingConfig::default();
         routing.rules = vec![rule];
-        let router = Router::from_config_with_geo_sources(&routing, &sources).unwrap();
+        let router =
+            Router::from_config_with_geo_sources(&routing, &sources, &mut Default::default())
+                .unwrap();
         let connection = |domain: &str, ip: &str| ConnectionInfo {
             domain: Some(domain.into()),
             dst_ip: ip.parse().unwrap(),
@@ -1950,8 +1957,12 @@ mod scan_tests {
             }],
             action: honk_config::dns::DnsResponseAction::Reject,
         }];
-        let dns_router =
-            crate::dns::routing::DnsRouter::new_with_geo_sources(&dns, &sources).unwrap();
+        let dns_router = crate::dns::routing::DnsRouter::new_with_geo_sources(
+            &dns,
+            &sources,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             dns_router.select_request("blocked.example", 1),
             crate::dns::routing::DnsRequestDecision::Reject

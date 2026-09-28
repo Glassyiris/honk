@@ -160,6 +160,24 @@ impl GeositeMatcher {
     }
 }
 
+/// Matchers shared by the traffic and DNS routers of one build. Keep it local
+/// to the build so a reload never pins the previous generation's matchers.
+#[derive(Default)]
+pub(crate) struct SharedMatchers {
+    ip: Vec<Arc<IpMatcher>>,
+}
+
+impl SharedMatchers {
+    pub(crate) fn ip(&mut self, nets: Vec<ipnet::IpNet>) -> Arc<IpMatcher> {
+        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
+            return Arc::clone(matcher);
+        }
+        let matcher = Arc::new(IpMatcher::new(nets));
+        self.ip.push(Arc::clone(&matcher));
+        matcher
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DomainMatcherKey {
     class: u8,
@@ -427,17 +445,19 @@ impl Router {
                 direct_mark_index: None,
             },
             &sources,
+            &mut SharedMatchers::default(),
         )
     }
 
     pub fn from_config(routing: &RoutingConfig) -> anyhow::Result<Self> {
         let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(&routing.rules));
-        Self::from_config_with_geo_sources(routing, &sources)
+        Self::from_config_with_geo_sources(routing, &sources, &mut SharedMatchers::default())
     }
 
     pub(crate) fn from_config_with_geo_sources(
         routing: &RoutingConfig,
         geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let fallback = RouteAction {
             outbound: routing.default_outbound.clone(),
@@ -445,13 +465,14 @@ impl Router {
             mark: DirectMark::new(routing.default_mark),
             direct_mark_index: None,
         };
-        Self::build(&routing.rules, fallback, geo_sources)
+        Self::build(&routing.rules, fallback, geo_sources, shared)
     }
 
     fn build(
         rules: &[RoutingRule],
         mut fallback: RouteAction,
         geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let requirements = GeoRequirements::for_traffic(rules);
         let assets = GeoAssets::from_sources(&requirements, geo_sources);
@@ -461,8 +482,9 @@ impl Router {
 
         for (source_index, rule) in rules.iter().enumerate() {
             let mut conditions = Vec::new();
-            append_conditions(&mut conditions, false, rule, &assets, &mut registry)?;
-            append_conditions(&mut conditions, true, rule, &assets, &mut registry)?;
+            for not in [false, true] {
+                append_conditions(&mut conditions, not, rule, &assets, &mut registry, shared)?;
+            }
 
             let outbound = rule.outbound.as_str().to_owned();
             let (rule_type, rule_payload) = rule
@@ -797,6 +819,7 @@ fn append_conditions(
     rule: &RoutingRule,
     assets: &GeoAssets,
     registry: &mut DomainRegistry,
+    shared: &mut SharedMatchers,
 ) -> anyhow::Result<()> {
     macro_rules! field {
         ($name:ident) => {
@@ -853,7 +876,7 @@ fn append_conditions(
         nets.extend(assets.geoip_nets(geo_ips));
         conditions.push(CompiledCondition {
             not,
-            predicate: CompiledPredicate::DestinationIp(Arc::new(IpMatcher::new(nets))),
+            predicate: CompiledPredicate::DestinationIp(shared.ip(nets)),
         });
     }
     if !source_ips.is_empty() {
@@ -863,7 +886,7 @@ fn append_conditions(
             .collect();
         conditions.push(CompiledCondition {
             not,
-            predicate: CompiledPredicate::SourceIp(Arc::new(IpMatcher::new(nets))),
+            predicate: CompiledPredicate::SourceIp(shared.ip(nets)),
         });
     }
     if !ports.is_empty() {
