@@ -786,10 +786,17 @@ fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &st
 /// otherwise.
 const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off";
 
+/// Colour belongs on a terminal only: a service manager (procd, syslog) stores
+/// the escape codes verbatim. A non-empty `NO_COLOR` turns it off everywhere.
+fn console_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(|value| value.is_empty())
+}
+
 /// The console layer, with or without the local timestamp. The file layer
 /// always stamps: a file has no journal in front of it.
 fn console_log_layer<S, W, F>(
     disable_timestamp: bool,
+    ansi: bool,
     writer: W,
     filter: F,
 ) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
@@ -803,6 +810,7 @@ where
         Box::new(
             tracing_subscriber::fmt::layer()
                 .without_time()
+                .with_ansi(ansi)
                 .with_writer(writer)
                 .with_filter(filter),
         )
@@ -810,6 +818,7 @@ where
         Box::new(
             tracing_subscriber::fmt::layer()
                 .with_timer(LocalTime)
+                .with_ansi(ansi)
                 .with_writer(writer)
                 .with_filter(filter),
         )
@@ -1190,6 +1199,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let registry = tracing_subscriber::registry()
         .with(console_log_layer(
             cli.disable_timestamp,
+            console_ansi(
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ),
             std::io::stdout,
             console_filter,
         ))
@@ -2689,6 +2702,7 @@ mod local_time_tests {
             let writer = sink.clone();
             let layer = super::console_log_layer(
                 disable_timestamp,
+                true,
                 move || writer.clone(),
                 tracing_subscriber::EnvFilter::new("info"),
             );
@@ -2716,6 +2730,18 @@ mod local_time_tests {
         let bare = render(true);
         assert!(bare.trim_start().starts_with("INFO "), "{bare:?}");
         assert!(bare.contains("stamp probe"), "{bare:?}");
+    }
+
+    /// Colour only on a terminal, and never when `NO_COLOR` is set non-empty.
+    #[test]
+    fn test_console_colour_needs_a_terminal_and_no_no_color() {
+        use std::ffi::OsStr;
+
+        assert!(super::console_ansi(true, None));
+        assert!(super::console_ansi(true, Some(OsStr::new(""))));
+        assert!(!super::console_ansi(true, Some(OsStr::new("1"))));
+        assert!(!super::console_ansi(false, None));
+        assert!(!super::console_ansi(false, Some(OsStr::new("1"))));
     }
 }
 
