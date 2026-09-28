@@ -405,7 +405,7 @@ async fn selection_evidence_keeps_the_consumed_catalog_after_group_recreation() 
         ],
         ..Default::default()
     });
-    let catalog = crate::native_api::catalog::Catalog::new(&config);
+    let catalog = crate::observe::catalog::Catalog::new(&config);
     let consumed = catalog.snapshot();
     let manager = GroupManager::new(&config.groups, &config.nodes);
     let mut removed = config.clone();

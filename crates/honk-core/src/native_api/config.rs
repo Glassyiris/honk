@@ -302,7 +302,7 @@ enum Work {
     },
     Manage {
         mutation: super::management::Mutation,
-        catalog: Arc<super::catalog::Catalog>,
+        catalog: Arc<crate::observe::catalog::Catalog>,
         group_manager: honk_outbound::group::SharedGroupManager,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         response: oneshot::Sender<Result<super::management::Completion, ApiError>>,
@@ -435,7 +435,7 @@ impl ConfigService {
     pub(super) async fn manage(
         &self,
         mutation: super::management::Mutation,
-        catalog: Arc<super::catalog::Catalog>,
+        catalog: Arc<crate::observe::catalog::Catalog>,
         group_manager: honk_outbound::group::SharedGroupManager,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     ) -> Result<super::management::Completion, ApiError> {

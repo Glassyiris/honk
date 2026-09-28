@@ -1,7 +1,7 @@
 //! Frozen source-owned dictionaries; decoding never evaluates a router or reads current policy.
 
 use super::record::RouteInput;
-use crate::native_api::routing::{RuleCondition, RuleEvaluation, rule_id};
+use crate::observe::rules::{RuleCondition, RuleEvaluation, rule_id};
 use crate::{
     control::routing_matcher::{KernelTraceDisposition, KernelTraceLayout, RoutingPushPlan},
     routing::Router,

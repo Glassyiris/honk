@@ -33,15 +33,14 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    ApiError, ErrorCode, NativeState,
-    catalog::CatalogIdentity,
-    config,
+    ApiError, ErrorCode, NativeState, config,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
     parse_query,
     security::RequestRate,
     timestamp,
     types::RequestId,
 };
+use crate::observe::catalog::CatalogIdentity;
 
 mod planning;
 #[cfg(test)]

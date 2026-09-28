@@ -19,7 +19,7 @@ async fn wait_for_close(close: Option<&CloseCompletion>) {
 #[cfg(feature = "native-api")]
 use super::observation::ConnectionObservation;
 #[cfg(feature = "native-api")]
-use crate::native_api::catalog::CatalogIdentity;
+use crate::observe::catalog::CatalogIdentity;
 
 mod dial;
 

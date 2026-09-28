@@ -149,7 +149,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
     let observed = router.route_full_observed(&connection, None, MAX_RULE_VALUES);
     assert_eq!(observed.matched.unwrap().action.outbound, "direct");
     let rules =
-        super::super::routing::observed_rule_evaluations("instance", 7, &router, &observed.rules);
+        crate::observe::rules::observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(rules[0].conditions[0].expression, "dip(geoip: test)");
     assert_eq!(rules[0].conditions[0].result, "matched");
     assert_eq!(rules[0].conditions[1].expression, "dport(443)");
@@ -880,7 +880,7 @@ fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
 
 #[test]
 fn captured_url_rule_values_survive_summary_updates_and_new_router_generations() {
-    use crate::native_api::routing::{RuleCondition, RuleEvaluation};
+    use crate::observe::rules::{RuleCondition, RuleEvaluation};
     let store = store();
     let flow = begin(&store, "tcp");
     let expression = r#"pname("/usr/bin/user@host") && domain(regex: "https://example.test/path")"#;

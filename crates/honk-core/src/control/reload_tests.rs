@@ -813,7 +813,7 @@ async fn group_patch_revision_rejects_same_named_provider_replacement_before_act
     native
         .configuration
         .sources
-        .generation_committed(&crate::native_api::catalog::revision_for(&config), 0);
+        .generation_committed(&crate::observe::catalog::revision_for(&config), 0);
     let expected = native.configuration.sources.revision().unwrap();
     let mut candidate = config.clone();
     candidate.groups[0].default = Some(first.name.clone());

@@ -228,7 +228,7 @@ impl super::ControlPlane {
         let revision = update.revision;
         #[cfg(feature = "native-api")]
         let selection = match (&member, &self.native) {
-            (None, Some(native)) => Some(crate::native_api::catalog::runtime_selection(
+            (None, Some(native)) => Some(crate::observe::catalog::runtime_selection(
                 &manager,
                 &native.catalog.snapshot(),
                 &name,
@@ -278,7 +278,7 @@ impl super::ControlPlane {
     #[cfg(feature = "native-api")]
     fn native_catalog(
         &self,
-    ) -> Result<Arc<crate::native_api::catalog::CatalogIdentity>, ControlError> {
+    ) -> Result<Arc<crate::observe::catalog::CatalogIdentity>, ControlError> {
         Ok(self
             .native
             .as_ref()
@@ -290,7 +290,7 @@ impl super::ControlPlane {
 
 #[cfg(feature = "native-api")]
 fn native_group_name(
-    catalog: &crate::native_api::catalog::CatalogIdentity,
+    catalog: &crate::observe::catalog::CatalogIdentity,
     group_id: &str,
 ) -> Result<String, ControlError> {
     catalog

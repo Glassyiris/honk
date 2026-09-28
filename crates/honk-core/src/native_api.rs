@@ -49,6 +49,7 @@ use tokio::sync::{RwLock, watch};
 
 use crate::connection_tracker::{ConnectionEntry, ConnectionTracker};
 use crate::control::{ControlPlane, EnginePhase};
+use crate::observe::timestamp;
 use crate::stats::StatsManager;
 use types::*;
 
@@ -366,10 +367,6 @@ fn full_detail(values: &HashMap<String, String>, id: &RequestId) -> Result<bool,
         "full" => Ok(true),
         _ => Err(invalid_query(id)),
     }
-}
-
-fn timestamp(time: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {

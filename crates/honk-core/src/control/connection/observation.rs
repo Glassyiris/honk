@@ -10,7 +10,6 @@ use honk_outbound::{alive::IpVersion, runtime::flow_observation::FlowObserver};
 use super::{handoff::HandoffResult, routing::RoutingDecision};
 use crate::{
     native_api::{
-        catalog::CatalogIdentity,
         flows::{
             FlowGuard,
             record::{
@@ -19,6 +18,10 @@ use crate::{
             },
         },
         observation::NativeObservation,
+    },
+    observe::{
+        catalog::CatalogIdentity,
+        rules::{RuleEvaluation, rule_id},
     },
     routing::{ConnectionInfo, RouteMatch, Router},
 };
@@ -31,7 +34,7 @@ pub(super) struct RouteObservation {
     evaluation_id: String,
     plane: &'static str,
     input: Option<RouteInput>,
-    rules: Vec<crate::native_api::routing::RuleEvaluation>,
+    rules: Vec<RuleEvaluation>,
     truncated: bool,
 }
 
@@ -55,12 +58,12 @@ impl RouteObservation {
         input: &ConnectionInfo,
         router: &Router,
         matched: Option<&RouteMatch<'_>>,
-        rules: Vec<crate::native_api::routing::RuleEvaluation>,
+        rules: Vec<RuleEvaluation>,
         truncated: bool,
     ) -> Self {
         Self {
             generation: Some(generation),
-            rule_id: Some(crate::native_api::routing::rule_id(
+            rule_id: Some(rule_id(
                 instance,
                 generation,
                 matched.map(|route| route.rule_id),

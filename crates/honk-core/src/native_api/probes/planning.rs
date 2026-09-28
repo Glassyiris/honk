@@ -1,6 +1,6 @@
 use super::*;
 use crate::dns::PinnedNameResolver;
-use crate::native_api::catalog::member_id;
+use crate::observe::catalog::member_id;
 
 pub(super) struct Specification {
     pub(super) target: Target,

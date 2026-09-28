@@ -88,7 +88,7 @@ pub(crate) struct GeoUpdatePlan {
     pub(crate) group_manager: honk_outbound::group::SharedGroupManager,
     pub(crate) proxy_registry: Arc<crate::proxy::ProxyRegistry>,
     pub(crate) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
-    pub(crate) catalog: Arc<super::catalog::Catalog>,
+    pub(crate) catalog: Arc<crate::observe::catalog::Catalog>,
     pub(crate) policy: Arc<Policy>,
     pub(crate) sources: Option<Arc<Sources>>,
 }
@@ -256,7 +256,7 @@ pub(crate) fn project(
 }
 
 /// The API id of the group named `name`, while it exists.
-pub(crate) fn group_id(catalog: &super::catalog::Catalog, name: &str) -> Option<String> {
+pub(crate) fn group_id(catalog: &crate::observe::catalog::Catalog, name: &str) -> Option<String> {
     catalog.snapshot().groups.get(name).cloned()
 }
 

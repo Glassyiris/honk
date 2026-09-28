@@ -166,7 +166,7 @@ fn check_url(value: &str) -> Option<String> {
     {
         return None;
     }
-    super::catalog::normalized_check_url(value).filter(|url| {
+    crate::observe::catalog::normalized_check_url(value).filter(|url| {
         url.len() <= MAX_CHECK_URL_BYTES
             && !url.contains(',')
             && !(url.contains('\'') && url.contains('"'))
@@ -186,10 +186,10 @@ impl GroupPatch {
             json!({"kind":policy,"native":policy}),
             json!(default),
             json!(self.group.final_outbound),
-            json!(super::catalog::tolerance(&self.group)),
+            json!(crate::observe::catalog::tolerance(&self.group)),
             json!(self.group.idle_timeout),
             json!(self.group.interrupt_connections),
-            json!(super::catalog::check_url(&self.group)),
+            json!(crate::observe::catalog::check_url(&self.group)),
         ];
         let mut values = initial.clone().map(Some);
         let operations = self

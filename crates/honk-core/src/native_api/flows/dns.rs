@@ -20,9 +20,12 @@ use crate::dns::{
     outcome::{DnsOutcome, OutcomeStatus, Provenance, ResponseClass},
     query::{DnsRequestMeta, IngressProfile, QueryContext},
 };
-use crate::native_api::{
-    dns::DnsApi,
-    routing::{RuleCondition, RuleEvaluation},
+use crate::{
+    native_api::dns::DnsApi,
+    observe::{
+        catalog::CatalogIdentity,
+        rules::{RuleCondition, RuleEvaluation},
+    },
 };
 
 const MAX_ADDRESSES: usize = 256;
@@ -30,7 +33,7 @@ const MAX_ADDRESSES: usize = 256;
 tokio::task_local! {
     static DNS_API: Weak<DnsApi>;
     static LOOKUP: LookupState;
-    static CATALOG: Option<Arc<crate::native_api::catalog::CatalogIdentity>>;
+    static CATALOG: Option<Arc<CatalogIdentity>>;
 }
 
 pub(crate) fn scope_api<F: Future>(
@@ -41,7 +44,7 @@ pub(crate) fn scope_api<F: Future>(
 }
 
 pub(crate) fn scope_catalog<F: Future>(
-    catalog: Option<Arc<crate::native_api::catalog::CatalogIdentity>>,
+    catalog: Option<Arc<CatalogIdentity>>,
     future: F,
 ) -> impl Future<Output = F::Output> {
     CATALOG.scope(catalog, future)
@@ -689,12 +692,12 @@ pub(crate) fn route_upstream(
         observer.publish(FlowEvent::Gap("buffer_overflow"));
     }
     let evaluation_id = Uuid::new_v4().to_string();
-    let rule_id = crate::native_api::routing::rule_id(
+    let rule_id = crate::observe::rules::rule_id(
         api.instance(),
         context.generation,
         observed.matched.as_ref().map(|matched| matched.rule_id),
     );
-    let rules = crate::native_api::routing::observed_rule_evaluations(
+    let rules = crate::observe::rules::observed_rule_evaluations(
         api.instance(),
         context.generation,
         router,

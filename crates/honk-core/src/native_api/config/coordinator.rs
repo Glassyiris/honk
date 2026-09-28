@@ -57,7 +57,7 @@ impl ConfigService {
             self.sources
                 .accept(self.sources.prepare_accept(initial), generation);
             self.sources
-                .generation_committed(&super::super::catalog::revision_for(&config), generation);
+                .generation_committed(&crate::observe::catalog::revision_for(&config), generation);
         }
         *self.store.write() = Some(store.clone());
         let (sender, mut receiver) = mpsc::channel(16);
@@ -357,7 +357,7 @@ impl Worker {
     async fn manage(
         &mut self,
         mutation: Mutation,
-        catalog: &super::super::catalog::Catalog,
+        catalog: &crate::observe::catalog::Catalog,
         group_manager: &honk_outbound::group::SharedGroupManager,
         alive_set: &honk_outbound::alive::AliveDialerSet,
     ) -> Result<Completion, ApiError> {

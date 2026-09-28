@@ -249,7 +249,7 @@ impl ControlPlaneHandle {
                     None,
                     crate::native_api::flows::MAX_RULE_VALUES,
                 );
-                let rules = crate::native_api::routing::observed_rule_evaluations(
+                let rules = crate::observe::rules::observed_rule_evaluations(
                     &native.instance_id,
                     generation,
                     &router,

@@ -1,10 +1,9 @@
-//! Process-local identities and bounded, immutable native node pages.
+//! Native node and group projections, with bounded, immutable node pages.
 
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
-    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -14,22 +13,23 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use honk_config::{
-    Config,
-    group::{Group, GroupPolicy},
-};
+use honk_config::{Config, group::Group};
 use honk_outbound::{
     alive::{AliveDialerSet, IpVersion, NativeHealthObservation},
     group::{GroupManager, GroupMember, SelectionNetwork},
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::observe::{
+    catalog::{CatalogIdentity, check_url, member_id, policy, selection, tolerance},
+    timestamp,
+};
 
 use super::{
     ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, invalid_query, parse_query,
-    timestamp, types::RequestId,
+    types::RequestId,
 };
 
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
@@ -37,67 +37,11 @@ const MAX_SNAPSHOTS: usize = 8;
 const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGE_SIZE: usize = 1000;
 
-pub(crate) struct CatalogIdentity {
-    pub(crate) revision: String,
-    pub(crate) groups: HashMap<String, String>,
-}
+/// Frozen node pages behind live cursors, bounded by age, count and bytes.
+#[derive(Default)]
+pub(crate) struct NodePages(Mutex<VecDeque<NodeSnapshot>>);
 
-pub(crate) struct Catalog {
-    identity: RwLock<Arc<CatalogIdentity>>,
-    snapshots: Mutex<VecDeque<NodeSnapshot>>,
-}
-
-impl Catalog {
-    pub(crate) fn new(config: &Config) -> Self {
-        let catalog = Self {
-            identity: RwLock::new(Arc::new(CatalogIdentity {
-                revision: String::new(),
-                groups: HashMap::new(),
-            })),
-            snapshots: Mutex::new(VecDeque::new()),
-        };
-        catalog.install(config);
-        catalog
-    }
-
-    pub(crate) fn install(&self, config: &Config) {
-        let mut identity = self.identity.write();
-        *identity = Self::prepare_identity(config, &identity);
-    }
-
-    pub(crate) fn prepare(&self, config: &Config) -> Arc<CatalogIdentity> {
-        Self::prepare_identity(config, &self.identity.read())
-    }
-
-    /// The configuration publisher installs the same identity bound to its DNS runtime.
-    pub(crate) fn install_prepared(&self, identity: Arc<CatalogIdentity>) {
-        *self.identity.write() = identity;
-    }
-
-    fn prepare_identity(config: &Config, identity: &Arc<CatalogIdentity>) -> Arc<CatalogIdentity> {
-        let effective = GroupManager::native_effective_groups(&config.groups);
-        let revision = config_revision(config, &effective);
-        if identity.revision == revision {
-            return Arc::clone(identity);
-        }
-        let groups = effective
-            .keys()
-            .map(|name| {
-                let id = identity
-                    .groups
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-                (name.clone(), id)
-            })
-            .collect();
-        Arc::new(CatalogIdentity { revision, groups })
-    }
-
-    pub(crate) fn snapshot(&self) -> Arc<CatalogIdentity> {
-        self.identity.read().clone()
-    }
-
+impl NodePages {
     fn page(
         &self,
         snapshot: NodeSnapshot,
@@ -106,7 +50,7 @@ impl Catalog {
     ) -> Result<Response, ApiError> {
         let response = snapshot.page(0, limit);
         if snapshot.nodes.len() > limit {
-            let mut snapshots = self.snapshots.lock();
+            let mut snapshots = self.0.lock();
             snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
             while snapshots.len() >= MAX_SNAPSHOTS
                 || snapshots
@@ -135,7 +79,7 @@ impl Catalog {
         let (snapshot_id, offset) = cursor.split_once(':').ok_or_else(|| invalid_query(id))?;
         let snapshot_id = Uuid::parse_str(snapshot_id).map_err(|_| invalid_query(id))?;
         let offset: usize = offset.parse().map_err(|_| invalid_query(id))?;
-        let mut snapshots = self.snapshots.lock();
+        let mut snapshots = self.0.lock();
         snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
         let snapshot = snapshots
             .iter()
@@ -147,94 +91,6 @@ impl Catalog {
         }
         Ok(snapshot.page(offset, limit))
     }
-}
-
-fn policy(policy: GroupPolicy) -> &'static str {
-    match policy {
-        GroupPolicy::Selector => "selector",
-        GroupPolicy::URLTest => "urltest",
-        GroupPolicy::LoadBalance => "loadbalance",
-        GroupPolicy::Fallback => "fallback",
-        GroupPolicy::Score => "score",
-    }
-}
-
-/// The URL a group's health check probes; later comma entries are literal
-/// fallback addresses, not part of the URL.
-pub(super) fn check_url(group: &Group) -> Option<String> {
-    honk_config::check::decode_health_http_target(group.check_url.as_deref()?)
-        .ok()
-        .map(|target| probed_url(&target))
-}
-
-/// A single check URL in the form GET reports and PATCH writes.
-pub(super) fn normalized_check_url(value: &str) -> Option<String> {
-    honk_config::check::decode_http_check_target(value, false)
-        .ok()
-        .map(|target| probed_url(&target))
-}
-
-fn probed_url(target: &honk_config::check::HttpCheckTarget) -> String {
-    format!(
-        "{}://{}{}",
-        if target.is_https() { "https" } else { "http" },
-        target.authority(),
-        target.request_target()
-    )
-}
-
-/// Only URLTest switches on latency; other policies have no tolerance to report.
-pub(super) fn tolerance(group: &Group) -> Option<u64> {
-    (group.policy == honk_config::group::GroupPolicy::URLTest).then_some(group.tolerance)
-}
-
-pub(crate) fn revision_for(config: &Config) -> String {
-    config_revision(
-        config,
-        &GroupManager::native_effective_groups(&config.groups),
-    )
-}
-
-fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
-    let nodes: HashMap<_, _> = config.nodes.iter().map(|node| (node.id, node)).collect();
-    let mut ordered: Vec<_> = groups.values().collect();
-    ordered.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    let canonical: Vec<_> = ordered
-        .into_iter()
-        .map(|group| {
-            let nodes: Vec<_> = group
-                .nodes
-                .iter()
-                .filter_map(|id| nodes.get(id))
-                .map(|node| (node.id, &node.name))
-                .collect();
-            let children: Vec<_> = group
-                .groups
-                .iter()
-                .filter(|name| groups.contains_key(*name))
-                .collect();
-            let mut filters: Vec<_> = group.filters.iter().collect();
-            filters.sort_unstable();
-            filters.dedup();
-            json!([
-                group.name,
-                group.icon,
-                policy(group.policy),
-                nodes,
-                children,
-                filters,
-                group.default,
-                group.final_outbound,
-                check_url(group),
-                group.check_interval,
-                tolerance(group),
-                group.idle_timeout,
-                group.interrupt_connections
-            ])
-        })
-        .collect();
-    let digest = Sha256::digest(serde_json::to_vec(&canonical).expect("catalog values serialize"));
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 struct NodeSnapshot {
@@ -498,7 +354,7 @@ pub(super) async fn nodes(
     if let Some(cursor) = query.get("cursor") {
         return state
             .observation
-            .catalog
+            .node_pages
             .resume(cursor, group_id, limit, id);
     }
     let config = state.config.read().await;
@@ -515,7 +371,7 @@ pub(super) async fn nodes(
         &secrets,
     )?;
     drop(config);
-    state.observation.catalog.page(snapshot, limit, id)
+    state.observation.node_pages.page(snapshot, limit, id)
 }
 
 pub(super) async fn node(
@@ -560,52 +416,6 @@ fn listener_secrets(state: &NativeState) -> ListenerSecrets {
         .as_ref()
         .clone()
         .with_clash(&state.clash_secret)
-}
-
-pub(crate) fn member_id(member: GroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
-    match member {
-        GroupMember::Node(node) => Some(node.id.to_string()),
-        GroupMember::Group(group) => identity.groups.get(&group.name).cloned(),
-    }
-}
-
-/// A group's current `{tcp, udp}` selections, `null` where none is formed.
-pub(crate) fn runtime_selection(
-    manager: &GroupManager,
-    identity: &CatalogIdentity,
-    group_name: &str,
-) -> Value {
-    let group = manager.native_group(group_name);
-    let [tcp, udp] = [SelectionNetwork::Tcp, SelectionNetwork::Udp].map(|network| {
-        group.map_or(Value::Null, |group| {
-            selection(manager, group, network, identity)
-        })
-    });
-    json!({ "tcp": tcp, "udp": udp })
-}
-
-fn selection(
-    manager: &GroupManager,
-    group: &Group,
-    network: SelectionNetwork,
-    identity: &CatalogIdentity,
-) -> Value {
-    let Some(selection) = manager.native_selection(&group.name, network) else {
-        return Value::Null;
-    };
-    let Some(member_id) = member_id(selection.member, identity) else {
-        return Value::Null;
-    };
-    json!({
-        "member_id": member_id,
-        "resolved_leaf_node_id": selection.leaf.map(|node| node.id.to_string()),
-        "source": match group.policy {
-            _ if manager.has_override(&group.name, network) => "override",
-            GroupPolicy::Selector => "runtime",
-            GroupPolicy::URLTest => "health",
-            _ => "policy",
-        }
-    })
 }
 
 fn group_health(

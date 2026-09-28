@@ -128,7 +128,7 @@ pub(crate) struct DnsRuntime {
     #[cfg(feature = "native-api")]
     network_tasks: std::sync::LazyLock<Arc<honk_outbound::runtime::TaskOwner>>,
     #[cfg(feature = "native-api")]
-    flow_catalog: std::sync::OnceLock<Arc<crate::native_api::catalog::CatalogIdentity>>,
+    flow_catalog: std::sync::OnceLock<Arc<crate::observe::catalog::CatalogIdentity>>,
 }
 
 impl DnsRuntime {
@@ -162,7 +162,7 @@ impl DnsRuntime {
     #[cfg(feature = "native-api")]
     pub(crate) fn bind_flow_catalog(
         &self,
-        identity: Arc<crate::native_api::catalog::CatalogIdentity>,
+        identity: Arc<crate::observe::catalog::CatalogIdentity>,
     ) {
         assert!(
             self.flow_catalog.set(identity).is_ok(),

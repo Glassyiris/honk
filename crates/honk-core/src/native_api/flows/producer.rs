@@ -586,13 +586,13 @@ pub(crate) fn bounded(value: &str) -> String {
 
 pub(crate) fn map_selection_observation(
     observation: &honk_outbound::group::observation::SelectionObservation,
-    catalog: &crate::native_api::catalog::CatalogIdentity,
+    catalog: &crate::observe::catalog::CatalogIdentity,
     observer: &FlowObserver,
 ) -> Vec<super::record::Selection> {
     use honk_outbound::group::observation::ObservedMember;
     fn member(
         value: &ObservedMember,
-        catalog: &crate::native_api::catalog::CatalogIdentity,
+        catalog: &crate::observe::catalog::CatalogIdentity,
         observer: &FlowObserver,
     ) -> Option<(String, Option<String>)> {
         match value {

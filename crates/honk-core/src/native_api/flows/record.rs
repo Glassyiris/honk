@@ -11,7 +11,7 @@ use honk_outbound::runtime::flow_observation::DnsLookup;
 use serde::Serialize;
 
 use super::{MAX_RULE_VALUES, MAX_STEPS, display_text, safe_text};
-use crate::native_api::routing::RuleEvaluation;
+use crate::observe::rules::RuleEvaluation;
 
 #[derive(Clone, Serialize)]
 pub(super) struct Summary {
@@ -753,5 +753,5 @@ fn redact_display(value: &mut Option<String>, redacted: &mut bool, overflow: &mu
 }
 
 fn rfc3339<S: serde::Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&crate::native_api::timestamp(*time))
+    serializer.serialize_str(&crate::observe::timestamp(*time))
 }

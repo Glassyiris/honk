@@ -1,5 +1,5 @@
 use super::*;
-use crate::native_api::catalog::Catalog;
+use crate::observe::catalog::Catalog;
 use crate::{
     ebpf::{EbpfBackend, mock::MockEbpfBackend},
     mode::{ModeOverride, SharedModeState},

@@ -5,13 +5,15 @@ use std::time::SystemTime;
 use honk_config::Config;
 use serde_json::json;
 
-use super::{catalog::Catalog, events::EventHub, flows::FlowStore};
+use super::{catalog::NodePages, events::EventHub, flows::FlowStore};
+use crate::observe::catalog::{Catalog, CatalogIdentity};
 
 pub(crate) struct NativeObservation {
     pub(crate) instance_id: String,
     pub(crate) events: Arc<EventHub>,
     pub(crate) flows: Arc<FlowStore>,
     pub(crate) catalog: Arc<Catalog>,
+    pub(crate) node_pages: NodePages,
     pub(crate) telemetry: super::telemetry::Telemetry,
     pub(crate) configuration: Arc<super::config::ConfigService>,
     pub(crate) operations: Arc<super::operations::OperationStore>,
@@ -86,6 +88,7 @@ impl NativeObservation {
             events,
             flows,
             catalog: Arc::new(Catalog::new(config)),
+            node_pages: NodePages::default(),
             telemetry: super::telemetry::Telemetry::new(
                 config.experimental.native_api.record_traffic,
                 config.experimental.native_api.record_memory,
@@ -137,12 +140,7 @@ impl NativeObservation {
             .map(|(_, at)| at)
     }
 
-    pub(crate) fn committed(
-        &self,
-        identity: Arc<super::catalog::CatalogIdentity>,
-        previous: u64,
-        generation: u64,
-    ) {
+    pub(crate) fn committed(&self, identity: Arc<CatalogIdentity>, previous: u64, generation: u64) {
         self.catalog.install_prepared(Arc::clone(&identity));
         self.configuration
             .sources
