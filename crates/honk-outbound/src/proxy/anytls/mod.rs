@@ -434,6 +434,10 @@ impl AnyTlsSession {
     }
 
     fn observe_request(&self, sid: u32, uot: bool) {
+        // Inert builds register no observers; skip the per-frame lock.
+        if !cfg!(feature = "flow-observation") {
+            return;
+        }
         let mut observations = self.observations.lock();
         let Some(observation) = observations.get_mut(&sid) else {
             return;
