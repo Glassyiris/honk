@@ -91,6 +91,15 @@ struct World {
 /// Group `proxy` holds one node whose tunnel refuses `refused`; group `empty`
 /// holds none. Loopback traffic is routed to `proxy`.
 fn world(refused: Vec<u16>) -> World {
+    let dials = Arc::new(AtomicUsize::new(0));
+    let tunnel = Tunnel {
+        dials: Arc::clone(&dials),
+        refused,
+    };
+    world_with(Arc::new(tunnel), dials)
+}
+
+fn world_with(outbound: Arc<impl TcpOutbound + 'static>, dials: Arc<AtomicUsize>) -> World {
     let mut node = Node {
         name: "tunnel".into(),
         outbound: OutboundConfig::from_protocol(NodeProtocol::Socks5),
@@ -125,15 +134,8 @@ fn world(refused: Vec<u16>) -> World {
         must: false,
         mark: 0,
     }];
-    let dials = Arc::new(AtomicUsize::new(0));
     let mut proxy_registry = ProxyRegistry::new();
-    proxy_registry.register(ProtocolEntry::new(
-        NodeProtocol::Socks5,
-        Arc::new(Tunnel {
-            dials: Arc::clone(&dials),
-            refused,
-        }),
-    ));
+    proxy_registry.register(ProtocolEntry::new(NodeProtocol::Socks5, outbound));
     World {
         router: RwLock::new(Router::new(&rules, "direct").unwrap()),
         group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
@@ -150,11 +152,7 @@ fn world(refused: Vec<u16>) -> World {
 }
 
 impl World {
-    async fn fetch(
-        &self,
-        route: Route,
-        urls: &[String],
-    ) -> Result<(Arc<[u8]>, Fetched), &'static str> {
+    async fn fetch(&self, route: Route, urls: &[String]) -> Result<(Arc<[u8]>, Fetched), Failure> {
         // Loopback servers are private destinations, so the policy has to allow them.
         let ports: Vec<u16> = urls
             .iter()
@@ -269,11 +267,12 @@ async fn a_group_not_ready_at_startup_fails_every_url_without_going_direct() {
         world
             .fetch(Route::Group("proxy".into()), &urls)
             .await
-            .unwrap_err(),
+            .unwrap_err()
+            .code,
         "connection_failed"
     );
     assert_eq!(
-        world.fetch(Route::Routing, &urls).await.unwrap_err(),
+        world.fetch(Route::Routing, &urls).await.unwrap_err().code,
         "connection_failed",
         "the rules send the URLs to the group"
     );
@@ -281,16 +280,133 @@ async fn a_group_not_ready_at_startup_fails_every_url_without_going_direct() {
         world
             .fetch(Route::Group("empty".into()), &urls)
             .await
-            .unwrap_err(),
+            .unwrap_err()
+            .code,
         "group_unavailable"
     );
     assert_eq!(
         world
             .fetch(Route::Group("removed".into()), &urls)
             .await
-            .unwrap_err(),
+            .unwrap_err()
+            .code,
         "group_unavailable"
     );
     assert_eq!(first_requests.load(Ordering::SeqCst), 0);
     assert_eq!(second_requests.load(Ordering::SeqCst), 0);
+}
+
+/// A tunnel whose far end is an in-memory server, so paused time never
+/// races real sockets: the file comes after `file_delay` and its correct
+/// checksum after `checksum_delay`, or `status` with no body when one is given.
+struct Slow {
+    body: &'static [u8],
+    file_delay: Duration,
+    checksum_delay: Duration,
+    status: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl TcpOutbound for Slow {
+    async fn dial(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let Slow {
+            body,
+            file_delay,
+            checksum_delay,
+            status,
+        } = *self;
+        tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(server.read_u8().await.unwrap());
+            }
+            let checksum = String::from_utf8_lossy(&head)
+                .split(' ')
+                .nth(1)
+                .is_some_and(|path| path.ends_with(".sha256sum"));
+            let (delay, reply) = if checksum {
+                (
+                    checksum_delay,
+                    crate::configuration::digest(body).into_bytes(),
+                )
+            } else {
+                (file_delay, body.to_vec())
+            };
+            tokio::time::sleep(delay).await;
+            let (status, reply) = status.map_or(("200 OK", reply), |status| (status, Vec::new()));
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply.len()
+            );
+            let _ = server.write_all(head.as_bytes()).await;
+            let _ = server.write_all(&reply).await;
+            let _ = server.shutdown().await;
+        });
+        Ok(ProxyStream {
+            stream: Box::new(client),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_owned),
+        })
+    }
+}
+
+async fn fetch_slow(slow: Slow) -> Result<(Arc<[u8]>, Fetched), Failure> {
+    let world = world_with(Arc::new(slow), Arc::new(AtomicUsize::new(0)));
+    let address = SocketAddr::from(([127, 0, 0, 1], 8080));
+    world
+        .fetch(Route::Group("proxy".into()), &[url(address)])
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_file_leaves_its_checksum_a_deadline_of_its_own() {
+    let (bytes, fetched) = fetch_slow(Slow {
+        body: b"slow file",
+        file_delay: NETWORK_TIMEOUT - Duration::from_secs(5),
+        checksum_delay: CHECKSUM_TIMEOUT - Duration::from_secs(2),
+        status: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(&*bytes, b"slow file");
+    assert!(fetched.verified);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_checksum_still_has_to_arrive_within_its_deadline() {
+    let failure = fetch_slow(Slow {
+        body: b"slow checksum",
+        file_delay: Duration::ZERO,
+        checksum_delay: CHECKSUM_TIMEOUT + Duration::from_secs(1),
+        status: None,
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(failure, Failure::from("checksum_unavailable"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_status_is_kept_with_the_failure() {
+    let failure = fetch_slow(Slow {
+        body: b"",
+        file_delay: Duration::ZERO,
+        checksum_delay: Duration::ZERO,
+        status: Some("429 Too Many Requests"),
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        failure,
+        Failure {
+            code: "http_status_rejected",
+            status: Some(429),
+        }
+    );
 }

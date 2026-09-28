@@ -161,7 +161,14 @@ impl Worker {
                 geodata::file_url(&active.experimental.native_api, asset.kind),
             )
             .await
-            .map_err(|stage| failure(stage, &writes))?;
+            .map_err(|error| {
+                let mut details = failure(error.code, &writes);
+                details["asset"] = json!(asset.kind);
+                if let Some(status) = error.status {
+                    details["http_status"] = json!(status);
+                }
+                details
+            })?;
             downloads.push(DownloadedAsset {
                 original: asset.clone(),
                 unchanged: digest(&bytes) == asset.sha256,

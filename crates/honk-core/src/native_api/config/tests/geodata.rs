@@ -485,7 +485,7 @@ async fn download_bounds_actual_chunked_bytes_and_joins_timed_out_connection() {
             assert!(read.is_ok() || read.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
         });
         let result = download_direct(&url, "", tokio::time::Instant::now() + Duration::from_millis(100), 4, None).await;
-        assert_eq!(result.unwrap_err(), expected);
+        assert_eq!(result.unwrap_err().code, expected);
         tasks.join_next().await.unwrap().unwrap();
     }
 }
@@ -821,6 +821,65 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
             "/good/geoip.dat.sha256sum",
         ]
     );
+    fixture.shutdown().await;
+    mirror.close().await;
+}
+
+#[tokio::test]
+async fn a_failed_download_names_its_asset_and_the_rejected_status() {
+    let site = geosite("new.example");
+    let mirror = Mirror::new(vec![
+        ("/geosite.dat", "200 OK", site),
+        ("/geoip.dat", "200 OK", geoip(203)),
+        ("/geoip.dat.sha256sum", "403 Forbidden", Vec::new()),
+    ])
+    .await;
+    let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
+        setup_rules(root, files);
+        allow(files, mirror.address);
+    })
+    .await;
+    ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geosite": {"urls": [mirror.url("/geosite.dat")]},
+            "geoip": {"urls": [mirror.url("/geoip.dat")]}}}),
+    )
+    .await)
+    .await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    let details = &terminal["error"]["details"];
+    assert_eq!(details["stage"], "checksum_unavailable");
+    assert_eq!(details["asset"], "geoip");
+    assert_eq!(details["http_status"], 403);
+    assert_eq!(details["committed"], false);
+    fixture.shutdown().await;
+    mirror.close().await;
+}
+
+#[tokio::test]
+async fn a_missing_file_keeps_its_404_in_the_failure() {
+    let mirror = Mirror::new(vec![("/geosite.dat", "200 OK", geosite("new.example"))]).await;
+    let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
+        setup_rules(root, files);
+        allow(files, mirror.address);
+    })
+    .await;
+    ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geosite": {"urls": [mirror.url("/geosite.dat")]},
+            "geoip": {"urls": [mirror.url("/geoip.dat")]}}}),
+    )
+    .await)
+    .await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    let details = &terminal["error"]["details"];
+    assert_eq!(details["stage"], "http_not_found");
+    assert_eq!(details["asset"], "geoip");
+    assert_eq!(details["http_status"], 404);
     fixture.shutdown().await;
     mirror.close().await;
 }
