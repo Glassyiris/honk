@@ -460,3 +460,17 @@ fn native_server_failures_are_admitted_at_their_emitting_module() {
         assert_eq!(project(message).finish("honk_core::native_api").0, WITHHELD);
     }
 }
+
+#[test]
+fn listener_ready_is_admitted_only_at_its_pinned_target() {
+    // startup.rs pins `target: "honk_core"`; its module path is not audited.
+    let project = || Projection {
+        message: audited_message("native API listener ready"),
+        ..Projection::default()
+    };
+    assert_eq!(project().finish("honk_core").0, "native API listener ready");
+    assert_eq!(
+        project().finish("honk_core::native_api::startup").0,
+        WITHHELD
+    );
+}

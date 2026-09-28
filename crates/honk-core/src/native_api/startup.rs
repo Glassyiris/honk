@@ -59,7 +59,7 @@ impl NativeRuntime {
         logs.attach_engine_level(engine_level);
         log_binding.bind(Arc::downgrade(logs));
         let server = NativeServer::start(listener, Arc::new(state));
-        info!(%listen, message = "native API listener ready");
+        info!(target: "honk_core", %listen, message = "native API listener ready");
         Ok(Self {
             server,
             observation,
