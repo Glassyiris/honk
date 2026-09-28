@@ -177,12 +177,15 @@ pub(crate) fn redact(
     secrets: &config::ListenerSecrets,
     service: &config::ConfigService,
 ) -> Option<String> {
-    display_url(url).map(|url| service.mask_text(&secrets.mask(&url).0).0)
+    let secret = |text: &str| secrets.contains(text) || service.mask_text(text).1;
+    display_url(url, secret).map(|url| service.mask_text(&secrets.mask(&url).0).0)
 }
 
 /// The URL without query and fragment, and with every path segment that may
-/// hold a credential replaced. A URL with userinfo does not parse.
-fn display_url(url: &str) -> Option<String> {
+/// hold a credential replaced. Segments are also checked decoded, because the
+/// parser percent-encodes characters a listener secret may contain. A URL with
+/// userinfo does not parse.
+fn display_url(url: &str, secret: impl Fn(&str) -> bool) -> Option<String> {
     let mut parsed = parse_geodata_url(url)?;
     parsed.set_query(None);
     parsed.set_fragment(None);
@@ -196,7 +199,8 @@ fn display_url(url: &str) -> Option<String> {
                     .iter()
                     .any(|name| previous.eq_ignore_ascii_case(name))
                 || segment.contains([':', '='])
-                || looks_like_token(segment);
+                || looks_like_token(segment)
+                || secret(&percent_encoding::percent_decode_str(segment).decode_utf8_lossy());
             previous = segment;
             if hidden { "[redacted]" } else { segment }
         })

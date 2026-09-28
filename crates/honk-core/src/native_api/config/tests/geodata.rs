@@ -1024,7 +1024,7 @@ async fn checksum_verification_is_on_by_default_and_settable() {
 
 #[tokio::test]
 async fn anonymous_callers_cannot_change_sources_and_read_masked_urls() {
-    const CLASH: &str = "clash-listener-secret";
+    const CLASH: &str = "clash{listener}secret";
     let fixture = Fixture::new_with_state(Access::Anonymous, |root, files| {
         setup_rules(root, files);
         let auth = files.get_mut("auth.dae").unwrap();
@@ -1042,8 +1042,10 @@ async fn anonymous_callers_cannot_change_sources_and_read_masked_urls() {
     let urls = before["geodata"]["geosite"]["urls"].as_array().unwrap();
     assert_eq!(urls.len(), 1);
     let url = urls[0].as_str().unwrap();
-    assert!(!url.contains(CLASH) && !url.contains('?'), "{url}");
+    assert!(!url.contains("listener") && !url.contains('?'), "{url}");
     assert!(url.starts_with("https://mirror.example/") && url.ends_with("/geosite.dat"));
+    let shown = &fixture.get(GEO).await["assets"][0]["source_redacted"];
+    assert!(!shown.to_string().contains("listener"), "{shown}");
     for body in [
         json!({"geodata": {"auto_update": {"enabled": false}}}),
         json!({"geodata": null}),

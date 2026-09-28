@@ -578,6 +578,6 @@ fn a_display_url_keeps_nothing_that_may_hold_a_credential() {
         ("https://user:pass@example.com/geoip.dat", None),
         ("https://user@example.com/geoip.dat", None),
     ] {
-        assert_eq!(display_url(url).as_deref(), shown, "{url}");
+        assert_eq!(display_url(url, |_| false).as_deref(), shown, "{url}");
     }
 }
