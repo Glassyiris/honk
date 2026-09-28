@@ -484,7 +484,7 @@ async fn download_bounds_actual_chunked_bytes_and_joins_timed_out_connection() {
             let read = timeout(WAIT, stream.read_to_end(&mut remaining)).await.unwrap();
             assert!(read.is_ok() || read.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
         });
-        let result = download_direct(&url, "", tokio::time::Instant::now() + Duration::from_millis(100), 4, None).await;
+        let result = download_direct(&url, "", (tokio::time::Instant::now() + Duration::from_millis(100)).into(), 4, None).await;
         assert_eq!(result.unwrap_err().code, expected);
         tasks.join_next().await.unwrap().unwrap();
     }

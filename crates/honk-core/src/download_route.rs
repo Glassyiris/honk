@@ -309,6 +309,27 @@ pub(crate) struct Reply {
     pub(crate) body: std::sync::Arc<[u8]>,
 }
 
+/// When a GET gives up. The answer's headers have to arrive by `headers`.
+/// Without `idle` the body has to be complete by then as well; with
+/// `idle: Some((pause, end))` it may run until `end`, as long as no wait for
+/// more of it lasts `pause`.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy)]
+pub(crate) struct Deadline {
+    pub(crate) headers: tokio::time::Instant,
+    pub(crate) idle: Option<(Duration, tokio::time::Instant)>,
+}
+
+#[cfg(feature = "native-api")]
+impl From<tokio::time::Instant> for Deadline {
+    fn from(at: tokio::time::Instant) -> Self {
+        Self {
+            headers: at,
+            idle: None,
+        }
+    }
+}
+
 /// TLS for https, then one HTTP/1.1 GET of `url` with `headers` added.
 /// The body is read only when `wants_body` accepts the answer's status and
 /// headers, so an unwanted answer is neither waited for nor size checked.
@@ -319,13 +340,14 @@ pub(crate) async fn get<S>(
     url: &reqwest::Url,
     headers: &http::HeaderMap,
     wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Deadline>,
     max_bytes: usize,
 ) -> Result<Reply, &'static str>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use tokio::time::timeout_at;
+    let deadline = deadline.into();
     if url.scheme() == "https" {
         let host = url
             .host_str()
@@ -333,7 +355,7 @@ where
             .trim_matches(['[', ']']);
         let connector = honk_outbound::tls::build_dns_connector(false, b"\x08http/1.1")
             .map_err(|_| "tls_failed")?;
-        let stream = timeout_at(deadline, connector.connect(host, stream))
+        let stream = timeout_at(deadline.headers, connector.connect(host, stream))
             .await
             .map_err(|_| "download_timeout")?
             .map_err(|_| "tls_failed")?;
@@ -349,7 +371,7 @@ async fn receive<S>(
     url: &reqwest::Url,
     headers: &http::HeaderMap,
     wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
-    deadline: tokio::time::Instant,
+    deadline: Deadline,
     max_bytes: usize,
 ) -> Result<Reply, &'static str>
 where
@@ -359,7 +381,7 @@ where
     use axum::http::{Request, Uri};
     use tokio::time::timeout_at;
     let (mut sender, connection) = timeout_at(
-        deadline,
+        deadline.headers,
         hyper::client::conn::http1::Builder::new()
             .max_headers(64)
             .max_buf_size(32768)
@@ -370,7 +392,7 @@ where
     .map_err(|_| "http_failed")?;
     let mut drivers = tokio::task::JoinSet::new();
     drivers.spawn(connection);
-    let result = timeout_at(deadline, async {
+    let result = async {
         let uri: Uri = url.as_str().parse().map_err(|_| "invalid_source")?;
         // Host is host[:port] only; userinfo in the URL never goes on the wire here.
         let host = url.host_str().ok_or("invalid_source")?;
@@ -393,9 +415,9 @@ where
             request = request.header(name, value);
         }
         let request = request.body(Body::empty()).map_err(|_| "invalid_source")?;
-        let mut response = sender
-            .send_request(request)
+        let mut response = timeout_at(deadline.headers, sender.send_request(request))
             .await
+            .map_err(|_| "download_timeout")?
             .map_err(|_| "http_failed")?;
         let status = response.status();
         let location = response.headers().get("location").cloned();
@@ -436,8 +458,17 @@ where
             .map(|length| std::iter::repeat_n(0, length as usize).collect());
         let mut grown = Vec::new();
         let mut received = 0;
-        while let Some(frame) =
-            std::future::poll_fn(|cx| std::pin::Pin::new(response.body_mut()).poll_frame(cx)).await
+        let next_bytes = || {
+            deadline.idle.map_or(deadline.headers, |(pause, end)| {
+                end.min(tokio::time::Instant::now() + pause)
+            })
+        };
+        while let Some(frame) = timeout_at(
+            next_bytes(),
+            std::future::poll_fn(|cx| std::pin::Pin::new(response.body_mut()).poll_frame(cx)),
+        )
+        .await
+        .map_err(|_| "download_timeout")?
         {
             let frame = frame.map_err(|_| "http_failed")?;
             if let Ok(data) = frame.into_data() {
@@ -465,9 +496,8 @@ where
             location,
             body,
         })
-    })
-    .await
-    .unwrap_or(Err("download_timeout"));
+    }
+    .await;
     drop(sender);
     drivers.abort_all();
     while drivers.join_next().await.is_some() {}
