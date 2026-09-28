@@ -94,7 +94,31 @@ fn a_changed_file_url_is_seeded_at_the_next_startup() {
 }
 
 #[test]
-fn a_url_patch_stores_both_lists_and_null_deletes_everything() {
+fn a_one_asset_patch_leaves_the_other_list_to_the_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = NativeApiConfig {
+        geoip_download_url: "https://config.example/geoip.dat".into(),
+        ..Default::default()
+    };
+    let sources = Sources::open(db(directory.path()), &file).unwrap();
+    sources
+        .apply(patch(
+            json!({"geosite": {"urls": ["https://patched.example/geosite.dat"]}}),
+        ))
+        .unwrap();
+    drop(sources);
+    let reopened = Sources::open(db(directory.path()), &settings(""))
+        .unwrap()
+        .effective();
+    assert_eq!(reopened.urls[0], ["https://patched.example/geosite.dat"]);
+    assert_eq!(
+        reopened.urls[1],
+        DEFAULT_URLS[1].map(str::to_owned).to_vec()
+    );
+}
+
+#[test]
+fn a_url_patch_is_stored_and_null_deletes_everything() {
     let directory = tempfile::tempdir().unwrap();
     let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
     assert_eq!(sources.effective().source, Source::Default);

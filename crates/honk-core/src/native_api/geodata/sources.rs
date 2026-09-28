@@ -424,18 +424,13 @@ impl Sources {
             None => Stored::default(),
             Some(patch) => {
                 let mut next = stored.clone();
-                if patch.geosite.is_some() || patch.geoip.is_some() {
-                    let [geosite, geoip] = current.urls.clone();
-                    next.urls = [
-                        patch.geosite.map_or(geosite, |patch| patch.urls),
-                        patch.geoip.map_or(geoip, |patch| patch.urls),
-                    ]
-                    .map(|urls| {
-                        Some(StoredUrls {
-                            urls,
+                for (list, patch) in next.urls.iter_mut().zip([patch.geosite, patch.geoip]) {
+                    if let Some(patch) = patch {
+                        *list = Some(StoredUrls {
+                            urls: patch.urls,
                             from_config: false,
-                        })
-                    });
+                        });
+                    }
                 }
                 if let Some(auto) = patch.auto_update {
                     let mut value = current.auto_update;
