@@ -129,7 +129,7 @@ impl NativeState {
                             })?)
                         }
                     };
-                    auth::Auth::open(db, &data_dir).map_err(|error| {
+                    auth::Auth::open(db).map_err(|error| {
                         anyhow::anyhow!(
                             "native API password login cannot use the state db: {error}"
                         )

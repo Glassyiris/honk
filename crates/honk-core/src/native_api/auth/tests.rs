@@ -1,6 +1,7 @@
-use super::storage::{LEGACY_DIR, LEGACY_RECORD, Record, SetupError};
+use super::storage::{Record, SetupError};
 use super::*;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::time::Duration;
 
 fn hex(bytes: &[u8]) -> String {
@@ -86,7 +87,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 }
 
 fn store_in(data: &Path) -> CredentialStore {
-    CredentialStore::open(Arc::new(StateDb::open(data).unwrap()), data).unwrap()
+    CredentialStore::open(Arc::new(StateDb::open(data).unwrap())).unwrap()
 }
 
 fn admin_rows(data: &Path) -> i64 {
@@ -144,7 +145,7 @@ fn two_stores_racing_setup_yield_one_winner() {
 fn a_failed_write_blocks_the_store() {
     let data = temp_data_dir();
     let db = Arc::new(StateDb::open(data.path()).unwrap());
-    let store = CredentialStore::open(Arc::clone(&db), data.path()).unwrap();
+    let store = CredentialStore::open(Arc::clone(&db)).unwrap();
     // The INSERT itself fails, after the transaction started.
     db.strict()
         .execute_batch(
@@ -167,62 +168,11 @@ fn a_failed_write_blocks_the_store() {
     );
 }
 
-fn legacy_record(data: &Path) -> std::path::PathBuf {
-    let dir = data.join(LEGACY_DIR);
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let file = dir.join(LEGACY_RECORD);
-    std::fs::write(
-        &file,
-        Record::create("legacy", "correct horse battery")
-            .unwrap()
-            .to_json(),
-    )
-    .unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    file
-}
-
-#[test]
-fn a_legacy_record_is_imported_and_removed_only_by_the_credential_store() {
-    let data = temp_data_dir();
-    let file = legacy_record(data.path());
-    // File mode without password_auth opens the state db and leaves it alone.
-    drop(StateDb::open(data.path()).unwrap());
-    assert!(file.exists());
-
-    let store = store_in(data.path());
-    assert!(store.verify("legacy", "correct horse battery"));
-    assert!(!file.exists());
-    assert!(!data.path().join(LEGACY_DIR).exists());
-}
-
-#[test]
-fn an_unsafe_legacy_directory_or_record_fails_closed() {
-    let data = temp_data_dir();
-    let file = legacy_record(data.path());
-    let dir = data.path().join(LEGACY_DIR);
-    let open =
-        || CredentialStore::open(Arc::new(StateDb::open(data.path()).unwrap()), data.path()).err();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
-    assert_eq!(open(), Some(StoreError::Unsafe));
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(open(), Some(StoreError::Unsafe));
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::write(&file, b"{}").unwrap();
-    assert_eq!(open(), Some(StoreError::Corrupt));
-    std::fs::remove_file(&file).unwrap();
-    std::os::unix::fs::symlink(data.path().join("elsewhere"), &file).unwrap();
-    assert_eq!(open(), Some(StoreError::Unsafe));
-    assert_eq!(admin_rows(data.path()), 0);
-}
-
 #[test]
 fn reset_refuses_while_a_daemon_has_the_db_open() {
     let data = temp_data_dir();
     let db = Arc::new(StateDb::open(data.path()).unwrap());
-    let store = CredentialStore::open(Arc::clone(&db), data.path()).unwrap();
+    let store = CredentialStore::open(Arc::clone(&db)).unwrap();
     store.setup("admin", "correct horse battery").unwrap();
     assert_eq!(
         crate::state::reset_admin(data.path()),
@@ -409,16 +359,6 @@ fn setup_peers_are_loopback_or_private_only() {
 }
 
 #[test]
-fn reset_also_removes_a_legacy_record_never_imported() {
-    let data = temp_data_dir();
-    drop(StateDb::open(data.path()).unwrap());
-    let file = legacy_record(data.path());
-    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
-    assert!(!file.exists());
-    assert!(store_in(data.path()).setup_required());
-}
-
-#[test]
 fn a_busy_db_leaves_setup_available() {
     let data = temp_data_dir();
     let store = store_in(data.path());
@@ -438,16 +378,7 @@ fn a_busy_db_leaves_setup_available() {
 }
 
 #[test]
-fn reset_removes_a_legacy_record_before_any_state_db_exists() {
-    let data = temp_data_dir();
-    let file = legacy_record(data.path());
-    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
-    assert!(!file.exists());
-    assert_eq!(crate::state::reset_admin(data.path()), Ok(false));
-}
-
-#[test]
-fn reset_on_a_db_without_its_schema_still_removes_a_legacy_record() {
+fn reset_on_a_db_without_its_schema_finds_no_administrator() {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let data = temp_data_dir();
@@ -461,33 +392,7 @@ fn reset_on_a_db_without_its_schema_still_removes_a_legacy_record() {
         .mode(0o600)
         .open(state.join(crate::state::DB_FILE))
         .unwrap();
-    let file = legacy_record(data.path());
-    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
-    assert!(!file.exists());
-}
-
-#[test]
-fn a_legacy_fifo_is_rejected_without_waiting_for_a_writer() {
-    use nix::fcntl::{OFlag, open};
-    use nix::sys::stat::Mode;
-
-    let data = temp_data_dir();
-    let directory = data.path().join(LEGACY_DIR);
-    std::fs::create_dir(&directory).unwrap();
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let fifo = directory.join(LEGACY_RECORD);
-    nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-    let db = Arc::new(StateDb::open(data.path()).unwrap());
-    let path = data.path().to_owned();
-    let (send, receive) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        send.send(CredentialStore::open(db, &path).err()).unwrap();
-    });
-    let result = receive.recv_timeout(Duration::from_secs(1));
-    // Unblock the old O_RDONLY implementation before asserting, so ablation cannot hang the suite.
-    let _unblock = open(&fifo, OFlag::O_RDWR | OFlag::O_NONBLOCK, Mode::empty()).unwrap();
-    reader.join().unwrap();
-    assert_eq!(result.unwrap(), Some(StoreError::Unsafe));
+    assert_eq!(crate::state::reset_admin(data.path()), Ok(false));
 }
 
 #[tokio::test]
@@ -498,7 +403,7 @@ async fn blocked_setup_keeps_discovery_live_and_shutdown_joins_dropped_work() {
 
     let data = temp_data_dir();
     let db = Arc::new(StateDb::open(data.path()).unwrap());
-    let auth = Arc::new(Auth::open(Arc::clone(&db), data.path()).unwrap());
+    let auth = Arc::new(Auth::open(Arc::clone(&db)).unwrap());
     let mut state = crate::native_api::tests::state().await;
     Arc::get_mut(&mut state).unwrap().auth = Some(Arc::clone(&auth));
     let app = router(Arc::clone(&state)).layer(axum::Extension(Peer("127.0.0.1".parse().unwrap())));
@@ -588,7 +493,7 @@ async fn an_unconfirmed_setup_write_is_not_retryable() {
 
     let data = temp_data_dir();
     let db = Arc::new(StateDb::open(data.path()).unwrap());
-    let auth = Arc::new(Auth::open(Arc::clone(&db), data.path()).unwrap());
+    let auth = Arc::new(Auth::open(Arc::clone(&db)).unwrap());
     let mut state = crate::native_api::tests::state().await;
     Arc::get_mut(&mut state).unwrap().auth = Some(auth);
     db.strict()

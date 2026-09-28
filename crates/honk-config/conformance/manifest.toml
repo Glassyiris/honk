@@ -1710,7 +1710,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
-source = { file = "doc/en/reference/experimental.md", lines = "149-162" }
+source = { file = "doc/en/reference/experimental.md", lines = "147-160" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2005,7 +2005,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
-source = { file = "doc/zh/reference/experimental.md", lines = "152-165" }
+source = { file = "doc/zh/reference/experimental.md", lines = "150-163" }
 wrap = ""
 layer = "structure"
 honk = "accept"

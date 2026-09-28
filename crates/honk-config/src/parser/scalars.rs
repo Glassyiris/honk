@@ -582,8 +582,6 @@ const NATIVE_API_KEYS: &[&str] = &[
     "probe_allowed_cidrs",
     "probe_allowed_ports",
     "config_write",
-    "config_content",
-    "writable_includes",
     "geosite_download_url",
     "geoip_download_url",
     "geodata_download_detour",
@@ -869,16 +867,6 @@ pub(super) fn parse_experimental_section(
                             })?;
                         }
                     }
-                    if let Some(text) = values.get("config_content") {
-                        strict_bool(text.unquote().raw()).ok_or_else(|| {
-                            scalar_error(
-                                *text,
-                                "invalid-config-value",
-                                "experimental.native_api.config_content",
-                                "expected true/false, yes/no, 1/0 or on/off",
-                            )
-                        })?;
-                    }
                     for (key, target) in [
                         ("listen", &mut config.native_api.listen),
                         ("secret", &mut config.native_api.secret),
@@ -923,9 +911,6 @@ pub(super) fn parse_experimental_section(
                             value.parse::<u16>().ok().filter(|port| *port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
                                 .ok_or_else(|| scalar_error(*text, "invalid-config-value", "experimental.native_api.probe_allowed_ports", "probe port allowlist requires ports from 1 through 65535"))
                         }).collect::<Result<Vec<_>,_>>()?;
-                    }
-                    if let Some(text) = values.get("writable_includes") {
-                        let _ = new_list_value(*text, diagnostics);
                     }
                     for (key, setting, target) in [
                         (

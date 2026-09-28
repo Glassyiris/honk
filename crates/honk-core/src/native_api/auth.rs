@@ -4,7 +4,6 @@
 //! PBKDF2-HMAC-SHA256 hash of the password. Sessions are opaque random tokens kept in memory as
 //! SHA-256 digests; a restart forgets them all.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -288,9 +287,9 @@ struct Work {
 }
 
 impl Auth {
-    pub(crate) fn open(db: Arc<StateDb>, data_dir: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open(db: Arc<StateDb>) -> Result<Self, StoreError> {
         Ok(Self {
-            store: CredentialStore::open(db, data_dir)?,
+            store: CredentialStore::open(db)?,
             sessions: Sessions::default(),
             rate: AuthRate::default(),
             work: Mutex::new(Work::default()),

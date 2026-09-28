@@ -258,14 +258,12 @@ impl Target {
 
     /// Moves `temporary` to the target name; never replaces anything already there.
     fn install(&self, temporary: &mut TemporaryFile) -> Result<(), WriteError> {
-        rustix::fs::renameat_with(
+        crate::state::rename_noreplace(
             &self.directory,
             temporary.name.as_str(),
-            &self.directory,
             self.filename.as_os_str(),
-            rustix::fs::RenameFlags::NOREPLACE,
         )
-        .map_err(|error| match Errno::from_raw(error.raw_os_error()) {
+        .map_err(|error| match error {
             Errno::EEXIST => WriteError::Conflict,
             error => path_error(error),
         })?;

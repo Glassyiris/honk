@@ -50,7 +50,7 @@ fn pragmas_read_back_on_a_fresh_and_a_reopened_file() {
         ("page_size", "Integer(4096)"),
         ("auto_vacuum", "Integer(2)"),
         ("application_id", "Integer(1752133227)"),
-        ("user_version", "Integer(2)"),
+        ("user_version", "Integer(1)"),
     ]
     .into_iter()
     .map(|(name, value)| (name, value.to_owned()))
@@ -463,12 +463,6 @@ fn reset_refuses_while_another_process_holds_the_directory() {
 #[test]
 fn admin_reset_refuses_startup_before_the_database_exists() {
     let data = tempfile::tempdir().unwrap();
-    let legacy = data.path().join("native-api");
-    fs::create_dir(&legacy).unwrap();
-    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
-    let record = legacy.join("admin.json");
-    fs::write(&record, b"legacy administrator").unwrap();
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
     let startup = Flock::lock(
         state_directory(data.path(), true, private).unwrap(),
         FlockArg::LockSharedNonblock,
@@ -477,50 +471,9 @@ fn admin_reset_refuses_startup_before_the_database_exists() {
 
     assert!(!db_path(data.path()).exists());
     assert_eq!(reset_admin(data.path()), Err(StateError::InUse));
-    assert_eq!(fs::read(&record).unwrap(), b"legacy administrator");
 
     drop(startup);
-    assert_eq!(reset_admin(data.path()), Ok(true));
-    assert!(!record.exists());
     assert_eq!(reset_admin(data.path()), Ok(false));
-}
-
-#[test]
-fn admin_reset_preserves_unsafe_legacy_credentials() {
-    let data = tempfile::tempdir().unwrap();
-    let legacy = data.path().join("native-api");
-    fs::create_dir(&legacy).unwrap();
-    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
-    let record = legacy.join("admin.json");
-    fs::write(&record, b"untrusted").unwrap();
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(
-        reset_admin(data.path()),
-        Err(StateError::Unsafe(Refusal::new(
-            Target::LegacyDir,
-            Rule::GroupOrOtherBits
-        )))
-    );
-    assert_eq!(fs::read(&record).unwrap(), b"untrusted");
-
-    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
-    let target = data.path().join("target");
-    fs::rename(&record, &target).unwrap();
-    std::os::unix::fs::symlink(&target, &record).unwrap();
-    assert_eq!(
-        reset_admin(data.path()),
-        Err(StateError::Unsafe(Refusal::new(
-            Target::LegacyRecord,
-            Rule::Symlink
-        )))
-    );
-    assert!(
-        fs::symlink_metadata(&record)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"untrusted");
 }
 
 #[test]
@@ -608,31 +561,4 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
     )
     .unwrap();
     assert_eq!(tables.map(count), [1, 1, 0, 1, 0, 1]);
-}
-
-#[test]
-fn a_version_1_database_gains_the_geodata_settings_table() {
-    let directory = tempfile::tempdir().unwrap();
-    drop(StateDb::open(directory.path()).unwrap());
-    let connection = Connection::open(db_path(directory.path())).unwrap();
-    connection
-        .execute_batch("DROP TABLE geodata_settings; PRAGMA user_version = 1;")
-        .unwrap();
-    drop(connection);
-    let state = StateDb::open(directory.path()).unwrap();
-    assert_eq!(pragma(&state.strict(), "user_version"), Ok(SCHEMA_VERSION));
-    state
-        .strict()
-        .execute(
-            "INSERT INTO geodata_settings (id, record) VALUES (1, '{}')",
-            [],
-        )
-        .unwrap();
-    drop(state);
-    let state = StateDb::open(directory.path()).unwrap();
-    let record: String = state
-        .strict()
-        .query_row("SELECT record FROM geodata_settings", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(record, "{}");
 }

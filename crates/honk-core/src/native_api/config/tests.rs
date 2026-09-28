@@ -126,9 +126,7 @@ impl Fixture {
         let addr = listener.local_addr().unwrap();
         let settings = match access {
             Access::Metadata => format!("secret: '{SECRET}'"),
-            Access::Admin => format!(
-                "secret: '{SECRET}'\n config_write: true\n config_content: true\n writable_includes: 'editable.dae'"
-            ),
+            Access::Admin => format!("secret: '{SECRET}'\n config_write: true"),
             Access::Anonymous => "allow_anonymous_loopback: true".into(),
         };
         let main = format!(
@@ -779,12 +777,8 @@ async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
 }
 
 #[tokio::test]
-async fn retired_content_flag_and_echoed_redaction_flag_do_not_grant_write_authority() {
-    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
-        let auth = files.get_mut("auth.dae").unwrap();
-        *auth = auth.replace("config_content: true", "config_content: false");
-    })
-    .await;
+async fn echoed_redaction_flag_does_not_grant_write_authority() {
+    let fixture = Fixture::new(Access::Admin, false).await;
     let config = fixture.get(CONFIG).await;
     let row = source(&config, &fixture.originals["locked.dae"]);
     assert_eq!(row["content"], fixture.originals["locked.dae"]);

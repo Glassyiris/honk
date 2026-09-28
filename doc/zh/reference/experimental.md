@@ -33,9 +33,7 @@
 | `record_dns_log` | `true` | 允许按 API 客户端连接规则或显式运行时设置记录客户端 DNS 完成历史，最多保留 512 条、8 MiB。`false` 禁止记录；修改配置需重启。 |
 | `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
 | `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
-| `config_content` | `false` | 为兼容旧配置而接受，不产生作用。所有获准请求均可读取可用来源，仅遮蔽监听凭据值。 |
 | `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，以及新建由 include 模式加载的 `.dae` 文件，含监听凭据的源除外；要求非空 `secret` 或启用 `password_auth`。 |
-| `writable_includes` | 空列表 | 为兼容旧配置而接受，不产生作用；不授予路径权限，也不限制已接受 include。 |
 | `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源，最长 4096 字节；要求 `config_write`。有状态库时，已设置的 URL 在启动时写入已存储的 geodata 来源，覆盖通过 API 修改的 URL；删除该项后，下次启动时该资产恢复内置 URL。更新使用已存储或内置的 URL。没有状态库时，URL 为空则不能更新。 |
 | `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
 | `geodata_download_detour` | `""` | Geodata 下载的出口：`direct`、`routing` 或组名。有状态库时，启动时按与 URL 相同的规则写入已存储的路由；空值与 `external_ui_download_detour` 相同，遵循路由规则；若已通过 API 存储路由，则保留该路由。未知的组在准入时拒绝。 |
@@ -76,7 +74,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。配置读取返回已接受正文，仅遮蔽声明的监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持入口目录相对名称，`absolute_path` 提供规范化绝对路径。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
 
-`config_content` 与 `writable_includes` 仍可配置，但不产生作用。启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略的固定成员只在运行时生效，不写回来源。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
+启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略的固定成员只在运行时生效，不写回来源。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
 
 
 ## `clash_api`
