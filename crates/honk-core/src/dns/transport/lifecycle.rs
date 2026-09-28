@@ -326,12 +326,8 @@ impl SessionObservation {
     ) -> anyhow::Result<T> {
         if self.observer.is_some() {
             let cancelled = result.as_ref().err().is_some_and(|error| {
-                error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<honk_outbound::proxy::PacketRejection>(),
-                        Some(honk_outbound::proxy::PacketRejection::Cancelled)
-                    )
-                })
+                honk_outbound::proxy::packet_rejection(error)
+                    == Some(honk_outbound::proxy::PacketRejection::Cancelled)
             });
             self.record(
                 if result.is_ok() {

@@ -1,7 +1,10 @@
 use super::*;
+use crate::native_api::pages::{MAX_SNAPSHOTS, SNAPSHOT_TTL};
 use crate::observe::catalog::{Catalog, tests::fixture};
 use honk_config::group::GroupPolicy;
+use honk_outbound::alive::IpVersion;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 async fn body(response: Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), MAX_SNAPSHOT_BYTES + 1024)
@@ -23,6 +26,21 @@ fn capture(config: &Config, catalog: &Catalog, filter: Option<&str>) -> NodeSnap
     .unwrap()
 }
 
+fn resume(
+    pages: &NodePages,
+    cursor: &str,
+    group_id: Option<&str>,
+    limit: usize,
+    request: &RequestId,
+) -> Result<Response, ApiError> {
+    pages.resume(
+        cursor,
+        limit,
+        |snapshot| snapshot.group_id.as_deref() == group_id,
+        request,
+    )
+}
+
 #[tokio::test]
 async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     let mut config = fixture();
@@ -34,7 +52,7 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     let parent = &identity.groups["parent"];
     let parent_page = body(
         pages
-            .page(capture(&config, &catalog, Some(parent)), 100, &request)
+            .first(capture(&config, &catalog, Some(parent)), 100, &request)
             .unwrap(),
     )
     .await;
@@ -51,29 +69,24 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     let child = &identity.groups["child"];
     let first = body(
         pages
-            .page(capture(&config, &catalog, Some(child)), 1, &request)
+            .first(capture(&config, &catalog, Some(child)), 1, &request)
             .unwrap(),
     )
     .await;
     let cursor = first["next_cursor"].as_str().unwrap();
-    assert!(
-        NodePages::default()
-            .resume(cursor, Some(child), 1, &request)
-            .is_err()
-    );
-    assert!(pages.resume(cursor, Some(parent), 1, &request).is_err());
-    assert!(pages.resume(cursor, None, 1, &request).is_err());
+    assert!(resume(&NodePages::default(), cursor, Some(child), 1, &request).is_err());
+    assert!(resume(&pages, cursor, Some(parent), 1, &request).is_err());
+    assert!(resume(&pages, cursor, None, 1, &request).is_err());
     config.nodes[2].name = "new-name".into();
     config.groups.clear();
     catalog.install(&config);
-    let second = body(pages.resume(cursor, Some(child), 100, &request).unwrap()).await;
+    let second = body(resume(&pages, cursor, Some(child), 100, &request).unwrap()).await;
     assert_eq!(second["observed_at"], first["observed_at"]);
     assert_eq!(second["nodes"][0]["name"], "node-3");
     assert_eq!(second["nodes"][0]["group_ids"], json!([child]));
     assert_eq!(second["next_cursor"], Value::Null);
     pages.0.lock()[0].created = Instant::now() - SNAPSHOT_TTL;
-    let error = pages
-        .resume(cursor, Some(child), 1, &request)
+    let error = resume(&pages, cursor, Some(child), 1, &request)
         .unwrap_err()
         .into_response();
     assert_eq!(error.status(), StatusCode::BAD_REQUEST);
@@ -87,31 +100,36 @@ async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_row
     let request = RequestId("request".into());
     let first = body(
         pages
-            .page(capture(&config, &catalog, None), 1, &request)
+            .first(capture(&config, &catalog, None), 1, &request)
             .unwrap(),
     )
     .await;
     for _ in 0..MAX_SNAPSHOTS {
         pages
-            .page(capture(&config, &catalog, None), 1, &request)
+            .first(capture(&config, &catalog, None), 1, &request)
             .unwrap();
     }
     assert_eq!(pages.0.lock().len(), MAX_SNAPSHOTS);
     assert!(
-        pages
-            .resume(first["next_cursor"].as_str().unwrap(), None, 1, &request)
-            .is_err()
+        resume(
+            &pages,
+            first["next_cursor"].as_str().unwrap(),
+            None,
+            1,
+            &request
+        )
+        .is_err()
     );
 
     config.nodes[0].name = "x".repeat(MAX_SNAPSHOT_BYTES / 2);
     let first_large = body(
         pages
-            .page(capture(&config, &catalog, None), 1, &request)
+            .first(capture(&config, &catalog, None), 1, &request)
             .unwrap(),
     )
     .await;
     pages
-        .page(capture(&config, &catalog, None), 1, &request)
+        .first(capture(&config, &catalog, None), 1, &request)
         .unwrap();
     assert!(
         pages
@@ -123,14 +141,14 @@ async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_row
             <= MAX_SNAPSHOT_BYTES
     );
     assert!(
-        pages
-            .resume(
-                first_large["next_cursor"].as_str().unwrap(),
-                None,
-                1,
-                &request
-            )
-            .is_err()
+        resume(
+            &pages,
+            first_large["next_cursor"].as_str().unwrap(),
+            None,
+            1,
+            &request
+        )
+        .is_err()
     );
 
     config.nodes[0].name = "x".repeat(MAX_SNAPSHOT_BYTES);
@@ -164,7 +182,7 @@ fn projections_keep_duplicate_names_and_nested_member_identity_separate() {
     let identity = Catalog::new(&config).snapshot();
     let value = group_value(
         &manager,
-        manager.native_group("parent").unwrap(),
+        manager.group("parent").unwrap(),
         &identity,
         &AliveDialerSet::new(),
         true,
@@ -203,7 +221,7 @@ fn projections_keep_duplicate_names_and_nested_member_identity_separate() {
     );
     assert!(
         manager
-            .native_selection("parent", SelectionNetwork::Tcp)
+            .peek_selection("parent", SelectionNetwork::Tcp)
             .is_none()
     );
 }
@@ -218,7 +236,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
     ]
     .into_iter()
     .map(|policy_kind| Group {
-        name: policy(policy_kind).into(),
+        name: policy_kind.as_str().into(),
         policy: policy_kind,
         nodes: config.nodes.iter().map(|node| node.id).collect(),
         ..Default::default()
@@ -247,7 +265,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
     assert!(alive.is_urltest_group_idle("urltest"));
     assert!(
         manager
-            .native_selection("urltest", SelectionNetwork::Tcp)
+            .peek_selection("urltest", SelectionNetwork::Tcp)
             .is_none()
     );
     assert_eq!(manager.score_reason_snapshot(), counters);
@@ -265,8 +283,8 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
 #[test]
 fn group_health_falls_back_by_member_and_full_measurement_key() {
     use honk_outbound::alive::{
-        HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth,
-        NativeGroupProbeContext, ProbeDomain,
+        GroupProbeContext, HealthMeasurement, HealthPurpose, HealthState, HealthTransport,
+        HealthWarmth, ProbeDomain,
     };
 
     let mut config = fixture();
@@ -285,58 +303,58 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     let manager = GroupManager::new(&config.groups, &config.nodes);
     let identity = Catalog::new(&config).snapshot();
     let alive = AliveDialerSet::new();
-    alive.enable_native_observations();
+    alive.enable_health_history();
     alive.register_node(node.id, node.name.clone(), "127.0.0.1:1".into());
-    let ticket = alive.native_probe_ticket(node.id);
-    let tcp = NativeHealthObservation::probe(
+    let ticket = alive.probe_ticket(node.id);
+    let tcp = HealthObservation::probe(
         ProbeDomain::Tcp,
         HealthMeasurement::TcpConnect,
         IpVersion::V4,
         Some(Duration::from_millis(12)),
         SystemTime::UNIX_EPOCH + Duration::from_secs(1),
     );
-    let http = NativeHealthObservation {
+    let http = HealthObservation {
         measurement: HealthMeasurement::HttpHeaders,
         ..tcp
     };
-    let dns = NativeHealthObservation {
+    let dns = HealthObservation {
         measurement: HealthMeasurement::DnsRoundTrip,
         purpose: HealthPurpose::Dns,
         ..tcp
     };
-    let udp_dns = NativeHealthObservation {
+    let udp_dns = HealthObservation {
         transport: HealthTransport::Udp,
         ..dns
     };
     let global = [
         tcp,
         http,
-        NativeHealthObservation {
+        HealthObservation {
             warmth: HealthWarmth::Warm,
             ..http
         },
-        NativeHealthObservation {
+        HealthObservation {
             ip_version: IpVersion::V6,
             ..http
         },
         dns,
         udp_dns,
-        NativeHealthObservation {
+        HealthObservation {
             purpose: HealthPurpose::Data,
             ..udp_dns
         },
     ];
     for sample in global {
-        assert!(alive.complete_native_probe(&ticket, None, sample));
+        assert!(alive.complete_probe(&ticket, None, sample));
     }
     for sample in [http, udp_dns] {
-        assert!(alive.complete_native_probe(
+        assert!(alive.complete_probe(
             &ticket,
-            Some(NativeGroupProbeContext {
+            Some(GroupProbeContext {
                 group_id: identity.groups["parent"].parse().unwrap(),
                 member_id: node.id,
             }),
-            NativeHealthObservation {
+            HealthObservation {
                 state: HealthState::Unavailable,
                 latency: None,
                 error: Some("probe_failed"),
@@ -346,7 +364,7 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     }
     let rows = group_health(
         &manager,
-        manager.native_group("parent").unwrap(),
+        manager.group("parent").unwrap(),
         &identity,
         &alive,
     );
@@ -378,12 +396,7 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
                 && row["warmth"] == json!(sample.warmth)
         }));
     }
-    let other = group_health(
-        &manager,
-        manager.native_group("other").unwrap(),
-        &identity,
-        &alive,
-    );
+    let other = group_health(&manager, manager.group("other").unwrap(), &identity, &alive);
     assert_eq!(other.len(), global.len());
     assert!(
         other
@@ -393,11 +406,11 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     assert!(
         group_health(
             &manager,
-            manager.native_group("custom").unwrap(),
+            manager.group("custom").unwrap(),
             &identity,
             &alive
         )
         .is_empty()
     );
-    assert_eq!(alive.native_observations(node.id), global);
+    assert_eq!(alive.health_observations(node.id), global);
 }

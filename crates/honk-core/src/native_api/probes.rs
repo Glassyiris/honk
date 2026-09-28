@@ -8,14 +8,12 @@ use axum::{
 use honk_config::{Config, experimental::NativeApiConfig, node::Node};
 use honk_outbound::{
     alive::{
-        HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth, IpVersion,
-        NativeGroupProbeContext, NativeHealthObservation, NativeProbeTicket, ProbeDomain,
-        ProbeMeasurement,
+        GroupProbeContext, HealthMeasurement, HealthObservation, HealthPurpose, HealthState,
+        HealthTransport, HealthWarmth, IpVersion, ProbeDomain, ProbeMeasurement, ProbeTicket,
     },
     group::{GroupManager, GroupMember, SelectionNetwork},
     runtime::OutboundRuntimeRegistry,
 };
-use ipnet::IpNet;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,9 +32,10 @@ use uuid::Uuid;
 
 use super::{
     ApiError, ErrorCode, NativeState, config,
+    destination::Policy,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
     parse_query,
-    security::RequestRate,
+    security::{REQUESTS_PER_MINUTE, RequestRate},
     timestamp,
     types::RequestId,
 };
@@ -74,6 +73,17 @@ enum Kind {
     TcpConnect,
     Http,
     Dns,
+}
+impl Kind {
+    /// The port the destination policy admits without `probe_allowed_ports`;
+    /// a TCP connect probe measures whatever port the node dials.
+    fn default_port(self, https: bool) -> Option<u16> {
+        match self {
+            Self::TcpConnect => None,
+            Self::Dns => Some(53),
+            Self::Http => Some(if https { 443 } else { 80 }),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -263,74 +273,6 @@ pub(crate) struct ProbeService {
     gate: Mutex<Gate>,
     requests_drained: Notify,
 }
-/// The administrator's outbound destination policy: default ports and public
-/// addresses unless `probe_allowed_ports` and `probe_allowed_cidrs` widen it.
-pub(crate) struct Policy {
-    allowed: Vec<IpNet>,
-    ports: Vec<u16>,
-    restricted: Vec<IpNet>,
-}
-impl Policy {
-    pub(crate) fn new(config: &NativeApiConfig) -> Self {
-        Self {
-            allowed: config
-                .probe_allowed_cidrs
-                .iter()
-                .map(|value| value.parse().expect("validated probe CIDR"))
-                .collect(),
-            ports: config.probe_allowed_ports.clone(),
-            restricted: [
-                "0.0.0.0/8",
-                "10.0.0.0/8",
-                "100.64.0.0/10",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
-                "172.16.0.0/12",
-                "192.0.0.0/24",
-                "192.0.2.0/24",
-                "192.88.99.0/24",
-                "192.168.0.0/16",
-                "198.18.0.0/15",
-                "198.51.100.0/24",
-                "203.0.113.0/24",
-                "224.0.0.0/4",
-                "240.0.0.0/4",
-                "2001::/23",
-                "2001:db8::/32",
-                "2002::/16",
-                "3fff::/20",
-            ]
-            .iter()
-            .map(|value| value.parse().unwrap())
-            .collect(),
-        }
-    }
-    pub(crate) fn address(&self, ip: IpAddr) -> bool {
-        let ip = ip.to_canonical();
-        let restricted = self.restricted.iter().any(|net| net.contains(&ip))
-            || match ip {
-                IpAddr::V4(_) => false,
-                IpAddr::V6(ip) => ip.segments()[0] & 0xe000 != 0x2000,
-            };
-        !restricted || self.allowed.iter().any(|net| net.contains(&ip))
-    }
-    pub(crate) fn http_port(&self, port: u16, https: bool) -> bool {
-        self.port(Kind::Http, port, https)
-    }
-    fn port(&self, kind: Kind, port: u16, https: bool) -> bool {
-        port != 0
-            && (kind == Kind::TcpConnect
-                || self.ports.contains(&port)
-                || port
-                    == if kind == Kind::Dns {
-                        53
-                    } else if https {
-                        443
-                    } else {
-                        80
-                    })
-    }
-}
 
 impl ProbeService {
     pub(crate) fn new(config: &NativeApiConfig, operations: Arc<OperationStore>) -> Self {
@@ -406,7 +348,7 @@ impl ProbeService {
         }
     }
     pub(crate) fn capability(&self) -> Value {
-        json!({"available": self.running(), "targets":["node","group"], "kinds":["tcp_connect","http","dns"], "purposes":["data","dns"], "transports":["tcp","udp"], "ip_versions":["ipv4","ipv6"], "limits":{"max_members_per_job":MAX_MEMBERS,"max_results_per_job":MAX_RESULTS,"max_active_jobs":MAX_ACTIVE,"max_queued_jobs":MAX_QUEUED,"max_concurrent_per_target":1,"job_timeout_ms":30000,"per_principal_requests_per_minute":30,"global_requests_per_minute":30}})
+        json!({"available": self.running(), "targets":["node","group"], "kinds":["tcp_connect","http","dns"], "purposes":["data","dns"], "transports":["tcp","udp"], "ip_versions":["ipv4","ipv6"], "limits":{"max_members_per_job":MAX_MEMBERS,"max_results_per_job":MAX_RESULTS,"max_active_jobs":MAX_ACTIVE,"max_queued_jobs":MAX_QUEUED,"max_concurrent_per_target":1,"job_timeout_ms":DEADLINE.as_millis(),"per_principal_requests_per_minute":REQUESTS_PER_MINUTE,"global_requests_per_minute":REQUESTS_PER_MINUTE}})
     }
     pub(crate) fn start(
         self: &Arc<Self>,

@@ -167,7 +167,7 @@ pub struct ControlPlane {
     mode_db: Option<Arc<crate::state::cache::CacheDb>>,
     /// The state database handed to `init_cache_db`.
     state_db: Option<Arc<crate::state::StateDb>>,
-    state_tick: cache::StateTick,
+    state_tick: lifecycle::OwnedTasks,
     /// Features running reduced; shared with startup and the native API.
     degradations: Arc<crate::degradations::Degradations>,
     /// Built by `configure_health_loop`; a reload updates whether it is needed.
@@ -213,7 +213,6 @@ pub struct ControlPlane {
     native_owner: Option<Arc<dyn crate::observe::Owner>>,
     #[cfg(feature = "native-api")]
     subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
-    #[cfg(feature = "native-api")]
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "clash-api")]
     ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
@@ -408,7 +407,6 @@ impl ControlPlane {
         self.subscriptions = Some(subscriptions);
     }
 
-    #[cfg(feature = "native-api")]
     pub(crate) fn shutdown_intent(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.shutdown_requested)
     }

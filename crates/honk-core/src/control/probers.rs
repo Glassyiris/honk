@@ -1,5 +1,5 @@
 use super::*;
-use honk_outbound::alive::{HealthMeasurement, NativeHealthObservation, ProbeMeasurement};
+use honk_outbound::alive::{HealthMeasurement, HealthObservation, ProbeMeasurement};
 use honk_outbound::group::{
     ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget,
     SelectionNetwork,
@@ -279,7 +279,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             {
                 None
             } else {
-                Some(honk_outbound::alive::NativeHealthObservation::probe(
+                Some(honk_outbound::alive::HealthObservation::probe(
                     ProbeDomain::Tcp,
                     honk_outbound::alive::HealthMeasurement::HttpHeaders,
                     target_family(addr),
@@ -693,7 +693,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error))
                     {
                         let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
-                        dns_observation = Some(NativeHealthObservation::probe(
+                        dns_observation = Some(HealthObservation::probe(
                             ProbeDomain::DnsUdp,
                             measurement,
                             target_family(*dns_target),
@@ -797,7 +797,7 @@ async fn score_quic_probe(
     probe_interval: Duration,
     connect_timeout: Duration,
     timeout: Duration,
-    observation: &mut Option<NativeHealthObservation>,
+    observation: &mut Option<HealthObservation>,
     cancel: &honk_outbound::alive::ProbeCancellation,
 ) -> Option<anyhow::Result<Duration>> {
     if !honk_outbound::descriptor::udp_target_allowed(node, target.addr.port()) {
@@ -862,7 +862,7 @@ async fn score_quic_probe(
     };
     if !matches!(&result, Err(error) if honk_outbound::proxy::is_packet_rejection(error)) {
         let sample = result.as_ref().ok();
-        *observation = Some(NativeHealthObservation::probe(
+        *observation = Some(HealthObservation::probe(
             ProbeDomain::DataUdp,
             measurement,
             target_family(target.addr),

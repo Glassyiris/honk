@@ -25,7 +25,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
     let mut ids = Vec::new();
     let mut owner_ids = Vec::new();
     for target in targets {
-        let flow = Arc::new(api.flows.begin("udp", client_addr, target));
+        let flow = Arc::new(api.flows.begin("udp", client_addr, target).unwrap());
         ids.push(flow.id().to_owned());
         let mut lease = reserve_source(&pool, &stats, client_addr, target, node.id);
         let attachment = pool

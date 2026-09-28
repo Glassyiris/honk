@@ -138,7 +138,14 @@ impl ControlPlane {
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
         drop(current_guard);
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
-        let declared = new_config.subscriptions.clone();
+        let declared = new_config
+            .subscriptions
+            .iter()
+            .filter(|subscription| retained_providers.contains(&subscription.id))
+            .filter_map(|subscription| {
+                Some((subscription.id, subscription.source.as_ref()?.0.clone()))
+            })
+            .collect();
         self.apply_resolved_runtime_config_locked(
             new_config,
             drain,
@@ -762,7 +769,7 @@ impl ControlPlane {
                     active_diagnostics.buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
-                        self.alive_set.invalidate_native_group_observations();
+                        self.alive_set.invalidate_group_health_observations();
                         if replaces_sources && let Some(owner) = &self.native_owner {
                             owner.activate(&config_guard);
                         }

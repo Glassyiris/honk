@@ -59,7 +59,7 @@ async fn native_mode_and_target_publish_once_and_failure_preserves_both() {
         .unwrap();
     assert!(first.is_global());
     assert!(
-        matches!(&first.target, Some(ModeTarget::Group { id, .. }) if *id == identity.groups["Proxy"])
+        matches!(&first.selection, Selection::Target(Some(ModeTarget::Group { id, .. })) if *id == identity.groups["Proxy"])
     );
     assert_eq!(first.source, ModeSource::Runtime);
     assert_eq!(backend.read().await.datapath_flags_write_log().len(), 2);
@@ -81,7 +81,7 @@ async fn native_mode_and_target_publish_once_and_failure_preserves_both() {
     );
     let after = flags.snapshot();
     assert_eq!(after.mode, before.mode);
-    assert_eq!(after.target, before.target);
+    assert_eq!(after.selection, before.selection);
     assert_eq!(after.source, before.source);
     assert!(
         backend
@@ -190,7 +190,9 @@ async fn refresh_retains_identity_and_missing_or_recreated_targets_fail_closed()
         ModeOverride::Block
     );
     assert_eq!(flags.snapshot().source, ModeSource::Runtime);
-    assert!(matches!(flags.snapshot().target, Some(ModeTarget::Node { id, .. }) if id == chosen));
+    assert!(
+        matches!(flags.snapshot().selection, Selection::Target(Some(ModeTarget::Node { id, .. })) if id == chosen)
+    );
 
     let group_id = catalog.snapshot().groups["Proxy"].clone();
     flags
@@ -253,7 +255,7 @@ async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
         publication.reset_for_activation(backend.as_mut()).unwrap();
         assert_eq!(flags.snapshot().mode, "Rule");
         assert_eq!(flags.snapshot().source, ModeSource::Config);
-        assert!(flags.snapshot().target.is_none());
+        assert_eq!(flags.snapshot().selection, Selection::Target(None));
         assert_eq!(
             backend.datapath_flags_write_log().last().copied(),
             Some(RULE | ENABLED)
@@ -293,7 +295,7 @@ async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
         .await
         .unwrap();
     assert!(
-        matches!(native.snapshot().target, Some(ModeTarget::Group { id, .. }) if id == catalog.snapshot().groups["Proxy"])
+        matches!(native.snapshot().selection, Selection::Target(Some(ModeTarget::Group { id, .. })) if id == catalog.snapshot().groups["Proxy"])
     );
     assert_eq!(native.snapshot().source, ModeSource::Runtime);
     assert_eq!(db.load_clash_mode().as_deref(), Some("Direct"));

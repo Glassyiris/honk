@@ -5,10 +5,11 @@ use std::time::SystemTime;
 
 use honk_config::parser::{SourceLimits, SourceSnapshot};
 use parking_lot::{Mutex, RwLock};
-use sha2::{Digest, Sha256};
 
-pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_SOURCES: usize = 32;
+use super::digest;
+
+pub(crate) const MAX_SOURCE_BYTES: usize = SourceLimits::DEFAULT.max_bytes;
+pub(crate) const MAX_SOURCES: usize = SourceLimits::DEFAULT.max_sources;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DependencyReader {
@@ -145,7 +146,7 @@ impl AcceptedSources {
                         .sources
                         .iter()
                         .map(|source| (&source.path, source.parent)))
-                && same_dependencies(&current.update.dependencies, &update.dependencies)
+                && current.update.dependencies == update.dependencies
         });
         let ids = update
             .sources
@@ -227,30 +228,6 @@ fn same_identity(current: Option<&Accepted>, expected: &Option<(String, u64)>) -
     }
 }
 
-pub(crate) fn digest(bytes: &[u8]) -> String {
-    encode_digest(&Sha256::digest(bytes))
-}
-
-pub(crate) fn encode_digest(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(output, "{byte:02x}").expect("writing to a String is infallible");
-    }
-    output
-}
-
-pub(crate) fn same_dependencies(left: &[DependencySnapshot], right: &[DependencySnapshot]) -> bool {
-    left == right
-}
-
-pub(crate) fn limits() -> SourceLimits {
-    SourceLimits {
-        max_bytes: MAX_SOURCE_BYTES,
-        max_sources: MAX_SOURCES,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +241,7 @@ mod tests {
                     PathBuf::from("/private/config.dae"),
                     Arc::<str>::from(content),
                 )],
-                limits(),
+                SourceLimits::DEFAULT,
                 &mut Vec::new(),
             )
             .unwrap();

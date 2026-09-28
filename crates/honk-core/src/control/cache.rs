@@ -1,30 +1,8 @@
-use std::collections::HashSet;
-
 use super::*;
 use crate::state::StateDb;
-use crate::state::cache::{CacheDb, Maintenance};
-
-const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
-
-/// The state db maintenance tick, every 60 s while the cache is open.
-#[derive(Default)]
-pub(super) struct StateTick {
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl StateTick {
-    pub(super) async fn stop_and_join(&mut self) -> anyhow::Result<()> {
-        super::lifecycle::abort_and_join(&mut self.task).await
-    }
-}
-
-impl Drop for StateTick {
-    fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-}
+use crate::state::cache::{
+    CacheDb, DELAY_SAMPLE_MAX_AGE_SECS, Live, Maintenance, Missing, TickOwners, maintenance_tick,
+};
 
 impl ControlPlane {
     /// Open the cache tables of the state database, import a legacy
@@ -240,7 +218,7 @@ impl ControlPlane {
                 interval.tick().await;
             }
         });
-        self.state_tick.task = Some(task);
+        self.state_tick.0.push(task);
     }
 
     /// The state database, when `init_cache_db` had one.
@@ -267,225 +245,11 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Names the config holds when a tick starts.
-pub(super) struct Live {
-    selector_groups: HashSet<String>,
-    nodes: HashSet<String>,
-}
-
-impl Live {
-    fn of(config: &Config) -> Self {
-        Self {
-            selector_groups: config
-                .groups
-                .iter()
-                .filter(|group| group.policy == GroupPolicy::Selector)
-                .map(|group| group.name.clone())
-                .collect(),
-            nodes: config.nodes.iter().map(|node| node.name.clone()).collect(),
-        }
-    }
-}
-
-/// Keys that were missing from the config at the previous tick, one per row.
-#[derive(Default)]
-pub(super) struct Missing {
-    groups: HashSet<String>,
-    nodes: HashSet<String>,
-    bodies: HashSet<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct TickOwners {
-    store_dns: bool,
-    store_subscribe: bool,
-}
-
-/// One maintenance tick. With `store_subscribe`, deletes subscription bodies
-/// whose subscription was not enabled at this tick and the previous one. With
-/// the cache open, writes `samples`, deletes Selector and delay rows whose
-/// group or node was missing at this tick and the previous one, delay rows
-/// older than 24 h and, with `store_dns`, expired DNS rows, then runs
-/// `incremental_vacuum`. The two-tick rule keeps rows across a config that
-/// briefly drops and restores a group, node or subscription.
-pub(super) fn maintenance_tick(
-    state: &StateDb,
-    db: Option<&CacheDb>,
-    live: &Live,
-    samples: Vec<(String, u64, u64)>,
-    missing: &mut Missing,
-    owners: TickOwners,
-    now: u64,
-) {
-    if owners.store_subscribe
-        && let Err(error) = crate::subscription::prune_bodies(state, &mut missing.bodies)
-    {
-        warn!(%error, "state db subscription body maintenance failed");
-    }
-    let Some(db) = db else {
-        return;
-    };
-    db.save_delay_samples(samples);
-    let stale = |rows: Result<Vec<String>, _>,
-                 present: &HashSet<String>,
-                 previous: &mut HashSet<String>| {
-        let current: HashSet<String> = match rows {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|key| !present.contains(key))
-                .collect(),
-            Err(error) => {
-                warn!(%error, "state db maintenance read failed");
-                HashSet::new()
-            }
-        };
-        let expired = current.intersection(previous).cloned().collect();
-        *previous = current;
-        expired
-    };
-    let work = Maintenance {
-        groups: stale(
-            db.selector_groups(),
-            &live.selector_groups,
-            &mut missing.groups,
-        ),
-        nodes: stale(db.delay_nodes(), &live.nodes, &mut missing.nodes),
-        delay_cutoff: now.saturating_sub(DELAY_SAMPLE_MAX_AGE_SECS),
-        dns_expired_at: owners.store_dns.then_some(now),
-    };
-    if let Err(error) = db.maintain(work) {
-        warn!(%error, "state db maintenance failed");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::tests::support::{canonical_socks5, control_plane};
     use honk_outbound::alive::{IpVersion, ProbeDomain};
-
-    #[test]
-    fn a_dropped_group_and_node_keep_their_rows_for_one_tick() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = Arc::new(StateDb::open(directory.path()).unwrap());
-        let db = CacheDb::open(Arc::clone(&state)).unwrap();
-        let now = 1_700_000_000;
-        let member = honk_outbound::group::SelectorMember::Group("m".into());
-        for group in ["kept", "dropped"] {
-            db.save_network_selector(group, honk_outbound::group::SelectionNetwork::Tcp, &member);
-        }
-        db.save_delay_samples(vec![
-            ("kept-node".into(), 5, now),
-            ("dropped-node".into(), 5, now),
-        ]);
-        db.write_dns(vec![
-            ("expired".into(), now - 1, vec![0]),
-            ("fresh".into(), now + 60, vec![0]),
-        ])
-        .unwrap();
-        db.maintain(Maintenance::default()).unwrap();
-        let live = Live {
-            selector_groups: HashSet::from(["kept".to_owned()]),
-            nodes: HashSet::from(["kept-node".to_owned()]),
-        };
-        let rows = |db: &CacheDb| {
-            let mut groups = db.selector_groups().unwrap();
-            let mut nodes = db.delay_nodes().unwrap();
-            groups.sort();
-            nodes.sort();
-            let dns: Vec<String> = db
-                .load_dns()
-                .unwrap()
-                .into_iter()
-                .map(|row| row.0)
-                .collect();
-            (groups, nodes, dns)
-        };
-        let mut missing = Missing::default();
-        let owners = TickOwners {
-            store_dns: true,
-            store_subscribe: false,
-        };
-
-        maintenance_tick(
-            &state,
-            Some(&db),
-            &live,
-            Vec::new(),
-            &mut missing,
-            owners,
-            now,
-        );
-        assert_eq!(
-            rows(&db),
-            (
-                vec!["dropped".to_owned(), "kept".to_owned()],
-                vec!["dropped-node".to_owned(), "kept-node".to_owned()],
-                vec!["fresh".to_owned()],
-            )
-        );
-        maintenance_tick(
-            &state,
-            Some(&db),
-            &live,
-            Vec::new(),
-            &mut missing,
-            owners,
-            now,
-        );
-        assert_eq!(
-            rows(&db),
-            (
-                vec!["kept".to_owned()],
-                vec!["kept-node".to_owned()],
-                vec!["fresh".to_owned()],
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn a_disabled_subscription_keeps_its_body_for_one_tick() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = Arc::new(StateDb::open(directory.path()).unwrap());
-        let store = crate::subscription::SubscriptionStore::new(Arc::clone(&state));
-        let subscription = |name: &str| honk_config::subscription::Subscription {
-            url: format!("https://example.invalid/{name}"),
-            ..Default::default()
-        };
-        let (kept, dropped) = (subscription("kept"), subscription("dropped"));
-        for sub in [&kept, &dropped] {
-            store.store_content(sub, "body".into()).await.unwrap();
-        }
-        store.set_enabled([&kept]);
-        let live = Live {
-            selector_groups: HashSet::new(),
-            nodes: HashSet::new(),
-        };
-        let owners = TickOwners {
-            store_dns: false,
-            store_subscribe: true,
-        };
-        let mut missing = Missing::default();
-        let bodies = || -> i64 {
-            state
-                .strict()
-                .query_row("SELECT count(*) FROM subscription_body", [], |row| {
-                    row.get(0)
-                })
-                .unwrap()
-        };
-        maintenance_tick(&state, None, &live, Vec::new(), &mut missing, owners, 0);
-        assert_eq!(bodies(), 2);
-        maintenance_tick(&state, None, &live, Vec::new(), &mut missing, owners, 0);
-        let remaining: String = state
-            .strict()
-            .query_row("SELECT key FROM subscription_body", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            remaining,
-            crate::subscription::SubscriptionStore::key(&kept)
-        );
-    }
 
     #[tokio::test]
     async fn a_default_config_keeps_the_selection_across_a_restart() {

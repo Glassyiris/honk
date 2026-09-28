@@ -9,7 +9,6 @@ use honk_config::{
 use honk_outbound::group::{GroupManager, GroupMember, SelectionNetwork};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub(crate) struct CatalogIdentity {
@@ -48,7 +47,7 @@ impl Catalog {
     }
 
     fn prepare_identity(config: &Config, identity: &Arc<CatalogIdentity>) -> Arc<CatalogIdentity> {
-        let effective = GroupManager::native_effective_groups(&config.groups);
+        let effective = GroupManager::effective_groups(&config.groups);
         let revision = config_revision(config, &effective);
         if identity.revision == revision {
             return Arc::clone(identity);
@@ -69,16 +68,6 @@ impl Catalog {
 
     pub(crate) fn snapshot(&self) -> Arc<CatalogIdentity> {
         self.identity.read().clone()
-    }
-}
-
-pub(crate) fn policy(policy: GroupPolicy) -> &'static str {
-    match policy {
-        GroupPolicy::Selector => "selector",
-        GroupPolicy::URLTest => "urltest",
-        GroupPolicy::LoadBalance => "loadbalance",
-        GroupPolicy::Fallback => "fallback",
-        GroupPolicy::Score => "score",
     }
 }
 
@@ -112,10 +101,7 @@ pub(crate) fn tolerance(group: &Group) -> Option<u64> {
 }
 
 pub(crate) fn revision_for(config: &Config) -> String {
-    config_revision(
-        config,
-        &GroupManager::native_effective_groups(&config.groups),
-    )
+    config_revision(config, &GroupManager::effective_groups(&config.groups))
 }
 
 fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
@@ -142,7 +128,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
             json!([
                 group.name,
                 group.icon,
-                policy(group.policy),
+                group.policy.as_str(),
                 nodes,
                 children,
                 filters,
@@ -156,8 +142,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
             ])
         })
         .collect();
-    let digest = Sha256::digest(serde_json::to_vec(&canonical).expect("catalog values serialize"));
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::configuration::digest(&serde_json::to_vec(&canonical).expect("catalog values serialize"))
 }
 
 pub(crate) fn member_id(member: GroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
@@ -173,7 +158,7 @@ pub(crate) fn runtime_selection(
     identity: &CatalogIdentity,
     group_name: &str,
 ) -> Value {
-    let group = manager.native_group(group_name);
+    let group = manager.group(group_name);
     let [tcp, udp] = [SelectionNetwork::Tcp, SelectionNetwork::Udp].map(|network| {
         group.map_or(Value::Null, |group| {
             selection(manager, group, network, identity)
@@ -188,7 +173,7 @@ pub(crate) fn selection(
     network: SelectionNetwork,
     identity: &CatalogIdentity,
 ) -> Value {
-    let Some(selection) = manager.native_selection(&group.name, network) else {
+    let Some(selection) = manager.peek_selection(&group.name, network) else {
         return Value::Null;
     };
     let Some(member_id) = member_id(selection.member, identity) else {

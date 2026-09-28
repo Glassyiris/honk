@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 use catalog::{Catalog, CatalogIdentity};
 use flows::FlowStore;
 
+/// Largest integer a JSON reader can hold exactly (2^53 - 1).
+pub(crate) const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
+
 /// Where recorded evidence announces itself to readers.
 pub(crate) trait Events: Send + Sync {
     fn publish(&self, kind: &'static str, data: Value, flow_id: Option<&str>);

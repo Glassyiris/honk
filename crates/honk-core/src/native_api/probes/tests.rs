@@ -113,7 +113,7 @@ async fn raw_probe_keeps_family_and_typed_health_out_of_http_ranking() {
     assert_eq!(result["result"]["results"][0]["warmth"], "cold");
     assert_eq!(result["result"]["results"][1]["state"], "unknown");
     assert_eq!(result["result"]["results"][1]["health_updated"], false);
-    let samples = state.alive_set.native_observations(id);
+    let samples = state.alive_set.health_observations(id);
     assert!(
         samples
             .iter()
@@ -531,7 +531,7 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
     assert!(
         state
             .alive_set
-            .native_observations(honk_config::config::DIRECT_NODE_ID)
+            .health_observations(honk_config::config::DIRECT_NODE_ID)
             .is_empty()
     );
 }
@@ -686,7 +686,7 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
     );
     let samples = state
         .alive_set
-        .native_observations(honk_config::config::DIRECT_NODE_ID);
+        .health_observations(honk_config::config::DIRECT_NODE_ID);
     for transport in [HealthTransport::Tcp, HealthTransport::Udp] {
         assert!(samples.iter().any(|sample| sample.transport == transport
             && sample.purpose == HealthPurpose::Dns
@@ -785,8 +785,8 @@ fn restricted_addresses_require_cidr_even_with_allowed_ports() {
     let policy = Policy::new(&config);
     assert!(!policy.address("::ffff:127.0.0.1".parse().unwrap()));
     assert!(!policy.address("169.254.169.254".parse().unwrap()));
-    assert!(policy.port(Kind::Http, 8080, false));
-    assert!(!policy.port(Kind::Dns, 443, false));
+    assert!(policy.port(8080, Kind::Http.default_port(false)));
+    assert!(!policy.port(443, Kind::Dns.default_port(false)));
     config.probe_allowed_cidrs = vec!["127.0.0.0/8".into()];
     assert!(Policy::new(&config).address("::ffff:127.0.0.1".parse().unwrap()));
 }
@@ -991,7 +991,7 @@ async fn ipv6_raw_probe_dials_the_requested_family_without_ipv4_fallback() {
     assert!(
         state
             .alive_set
-            .native_observations(id)
+            .health_observations(id)
             .iter()
             .all(|sample| sample.ip_version == IpVersion::V6)
     );

@@ -6,7 +6,6 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "flow-observation")]
 use std::sync::Arc;
 
-use serde::Serialize;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,7 +230,7 @@ pub enum FlowEvent {
     Gap(&'static str),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct DnsLookup {
     pub lookup_id: Uuid,
     pub parent_lookup_id: Option<Uuid>,

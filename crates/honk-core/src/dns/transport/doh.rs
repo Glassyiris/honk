@@ -345,7 +345,11 @@ mod tests {
                     .unwrap();
                 session.driver.shutdown(Duration::ZERO).await;
             }
-            let flow = Arc::new(store.begin("udp", "127.0.0.1:31000".parse().unwrap(), address));
+            let flow = Arc::new(
+                store
+                    .begin("udp", "127.0.0.1:31000".parse().unwrap(), address)
+                    .unwrap(),
+            );
             let observer = flow.observer(11, None, "intercepted_query").unwrap();
             let query = build_dns_query(name, 1);
             let response = tokio::time::timeout(

@@ -856,11 +856,16 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
     let fixture = Fixture::new(Access::Metadata, false).await;
     let state = fixture.state.upgrade().unwrap();
     state.observation.attach_for_test();
-    let flow = state.observation.core.flows.begin(
-        "tcp",
-        "192.0.2.1:31000".parse().unwrap(),
-        "198.51.100.1:443".parse().unwrap(),
-    );
+    let flow = state
+        .observation
+        .core
+        .flows
+        .begin(
+            "tcp",
+            "192.0.2.1:31000".parse().unwrap(),
+            "198.51.100.1:443".parse().unwrap(),
+        )
+        .unwrap();
     let rule_id = format!("{}:1:rule:0", state.instance_id);
     flow.routed(
         "group/name@host",

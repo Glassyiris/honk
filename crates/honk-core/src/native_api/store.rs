@@ -8,11 +8,11 @@ use std::sync::Arc;
 use honk_config::Config;
 use honk_config::diagnostic::DetailedDiagnostic;
 use honk_config::error::DetailedConfigError;
-use honk_config::parser::{LoadedConfig, SourceSnapshot};
+use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 
 use super::ApiError;
 use super::config_write::{CreatedFile, SourceFile, WriteError};
-use crate::configuration::{MAX_SOURCE_BYTES, limits};
+use crate::configuration::MAX_SOURCE_BYTES;
 
 pub(crate) mod db;
 pub(crate) mod startup;
@@ -35,14 +35,6 @@ impl Pin {
         }
     }
 
-    /// The pinned file, for alias checks against other open files.
-    pub(crate) fn file(&self) -> Option<&SourceFile> {
-        match self {
-            Self::File(file) => Some(file),
-            Self::Revision(..) => None,
-        }
-    }
-
     pub(crate) fn recheck(&self) -> Result<(), WriteError> {
         match self {
             Self::File(file) => file.recheck(),
@@ -60,8 +52,7 @@ impl Pin {
     ) -> Result<Committed, WriteError> {
         match self {
             Self::File(file) => {
-                let expected = file.sha256();
-                file.replace(&expected, content, before)?;
+                file.replace(content, before)?;
                 Ok(Committed::Written)
             }
             Self::Revision(db, pin) => db
@@ -129,9 +120,12 @@ impl SourceStore {
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<LoadedConfig, DetailedConfigError> {
         match self {
-            Self::File(entry) => {
-                Config::from_dae_file_with_sources(entry, overlay, limits(), diagnostics)
-            }
+            Self::File(entry) => Config::from_dae_file_with_sources(
+                entry,
+                overlay,
+                SourceLimits::DEFAULT,
+                diagnostics,
+            ),
             Self::Db(db) => db.load(overlay, diagnostics),
         }
     }

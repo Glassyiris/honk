@@ -23,7 +23,7 @@ use honk_config::{
     Config,
     diagnostic::{DetailedDiagnostic, Severity},
     experimental::NativeApiConfig,
-    parser::{SourceSnapshot, cursor::Document, lexer::Source},
+    parser::{SourceLimits, SourceSnapshot, cursor::Document, lexer::Source},
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
@@ -36,8 +36,7 @@ use super::{
     ApiError, ErrorCode, NativeState, body, error, parse_query, timestamp, types::RequestId,
 };
 use crate::configuration::{
-    Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate, limits,
-    same_dependencies,
+    Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate,
 };
 
 /// Shorter secrets are not masked: a one-byte value would erase every
@@ -116,18 +115,22 @@ impl ListenerSecrets {
         Self { values }
     }
 
+    pub(crate) fn empty() -> Self {
+        Self { values: Vec::new() }
+    }
+
     pub(crate) fn from_config(config: &Config) -> Self {
         Self::new(&[], &config.experimental.native_api.secret)
-            .with_clash(&config.experimental.clash_api.secret)
+            .with_secret(&config.experimental.clash_api.secret)
     }
 
     /// Adds both effective secrets the configuration db holds.
-    pub(crate) fn with_all(self, secrets: &super::store::db::ListenerSecrets) -> Self {
-        self.with_clash(&secrets.native_api)
-            .with_clash(&secrets.clash_api)
+    pub(crate) fn with_all(self, secrets: &super::store::db::StoredSecrets) -> Self {
+        self.with_secret(&secrets.native_api)
+            .with_secret(&secrets.clash_api)
     }
 
-    pub(crate) fn with_clash(mut self, secret: &str) -> Self {
+    pub(crate) fn with_secret(mut self, secret: &str) -> Self {
         if secret.len() >= MIN_MASKED_SECRET && !self.values.iter().any(|value| value == secret) {
             self.values.push(secret.to_owned());
         }
@@ -275,6 +278,8 @@ fn source_path(accepted: &Accepted, index: usize) -> &Path {
 
 pub(crate) struct ConfigService {
     settings: NativeApiConfig,
+    /// Restart-required like every listener secret, so the startup value masks every response.
+    clash_secret: String,
     instance_id: String,
     operations: Arc<OperationStore>,
     pub(crate) sources: Arc<AcceptedSources>,
@@ -342,11 +347,13 @@ enum Work {
 impl ConfigService {
     pub(crate) fn new(
         settings: NativeApiConfig,
+        clash_secret: String,
         instance_id: String,
         operations: Arc<OperationStore>,
     ) -> Self {
         Self {
             settings,
+            clash_secret,
             instance_id,
             operations,
             sources: Arc::new(AcceptedSources::default()),
@@ -439,7 +446,6 @@ impl ConfigService {
         group_manager: honk_outbound::group::SharedGroupManager,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     ) -> Result<super::management::Completion, ApiError> {
-        let deleting = mutation.deleting();
         let (response, wait) = oneshot::channel();
         self.enqueue(Work::Manage {
             mutation,
@@ -447,8 +453,7 @@ impl ConfigService {
             group_manager,
             alive_set,
             response,
-        })
-        .map_err(|error| error.for_management(deleting))?;
+        })?;
         wait.await.map_err(|_| {
             super::management::activation_error("coordinator_stopped", None, None, None)
         })?
@@ -463,9 +468,6 @@ impl ConfigService {
             plan: Box::new(plan),
             reservation,
         })
-    }
-    pub(crate) fn content_enabled(&self) -> bool {
-        self.sources.available()
     }
     pub(crate) fn running(&self) -> bool {
         self.sources.available() && self.sender.lock().is_some()
@@ -486,7 +488,9 @@ impl ConfigService {
     /// The secret set for `accepted`, rebuilt only when its sources are a new `SourceUpdate`.
     pub(crate) fn secrets(&self, accepted: Option<&Accepted>) -> Arc<ListenerSecrets> {
         let Some(accepted) = accepted else {
-            return Arc::new(ListenerSecrets::new(&[], &self.settings.secret));
+            return Arc::new(
+                ListenerSecrets::new(&[], &self.settings.secret).with_secret(&self.clash_secret),
+            );
         };
         let mut cached = self.secrets.lock();
         if let Some((update, secrets)) = cached.as_ref()
@@ -494,7 +498,8 @@ impl ConfigService {
         {
             return Arc::clone(secrets);
         }
-        let mut secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let mut secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret)
+            .with_secret(&self.clash_secret);
         // Db sources are stripped, so the stored values are the only record of them.
         if let Some(SourceStore::Db(database)) = &*self.store.read() {
             secrets = secrets.with_all(&database.listener_secrets());
@@ -528,8 +533,7 @@ impl ConfigService {
     }
 
     pub(crate) fn group_writable(&self, name: &str) -> bool {
-        self.writable()
-            && !self.store_blocked()
+        self.editable()
             && self
                 .sources
                 .accepted
@@ -645,32 +649,19 @@ impl ConfigService {
         )
     }
 
+    /// Only validation runs while the engine is not running.
     fn check_phase(&self, work: &Work) -> Result<(), ApiError> {
-        use crate::control::EnginePhase;
-        if matches!(work, Work::Validate { .. }) {
-            return Ok(());
-        }
-        let phase = self.engine_phase();
-        if phase == Some(EnginePhase::Running) {
+        if matches!(work, Work::Validate { .. })
+            || self.engine_phase() == Some(crate::control::EnginePhase::Running)
+        {
             return Ok(());
         }
         Err(unavailable())
     }
 
+    /// A dropped `Work` drops its reservation, which rejects the operation as unavailable.
     fn enqueue(&self, work: Work) -> Result<(), ApiError> {
-        if let Err(error) = self.check_phase(&work) {
-            match &work {
-                Work::Replace { reservation, .. }
-                | Work::Create { reservation, .. }
-                | Work::GeoUpdate { reservation, .. }
-                | Work::GroupPatch { reservation, .. }
-                | Work::Reload { reservation } => {
-                    self.operations.reject(&reservation.id, error.clone());
-                }
-                _ => {}
-            }
-            return Err(error);
-        }
+        self.check_phase(&work)?;
         self.sender
             .lock()
             .as_ref()
@@ -682,6 +673,31 @@ impl ConfigService {
     pub(crate) fn request_sighup(&self) -> Result<(), ApiError> {
         self.enqueue(Work::Sighup)
     }
+}
+
+/// Reserves the operation and queues `work` for a fresh reservation; a replay awaits the original.
+async fn admit(
+    state: &NativeState,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    bytes: &[u8],
+    work: impl FnOnce(Reservation) -> Work,
+) -> Result<Response, ApiError> {
+    let service = &state.observation.configuration;
+    let reservation = service.operations.reserve(
+        state.principal(),
+        method,
+        path,
+        key,
+        bytes,
+        super::operations::OperationKind::Reload,
+    )?;
+    let admission = reservation.admission();
+    if reservation.fresh {
+        service.enqueue(work(reservation))?;
+    }
+    Ok(admission.await?.into_response())
 }
 
 fn same_source_documents(left: &[SourceSnapshot], right: &[SourceSnapshot]) -> bool {

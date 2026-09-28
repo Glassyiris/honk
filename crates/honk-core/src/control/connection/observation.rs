@@ -77,22 +77,7 @@ impl RouteObservation {
             }),
             evaluation_id: uuid::Uuid::new_v4().to_string(),
             plane: "userspace",
-            input: Some(RouteInput {
-                network: input.protocol,
-                src_ip: input.src_ip,
-                src_port: input.src_port,
-                dst_ip: input.dst_ip,
-                dst_port: input.dst_port,
-                domain: input.domain.clone(),
-                pname: input.process_name.clone(),
-                src_mac: input.mac.clone(),
-                dscp: input.dscp,
-                mark: (),
-                ingress: None,
-                domain_rule_ids: None,
-                domain_fact_bitmap: None,
-                domain_fact_state: None,
-            }),
+            input: Some(RouteInput::from(input)),
             rules,
             truncated,
         }
@@ -137,9 +122,9 @@ impl ConnectionObservation {
         destination: SocketAddr,
     ) -> Self {
         Self {
-            recorded: native.and_then(|native| {
-                let flow = native.flows.begin(network, source, destination);
-                (!flow.id().is_empty()).then(|| RecordedConnection {
+            recorded: native
+                .and_then(|native| native.flows.begin(network, source, destination))
+                .map(|flow| RecordedConnection {
                     flow: Arc::new(flow),
                     network,
                     source,
@@ -152,8 +137,7 @@ impl ConnectionObservation {
                     effective_outbound: None,
                     dial_mode_generation: None,
                     selection: None,
-                })
-            }),
+                }),
         }
     }
 
@@ -192,10 +176,7 @@ impl ConnectionObservation {
             record.flow.mark_gap("not_instrumented");
             return;
         };
-        selection.health_family = Some(match family {
-            IpVersion::V4 => "ipv4",
-            IpVersion::V6 => "ipv6",
-        });
+        selection.health_family = Some(crate::observe::flows::producer::ip_family(family));
         let Some(observation) = observation else {
             return;
         };
@@ -885,20 +866,12 @@ fn selection_path(
                         .map(|id| (id.clone(), name.clone()))
                 })
                 .unwrap_or_else(|| (node.id.to_string(), node.name.clone()));
-            let compatible = |row: &&Selection| {
-                &row.group_id == group_id
-                    && row.health_family == selection.health_family
-                    && (row.member_id.is_none()
-                        || row.member_id.as_deref() == Some(next.0.as_str()))
-            };
-            if let Some(captured) = selection
-                .decisions
-                .iter()
-                .rev()
-                .filter(compatible)
-                .find(|row| row.applied == Some(true))
-                .or_else(|| selection.decisions.iter().rev().find(compatible))
-            {
+            if let Some(captured) = crate::observe::flows::producer::captured_selection(
+                &selection.decisions,
+                group_id,
+                selection.health_family,
+                &next.0,
+            ) {
                 let mut captured = captured.clone();
                 captured.member_id = Some(next.0);
                 captured.member_name = Some(next.1);
@@ -910,13 +883,7 @@ fn selection_path(
                 .iter()
                 .rev()
                 .find(|group| &group.name == name)?;
-            let policy = match group.policy {
-                honk_config::group::GroupPolicy::Selector => "selector",
-                honk_config::group::GroupPolicy::URLTest => "urltest",
-                honk_config::group::GroupPolicy::LoadBalance => "loadbalance",
-                honk_config::group::GroupPolicy::Fallback => "fallback",
-                honk_config::group::GroupPolicy::Score => "score",
-            };
+            let policy = group.policy.as_str();
             Some(Selection {
                 group_id: group_id.clone(),
                 member_id: Some(next.0),

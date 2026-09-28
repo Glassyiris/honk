@@ -260,7 +260,7 @@ impl ControlPlane {
             cache_db: None,
             mode_db: None,
             state_db: None,
-            state_tick: cache::StateTick::default(),
+            state_tick: lifecycle::OwnedTasks::default(),
             degradations,
             quic_score_target: None,
             outbound_id_map,
@@ -295,7 +295,6 @@ impl ControlPlane {
             native_owner: None,
             #[cfg(feature = "native-api")]
             subscriptions: None,
-            #[cfg(feature = "native-api")]
             shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "clash-api")]
             ui_download: Arc::new(tokio::sync::Mutex::new(None)),
@@ -371,7 +370,7 @@ impl ControlPlane {
         native: Arc<crate::observe::Observation>,
         owner: Arc<dyn crate::observe::Owner>,
     ) {
-        self.alive_set.enable_native_observations();
+        self.alive_set.enable_health_history();
         install_url_member_resolver(
             &self.alive_set,
             self.group_manager.clone(),
@@ -428,7 +427,7 @@ fn install_url_member_resolver(
                 .get(group)
                 .and_then(|id| uuid::Uuid::parse_str(id).ok());
             return manager
-                .native_delay_test_members(group)
+                .delay_test_targets(group)
                 .into_iter()
                 .map(|(member, node)| {
                     let (tag, member_id) = match member {
@@ -447,7 +446,7 @@ fn install_url_member_resolver(
                         tag,
                         leaf: node.id,
                         native: group_id.zip(member_id).map(|(group_id, member_id)| {
-                            honk_outbound::alive::NativeGroupProbeContext {
+                            honk_outbound::alive::GroupProbeContext {
                                 group_id,
                                 member_id,
                             }

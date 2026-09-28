@@ -44,12 +44,12 @@ fn sources(entry: &Path, content: &str) -> Vec<SourceSnapshot> {
 fn initialized(fixture: &Fixture) -> DbStore {
     let store = DbStore::open_in(&fixture.data_dir, &fixture.entry).unwrap();
     let main = sources(&fixture.entry, MAIN);
-    let secrets = ListenerSecrets {
+    let secrets = StoredSecrets {
         native_api: "native-token".into(),
         clash_api: String::new(),
     };
     assert_eq!(
-        store.initialize(&main, &MaskSet::new(&[], ""), &secrets, "startup"),
+        store.initialize(&main, &ListenerSecrets::empty(), &secrets, "startup"),
         Ok(1)
     );
     store

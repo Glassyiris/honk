@@ -18,7 +18,7 @@ pub(crate) struct NativeObservation {
     pub(crate) dns: Arc<super::dns::DnsApi>,
     pub(crate) probes: Arc<super::probes::ProbeService>,
     pub(crate) logs: Arc<super::logs::LogStore>,
-    pub(crate) trace: super::routing::TraceState,
+    pub(crate) trace_rate: super::security::RequestRate,
     pub(crate) settings: super::settings::Settings,
     pub(crate) providers: super::providers::ProviderApi,
     pub(crate) degradations: Arc<crate::degradations::Degradations>,
@@ -65,6 +65,7 @@ impl NativeObservation {
         ));
         let configuration = Arc::new(super::config::ConfigService::new(
             config.experimental.native_api.clone(),
+            config.experimental.clash_api.secret.clone(),
             instance_id.clone(),
             Arc::clone(&operations),
         ));
@@ -110,7 +111,7 @@ impl NativeObservation {
             dns,
             probes,
             logs,
-            trace: super::routing::TraceState::new(),
+            trace_rate: super::security::RequestRate::new(),
             settings: super::settings::Settings::new(config),
             providers: super::providers::ProviderApi::new(),
             degradations,

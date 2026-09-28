@@ -42,7 +42,7 @@ pub(super) async fn execute(
             "unknown"
         };
         let observed_at = outcome.observed_at;
-        let observation = NativeHealthObservation {
+        let observation = HealthObservation {
             transport: if candidate.transport == Transport::Tcp {
                 HealthTransport::Tcp
             } else {
@@ -64,7 +64,6 @@ pub(super) async fn execute(
                 "warm" => HealthWarmth::Warm,
                 _ => HealthWarmth::Unknown,
             },
-            sample_source: "probe",
             state: if sample.is_some() {
                 HealthState::Healthy
             } else {
@@ -77,7 +76,7 @@ pub(super) async fn execute(
         for &index in &candidate.rows {
             let row = &mut plan.result.results[index];
             let context = match &plan.context.spec.target {
-                Target::Group { group_id } => Some(NativeGroupProbeContext {
+                Target::Group { group_id } => Some(GroupProbeContext {
                     group_id: Uuid::parse_str(group_id).expect("catalog UUID"),
                     member_id: Uuid::parse_str(&row.member_id).expect("catalog member UUID"),
                 }),
@@ -86,7 +85,7 @@ pub(super) async fn execute(
             row.health_updated = completed
                 && state
                     .alive_set
-                    .complete_native_probe(&candidate.ticket, context, observation);
+                    .complete_probe(&candidate.ticket, context, observation);
             row.state = if sample.is_some() {
                 "healthy"
             } else if completed {
@@ -226,16 +225,20 @@ async fn attempt_wire(
     let runtime = ephemeral.runtime();
     let operation = async {
         if plan.spec.kind == Kind::Http {
-            honk_outbound::urltest::native_http_probe(
-                &runtime,
-                entry.tcp.as_ref(),
-                plan.http.as_ref().expect("HTTP plan"),
-                addr,
-                plan.spec.warmth == Warmth::Cold,
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            bounded(
                 deadline,
                 cancel.clone(),
+                honk_outbound::urltest::measure_pinned_http_probe(
+                    &runtime,
+                    entry.tcp.as_ref(),
+                    plan.http.as_ref().expect("HTTP plan"),
+                    addr,
+                    plan.spec.warmth == Warmth::Cold,
+                    timeout,
+                ),
             )
-            .await
+            .await?
         } else {
             bounded(deadline, cancel.clone(), async {
                 let connect_timeout = Duration::from_millis(plan.config.global.connect_timeout_ms)

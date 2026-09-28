@@ -126,6 +126,14 @@ pub(crate) mod flows {
         pub(crate) fn delivery(_status: &'static str, _error: Option<&'static str>) {}
 
         #[inline]
+        pub(crate) fn reply_delivery<T, E, C>(
+            _result: &Result<Result<T, E>, C>,
+            _complete: impl FnOnce(&T) -> bool,
+            _failure: &'static str,
+        ) {
+        }
+
+        #[inline]
         pub(crate) fn decision(_status: &'static str, _error: Option<&'static str>) {}
 
         #[inline]

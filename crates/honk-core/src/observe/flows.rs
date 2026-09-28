@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{Events, timestamp};
+use super::{Events, MAX_SAFE_UINT, timestamp};
 
 pub(crate) mod dns;
 pub(crate) mod kernel;
@@ -38,7 +38,6 @@ const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 /// flow under load. Departures are reported at most once per interval, with
 /// the cumulative `dropped_records`; the count itself never skips.
 const EVICTED_GAP_INTERVAL: Duration = Duration::from_secs(10);
-const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 const MAX_TEXT: usize = 512;
 const MAX_STEP_BYTES: usize = 64 * 1024;
 // Kernel dictionaries and snapshots share the recorder's fixed userspace budget.
@@ -196,23 +195,13 @@ impl FlowStore {
         network: &'static str,
         src: SocketAddr,
         dst: SocketAddr,
-    ) -> FlowGuard {
+    ) -> Option<FlowGuard> {
         if !self.recording.load(Ordering::Acquire) {
-            return FlowGuard {
-                store: Weak::new(),
-                id: String::new(),
-                replied: AtomicBool::new(false),
-                sent: AtomicBool::new(false),
-            };
+            return None;
         }
         let mut store = self.inner.lock();
         if !store.recording || !matches!(network, "tcp" | "udp") {
-            return FlowGuard {
-                store: Weak::new(),
-                id: String::new(),
-                replied: AtomicBool::new(false),
-                sent: AtomicBool::new(false),
-            };
+            return None;
         }
         let now = Instant::now();
         let id = Uuid::new_v4().to_string();
@@ -277,12 +266,12 @@ impl FlowStore {
         self.updated(&record);
         store.records.push_back(record);
         self.enforce_limit(&mut store, now);
-        FlowGuard {
+        Some(FlowGuard {
             store: Arc::downgrade(self),
             id,
             replied: AtomicBool::new(false),
             sent: AtomicBool::new(false),
-        }
+        })
     }
 
     pub(crate) fn connection_evidence(&self, flow_id: &str) -> Option<ConnectionEvidence> {
@@ -661,12 +650,7 @@ impl Record {
             "buffer_overflow" => !std::mem::replace(&mut self.overflow, true),
             "redacted" => !std::mem::replace(&mut self.redacted, true),
             reason => {
-                let flag = match reason {
-                    "started_late" => 2,
-                    "sampled" => 4,
-                    "evicted" => 8,
-                    _ => 1,
-                };
+                let flag = if reason == "started_late" { 2 } else { 1 };
                 let changed = self.missing & flag == 0;
                 self.missing |= flag;
                 changed
@@ -757,12 +741,7 @@ impl Record {
         let mut row = json!(self.summary);
         row["input"] = json!(self.input);
         let mut missing = Vec::new();
-        for (flag, reason) in [
-            (1, "not_instrumented"),
-            (2, "started_late"),
-            (4, "sampled"),
-            (8, "evicted"),
-        ] {
+        for (flag, reason) in [(1, "not_instrumented"), (2, "started_late")] {
             if self.missing & flag != 0 {
                 missing.push(reason);
             }

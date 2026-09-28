@@ -8,10 +8,7 @@ use honk_outbound::runtime::flow_observation::FlowObserver;
 use parking_lot::Mutex;
 
 use super::UdpEndpointPool;
-use crate::observe::flows::{
-    FlowGuard,
-    record::{FlowError, StepData},
-};
+use crate::observe::flows::FlowGuard;
 
 pub(in crate::control) struct NativeUdpTerminal {
     flow: Arc<FlowGuard>,
@@ -72,15 +69,7 @@ impl NativeUdpTerminal {
     }
 
     pub(super) fn packet_drop(&self, reason: &'static str) {
-        self.flow.step(
-            None,
-            StepData::Datapath {
-                plane: "userspace",
-                action: "drop",
-                reason,
-                error: None,
-            },
-        );
+        self.flow.datapath("userspace", "drop", reason, None);
     }
 
     pub(in crate::control) fn outcome(&self, state: &'static str, reason: &'static str) {
@@ -155,15 +144,7 @@ impl EndpointObservation {
 
     pub(super) fn dropped(&self, reason: &'static str, error: Option<&'static str>) {
         if let Some(flow) = &self.flow {
-            flow.step(
-                None,
-                StepData::Datapath {
-                    plane: "userspace",
-                    action: "drop",
-                    reason,
-                    error: error.map(FlowError::Code),
-                },
-            );
+            flow.datapath("userspace", "drop", reason, error);
         }
     }
 

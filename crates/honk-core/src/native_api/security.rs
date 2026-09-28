@@ -30,6 +30,9 @@ pub(super) const MAX_BODY_BYTES: usize = 65536;
 const ALLOW_HEADERS: &str =
     "Authorization, Last-Event-ID, Content-Type, If-Match, Idempotency-Key, Accept";
 
+/// Admissions per minute through one `RequestRate`, as capabilities advertise it.
+pub(crate) const REQUESTS_PER_MINUTE: u32 = 30;
+
 pub(crate) struct RequestRate(parking_lot::Mutex<(Instant, u32)>);
 
 impl RequestRate {
@@ -37,14 +40,14 @@ impl RequestRate {
         Self(parking_lot::Mutex::new((Instant::now(), 0)))
     }
 
-    pub(crate) fn admit(&self, id: &RequestId) -> Result<(), ApiError> {
+    pub(super) fn admit(&self, id: &RequestId) -> Result<(), ApiError> {
         let now = Instant::now();
         let mut window = self.0.lock();
         let elapsed = now.duration_since(window.0);
         if elapsed >= std::time::Duration::from_secs(60) {
             *window = (now, 0);
         }
-        if window.1 == 30 {
+        if window.1 == REQUESTS_PER_MINUTE {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::RateLimited,

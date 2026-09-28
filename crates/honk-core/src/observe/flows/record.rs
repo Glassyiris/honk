@@ -13,6 +13,32 @@ use serde::Serialize;
 use super::{MAX_RULE_VALUES, MAX_STEPS, display_text, safe_text};
 use crate::observe::rules::RuleEvaluation;
 
+/// Wire shape of a DNS lookup step; outbound captures the facts, the
+/// recorder owns how they serialize.
+// Serde only reads the remote type's fields; this mirror is never built.
+#[allow(dead_code)]
+#[derive(Serialize)]
+#[serde(remote = "DnsLookup")]
+struct DnsLookupWire {
+    lookup_id: uuid::Uuid,
+    parent_lookup_id: Option<uuid::Uuid>,
+    attempt_id: Option<uuid::Uuid>,
+    purpose: &'static str,
+    name: String,
+    qtype: String,
+    source: &'static str,
+    upstream_transport: Option<&'static str>,
+    carrier_transport: Option<&'static str>,
+    cache: &'static str,
+    cache_entry_id: Option<String>,
+    upstream: Option<String>,
+    route_evaluation_ids: Vec<String>,
+    status: &'static str,
+    addresses: Vec<IpAddr>,
+    selected_ip: Option<IpAddr>,
+    error: Option<&'static str>,
+}
+
 #[derive(Clone, Serialize)]
 pub(super) struct Summary {
     pub id: String,
@@ -114,6 +140,27 @@ impl RouteInput {
                 ids.capacity() * size_of::<String>()
                     + ids.iter().map(String::capacity).sum::<usize>()
             })
+    }
+}
+
+impl From<&crate::routing::ConnectionInfo> for RouteInput {
+    fn from(input: &crate::routing::ConnectionInfo) -> Self {
+        Self {
+            network: input.protocol,
+            src_ip: input.src_ip,
+            src_port: input.src_port,
+            dst_ip: input.dst_ip,
+            dst_port: input.dst_port,
+            domain: input.domain.clone(),
+            pname: input.process_name.clone(),
+            src_mac: input.mac.clone(),
+            dscp: input.dscp,
+            mark: (),
+            ingress: None,
+            domain_rule_ids: None,
+            domain_fact_bitmap: None,
+            domain_fact_state: None,
+        }
     }
 }
 
@@ -300,7 +347,7 @@ pub(crate) enum StepData {
         input: Option<EvaluationInput>,
         dns_action: Option<&'static str>,
     },
-    Dns(DnsLookup),
+    Dns(#[serde(with = "DnsLookupWire")] DnsLookup),
     Datapath {
         plane: &'static str,
         action: &'static str,

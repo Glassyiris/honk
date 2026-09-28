@@ -14,35 +14,44 @@ use super::{
     types::RequestId,
 };
 
-pub(crate) const MUTABLE_CONFIG: [&str; 7] = [
-    "policy",
-    "default_member_id",
-    "final_outbound",
-    "tolerance",
-    "idle_timeout",
-    "interrupt_connections",
-    "check_url",
+/// Patchable settings: wire field name, JSON pointer and source edit, indexed by the constants below.
+pub(super) const FIELDS: [(&str, &str, GroupField); 7] = [
+    ("policy", "/policy", GroupField::Policy),
+    (
+        "default_member_id",
+        "/config/default_member_id",
+        GroupField::Default,
+    ),
+    (
+        "final_outbound",
+        "/config/final_outbound",
+        GroupField::Final,
+    ),
+    ("tolerance", "/config/tolerance", GroupField::Tolerance),
+    (
+        "idle_timeout",
+        "/config/idle_timeout",
+        GroupField::IdleTimeout,
+    ),
+    (
+        "interrupt_connections",
+        "/config/interrupt_connections",
+        GroupField::InterruptConnections,
+    ),
+    ("check_url", "/config/check_url", GroupField::CheckUrl),
 ];
-const PATHS: [&str; 7] = [
-    "/policy",
-    "/config/default_member_id",
-    "/config/final_outbound",
-    "/config/tolerance",
-    "/config/idle_timeout",
-    "/config/interrupt_connections",
-    "/config/check_url",
-];
-const FIELDS: [GroupField; 7] = [
-    GroupField::Policy,
-    GroupField::Default,
-    GroupField::Final,
-    GroupField::Tolerance,
-    GroupField::IdleTimeout,
-    GroupField::InterruptConnections,
-    GroupField::CheckUrl,
-];
-const MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
+const POLICY: usize = 0;
+const DEFAULT: usize = 1;
+const FINAL: usize = 2;
+const TOLERANCE: usize = 3;
+const IDLE_TIMEOUT: usize = 4;
+const INTERRUPT: usize = 5;
+const CHECK_URL: usize = 6;
 const MAX_CHECK_URL_BYTES: usize = 2048;
+
+fn paths() -> [&'static str; 7] {
+    FIELDS.map(|(_, path, _)| path)
+}
 
 pub(super) struct GroupPatch {
     pub(super) id: String,
@@ -87,14 +96,14 @@ fn unsupported(message: &'static str, details: Value) -> ApiError {
 fn unsupported_value(index: usize) -> ApiError {
     unsupported(
         "Group patch value is unsupported",
-        json!({"field": MUTABLE_CONFIG[index]}),
+        json!({"field": FIELDS[index].0}),
     )
 }
 
 fn tolerance_not_urltest() -> ApiError {
     unsupported(
         "Group tolerance applies only to URLTest groups",
-        json!({"field": MUTABLE_CONFIG[3]}),
+        json!({"field": FIELDS[TOLERANCE].0}),
     )
 }
 
@@ -104,13 +113,14 @@ fn field(operation: &serde_json::Map<String, Value>, key: &'static str) -> Resul
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(invalid)?;
-    PATHS
+    let paths = paths();
+    paths
         .iter()
         .position(|candidate| *candidate == pointer)
         .ok_or_else(|| {
             unsupported(
                 "Group patch path is unsupported",
-                json!({"field": key, "allowed": PATHS}),
+                json!({"field": key, "allowed": paths}),
             )
         })
 }
@@ -118,12 +128,14 @@ fn field(operation: &serde_json::Map<String, Value>, key: &'static str) -> Resul
 fn integer(value: &Value) -> Option<u64> {
     value
         .as_u64()
-        .filter(|value| *value <= MAX_SAFE_INTEGER)
+        .filter(|value| *value <= crate::observe::MAX_SAFE_UINT)
         .or_else(|| {
             value
                 .as_f64()
                 .filter(|value| {
-                    *value >= 0.0 && *value <= MAX_SAFE_INTEGER as f64 && value.fract() == 0.0
+                    *value >= 0.0
+                        && *value <= crate::observe::MAX_SAFE_UINT as f64
+                        && value.fract() == 0.0
                 })
                 .map(|value| value as u64)
         })
@@ -132,7 +144,7 @@ fn integer(value: &Value) -> Option<u64> {
 /// The stored form of a supported value, as GET reports it.
 fn normalized(index: usize, value: &Value) -> Option<Value> {
     let valid = match index {
-        0 => value.as_object().is_some_and(|policy| {
+        POLICY => value.as_object().is_some_and(|policy| {
             policy.len() == 2
                 && policy
                     .get("kind")
@@ -142,11 +154,13 @@ fn normalized(index: usize, value: &Value) -> Option<Value> {
                             && policy.get("native").and_then(Value::as_str) == Some(kind)
                     })
         }),
-        1 | 2 => value.is_null() || value.as_str().is_some_and(|value| !value.is_empty()),
-        3 | 4 if !value.is_null() => return integer(value).map(Value::from),
-        5 => value.is_boolean(),
-        6 if !value.is_null() => return value.as_str().and_then(check_url).map(Value::from),
-        3 | 4 | 6 => true,
+        DEFAULT | FINAL => value.is_null() || value.as_str().is_some_and(|value| !value.is_empty()),
+        TOLERANCE | IDLE_TIMEOUT if !value.is_null() => return integer(value).map(Value::from),
+        INTERRUPT => value.is_boolean(),
+        CHECK_URL if !value.is_null() => {
+            return value.as_str().and_then(check_url).map(Value::from);
+        }
+        TOLERANCE | IDLE_TIMEOUT | CHECK_URL => true,
         _ => false,
     };
     valid.then(|| value.clone())
@@ -201,12 +215,12 @@ impl GroupPatch {
             // Without a policy write the group cannot become URLTest, so any
             // tolerance write fails on the policy rule whatever its value.
             let never_urltest = || {
-                initial[0]["kind"] != "urltest"
+                initial[POLICY]["kind"] != "urltest"
                     && !operations.iter().any(|operation| {
-                        operation.get("path").and_then(Value::as_str) == Some(PATHS[0])
+                        operation.get("path").and_then(Value::as_str) == Some(FIELDS[POLICY].1)
                     })
             };
-            if path == 3 && op != "test" && never_urltest() {
+            if path == TOLERANCE && op != "test" && never_urltest() {
                 tolerance_not_urltest()
             } else {
                 unsupported_value(path)
@@ -270,14 +284,14 @@ impl GroupPatch {
                 _ => return Err(invalid()),
             }
         }
-        let urltest = values[0]
+        let urltest = values[POLICY]
             .as_ref()
             .and_then(|policy| policy["kind"].as_str())
             == Some("urltest");
         if !urltest
-            && values[3]
+            && values[TOLERANCE]
                 .as_ref()
-                .is_some_and(|value| !value.is_null() && *value != initial[3])
+                .is_some_and(|value| !value.is_null() && *value != initial[TOLERANCE])
         {
             return Err(tolerance_not_urltest());
         }
@@ -288,10 +302,10 @@ impl GroupPatch {
             }
             let value = match value.as_ref().filter(|value| !value.is_null()) {
                 None => None,
-                Some(value) if index == 0 => {
+                Some(value) if index == POLICY => {
                     Some(value["kind"].as_str().ok_or_else(invalid)?.to_owned())
                 }
-                Some(value) if index == 1 => {
+                Some(value) if index == DEFAULT => {
                     let id = value.as_str().ok_or_else(invalid)?;
                     let (_, name) = self
                         .members
@@ -300,7 +314,7 @@ impl GroupPatch {
                         .ok_or_else(|| {
                             unsupported(
                                 "Group default member is not a direct member",
-                                json!({"field": MUTABLE_CONFIG[1]}),
+                                json!({"field": FIELDS[DEFAULT].0}),
                             )
                         })?;
                     // Dae defaults are names: reject identities shadowed by an earlier same-name member.
@@ -313,7 +327,7 @@ impl GroupPatch {
                     {
                         return Err(unsupported(
                             "Group default member shares its name with an earlier member",
-                            json!({"field": MUTABLE_CONFIG[1]}),
+                            json!({"field": FIELDS[DEFAULT].0}),
                         ));
                     }
                     Some(name.clone())
@@ -325,7 +339,7 @@ impl GroupPatch {
                         .unwrap_or_else(|| value.to_string()),
                 ),
             };
-            changes.push((FIELDS[index], value));
+            changes.push((FIELDS[index].2, value));
         }
         Ok(changes)
     }
@@ -409,9 +423,9 @@ pub(super) async fn patch(
                     )
                 })?;
             let manager = state.group_manager.read().clone();
-            let group = manager.native_group(name).ok_or_else(invalid)?.clone();
+            let group = manager.group(name).ok_or_else(invalid)?.clone();
             let members = manager
-                .native_members(name)
+                .group_members(name)
                 .filter_map(|member| match member {
                     GroupMember::Node(node) => Some((node.id.to_string(), node.name.clone())),
                     GroupMember::Group(group) => identity
@@ -445,12 +459,12 @@ pub(super) async fn patch(
 #[serde(deny_unknown_fields)]
 struct SelectionBody {
     member_id: String,
-    network: SelectionNetwork,
+    network: NetworkChoice,
 }
 
 #[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-enum SelectionNetwork {
+enum NetworkChoice {
     Tcp,
     Udp,
     Both,
@@ -501,9 +515,9 @@ pub(super) async fn clear_override(
 ) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["network"], id)?;
     let network = match query.get("network").map(String::as_str) {
-        None | Some("both") => SelectionNetwork::Both,
-        Some("tcp") => SelectionNetwork::Tcp,
-        Some("udp") => SelectionNetwork::Udp,
+        None | Some("both") => NetworkChoice::Both,
+        Some("tcp") => NetworkChoice::Tcp,
+        Some("udp") => NetworkChoice::Udp,
         Some(_) => return Err(super::invalid_query(id)),
     };
     state.require_running()?;
@@ -553,12 +567,12 @@ async fn apply_selection(
         })
 }
 
-impl From<SelectionNetwork> for honk_outbound::group::SelectorNetworks {
-    fn from(network: SelectionNetwork) -> Self {
+impl From<NetworkChoice> for honk_outbound::group::SelectorNetworks {
+    fn from(network: NetworkChoice) -> Self {
         match network {
-            SelectionNetwork::Tcp => Self::Tcp,
-            SelectionNetwork::Udp => Self::Udp,
-            SelectionNetwork::Both => Self::Both,
+            NetworkChoice::Tcp => Self::Tcp,
+            NetworkChoice::Udp => Self::Udp,
+            NetworkChoice::Both => Self::Both,
         }
     }
 }
@@ -625,7 +639,7 @@ mod tests {
             ("first".into(), "PRIVATE".into()),
             ("second".into(), "PRIVATE".into()),
         ];
-        let allowed = |field| json!({"field":field,"allowed":PATHS});
+        let allowed = |field| json!({"field":field,"allowed":paths()});
         for (patch, message, details) in [
             (
                 request(json!([{"op":"replace","path":"/config/PRIVATE","value":1}])),

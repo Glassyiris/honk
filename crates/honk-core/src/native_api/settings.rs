@@ -848,11 +848,15 @@ mod tests {
         assert!(!owner.settings.flow_recording());
         let first = stream(&owner, true);
         let second = stream(&owner, true);
-        let flow = owner.core.flows.begin(
-            "tcp",
-            "127.0.0.1:31000".parse().unwrap(),
-            "127.0.0.2:443".parse().unwrap(),
-        );
+        let flow = owner
+            .core
+            .flows
+            .begin(
+                "tcp",
+                "127.0.0.1:31000".parse().unwrap(),
+                "127.0.0.2:443".parse().unwrap(),
+            )
+            .unwrap();
         assert!(owner.core.flows.connection_evidence(flow.id()).is_some());
         drop(first);
         tokio::time::advance(Duration::from_secs(61)).await;

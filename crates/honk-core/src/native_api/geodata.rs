@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::destination::Policy;
 use super::operations::{OperationKind, Reservation};
-use super::probes::Policy;
 use super::{ApiError, ErrorCode, NativeState, config, parse_query, timestamp, types::RequestId};
 use crate::download_route::{self, Detour, Failed, Outbounds};
 use crate::marked_http::Deadline;

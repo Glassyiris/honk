@@ -317,14 +317,11 @@ fn same_settled_dependencies(
     accepted: &[DependencySnapshot],
     captured: &[DependencySnapshot],
 ) -> bool {
-    let settled = |dependencies: &[DependencySnapshot]| {
-        dependencies
-            .iter()
-            .filter(|dependency| !subscription_dependency(dependency))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    same_dependencies(&settled(accepted), &settled(captured))
+    let settled = |dependency: &&DependencySnapshot| !subscription_dependency(dependency);
+    accepted
+        .iter()
+        .filter(settled)
+        .eq(captured.iter().filter(settled))
 }
 
 /// `None` when every download matches its loaded file: nothing is written,
@@ -361,7 +358,7 @@ fn prepare_and_replace(
         store.dependency_root(),
         active,
         data_dir,
-        limits(),
+        SourceLimits::DEFAULT,
         &mut diagnostics,
         deferred,
         None,
@@ -438,7 +435,10 @@ fn prepare_and_replace(
         }
         if guards
             .iter()
-            .chain(source_pins.iter().filter_map(Pin::file))
+            .chain(source_pins.iter().filter_map(|pin| match pin {
+                Pin::File(file) => Some(file),
+                Pin::Revision(..) => None,
+            }))
             .chain(kept.iter().map(|asset| &asset.file))
             .any(|other| file.same_target(other))
             || assets.iter().any(|asset| asset.staged.same_target(&file))
@@ -568,24 +568,14 @@ fn prepare_and_replace(
             for pending in &assets {
                 pending.staged.recheck()?;
             }
-            let mut notices = Vec::new();
-            let loaded = store
-                .load(&HashMap::new(), &mut notices)
-                .map_err(|_| WriteError::Conflict)?;
-            if notices
-                .iter()
-                .any(|notice| notice.severity == Severity::Error)
-                || !same_source_documents(&validated.sources, &loaded.sources)
-            {
-                return Err(WriteError::Conflict);
-            }
-            let dependencies = validated
-                .recapture_dependencies(active, data_dir, limits(), deferred)
-                .map_err(|_| WriteError::Conflict)?;
-            if !same_dependencies(&validated.dependencies, &dependencies) {
-                return Err(WriteError::Conflict);
-            }
-            Ok(())
+            unchanged(
+                store,
+                &HashMap::new(),
+                &validated,
+                active,
+                data_dir,
+                deferred,
+            )
         });
         let completed = match result {
             Ok(completed) => completed,
@@ -644,7 +634,7 @@ fn prepare_and_replace(
                 geo_sources: validated.geo_sources,
             }),
             diagnostics,
-            expected_revision: Some(revision.to_owned()),
+            expected_group_revision: Some(revision.to_owned()),
             deferred_provider: None,
         },
         assets: installed,

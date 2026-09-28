@@ -73,15 +73,7 @@ pub(super) async fn serve(
         },
         full: full_detail(&values, id)?,
     };
-    let limit = values
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=1000).contains(&limit) {
-        return Err(invalid_query(id));
-    }
+    let limit = crate::native_api::pages::limit(&values, id)?;
     let api = &state.observation.dns;
     let mut snapshots = api.snapshots.lock().await;
     snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);

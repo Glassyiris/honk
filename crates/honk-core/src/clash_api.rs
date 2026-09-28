@@ -377,7 +377,7 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
             );
         };
         #[cfg(feature = "native-api")]
-        if s.datapath_flags.snapshot().native_enabled {
+        if s.datapath_flags.snapshot().is_native() {
             let Some(control) = &s.control else {
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -556,7 +556,7 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
 
 async fn get_proxies(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let config = s.config.read().await;
-    let global_selection = s.mode_state.read().global_selection.clone();
+    let global_selection = s.mode_state.read().global_selection().to_owned();
     let group_manager = s.group_manager.read().clone();
     let mut proxies = serde_json::Map::new();
 
@@ -587,7 +587,7 @@ async fn get_proxy(State(s): State<Arc<ClashState>>, Path(name): Path<String>) -
     let group_manager = s.group_manager.read().clone();
 
     if name == "GLOBAL" {
-        let global_selection = s.mode_state.read().global_selection.clone();
+        let global_selection = s.mode_state.read().global_selection().to_owned();
         return Json(build_global_proxy_info(&config, &global_selection)).into_response();
     }
 
@@ -623,7 +623,7 @@ async fn put_proxy(
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
         #[cfg(feature = "native-api")]
-        if s.datapath_flags.snapshot().native_enabled {
+        if s.datapath_flags.snapshot().is_native() {
             let Some(control) = &s.control else {
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,

@@ -331,11 +331,13 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
 /// `ech_config_path`. `ech_enabled` without configs is handled separately at
 /// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
-    load_ech_config_list_with_reader(node, |path| {
-        let path = honk_config::paths::resolve_dependency_path(path);
-        std::fs::read_to_string(&path)
-            .with_context(|| format!("node {}: read {}", node.name, path.display()))
-    })
+    load_ech_config_list_with_reader(node, |path| read_dependency(node, path))
+}
+
+fn read_dependency(node: &Node, path: &str) -> anyhow::Result<String> {
+    let path = honk_config::paths::resolve_dependency_path(path);
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("node {}: read {}", node.name, path.display()))
 }
 
 fn load_ech_config_list_with_reader(
@@ -362,11 +364,7 @@ fn load_ech_config_list_with_reader(
 /// root store. Runtime registries use this before publication; connectors are
 /// built lazily when a node first enters the active working set.
 pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
-    validate_connector_config_with_ech_reader(node, |path| {
-        let path = honk_config::paths::resolve_dependency_path(path);
-        std::fs::read_to_string(&path)
-            .with_context(|| format!("node {}: read {}", node.name, path.display()))
-    })
+    validate_connector_config_with_ech_reader(node, |path| read_dependency(node, path))
 }
 
 /// Validate the same TLS inputs using caller-authorized, captured ECH bytes.

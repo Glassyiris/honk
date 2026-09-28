@@ -231,7 +231,11 @@ mod tests {
         for (index, name) in ["cold.example", "warm.example"].into_iter().enumerate() {
             let query = build_dns_query(name, 1);
             #[cfg(feature = "native-api")]
-            let flow = Arc::new(store.begin("udp", "127.0.0.1:31000".parse().unwrap(), address));
+            let flow = Arc::new(
+                store
+                    .begin("udp", "127.0.0.1:31000".parse().unwrap(), address)
+                    .unwrap(),
+            );
             #[cfg(feature = "native-api")]
             let observer = flow.observer(13, None, "intercepted_query").unwrap();
             let exchange = client.exchange(&query, None);

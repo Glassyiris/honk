@@ -415,11 +415,13 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
         "instance".into(),
         Arc::new(EventHub::new("instance".into())),
     ));
-    let flow = store.begin(
-        "tcp",
-        (capture.input.src_ip, capture.input.src_port).into(),
-        (capture.input.dst_ip, capture.input.dst_port).into(),
-    );
+    let flow = store
+        .begin(
+            "tcp",
+            (capture.input.src_ip, capture.input.src_port).into(),
+            (capture.input.dst_ip, capture.input.dst_port).into(),
+        )
+        .unwrap();
     flow.step(
         Some(17),
         StepData::Route {

@@ -114,11 +114,15 @@ async fn fixture() -> (
 }
 
 fn observer(store: &Arc<FlowStore>) -> (Arc<FlowGuard>, FlowObserver) {
-    let flow = Arc::new(store.begin(
-        "tcp",
-        "127.0.0.1:31000".parse().unwrap(),
-        "192.0.2.17:443".parse().unwrap(),
-    ));
+    let flow = Arc::new(
+        store
+            .begin(
+                "tcp",
+                "127.0.0.1:31000".parse().unwrap(),
+                "192.0.2.17:443".parse().unwrap(),
+            )
+            .unwrap(),
+    );
     let observer = flow.observer(7, None, "dial_target").unwrap();
     (flow, observer)
 }

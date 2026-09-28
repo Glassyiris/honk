@@ -159,7 +159,7 @@ impl super::ControlPlane {
                 let catalog = self.native_catalog()?;
                 let name = native_group_name(&catalog, &group_id)?;
                 let selected = manager
-                    .native_members(&name)
+                    .group_members(&name)
                     .find_map(|member| match member {
                         honk_outbound::group::GroupMember::Node(node)
                             if node.id.to_string() == member_id =>

@@ -27,29 +27,17 @@ use crate::{
 
 use super::{
     ApiError, ErrorCode, NativeState, catalog::snapshot_unavailable, error, parse_query,
-    security::RequestRate, types::RequestId,
+    security::REQUESTS_PER_MINUTE, types::RequestId,
 };
 
 const MAX_RULES: usize = 4096;
 const MAX_STEPS: usize = 256;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) struct TraceState {
-    rate: RequestRate,
-}
-
-impl TraceState {
-    pub(crate) fn new() -> Self {
-        Self {
-            rate: RequestRate::new(),
-        }
-    }
-
-    pub(crate) fn capability(&self) -> Value {
-        json!({"available":true,"resolve_modes":["none"],"max_addresses":1,
-            "max_rule_steps":MAX_STEPS,"timeout_ms":TIMEOUT.as_millis(),
-            "per_principal_requests_per_minute":30,"global_requests_per_minute":30})
-    }
+pub(crate) fn trace_capability() -> Value {
+    json!({"available":true,"resolve_modes":["none"],"max_addresses":1,
+        "max_rule_steps":MAX_STEPS,"timeout_ms":TIMEOUT.as_millis(),
+        "per_principal_requests_per_minute":REQUESTS_PER_MINUTE,"global_requests_per_minute":REQUESTS_PER_MINUTE})
 }
 
 pub(crate) fn rules_capability() -> Value {
@@ -243,7 +231,7 @@ pub(super) async fn trace(
 ) -> Result<Response, ApiError> {
     let deadline = Instant::now() + TIMEOUT;
     parse_query(request.uri(), &[], id)?;
-    state.observation.trace.rate.admit(id)?;
+    state.observation.trace_rate.admit(id)?;
     super::config::json_type(&request)?;
     let bytes = super::body::buffered(request.into_body()).await;
     let request: TraceRequest = super::body::decode(&bytes, || invalid(id))?;

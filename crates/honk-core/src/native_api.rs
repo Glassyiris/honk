@@ -7,6 +7,7 @@ pub(crate) mod config;
 mod config_write;
 mod connections;
 mod datapath;
+mod destination;
 pub(crate) mod dns;
 pub(crate) mod events;
 pub(crate) mod flows;
@@ -18,6 +19,7 @@ mod management;
 pub(crate) mod observation;
 pub(crate) mod offline;
 pub(crate) mod operations;
+mod pages;
 pub(crate) mod probes;
 pub(crate) mod providers;
 pub(crate) mod routing;
@@ -56,9 +58,6 @@ use types::*;
 /// Process-owned handles; constructing a router never starts observers or I/O.
 pub struct NativeState {
     settings: NativeApiConfig,
-    /// Restart-required like every listener secret; read here so masking never
-    /// waits on the configuration lock.
-    clash_secret: String,
     security: security::Security,
     /// Present only in password mode: the administrator record, the live sessions and login admission.
     pub(crate) auth: Option<Arc<auth::Auth>>,
@@ -174,7 +173,6 @@ impl NativeState {
             geodata,
             ui: ui::load(&settings.ui).await?,
             settings,
-            clash_secret,
             instance_id: observation.core.instance_id.clone(),
             observation,
             alive_set: control.alive_set(),

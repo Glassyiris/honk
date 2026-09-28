@@ -5,7 +5,7 @@
 use super::*;
 
 #[cfg(feature = "flow-observation")]
-pub struct NativeGroupSelection<'a> {
+pub struct GroupSelection<'a> {
     pub member: GroupMember<'a>,
     pub leaf: Option<&'a Node>,
 }
@@ -13,7 +13,7 @@ pub struct NativeGroupSelection<'a> {
 #[cfg(feature = "flow-observation")]
 impl GroupManager {
     /// Apply the same last-definition and cycle rules as the runtime graph.
-    pub fn native_effective_groups(groups: &[Group]) -> HashMap<String, Group> {
+    pub fn effective_groups(groups: &[Group]) -> HashMap<String, Group> {
         let mut groups = groups
             .iter()
             .map(|group| (group.name.clone(), group.clone()))
@@ -22,11 +22,11 @@ impl GroupManager {
         groups
     }
 
-    pub fn native_group(&self, name: &str) -> Option<&Group> {
+    pub fn group(&self, name: &str) -> Option<&Group> {
         self.groups.get(name)
     }
 
-    pub fn native_members(&self, name: &str) -> impl Iterator<Item = GroupMember<'_>> {
+    pub fn group_members(&self, name: &str) -> impl Iterator<Item = GroupMember<'_>> {
         self.groups
             .get(name)
             .into_iter()
@@ -34,7 +34,7 @@ impl GroupManager {
     }
 
     /// Enumerate unique ordinary leaves, stopping before exceeding the request limit.
-    pub fn native_probe_leaves(&self, name: &str, limit: usize) -> Vec<&Node> {
+    pub fn probe_leaves(&self, name: &str, limit: usize) -> Vec<&Node> {
         let mut leaves: Vec<&Node> = Vec::new();
         if limit == 0 {
             return leaves;
@@ -49,11 +49,11 @@ impl GroupManager {
     }
 
     /// Bound the graph work before invoking allocation-producing policy planners.
-    pub fn native_probe_plan_within_limit(&self, name: &str, mut limit: usize) -> bool {
-        self.native_probe_graph_budget(name, &mut limit, &mut [""; MAX_GROUP_DEPTH], 0)
+    pub fn probe_plan_within_limit(&self, name: &str, mut limit: usize) -> bool {
+        self.probe_graph_budget(name, &mut limit, &mut [""; MAX_GROUP_DEPTH], 0)
     }
 
-    fn native_probe_graph_budget<'a>(
+    fn probe_graph_budget<'a>(
         &'a self,
         name: &str,
         remaining: &mut usize,
@@ -75,13 +75,13 @@ impl GroupManager {
         *remaining = next;
         visited[depth] = group.name.as_str();
         for child in &group.groups {
-            if !self.native_probe_graph_budget(child, remaining, visited, depth + 1) {
+            if !self.probe_graph_budget(child, remaining, visited, depth + 1) {
                 return false;
             }
         }
         match self.final_member(group) {
             Some(GroupMember::Group(child)) => {
-                self.native_probe_graph_budget(&child.name, remaining, visited, depth + 1)
+                self.probe_graph_budget(&child.name, remaining, visited, depth + 1)
             }
             Some(GroupMember::Node(_)) => match remaining.checked_sub(1) {
                 Some(next) => {
@@ -96,7 +96,7 @@ impl GroupManager {
 
     /// Resolve one direct member without changing selection state or falling back
     /// to an arbitrary leaf when a cold URLTest plan has several candidates.
-    pub fn native_probe_leaf<'a>(
+    pub fn probe_leaf<'a>(
         &'a self,
         member: GroupMember<'a>,
         domain: ProbeDomain,
@@ -105,7 +105,7 @@ impl GroupManager {
         let node = match member {
             GroupMember::Node(node) => node,
             GroupMember::Group(group) => {
-                if !self.native_probe_plan_within_limit(&group.name, 256) {
+                if !self.probe_plan_within_limit(&group.name, 256) {
                     return None;
                 }
                 let plan = self.peek_selection_plan_for_domain(&group.name, domain, ip);
@@ -121,38 +121,21 @@ impl GroupManager {
         .then_some(node)
     }
 
-    /// Preserve the production probe set while retaining direct member identity.
-    pub fn native_delay_test_members(&self, name: &str) -> Vec<(GroupMember<'_>, Node)> {
-        let Some(group) = self.groups.get(name) else {
-            return Vec::new();
-        };
-        self.delay_test_members(name)
-            .into_iter()
-            .filter_map(|(tag, leaf)| {
-                let member = self.members(group).find(|member| match member {
-                    GroupMember::Node(node) => node.id == leaf.id && node.name == tag,
-                    GroupMember::Group(group) => group.name == tag,
-                })?;
-                Some((member, leaf))
-            })
-            .collect()
-    }
-
     /// Observe stable choices, without marking activity or advancing policy state.
-    pub fn native_selection(
+    pub fn peek_selection(
         &self,
         name: &str,
         network: SelectionNetwork,
-    ) -> Option<NativeGroupSelection<'_>> {
-        self.native_selection_inner(self.groups.get(name)?, network, 0)
+    ) -> Option<GroupSelection<'_>> {
+        self.peek_selection_inner(self.groups.get(name)?, network, 0)
     }
 
-    fn native_selection_inner<'a>(
+    fn peek_selection_inner<'a>(
         &'a self,
         group: &'a Group,
         network: SelectionNetwork,
         depth: usize,
-    ) -> Option<NativeGroupSelection<'a>> {
+    ) -> Option<GroupSelection<'a>> {
         if depth >= MAX_GROUP_DEPTH {
             return None;
         }
@@ -176,7 +159,7 @@ impl GroupManager {
                     SelectionEffects::Peek,
                     score::selection::ScoreSelectionRules::default(),
                 )?;
-                return Some(NativeGroupSelection {
+                return Some(GroupSelection {
                     member: candidate.member(),
                     leaf: Some(candidate.node),
                 });
@@ -199,10 +182,10 @@ impl GroupManager {
         let leaf = match member {
             GroupMember::Node(node) => Some(node),
             GroupMember::Group(child) => self
-                .native_selection_inner(child, network, depth + 1)
+                .peek_selection_inner(child, network, depth + 1)
                 .and_then(|selection| selection.leaf),
         };
-        Some(NativeGroupSelection { member, leaf })
+        Some(GroupSelection { member, leaf })
     }
 }
 
@@ -574,17 +557,25 @@ impl GroupManager {
     /// order, so an explicit test can discover recovery). Members sharing
     /// a leaf appear once (first tag wins) to avoid duplicate measurement.
     pub fn delay_test_members(&self, group_name: &str) -> Vec<(String, Node)> {
+        self.delay_test_targets(group_name)
+            .into_iter()
+            .map(|(member, leaf)| (member.tag().to_owned(), leaf.clone()))
+            .collect()
+    }
+
+    /// [`Self::delay_test_members`] keeping each direct member's identity.
+    pub fn delay_test_targets(&self, group_name: &str) -> Vec<(GroupMember<'_>, &Node)> {
         let Some(group) = self.groups.get(group_name) else {
             return vec![];
         };
-        let mut out: Vec<(String, Node)> = Vec::new();
+        let mut out: Vec<(GroupMember<'_>, &Node)> = Vec::new();
         let mut seen: Vec<uuid::Uuid> = Vec::new();
         for id in &group.nodes {
             if let Some(n) = self.nodes.get(id)
                 && !seen.contains(&n.id)
             {
                 seen.push(n.id);
-                out.push((n.name.clone(), n.clone()));
+                out.push((GroupMember::Node(n), n));
             }
         }
         for tag in &group.groups {
@@ -612,7 +603,7 @@ impl GroupManager {
                 && !seen.contains(&leaf.id)
             {
                 seen.push(leaf.id);
-                out.push((tag.clone(), leaf.clone()));
+                out.push((GroupMember::Group(sub), leaf));
             }
         }
         out
@@ -733,12 +724,12 @@ mod native_probe_tests {
             ..Default::default()
         };
         let manager = GroupManager::new(&[parent, child], &nodes);
-        assert!(!manager.native_probe_plan_within_limit("parent", 256));
-        assert!(manager.native_probe_plan_within_limit("parent", 258));
-        let member = GroupMember::Group(manager.native_group("large").unwrap());
+        assert!(!manager.probe_plan_within_limit("parent", 256));
+        assert!(manager.probe_plan_within_limit("parent", 258));
+        let member = GroupMember::Group(manager.group("large").unwrap());
         assert!(
             manager
-                .native_probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
+                .probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
                 .is_none()
         );
     }
@@ -761,7 +752,7 @@ mod native_probe_tests {
         let manager = GroupManager::new(&[parent, child], &nodes);
         let ids = |limit| {
             manager
-                .native_probe_leaves("parent", limit)
+                .probe_leaves("parent", limit)
                 .into_iter()
                 .map(|node| node.id)
                 .collect::<Vec<_>>()
@@ -770,7 +761,7 @@ mod native_probe_tests {
         assert_eq!(ids(1), [nodes[0].id]);
         assert_eq!(ids(2), [nodes[0].id, nodes[1].id]);
         assert_eq!(ids(65), [nodes[0].id, nodes[1].id]);
-        assert!(manager.native_probe_leaves("missing", 65).is_empty());
+        assert!(manager.probe_leaves("missing", 65).is_empty());
     }
 
     #[test]
@@ -791,10 +782,10 @@ mod native_probe_tests {
         let alive = Arc::new(AliveDialerSet::new());
         let manager = GroupManager::with_alive_set(&[parent, child], &nodes, Some(alive.clone()));
         let leaves: Vec<_> = manager
-            .native_members("parent")
+            .group_members("parent")
             .map(|member| {
                 manager
-                    .native_probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
+                    .probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
                     .unwrap()
                     .id
             })
@@ -804,15 +795,15 @@ mod native_probe_tests {
             alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V4);
             assert_eq!(
                 manager
-                    .native_probe_leaf(GroupMember::Node(&nodes[0]), domain, IpVersion::V4)
+                    .probe_leaf(GroupMember::Node(&nodes[0]), domain, IpVersion::V4)
                     .map(|node| node.id),
                 Some(nodes[0].id)
             );
         }
-        let child = GroupMember::Group(manager.native_group("child").unwrap());
+        let child = GroupMember::Group(manager.group("child").unwrap());
         assert!(
             manager
-                .native_probe_leaf(child, ProbeDomain::DataUdp, IpVersion::V4)
+                .probe_leaf(child, ProbeDomain::DataUdp, IpVersion::V4)
                 .is_none()
         );
         let tcp_only = Node {
@@ -822,12 +813,12 @@ mod native_probe_tests {
         let member = GroupMember::Node(&tcp_only);
         assert!(
             manager
-                .native_probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
+                .probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
                 .is_some()
         );
         assert!(
             manager
-                .native_probe_leaf(member, ProbeDomain::DnsUdp, IpVersion::V4)
+                .probe_leaf(member, ProbeDomain::DnsUdp, IpVersion::V4)
                 .is_none()
         );
         let direct = honk_config::Config::builtin_direct_node();
@@ -835,13 +826,13 @@ mod native_probe_tests {
         for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
             assert_eq!(
                 manager
-                    .native_probe_leaf(GroupMember::Node(&direct), domain, IpVersion::V4)
+                    .probe_leaf(GroupMember::Node(&direct), domain, IpVersion::V4)
                     .map(|node| node.id),
                 Some(direct.id)
             );
             assert!(
                 manager
-                    .native_probe_leaf(GroupMember::Node(&block), domain, IpVersion::V4)
+                    .probe_leaf(GroupMember::Node(&block), domain, IpVersion::V4)
                     .is_none()
             );
         }
@@ -859,10 +850,10 @@ mod native_probe_tests {
         let alive = Arc::new(AliveDialerSet::new());
         alive.register_urltest_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
         let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
-        let member = GroupMember::Group(manager.native_group("urltest").unwrap());
+        let member = GroupMember::Group(manager.group("urltest").unwrap());
         assert!(
             manager
-                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V6)
+                .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V6)
                 .is_none()
         );
         alive.record_probe_latency(
@@ -873,13 +864,13 @@ mod native_probe_tests {
         );
         assert_eq!(
             manager
-                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V6)
+                .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V6)
                 .map(|node| node.id),
             Some(nodes[1].id)
         );
         assert!(
             manager
-                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                 .is_none()
         );
         assert!(alive.is_urltest_group_idle("urltest"));
@@ -892,7 +883,7 @@ mod native_probe_tests {
         }
         assert_eq!(
             manager
-                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                 .map(|node| node.id),
             Some(nodes[0].id)
         );
@@ -901,7 +892,7 @@ mod native_probe_tests {
         }
         assert!(
             manager
-                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                 .is_none()
         );
     }
@@ -921,11 +912,11 @@ mod native_probe_tests {
             ..Default::default()
         };
         let manager = GroupManager::new(&[parent, child], &nodes);
-        let member = GroupMember::Group(manager.native_group("parent").unwrap());
+        let member = GroupMember::Group(manager.group("parent").unwrap());
         for _ in 0..2 {
             assert_eq!(
                 manager
-                    .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                    .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                     .map(|node| node.id),
                 Some(nodes[0].id)
             );

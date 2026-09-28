@@ -18,6 +18,10 @@ fn store_with_hub() -> (Arc<FlowStore>, Arc<EventHub>) {
 }
 
 fn begin(store: &Arc<FlowStore>, network: &'static str) -> FlowGuard {
+    try_begin(store, network).expect("recording flow")
+}
+
+fn try_begin(store: &Arc<FlowStore>, network: &'static str) -> Option<FlowGuard> {
     store.begin(
         network,
         "127.0.0.1:31000".parse().unwrap(),
@@ -143,11 +147,13 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
     assert_eq!(rules[0].conditions[1].expression, "dport(443)");
 
     let store = store();
-    let flow = store.begin(
-        "tcp",
-        (connection.src_ip, connection.src_port).into(),
-        (connection.dst_ip, connection.dst_port).into(),
-    );
+    let flow = store
+        .begin(
+            "tcp",
+            (connection.src_ip, connection.src_port).into(),
+            (connection.dst_ip, connection.dst_port).into(),
+        )
+        .unwrap();
     flow.step(
         Some(7),
         StepData::Route {
@@ -387,9 +393,7 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     );
     store.page(query.clone(), Some(&cursor)).unwrap();
     store.set_recording(false);
-    let inert = begin(&store, "tcp");
-    assert!(inert.id().is_empty());
-    assert!(!inert.first_reply());
+    assert!(try_begin(&store, "tcp").is_none());
     first.finish("closed", "late_finish");
     assert_eq!(
         store.page(query.clone(), Some(&cursor)).unwrap_err(),
@@ -601,11 +605,13 @@ fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
 #[test]
 fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
     let store = store();
-    let flow = store.begin(
-        "udp",
-        "[::1]:31000".parse().unwrap(),
-        "[2001:db8::1]:443".parse().unwrap(),
-    );
+    let flow = store
+        .begin(
+            "udp",
+            "[::1]:31000".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        )
+        .unwrap();
     flow.update_input(None, None, Some("client"), Some(42), None, Some(0), Some(0));
     let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 1);
@@ -810,15 +816,12 @@ fn room_making_evicts_ended_records_before_the_oldest_live_one() {
 }
 
 #[test]
-fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
+fn detached_begin_records_nothing_without_locking() {
     let owner =
         crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
     assert!(!owner.core.flows.recording.load(Ordering::Acquire));
     let inner = owner.core.flows.inner.lock();
-    let guard = begin(&owner.core.flows, "tcp");
-    assert!(guard.id().is_empty());
-    assert_eq!(guard.id.capacity(), 0);
-    assert!(guard.store.upgrade().is_none());
+    assert!(try_begin(&owner.core.flows, "tcp").is_none());
     assert!(inner.records.is_empty());
     assert_eq!(inner.records.capacity(), 0);
     assert_eq!(inner.record_bytes, 0);

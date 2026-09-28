@@ -23,7 +23,7 @@ use super::{
 use crate::dns::{
     DiagnosticError, DiagnosticFailure,
     forwarder::{CacheAccess, ResolveOptions},
-    outcome::{Provenance, RequestRoute},
+    outcome::RequestRoute,
     planner::UpstreamTag,
     query::IngressProfile,
 };
@@ -44,13 +44,13 @@ const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 pub(crate) struct DnsApi {
     rate: super::security::RequestRate,
     snapshots: tokio::sync::Mutex<VecDeque<cache::Snapshot>>,
-    log: Arc<log::LogStore>,
+    log: Arc<log::DnsHistory>,
     pub(crate) recorder: Arc<DnsRecorder>,
 }
 
 impl DnsApi {
     pub(crate) fn new(instance_id: String, recording: bool, flows: Weak<FlowStore>) -> Self {
-        let log = Arc::new(log::LogStore::new(instance_id.clone(), recording));
+        let log = Arc::new(log::DnsHistory::new(instance_id.clone(), recording));
         Self {
             recorder: Arc::new(DnsRecorder::new(instance_id, flows, log.clone())),
             log,
@@ -68,7 +68,7 @@ impl DnsApi {
     pub(crate) fn query_capability(&self) -> Value {
         json!({"available":true,"record_types":TYPES.iter().map(|&value| records::record_type(value)).collect::<Vec<_>>(),
             "limits":{"max_types_per_request":8,"query_timeout_ms":10000,"max_response_bytes":MAX_RESPONSE_BYTES,
-            "per_principal_requests_per_minute":30,"global_requests_per_minute":30}})
+            "per_principal_requests_per_minute":super::security::REQUESTS_PER_MINUTE,"global_requests_per_minute":super::security::REQUESTS_PER_MINUTE}})
     }
     pub(crate) fn cache_capability(&self) -> Value {
         json!({"available":true,"read":true,"delete_entry":true,"delete_name":true,"flush":true,"entry_kinds":["positive","negative"]})
@@ -77,7 +77,7 @@ impl DnsApi {
         self.log.capability()
     }
     #[cfg(test)]
-    pub(crate) fn log_for_test(&self) -> &log::LogStore {
+    pub(crate) fn log_for_test(&self) -> &log::DnsHistory {
         &self.log
     }
 }
@@ -205,10 +205,10 @@ pub(super) async fn query(
     for result in results {
         let question =
             records::question(&result.query, IngressProfile::Api).map_err(|_| unavailable(id))?;
-        let mut row = json!({"type": question.rtype, "question": question, "elapsed_ms": result.elapsed.as_millis().min(9_007_199_254_740_991) as u64});
+        let mut row = json!({"type": question.rtype, "question": question, "elapsed_ms": result.elapsed.as_millis().min(u128::from(crate::observe::MAX_SAFE_UINT)) as u64});
         match result.outcome {
             Ok(outcome) => {
-                let cached = matches!(outcome.provenance(), Provenance::Cache | Provenance::Stale);
+                let cached = outcome.is_cached();
                 row["cached"] = json!(cached);
                 row["cache_entry_id"] = json!(outcome.cache_entry_id());
                 row["upstream"] = json!(if cached {
@@ -343,7 +343,7 @@ pub(super) async fn delete_name(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
-        &json!({"matched":result.matched,"deleted":result.deleted}),
+        &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
 }
@@ -379,7 +379,7 @@ pub(super) async fn flush(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
-        &json!({"matched":result.matched,"deleted":result.deleted}),
+        &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
 }

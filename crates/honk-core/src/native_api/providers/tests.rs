@@ -11,7 +11,7 @@ use honk_config::{Config, node::Node};
 use std::{
     net::SocketAddr,
     sync::atomic::{AtomicUsize, Ordering},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -678,14 +678,16 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
 async fn provider_snapshot_over_budget_is_retryable_snapshot_unavailable() {
     let api = ProviderApi::new();
     let snapshot = Snapshot {
-        id: Uuid::new_v4(),
         instance: "instance".into(),
-        created: Instant::now(),
         rows: vec![Provider::inline(0), Provider::inline(0)],
         bytes: MAX_SNAPSHOT_BYTES + 1,
     };
     let id = RequestId("request-providers".into());
-    let response = api.page(snapshot, 1, &id).unwrap_err().into_response();
+    let response = api
+        .snapshots
+        .first(snapshot, 1, &id)
+        .unwrap_err()
+        .into_response();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()["retry-after"], "1");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)

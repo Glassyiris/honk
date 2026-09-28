@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::dns::cache::{CacheKey, OperationKind};
@@ -132,7 +131,7 @@ pub(super) enum DecodeError {
 
 pub(super) fn encode(key: &CacheKey, response: &[u8], expire_at_unix: u64) -> EncodedEntry {
     let key_bytes = encode_key(key);
-    let suffix = digest_hex(&key_bytes);
+    let suffix = crate::configuration::digest(&key_bytes);
     let mut bytes = Vec::with_capacity(17 + key_bytes.len() + response.len());
     bytes.extend_from_slice(MAGIC);
     bytes.push(VERSION);
@@ -144,7 +143,7 @@ pub(super) fn encode(key: &CacheKey, response: &[u8], expire_at_unix: u64) -> En
 
 #[cfg(any(feature = "native-api", test))]
 pub(super) fn key_suffix(key: &CacheKey) -> String {
-    digest_hex(&encode_key(key))
+    crate::configuration::digest(&encode_key(key))
 }
 
 #[cfg(any(feature = "native-api", test))]
@@ -177,7 +176,7 @@ pub(super) fn decode(
     let expire_at_unix = reader.u64()?;
     let key_bytes = reader.bytes()?;
     let response = reader.bytes()?.to_vec();
-    if !reader.is_empty() || digest_hex(key_bytes) != suffix {
+    if !reader.is_empty() || crate::configuration::digest(key_bytes) != suffix {
         return Err(DecodeError::Collision);
     }
     let (query, policy, scope, operation) = decode_key(key_bytes, active_policy)?;
@@ -316,11 +315,4 @@ fn decode_address(reader: &mut Reader<'_>) -> Result<SocketAddr, DecodeError> {
 fn put_bytes(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(&u32::try_from(value.len()).unwrap_or(u32::MAX).to_be_bytes());
     output.extend_from_slice(value);
-}
-
-fn digest_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

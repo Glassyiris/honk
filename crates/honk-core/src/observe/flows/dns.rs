@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{
     MAX_RULE_VALUES, MAX_TEXT,
-    producer::{bounded, map_selection_observation},
+    producer::{bounded, captured_selection, map_selection_observation},
     record::{DnsRequestInput, DnsResponseInput, EvaluationInput, StepData},
 };
 use crate::dns::{
@@ -296,6 +296,21 @@ pub(crate) fn delivery(status: &'static str, error: Option<&'static str>) {
         data.status = status;
         data.error = error;
     });
+}
+
+/// Records how a reply guarded by runtime retirement left: delivered when the
+/// send finished and `complete` accepts what it reports, else `failure`.
+pub(crate) fn reply_delivery<T, E, C>(
+    result: &Result<Result<T, E>, C>,
+    complete: impl FnOnce(&T) -> bool,
+    failure: &'static str,
+) {
+    let (status, error) = match result {
+        Ok(Ok(sent)) if complete(sent) => ("delivered", None),
+        Ok(_) => ("delivery_failed", Some(failure)),
+        Err(_) => ("cancelled", Some("runtime_retired")),
+    };
+    delivery(status, error);
 }
 
 pub(crate) fn decision(status: &'static str, error: Option<&'static str>) {
@@ -712,21 +727,19 @@ pub(crate) fn route_upstream(
             outbound: Some(bounded(outbound)),
             must: Some(action.must),
             mark: Some(action.mark.map_or(0, honk_outbound::proxy::DirectMark::get)),
-            input: Some(EvaluationInput::Traffic(super::record::RouteInput {
-                network: input.protocol,
-                src_ip: input.src_ip,
-                src_port: input.src_port,
-                dst_ip: input.dst_ip,
-                dst_port: input.dst_port,
-                domain: input.domain.as_deref().map(bounded),
-                pname: input.process_name.as_deref().map(bounded),
-                src_mac: input.mac.as_deref().map(bounded),
-                dscp: input.dscp,
-                mark: (),
-                ingress: None,
-                domain_rule_ids: None,
-                domain_fact_bitmap: None,
-                domain_fact_state: None,
+            input: Some(EvaluationInput::Traffic({
+                let mut traffic = super::record::RouteInput::from(input);
+                for text in [
+                    &mut traffic.domain,
+                    &mut traffic.pname,
+                    &mut traffic.src_mac,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    *text = bounded(text);
+                }
+                traffic
             })),
             dns_action: None,
         },
@@ -799,10 +812,7 @@ pub(crate) fn selection_path(
         observer.publish(FlowEvent::Gap("not_instrumented"));
         return Vec::new();
     };
-    let family = match family {
-        honk_outbound::alive::IpVersion::V4 => "ipv4",
-        honk_outbound::alive::IpVersion::V6 => "ipv6",
-    };
+    let family = Some(super::producer::ip_family(family));
     if chain.len() > MAX_RULE_VALUES {
         observer.publish(FlowEvent::Gap("buffer_overflow"));
     }
@@ -821,20 +831,7 @@ pub(crate) fn selection_path(
                         .map(|id| (id.clone(), bounded(name)))
                 })
                 .unwrap_or_else(|| (node.id.to_string(), bounded(&node.name)));
-            let matches = |selection: &&super::record::Selection| {
-                &selection.group_id == group_id
-                    && selection.health_family == Some(family)
-                    && selection
-                        .member_id
-                        .as_ref()
-                        .is_none_or(|id| id == &member_id)
-            };
-            let Some(captured) = selections
-                .iter()
-                .rev()
-                .filter(matches)
-                .find(|selection| selection.applied == Some(true))
-                .or_else(|| selections.iter().rev().find(matches))
+            let Some(captured) = captured_selection(selections, group_id, family, &member_id)
             else {
                 observer.publish(FlowEvent::Gap("not_instrumented"));
                 return None;
@@ -965,12 +962,8 @@ pub(crate) async fn outbound_scope<T, F: Future<Output = anyhow::Result<T>>>(
 }
 
 fn cancelled(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<honk_outbound::proxy::PacketRejection>(),
-            Some(honk_outbound::proxy::PacketRejection::Cancelled)
-        )
-    })
+    honk_outbound::proxy::packet_rejection(error)
+        == Some(honk_outbound::proxy::PacketRejection::Cancelled)
 }
 
 #[cfg(test)]

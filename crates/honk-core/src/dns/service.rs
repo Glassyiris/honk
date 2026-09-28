@@ -22,7 +22,7 @@ pub(crate) use name_resolution::PinnedNameResolver;
 pub struct DnsService {
     backend: Arc<DnsServiceBackend>,
     flush_generation: watch::Sender<u64>,
-    observer: crate::observe::DnsObserver,
+    pub(crate) observer: crate::observe::DnsObserver,
 }
 
 enum DnsServiceBackend {
@@ -73,20 +73,6 @@ impl DnsService {
     #[cfg(feature = "native-api")]
     pub(crate) fn observation_enabled(&self) -> bool {
         self.observer.recording()
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn observe_client(
-        &self,
-        query: &[u8],
-        ingress: IngressProfile,
-        source: Option<std::net::SocketAddr>,
-        outcome: Option<&DnsOutcome>,
-        response: &[u8],
-        elapsed: std::time::Duration,
-    ) {
-        self.observer
-            .observe_client(query, ingress, source, outcome, response, elapsed);
     }
 
     pub fn with_forwarder(forwarder: Arc<DnsForwarder>) -> Self {

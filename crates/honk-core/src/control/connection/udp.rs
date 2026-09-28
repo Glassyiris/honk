@@ -14,15 +14,7 @@ fn kernel_enforcement(
     error: Option<&'static str>,
 ) {
     if let Some(flow) = observation.flow() {
-        flow.step(
-            None,
-            crate::observe::flows::record::StepData::Datapath {
-                plane: "kernel",
-                action,
-                reason: "udp_decision",
-                error: error.map(crate::observe::flows::record::FlowError::Code),
-            },
-        );
+        flow.datapath("kernel", action, "udp_decision", error);
     }
 }
 
@@ -1075,11 +1067,7 @@ impl ControlPlaneHandle {
                             .native_enabled()
                             .then(|| outbound_name.clone()),
                         #[cfg(feature = "native-api")]
-                        native_flow_id: endpoint
-                            .native
-                            .flow()
-                            .filter(|flow| !flow.id().is_empty())
-                            .map(|flow| flow.id().to_owned()),
+                        native_flow_id: endpoint.native.flow().map(|flow| flow.id().to_owned()),
                         rule,
                         rule_payload,
                         chains: connection_chains(selection_chain, &node.name),

@@ -61,14 +61,13 @@ impl DnsController {
                 original_dst,
             ))
             .await;
-        let (status, error) = match &delivery {
-            Ok(Ok(length)) if *length == response.wire().len() => ("delivered", None),
-            Err(_) => ("cancelled", Some("runtime_retired")),
-            _ => ("delivery_failed", Some("client_send_failed")),
-        };
-        crate::observe::flows::dns::delivery(status, error);
+        crate::observe::flows::dns::reply_delivery(
+            &delivery,
+            |length| *length == response.wire().len(),
+            "client_send_failed",
+        );
         #[cfg(feature = "native-api")]
-        self.dns_service.observe_client(
+        self.dns_service.observer.observe_client(
             data,
             validated.ingress(),
             Some(client_addr),
@@ -180,7 +179,7 @@ impl DnsController {
                     },
                 );
                 #[cfg(feature = "native-api")]
-                self.dns_service.observe_client(
+                self.dns_service.observer.observe_client(
                     query,
                     IngressProfile::Tcp,
                     Some(client_addr),
@@ -202,14 +201,9 @@ impl DnsController {
             ))
             .await
             .map_err(|_| anyhow::anyhow!("DNS runtime retired during TCP response write"));
-        let (status, error) = match &result {
-            Ok(Ok(())) => ("delivered", None),
-            Err(_) => ("cancelled", Some("runtime_retired")),
-            _ => ("delivery_failed", Some("client_write_failed")),
-        };
-        crate::observe::flows::dns::delivery(status, error);
+        crate::observe::flows::dns::reply_delivery(&result, |_| true, "client_write_failed");
         #[cfg(feature = "native-api")]
-        self.dns_service.observe_client(
+        self.dns_service.observer.observe_client(
             query,
             IngressProfile::Tcp,
             Some(client_addr),

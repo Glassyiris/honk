@@ -55,19 +55,6 @@ impl DnsRecorder {
     pub(crate) fn recording(&self) -> bool {
         self.log.recording()
     }
-
-    pub(crate) fn observe_client(
-        &self,
-        query: &[u8],
-        ingress: IngressProfile,
-        source: Option<SocketAddr>,
-        outcome: Option<&DnsOutcome>,
-        response: &[u8],
-        elapsed: Duration,
-    ) {
-        self.log
-            .capture(query, ingress, source, outcome, response, elapsed);
-    }
 }
 
 /// The recorder a DNS service reports to, attached after the service is built.
@@ -97,7 +84,9 @@ impl DnsObserver {
     ) {
         let recorder = self.0.read().upgrade();
         if let Some(recorder) = recorder {
-            recorder.observe_client(query, ingress, source, outcome, response, elapsed);
+            recorder
+                .log
+                .capture(query, ingress, source, outcome, response, elapsed);
         }
     }
 

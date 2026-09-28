@@ -16,7 +16,8 @@ pub(crate) enum DiagnosticUpdate {
     Rebase {
         static_diagnostics: Vec<DetailedDiagnostic>,
         retained_provider_ids: std::collections::HashSet<Uuid>,
-        declared: Vec<Subscription>,
+        /// Each retained subscription's id and the file that declares it.
+        declared: Vec<(Uuid, SourceRef)>,
     },
     ReplaceProvider {
         id: Uuid,
@@ -51,8 +52,10 @@ impl DiagnosticBuckets {
                 self.providers
                     .retain(|(id, _)| retained_provider_ids.contains(id));
                 for (id, diagnostics) in &mut self.providers {
-                    if let Some(subscription) = declared.iter().find(|sub| sub.id == *id) {
-                        declare_provider_diagnostics(subscription, diagnostics);
+                    if let Some((_, source)) =
+                        declared.iter().find(|(declared, _)| *declared == *id)
+                    {
+                        declare_diagnostics(source, diagnostics);
                     }
                 }
             }
@@ -90,11 +93,15 @@ pub(crate) fn declare_provider_diagnostics(
     subscription: &Subscription,
     diagnostics: &mut [DetailedDiagnostic],
 ) {
-    let Some(declared) = &subscription.source else {
-        return;
-    };
+    if let Some(declared) = &subscription.source {
+        declare_diagnostics(&declared.0, diagnostics);
+    }
+}
+
+/// Point body diagnostics at `source`, clearing coordinates that count in the body.
+pub(crate) fn declare_diagnostics(source: &SourceRef, diagnostics: &mut [DetailedDiagnostic]) {
     for diagnostic in diagnostics {
-        diagnostic.source = declared.0.clone();
+        diagnostic.source = source.clone();
         diagnostic.span = None;
         diagnostic.line = None;
         diagnostic.byte_column = None;

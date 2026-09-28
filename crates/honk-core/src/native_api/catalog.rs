@@ -2,9 +2,10 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io::{self, Write},
-    time::{Duration, Instant, SystemTime},
+    ops::Range,
+    time::SystemTime,
 };
 
 use axum::{
@@ -15,106 +16,55 @@ use axum::{
 };
 use honk_config::{Config, group::Group};
 use honk_outbound::{
-    alive::{AliveDialerSet, IpVersion, NativeHealthObservation},
+    alive::{AliveDialerSet, HealthObservation},
     group::{GroupManager, GroupMember, SelectionNetwork},
 };
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::observe::{
-    catalog::{CatalogIdentity, check_url, member_id, policy, selection, tolerance},
+    catalog::{CatalogIdentity, check_url, member_id, selection, tolerance},
     timestamp,
 };
 
 use super::{
-    ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, invalid_query, parse_query,
+    ApiError, ErrorCode, NativeState,
+    config::ListenerSecrets,
+    error, invalid_query,
+    pages::{self, MAX_SNAPSHOT_BYTES, Pages, Snapshot},
+    parse_query,
     types::RequestId,
 };
 
-const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
-const MAX_SNAPSHOTS: usize = 8;
-const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PAGE_SIZE: usize = 1000;
+/// Frozen node pages behind live cursors.
+pub(crate) type NodePages = Pages<NodeSnapshot>;
 
-/// Frozen node pages behind live cursors, bounded by age, count and bytes.
-#[derive(Default)]
-pub(crate) struct NodePages(Mutex<VecDeque<NodeSnapshot>>);
-
-impl NodePages {
-    fn page(
-        &self,
-        snapshot: NodeSnapshot,
-        limit: usize,
-        id: &RequestId,
-    ) -> Result<Response, ApiError> {
-        let response = snapshot.page(0, limit);
-        if snapshot.nodes.len() > limit {
-            let mut snapshots = self.0.lock();
-            snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-            while snapshots.len() >= MAX_SNAPSHOTS
-                || snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.bytes)
-                    .sum::<usize>()
-                    + snapshot.bytes
-                    > MAX_SNAPSHOT_BYTES
-            {
-                if snapshots.pop_front().is_none() {
-                    return Err(snapshot_unavailable(id));
-                }
-            }
-            snapshots.push_back(snapshot);
-        }
-        Ok(response)
-    }
-
-    fn resume(
-        &self,
-        cursor: &str,
-        group_id: Option<&str>,
-        limit: usize,
-        id: &RequestId,
-    ) -> Result<Response, ApiError> {
-        let (snapshot_id, offset) = cursor.split_once(':').ok_or_else(|| invalid_query(id))?;
-        let snapshot_id = Uuid::parse_str(snapshot_id).map_err(|_| invalid_query(id))?;
-        let offset: usize = offset.parse().map_err(|_| invalid_query(id))?;
-        let mut snapshots = self.0.lock();
-        snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-        let snapshot = snapshots
-            .iter()
-            .find(|snapshot| snapshot.id == snapshot_id)
-            .ok_or_else(|| invalid_query(id))?;
-        if snapshot.group_id.as_deref() != group_id || offset == 0 || offset >= snapshot.nodes.len()
-        {
-            return Err(invalid_query(id));
-        }
-        Ok(snapshot.page(offset, limit))
-    }
-}
-
-struct NodeSnapshot {
-    id: Uuid,
+pub(crate) struct NodeSnapshot {
     group_id: Option<String>,
     observed_at: String,
-    created: Instant,
     nodes: Vec<Box<str>>,
     bytes: usize,
 }
 
-impl NodeSnapshot {
-    fn page(&self, offset: usize, limit: usize) -> Response {
-        let end = offset.saturating_add(limit).min(self.nodes.len());
-        let cursor = (end < self.nodes.len()).then(|| format!("{}:{end}", self.id));
+impl Snapshot for NodeSnapshot {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn page(&self, rows: Range<usize>, next_cursor: Option<String>) -> Response {
         let mut body = format!("{{\"observed_at\":\"{}\",\"nodes\":[", self.observed_at);
-        for (index, node) in self.nodes[offset..end].iter().enumerate() {
+        for (index, node) in self.nodes[rows].iter().enumerate() {
             if index != 0 {
                 body.push(',');
             }
             body.push_str(node);
         }
         body.push_str("],\"next_cursor\":");
-        body.push_str(&serde_json::to_string(&cursor).expect("cursor serializes"));
+        body.push_str(&serde_json::to_string(&next_cursor).expect("cursor serializes"));
         body.push('}');
         (
             [(header::CONTENT_TYPE, "application/json")],
@@ -150,14 +100,14 @@ impl Write for BoundedJson {
     }
 }
 
-fn health(observation: NativeHealthObservation) -> Value {
+fn health(observation: HealthObservation) -> Value {
     json!({
         "transport": observation.transport,
         "purpose": observation.purpose,
-        "ip_version": match observation.ip_version { IpVersion::V4 => "ipv4", IpVersion::V6 => "ipv6" },
+        "ip_version": crate::observe::flows::producer::ip_family(observation.ip_version),
         "warmth": observation.warmth,
         "measurement": observation.measurement,
-        "sample_source": observation.sample_source,
+        "sample_source": "probe",
         "state": observation.state,
         "latency_ms": observation.latency.map(|latency| latency.as_secs_f64() * 1000.0),
         "moving_avg_ms": null,
@@ -219,7 +169,7 @@ fn node_row<'a>(
             .or_else(|| is_inline_node(node).then_some(ProviderId::Inline("inline"))),
         group_ids,
         health: alive
-            .native_observations(node.id)
+            .health_observations(node.id)
             .into_iter()
             .map(health)
             .collect(),
@@ -240,7 +190,7 @@ pub(super) fn node_value(
         .iter()
         .filter_map(|(name, id)| {
             manager
-                .native_members(name)
+                .group_members(name)
                 .any(|member| matches!(member, GroupMember::Node(node) if node.id == node_id))
                 .then_some(id)
         })
@@ -272,7 +222,7 @@ fn node_snapshot(
     };
     let filter_nodes: Option<HashSet<_>> = filter.map(|name| {
         manager
-            .native_members(name)
+            .group_members(name)
             .filter_map(|member| match member {
                 GroupMember::Node(node) => Some(node.id),
                 GroupMember::Group(_) => None,
@@ -290,10 +240,8 @@ fn node_snapshot(
         .collect();
     nodes.sort_unstable_by_key(|node| node.id);
     let mut snapshot = NodeSnapshot {
-        id: Uuid::new_v4(),
         group_id: group_id.map(str::to_owned),
         observed_at: timestamp(SystemTime::now()),
-        created: Instant::now(),
         nodes: Vec::new(),
         bytes: 0,
     };
@@ -308,7 +256,7 @@ fn node_snapshot(
     snapshot.bytes = overhead;
     let mut membership: HashMap<Uuid, Vec<&String>> = HashMap::new();
     for (name, group_id) in &identity.groups {
-        for member in manager.native_members(name) {
+        for member in manager.group_members(name) {
             if let GroupMember::Node(node) = member {
                 membership.entry(node.id).or_default().push(group_id);
             }
@@ -340,22 +288,18 @@ pub(super) async fn nodes(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["group_id", "limit", "cursor"], id)?;
-    let limit = query
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=MAX_PAGE_SIZE).contains(&limit) || query.get("group_id").is_some_and(String::is_empty)
-    {
+    let limit = pages::limit(&query, id)?;
+    if query.get("group_id").is_some_and(String::is_empty) {
         return Err(invalid_query(id));
     }
     let group_id = query.get("group_id").map(String::as_str);
     if let Some(cursor) = query.get("cursor") {
-        return state
-            .observation
-            .node_pages
-            .resume(cursor, group_id, limit, id);
+        return state.observation.node_pages.resume(
+            cursor,
+            limit,
+            |snapshot| snapshot.group_id.as_deref() == group_id,
+            id,
+        );
     }
     let config = state.config.read().await;
     let identity = state.observation.core.catalog.snapshot();
@@ -371,7 +315,7 @@ pub(super) async fn nodes(
         &secrets,
     )?;
     drop(config);
-    state.observation.node_pages.page(snapshot, limit, id)
+    state.observation.node_pages.first(snapshot, limit, id)
 }
 
 pub(super) async fn node(
@@ -407,15 +351,9 @@ pub(super) async fn node(
         })
 }
 
-fn listener_secrets(state: &NativeState) -> ListenerSecrets {
+fn listener_secrets(state: &NativeState) -> std::sync::Arc<ListenerSecrets> {
     let accepted = state.observation.configuration.sources.accepted.read();
-    state
-        .observation
-        .configuration
-        .secrets(accepted.as_ref())
-        .as_ref()
-        .clone()
-        .with_clash(&state.clash_secret)
+    state.observation.configuration.secrets(accepted.as_ref())
 }
 
 fn group_health(
@@ -427,7 +365,7 @@ fn group_health(
     let group_id =
         Uuid::parse_str(&identity.groups[&group.name]).expect("catalog group IDs are UUIDs");
     // Accepted-epoch retention owns member/leaf associations, including explicit leaf probes.
-    let samples = alive.native_group_observations(group_id);
+    let samples = alive.group_health_observations(group_id);
     let mut result: Vec<_> = samples
         .iter()
         .map(|sample| {
@@ -440,14 +378,14 @@ fn group_health(
         .collect();
     if group.check_url.is_none() {
         let mut seen = HashSet::new();
-        for member in manager.native_members(&group.name) {
+        for member in manager.group_members(&group.name) {
             let GroupMember::Node(node) = member else {
                 continue;
             };
             if !seen.insert(node.id) {
                 continue;
             }
-            for sample in alive.native_observations(node.id) {
+            for sample in alive.health_observations(node.id) {
                 if samples.iter().any(|retained| {
                     retained.member_id == node.id
                         && retained.observation.transport == sample.transport
@@ -465,7 +403,7 @@ fn group_health(
     result
 }
 
-fn group_observation(member_id: String, node_id: Uuid, sample: NativeHealthObservation) -> Value {
+fn group_observation(member_id: String, node_id: Uuid, sample: HealthObservation) -> Value {
     let mut result = health(sample);
     result["member_id"] = json!(member_id);
     result["resolved_leaf_node_id"] = json!(node_id.to_string());
@@ -486,16 +424,16 @@ fn group_value(
     let mut result = json!({
         "id": identity.groups[&group.name], "name": group.name, "icon": group.icon,
         "config_revision": identity.revision,
-        "policy": { "kind": policy(group.policy), "native": policy(group.policy) }
+        "policy": { "kind": group.policy.as_str(), "native": group.policy.as_str() }
     });
     if !full {
-        result["member_count"] = json!(manager.native_members(&group.name).count());
+        result["member_count"] = json!(manager.group_members(&group.name).count());
         result["selection"] =
             json!({ "tcp_member_id": tcp["member_id"], "udp_member_id": udp["member_id"] });
         return result;
     }
     let members: Vec<_> = manager
-        .native_members(&group.name)
+        .group_members(&group.name)
         .filter_map(|member| {
             let id = member_id(member, identity)?;
             let (name, kind) = match member {
@@ -548,7 +486,7 @@ pub(super) async fn groups(
         .unwrap_or_else(|| identity.revision.clone());
     let groups: Vec<_> = names
         .into_iter()
-        .filter_map(|name| manager.native_group(name))
+        .filter_map(|name| manager.group(name))
         .map(|group| {
             let mut value = group_value(&manager, group, &identity, &state.alive_set, false);
             value["config_revision"] = json!(revision);
@@ -578,9 +516,7 @@ pub(super) async fn group(
         .find(|(_, id)| id.as_str() == group_id)
         .map(|(name, _)| name)
         .ok_or_else(|| group_not_found(id))?;
-    let group = manager
-        .native_group(name)
-        .ok_or_else(|| group_not_found(id))?;
+    let group = manager.group(name).ok_or_else(|| group_not_found(id))?;
     let revision = state
         .observation
         .configuration
@@ -590,8 +526,9 @@ pub(super) async fn group(
     let mut value = group_value(&manager, group, &identity, &state.alive_set, true);
     value["config_revision"] = json!(revision);
     if state.observation.configuration.group_writable(name) {
-        let mutable: Vec<_> = super::groups::MUTABLE_CONFIG
+        let mutable: Vec<_> = super::groups::FIELDS
             .into_iter()
+            .map(|(field, ..)| field)
             .filter(|field| *field != "tolerance" || tolerance(group).is_some())
             .collect();
         value["capabilities"]["mutable_config"] = json!(mutable);

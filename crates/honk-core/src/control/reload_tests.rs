@@ -1527,7 +1527,7 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
             #[cfg(feature = "native-api")]
             sources: None,
             #[cfg(feature = "native-api")]
-            expected_revision: None,
+            expected_group_revision: None,
             #[cfg(feature = "native-api")]
             deferred_provider: None,
         })
@@ -2079,11 +2079,17 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
         manager: &GroupManager,
         active_generation: u64,
     ) -> (u64, String) {
-        let flow = Arc::new(native.core.flows.begin(
-            "tcp",
-            "127.0.0.1:31000".parse().unwrap(),
-            "192.0.2.17:443".parse().unwrap(),
-        ));
+        let flow = Arc::new(
+            native
+                .core
+                .flows
+                .begin(
+                    "tcp",
+                    "127.0.0.1:31000".parse().unwrap(),
+                    "192.0.2.17:443".parse().unwrap(),
+                )
+                .unwrap(),
+        );
         let observer = flow
             .observer(active_generation, None, "dial_target")
             .unwrap();

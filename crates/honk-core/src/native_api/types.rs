@@ -68,22 +68,29 @@ impl Serialize for ErrorCode {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RetryAfter {
+    /// `1` on a 429 or 503, absent otherwise.
+    Default,
+    Seconds(u32),
+    Never,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
     #[serde(skip)]
-    status: StatusCode,
-    /// `Some(0)` suppresses the default 429/503 `Retry-After`.
+    pub(super) status: StatusCode,
     #[serde(skip)]
-    retry_after: Option<u32>,
-    error: ErrorBody,
+    retry_after: RetryAfter,
+    pub(super) error: ErrorBody,
     request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ErrorBody {
-    code: ErrorCode,
+pub(super) struct ErrorBody {
+    pub(super) code: ErrorCode,
     message: &'static str,
-    details: Option<Value>,
+    pub(super) details: Option<Value>,
 }
 
 impl ApiError {
@@ -95,7 +102,7 @@ impl ApiError {
     ) -> Self {
         Self {
             status,
-            retry_after: None,
+            retry_after: RetryAfter::Default,
             error: ErrorBody {
                 code,
                 message,
@@ -116,13 +123,13 @@ impl ApiError {
     }
 
     pub fn with_retry_after(mut self, seconds: u32) -> Self {
-        self.retry_after = Some(seconds.max(1));
+        self.retry_after = RetryAfter::Seconds(seconds.max(1));
         self
     }
 
     /// For a 503 after a completed write, where repeating the request cannot succeed.
     pub(crate) fn without_retry_after(mut self) -> Self {
-        self.retry_after = Some(0);
+        self.retry_after = RetryAfter::Never;
         self
     }
 
@@ -142,54 +149,20 @@ impl ApiError {
             self.into_details(),
         )
     }
-
-    pub(crate) fn for_management(mut self, deleting: bool) -> Self {
-        let stage = match self.status {
-            StatusCode::PRECONDITION_FAILED => "revision_conflict",
-            StatusCode::UNPROCESSABLE_ENTITY => "validation",
-            StatusCode::CONFLICT => "state_conflict",
-            StatusCode::NOT_FOUND => "capability",
-            _ => "admission",
-        };
-        if !matches!(
-            self.status,
-            StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
-        ) && (deleting
-            || !matches!(
-                self.status,
-                StatusCode::CONFLICT
-                    | StatusCode::UNPROCESSABLE_ENTITY
-                    | StatusCode::BAD_REQUEST
-                    | StatusCode::PAYLOAD_TOO_LARGE
-                    | StatusCode::UNSUPPORTED_MEDIA_TYPE
-            ))
-        {
-            self.status = StatusCode::SERVICE_UNAVAILABLE;
-            self.error.code = ErrorCode::TemporarilyUnavailable;
-        }
-        let details = self.error.details.get_or_insert_with(|| json!({}));
-        if let Some(details) = details.as_object_mut() {
-            details.entry("stage").or_insert(json!(stage));
-            details.entry("written").or_insert(json!(false));
-            details
-                .entry("durability_confirmed")
-                .or_insert(json!(false));
-            details.entry("committed").or_insert(json!(false));
-        }
-        self
-    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status;
-        let retry_after = self.retry_after.or_else(|| {
-            matches!(
+        let retry_after = match self.retry_after {
+            RetryAfter::Seconds(seconds) => Some(seconds),
+            RetryAfter::Never => None,
+            RetryAfter::Default => matches!(
                 status,
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
             )
-            .then_some(1)
-        });
+            .then_some(1),
+        };
         let mut response = (
             self.status,
             [
@@ -199,7 +172,7 @@ impl IntoResponse for ApiError {
             Json(self),
         )
             .into_response();
-        if let Some(seconds) = retry_after.filter(|seconds| *seconds > 0) {
+        if let Some(seconds) = retry_after {
             response
                 .headers_mut()
                 .insert("retry-after", axum::http::HeaderValue::from(seconds));
@@ -429,7 +402,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let mut providers = state.observation.providers.capability();
     providers["can_manage"] = json!(config.can_manage());
     let geodata = super::geodata::capability(state).await;
-    let routing_trace = state.observation.trace.capability();
+    let routing_trace = super::routing::trace_capability();
     let rules = super::routing::rules_capability();
     let (max_flows, flow_retention) = state.observation.settings.flow_limits();
     json!({
@@ -441,8 +414,8 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": super::security::MAX_BODY_BYTES,
         },
         "resources": {
-            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::security::MAX_BODY_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
-            "config_export": {"available":config.content_enabled()},
+            "config": {"available":config.sources.available(),"content":config.sources.available(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::security::MAX_BODY_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
+            "config_export": {"available":config.sources.available()},
             "config_import": config.import_capability(),
             "config_revisions": config.revisions_capability(),
             "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},

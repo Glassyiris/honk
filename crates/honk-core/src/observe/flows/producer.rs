@@ -19,9 +19,6 @@ impl FlowGuard {
         attempt_id: Option<Uuid>,
         dns_purpose: &'static str,
     ) -> Option<FlowObserver> {
-        if self.id.is_empty() {
-            return None;
-        }
         let store = self.store.upgrade()?;
         if !store
             .inner
@@ -223,7 +220,7 @@ impl FlowGuard {
     }
 
     pub(crate) fn accepted_send(&self) {
-        if self.id.is_empty() || self.sent.swap(true, Ordering::Relaxed) {
+        if self.sent.swap(true, Ordering::Relaxed) {
             return;
         }
         if let Some(store) = self.store.upgrade() {
@@ -251,7 +248,7 @@ impl FlowGuard {
 
     /// Returns true only for the first observed reply; callers need not record every packet.
     pub(crate) fn first_reply(&self) -> bool {
-        !self.id.is_empty() && !self.replied.swap(true, Ordering::Relaxed)
+        !self.replied.swap(true, Ordering::Relaxed)
     }
 
     pub(crate) fn step(&self, generation: Option<u64>, mut data: StepData) {
@@ -266,6 +263,24 @@ impl FlowGuard {
             *reply_received |= self.replied.load(Ordering::Relaxed);
         }
         store.record_step(&self.id, generation, data);
+    }
+
+    pub(crate) fn datapath(
+        &self,
+        plane: &'static str,
+        action: &'static str,
+        reason: &'static str,
+        error: Option<&'static str>,
+    ) {
+        self.step(
+            None,
+            StepData::Datapath {
+                plane,
+                action,
+                reason,
+                error: error.map(super::record::FlowError::Code),
+            },
+        );
     }
 
     pub(crate) fn mark_gap(&self, reason: &'static str) {
@@ -584,6 +599,34 @@ pub(crate) fn bounded(value: &str) -> String {
     value[..end].to_owned()
 }
 
+pub(crate) fn ip_family(version: honk_outbound::alive::IpVersion) -> &'static str {
+    match version {
+        honk_outbound::alive::IpVersion::V4 => "ipv4",
+        honk_outbound::alive::IpVersion::V6 => "ipv6",
+    }
+}
+
+/// The latest captured decision of `group_id` that could have led to
+/// `member_id`, preferring one that was applied.
+pub(crate) fn captured_selection<'a>(
+    decisions: &'a [super::record::Selection],
+    group_id: &str,
+    family: Option<&'static str>,
+    member_id: &str,
+) -> Option<&'a super::record::Selection> {
+    let compatible = |row: &&super::record::Selection| {
+        row.group_id == group_id
+            && row.health_family == family
+            && row.member_id.as_deref().is_none_or(|id| id == member_id)
+    };
+    decisions
+        .iter()
+        .rev()
+        .filter(compatible)
+        .find(|row| row.applied == Some(true))
+        .or_else(|| decisions.iter().rev().find(compatible))
+}
+
 pub(crate) fn map_selection_observation(
     observation: &honk_outbound::group::observation::SelectionObservation,
     catalog: &crate::observe::catalog::CatalogIdentity,
@@ -659,10 +702,7 @@ pub(crate) fn map_selection_observation(
                 member_name: selected.and_then(|(_, name)| name),
                 policy: decision.policy,
                 reason: decision.reason,
-                health_family: Some(match decision.health_family {
-                    honk_outbound::alive::IpVersion::V4 => "ipv4",
-                    honk_outbound::alive::IpVersion::V6 => "ipv6",
-                }),
+                health_family: Some(ip_family(decision.health_family)),
                 applied: Some(decision.applied),
                 selection: Some(super::record::SelectionDecision {
                     previous_member_id: previous.map(|(id, _)| id),

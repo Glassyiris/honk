@@ -4,7 +4,6 @@ use super::runtime::{
 use super::udp_ingress::{UdpLoopState, udp_listener_loop};
 use super::*;
 use std::collections::HashSet;
-#[cfg(feature = "native-api")]
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -31,7 +30,7 @@ pub(super) struct RuntimeEpoch {
     stop: watch::Sender<bool>,
     ingress: JoinSet<()>,
     tcp: JoinSet<()>,
-    maintenance: [Option<tokio::task::JoinHandle<()>>; 7],
+    maintenance: OwnedTasks,
     dns: Option<dns_listener::DnsListener>,
     janitor: Option<tokio::task::JoinHandle<()>>,
     removals: Option<tokio::task::JoinHandle<()>>,
@@ -40,14 +39,6 @@ pub(super) struct RuntimeEpoch {
     health_updates: Option<HealthUpdates>,
     #[cfg(feature = "ebpf")]
     queue: Option<NfqueueRuntime>,
-}
-
-impl Drop for RuntimeEpoch {
-    fn drop(&mut self) {
-        for task in self.maintenance.iter().flatten() {
-            task.abort();
-        }
-    }
 }
 
 type HealthUpdateKey = (uuid::Uuid, u32, u32);
@@ -213,9 +204,6 @@ impl ControlPlane {
                 }
             };
 
-        #[cfg(all(test, feature = "native-api"))]
-        tests::enable_udp_provenance(&udp4_sockets, &udp6_sockets)?;
-
         Ok(BoundListeners {
             tcp4: tcp4_listener,
             tcp6: tcp6_listener,
@@ -351,7 +339,7 @@ impl ControlPlane {
             stop,
             ingress: JoinSet::new(),
             tcp: JoinSet::new(),
-            maintenance: std::array::from_fn(|_| None),
+            maintenance: OwnedTasks::default(),
             janitor: None,
             removals: None,
             removal_errors,
@@ -475,7 +463,9 @@ impl ControlPlane {
             // Preparation has not opened admission. Cleanup must not borrow the
             // terminal process shutdown path or discard retained API owners.
             if let Err(cleanup) = self.stop_network_epoch(Some(&mut epoch)).await {
-                return Err(anyhow::Error::new(EpochCleanupFailure(cleanup)).context(error));
+                return Err(cleanup
+                    .context("runtime candidate cleanup failed")
+                    .context(error));
             }
             return Err(error);
         }
@@ -507,48 +497,44 @@ impl ControlPlane {
         let registry = self.runtime_registry.clone();
         let dns = self.dns_controller.runtime_provider();
         let groups = self.group_manager.clone();
-        epoch.maintenance = [
-            self.udp_pool.spawn_janitor(),
-            self.sniffer_pool.spawn_janitor(),
-            super::tcp_sniff::spawn_sniff_neg_cache_janitor(self.tcp_sniff_neg_cache.clone()),
-            self.connection_pool.spawn_janitor(),
-            tokio::spawn(run_tcp_admission_scaler(
-                self.concurrency_limit.clone(),
-                self.resource_budget,
-                self.stats.clone(),
-                self.tcp_admission_target.clone(),
-            )),
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+        let tasks = &mut epoch.maintenance.0;
+        tasks.push(self.udp_pool.spawn_janitor());
+        tasks.push(self.sniffer_pool.spawn_janitor());
+        tasks.push(super::tcp_sniff::spawn_sniff_neg_cache_janitor(
+            self.tcp_sniff_neg_cache.clone(),
+        ));
+        tasks.push(self.connection_pool.spawn_janitor());
+        tasks.push(tokio::spawn(run_tcp_admission_scaler(
+            self.concurrency_limit.clone(),
+            self.resource_budget,
+            self.stats.clone(),
+            self.tcp_admission_target.clone(),
+        )));
+        tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+            tick.tick().await;
+            loop {
                 tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    let now = std::time::Instant::now();
-                    registry.read().reap_idle_resources(now);
-                    dns.current().reap_idle_resources(now);
-                }
-            }),
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(5));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    let manager = groups.read().clone();
-                    manager.observe_transport_quality();
-                }
-            }),
-        ]
-        .map(Some);
+                let now = std::time::Instant::now();
+                registry.read().reap_idle_resources(now);
+                dns.current().reap_idle_resources(now);
+            }
+        }));
+        tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let manager = groups.read().clone();
+                manager.observe_transport_quality();
+            }
+        }));
         self.start_preconnect().await;
         let generation = self.runtime_registry.read().clone();
         self.start_udp_warm_coordinator(generation.clone()).await;
         self.start_selector_warm_coordinator(generation).await;
     }
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("runtime candidate cleanup failed: {0}")]
-struct EpochCleanupFailure(#[source] anyhow::Error);
 
 /// Whether `socket` records kernel UDP receive traces: `SO_RCVPRIORITY` where
 /// the kernel has it, otherwise the eBPF receive trace.
@@ -606,9 +592,7 @@ async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Resul
     result
 }
 
-pub(super) async fn abort_and_join(
-    task: &mut Option<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<()> {
+async fn abort_and_join(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
     if let Some(handle) = task.as_ref() {
         handle.abort();
     }
@@ -621,6 +605,32 @@ pub(super) async fn abort_and_join(
             Ok(())
         }
         result => result,
+    }
+}
+
+/// Background tasks that are aborted when dropped.
+#[derive(Default)]
+pub(super) struct OwnedTasks(pub(super) Vec<tokio::task::JoinHandle<()>>);
+
+impl OwnedTasks {
+    /// Aborts every task, then joins each; cancellation is the expected exit.
+    pub(super) async fn abort_and_join(&mut self) -> anyhow::Result<()> {
+        for task in &self.0 {
+            task.abort();
+        }
+        let mut error = None;
+        for task in self.0.drain(..) {
+            retain_error(&mut error, abort_and_join(&mut Some(task)).await);
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for OwnedTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -697,17 +707,6 @@ impl ControlPlane {
         error.map_or(Ok(()), Err)
     }
 
-    fn shutdown_pending(&self) -> bool {
-        #[cfg(feature = "native-api")]
-        {
-            self.shutdown_requested.load(Ordering::Acquire)
-        }
-        #[cfg(not(feature = "native-api"))]
-        {
-            false
-        }
-    }
-
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut commands = self
             .command_rx
@@ -728,8 +727,8 @@ impl ControlPlane {
         .await;
         let mut fatal = startup.err();
         if fatal.is_none() {
-            self.start_epoch_maintenance(epoch.as_mut().expect("startup epoch"))
-                .await;
+            let active = epoch.as_mut().expect("startup epoch");
+            self.start_epoch_maintenance(active).await;
             #[cfg(feature = "native-api")]
             self.publish_phase(EnginePhase::Running);
             #[cfg(target_os = "linux")]
@@ -738,60 +737,52 @@ impl ControlPlane {
             {
                 warn!(%error, "sd_notify readiness failed");
             }
-        }
-        while fatal.is_none() && !self.shutdown_pending() {
-            let event = match epoch.as_mut() {
-                Some(active) => active.next(self, &mut commands).await,
-                None => EpochEvent::Command(commands.recv().await),
-            };
-            match event {
-                EpochEvent::Command(command) => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    let drain = self.drain_tracker.clone();
-                    if !self
-                        .dispatch_control_command(command, &drain, &mut authorizations)
-                        .await
-                    {
-                        break;
+            while fatal.is_none() && !self.shutdown_requested.load(Ordering::Acquire) {
+                match active.next(self, &mut commands).await {
+                    EpochEvent::Command(command) => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        let drain = self.drain_tracker.clone();
+                        if !self
+                            .dispatch_control_command(command, &drain, &mut authorizations)
+                            .await
+                        {
+                            break;
+                        }
                     }
-                }
-                EpochEvent::Fatal(error) => fatal = Some(error),
-                #[cfg(feature = "ebpf")]
-                EpochEvent::TokenExhausted => {
-                    if let Some(queue) = epoch.as_mut().and_then(|epoch| epoch.queue.as_mut())
-                        && let Err(error) = self.recover_nfqueue_token_exhaustion(queue).await
-                    {
-                        fatal = Some(error);
+                    EpochEvent::Fatal(error) => fatal = Some(error),
+                    #[cfg(feature = "ebpf")]
+                    EpochEvent::TokenExhausted => {
+                        if let Some(queue) = active.queue.as_mut()
+                            && let Err(error) = self.recover_nfqueue_token_exhaustion(queue).await
+                        {
+                            fatal = Some(error);
+                        }
                     }
-                }
-                EpochEvent::Reaped => {}
-                EpochEvent::Accepted(Ok((stream, address, family, permit))) => {
-                    if self.drain_tracker.should_reject() {
-                        continue;
-                    }
-                    if let Err(error) = set_so_mark_zero(&stream) {
-                        warn!(%error, "failed to clear accepted socket bypass mark");
-                    }
-                    let handle = self.spawn_handle();
-                    let guard = ConnectionGuard::new(self.drain_tracker.clone());
-                    let flow = self.stats.track_tcp_flow();
-                    epoch
-                        .as_mut()
-                        .expect("accepted epoch")
-                        .tcp
-                        .spawn(async move {
+                    EpochEvent::Reaped => {}
+                    EpochEvent::Accepted(Ok((stream, address, family, permit))) => {
+                        if self.drain_tracker.should_reject() {
+                            continue;
+                        }
+                        if let Err(error) = set_so_mark_zero(&stream) {
+                            warn!(%error, "failed to clear accepted socket bypass mark");
+                        }
+                        let handle = self.spawn_handle();
+                        let guard = ConnectionGuard::new(self.drain_tracker.clone());
+                        let flow = self.stats.track_tcp_flow();
+                        active.tcp.spawn(async move {
                             let (_permit, _guard, _flow) = (permit, guard, flow);
                             if let Err(error) = handle.serve_connection(stream, address).await {
                                 debug!(%error, family, "TCP connection ended");
                             }
                         });
-                }
-                EpochEvent::Accepted(Err(error)) => {
-                    error!(%error, "TPROXY TCP accept failed");
-                    if error.raw_os_error() == Some(libc::EMFILE) {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    EpochEvent::Accepted(Err(error)) => {
+                        error!(%error, "TPROXY TCP accept failed");
+                        if error.raw_os_error() == Some(libc::EMFILE) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
             }

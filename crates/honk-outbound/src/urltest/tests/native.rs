@@ -58,16 +58,14 @@ async fn native_http1_cold_and_warm_keep_pinned_authority_without_redirects() {
             addr,
             delay: Duration::from_millis(60),
         };
-        let (_cancel, cancel) = tokio::sync::watch::channel(false);
         let started = Instant::now();
-        let measured = native_http_probe(
+        let measured = measure_pinned_http_probe(
             &guard.runtime(),
             &handler,
             &request,
             addr,
             cold,
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            cancel,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -113,15 +111,13 @@ async fn native_http1_rejects_invalid_responses_but_keeps_validated_close_fallba
             crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-invalid"))
                 .unwrap();
         let request = http_probe_request("http://probe.example/check", "GET").unwrap();
-        let (_cancel, cancel) = tokio::sync::watch::channel(false);
-        let result = native_http_probe(
+        let result = measure_pinned_http_probe(
             &guard.runtime(),
             &MockHandler,
             &request,
             addr,
             cold,
-            tokio::time::Instant::now() + Duration::from_secs(2),
-            cancel,
+            Duration::from_secs(2),
         )
         .await;
         assert_eq!(result.is_ok(), succeeds, "cold={cold}: {result:?}");
@@ -131,46 +127,7 @@ async fn native_http1_rejects_invalid_responses_but_keeps_validated_close_fallba
 }
 
 #[tokio::test]
-async fn native_http_deadline_includes_dial_and_warmup() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let peer = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let warm = read_request_head(&mut stream).await;
-        assert!(warm.starts_with(b"HEAD "));
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
-        assert!(matches!(stream.read(&mut [0; 1]).await, Ok(0) | Err(_)));
-    });
-    let mut guard =
-        crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-deadline")).unwrap();
-    let handler = PinnedHandler {
-        addr,
-        delay: Duration::from_millis(150),
-    };
-    let request = http_probe_request("http://probe.example/check", "GET").unwrap();
-    let (_cancel, cancel) = tokio::sync::watch::channel(false);
-    let error = native_http_probe(
-        &guard.runtime(),
-        &handler,
-        &request,
-        addr,
-        false,
-        tokio::time::Instant::now() + Duration::from_millis(250),
-        cancel,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<std::io::Error>().unwrap().kind(),
-        std::io::ErrorKind::TimedOut
-    );
-    peer.await.unwrap();
-    guard.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn native_http_cancellation_releases_connection_before_return() {
+async fn http_probe_drop_releases_connection_before_return() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (received, receiving) = tokio::sync::oneshot::channel();
@@ -189,26 +146,19 @@ async fn native_http_cancellation_releases_connection_before_return() {
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-cancel")).unwrap();
     let runtime = guard.runtime();
     let request = http_probe_request("http://probe.example/check", "GET").unwrap();
-    let (cancel, cancelled) = tokio::sync::watch::channel(false);
-    let mut probe = Box::pin(native_http_probe(
+    let mut probe = Box::pin(measure_pinned_http_probe(
         &runtime,
         &MockHandler,
         &request,
         addr,
         false,
-        tokio::time::Instant::now() + Duration::from_secs(5),
-        cancelled,
+        Duration::from_secs(5),
     ));
     tokio::select! {
-        result = &mut probe => panic!("probe completed before cancellation: {result:?}"),
+        result = &mut probe => panic!("probe completed before drop: {result:?}"),
         result = receiving => result.unwrap(),
     }
-    cancel.send(true).unwrap();
-    let error = probe.await.unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<std::io::Error>().unwrap().kind(),
-        std::io::ErrorKind::Interrupted
-    );
+    drop(probe);
     tokio::time::timeout(Duration::from_secs(1), peer)
         .await
         .unwrap()
@@ -240,8 +190,7 @@ async fn native_https_keeps_request_sni_on_pinned_dial() {
     let mut guard =
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-sni")).unwrap();
     let request = http_probe_request("https://probe.example:8443/check", "GET").unwrap();
-    let (_cancel, cancel) = tokio::sync::watch::channel(false);
-    let result = native_http_probe(
+    let result = measure_pinned_http_probe(
         &guard.runtime(),
         &PinnedHandler {
             addr,
@@ -250,8 +199,7 @@ async fn native_https_keeps_request_sni_on_pinned_dial() {
         &request,
         addr,
         true,
-        tokio::time::Instant::now() + Duration::from_secs(2),
-        cancel,
+        Duration::from_secs(2),
     )
     .await;
     assert!(result.is_err(), "peer intentionally does not complete TLS");

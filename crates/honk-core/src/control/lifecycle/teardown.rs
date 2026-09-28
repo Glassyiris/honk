@@ -62,12 +62,7 @@ impl ControlPlane {
         let registry = self.runtime_registry.read().clone();
         registry.begin_retirement();
         if let Some(epoch) = epoch.as_mut() {
-            for task in epoch.maintenance.iter().flatten() {
-                task.abort();
-            }
-            for task in &mut epoch.maintenance {
-                retain_error(&mut error, abort_and_join(task).await);
-            }
+            retain_error(&mut error, epoch.maintenance.abort_and_join().await);
         }
         // The tracker covers published UUIDs; the epoch also owns pre-ID TCP work.
         if let Ok(summary) = self

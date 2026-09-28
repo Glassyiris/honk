@@ -110,7 +110,7 @@ async fn private_child_panic_fails_operation_and_pause_without_negating_measurem
         assert_eq!(
             state
                 .alive_set
-                .native_observations(honk_config::config::DIRECT_NODE_ID)
+                .health_observations(honk_config::config::DIRECT_NODE_ID)
                 .iter()
                 .map(|observation| observation.state)
                 .collect::<Vec<_>>(),
@@ -272,7 +272,7 @@ async fn pause_drains_started_and_disconnected_queued_jobs() {
     assert!(
         state
             .alive_set
-            .native_observations(honk_config::config::DIRECT_NODE_ID)
+            .health_observations(honk_config::config::DIRECT_NODE_ID)
             .is_empty()
     );
     assert_eq!(service.pause().await, Err(ProbeLifecycleError::Unavailable));
@@ -346,7 +346,7 @@ async fn pause_cancels_reserved_capture_without_late_enqueue() {
     assert!(
         state
             .alive_set
-            .native_observations(honk_config::config::DIRECT_NODE_ID)
+            .health_observations(honk_config::config::DIRECT_NODE_ID)
             .is_empty()
     );
     stop.send(true).unwrap();

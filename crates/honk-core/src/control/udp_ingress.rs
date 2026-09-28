@@ -613,12 +613,11 @@ impl UdpLoopState {
                                 original_dst,
                             ))
                             .await;
-                        let (status, error) = match result {
-                            Ok(Ok(length)) if length == response.len() => ("delivered", None),
-                            Ok(_) => ("delivery_failed", Some("client_send_failed")),
-                            Err(_) => ("cancelled", Some("runtime_retired")),
-                        };
-                        crate::observe::flows::dns::delivery(status, error);
+                        crate::observe::flows::dns::reply_delivery(
+                            &result,
+                            |length| *length == response.len(),
+                            "client_send_failed",
+                        );
                     };
                     #[cfg(feature = "native-api")]
                     if let Some(raw) = query.as_deref() {
@@ -645,7 +644,7 @@ impl UdpLoopState {
                     operation.await;
                     #[cfg(feature = "native-api")]
                     if let Some(query) = query {
-                        dns_controller.dns_service().observe_client(
+                        dns_controller.dns_service().observer.observe_client(
                             &query,
                             ingress,
                             Some(src_addr),

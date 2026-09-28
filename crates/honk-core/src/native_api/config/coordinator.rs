@@ -88,7 +88,7 @@ impl ConfigService {
                         let _ = response.send(Err(unavailable()));
                     }
                     Work::Manage { response, .. } => {
-                        let _ = response.send(Err(unavailable().for_management(true)));
+                        let _ = response.send(Err(unavailable()));
                     }
                     _ => {}
                 }
@@ -116,10 +116,8 @@ impl Worker {
     async fn perform(&mut self, work: Work) {
         if let Err(error) = self.service.check_phase(&work) {
             match work {
-                Work::Manage {
-                    mutation, response, ..
-                } => {
-                    let _ = response.send(Err(error.for_management(mutation.deleting())));
+                Work::Manage { response, .. } => {
+                    let _ = response.send(Err(error));
                 }
                 Work::Replace { reservation, .. }
                 | Work::Create { reservation, .. }
@@ -146,11 +144,9 @@ impl Worker {
                 alive_set,
                 response,
             } => {
-                let deleting = mutation.deleting();
                 let result = self
                     .manage(mutation, &catalog, &group_manager, &alive_set)
-                    .await
-                    .map_err(|error| error.for_management(deleting));
+                    .await;
                 let _ = response.send(result);
             }
             Work::GroupPatch { patch, reservation } => {
@@ -168,7 +164,7 @@ impl Worker {
                                 candidate,
                                 sources: Some(sources),
                                 diagnostics,
-                                expected_revision: Some(revision),
+                                expected_group_revision: Some(revision),
                                 deferred_provider: None,
                             },
                             Some(&group_id),
@@ -222,7 +218,7 @@ impl Worker {
                                 candidate,
                                 sources: Some(sources),
                                 diagnostics,
-                                expected_revision: None,
+                                expected_group_revision: None,
                                 deferred_provider: None,
                             },
                             None,
@@ -282,8 +278,10 @@ impl Worker {
                         },
                     );
                 } else {
+                    let origin =
+                        (!current).then_some(crate::native_api::store::db::Origin::Activate);
                     let prepared = self
-                        .prepare_revision(number, &reservation.principal, current)
+                        .prepare_revision(number, &reservation.principal, origin)
                         .await;
                     self.tree_operation(&id, prepared).await;
                 }
@@ -301,7 +299,7 @@ impl Worker {
                                 candidate,
                                 sources,
                                 diagnostics,
-                                expected_revision: None,
+                                expected_group_revision: None,
                                 deferred_provider: None,
                             },
                         )
@@ -334,7 +332,7 @@ impl Worker {
                             candidate,
                             sources,
                             diagnostics,
-                            expected_revision: None,
+                            expected_group_revision: None,
                             deferred_provider: None,
                         })
                         .await;
@@ -497,7 +495,7 @@ impl Worker {
                 candidate,
                 sources: Some(sources),
                 diagnostics,
-                expected_revision: Some(accepted.revision),
+                expected_group_revision: Some(accepted.revision),
                 deferred_provider: deferred,
             })
             .await;
@@ -521,7 +519,7 @@ impl Worker {
                     .secrets(accepted.as_ref())
                     .as_ref()
                     .clone()
-                    .with_clash(&active.experimental.clash_api.secret)
+                    .with_secret(&active.experimental.clash_api.secret)
             };
             super::super::catalog::node_value(
                 &active,
@@ -559,7 +557,7 @@ impl Worker {
                         candidate,
                         sources: Some(sources),
                         diagnostics,
-                        expected_revision: None,
+                        expected_group_revision: None,
                         deferred_provider: None,
                     },
                     None,
@@ -731,7 +729,7 @@ impl Worker {
             return Err(denied());
         }
         let target = accepted.update.sources[index].path.clone();
-        let mut check = self.candidate_check(accepted).await?;
+        let mut check = self.candidate_check().await?;
         let source_id = source_id.to_owned();
         let principal = principal.to_owned();
         #[cfg(test)]
@@ -739,7 +737,6 @@ impl Worker {
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
             let store = check.store.clone();
-            let accepted = &check.accepted;
             let pin = store
                 .pin(&target)
                 .map_err(|error| store_write_error(&store, error))?;
@@ -795,10 +792,9 @@ impl Worker {
             let validated = check.validate(
                 loaded,
                 &mut diagnostics,
-                &target,
-                &content,
+                Some((&accepted, &target, &content)),
                 Some(&source_id),
-                &check.accepted.ids,
+                Some(&accepted.ids),
             )?;
             let recheck = Box::new(|| {
                 #[cfg(test)]
@@ -838,13 +834,13 @@ impl Worker {
             .read()
             .clone()
             .ok_or_else(unsupported)?;
-        let check = self.candidate_check(accepted).await?;
+        let check = self.candidate_check().await?;
         let principal = principal.to_owned();
         #[cfg(test)]
         let before_replace = self.service.before_replace.lock().take();
         tokio::task::spawn_blocking(move || {
             let store = &check.store;
-            let accepted = &check.accepted;
+            let accepted = &accepted;
             let target = store.resolve(&label)?;
             if accepted.ids.contains_key(&target)
                 || (matches!(store, SourceStore::File(_)) && target.symlink_metadata().is_ok())
@@ -869,10 +865,9 @@ impl Worker {
             let validated = check.validate(
                 loaded,
                 &mut diagnostics,
-                &target,
-                &content,
+                Some((accepted, &target, &content)),
                 Some(main),
-                &ids,
+                Some(&ids),
             )?;
             if !validated.sources.iter().any(|source| source.path == target) {
                 return Err(not_included(main));
@@ -898,7 +893,7 @@ impl Worker {
         .map_err(|_| unavailable())?
     }
 
-    async fn candidate_check(&self, accepted: Accepted) -> Result<CandidateCheck, ApiError> {
+    async fn candidate_check(&self) -> Result<CandidateCheck, ApiError> {
         Ok(CandidateCheck {
             store: self.store.clone(),
             active: self.active.read().await.clone(),
@@ -909,32 +904,30 @@ impl Worker {
                 .deferred_subscriptions()
                 .await
                 .map_err(|_| unavailable())?,
-            accepted,
         })
     }
 }
 
-/// What a source write validates its candidate against, captured before blocking work.
+/// What a candidate validates against, captured before blocking work.
 struct CandidateCheck {
     store: SourceStore,
     active: Arc<Config>,
     log_files: LogFiles,
     data_dir: PathBuf,
     deferred: Vec<honk_config::subscription::Subscription>,
-    accepted: Accepted,
 }
 
 impl CandidateCheck {
-    /// Full validation of a candidate that puts `content` at `target`, refusing anything
-    /// the write or the following reload must not admit.
+    /// Full validation of a candidate, refusing anything the write or the following reload
+    /// must not admit. `write` is a source write of `content` at `target` over `accepted`;
+    /// `None` is a whole-tree candidate.
     fn validate(
         &self,
         loaded: LoadedConfig,
         diagnostics: &mut Vec<DetailedDiagnostic>,
-        target: &Path,
-        content: &str,
+        write: Option<(&Accepted, &Path, &str)>,
         fallback: Option<&str>,
-        ids: &HashMap<PathBuf, String>,
+        ids: Option<&HashMap<PathBuf, String>>,
     ) -> Result<offline::ValidatedConfig, ApiError> {
         let active = &self.active;
         let parsed_sources = loaded.sources.clone();
@@ -943,13 +936,13 @@ impl CandidateCheck {
             self.store.dependency_root(),
             active,
             &self.data_dir,
-            limits(),
+            SourceLimits::DEFAULT,
             diagnostics,
             &self.deferred,
             None,
             &[],
         )
-        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, Some(ids)))?;
+        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, ids))?;
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == Severity::Error)
@@ -958,7 +951,7 @@ impl CandidateCheck {
                 diagnostics,
                 &validated.sources,
                 fallback,
-                Some(ids),
+                ids,
             ));
         }
         if validated.config.experimental.native_api != active.experimental.native_api
@@ -969,41 +962,45 @@ impl CandidateCheck {
         {
             return Err(denied());
         }
-        let old_credentials: Vec<_> = self
-            .accepted
-            .update
-            .sources
-            .iter()
-            .filter(|source| source.contains_api_secret)
-            .map(|source| (&source.path, &source.content))
-            .collect();
-        let new_credentials: Vec<_> = validated
-            .sources
-            .iter()
-            .filter(|source| source.contains_api_secret)
-            .map(|source| (&source.path, &source.content))
-            .collect();
-        if old_credentials != new_credentials
-            || validated
+        let mut written = &validated.sources[0];
+        if let Some((accepted, target, content)) = write {
+            let old_credentials: Vec<_> = accepted
+                .update
                 .sources
                 .iter()
-                .any(|source| source.path == target && source.contains_api_secret)
-            || [
-                &active.experimental.native_api.secret,
-                &active.experimental.clash_api.secret,
-            ]
-            .iter()
-            .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
-        {
-            return Err(denied());
+                .filter(|source| source.contains_api_secret)
+                .map(|source| (&source.path, &source.content))
+                .collect();
+            let new_credentials: Vec<_> = validated
+                .sources
+                .iter()
+                .filter(|source| source.contains_api_secret)
+                .map(|source| (&source.path, &source.content))
+                .collect();
+            if old_credentials != new_credentials
+                || validated
+                    .sources
+                    .iter()
+                    .any(|source| source.path == target && source.contains_api_secret)
+                || [
+                    &active.experimental.native_api.secret,
+                    &active.experimental.clash_api.secret,
+                ]
+                .iter()
+                .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
+            {
+                return Err(denied());
+            }
+            if let Some(source) = validated
+                .sources
+                .iter()
+                .find(|source| source.path == target)
+            {
+                written = source;
+            }
         }
         // The reload would reject these, and a rejected reload leaves the written file
         // ahead of the accepted hash; refuse before writing.
-        let written = validated
-            .sources
-            .iter()
-            .find(|source| source.path == target)
-            .unwrap_or(&validated.sources[0]);
         let restart = restart_diagnostics(
             active,
             &validated.config,
@@ -1017,34 +1014,56 @@ impl CandidateCheck {
                 diagnostics,
                 &validated.sources,
                 fallback,
-                Some(ids),
+                ids,
             ));
         }
         Ok(validated)
     }
 
-    /// Fails with `Conflict` unless the store still yields the validated candidate.
     fn recheck(
         &self,
         overlay: &HashMap<PathBuf, Arc<str>>,
         validated: &offline::ValidatedConfig,
     ) -> Result<(), WriteError> {
-        let mut diagnostics = Vec::new();
-        let reloaded = self
-            .store
-            .load(overlay, &mut diagnostics)
-            .map_err(|_| WriteError::Conflict)?;
-        if !same_source_documents(&validated.sources, &reloaded.sources) {
-            return Err(WriteError::Conflict);
-        }
-        let dependencies = validated
-            .recapture_dependencies(&self.active, &self.data_dir, limits(), &self.deferred)
-            .map_err(|_| WriteError::Conflict)?;
-        if !same_dependencies(&validated.dependencies, &dependencies) {
-            return Err(WriteError::Conflict);
-        }
-        Ok(())
+        unchanged(
+            &self.store,
+            overlay,
+            validated,
+            &self.active,
+            &self.data_dir,
+            &self.deferred,
+        )
     }
+}
+
+/// Fails with `Conflict` unless `store` still yields `validated`: the same documents, loading
+/// without errors, over the same dependencies.
+fn unchanged(
+    store: &SourceStore,
+    overlay: &HashMap<PathBuf, Arc<str>>,
+    validated: &offline::ValidatedConfig,
+    active: &Config,
+    data_dir: &Path,
+    deferred: &[honk_config::subscription::Subscription],
+) -> Result<(), WriteError> {
+    let mut notices = Vec::new();
+    let loaded = store
+        .load(overlay, &mut notices)
+        .map_err(|_| WriteError::Conflict)?;
+    if notices
+        .iter()
+        .any(|notice| notice.severity == Severity::Error)
+        || !same_source_documents(&validated.sources, &loaded.sources)
+    {
+        return Err(WriteError::Conflict);
+    }
+    let dependencies = validated
+        .recapture_dependencies(active, data_dir, SourceLimits::DEFAULT, deferred)
+        .map_err(|_| WriteError::Conflict)?;
+    if validated.dependencies != dependencies {
+        return Err(WriteError::Conflict);
+    }
+    Ok(())
 }
 
 fn prepared(

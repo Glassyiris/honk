@@ -6,7 +6,6 @@ use crate::native_api::store::Committed;
 impl ActivationFailure {
     fn reason(self) -> (&'static str, &'static str) {
         match self {
-            Self::RequestExhausted => ("request_exhausted", "Reload request sequence exhausted"),
             Self::EngineUnavailable => ("engine_unavailable", "Reload engine is unavailable"),
             Self::Unconfirmed => (
                 "engine_unavailable",

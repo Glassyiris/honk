@@ -1610,7 +1610,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             #[cfg(feature = "native-api")]
                             sources: None,
                             #[cfg(feature = "native-api")]
-                            expected_revision: None,
+                            expected_group_revision: None,
                             #[cfg(feature = "native-api")]
                             deferred_provider: None,
                         })
@@ -1638,7 +1638,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
-    #[cfg(feature = "native-api")]
     let shutdown_intent = control_plane.shutdown_intent();
     let sig_handle = tokio::spawn(async move {
         // The shell may start us with SIGINT/SIGTERM ignored (e.g. background
@@ -1662,7 +1661,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
-        #[cfg(feature = "native-api")]
         shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });

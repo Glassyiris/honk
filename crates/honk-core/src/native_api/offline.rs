@@ -232,11 +232,11 @@ fn capture_inner(
                 parse_subscription_content_with_diagnostics(subscription, contents, &mut notices);
             // Decoded-provider coordinates are not coordinates in the referring dae document.
             for mut notice in notices.into_iter().filter(|notice| !notice.terminal) {
-                notice.source = declared.clone();
+                crate::config_diagnostics::declare_diagnostics(
+                    declared,
+                    std::slice::from_mut(&mut notice),
+                );
                 notice.setting = SettingPath::new("subscription").index(index + 1);
-                notice.span = None;
-                notice.line = None;
-                notice.byte_column = None;
                 notice.entry_index = None;
                 notice.related_indices.clear();
                 diagnostics.push(notice);
@@ -488,8 +488,8 @@ impl Capture {
         submitted: &[(PathBuf, Arc<str>)],
     ) -> io::Result<Self> {
         let limits = SourceLimits {
-            max_bytes: limits.max_bytes.min(8 * 1024 * 1024),
-            max_sources: limits.max_sources.min(32),
+            max_bytes: limits.max_bytes.min(SourceLimits::DEFAULT.max_bytes),
+            max_sources: limits.max_sources.min(SourceLimits::DEFAULT.max_sources),
         };
         let unused = submitted
             .iter()
@@ -577,21 +577,12 @@ impl Capture {
             nix::sys::stat::Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        self.file(File::from(descriptor), standard, standard, reader)
-    }
-
-    fn file(
-        &mut self,
-        file: File,
-        trusted: bool,
-        asset: bool,
-        reader: DependencyReader,
-    ) -> io::Result<Arc<[u8]>> {
+        let file = File::from(descriptor);
         let path = fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-        if !trusted && !self.authorized(&path) {
+        if !standard && !self.authorized(&path) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        self.admit(path, asset, reader, |remaining| {
+        self.admit(path, standard, reader, |remaining| {
             let metadata = file.metadata()?;
             if !metadata.is_file() {
                 return Err(io::ErrorKind::InvalidData.into());

@@ -21,7 +21,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
         ("intentional_retirement", "closed", false),
         ("shutdown", "closed", false),
     ] {
-        let flow = Arc::new(api.flows.begin("udp", client, dst));
+        let flow = Arc::new(api.flows.begin("udp", client, dst).unwrap());
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", permit, &stats) {
@@ -453,7 +453,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = upstream.local_addr().unwrap();
         let client = make_addr("127.0.0.1", 0);
-        let flow = Arc::new(api.flows.begin("udp", client, destination));
+        let flow = Arc::new(api.flows.begin("udp", client, destination).unwrap());
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease =

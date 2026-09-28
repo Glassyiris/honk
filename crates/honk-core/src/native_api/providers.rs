@@ -1,11 +1,6 @@
 //! Provider observations and supervisor-owned refresh admission.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    mem::size_of,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, mem::size_of, ops::Range, sync::Arc};
 
 use axum::{
     Json,
@@ -14,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use honk_config::subscription::Subscription;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -24,6 +19,7 @@ use super::{
     catalog::snapshot_unavailable,
     invalid_query,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
+    pages::{self, MAX_PAGE_SIZE, MAX_SNAPSHOT_BYTES, Pages},
     parse_query, timestamp,
     types::RequestId,
 };
@@ -34,11 +30,6 @@ use crate::{
         SubscriptionSupervisorHandle,
     },
 };
-
-const MAX_PAGE_SIZE: usize = 1000;
-const MAX_SNAPSHOTS: usize = 8;
-const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
-const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize)]
 pub(crate) struct Provider {
@@ -178,30 +169,35 @@ impl Provider {
 }
 
 struct Snapshot {
-    id: Uuid,
     instance: String,
-    created: Instant,
     rows: Vec<Provider>,
     bytes: usize,
 }
 
-impl Snapshot {
-    fn page(&self, offset: usize, limit: usize) -> Response {
-        let end = offset.saturating_add(limit).min(self.rows.len());
-        Json(json!({"providers": &self.rows[offset..end], "next_cursor": (end < self.rows.len()).then(|| format!("{}:{end}", self.id))})).into_response()
+impl pages::Snapshot for Snapshot {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn page(&self, rows: Range<usize>, next_cursor: Option<String>) -> Response {
+        Json(json!({"providers": &self.rows[rows], "next_cursor": next_cursor})).into_response()
     }
 }
 
 pub(crate) struct ProviderApi {
     supervisor: RwLock<Option<SubscriptionSupervisorHandle>>,
-    snapshots: Mutex<VecDeque<Snapshot>>,
+    snapshots: Pages<Snapshot>,
 }
 
 impl ProviderApi {
     pub(crate) fn new() -> Self {
         Self {
             supervisor: RwLock::new(None),
-            snapshots: Mutex::new(VecDeque::new()),
+            snapshots: Pages::default(),
         }
     }
 
@@ -227,46 +223,6 @@ impl ProviderApi {
             .as_ref()
             .is_some_and(SubscriptionSupervisorHandle::caches)
     }
-
-    fn resume(
-        &self,
-        cursor: &str,
-        instance: &str,
-        limit: usize,
-        id: &RequestId,
-    ) -> Result<Response, ApiError> {
-        let (snapshot, offset) = cursor.split_once(':').ok_or_else(|| invalid_query(id))?;
-        let snapshot = Uuid::parse_str(snapshot).map_err(|_| invalid_query(id))?;
-        let offset: usize = offset.parse().map_err(|_| invalid_query(id))?;
-        let mut snapshots = self.snapshots.lock();
-        snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-        let snapshot = snapshots
-            .iter()
-            .find(|candidate| candidate.id == snapshot && candidate.instance == instance)
-            .ok_or_else(|| invalid_query(id))?;
-        if offset == 0 || offset >= snapshot.rows.len() {
-            return Err(invalid_query(id));
-        }
-        Ok(snapshot.page(offset, limit))
-    }
-
-    fn page(&self, snapshot: Snapshot, limit: usize, id: &RequestId) -> Result<Response, ApiError> {
-        let response = snapshot.page(0, limit);
-        if snapshot.rows.len() > limit {
-            let mut snapshots = self.snapshots.lock();
-            snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-            while snapshots.len() >= MAX_SNAPSHOTS
-                || snapshots.iter().map(|s| s.bytes).sum::<usize>() + snapshot.bytes
-                    > MAX_SNAPSHOT_BYTES
-            {
-                if snapshots.pop_front().is_none() {
-                    return Err(snapshot_unavailable(id));
-                }
-            }
-            snapshots.push_back(snapshot);
-        }
-        Ok(response)
-    }
 }
 
 pub(super) async fn list(
@@ -275,18 +231,16 @@ pub(super) async fn list(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["limit", "cursor"], id)?;
-    let limit = query
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-        return Err(invalid_query(id));
-    }
+    let limit = pages::limit(&query, id)?;
     let service = &state.observation.providers;
     if let Some(cursor) = query.get("cursor") {
-        return service.resume(cursor, &state.observation.core.instance_id, limit, id);
+        let instance = &state.observation.core.instance_id;
+        return service.snapshots.resume(
+            cursor,
+            limit,
+            |snapshot| &snapshot.instance == instance,
+            id,
+        );
     }
     let config = state.config.read().await;
     if config
@@ -334,11 +288,9 @@ pub(super) async fn list(
         rows.push(row);
     }
     rows[1..].sort_unstable_by(|a, b| a.id.cmp(&b.id));
-    service.page(
+    service.snapshots.first(
         Snapshot {
-            id: Uuid::new_v4(),
             instance: state.observation.core.instance_id.clone(),
-            created: Instant::now(),
             rows,
             bytes,
         },
@@ -410,15 +362,9 @@ pub(super) async fn refresh(
     if provider_id == "inline" {
         return Err(not_refreshable());
     }
-    let mut keys = request.headers().get_all("idempotency-key").iter();
-    let key = keys
-        .next()
-        .map(|value| value.to_str().map(str::to_owned))
-        .transpose()
-        .map_err(|_| invalid_query(id))?;
-    if keys.next().is_some() {
-        return Err(invalid_query(id));
-    }
+    let key = super::config::request_header(&request, "idempotency-key")
+        .map_err(|_| invalid_query(id))?
+        .map(str::to_owned);
     let body = super::body::buffered(request.into_body()).await;
     let operations = &state.observation.operations;
     let path = format!("/api/v1/providers/{provider_id}/refresh");

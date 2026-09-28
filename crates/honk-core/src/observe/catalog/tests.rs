@@ -78,9 +78,9 @@ fn revision_and_members_follow_effective_duplicate_and_cycle_rules() {
     catalog.install(&config);
     assert_eq!(catalog.snapshot().revision, original.revision);
     let manager = GroupManager::new(&config.groups, &config.nodes);
-    let effective = GroupManager::native_effective_groups(&config.groups);
+    let effective = GroupManager::effective_groups(&config.groups);
     for (name, group) in &effective {
-        assert_eq!(manager.native_group(name).unwrap(), group);
+        assert_eq!(manager.group(name).unwrap(), group);
     }
     let before = catalog.snapshot().revision.clone();
     config.groups[1].nodes.push(config.nodes[2].id);
@@ -97,7 +97,7 @@ fn cold_nested_selection_keeps_member_without_inventing_leaf() {
     let identity = Catalog::new(&config).snapshot();
     let value = selection(
         &manager,
-        manager.native_group("parent").unwrap(),
+        manager.group("parent").unwrap(),
         SelectionNetwork::Tcp,
         &identity,
     );
@@ -148,7 +148,7 @@ fn native_probe_context_keeps_exact_members_without_expanding_probe_set() {
     config.groups[1].default = Some("node-3".into());
     let manager = GroupManager::new(&config.groups, &config.nodes);
     let identity = Catalog::new(&config).snapshot();
-    let probes = manager.native_delay_test_members("parent");
+    let probes = manager.delay_test_targets("parent");
     assert_eq!(
         probes
             .iter()
@@ -179,7 +179,7 @@ fn native_probe_context_keeps_exact_members_without_expanding_probe_set() {
             honk_outbound::group::SelectorNetworks::Both,
         )
         .unwrap();
-    let probes = manager.native_delay_test_members("parent");
+    let probes = manager.delay_test_targets("parent");
     assert_eq!(
         probes
             .iter()
@@ -200,7 +200,7 @@ fn manual_selector_reports_runtime_selection_source() {
     let identity = Catalog::new(&config).snapshot();
     let value = selection(
         &manager,
-        manager.native_group("child").unwrap(),
+        manager.group("child").unwrap(),
         SelectionNetwork::Tcp,
         &identity,
     );

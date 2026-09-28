@@ -10,7 +10,7 @@ pub(super) struct Specification {
 }
 pub(super) struct Candidate {
     pub(super) node: Node,
-    pub(super) ticket: NativeProbeTicket,
+    pub(super) ticket: ProbeTicket,
     pub(super) transport: Transport,
     pub(super) family: Family,
     pub(super) rows: Vec<usize>,
@@ -122,20 +122,20 @@ fn plan(
     };
     if group
         .as_ref()
-        .is_some_and(|name| !manager.native_probe_plan_within_limit(name, MAX_RESULTS))
+        .is_some_and(|name| !manager.probe_plan_within_limit(name, MAX_RESULTS))
     {
         return Err(too_large());
     }
     let members: Vec<_> = if let Some(group) = &group {
         match request.members.as_ref() {
             Some(Members::Scope(MemberScope::Leaves)) => manager
-                .native_probe_leaves(group, MAX_MEMBERS + 1)
+                .probe_leaves(group, MAX_MEMBERS + 1)
                 .into_iter()
                 .map(GroupMember::Node)
                 .collect(),
             _ => {
                 let mut members = Vec::new();
-                for member in manager.native_members(group) {
+                for member in manager.group_members(group) {
                     if let Some(Members::Ids(ids)) = &request.members {
                         let id = member_id(member, &identity).ok_or_else(not_found)?;
                         if !ids.contains(&id) {
@@ -210,7 +210,7 @@ fn plan(
                 } else {
                     ProbeDomain::DnsUdp
                 };
-                let leaf = manager.native_probe_leaf(member, domain, family.ip());
+                let leaf = manager.probe_leaf(member, domain, family.ip());
                 let index = rows.len();
                 rows.push(ResultRow {
                     member_id: member_id.clone(),
@@ -264,7 +264,7 @@ fn plan(
                         unique.insert((node.id, transport, family), candidates.len());
                         candidates.push(Candidate {
                             node: node.clone(),
-                            ticket: state.alive_set.native_probe_ticket(node.id),
+                            ticket: state.alive_set.probe_ticket(node.id),
                             transport,
                             family,
                             rows: vec![index],
@@ -281,7 +281,7 @@ fn plan(
             let unusable_url = || configured("The configured HTTP check URL is not usable", &URLS);
             let url = group
                 .as_ref()
-                .and_then(|name| manager.native_group(name))
+                .and_then(|name| manager.group(name))
                 .and_then(|group| group.check_url.as_deref())
                 .or_else(|| config.global.tcp_check_url.first().map(String::as_str))
                 .ok_or_else(|| configured("No HTTP check URL is configured", &URLS))?;
@@ -398,7 +398,7 @@ pub(super) fn selections(
 ) -> TransportMap<Option<String>> {
     let pick = |network| {
         group
-            .and_then(|name| manager.native_selection(name, network))
+            .and_then(|name| manager.peek_selection(name, network))
             .and_then(|selection| member_id(selection.member, identity))
     };
     TransportMap {
@@ -426,7 +426,7 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
             .as_ref()
             .map(|(host, port)| (host.as_str(), *port))
             .unwrap_or((candidate.node.host(), candidate.node.port));
-        if !policy.port(context.spec.kind, port, https) {
+        if !policy.port(port, context.spec.kind.default_port(https)) {
             return Err(unsupported(
                 "The probe destination port is not permitted",
                 json!({"check":"port","settings":["probe_allowed_ports"]}),

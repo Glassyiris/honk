@@ -30,6 +30,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use uuid::Uuid;
 
 use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
+use crate::observe::MAX_SAFE_UINT;
 
 pub(super) const MAX_EVENTS: usize = 512;
 pub(super) const MAX_CLIENTS: usize = 16;
@@ -38,17 +39,52 @@ const MAX_PAYLOAD_BYTES: usize = 4096;
 const MAX_RETAINED_BYTES: usize = MAX_EVENTS * MAX_PAYLOAD_BYTES;
 pub(super) const RETENTION: Duration = Duration::from_secs(60);
 pub(super) const HEARTBEAT: Duration = Duration::from_secs(15);
-const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 // Signed cursors distinguish an after-record checkpoint from the record itself.
 const CHECKPOINT_BIT: u64 = 1 << 63;
-const KINDS: [&str; 6] = [
-    "stream.ready",
-    "runtime.updated",
-    "flow.updated",
-    "flow.gap",
-    "operation.updated",
-    "generation.changed",
+
+/// Notification kinds; the discriminant is the `kinds` filter bit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    StreamReady,
+    RuntimeUpdated,
+    FlowUpdated,
+    FlowGap,
+    OperationUpdated,
+    GenerationChanged,
+    Log,
+}
+
+/// The kinds an event subscriber may filter on.
+const KINDS: [Kind; 6] = [
+    Kind::StreamReady,
+    Kind::RuntimeUpdated,
+    Kind::FlowUpdated,
+    Kind::FlowGap,
+    Kind::OperationUpdated,
+    Kind::GenerationChanged,
 ];
+
+impl Kind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::StreamReady => "stream.ready",
+            Self::RuntimeUpdated => "runtime.updated",
+            Self::FlowUpdated => "flow.updated",
+            Self::FlowGap => "flow.gap",
+            Self::OperationUpdated => "operation.updated",
+            Self::GenerationChanged => "generation.changed",
+            Self::Log => "log",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        KINDS.into_iter().find(|kind| kind.name() == name)
+    }
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamKind {
@@ -104,10 +140,10 @@ impl Filter {
                         .is_none_or(|target| module.starts_with(target))
             });
         }
-        self.kinds & (1 << record.kind) != 0
-            && (!matches!(record.kind, 2 | 3)
+        self.kinds & record.kind.bit() != 0
+            && (!matches!(record.kind, Kind::FlowUpdated | Kind::FlowGap)
                 || self.flow_id.is_none()
-                || (record.kind == 3 && record.flow_id.is_none())
+                || (record.kind == Kind::FlowGap && record.flow_id.is_none())
                 || self.flow_id.as_deref() == record.flow_id.as_deref())
     }
 }
@@ -117,7 +153,7 @@ struct Record {
     stamp: u64,
     nonce: [u8; 16],
     created: Instant,
-    kind: usize,
+    kind: Kind,
     flow_id: Option<String>,
     logs: Option<(u8, &'static str)>,
     payload: Bytes,
@@ -264,7 +300,7 @@ impl EventHub {
                     href: format!("/api/v1/flows/{resource_id}"),
                 };
                 (
-                    2,
+                    Kind::FlowUpdated,
                     Bytes::from(serde_json::to_vec(&update).expect("event data is serializable")),
                 )
             });
@@ -272,7 +308,12 @@ impl EventHub {
     }
 
     pub(super) fn publish_log(&self, level: u8, target: &'static str, payload: Bytes, epoch: u64) {
-        self.publish_record(Some((0, payload)), None, Some((level, target)), epoch);
+        self.publish_record(
+            Some((Kind::Log, payload)),
+            None,
+            Some((level, target)),
+            epoch,
+        );
     }
 
     pub(super) fn reject_log(&self, epoch: u64) {
@@ -281,7 +322,7 @@ impl EventHub {
 
     fn publish_record(
         &self,
-        payload: Option<(usize, Bytes)>,
+        payload: Option<(Kind, Bytes)>,
         flow_id: Option<&str>,
         logs: Option<(u8, &'static str)>,
         epoch: u64,
@@ -339,11 +380,10 @@ impl EventHub {
             if subscriber.closed || !subscriber.filter.matches(&record) {
                 continue;
             }
-            if record.kind == 2
-                && let Some(index) = subscriber
-                    .queue
-                    .iter()
-                    .position(|queued| queued.kind == 2 && queued.flow_id == record.flow_id)
+            if record.kind == Kind::FlowUpdated
+                && let Some(index) = subscriber.queue.iter().position(|queued| {
+                    queued.kind == Kind::FlowUpdated && queued.flow_id == record.flow_id
+                })
             {
                 // Reappend at the tail: replacing in place would reorder signed cursors.
                 subscriber.queue.remove(index);
@@ -364,7 +404,7 @@ impl EventHub {
         state
             .records
             .iter()
-            .map(|record| KINDS[record.kind])
+            .map(|record| record.kind.name())
             .collect()
     }
 
@@ -409,18 +449,18 @@ impl EventHub {
         }
     }
 
-    fn payload(&self, kind: &str, data: &Value, flow_id: Option<&str>) -> Option<(usize, Bytes)> {
-        let kind = KINDS.iter().position(|candidate| *candidate == kind)?;
+    fn payload(&self, kind: &str, data: &Value, flow_id: Option<&str>) -> Option<(Kind, Bytes)> {
+        let kind = Kind::parse(kind)?;
         let mut payload = json!({
             "instance_id": self.instance_id,
             "observed_at": timestamp(SystemTime::now()),
         });
         let object = payload.as_object_mut()?;
         match kind {
-            1 if flow_id.is_none() => {
+            Kind::RuntimeUpdated if flow_id.is_none() => {
                 object.insert("href".into(), json!("/api/v1/runtime"));
             }
-            3 => {
+            Kind::FlowGap => {
                 let resource = data.get("resource_id")?;
                 let id = if resource.is_null() {
                     None
@@ -430,8 +470,7 @@ impl EventHub {
                 let reason = data.get("reason")?.as_str()?;
                 let dropped = data.get("dropped_records")?;
                 if id != flow_id
-                    || !["buffer_overflow", "sampled", "evicted", "recording_changed"]
-                        .contains(&reason)
+                    || !["buffer_overflow", "evicted", "recording_changed"].contains(&reason)
                     || !nullable_uint64(dropped)
                 {
                     return None;
@@ -440,7 +479,7 @@ impl EventHub {
                 object.insert("reason".into(), json!(reason));
                 object.insert("dropped_records".into(), dropped.clone());
             }
-            4 if flow_id.is_none() => {
+            Kind::OperationUpdated if flow_id.is_none() => {
                 let id = identifier(data.get("resource_id")?.as_str()?)?;
                 let status = data.get("status")?.as_str()?;
                 if !["queued", "running", "succeeded", "failed"].contains(&status) {
@@ -450,7 +489,7 @@ impl EventHub {
                 object.insert("status".into(), json!(status));
                 object.insert("href".into(), json!(format!("/api/v1/operations/{id}")));
             }
-            5 if flow_id.is_none() => {
+            Kind::GenerationChanged if flow_id.is_none() => {
                 for field in ["previous_generation_id", "generation_id"] {
                     object.insert(field.into(), json!(identifier(data.get(field)?.as_str()?)?));
                 }
@@ -716,15 +755,7 @@ fn record_frame(signer: &Hkdf<Sha256>, record: &Record, filter: &Filter) -> Byte
         &record.nonce,
         &filter.binding,
     );
-    frame(
-        if record.logs.is_some() {
-            "log"
-        } else {
-            KINDS[record.kind]
-        },
-        &cursor,
-        &record.payload,
-    )
+    frame(record.kind.name(), &cursor, &record.payload)
 }
 
 fn frame(kind: &str, cursor: &str, payload: &[u8]) -> Bytes {
@@ -785,14 +816,11 @@ fn request_options(
     let kinds = if let Some(kinds) = values.get("kinds") {
         let mut mask = 0;
         for kind in kinds.split(',') {
-            let bit = KINDS
-                .iter()
-                .position(|candidate| *candidate == kind)
-                .ok_or_else(|| invalid(id))?;
-            if mask & (1 << bit) != 0 {
+            let bit = Kind::parse(kind).ok_or_else(|| invalid(id))?.bit();
+            if mask & bit != 0 {
                 return Err(invalid(id));
             }
-            mask |= 1 << bit;
+            mask |= bit;
         }
         mask
     } else {
@@ -805,7 +833,7 @@ fn request_options(
     {
         return Err(invalid(id));
     }
-    let flow_demand = kinds & ((1 << 2) | (1 << 3)) != 0
+    let flow_demand = kinds & (Kind::FlowUpdated.bit() | Kind::FlowGap.bit()) != 0
         && (values.contains_key("kinds")
             || flow_id.as_ref().is_some_and(|id| !id.trim().is_empty()));
     Ok((

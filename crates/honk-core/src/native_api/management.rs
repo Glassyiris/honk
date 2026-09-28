@@ -48,8 +48,7 @@ impl ProviderCreate {
 pub(super) enum Action {
     CreateNode,
     CreateProvider,
-    DeleteNode(String),
-    DeleteProvider(String),
+    Delete(Mutation),
 }
 
 pub(super) enum Mutation {
@@ -147,6 +146,44 @@ pub(super) fn activation_error(
             "durability_confirmed":durability,"committed":committed}))
 }
 
+/// The management error contract: every failure carries activation details, and
+/// anything but a request-shaped rejection of a create is retryable unavailability.
+fn contract_error(mut error: ApiError, deleting: bool) -> ApiError {
+    let stage = match error.status {
+        StatusCode::PRECONDITION_FAILED => "revision_conflict",
+        StatusCode::UNPROCESSABLE_ENTITY => "validation",
+        StatusCode::CONFLICT => "state_conflict",
+        StatusCode::NOT_FOUND => "capability",
+        _ => "admission",
+    };
+    if !matches!(
+        error.status,
+        StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
+    ) && (deleting
+        || !matches!(
+            error.status,
+            StatusCode::CONFLICT
+                | StatusCode::UNPROCESSABLE_ENTITY
+                | StatusCode::BAD_REQUEST
+                | StatusCode::PAYLOAD_TOO_LARGE
+                | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        ))
+    {
+        error.status = StatusCode::SERVICE_UNAVAILABLE;
+        error.error.code = ErrorCode::TemporarilyUnavailable;
+    }
+    let details = error.error.details.get_or_insert_with(|| json!({}));
+    if let Some(details) = details.as_object_mut() {
+        details.entry("stage").or_insert(json!(stage));
+        details.entry("written").or_insert(json!(false));
+        details
+            .entry("durability_confirmed")
+            .or_insert(json!(false));
+        details.entry("committed").or_insert(json!(false));
+    }
+    error
+}
+
 pub(super) async fn mutate(
     state: &Arc<NativeState>,
     action: Action,
@@ -156,7 +193,7 @@ pub(super) async fn mutate(
     if !state.observation.configuration.can_manage() {
         return Err(unsupported());
     }
-    let deleting = matches!(action, Action::DeleteNode(_) | Action::DeleteProvider(_));
+    let deleting = matches!(action, Action::Delete(_));
     let result = async {
         parse_query(request.uri(), &[], id)?;
         if !deleting {
@@ -164,11 +201,10 @@ pub(super) async fn mutate(
         }
         let body = super::body::buffered(request.into_body()).await;
         let mutation = match action {
-            Action::DeleteNode(_) | Action::DeleteProvider(_) if !body.is_empty() => {
+            Action::Delete(_) if !body.is_empty() => {
                 return Err(invalid());
             }
-            Action::DeleteNode(target) => Mutation::DeleteNode(target),
-            Action::DeleteProvider(target) => Mutation::DeleteProvider(target),
+            Action::Delete(mutation) => mutation,
             Action::CreateNode => {
                 let input: NodeCreate = super::body::decode(&body, invalid)?;
                 if !(1..=64).contains(&input.name.chars().count()) {
@@ -258,5 +294,5 @@ pub(super) async fn mutate(
         Ok(completion.response())
     }
     .await;
-    result.map_err(|error| error.for_management(deleting))
+    result.map_err(|error| contract_error(error, deleting))
 }

@@ -38,7 +38,7 @@ pub(in crate::native_api) async fn export(
     }
     let inlined = inline_sources(&sources).map_err(|_| unavailable())?;
     let (inlined, _) = ListenerSecrets::from_config(&config)
-        .with_clash(&state.clash_secret)
+        .with_secret(&service.clash_secret)
         .mask(&inlined);
     let body = if omitted {
         format!("# listener secrets omitted\n{inlined}")
@@ -132,19 +132,15 @@ pub(in crate::native_api) async fn import(
             None,
         ));
     }
-    let reservation = service.operations.reserve(
-        state.principal(),
+    admit(
+        state,
         "POST",
         "/api/v1/config/import",
         Some(&key),
         &bytes,
-        crate::native_api::operations::OperationKind::Reload,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        service.enqueue(Work::Import { reservation })?;
-    }
-    Ok(admission.await?.into_response())
+        |reservation| Work::Import { reservation },
+    )
+    .await
 }
 
 pub(in crate::native_api) async fn activate(
@@ -180,22 +176,18 @@ pub(in crate::native_api) async fn activate(
         Ok(false) => return Err(not_found()),
         Err(_) => return Err(unavailable().with_details(json!({"stage":"store"}))),
     }
-    let reservation = service.operations.reserve(
-        state.principal(),
+    admit(
+        state,
         "POST",
         &path,
         key.as_deref(),
         &bytes,
-        crate::native_api::operations::OperationKind::Reload,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        service.enqueue(Work::ActivateRevision {
+        |reservation| Work::ActivateRevision {
             number,
             reservation,
-        })?;
-    }
-    Ok(admission.await?.into_response())
+        },
+    )
+    .await
 }
 
 fn precondition_required() -> ApiError {
