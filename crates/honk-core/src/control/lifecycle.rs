@@ -379,7 +379,7 @@ impl ControlPlane {
                     .native_api
                     .record_flows;
             #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            let mut trace_unavailable = false;
+            let mut trace_error = None;
             let state = UdpLoopState::new(self, daens_netns_exists());
             for (socket, family) in epoch
                 .listeners
@@ -395,9 +395,9 @@ impl ControlPlane {
                 let mut batch = batch;
                 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
                 if record_flows
-                    && !enable_receive_trace(&self.ebpf, &mut batch, &socket, family).await
+                    && let Err(error) = enable_receive_trace(&self.ebpf, &mut batch, &socket).await
                 {
-                    trace_unavailable = true;
+                    trace_error.get_or_insert(error);
                 }
                 let mut stopping = epoch.stop.subscribe();
                 let mut exit = CriticalTaskExit {
@@ -413,8 +413,13 @@ impl ControlPlane {
                     }
                 });
             }
+            // Every listener socket fails for the same reason; say it once.
             #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            record_udp_trace(&self.degradations, trace_unavailable);
+            if let Some(error) = &trace_error {
+                warn!(%error, "UDP receive trace unavailable");
+            }
+            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            record_udp_trace(&self.degradations, trace_error.is_some());
             epoch.removals = Some(spawn_udp_removal_worker(
                 self.udp_pool.clone(),
                 self.ebpf.clone(),
@@ -550,19 +555,12 @@ async fn enable_receive_trace(
     ebpf: &RwLock<Box<dyn EbpfBackend>>,
     batch: &mut sockets::UdpRecvBatch,
     socket: &tokio::net::UdpSocket,
-    family: &str,
-) -> bool {
+) -> std::io::Result<()> {
     if batch.enable_trace(socket, None).is_ok() {
-        return true;
+        return Ok(());
     }
     let trace = ebpf.write().await.receive_trace();
-    match batch.enable_trace(socket, trace) {
-        Ok(()) => true,
-        Err(error) => {
-            warn!(family, %error, "UDP receive trace unavailable");
-            false
-        }
-    }
+    batch.enable_trace(socket, trace)
 }
 
 /// Kernel UDP receive tracing is only needed while flows are recorded.

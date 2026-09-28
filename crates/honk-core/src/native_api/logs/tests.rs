@@ -286,6 +286,7 @@ async fn disabled_capture_skips_field_evaluation_and_dynamic_level_is_independen
         tracing_subscriber::registry()
             .with(crate::console_log_layer(
                 false,
+                false,
                 io::sink,
                 tracing_subscriber::EnvFilter::new("error"),
             ))
