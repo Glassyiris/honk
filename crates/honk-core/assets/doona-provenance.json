@@ -17,7 +17,8 @@
     "pnpm build",
     "SOURCE_DATE_EPOCH=1790423166 pnpm package (GNU tar and gzip)"
   ],
-  "source_archive": "doona-source.tar.gz",
+  "source_url": "https://github.com/Zakkaus/doona/tree/v0.1.0-beta.6",
+  "source_archive_command": "git archive --format=tar --prefix=doona/ ad130fbd88a279531667601a059d999eecf195ed | gzip -n",
   "source_sha256": "ac7bcad2e8202a3b4cae502fe1614e5ea016c6da36f585ef0d9a472274efb8c2",
   "upstream_program_tar_sha256": "749d73b3a75aab43518783a75a0dfb27b00b1c8020e54c53e12eac609767fd6c",
   "upstream_fonts_tar_sha256": "ca6abb766831ac174b5cb37f6341e66df62f1fc0ea46dfe1220744aa17623d62",
