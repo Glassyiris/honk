@@ -308,6 +308,17 @@ impl DomainRegistry {
         self.0.push(matcher);
         Ok(id)
     }
+
+    /// Geosite keys copy the whole expansion and are read only by interning
+    /// and the policy fingerprint, so they are released before routing starts.
+    fn into_runtime(mut self) -> Arc<[DomainMatcher]> {
+        for matcher in &mut self.0 {
+            if let DomainMatcher::Geosite { key, .. } = matcher {
+                key.alternatives = Vec::new();
+            }
+        }
+        self.0.into()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -548,7 +559,7 @@ impl Router {
                 requirements,
             ),
             fallback,
-            domain_matchers: registry.0.into(),
+            domain_matchers: registry.into_runtime(),
             direct_marks: direct_marks.into(),
             policy_fingerprint,
         })
