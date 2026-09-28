@@ -101,12 +101,14 @@ mod routed {
                 && let Some(location) = reply.location
             {
                 redirects += 1;
-                let mut next = url.join(location.to_str()?)?;
-                strip_userinfo(&mut next);
+                // The bound comes first, as on the direct fetch, so a hop
+                // past it fails the same way whatever its Location holds.
                 anyhow::ensure!(
                     redirects <= super::super::MAX_SUBSCRIPTION_REDIRECTS,
                     "subscription redirected too many times"
                 );
+                let mut next = url.join(location.to_str()?)?;
+                strip_userinfo(&mut next);
                 if let Some(reason) = super::super::subscription_redirect_error(&origin, &next) {
                     anyhow::bail!(reason);
                 }

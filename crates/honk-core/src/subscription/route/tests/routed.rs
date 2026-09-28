@@ -524,6 +524,37 @@ async fn a_followed_redirect_with_a_location_that_is_not_text_fails() {
     assert!(direct.is_err(), "direct fetch took the redirect body");
 }
 
+/// A redirect past the bound fails on the bound on both paths, before its
+/// Location is read, even when that Location would fail on its own.
+#[tokio::test]
+async fn a_sixth_redirect_fails_on_the_bound_before_its_location_is_checked() {
+    let (address, _) = serve(|path| match path {
+        "/sub" => redirect("302 Found", "/1").into_bytes(),
+        "/5" => b"HTTP/1.1 302 Found\r\nLocation: /n\xffxt\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        path => {
+            let hop: u8 = path[1..].parse().unwrap();
+            redirect("302 Found", &format!("/{}", hop + 1)).into_bytes()
+        }
+    })
+    .await;
+    let (routing, _) = routing("direct");
+    let routed = manager(routing)
+        .fetch(&subscription(address, ""))
+        .await
+        .unwrap_err();
+    let direct = SubscriptionManager::new()
+        .unwrap()
+        .fetch(&subscription(address, "direct"))
+        .await
+        .unwrap_err();
+    for error in [routed, direct] {
+        assert!(
+            format!("{error:#}").contains("redirected too many times"),
+            "{error:#}"
+        );
+    }
+}
+
 /// The request asks for identity, so an answer that names identity is
 /// taken and one that names a real encoding is not.
 #[tokio::test]
