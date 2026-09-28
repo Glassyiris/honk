@@ -108,6 +108,7 @@ fn histories_bound_capacity_age_and_allocate_nothing_when_disabled() {
         MemoryReading {
             rss: Some(4096),
             cgroup: None,
+            ebpf: None,
         },
         base,
         now,
@@ -220,9 +221,15 @@ async fn memory_reads_real_files_and_preserves_unavailable_metrics() {
         "low 0\nhigh 2\nmax 0\noom 3\noom_kill 4\n",
     )
     .unwrap();
+    std::fs::write(
+        cgroup.join("cgroup.procs"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
     let reading = read_memory(&proc_self).await;
     assert_eq!(reading.rss, Some(4097 * 1024));
     let group = reading.cgroup.as_ref().unwrap();
+    assert_eq!(group.scope, "service");
     assert_eq!(group.current, Some(8589934593));
     assert_eq!(group.limit, None);
     assert!(group.limit_readable);
@@ -276,4 +283,80 @@ async fn sampler_observes_linux_process_without_enabling_history() {
     assert!(!samples.metrics.contains(&"kernel.ebpf_bytes"));
     assert!(samples.traffic.is_none());
     assert!(samples.memory.is_none());
+}
+
+#[tokio::test]
+async fn cgroup_scope_distinguishes_service_shared_and_unreadable() {
+    let fixture = tempfile::tempdir().unwrap();
+    let group = fixture.path();
+    let own = format!("{}\n", std::process::id());
+    assert_eq!(cgroup_scope(group).await, "unknown");
+    std::fs::write(group.join("cgroup.procs"), "").unwrap();
+    assert_eq!(cgroup_scope(group).await, "unknown");
+    std::fs::write(group.join("cgroup.procs"), &own).unwrap();
+    std::fs::write(group.join("memory.current"), "1\n").unwrap();
+    assert_eq!(cgroup_scope(group).await, "service");
+    std::fs::create_dir(group.join("child")).unwrap();
+    assert_eq!(cgroup_scope(group).await, "shared");
+    std::fs::remove_dir(group.join("child")).unwrap();
+    std::fs::write(group.join("cgroup.procs"), format!("1\n{own}")).unwrap();
+    assert_eq!(cgroup_scope(group).await, "shared");
+    std::fs::write(
+        group.join("cgroup.procs"),
+        format!("{own}{}\n", "9".repeat(4096)),
+    )
+    .unwrap();
+    assert_eq!(cgroup_scope(group).await, "shared");
+}
+
+#[tokio::test]
+async fn ebpf_bytes_sum_memlock_of_own_bpf_fds_only() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let proc_self = fixture.path();
+    let (fd, fdinfo) = (proc_self.join("fd"), proc_self.join("fdinfo"));
+    std::fs::create_dir(&fd).unwrap();
+    std::fs::create_dir(&fdinfo).unwrap();
+    assert_eq!(ebpf_bytes(proc_self), None);
+    let entries = [
+        (
+            "3",
+            "anon_inode:bpf-map",
+            Some("pos:\t0\nmap_type:\t1\nmemlock:\t4096\n"),
+        ),
+        (
+            "4",
+            "anon_inode:bpf-prog",
+            Some("prog_type:\t3\nmemlock:\t8192\n"),
+        ),
+        (
+            "5",
+            "socket:[77]",
+            Some("map_type:\t1\nmemlock:\t1000000\n"),
+        ),
+        (
+            "6",
+            "anon_inode:bpf-map",
+            Some("pos:\t0\nmemlock:\t1000000\n"),
+        ),
+        ("7", "anon_inode:bpf-map", None),
+    ];
+    for (name, target, info) in entries {
+        symlink(target, fd.join(name)).unwrap();
+        if let Some(info) = info {
+            std::fs::write(fdinfo.join(name), info).unwrap();
+        }
+    }
+    assert_eq!(ebpf_bytes(proc_self), Some(4096 + 8192));
+    let reading = read_memory(proc_self).await;
+    assert_eq!(reading.ebpf.map(|(bytes, _)| bytes), Some(12288));
+    assert!(
+        reading
+            .metrics()
+            .any(|metric| metric == "kernel.ebpf_bytes")
+    );
+    for name in ["3", "4"] {
+        std::fs::remove_file(fdinfo.join(name)).unwrap();
+    }
+    assert_eq!(ebpf_bytes(proc_self), None);
 }
