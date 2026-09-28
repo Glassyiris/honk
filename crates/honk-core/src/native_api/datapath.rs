@@ -201,8 +201,8 @@ pub(super) fn summary(
             },
             last_error: observation
                 .errors
-                .first()
-                .map(|error| safe_error(*error).message),
+                .last()
+                .map(|error| safe_error(*error).code),
             checked_at: timestamp(observation.checked_at),
         }),
     }
@@ -364,6 +364,7 @@ mod tests {
         assert_eq!(body["state"], "degraded");
         assert!(body["ebpf"]["routing"]["generation_id"].is_null());
         assert_eq!(body["errors"][0]["code"], "routing_observation_failed");
+        assert_eq!(body["ebpf"]["last_error"], "map_observation_failed");
         assert!(!body.to_string().contains("/sys/fs/bpf"));
     }
 

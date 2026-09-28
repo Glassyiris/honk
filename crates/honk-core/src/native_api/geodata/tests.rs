@@ -517,3 +517,67 @@ async fn a_trickle_ends_at_the_download_limit() {
     assert_eq!(failure, Failure::from("download_timeout"));
     assert_eq!(started.elapsed(), DOWNLOAD_LIMIT);
 }
+
+#[test]
+fn a_display_url_keeps_nothing_that_may_hold_a_credential() {
+    for (url, shown) in [
+        (
+            "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat",
+            Some("https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"),
+        ),
+        (
+            "https://example.com/geoip.dat?sig=abc&key=xyz",
+            Some("https://example.com/geoip.dat"),
+        ),
+        (
+            "https://example.com/token/abc123/geoip.dat",
+            Some("https://example.com/token/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://raw.githubusercontent.com/o/r/0123456789abcdef0123456789abcdef01234567/geoip.dat",
+            Some(
+                "https://raw.githubusercontent.com/o/r/0123456789abcdef0123456789abcdef01234567/geoip.dat",
+            ),
+        ),
+        (
+            "https://example.com/d/0F3C9A7E-51b2-4c1d-9e8f-2a6b7c8d9e0f/geoip.dat",
+            Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/s/0123456789abcdef0123456789abcdef/geoip.dat",
+            Some("https://example.com/s/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/release-2026-09-29/geoip.dat",
+            Some("https://example.com/release-2026-09-29/geoip.dat"),
+        ),
+        (
+            "https://example.com/20260929120000123/geoip.dat",
+            Some("https://example.com/20260929120000123/geoip.dat"),
+        ),
+        (
+            "https://example.com/d/Xk7pQ2mZ9vLb4RtY8wNc3HsJ/geoip.dat",
+            Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/d/ghp_16C7e42F292c6912E7710c838347Ae178B4a/geoip.dat",
+            Some("https://example.com/d/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/auth_token/v4lue/geoip.dat",
+            Some("https://example.com/auth_token/[redacted]/geoip.dat"),
+        ),
+        (
+            "https://example.com/token/",
+            Some("https://example.com/token/"),
+        ),
+        (
+            "https://example.com/bot123:abc/geoip.dat",
+            Some("https://example.com/[redacted]/geoip.dat"),
+        ),
+        ("https://user:pass@example.com/geoip.dat", None),
+        ("https://user@example.com/geoip.dat", None),
+    ] {
+        assert_eq!(display_url(url, |_| false).as_deref(), shown, "{url}");
+    }
+}
