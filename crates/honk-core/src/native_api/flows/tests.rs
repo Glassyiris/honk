@@ -383,6 +383,15 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
 }
 
 #[test]
+fn a_snapshot_over_its_budget_is_snapshot_unavailable() {
+    error_code(
+        super::snapshot_busy(&request_id()),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "snapshot_unavailable",
+    );
+}
+
+#[test]
 fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     let store = store();
     store.set_limits(64, 1);

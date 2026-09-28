@@ -922,7 +922,7 @@ fn snapshot_expired(id: &RequestId) -> ApiError {
 fn snapshot_busy(id: &RequestId) -> ApiError {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
-        ErrorCode::TemporarilyUnavailable,
+        ErrorCode::SnapshotUnavailable,
         "Flow snapshot capacity is full",
         id,
     )

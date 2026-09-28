@@ -73,10 +73,9 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     expected_ids.sort();
 
     for query in ["", "?type=TXT"] {
-        assert_eq!(
-            cache_page(&state, query).await.0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        let (status, body) = cache_page(&state, query).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "snapshot_unavailable");
     }
     for query in ["?name=missing.example", "?domain=missing", "?type=AAAA"] {
         let (status, page) = cache_page(&state, query).await;
