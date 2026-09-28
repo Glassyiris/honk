@@ -74,16 +74,6 @@ async fn discovery_reports_the_mode_and_setup_state() {
         }),
         "a caller without a session sees only how to sign in"
     );
-    let alias: Value = app
-        .client
-        .get(app.url("/api/v1/discovery"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(alias, body, "the alias answers exactly as /api does");
     error_response(
         app.client
             .get(app.url("/api/v1/version"))

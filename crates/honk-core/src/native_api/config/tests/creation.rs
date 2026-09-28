@@ -217,7 +217,7 @@ async fn database_store_records_the_new_source_as_a_revision() {
     let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
     assert!(listed(&fixture.get(CONFIG).await, NEW));
-    let list = fixture.get("/api/v1/config/revisions").await;
+    let list = fixture.get("/api/v1/x-honk/config/revisions").await;
     assert_eq!(list["active"], 2);
     assert_eq!(list["revisions"][0]["revision"], 2);
     assert!(

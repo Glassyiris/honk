@@ -358,7 +358,7 @@ async fn authentication_precedes_capability_and_query_validation() {
         (Method::GET, "/api/v1/config"),
         (Method::GET, "/api/v1/missing"),
         (Method::GET, "/api/v1/runtime?unknown=x"),
-        (Method::GET, "/api/v1/runtime/mode?unknown=x"),
+        (Method::GET, "/api/v1/x-honk/runtime/mode?unknown=x"),
         (Method::POST, "/api/v1/runtime"),
     ] {
         error_response(
@@ -421,22 +421,45 @@ async fn authentication_precedes_capability_and_query_validation() {
 async fn discovery_withholds_detail_from_callers_without_a_credential() {
     let app = TestApp::new(|_| {}).await;
     // Without a credential a caller learns only how to sign in.
-    for path in ["/api", "/api/v1/discovery"] {
-        let public = response_json(app.client.get(app.url(path)).send().await.unwrap()).await;
-        assert_eq!(
-            public,
-            serde_json::json!({
-                "name": "daeuniverse/native",
-                "api_major": 1,
-                "links": {"auth_setup": null, "auth_login": null},
-                "auth": {"mode": "token", "setup_required": false},
-            }),
-            "{path}"
-        );
-    }
+    let public = response_json(app.client.get(app.url("/api")).send().await.unwrap()).await;
+    assert_eq!(
+        public,
+        serde_json::json!({
+            "name": "daeuniverse/native",
+            "api_major": 1,
+            "links": {"auth_setup": null, "auth_login": null},
+            "auth": {"mode": "token", "setup_required": false},
+        })
+    );
+    // The contract serves discovery at one path only.
+    let alias = app.get("/api/v1/discovery").send().await.unwrap();
+    assert_eq!(alias.status(), StatusCode::NOT_FOUND);
     let full = response_json(app.get("/api").send().await.unwrap()).await;
     assert_eq!(full["name"], "daeuniverse/native");
     assert_eq!(full["status"], "draft");
+    assert_eq!(
+        full["links"]["x-honk"],
+        serde_json::json!({
+            "config_export": "/api/v1/x-honk/config/export",
+            "config_import": "/api/v1/x-honk/config/import",
+            "config_revisions": "/api/v1/x-honk/config/revisions",
+        })
+    );
+    assert!(full["links"].get("config_export").is_none());
+    let resources =
+        response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await["resources"]
+            .take();
+    for key in [
+        "config_export",
+        "config_import",
+        "config_revisions",
+        "runtime_mode",
+    ] {
+        assert!(resources.get(key).is_none(), "{key}");
+        assert!(resources["x-honk"][key]["available"].is_boolean(), "{key}");
+    }
+    assert!(resources["config"].get("store").is_none());
+    assert_eq!(resources["config"]["x-honk"]["store"], "file");
     let version = response_json(app.get("/api/v1/version").send().await.unwrap()).await;
     assert_eq!(version["api"]["name"], "daeuniverse/native");
     assert_eq!(version["engine"]["name"], "honk");
@@ -666,7 +689,7 @@ async fn preflight_uses_route_methods_but_never_grants_authorization() {
         ("/api/v1/connections", "DELETE"),
         ("/api/v1/providers/raw%2Fid/refresh", "POST"),
         ("/api/v1/dns/cache/flush", "POST"),
-        ("/api/v1/runtime/mode", "PUT"),
+        ("/api/v1/x-honk/runtime/mode", "PUT"),
     ] {
         let response = preflight(path, method).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -780,12 +803,12 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
         ),
         (
             Method::GET,
-            "/api/v1/runtime/mode?unknown=x",
+            "/api/v1/x-honk/runtime/mode?unknown=x",
             "capability_not_supported",
         ),
         (
             Method::PUT,
-            "/api/v1/runtime/mode",
+            "/api/v1/x-honk/runtime/mode",
             "capability_not_supported",
         ),
         (
@@ -816,7 +839,7 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
     for (path, status) in [
         ("/api", StatusCode::OK),
         ("/api/v1/config", StatusCode::NOT_FOUND),
-        ("/api/v1/runtime/mode", StatusCode::NOT_FOUND),
+        ("/api/v1/x-honk/runtime/mode", StatusCode::NOT_FOUND),
         ("/api/v1/missing", StatusCode::NOT_FOUND),
     ] {
         let get = app.get(path).send().await.unwrap();
