@@ -2,7 +2,7 @@
 
 The native and Clash APIs have independent features, listeners, credentials, and HTTP boundaries; both reuse the same engine handles and userspace statistics.
 
-## Native API (M1)
+## Native API
 
 The `native-api` Cargo feature is included in default builds and both release allocator variants; the listener remains disabled until [`experimental.native_api`](./experimental.md#native_api) is enabled. `--no-default-features --features native-api` works without Clash. `.dae` remains the configuration format. Source administration edits the `-c` files, or with `--store db` records revisions in a SQLite configuration db ([Configuration db](#configuration-db---store-db)).
 
@@ -118,7 +118,7 @@ There is no HTTP password reset. To recover access, stop honk, run `honk-core ad
 
 Reset takes the exclusive state-directory lock before checking whether the database exists, so it cannot race the first startup's legacy import. Legacy credential files must still pass ownership, mode and regular-file checks.
 
-### Recorded userspace flows (M2)
+### Recorded userspace flows
 
 Admitted anonymous loopback requests read the same flow data as bearer-authenticated requests.
 
@@ -140,7 +140,7 @@ Native extension fields retain source detail without inventing identities: route
 
 Flow list filters are `network`, `state`, `connection_id`, `detail`, `limit` and `cursor`. Eight bounded immutable snapshots live for at most 30 seconds; cursors bind instance and original filters/detail. A full snapshot table evicts the oldest snapshot; exhausted retained-byte capacity returns 503 with Retry-After. Expired or evicted list snapshots return `410 snapshot_expired`, known retained tombstones `410 flow_expired`, unknown IDs `404 resource_not_found`. Detail has no query parameters and always includes full retained input/trace. Counters are decimal strings; revisions, sequence and elapsed microseconds are safe JSON integers. Display fields preserve paths, `@` and URLs within the 512-byte `MAX_TEXT` bound; identifiers retain their separate validation. Unrepresentable or oversized text and step/byte overflow remain explicit partial evidence, without discarding causal IDs or outcomes. Retained rule displays belong to the captured generation and are never rebuilt from current configuration.
 
-### Nodes and groups (M3)
+### Nodes and groups
 
 Node reads accept `group_id`, `limit` (1–1000) and `cursor`; filtering is direct membership, not recursive leaves. Node pages freeze observations across up to eight snapshots, 30 seconds and 4 MiB; a page that cannot fit returns `503 snapshot_unavailable` with `Retry-After`. Invalidated or filter-mismatched node cursors return 400. Groups return a summary array; detail returns a quoted ETag matching its configuration-only revision. Group IDs are random process-lifetime identities: same-name reload/reorder retains them, removal/readdition creates new IDs, and restart requires rediscovery. They are not positional config UUIDs or name hashes.
 
@@ -155,7 +155,7 @@ Health rows are completed, qualified producer observations—not optimistic aliv
 
 Patch availability and `mutable_config` depend on the actual source's write permission; without it, `mutable_config` is empty and PATCH returns `404 capability_not_supported`. This is a parser-span edit of the authorized source, followed by full offline admission, durable replacement and a 202 reload operation—not an in-memory Group edit. The accepted group/config revision is checked before writing and again under the reload lock before activation; source disk hashes and dependency topology are independently fenced. A provider publication racing after the write can leave `written:true,committed:false`; no rollback is promised. A group ETag is not a source-file SHA-256. Icons, names, filters and membership are not PATCH fields; edit their authorized source instead.
 
-### Native events (M4)
+### Native events
 
 Use streaming fetch with Bearer and `Accept: text/event-stream`; browser EventSource cannot supply the required Authorization header. Optional `kinds` and `flow_id` filters bind the resume cursor. The store retains 512 events for at most 60 seconds, with 16 clients and 64 queued live events per client; a full client queue disconnects rather than silently skipping. Heartbeat comments arrive every 15 seconds. Every stream sends ready first. On a valid resume, ready keeps the supplied cursor, retained replay then advances it, and live events follow without an attachment gap. Expired, unknown, previous-instance or changed-filter cursors return `409 event_cursor_expired` before HTTP 200.
 
@@ -167,7 +167,7 @@ Published events are `stream.ready`, `runtime.updated`, `flow.updated`, `flow.ga
 
 Event capture is active while a client is attached or a permitted recorder is explicitly pinned on. An idle hub still admits new streams. Stopping capture invalidates earlier event cursors. `flow.gap` with `reason=recording_changed` marks lost continuity across manual or automatic recording transitions when events are active; it does not count packet loss or uncaptured flows. A sleeping hub does not replay its shutdown gap; reattachment starts a fresh boundary.
 
-### Outbound counters and telemetry (M5)
+### Outbound counters and telemetry
 
 `runtime/outbounds` retains `kind` (`builtin`, `node` or `group`) alongside `name`: names can collide across kinds, so do not key rows by name alone. Cumulative connections, bytes and errors are full 64-bit decimal strings; active connections are safe JSON integers. Counters share the engine's existing statistics lifetime and survive reload, rather than resetting with a dashboard or listener request.
 
@@ -177,7 +177,7 @@ Traffic and memory histories use the existing one-second sampler with missed tic
 
 RSS comes from `/proc/self/status`. Cgroup-v2 membership and mount discovery select the actual `memory.current`, `memory.max` and `memory.events` files; unreadable/unknown values are null, not zero or substituted RSS. An unlimited `memory.max` also has a null limit. Cgroup scope is `unknown`; process and cgroup usage overlap and must not be added together. Capabilities list observed metrics, read once at startup before the first sample; `kernel` is null and kernel-memory accounting is not advertised.
 
-### Accepted configuration and reload operations (M6)
+### Accepted configuration and reload operations
 
 The source manager requires a genuine `.dae` startup captured by the file loader. Programmatic configs and compatibility serde loaders do not provide lossless sources; their configuration/validation/reload capabilities remain unavailable. GET describes the **accepted snapshot**, not a fresh disk scan: opaque source IDs, exact-byte SHA-256 hashes, main/include kinds, write permissions and safe diagnostics. Source `path` and rule `file` retain canonical entry-directory-relative names, such as `config.d/routing.dae`; source `absolute_path` additionally exposes the canonical absolute path. Source hashes, configuration revision and runtime generation are distinct: accepting comments-only changes advances revision without requiring a new runtime generation; effective group membership changes revision, but health observations do not.
 
@@ -269,7 +269,7 @@ Admitted anonymous loopback requests read the same provider data as bearer-authe
 
 `POST /providers/{id}/refresh` takes an empty body and optional `Idempotency-Key`, returning a 202 operation. Success requires actual revision-authorized runtime publication, not just fetch or cache write; disconnecting HTTP does not cancel admitted work. A distinct concurrent refresh for the same provider conflicts (409), while retained same-key replay returns the original operation first. Disabled providers, or a runtime without a subscription owner (`can_refresh: false`), return `404 capability_not_supported`; stopped/capacity-limited owners return 503. The virtual `inline` provider is not refreshable or deletable; it groups static non-builtin nodes, whose `provider_id` is `inline`. Builtins retain null provider ownership. Subscription IDs remain UUIDs.
 
-### Managed entries and geodata (M9)
+### Managed entries and geodata
 
 `resources.nodes.can_manage` and `resources.providers.can_manage` require a running source coordinator and a writable, non-credential-bearing accepted **main** source. Node creation accepts `{"name":"edge","link":"socks5://192.0.2.2:1080"}`; provider creation accepts `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`. `resources.providers.create_options` lists the optional provider fields with the value an omitted one takes: `update_interval` (seconds, at most one year, `0` refreshes only on request; default `86400`), `user_agent` (1 to 256 printable ASCII characters; default `honk/<version>`) and, only when `global.store_subscribe` opened a subscription store, `cache` (default `true`). A provider with any of them is written as a block entry with `ua`, `interval` and `cache`; an unlisted or out-of-range value returns `422 unsupported_value`. Strict JSON and the 64 KiB body limit remain. The engine parser and full offline admission precede the existing FD-relative durable replacement and real reload. `201` with the live Node/Provider and its `Location` is returned only after activation and subscription reconciliation; HTTP disconnect does not cancel queued work. With `--store db`, these actions record a new revision instead of rewriting the main file.
 
