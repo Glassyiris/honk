@@ -554,9 +554,28 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
         }
     }
     let before = response_json(app.get(path).send().await.unwrap()).await;
+    for patch in [
+        json!({"record_flows": true, "record_logs": true}),
+        json!({"log": {"level": "debug"}}),
+    ] {
+        error_response(
+            app.client
+                .patch(app.url(path))
+                .bearer_auth(SECRET)
+                .json(&patch)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_value",
+        )
+        .await;
+        let after = response_json(app.get(path).send().await.unwrap()).await;
+        assert_eq!(after["recording"], before["recording"]);
+    }
     for (patch, details) in [
         (
-            json!({"record_flows": true, "record_logs": true}),
+            json!({"record_logs": true, "dns_log": {"max_records": 1}}),
             Value::Null,
         ),
         (json!({"record_flows": null}), Value::Null),

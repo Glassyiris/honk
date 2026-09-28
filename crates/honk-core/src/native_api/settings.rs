@@ -339,6 +339,9 @@ impl Settings {
             return Err(invalid(id));
         }
         let mut next = *current;
+        // A bound or schema error is 400 even when the same patch also names
+        // an unadvertised field, so 422 waits until every value is checked.
+        let mut unadvertised = false;
         if patch.log.is_none()
             && patch.dns_log.is_none()
             && patch.flows.is_none()
@@ -349,9 +352,10 @@ impl Settings {
             return Err(invalid(id));
         }
         if let Some(log) = patch.log {
-            if !settings.record_logs || (log.level.is_none() && log.buffered_records.is_none()) {
+            if log.level.is_none() && log.buffered_records.is_none() {
                 return Err(invalid(id));
             }
+            unadvertised |= !settings.record_logs;
             if let Some(level) = log.level {
                 next.level = level;
                 next.level_overridden = true;
@@ -367,17 +371,17 @@ impl Settings {
             let Some(count) = dns.max_records else {
                 return Err(invalid(id));
             };
-            if !settings.record_dns_log || !(64..=512).contains(&count) {
+            if !(64..=512).contains(&count) {
                 return Err(invalid(id));
             }
+            unadvertised |= !settings.record_dns_log;
             next.dns = count;
         }
         if let Some(flows) = patch.flows {
-            if !settings.record_flows
-                || (flows.max_flows.is_none() && flows.retention_seconds.is_none())
-            {
+            if flows.max_flows.is_none() && flows.retention_seconds.is_none() {
                 return Err(invalid(id));
             }
+            unadvertised |= !settings.record_flows;
             if let Some(count) = flows.max_flows {
                 if !(64..=1024).contains(&count) {
                     return Err(invalid(id));
@@ -396,11 +400,12 @@ impl Settings {
             .enumerate()
         {
             if let Some(mode) = mode {
-                if mode == RecorderMode::On && !next.allowed[index] {
-                    return Err(invalid(id));
-                }
+                unadvertised |= mode == RecorderMode::On && !next.allowed[index];
                 next.modes[index] = mode;
             }
+        }
+        if unadvertised {
+            return Err(unsupported(id));
         }
         commit()?;
         next.overridden = true;
@@ -535,9 +540,6 @@ pub(super) async fn patch(
         .as_object_mut()
         .and_then(|object| object.remove("geodata"))
         .map(|patch| {
-            if state.geodata.as_ref().is_none() {
-                return Err(invalid(id));
-            }
             if !state.settings.credentialed() {
                 return Err(super::error(
                     StatusCode::FORBIDDEN,
@@ -548,23 +550,16 @@ pub(super) async fn patch(
             }
             let mut patch = super::geodata::SourcesPatch::parse(patch, || invalid(id))?;
             let groups = state.observation.catalog.snapshot();
-            if let Some(patch) = patch.as_mut()
-                && !patch.resolve_group(|id| {
+            let current = patch.as_mut().is_none_or(|patch| {
+                patch.resolve_group(|id| {
                     groups
                         .groups
                         .iter()
                         .find(|(_, group_id)| group_id.as_str() == id)
                         .map(|(name, _)| name.clone())
                 })
-            {
-                return Err(super::error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    ErrorCode::UnsupportedValue,
-                    "geodata.download.group_id is not a current group",
-                    id,
-                ));
-            }
-            Ok(patch)
+            });
+            Ok((patch, current))
         })
         .transpose()?;
     let others = value.as_object().is_some_and(|object| !object.is_empty());
@@ -583,7 +578,14 @@ pub(super) async fn patch(
     }
     let active = state.config.read().await;
     let commit = || match (geodata, state.geodata.as_ref()) {
-        (Some(patch), Some(sources)) => sources.apply(patch).map(drop).map_err(|_| {
+        (Some(_), None) => Err(unsupported(id)),
+        (Some((_, false)), Some(_)) => Err(super::error(
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "geodata.download.group_id is not a current group",
+            id,
+        )),
+        (Some((patch, true)), Some(sources)) => sources.apply(patch).map(drop).map_err(|_| {
             super::error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::TemporarilyUnavailable,
@@ -614,6 +616,15 @@ fn invalid(id: &RequestId) -> ApiError {
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest,
         "Unsupported or invalid runtime setting",
+        id,
+    )
+}
+
+fn unsupported(id: &RequestId) -> ApiError {
+    super::error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ErrorCode::UnsupportedValue,
+        "Runtime setting is not advertised",
         id,
     )
 }
