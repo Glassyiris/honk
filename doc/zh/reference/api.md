@@ -41,6 +41,7 @@
 | POST | `/api/v1/dns/cache/flush` | 等待内存与启用的持久化缓存失效确认，不清空域名路由事实。 |
 | POST | `/api/v1/routing/trace` | 固定当前 generation 的无联网路由模拟，仅支持 `resolve=none`。 |
 | GET | `/api/v1/rules` | 当前 generation 的完整规则字典、fallback 与可用来源位置。 |
+| GET | `/api/v1/dns/rules` | 当前 generation 的 DNS 请求规则与响应规则，每个列表以 fallback 结尾。 |
 | GET | `/api/v1/providers`、`/api/v1/providers/{id}` | 真实订阅 owner 状态，不在读取时拉取。 |
 | POST | `/api/v1/providers/{id}/refresh` | 显式刷新订阅，并等待真实 runtime publication 的 operation。 |
 | POST | `/api/v1/providers` | 用 `{name,kind:"subscription",url}` 及可选的 `update_interval`、`user_agent`、`cache` 创建尚未拉取的主文件订阅。 |
@@ -256,6 +257,10 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。两者在期限内无法固定 router 时返回 `503 snapshot_unavailable` 并带 `Retry-After`。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
 对已接受 `.dae` 配置中的规则，包括含凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序以 dae 写法显示配置值，不加引号：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。监听凭据值仍被遮蔽；普通条件文本无需写权限即可读取，`config_content` 不产生作用。没有已接受来源元数据的规则显示编译后条件值，来源保持 null。编译后展示反映规范化的谓词，不等同于原始编写语法，也不展开 geodata。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 保留各自代次捕获的有界编译后值，包括程序内构造路由器的值。
+
+`GET /dns/rules` 以 `{generation_id, request, response}` 返回当前 generation 的 `dns { routing { … } }` 规则。该接口只读，编辑 DNS 规则与 `/rules` 相同，通过来源 PUT 完成。两个列表均按求值顺序排列，并以恰好一条 `kind: "fallback"` 结尾。每条记录包含 `rule_id`、从 0 开始的 `index`、`expression`、`action`、`upstream`、`source` 与 `kind`。请求规则的 action 为 `upstream`、`asis`、`reject`；响应规则的 action 为 `accept`、`reject`、`requery`。action 为 `upstream` 或 `requery` 时，`upstream` 为引擎使用的小写名称，其他 action 为 null。`expression` 为编写时的整条语句，包含 action，去掉行尾注释，例如 `qname(suffix: example.com) -> AliDNS` 或 `fallback: googledns`。配置未写 fallback 时仍列出引擎默认值：请求为 `upstream` `default`，响应为 `accept`；其 expression 为 `fallback: <action>`，`source` 为 null。parser 以警告忽略的规则不列出。
+
+`rule_id` 的格式为 `{instance}:{generation}:dns_request:rule:{index}` 或 `{instance}:{generation}:dns_request:fallback`，响应列表把 `dns_request` 换成 `dns_response`。它在两个列表间唯一，随 generation 变化，因此须同时用 `generation_id` 与 `rule_id` 定位规则。`source` 与 `/rules` 结构相同：不透明的 `source_id`，与该来源入口相对 `path` 一致的 `file`，以及语句在该来源中起始处从 1 开始的 `line` 和字节 `column`。没有已接受来源元数据的规则 `source` 为 null，expression 由解析后的条件生成。每个列表连同 fallback 最多 4096 条（`resources.dns_rules.max_rules`），超限返回 `503 temporarily_unavailable`；5 秒内无法固定当前配置时返回 `503 snapshot_unavailable`，两者均带 `Retry-After`。磁盘编辑只有在 reload 被接受后才更新响应。
 
 ### Provider、日志与临时设置
 

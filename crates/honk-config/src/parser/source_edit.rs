@@ -621,6 +621,16 @@ pub struct RuleSourceLocation {
 pub struct RuleSourceIndex {
     pub rules: Vec<RuleSourceLocation>,
     pub fallback: Option<RuleSourceLocation>,
+    pub dns_request: DnsRuleSources,
+    pub dns_response: DnsRuleSources,
+}
+
+/// One DNS rule list; `expression` holds the whole statement as written,
+/// including its action.
+#[derive(Debug, Clone, Default)]
+pub struct DnsRuleSources {
+    pub rules: Vec<RuleSourceLocation>,
+    pub fallback: Option<RuleSourceLocation>,
 }
 
 /// Index the runtime's last group declarations and the real rule parser's
@@ -681,6 +691,36 @@ pub fn source_indices(
         }
     })
     .map_err(|_| GroupSourceError)?;
+    let dns = documents
+        .iter()
+        .flat_map(Document::sections)
+        .filter(|section| section.header() == "dns")
+        .collect::<Vec<_>>();
+    super::dns::parse_routing_indexed(&dns, &mut diagnostics, |response, index, line| {
+        let Some(source_index) = sources
+            .iter()
+            .position(|source| source.source.index() == line.span.source)
+        else {
+            return;
+        };
+        let (line_number, column) = documents[source_index].source().location(line.span.start);
+        let location = RuleSourceLocation {
+            source_index,
+            bytes: line.span.start..line.span.end,
+            line: line_number,
+            column,
+            expression: line.trim().raw().to_owned(),
+        };
+        let list = if response {
+            &mut result.dns_response
+        } else {
+            &mut result.dns_request
+        };
+        match index {
+            Some(_) => list.rules.push(location),
+            None => list.fallback = Some(location),
+        }
+    });
     Ok((groups, result))
 }
 

@@ -550,6 +550,17 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
+            "/api/v1/dns/rules",
+            resource(
+                get(
+                    |State(state): App, Extension(id): Id, uri: Uri| async move {
+                        respond(dns::rules::serve(&state, &uri, &id).await, id)
+                    },
+                ),
+                &["GET"],
+            ),
+        )
+        .route(
             "/api/v1/dns/log",
             resource(
                 get(

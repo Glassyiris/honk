@@ -417,3 +417,19 @@ async fn query_type_count_over_limit_is_too_large() {
         .into_response();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn rules_lock_wait_past_deadline_is_retryable_snapshot_unavailable() {
+    let state = crate::native_api::tests::state().await;
+    let _reload = state.config.write().await;
+    let error = rules::snapshot(
+        &state,
+        std::time::Instant::now() + Duration::from_millis(20),
+        &RequestId("test".into()),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.headers()["retry-after"], "1");
+}
