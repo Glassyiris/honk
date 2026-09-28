@@ -361,7 +361,7 @@ pub struct AliveDialerSet {
     health_mode: tokio::sync::watch::Sender<probe::HealthMode>,
     health_changed: tokio::sync::Notify,
     external_probes: Mutex<tokio::task::JoinSet<()>>,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     health_resolver_tasks: Mutex<Option<Arc<crate::runtime::TaskOwner>>>,
     /// Optional `SO_MARK` value applied to probe sockets so the eBPF datapath
     /// treats them as control-plane traffic and does not re-route them.
@@ -453,7 +453,7 @@ impl AliveDialerSet {
             health_mode,
             health_changed: tokio::sync::Notify::new(),
             external_probes: Mutex::new(tokio::task::JoinSet::new()),
-            #[cfg(feature = "native-api")]
+            #[cfg(feature = "owned-tasks")]
             health_resolver_tasks: Mutex::new(None),
             so_mark: None,
             last_emergency_tcp: Mutex::new(HashMap::new()),

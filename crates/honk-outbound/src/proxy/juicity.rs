@@ -236,7 +236,6 @@ impl JuicityHandler {
             .await
             .context("Juicity: send request header")
             .map_err(super::quic_carrier_error)?;
-        #[cfg(feature = "native-api")]
         if let Some(observer) = crate::runtime::flow_observation::current() {
             observer.milestone_once("target_request_sent");
         }
@@ -294,11 +293,9 @@ impl JuicityHandler {
         for _ in 0..2 {
             let (conn, state) = client.connection(connect_timeout).await?;
             state.touch();
-            #[cfg(feature = "native-api")]
             let observation = crate::session::ObservedSessionOpen::start();
             match Self::open_stream(&conn, NETWORK_UDP, &stream_addr).await {
                 Ok((send, recv)) => {
-                    #[cfg(feature = "native-api")]
                     observation.finish("session_open_succeeded", None);
                     state.open.fetch_add(1, Ordering::Relaxed);
                     let open = Arc::clone(&state.open);
@@ -319,7 +316,6 @@ impl JuicityHandler {
                     }));
                 }
                 Err(error) => {
-                    #[cfg(feature = "native-api")]
                     observation.finish("session_open_failed", Some("session"));
                     client.quic.invalidate(&conn).await;
                     last_error = Some(error);
@@ -343,7 +339,6 @@ impl WarmableOutbound for JuicityHandler {
             client.connection(connect_timeout).await?;
             Ok(())
         };
-        #[cfg(feature = "native-api")]
         let warm = crate::runtime::flow_observation::without(warm);
         warm.await
     }

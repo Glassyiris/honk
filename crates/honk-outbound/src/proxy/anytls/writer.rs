@@ -254,7 +254,6 @@ pub(super) async fn session_writer(
                 } if succeeded => {
                     session.start_synack_deadline(*sid, pre_write_activity);
                 }
-                #[cfg(feature = "native-api")]
                 FrameCommand::Control {
                     cmd: CMD_PSH, sid, ..
                 } if succeeded => {
@@ -263,12 +262,9 @@ pub(super) async fn session_writer(
                 FrameCommand::Data {
                     sid, completion, ..
                 } => {
-                    #[cfg(feature = "native-api")]
                     if succeeded {
                         session.observe_request(*sid, true);
                     }
-                    #[cfg(not(feature = "native-api"))]
-                    let _ = sid;
                     if let Some(completion) = completion.take() {
                         let _ = completion.send(succeeded);
                     }

@@ -2428,7 +2428,7 @@ async fn health_shutdown_preserves_completed_failure_before_cancelled_retry() {
     .unwrap();
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn health_shutdown_rejects_panicked_resolver_child() {
     let set = AliveDialerSet::new();
@@ -2459,7 +2459,7 @@ async fn health_shutdown_rejects_panicked_resolver_child() {
     ));
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test(start_paused = true)]
 async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error() {
     use futures_util::FutureExt as _;

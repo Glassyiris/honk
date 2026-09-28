@@ -1,7 +1,9 @@
 //! Source-owned, optional evidence for one observed business operation.
 
+#[cfg(feature = "flow-observation")]
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(feature = "flow-observation")]
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -16,6 +18,7 @@ pub struct FlowContext {
     pub dns_purpose: &'static str,
 }
 
+#[cfg(feature = "flow-observation")]
 #[derive(Clone)]
 pub struct FlowObserver {
     context: FlowContext,
@@ -23,6 +26,7 @@ pub struct FlowObserver {
     milestones: Arc<std::sync::atomic::AtomicU8>,
 }
 
+#[cfg(feature = "flow-observation")]
 impl std::fmt::Debug for FlowObserver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -32,6 +36,7 @@ impl std::fmt::Debug for FlowObserver {
     }
 }
 
+#[cfg(feature = "flow-observation")]
 impl FlowObserver {
     pub fn new(
         context: FlowContext,
@@ -87,12 +92,14 @@ impl FlowObserver {
     }
 }
 
+#[cfg(feature = "flow-observation")]
 tokio::task_local! {
     static FLOW_OBSERVER: Option<FlowObserver>;
     static SUPPRESSED: bool;
     static REQUEST_WRITE: RequestWrite;
 }
 
+#[cfg(feature = "flow-observation")]
 pub fn current() -> Option<FlowObserver> {
     if is_suppressed() {
         return None;
@@ -100,12 +107,14 @@ pub fn current() -> Option<FlowObserver> {
     FLOW_OBSERVER.try_with(Clone::clone).ok().flatten()
 }
 
+#[cfg(feature = "flow-observation")]
 pub(crate) fn is_suppressed() -> bool {
     SUPPRESSED
         .try_with(|suppressed| *suppressed)
         .unwrap_or(false)
 }
 
+#[cfg(feature = "flow-observation")]
 pub(crate) fn scope<F: Future>(
     observer: Option<FlowObserver>,
     future: F,
@@ -113,22 +122,26 @@ pub(crate) fn scope<F: Future>(
     FLOW_OBSERVER.scope(observer, future)
 }
 
+#[cfg(feature = "flow-observation")]
 pub fn without<F: Future>(future: F) -> impl Future<Output = F::Output> {
     SUPPRESSED.scope(true, scope(None, future))
 }
 
+#[cfg(feature = "flow-observation")]
 pub fn milestone(milestone: &'static str) {
     if let Some(observer) = current() {
         observer.milestone_once(milestone);
     }
 }
 
+#[cfg(feature = "flow-observation")]
 #[derive(Clone, Debug)]
 pub(crate) struct RequestWrite {
     observer: FlowObserver,
     state: Arc<parking_lot::Mutex<RequestWriteState>>,
 }
 
+#[cfg(feature = "flow-observation")]
 #[derive(Debug, Default)]
 struct RequestWriteState {
     required: u64,
@@ -136,6 +149,7 @@ struct RequestWriteState {
     finished: bool,
 }
 
+#[cfg(feature = "flow-observation")]
 impl RequestWrite {
     pub(crate) fn current() -> Option<Self> {
         if is_suppressed() {
@@ -171,6 +185,7 @@ impl RequestWrite {
     }
 }
 
+#[cfg(feature = "flow-observation")]
 /// A buffered transport may defer the event until the actual frame writer flushes.
 pub(crate) async fn request_write<T, E>(
     future: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
@@ -237,12 +252,14 @@ pub struct DnsLookup {
     pub error: Option<&'static str>,
 }
 
+#[cfg(feature = "flow-observation")]
 /// Lookup facts captured by this resolution operation, never recovered by name.
 pub struct LookupSelection {
     observer: FlowObserver,
     lookups: Arc<parking_lot::Mutex<Vec<(FlowContext, DnsLookup)>>>,
 }
 
+#[cfg(feature = "flow-observation")]
 impl LookupSelection {
     pub fn selected_ip(&self, ip: IpAddr) {
         let (selected, ambiguous) = {
@@ -267,6 +284,7 @@ impl LookupSelection {
     }
 }
 
+#[cfg(feature = "flow-observation")]
 /// Preserve source identity until a consumer chooses an address from the result.
 pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<LookupSelection>) {
     let future = std::pin::pin!(future);
@@ -308,6 +326,7 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
     (result, Some(LookupSelection { observer, lookups }))
 }
 
+#[cfg(feature = "flow-observation")]
 /// One real physical attempt. Capture before starting I/O, not before admission.
 pub struct TransportAttempt {
     observer: FlowObserver,
@@ -317,6 +336,7 @@ pub struct TransportAttempt {
     finished: bool,
 }
 
+#[cfg(feature = "flow-observation")]
 impl TransportAttempt {
     pub fn start(
         server_addr: Option<SocketAddr>,
@@ -352,11 +372,156 @@ impl TransportAttempt {
     }
 }
 
+#[cfg(feature = "flow-observation")]
 impl Drop for TransportAttempt {
     fn drop(&mut self) {
         self.finish("cancelled", Some("cancelled"));
     }
 }
 
-#[cfg(test)]
+/// Inert twin: uninhabited types keep `Option<_>` fields zero-sized and every
+/// hook folds away, so call sites need no feature gates.
+#[cfg(not(feature = "flow-observation"))]
+mod inert {
+    use std::future::Future;
+    use std::net::{IpAddr, SocketAddr};
+    use std::pin::Pin;
+
+    use futures_util::FutureExt;
+
+    use super::{FlowContext, FlowEvent};
+
+    #[derive(Clone, Debug)]
+    pub enum FlowObserver {}
+
+    impl FlowObserver {
+        #[inline]
+        pub fn context(&self) -> FlowContext {
+            match *self {}
+        }
+
+        #[inline]
+        pub fn with_context(&self, _context: FlowContext) -> Self {
+            match *self {}
+        }
+
+        #[inline]
+        pub fn publish(&self, _event: FlowEvent) {
+            match *self {}
+        }
+
+        #[inline]
+        pub fn milestone_once(&self, _milestone: &'static str) {
+            match *self {}
+        }
+
+        #[inline]
+        pub fn scope<F: Future>(&self, _future: F) -> F {
+            match *self {}
+        }
+
+        #[inline]
+        pub fn sync_scope<T>(&self, _build: impl FnOnce() -> T) -> T {
+            match *self {}
+        }
+    }
+
+    #[inline]
+    pub fn current() -> Option<FlowObserver> {
+        None
+    }
+
+    #[inline]
+    pub(crate) fn is_suppressed() -> bool {
+        false
+    }
+
+    // Only the rprx VMess relay re-scopes a captured observer in inert builds.
+    #[cfg(feature = "rprx")]
+    #[inline]
+    pub(crate) fn scope<F: Future>(_observer: Option<FlowObserver>, future: F) -> F {
+        future
+    }
+
+    #[inline]
+    pub fn without<F: Future>(future: F) -> F {
+        future
+    }
+
+    #[inline]
+    pub fn milestone(_milestone: &'static str) {}
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum RequestWrite {}
+
+    impl RequestWrite {
+        #[inline]
+        pub(crate) fn current() -> Option<Self> {
+            None
+        }
+
+        #[inline]
+        pub(crate) fn defer(&self, _position: u64) {
+            match *self {}
+        }
+
+        #[inline]
+        pub(crate) fn delivered(&self, _position: u64) {
+            match *self {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn request_write<F: Future>(future: Pin<&mut F>) -> Pin<&mut F> {
+        future
+    }
+
+    pub enum LookupSelection {}
+
+    impl LookupSelection {
+        #[inline]
+        pub fn selected_ip(&self, _ip: IpAddr) {
+            match *self {}
+        }
+    }
+
+    #[inline]
+    pub fn observe_resolution<F: Future>(
+        future: F,
+    ) -> impl Future<Output = (F::Output, Option<LookupSelection>)> {
+        future.map(|output| (output, None))
+    }
+
+    pub enum TransportAttempt {}
+
+    impl TransportAttempt {
+        #[inline]
+        pub fn start(
+            _server_addr: Option<SocketAddr>,
+            _resolution_location: &'static str,
+        ) -> Option<Self> {
+            None
+        }
+
+        #[inline]
+        pub fn finish(&mut self, _status: &'static str, _error: Option<&'static str>) {
+            match *self {}
+        }
+    }
+
+    const _: () = assert!(size_of::<Option<FlowObserver>>() == 0);
+    const _: () = assert!(size_of::<Option<TransportAttempt>>() == 0);
+}
+
+#[cfg(all(not(feature = "flow-observation"), feature = "rprx"))]
+pub(crate) use inert::scope;
+#[cfg(not(feature = "flow-observation"))]
+pub use inert::{
+    FlowObserver, LookupSelection, TransportAttempt, current, milestone, observe_resolution,
+    without,
+};
+#[cfg(not(feature = "flow-observation"))]
+pub(crate) use inert::{RequestWrite, is_suppressed, request_write};
+
+#[cfg(all(test, feature = "flow-observation"))]
 mod tests;

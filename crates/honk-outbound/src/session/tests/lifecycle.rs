@@ -6,9 +6,9 @@ use super::*;
 async fn caller_cancel_does_not_stop_shared_dial() {
     let pool = Arc::new(pool(SessionPoolConfig::default()));
     let (tx, rx) = tokio::sync::oneshot::channel::<Arc<TestSession>>();
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let events = Arc::new(Mutex::new(Vec::new()));
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let observer = {
         use crate::runtime::flow_observation::{FlowContext, FlowObserver};
         let events = Arc::clone(&events);
@@ -29,14 +29,14 @@ async fn caller_cancel_does_not_stop_shared_dial() {
             let s: anyhow::Result<Arc<TestSession>> = Ok(rx.await.expect("trigger"));
             s
         });
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "flow-observation")]
         let dial = observer.scope(dial);
         dial.await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     leader.abort();
     let _ = leader.await;
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     assert!(matches!(
         events.lock().as_slice(),
         [crate::runtime::flow_observation::FlowEvent::Gap(
@@ -70,7 +70,7 @@ async fn caller_cancel_does_not_stop_shared_dial() {
     assert_eq!(pool.pool.lock().dial_failures, 0);
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn shared_physical_setup_survives_creator_cancellation_without_reparenting() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

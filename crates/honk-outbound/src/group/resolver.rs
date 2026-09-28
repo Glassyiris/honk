@@ -4,13 +4,13 @@
 
 use super::*;
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 pub struct NativeGroupSelection<'a> {
     pub member: GroupMember<'a>,
     pub leaf: Option<&'a Node>,
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 impl GroupManager {
     /// Apply the same last-definition and cycle rules as the runtime graph.
     pub fn native_effective_groups(groups: &[Group]) -> HashMap<String, Group> {
@@ -704,7 +704,7 @@ pub(super) fn break_group_cycles(groups: &mut HashMap<String, Group>) {
     }
 }
 
-#[cfg(all(test, feature = "native-api"))]
+#[cfg(all(test, feature = "flow-observation"))]
 mod native_probe_tests {
     use super::*;
     use honk_config::node::OutboundConfig;

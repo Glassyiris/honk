@@ -259,6 +259,7 @@ async fn native_https_keeps_request_sni_on_pinned_dial() {
     guard.close().await.unwrap();
 }
 
+#[cfg(feature = "owned-tasks")]
 #[test]
 fn native_cold_runtime_preserves_admission_and_generation_carrier_ceiling() {
     let node = make_node("native-runtime");

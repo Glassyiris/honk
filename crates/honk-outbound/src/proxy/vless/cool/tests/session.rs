@@ -34,7 +34,7 @@ async fn fragmented_and_coalesced_responses_are_demultiplexed() {
     session.close();
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn shared_xudp_records_each_business_target_once_without_carrying_opener_context() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

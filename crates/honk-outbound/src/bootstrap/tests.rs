@@ -260,7 +260,7 @@ async fn test_query_ech_config_via_bootstrap_udp() {
     assert_eq!(query_ech_config("1.2.3.4").await.unwrap(), None);
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn observed_bootstrap_lookup_preserves_source_lineage_and_cancellation() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

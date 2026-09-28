@@ -269,13 +269,11 @@ enum DialSignal {
     Failed(crate::SharedError),
 }
 
-#[cfg(feature = "native-api")]
 struct ObservedSharedDialWait {
     observer: crate::runtime::flow_observation::FlowObserver,
     completion: tokio::sync::watch::Receiver<DialSignal>,
 }
 
-#[cfg(feature = "native-api")]
 impl Drop for ObservedSharedDialWait {
     fn drop(&mut self) {
         let pending = self.completion.has_changed().is_ok()
@@ -290,12 +288,10 @@ impl Drop for ObservedSharedDialWait {
     }
 }
 
-#[cfg(feature = "native-api")]
 pub(crate) struct ObservedSessionOpen {
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
-#[cfg(feature = "native-api")]
 impl ObservedSessionOpen {
     pub(crate) fn start() -> Self {
         let observer = crate::runtime::flow_observation::current();
@@ -326,7 +322,6 @@ impl ObservedSessionOpen {
     }
 }
 
-#[cfg(feature = "native-api")]
 impl Drop for ObservedSessionOpen {
     fn drop(&mut self) {
         if let Some(observer) = &self.observer {
@@ -638,7 +633,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
             };
 
-            #[cfg(feature = "native-api")]
             let mut dial_observer = None;
             let mut rx = match step {
                 Step::Closed => return Err(Self::pool_closed_err()),
@@ -669,7 +663,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     // Subscribe before spawning: a fast failure can clear the
                     // pool's entry before this caller gets to await it.
                     let rx = done.subscribe();
-                    #[cfg(feature = "native-api")]
                     {
                         dial_observer = crate::runtime::flow_observation::current();
                     }
@@ -792,7 +785,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     rx
                 }
             };
-            #[cfg(feature = "native-api")]
             let _observation = dial_observer.map(|observer| ObservedSharedDialWait {
                 observer,
                 completion: rx.clone(),
@@ -856,7 +848,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         for _attempt in 0..2 {
             let session = self.offer(dial.clone()).await?;
             let Some(permit) = self.try_reserve(&session) else {
-                #[cfg(feature = "native-api")]
                 if let Some(observer) = crate::runtime::flow_observation::current() {
                     observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
                         reason: "session_open_capacity",
@@ -879,7 +870,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             // logical open before protocol negotiation can block or cancel.
             // A cold offer has already fired this one-shot hook on admission.
             crate::runtime::start_scoped_dial();
-            #[cfg(feature = "native-api")]
             if let Some(observer) = crate::runtime::flow_observation::current() {
                 observer.publish(
                     crate::runtime::flow_observation::FlowEvent::TransportAttached {
@@ -888,10 +878,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     },
                 );
             }
-            #[cfg(feature = "native-api")]
             let observation = ObservedSessionOpen::start();
             let result = open(Arc::clone(&session), permit).await;
-            #[cfg(feature = "native-api")]
             observation.finish_open(&result);
             match result {
                 Ok(t) => return Ok(t),

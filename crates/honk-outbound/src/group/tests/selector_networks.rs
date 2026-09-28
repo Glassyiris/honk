@@ -64,7 +64,7 @@ fn split_selector_drives_routes_peeks_score_finals_and_warmth() {
             manager.selection_chain_for_network("parent", network),
             ["parent", "child", if expected == a.id { "a" } else { "b" }]
         );
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "flow-observation")]
         assert_eq!(
             manager
                 .native_selection("parent", network)
@@ -304,7 +304,7 @@ fn exact_selector_identity_survives_duplicate_tags_and_reload() {
             .map(|node| node.id),
         Some(leaf.id)
     );
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     {
         assert!(
             matches!(manager.native_selection("parent", SelectionNetwork::Tcp).unwrap().member, GroupMember::Node(node) if node.id == second.id)
@@ -444,7 +444,7 @@ fn automatic_group_pins_act_as_selector_choices_until_replaced() {
             manager.selection_chain_for_network("auto", SelectionNetwork::Udp),
             ["auto", "child", "leaf"]
         );
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "flow-observation")]
         assert!(
             matches!(manager.native_selection("auto", SelectionNetwork::Tcp).unwrap().member, GroupMember::Node(node) if node.id == b.id)
         );

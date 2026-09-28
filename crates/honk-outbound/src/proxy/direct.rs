@@ -55,7 +55,6 @@ impl DirectHandler {
             connect_timeout,
         ))
         .await?;
-        #[cfg(feature = "native-api")]
         {
             crate::runtime::flow_observation::milestone("transport_ready");
             crate::runtime::flow_observation::milestone("target_confirmed");
@@ -85,7 +84,6 @@ impl DirectHandler {
         let socket = tokio::net::UdpSocket::from_std(crate::util::marked_udp_socket_with_mark(
             bind_addr, mark,
         )?)?;
-        #[cfg(feature = "native-api")]
         crate::runtime::flow_observation::milestone("transport_ready");
         Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
     }

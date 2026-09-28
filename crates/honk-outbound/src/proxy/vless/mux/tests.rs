@@ -878,7 +878,7 @@ async fn mux_refusal_distinguishes_target_status_from_http_envelope() {
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn target_evidence_requires_mux_body_status_not_http_success() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

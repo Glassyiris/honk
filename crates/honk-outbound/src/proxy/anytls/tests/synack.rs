@@ -402,7 +402,7 @@ async fn synack_before_wire_write_settles_the_open() {
     assert!(!session.is_closed());
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn target_evidence_is_scoped_to_sid_and_uot_ack_is_not_target_confirmation() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

@@ -843,7 +843,7 @@ async fn test_first_read_sends_tcp_request_and_reports_response_error() {
     );
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn observed_target_requires_deferred_request_and_positive_response() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

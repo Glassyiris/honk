@@ -123,7 +123,7 @@ async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
     assert_eq!(host, "example.invalid");
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn websocket_request_event_waits_for_real_frame_flush() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};

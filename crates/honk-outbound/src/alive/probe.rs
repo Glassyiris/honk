@@ -34,7 +34,7 @@ pub enum HealthCheckError {
 #[derive(Clone, Default)]
 pub struct ProbeCancellation {
     mode: Option<tokio::sync::watch::Sender<HealthMode>>,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     resolver_tasks: Option<Arc<crate::runtime::TaskOwner>>,
 }
 
@@ -79,7 +79,7 @@ impl ProbeCancellation {
         &self,
         future: impl Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.resolver_tasks {
             return owner.scope(future).await;
         }
@@ -152,7 +152,7 @@ impl AliveDialerSet {
         control.active += 1;
         Ok(ProbeCancellation {
             mode: Some(self.health_mode.clone()),
-            #[cfg(feature = "native-api")]
+            #[cfg(feature = "owned-tasks")]
             resolver_tasks: self.native_observations.read().is_some().then(|| {
                 Arc::clone(
                     self.health_resolver_tasks
@@ -239,7 +239,7 @@ impl AliveDialerSet {
                         && self.external_probes.lock().is_empty()
                 };
                 if drained {
-                    #[cfg(feature = "native-api")]
+                    #[cfg(feature = "owned-tasks")]
                     {
                         let owner = self.health_resolver_tasks.lock().clone();
                         if let Some(owner) = owner {

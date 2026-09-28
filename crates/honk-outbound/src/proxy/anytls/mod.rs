@@ -284,7 +284,6 @@ impl std::ops::Deref for AnyTlsPool {
 /// tune by load test).
 pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;
 
-#[cfg(feature = "native-api")]
 struct StreamObservation {
     observer: crate::runtime::flow_observation::FlowObserver,
     uot: bool,
@@ -365,7 +364,6 @@ pub(crate) struct AnyTlsSession {
     /// merely slow to open a stream.
     rx_frame_seq: AtomicU64,
     task_scope: crate::runtime::TaskScope,
-    #[cfg(feature = "native-api")]
     observations: parking_lot::Mutex<HashMap<u32, StreamObservation>>,
 }
 
@@ -413,7 +411,6 @@ impl AnyTlsSession {
             demux: Mutex::new(None),
             rx_frame_seq: AtomicU64::new(0),
             task_scope: crate::runtime::TaskScope::capture(),
-            #[cfg(feature = "native-api")]
             observations: parking_lot::Mutex::new(HashMap::new()),
         });
         session.inbound_payload_budget.register(&session);
@@ -436,7 +433,6 @@ impl AnyTlsSession {
         Ok(session)
     }
 
-    #[cfg(feature = "native-api")]
     fn observe_request(&self, sid: u32, uot: bool) {
         let mut observations = self.observations.lock();
         let Some(observation) = observations.get_mut(&sid) else {
@@ -455,7 +451,6 @@ impl AnyTlsSession {
         }
     }
 
-    #[cfg(feature = "native-api")]
     fn observe_synack(&self, sid: u32, accepted: bool) {
         let mut observations = self.observations.lock();
         let Some(observation) = observations.get_mut(&sid) else {
@@ -474,7 +469,6 @@ impl AnyTlsSession {
         }
     }
 
-    #[cfg(feature = "native-api")]
     fn end_observation(&self, sid: u32) {
         self.observations.lock().remove(&sid);
     }
@@ -787,7 +781,6 @@ impl AnyTlsSession {
             anyhow::bail!("AnyTLS session {} is closed", self.seq);
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
-        #[cfg(feature = "native-api")]
         if let Some(observer) = crate::runtime::flow_observation::current() {
             self.observations.lock().insert(
                 sid,
@@ -973,7 +966,6 @@ impl AnyTlsSession {
     /// Stream capacity is released by the transport permit, not this map.
     fn end_uot_stream(&self, sid: u32, notify_fin: bool) {
         self.settle_syn_pending(sid);
-        #[cfg(feature = "native-api")]
         self.end_observation(sid);
         let (was_registered, received_fin) = {
             let mut remote_fin = self.remote_fin.lock();
@@ -992,7 +984,6 @@ impl AnyTlsSession {
     /// Returns whether the watchdog had killed this stream.
     fn end_stream(&self, sid: u32, notify_fin: bool) -> bool {
         self.settle_syn_pending(sid);
-        #[cfg(feature = "native-api")]
         self.end_observation(sid);
         let (was_registered, received_fin, was_killed) = {
             let mut remote_fin = self.remote_fin.lock();
@@ -1014,7 +1005,6 @@ impl AnyTlsSession {
 
     fn kill_stream(&self, sid: u32) -> Option<usize> {
         self.settle_syn_pending(sid);
-        #[cfg(feature = "native-api")]
         self.end_observation(sid);
         let queue_capacity = {
             let mut remote_fin = self.remote_fin.lock();
@@ -1079,7 +1069,6 @@ impl AnyTlsSession {
             handle.abort();
         }
         self.clear_synack_pending();
-        #[cfg(feature = "native-api")]
         self.observations.lock().clear();
         if let Some(handle) = self.watchdog.lock().unwrap().take() {
             handle.abort();
@@ -1410,7 +1399,6 @@ async fn connect_transport(
             anyhow::anyhow!("AnyTLS TLS handshake timed out after {connect_timeout:?}")
         })??;
     tls.get_mut().activate();
-    #[cfg(feature = "native-api")]
     crate::runtime::flow_observation::milestone("transport_ready");
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
@@ -1488,7 +1476,6 @@ impl AnyTlsHandler {
             }
             Ok(())
         };
-        #[cfg(feature = "native-api")]
         let warm = crate::runtime::flow_observation::without(warm);
         warm.await
     }

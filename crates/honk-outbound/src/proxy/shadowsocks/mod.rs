@@ -339,7 +339,6 @@ impl ShadowsocksHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
     ) -> anyhow::Result<ProxyStream> {
-        #[cfg(feature = "native-api")]
         crate::runtime::flow_observation::milestone("transport_ready");
         let stream: Box<dyn super::AsyncReadWrite> = if is_2022_method(method) {
             let method_2022 = Ss2022Method::new(method, password)?;
@@ -375,7 +374,6 @@ impl ShadowsocksHandler {
                 prologue,
             ))
         };
-        #[cfg(feature = "native-api")]
         crate::runtime::flow_observation::milestone("target_request_sent");
         Ok(ProxyStream {
             stream,
@@ -481,15 +479,11 @@ impl ShadowsocksHandler {
         let lookup = format!("{}:{}", node.host(), node.port);
         let server_addr = tokio::time::timeout(connect_timeout, async {
             let resolution = crate::bootstrap::resolve(node.host());
-            #[cfg(feature = "native-api")]
             let (resolution, selection) =
                 crate::runtime::flow_observation::observe_resolution(resolution).await;
-            #[cfg(not(feature = "native-api"))]
-            let resolution = resolution.await;
             let ip = resolution?.into_iter().next().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host")
             })?;
-            #[cfg(feature = "native-api")]
             if let Some(selection) = selection {
                 selection.selected_ip(ip);
             }
@@ -506,7 +500,6 @@ impl ShadowsocksHandler {
         };
         let outbound = crate::util::udp_marked_bind(bind_addr).await?;
         outbound.connect(server_addr).await?;
-        #[cfg(feature = "native-api")]
         crate::runtime::flow_observation::milestone("transport_ready");
         debug!(
             "Shadowsocks UDP: session to {} for target {}",

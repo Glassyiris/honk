@@ -12,7 +12,6 @@
 //! QUIC protocols own their per-node client (and shared connection) here.
 
 mod admission;
-#[cfg(feature = "native-api")]
 pub mod flow_observation;
 mod tasks;
 pub use tasks::TaskOwner;
@@ -388,7 +387,7 @@ pub struct NodeRuntime {
     /// long-lived owner to keep warm state for, only [`Self::close`] to
     /// release it deterministically.
     ephemeral: bool,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     task_owner: Option<Arc<tasks::TaskOwner>>,
     /// Serializes warm establishment and release while tracking independent
     /// selector/UDP owners across runtime reuse on reload.
@@ -468,7 +467,7 @@ impl NodeRuntime {
     fn build(
         node: &Node,
         ephemeral: bool,
-        #[cfg(feature = "native-api")] task_owner: Option<Arc<tasks::TaskOwner>>,
+        #[cfg(feature = "owned-tasks")] task_owner: Option<Arc<tasks::TaskOwner>>,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
     ) -> Arc<Self> {
         let transport_quality = Arc::new(crate::transport_quality::TransportQuality::default());
@@ -481,16 +480,16 @@ impl NodeRuntime {
                     .build(node, !ephemeral, Arc::clone(&transport_quality)),
                 ephemeral,
                 transport_quality,
-                #[cfg(feature = "native-api")]
+                #[cfg(feature = "owned-tasks")]
                 task_owner: task_owner.clone(),
                 warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
                 #[cfg(any(feature = "rprx", test))]
                 vless_carriers,
             })
         };
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         return tasks::sync_scope_owner(task_owner.as_ref().map(Arc::downgrade), build);
-        #[cfg(not(feature = "native-api"))]
+        #[cfg(not(feature = "owned-tasks"))]
         build()
     }
 
@@ -501,7 +500,7 @@ impl NodeRuntime {
         Self::build(
             node,
             true,
-            #[cfg(feature = "native-api")]
+            #[cfg(feature = "owned-tasks")]
             Some(Arc::new(tasks::TaskOwner::default())),
             #[cfg(any(feature = "rprx", test))]
             vless_carriers,
@@ -556,17 +555,17 @@ impl NodeRuntime {
     where
         F: Future<Output = anyhow::Result<T>>,
     {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         match &self.task_owner {
             Some(owner) => owner.scope(future).await,
             None => tasks::scope_owner(None, future).await,
         }
-        #[cfg(not(feature = "native-api"))]
+        #[cfg(not(feature = "owned-tasks"))]
         future.await
     }
 
     pub(crate) fn task_scope(&self) -> TaskScope {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.task_owner {
             return owner.task_scope();
         }
@@ -670,7 +669,7 @@ impl NodeRuntime {
     /// mux pool sessions (connections + drivers), or one cached QUIC client
     /// (connection + endpoint driver). Terminal for the runtime; idempotent.
     pub async fn close(&self) {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.task_owner {
             owner.abort();
         }
@@ -684,7 +683,7 @@ impl NodeRuntime {
             ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
             ProtocolRuntime::None => {}
         }
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.task_owner {
             owner.close().await;
         }
@@ -692,12 +691,12 @@ impl NodeRuntime {
 
     /// Whether an owned protocol task panicked, including already reaped tasks.
     pub fn tasks_failed(&self) -> bool {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         return self
             .task_owner
             .as_ref()
             .is_some_and(|owner| owner.has_failed());
-        #[cfg(not(feature = "native-api"))]
+        #[cfg(not(feature = "owned-tasks"))]
         false
     }
 
@@ -882,7 +881,7 @@ impl EphemeralRuntimeGuard {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &runtime.task_owner {
             owner.abort();
         }
@@ -964,7 +963,7 @@ pub struct OutboundRuntimeRegistry {
     /// Process-wide descriptor gate shared by every overlapping generation.
     dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
     dial_ceiling_limit: usize,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     own_node_tasks: bool,
     background_tasks: std::sync::LazyLock<Arc<tasks::TaskOwner>>,
     #[cfg(any(feature = "rprx", test))]
@@ -988,7 +987,7 @@ impl OutboundRuntimeRegistry {
 
     /// Admit a cold one-shot runtime using this generation's shared carrier budget.
     /// The caller must scope dials to this registry and close the returned guard.
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     pub fn try_ephemeral_guarded(
         &self,
         node: &Node,
@@ -1112,7 +1111,7 @@ impl OutboundRuntimeRegistry {
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         honk_config::node::validate_node_collection(nodes)
             .map_err(RuntimeRegistryError::Admission)?;
-        let own_tasks = cfg!(feature = "native-api") && own_tasks;
+        let own_tasks = cfg!(feature = "owned-tasks") && own_tasks;
         let mut map = HashMap::with_capacity(nodes.len());
         let mut reused = HashSet::new();
         for node in nodes {
@@ -1136,7 +1135,7 @@ impl OutboundRuntimeRegistry {
                     return None;
                 }
                 let runtime = previous.get(&node.id)?;
-                #[cfg(feature = "native-api")]
+                #[cfg(feature = "owned-tasks")]
                 if runtime
                     .task_owner
                     .as_ref()
@@ -1154,7 +1153,7 @@ impl OutboundRuntimeRegistry {
                 None => NodeRuntime::build(
                     node,
                     false,
-                    #[cfg(feature = "native-api")]
+                    #[cfg(feature = "owned-tasks")]
                     own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
                     #[cfg(any(feature = "rprx", test))]
                     Arc::clone(&vless_carrier_semaphore),
@@ -1174,7 +1173,7 @@ impl OutboundRuntimeRegistry {
                 dial_limit: max_concurrent_dials.max(1).min(dial_ceiling_limit),
                 dial_ceiling_semaphore,
                 dial_ceiling_limit,
-                #[cfg(feature = "native-api")]
+                #[cfg(feature = "owned-tasks")]
                 own_node_tasks: own_tasks,
                 background_tasks: std::sync::LazyLock::new(|| {
                     Arc::new(tasks::TaskOwner::production())
@@ -1187,9 +1186,9 @@ impl OutboundRuntimeRegistry {
     }
 
     fn owns_tasks(&self) -> bool {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         return self.own_node_tasks;
-        #[cfg(not(feature = "native-api"))]
+        #[cfg(not(feature = "owned-tasks"))]
         false
     }
 
@@ -1244,7 +1243,7 @@ impl OutboundRuntimeRegistry {
         if let Some(owner) = std::sync::LazyLock::get(&self.background_tasks) {
             owner.reap();
         }
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         {
             for runtime in self.nodes.values() {
                 if let Some(owner) = &runtime.task_owner {
@@ -1306,14 +1305,14 @@ impl OutboundRuntimeRegistry {
         {
             return true;
         }
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         {
             let moved_out = self.moved_out.lock();
             self.nodes
                 .iter()
                 .any(|(id, runtime)| !moved_out.contains(id) && runtime.tasks_failed())
         }
-        #[cfg(not(feature = "native-api"))]
+        #[cfg(not(feature = "owned-tasks"))]
         false
     }
 
@@ -1364,7 +1363,7 @@ impl OutboundRuntimeRegistry {
     pub async fn shutdown(&self) {
         self.begin_retirement();
         let moved_out: HashSet<uuid::Uuid> = self.moved_out.lock().clone();
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         {
             for (id, runtime) in &self.nodes {
                 if !moved_out.contains(id)

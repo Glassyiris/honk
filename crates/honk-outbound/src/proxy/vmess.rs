@@ -441,7 +441,6 @@ impl VmessHandler {
         let failure = RelayFailure::default();
         let relay_future =
             vmess_relay_recorded(stream, server_half, header_wire, session, failure.clone());
-        #[cfg(feature = "native-api")]
         let relay_future = crate::runtime::flow_observation::scope(
             crate::runtime::flow_observation::current(),
             relay_future,

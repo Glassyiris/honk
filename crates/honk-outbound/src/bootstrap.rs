@@ -101,7 +101,6 @@ async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
         let addrs = hosts_addresses(&contents, host);
         if !addrs.is_empty() {
-            #[cfg(feature = "native-api")]
             if let Some(mut observation) =
                 LookupObservation::start(host, "UNKNOWN", LookupOrigin::Hosts)
             {
@@ -160,7 +159,6 @@ impl BootstrapResolver {
     }
 
     async fn query_family(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        #[cfg(feature = "native-api")]
         let mut observation = LookupObservation::start(
             host,
             qtype_name(qtype),
@@ -174,14 +172,10 @@ impl BootstrapResolver {
                 })??;
             parse_answers(&msg, qtype)
         };
-        #[cfg(feature = "native-api")]
         let result = match &observation {
             Some(observation) => observation.child().scope(result).await,
             None => result.await,
         };
-        #[cfg(not(feature = "native-api"))]
-        let result = result.await;
-        #[cfg(feature = "native-api")]
         if let Some(observation) = &mut observation {
             observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
         }
@@ -305,7 +299,6 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
             }
         }
     };
-    #[cfg(feature = "native-api")]
     let mut observation = LookupObservation::start(
         host,
         "HTTPS",
@@ -315,14 +308,10 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
         ),
     );
     let operation = resolver.query_raw(host, QTYPE_HTTPS);
-    #[cfg(feature = "native-api")]
     let result = match &observation {
         Some(observation) => observation.child().scope(operation).await,
         None => operation.await,
     };
-    #[cfg(not(feature = "native-api"))]
-    let result = operation.await;
-    #[cfg(feature = "native-api")]
     if let Some(observation) = &mut observation {
         observation.finish(result.as_ref().map(|_| std::iter::empty()));
     }
@@ -499,7 +488,6 @@ pub fn qtype_name(qtype: u16) -> &'static str {
 }
 
 /// Where an observed lookup's answer comes from.
-#[cfg(feature = "native-api")]
 enum LookupOrigin {
     /// `/etc/hosts`, without a DNS exchange.
     Hosts,
@@ -507,14 +495,12 @@ enum LookupOrigin {
     Upstream(SocketAddr, &'static str),
 }
 
-#[cfg(feature = "native-api")]
 struct LookupObservation {
     observer: crate::runtime::flow_observation::FlowObserver,
     data: crate::runtime::flow_observation::DnsLookup,
     finished: bool,
 }
 
-#[cfg(feature = "native-api")]
 impl LookupObservation {
     fn start(host: &str, qtype: &str, origin: LookupOrigin) -> Option<Self> {
         use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
@@ -591,7 +577,6 @@ impl LookupObservation {
     }
 }
 
-#[cfg(feature = "native-api")]
 impl Drop for LookupObservation {
     fn drop(&mut self) {
         if !self.finished {

@@ -522,7 +522,7 @@ async fn measure_http_probe_mode(
 /// configured request after a validated HEAD. Host/SNI come from the request URI.
 /// The caller owns runtime teardown. HTTP/2 is driven inline, so returning or
 /// dropping this future releases its connection without a detached driver task.
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 pub async fn native_http_probe(
     runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
