@@ -160,9 +160,15 @@ impl Worker {
                 offline::MAX_ASSET_BYTES,
                 &plan.policy,
                 geodata::file_url(&active.experimental.native_api, asset.kind),
+                plan.verify_checksum,
             )
             .await
             .map_err(|error| {
+                if plan.sources.is_some() && error.code.starts_with("checksum_") {
+                    tracing::warn!(
+                        "geodata checksum check failed; for a mirror that publishes no usable .sha256sum, setting geodata.verify_checksum to false turns the check off"
+                    );
+                }
                 let mut details = failure(error.code, &writes);
                 details["asset"] = json!(asset.kind);
                 if let Some(status) = error.status {

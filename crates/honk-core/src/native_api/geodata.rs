@@ -77,6 +77,9 @@ pub(crate) struct GeoUpdatePlan {
     pub(crate) urls: Vec<Vec<String>>,
     /// The route every request takes, resolved when the update was queued.
     pub(crate) route: Route,
+    /// Whether each file has to match its published sha256, resolved when the
+    /// update was queued.
+    pub(crate) verify_checksum: bool,
     pub(crate) group_manager: honk_outbound::group::SharedGroupManager,
     pub(crate) proxy_registry: Arc<crate::proxy::ProxyRegistry>,
     pub(crate) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
@@ -350,6 +353,9 @@ async fn queue(state: &Arc<NativeState>, reservation: Reservation) -> bool {
                 .map(|asset| urls(&settings, sources.as_deref(), asset.kind))
                 .collect(),
             route: route(&settings, sources.as_deref()),
+            verify_checksum: sources
+                .as_deref()
+                .is_none_or(|sources| sources.effective().verify_checksum),
             group_manager: Arc::clone(&state.group_manager),
             proxy_registry: Arc::clone(&state.proxy_registry),
             runtime_registry: Arc::clone(&state.runtime_registry),
@@ -451,7 +457,8 @@ impl From<&'static str> for Failure {
 /// arrives. Every request takes the route in
 /// `egress`; one it cannot carry fails like a connection and never goes
 /// direct instead. `policy` applies to every URL but `exempt`, the one the
-/// administrator wrote in the configuration file.
+/// administrator wrote in the configuration file. Without `verify_checksum`
+/// no checksum is requested and every downloaded file is accepted unverified.
 pub(crate) async fn fetch(
     kind: &'static str,
     urls: &[String],
@@ -459,6 +466,7 @@ pub(crate) async fn fetch(
     max_bytes: usize,
     policy: &Policy,
     exempt: &str,
+    verify_checksum: bool,
 ) -> Result<(Arc<[u8]>, Fetched), Failure> {
     let mut last = Failure::from("invalid_source");
     for url in urls {
@@ -472,42 +480,46 @@ pub(crate) async fn fetch(
             }
         };
         let sha256 = crate::configuration::digest(&bytes);
-        let Some(mut checksum) = parse_geodata_url(url) else {
-            last = "invalid_source".into();
-            continue;
-        };
-        checksum.set_path(&format!("{}.sha256sum", checksum.path()));
-        let published = download(
-            checksum.as_str(),
-            egress,
-            Instant::now() + CHECKSUM_TIMEOUT,
-            MAX_CHECKSUM_BYTES,
-            policy,
-        )
-        .await;
-        let verified = match published {
-            Ok((published, _)) => {
-                let matches = std::str::from_utf8(&published)
-                    .ok()
-                    .and_then(|text| text.split_whitespace().next())
-                    .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha256));
-                if !matches {
-                    last = "checksum_mismatch".into();
+        let verified = if verify_checksum {
+            let Some(mut checksum) = parse_geodata_url(url) else {
+                last = "invalid_source".into();
+                continue;
+            };
+            checksum.set_path(&format!("{}.sha256sum", checksum.path()));
+            let published = download(
+                checksum.as_str(),
+                egress,
+                Instant::now() + CHECKSUM_TIMEOUT,
+                MAX_CHECKSUM_BYTES,
+                policy,
+            )
+            .await;
+            match published {
+                Ok((published, _)) => {
+                    let matches = std::str::from_utf8(&published)
+                        .ok()
+                        .and_then(|text| text.split_whitespace().next())
+                        .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha256));
+                    if !matches {
+                        last = "checksum_mismatch".into();
+                        continue;
+                    }
+                    true
+                }
+                Err(Failure {
+                    code: "http_not_found",
+                    ..
+                }) => false,
+                Err(error) => {
+                    last = Failure {
+                        code: "checksum_unavailable",
+                        status: error.status,
+                    };
                     continue;
                 }
-                true
             }
-            Err(Failure {
-                code: "http_not_found",
-                ..
-            }) => false,
-            Err(error) => {
-                last = Failure {
-                    code: "checksum_unavailable",
-                    status: error.status,
-                };
-                continue;
-            }
+        } else {
+            false
         };
         return Ok((
             bytes,

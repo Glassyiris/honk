@@ -413,3 +413,31 @@ fn download_patches_name_a_group_only_for_the_group_route() {
         "only a group route looks the id up"
     );
 }
+
+#[test]
+fn checksum_verification_is_on_until_a_patch_turns_it_off() {
+    let directory = tempfile::tempdir().unwrap();
+    db(directory.path())
+        .strict()
+        .execute(
+            "INSERT INTO geodata_settings (id, record) VALUES (1, ?1)",
+            [r#"{"auto_update":{"enabled":false,"interval_hours":48}}"#],
+        )
+        .unwrap();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    assert!(sources.effective().verify_checksum, "an older record");
+    let stored = sources
+        .apply(patch(json!({"verify_checksum": false})))
+        .unwrap();
+    assert!(!stored.verify_checksum);
+    assert!(!stored.auto_update.enabled);
+    assert_eq!(
+        stored.json(str::to_owned, |_| None)["verify_checksum"],
+        false
+    );
+    drop(sources);
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    assert!(!sources.effective().verify_checksum);
+    assert!(sources.apply(None).unwrap().verify_checksum);
+    assert!(Patch::parse(json!({"verify_checksum": "no"}), invalid).is_err());
+}

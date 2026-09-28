@@ -919,7 +919,8 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
             "geosite": {"urls": [format!("http://{address}/geosite/PRIVATE?token=PRIVATE")]},
             "geoip": {"urls": [format!("http://{address}/geoip")]},
             "auto_update": {"enabled": true, "interval_hours": 24},
-            "download": {"route": "routing", "group_id": null}})
+            "download": {"route": "routing", "group_id": null},
+            "verify_checksum": true})
     );
     let patched = ok(patch_settings(
         &fixture,
@@ -995,6 +996,22 @@ async fn auto_update_stays_settable_while_the_configuration_names_urls() {
     assert_eq!(settings["source"], "config");
     assert_eq!(fixture.get(SETTINGS).await["geodata"], settings["geodata"]);
     assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn checksum_verification_is_on_by_default_and_settable() {
+    let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let fixture =
+        Fixture::new_with_state(Access::Admin, |root, files| setup(root, files, address)).await;
+    assert_eq!(
+        fixture.get(SETTINGS).await["geodata"]["verify_checksum"],
+        true
+    );
+    let settings =
+        ok(patch_settings(&fixture, json!({"geodata": {"verify_checksum": false}})).await).await;
+    assert_eq!(settings["geodata"]["verify_checksum"], false);
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], settings["geodata"]);
     fixture.shutdown().await;
 }
 
