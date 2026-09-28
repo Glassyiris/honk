@@ -28,6 +28,21 @@ pub(in crate::control) fn effective_config_unchanged(
     current == candidate
 }
 
+/// Equal configurations may still come from a fresh source table, which later
+/// refresh diagnostics name their declaring file through.
+pub(in crate::control) fn declaring_sources_replaced(current: &Config, candidate: &Config) -> bool {
+    current
+        .subscriptions
+        .iter()
+        .zip(&candidate.subscriptions)
+        .any(
+            |(current, candidate)| match (&current.source, &candidate.source) {
+                (Some(current), Some(candidate)) => !current.0.same_source(&candidate.0),
+                (current, candidate) => current.is_some() != candidate.is_some(),
+            },
+        )
+}
+
 pub(in crate::control) fn dns_routing_state_reusable(current: &Config, candidate: &Config) -> bool {
     current.dns.routing == candidate.dns.routing
         && current.dns.fixed_domain_ttl == candidate.dns.fixed_domain_ttl

@@ -8,8 +8,8 @@ mod warm;
 pub(in crate::control) use warm::WarmTask;
 
 pub(in crate::control) use fingerprint::{
-    dns_routing_state_reusable, effective_config_unchanged, routing_state_reusable,
-    subscription_nodes_unchanged,
+    declaring_sources_replaced, dns_routing_state_reusable, effective_config_unchanged,
+    routing_state_reusable, subscription_nodes_unchanged,
 };
 pub(crate) use policy::{LogFiles, restart_required_fields};
 #[cfg(test)]

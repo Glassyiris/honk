@@ -330,9 +330,9 @@ impl ControlPlane {
                 {
                     native.settings.activate(native, &new_config);
                 }
-                // Equal configurations may still come from a fresh source table;
-                // later refresh diagnostics name their declaring file through it.
-                *config = Arc::new(new_config);
+                if declaring_sources_replaced(current_config.as_ref(), &new_config) {
+                    *config = Arc::new(new_config);
+                }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(ReloadOutcome::Noop { generation });
             }
