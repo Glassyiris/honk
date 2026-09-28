@@ -382,6 +382,21 @@ fn check_urls_remove_userinfo_and_fragments_without_rewriting_request_target() {
 }
 
 #[test]
+fn check_url_reports_the_probed_url_without_fallback_entries() {
+    let configured = "http://example.test/probe,192.0.2.1,http://other.test/";
+    let group = Group {
+        check_url: Some(configured.into()),
+        ..Default::default()
+    };
+    let probed = honk_outbound::urltest::health_http_probe_request(configured, "")
+        .unwrap()
+        .uri()
+        .to_string();
+    assert_eq!(probed, "http://example.test/probe");
+    assert_eq!(check_url(&group), Some(probed));
+}
+
+#[test]
 fn native_probe_context_keeps_exact_members_without_expanding_probe_set() {
     let mut config = fixture();
     config.nodes[0].name = "child".into();

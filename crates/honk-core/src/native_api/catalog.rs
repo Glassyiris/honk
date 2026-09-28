@@ -159,19 +159,28 @@ fn policy(policy: GroupPolicy) -> &'static str {
     }
 }
 
+/// The URL a group's health check probes; later comma entries are literal
+/// fallback addresses, not part of the URL.
 pub(super) fn check_url(group: &Group) -> Option<String> {
-    normalized_check_url(group.check_url.as_deref()?)
+    honk_config::check::decode_health_http_target(group.check_url.as_deref()?)
+        .ok()
+        .map(|target| probed_url(&target))
 }
 
-/// The URL a health check probes, as GET reports and PATCH writes it.
+/// A single check URL in the form GET reports and PATCH writes.
 pub(super) fn normalized_check_url(value: &str) -> Option<String> {
-    let target = honk_config::check::decode_http_check_target(value, false).ok()?;
-    Some(format!(
+    honk_config::check::decode_http_check_target(value, false)
+        .ok()
+        .map(|target| probed_url(&target))
+}
+
+fn probed_url(target: &honk_config::check::HttpCheckTarget) -> String {
+    format!(
         "{}://{}{}",
         if target.is_https() { "https" } else { "http" },
         target.authority(),
         target.request_target()
-    ))
+    )
 }
 
 /// Only URLTest switches on latency; other policies have no tolerance to report.
