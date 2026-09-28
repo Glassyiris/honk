@@ -142,6 +142,9 @@ pub(in crate::native_api) async fn replace(
         .await
         .map_err(|_| too_large())?;
     let replacement: Replacement = body::decode(&bytes, invalid)?;
+    if replacement.content.len() > MAX_CONTENT_BYTES {
+        return Err(too_large());
+    }
     let reservation = state.observation.configuration.operations.reserve(
         state.principal(),
         "PUT",
@@ -184,6 +187,9 @@ pub(in crate::native_api) async fn create(
         .await
         .map_err(|_| too_large())?;
     let creation: Creation = body::decode(&bytes, invalid)?;
+    if creation.content.len() > MAX_CONTENT_BYTES {
+        return Err(too_large());
+    }
     if !new_source_path(&creation.path) {
         return Err(invalid());
     }

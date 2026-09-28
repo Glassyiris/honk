@@ -430,6 +430,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     ];
     let mut providers = state.observation.providers.capability();
     providers["can_manage"] = json!(config.can_manage());
+    providers["create_unfetched"] = json!(true);
     let geodata = super::geodata::capability(state).await;
     let routing_trace = state.observation.trace.capability();
     let rules = super::routing::rules_capability();
@@ -443,7 +444,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": super::security::MAX_BODY_BYTES,
         },
         "resources": {
-            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::security::MAX_BODY_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
+            "config": {"available":config.content_enabled(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::config::MAX_CONTENT_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
             "config_export": {"available":config.content_enabled()},
             "config_import": config.import_capability(),
             "config_revisions": config.revisions_capability(),
@@ -475,7 +476,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "dns_log": state.observation.dns.log_capability(),
             "dns_rules": super::dns::rules_capability(),
             "runtime_settings": super::settings::capability(&state.settings, state.geodata.as_ref().is_some()),
-            "operations": {"available":true,"retention_seconds":300},
+            "operations": {"available":true,"retention_seconds":300,"max_replay_keys":super::operations::MAX_TOMBSTONES},
             "reload": {"available":config.running()},
             "suspend": {"available":false},
             "resume": {"available":false},
