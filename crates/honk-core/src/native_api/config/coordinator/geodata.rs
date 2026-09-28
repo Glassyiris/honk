@@ -352,7 +352,7 @@ fn prepare_and_replace(
     let requirements = GeoRequirements::for_traffic(&loaded.config.routing.rules).union(
         &crate::dns::routing::DnsRouter::geo_requirements(&loaded.config.dns),
     );
-    let captured = offline::capture_for_coordinator(
+    let mut captured = offline::capture_for_coordinator(
         loaded,
         store.dependency_root(),
         active,
@@ -363,6 +363,8 @@ fn prepare_and_replace(
         None,
     )
     .map_err(|_| failure("dependency_validation_failed", &writes))?;
+    // Only the dependency snapshots are needed from the loaded assets.
+    captured.release_geo();
     if !accepted.update.dependencies.is_empty()
         && !same_settled_dependencies(&accepted.update.dependencies, &captured.dependencies)
     {

@@ -1,6 +1,12 @@
 use super::*;
 
 impl CapturedConfig {
+    /// Drops the captured asset bytes that [`Self::with_geo`] replaces, so a
+    /// geodata update does not hold the loaded files beside the downloads.
+    pub(crate) fn release_geo(&mut self) {
+        self.geo = GeoSourceSet::unused();
+    }
+
     pub(crate) fn with_geo(mut self, geo: GeoSourceSet) -> Result<Self, DetailedConfigError> {
         let requirements = GeoRequirements::for_traffic(&self.config.routing.rules)
             .union(&DnsRouter::geo_requirements(&self.config.dns));

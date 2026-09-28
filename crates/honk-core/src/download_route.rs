@@ -427,22 +427,43 @@ where
         {
             return Err("asset_too_large");
         }
-        let mut bytes = Vec::new();
+        // A declared length fills one buffer of that size, so a large body is
+        // neither grown in steps nor copied once more into an `Arc`.
+        let mut sized: Option<std::sync::Arc<[u8]>> = response
+            .body()
+            .size_hint()
+            .exact()
+            .map(|length| std::iter::repeat_n(0, length as usize).collect());
+        let mut grown = Vec::new();
+        let mut received = 0;
         while let Some(frame) =
             std::future::poll_fn(|cx| std::pin::Pin::new(response.body_mut()).poll_frame(cx)).await
         {
             let frame = frame.map_err(|_| "http_failed")?;
             if let Ok(data) = frame.into_data() {
-                if data.len() > max_bytes.saturating_sub(bytes.len()) {
+                if data.len() > max_bytes.saturating_sub(received) {
                     return Err("asset_too_large");
                 }
-                bytes.extend_from_slice(&data);
+                match sized.as_mut() {
+                    Some(buffer) => std::sync::Arc::get_mut(buffer)
+                        .expect("a new buffer is unshared")
+                        .get_mut(received..received + data.len())
+                        .ok_or("http_failed")?
+                        .copy_from_slice(&data),
+                    None => grown.extend_from_slice(&data),
+                }
+                received += data.len();
             }
         }
+        let body = match sized {
+            Some(buffer) if buffer.len() == received => buffer,
+            Some(_) => return Err("http_failed"),
+            None => grown.into(),
+        };
         Ok(Reply {
             status,
             location,
-            body: std::sync::Arc::from(bytes),
+            body,
         })
     })
     .await

@@ -59,18 +59,24 @@ impl SourceFile {
         let directory = open_directory(&parent_path).map_err(path_error)?;
         let file = open_source(&directory, &filename).map_err(path_error)?;
         let metadata = regular_metadata(&file, max_bytes)?;
-        let mut bytes = Vec::new();
-        (&file)
-            .take(read_limit(max_bytes))
-            .read_to_end(&mut bytes)
-            .map_err(|_| WriteError::Unavailable)?;
-        if bytes.len() > max_bytes {
-            return Err(WriteError::TooLarge);
-        }
-        if text && std::str::from_utf8(&bytes).is_err() {
-            return Err(WriteError::InvalidUtf8);
-        }
-        if metadata.len() != bytes.len() as u64
+        let (hash, length) = if text {
+            let mut bytes = Vec::new();
+            (&file)
+                .take(read_limit(max_bytes))
+                .read_to_end(&mut bytes)
+                .map_err(|_| WriteError::Unavailable)?;
+            if bytes.len() > max_bytes {
+                return Err(WriteError::TooLarge);
+            }
+            if std::str::from_utf8(&bytes).is_err() {
+                return Err(WriteError::InvalidUtf8);
+            }
+            (crate::configuration::digest(&bytes), bytes.len() as u64)
+        } else {
+            // Only text needs its bytes whole; a geodata asset is hashed as it is read.
+            stream_digest(&file, max_bytes)?
+        };
+        if metadata.len() != length
             || !same_version(
                 &metadata,
                 &file.metadata().map_err(|_| WriteError::Unavailable)?,
@@ -78,7 +84,6 @@ impl SourceFile {
         {
             return Err(WriteError::Conflict);
         }
-        let hash = crate::configuration::digest(&bytes);
         Ok(Self {
             directory,
             parent_path,
@@ -183,27 +188,9 @@ impl SourceFile {
         {
             return Err(WriteError::Conflict);
         }
-        let mut reader = (&current).take(read_limit(self.max_bytes));
-        let mut digest = Sha256::new();
-        let mut buffer = [0; 8192];
-        let mut total = 0u64;
-        loop {
-            let count = match reader.read(&mut buffer) {
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return Err(WriteError::Unavailable),
-            };
-            if count == 0 {
-                break;
-            }
-            total += count as u64;
-            if total > self.max_bytes as u64 {
-                return Err(WriteError::TooLarge);
-            }
-            digest.update(&buffer[..count]);
-        }
+        let (hash, total) = stream_digest(&current, self.max_bytes)?;
         if total != metadata.len()
-            || crate::configuration::encode_digest(&digest.finalize()) != self.hash
+            || hash != self.hash
             || !same_version(
                 &metadata,
                 &current.metadata().map_err(|_| WriteError::Unavailable)?,
@@ -213,6 +200,33 @@ impl SourceFile {
         }
         Ok(())
     }
+}
+
+/// The SHA-256 and length of at most `max_bytes` of `file`, read in chunks.
+fn stream_digest(file: &File, max_bytes: usize) -> Result<(String, u64), WriteError> {
+    let mut reader = file.take(read_limit(max_bytes));
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 8192];
+    let mut total = 0u64;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(WriteError::Unavailable),
+        };
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > max_bytes as u64 {
+            return Err(WriteError::TooLarge);
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok((
+        crate::configuration::encode_digest(&digest.finalize()),
+        total,
+    ))
 }
 
 pub(crate) struct StagedFile {

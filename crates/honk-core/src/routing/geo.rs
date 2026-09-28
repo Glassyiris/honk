@@ -232,6 +232,12 @@ impl GeoSourceSet {
         Ok(Self::from_sources(geosite, geoip))
     }
 
+    /// A set that holds no asset.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn unused() -> Self {
+        Self::from_sources(GeoSource::Unused, GeoSource::Unused)
+    }
+
     #[cfg(feature = "native-api")]
     pub(crate) fn from_assets(
         requirements: &GeoRequirements,
