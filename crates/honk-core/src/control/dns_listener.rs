@@ -485,17 +485,17 @@ async fn run_udp_supervisor(
                     {
                         Ok(Err(error)) => {
                             #[cfg(feature = "native-api")]
-                            crate::native_api::flows::dns::delivery("delivery_failed", Some("client_send_failed"));
+                            crate::observe::flows::dns::delivery("delivery_failed", Some("client_send_failed"));
                             debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS response send failed");
                         }
                         Err(_) => {
                             #[cfg(feature = "native-api")]
-                            crate::native_api::flows::dns::delivery("cancelled", Some("runtime_retired"));
+                            crate::observe::flows::dns::delivery("cancelled", Some("runtime_retired"));
                             debug!(%client_addr, "standalone UDP DNS response cancelled with runtime retirement");
                         }
                         Ok(Ok(_)) => {
                             #[cfg(feature = "native-api")]
-                            crate::native_api::flows::dns::delivery("delivered", None);
+                            crate::observe::flows::dns::delivery("delivered", None);
                         }
                     }
                     #[cfg(feature = "native-api")]
@@ -504,7 +504,7 @@ async fn run_udp_supervisor(
                     #[cfg(feature = "native-api")]
                     {
                         let operation = std::pin::pin!(operation);
-                        let operation = crate::native_api::flows::dns::client_scope(&query, ingress, metadata, operation);
+                        let operation = crate::observe::flows::dns::client_scope(&query, ingress, metadata, operation);
                         match observer {
                             Some(observer) => observer.scope(operation).await,
                             None => operation.await,
@@ -547,18 +547,18 @@ async fn observe_bound_error(
     operation: impl Future<Output = Result<io::Result<usize>, crate::dns::runtime::RuntimeCancelled>>,
 ) -> Result<io::Result<usize>, crate::dns::runtime::RuntimeCancelled> {
     let operation = async {
-        crate::native_api::flows::dns::decision("rejected", Some(reason));
+        crate::observe::flows::dns::decision("rejected", Some(reason));
         let result = operation.await;
         let (status, error) = match &result {
             Ok(Ok(length)) if *length == 12 => ("delivered", None),
             Ok(_) => ("delivery_failed", Some("client_send_failed")),
             Err(_) => ("cancelled", Some("runtime_retired")),
         };
-        crate::native_api::flows::dns::delivery(status, error);
+        crate::observe::flows::dns::delivery(status, error);
         result
     };
     let operation = std::pin::pin!(operation);
-    let operation = crate::native_api::flows::dns::client_scope(
+    let operation = crate::observe::flows::dns::client_scope(
         query,
         crate::dns::query::IngressProfile::Udp {
             advertised_size: 512,
@@ -981,7 +981,7 @@ mod tests {
         ));
         controller
             .dns_service()
-            .attach_observer(Arc::downgrade(&api));
+            .attach_observer(Arc::downgrade(&api.recorder));
         let (mut listener, address, drain) =
             start_listener("udp://127.0.0.1:0", Arc::clone(&controller));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1001,7 +1001,7 @@ mod tests {
             controller_with_config([192, 0, 2, 10], &honk_config::dns::DnsConfig::default(), 0);
         saturated
             .dns_service()
-            .attach_observer(Arc::downgrade(&api));
+            .attach_observer(Arc::downgrade(&api.recorder));
         let (mut listener, address, drain) = start_listener("udp://127.0.0.1:0", saturated);
         client
             .send_to(&query("refused.example", 2), address)
@@ -1157,7 +1157,7 @@ mod tests {
         let (controller, calls) = controller([192, 0, 2, 10]);
         controller
             .dns_service()
-            .attach_observer(Arc::downgrade(&native.dns));
+            .attach_observer(Arc::downgrade(&native.dns.recorder));
         let bound =
             BoundDnsListener::bind(&DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap())
                 .unwrap();
@@ -1189,7 +1189,7 @@ mod tests {
             controller_with_config([192, 0, 2, 10], &honk_config::dns::DnsConfig::default(), 0);
         saturated
             .dns_service()
-            .attach_observer(Arc::downgrade(&native.dns));
+            .attach_observer(Arc::downgrade(&native.dns.recorder));
         let bound =
             BoundDnsListener::bind(&DnsBindEndpoint::parse("udp://127.0.0.1:0").unwrap()).unwrap();
         let address = bound.local_addr();

@@ -610,7 +610,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
         let mut backend = MockEbpfBackend::new();
         backend.publish_routing_plan(&plan, &[]).unwrap();
         backend.bind_kernel_trace_dictionary(
-            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
                 &native.instance_id,
                 17,
                 &router,
@@ -640,7 +640,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
         witness.output.input.dscp = 8;
         witness.output.outcomes[0] = ROUTE_TRACE_MATCHED;
         let first_id = backend.capture_route_witness(witness);
-        let reference = crate::native_api::flows::kernel::KernelRouteReference {
+        let reference = crate::observe::flows::kernel::KernelRouteReference {
             trace_id: first_id,
             decision_token: 0,
             routing_generation: descriptor.generation,
@@ -652,7 +652,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             backend
                 .capture_kernel_route(
                     &tuples,
-                    crate::native_api::flows::kernel::KernelRouteReference {
+                    crate::observe::flows::kernel::KernelRouteReference {
                         effective_outbound: OutboundIndex::Block as u8,
                         ..reference
                     },

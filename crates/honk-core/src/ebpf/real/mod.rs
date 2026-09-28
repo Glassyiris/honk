@@ -105,7 +105,7 @@ pub struct RealEbpfBackend {
     routing_generation_sequence: AyaArray<AyaMapData, u64>,
     next_trace_policy: u32,
     #[cfg(feature = "native-api")]
-    trace_dictionaries: crate::native_api::flows::kernel::KernelTraceDictionaries,
+    trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
     receive_trace: Option<std::sync::Arc<receive_trace::ReceiveTrace>>,
     receive_trace_available: bool,
     receive_trace_attempted: bool,
@@ -877,7 +877,7 @@ impl EbpfBackend for RealEbpfBackend {
     #[cfg(feature = "native-api")]
     fn bind_kernel_trace_dictionary(
         &mut self,
-        dictionary: crate::native_api::flows::kernel::KernelTraceDictionary,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
     ) {
         if let Some(owner) = &self.routing_generation {
             self.trace_dictionaries
@@ -889,8 +889,8 @@ impl EbpfBackend for RealEbpfBackend {
     fn capture_kernel_route(
         &self,
         key: &TuplesKey,
-        reference: crate::native_api::flows::kernel::KernelRouteReference,
-    ) -> Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str> {
+        reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
         if reference.trace_id == 0 {
             return Err("kernel_trace_not_captured");
         }

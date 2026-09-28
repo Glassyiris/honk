@@ -6,11 +6,8 @@ use crate::dns::{
     routing::DnsRouter,
     upstream_pool::UpstreamPool,
 };
-use crate::native_api::{
-    events::EventHub,
-    flows::{FlowGuard, FlowStore},
-    types::RequestId,
-};
+use crate::native_api::events::EventHub;
+use crate::observe::flows::{FlowGuard, FlowStore};
 use honk_config::{
     dns::{DnsCond, DnsConfig, DnsRequestAction, DnsRequestRule, DnsUpstream},
     types::DnsProtocol,
@@ -18,10 +15,37 @@ use honk_config::{
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 
+struct Unrecorded;
+
+impl crate::observe::DnsLog for Unrecorded {
+    fn recording(&self) -> bool {
+        false
+    }
+
+    fn capture(
+        &self,
+        _: &[u8],
+        _: IngressProfile,
+        _: Option<SocketAddr>,
+        _: Option<&DnsOutcome>,
+        _: &[u8],
+        _: Duration,
+    ) {
+    }
+}
+
+fn recorder(instance: String, store: &Arc<FlowStore>) -> Arc<DnsRecorder> {
+    Arc::new(DnsRecorder::new(
+        instance,
+        Arc::downgrade(store),
+        Arc::new(Unrecorded),
+    ))
+}
+
 async fn fixture() -> (
     DnsService,
     Arc<FlowStore>,
-    Arc<DnsApi>,
+    Arc<DnsRecorder>,
     Arc<Semaphore>,
     mpsc::UnboundedReceiver<()>,
     tokio::task::JoinHandle<()>,
@@ -84,7 +108,7 @@ async fn fixture() -> (
         instance.clone(),
         Arc::new(EventHub::new(instance.clone())),
     ));
-    let api = Arc::new(DnsApi::new(instance, false, Arc::downgrade(&store)));
+    let api = recorder(instance, &store);
     service.attach_observer(Arc::downgrade(&api));
     (service, store, api, gate, received, server)
 }
@@ -100,9 +124,7 @@ fn observer(store: &Arc<FlowStore>) -> (Arc<FlowGuard>, FlowObserver) {
 }
 
 fn detail(store: &FlowStore, flow: &FlowGuard) -> serde_json::Value {
-    store
-        .get(flow.id(), &RequestId("dns-evidence".into()))
-        .unwrap()
+    store.get(flow.id()).unwrap()
 }
 fn dns_rows(detail: &serde_json::Value) -> Vec<&serde_json::Value> {
     detail["trace"]["steps"]
@@ -311,11 +333,7 @@ async fn foreign_dns_sink_cannot_publish_unresolved_rule_references() {
         other_instance.clone(),
         Arc::new(EventHub::new(other_instance.clone())),
     ));
-    let foreign_api = Arc::new(DnsApi::new(
-        other_instance,
-        false,
-        Arc::downgrade(&other_store),
-    ));
+    let foreign_api = recorder(other_instance, &other_store);
     service.attach_observer(Arc::downgrade(&foreign_api));
     let (flow, observer) = observer(&store);
     gate.add_permits(1);
@@ -421,7 +439,7 @@ async fn selection_evidence_keeps_the_consumed_catalog_after_group_recreation() 
         instance.clone(),
         Arc::new(EventHub::new(instance.clone())),
     ));
-    let api = Arc::new(DnsApi::new(instance, false, Arc::downgrade(&store)));
+    let api = recorder(instance, &store);
     let (flow, observer) = observer(&store);
     scope_api(
         Arc::downgrade(&api),
@@ -534,7 +552,7 @@ async fn tcp_wire_retry_keeps_distinct_lookup_ids_and_physical_parentage() {
             instance.clone(),
             Arc::new(EventHub::new(instance.clone())),
         ));
-        let api = Arc::new(DnsApi::new(instance, false, Arc::downgrade(&store)));
+        let api = recorder(instance, &store);
         service.attach_observer(Arc::downgrade(&api));
         let (flow, observer) = observer(&store);
         let resolve = tokio::spawn(async move {
@@ -733,7 +751,7 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
             instance.clone(),
             Arc::new(EventHub::new(instance.clone())),
         ));
-        let api = Arc::new(DnsApi::new(instance, false, Arc::downgrade(&store)));
+        let api = recorder(instance, &store);
         service.attach_observer(Arc::downgrade(&api));
         for (index, name) in ["cold.example", "warm.example"].into_iter().enumerate() {
             let (flow, _) = observer(&store);
@@ -882,7 +900,7 @@ async fn truncated_udp_keeps_both_wire_lookups_and_tcp_fallback_reason() {
             instance.clone(),
             Arc::new(EventHub::new(instance.clone())),
         ));
-        let api = Arc::new(DnsApi::new(instance, false, Arc::downgrade(&store)));
+        let api = recorder(instance, &store);
         service.attach_observer(Arc::downgrade(&api));
         let (flow, observer) = observer(&store);
         let query = build_dns_query("truncated.example", 1);

@@ -366,7 +366,7 @@ impl UdpInitLease {
     #[cfg(feature = "native-api")]
     pub(in crate::control) fn set_native_flow(
         &self,
-        flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
+        flow: Option<Arc<crate::observe::flows::FlowGuard>>,
     ) -> Option<Arc<retirement::NativeUdpTerminal>> {
         let flow = flow?;
         let terminal = Arc::clone(

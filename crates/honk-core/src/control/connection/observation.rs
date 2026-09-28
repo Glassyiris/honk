@@ -9,7 +9,9 @@ use honk_outbound::{alive::IpVersion, runtime::flow_observation::FlowObserver};
 
 use super::{handoff::HandoffResult, routing::RoutingDecision};
 use crate::{
-    native_api::{
+    native_api::observation::NativeObservation,
+    observe::{
+        catalog::CatalogIdentity,
         flows::{
             FlowGuard,
             record::{
@@ -17,10 +19,6 @@ use crate::{
                 Selection, StepData,
             },
         },
-        observation::NativeObservation,
-    },
-    observe::{
-        catalog::CatalogIdentity,
         rules::{RuleEvaluation, rule_id},
     },
     routing::{ConnectionInfo, RouteMatch, Router},
@@ -206,7 +204,7 @@ impl ConnectionObservation {
         else {
             return;
         };
-        let decisions = crate::native_api::flows::producer::map_selection_observation(
+        let decisions = crate::observe::flows::producer::map_selection_observation(
             observation,
             &selection.catalog,
             &observer,
@@ -276,7 +274,7 @@ impl ConnectionObservation {
 
     pub(in crate::control) fn packet_route(
         &mut self,
-        capture: Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str>,
+        capture: Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str>,
     ) {
         let Some(record) = &mut self.recorded else {
             return;
@@ -289,7 +287,7 @@ impl ConnectionObservation {
 
     fn record_kernel(
         record: &mut RecordedConnection,
-        capture: crate::native_api::flows::kernel::CapturedKernelRoute,
+        capture: crate::observe::flows::kernel::CapturedKernelRoute,
     ) {
         if capture.truncated {
             record.flow.mark_overflow();

@@ -967,5 +967,15 @@ pub(super) fn stream_response(subscription: Subscription) -> Response {
         .into_response()
 }
 
+impl crate::observe::Events for EventHub {
+    fn publish(&self, kind: &'static str, data: Value, flow_id: Option<&str>) {
+        EventHub::publish(self, kind, data, flow_id);
+    }
+
+    fn flow_updated(&self, flow_id: &str, revision: u64) {
+        EventHub::flow_updated(self, flow_id, revision);
+    }
+}
+
 #[cfg(test)]
 mod tests;

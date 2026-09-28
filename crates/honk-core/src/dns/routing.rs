@@ -478,7 +478,7 @@ impl DnsRouter {
         let evaluation = Evaluation::request(domain, qtype, source_ip);
         #[cfg(feature = "native-api")]
         let mut capture =
-            crate::native_api::flows::dns::RuleCapture::request(domain, qtype, source_ip);
+            crate::observe::flows::dns::RuleCapture::request(domain, qtype, source_ip);
         for (_index, rule) in self.request_rules.iter().enumerate() {
             #[cfg(feature = "native-api")]
             if let Some(capture) = &mut capture {
@@ -548,7 +548,7 @@ impl DnsRouter {
             },
         );
         #[cfg(feature = "native-api")]
-        let mut capture = crate::native_api::flows::dns::RuleCapture::response(
+        let mut capture = crate::observe::flows::dns::RuleCapture::response(
             domain,
             qtype,
             answer_ips,

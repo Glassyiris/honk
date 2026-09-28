@@ -536,7 +536,7 @@ impl Drop for FlowGuard {
     }
 }
 
-pub(super) fn connection_state(value: &str) -> &'static str {
+pub(crate) fn connection_state(value: &str) -> &'static str {
     match value {
         "observed" => "observed",
         "routing" => "routing",

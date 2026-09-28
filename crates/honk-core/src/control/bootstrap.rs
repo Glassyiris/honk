@@ -224,7 +224,7 @@ impl ControlPlane {
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         #[cfg(feature = "native-api")]
         let initial_dictionary = native.as_ref().and_then(|native| {
-            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
                 &native.instance_id,
                 0,
                 &router,
@@ -265,7 +265,7 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         if let Some(native) = &native {
             runtime_provider.enable_lifecycle();
-            dns_service.attach_observer(Arc::downgrade(&native.dns));
+            dns_service.attach_observer(Arc::downgrade(&native.dns.recorder));
         }
         let dns_resolver = Arc::new(DnsResolver::with_service(dns_service.clone()));
 

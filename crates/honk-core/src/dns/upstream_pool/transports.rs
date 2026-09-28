@@ -58,7 +58,7 @@ impl PooledTransport {
                 Self::Doq(_) => ("doq", "udp"),
                 Self::Doh3(_) => ("doh3", "udp"),
             };
-            crate::native_api::flows::dns::transport(upstream, carrier);
+            crate::observe::flows::dns::transport(upstream, carrier);
         }
         match self {
             Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,

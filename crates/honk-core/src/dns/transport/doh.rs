@@ -268,7 +268,8 @@ mod tests {
     async fn native_h2_reuse_and_stale_readiness_keep_inner_retry_evidence() {
         use super::*;
         use crate::dns::{endpoint::DnsEndpoint, forwarder::build_dns_query};
-        use crate::native_api::{events::EventHub, flows::FlowStore};
+        use crate::native_api::events::EventHub;
+        use crate::observe::flows::FlowStore;
         use honk_config::types::DnsProtocol;
         use uuid::Uuid;
 

@@ -5,7 +5,7 @@ use super::*;
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) type PacketRoute =
-    Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str>;
+    Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str>;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UdpOriginalDst {
@@ -366,7 +366,7 @@ impl UdpLoopState {
                         src_addr.port(),
                         17,
                     ),
-                    crate::native_api::flows::kernel::KernelRouteReference {
+                    crate::observe::flows::kernel::KernelRouteReference {
                         trace_id,
                         decision_token: 0,
                         routing_generation: u64::from(route.generation()),
@@ -606,10 +606,7 @@ impl UdpLoopState {
                     let started = std::time::Instant::now();
                     let operation = async {
                         #[cfg(feature = "native-api")]
-                        crate::native_api::flows::dns::decision(
-                            "rejected",
-                            Some("admission_refused"),
-                        );
+                        crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
                         let result = runtime
                             .run_reply(send_udp_reply_from_orig_dst(
                                 &response,
@@ -624,7 +621,7 @@ impl UdpLoopState {
                                 Ok(_) => ("delivery_failed", Some("client_send_failed")),
                                 Err(_) => ("cancelled", Some("runtime_retired")),
                             };
-                            crate::native_api::flows::dns::delivery(status, error);
+                            crate::observe::flows::dns::delivery(status, error);
                         }
                         #[cfg(not(feature = "native-api"))]
                         let _ = result;
@@ -632,7 +629,7 @@ impl UdpLoopState {
                     #[cfg(feature = "native-api")]
                     if let Some(raw) = query.as_deref() {
                         let operation = std::pin::pin!(operation);
-                        let operation = crate::native_api::flows::dns::client_scope(
+                        let operation = crate::observe::flows::dns::client_scope(
                             raw,
                             ingress,
                             crate::dns::query::DnsRequestMeta::new(

@@ -96,7 +96,7 @@ impl DnsEndpoint {
     pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
         let resolve = self.resolve_addrs();
         #[cfg(feature = "native-api")]
-        let (addresses, witness) = crate::native_api::flows::dns::scope_purpose(
+        let (addresses, witness) = crate::observe::flows::dns::scope_purpose(
             "proxy_server",
             std::pin::pin!(honk_outbound::runtime::flow_observation::observe_resolution(resolve)),
         )

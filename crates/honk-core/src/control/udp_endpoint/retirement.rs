@@ -7,7 +7,7 @@ const DRIVER_RELEASED: u8 = 2;
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) struct NativeUdpTerminal {
-    flow: Arc<crate::native_api::flows::FlowGuard>,
+    flow: Arc<crate::observe::flows::FlowGuard>,
     state: Mutex<NativeUdpState>,
 }
 
@@ -41,7 +41,7 @@ impl Drop for NativeInitializerGuard {
 #[cfg(feature = "native-api")]
 impl NativeUdpTerminal {
     pub(super) fn new(
-        flow: Arc<crate::native_api::flows::FlowGuard>,
+        flow: Arc<crate::observe::flows::FlowGuard>,
         initializer_done: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -65,7 +65,7 @@ impl NativeUdpTerminal {
     pub(super) fn packet_drop(&self, reason: &'static str) {
         self.flow.step(
             None,
-            crate::native_api::flows::record::StepData::Datapath {
+            crate::observe::flows::record::StepData::Datapath {
                 plane: "userspace",
                 action: "drop",
                 reason,

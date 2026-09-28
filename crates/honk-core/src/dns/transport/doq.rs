@@ -220,7 +220,8 @@ mod tests {
         });
         #[cfg(feature = "native-api")]
         let store = {
-            use crate::native_api::{events::EventHub, flows::FlowStore};
+            use crate::native_api::events::EventHub;
+            use crate::observe::flows::FlowStore;
             let instance = uuid::Uuid::new_v4().to_string();
             Arc::new(FlowStore::new(
                 instance.clone(),

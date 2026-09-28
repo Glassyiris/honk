@@ -379,12 +379,10 @@ fn oversized_dictionary_reports_only_executed_evidence_loss() {
 
 #[test]
 fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
-    use crate::native_api::{
-        events::EventHub,
-        flows::{
-            FlowStore,
-            record::{EvaluationInput, StepData},
-        },
+    use crate::native_api::events::EventHub;
+    use crate::observe::flows::{
+        FlowStore,
+        record::{EvaluationInput, StepData},
     };
     use std::sync::Arc;
 

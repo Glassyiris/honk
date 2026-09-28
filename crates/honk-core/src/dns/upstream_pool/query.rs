@@ -143,7 +143,7 @@ impl UpstreamPool {
             let injected = self.prepare_generated_ecs(raw_query);
             let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
             #[cfg(feature = "native-api")]
-            crate::native_api::flows::dns::transport("udp", "udp");
+            crate::observe::flows::dns::transport("udp", "udp");
             let response = {
                 let query = async {
                     self.udp_pool(entry, address)
@@ -155,7 +155,7 @@ impl UpstreamPool {
                 let query = std::pin::pin!(query);
                 #[cfg(feature = "native-api")]
                 let query =
-                    crate::native_api::flows::dns::transport_exchange_scope(effective_query, query);
+                    crate::observe::flows::dns::transport_exchange_scope(effective_query, query);
                 query.await?
             };
             entry.udp.lock().mark_current(address);
@@ -165,7 +165,7 @@ impl UpstreamPool {
         let exchange = std::pin::pin!(exchange);
         #[cfg(feature = "native-api")]
         let exchange =
-            crate::native_api::flows::dns::outbound_scope(route.observation.as_ref(), exchange);
+            crate::observe::flows::dns::outbound_scope(route.observation.as_ref(), exchange);
         exchange.await
     }
 
@@ -224,7 +224,7 @@ impl UpstreamPool {
                 .await?;
             let response = if crate::dns::response::is_truncated(&response) {
                 #[cfg(feature = "native-api")]
-                crate::native_api::flows::dns::tcp_fallback();
+                crate::observe::flows::dns::tcp_fallback();
                 let tcp_feedback = self.tcp_feedback_for_route(entry, route)?;
                 let business = admit_score_attempt(tcp_feedback.as_ref(), original)?;
                 debug!(
@@ -248,7 +248,7 @@ impl UpstreamPool {
         let exchange = std::pin::pin!(exchange);
         #[cfg(feature = "native-api")]
         let exchange =
-            crate::native_api::flows::dns::outbound_scope(route.observation.as_ref(), exchange);
+            crate::observe::flows::dns::outbound_scope(route.observation.as_ref(), exchange);
         exchange.await
     }
 
@@ -269,7 +269,7 @@ impl UpstreamPool {
             );
             let exchange = async {
                 #[cfg(feature = "native-api")]
-                crate::native_api::flows::dns::tcp_fallback();
+                crate::observe::flows::dns::tcp_fallback();
                 self.get_transport(entry, None, route.target)
                     .await?
                     .exchange(effective_query, None)
@@ -279,7 +279,7 @@ impl UpstreamPool {
             let exchange = std::pin::pin!(exchange);
             #[cfg(feature = "native-api")]
             let exchange =
-                crate::native_api::flows::dns::outbound_scope(route.observation.as_ref(), exchange);
+                crate::observe::flows::dns::outbound_scope(route.observation.as_ref(), exchange);
             exchange.await?
         } else {
             debug!(
@@ -309,7 +309,7 @@ impl UpstreamPool {
         let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
             let resolve = Self::resolve_udp_addrs(entry);
             #[cfg(feature = "native-api")]
-            let (targets, witness) = crate::native_api::flows::dns::scope_purpose(
+            let (targets, witness) = crate::observe::flows::dns::scope_purpose(
                 "proxy_server",
                 std::pin::pin!(
                     honk_outbound::runtime::flow_observation::observe_resolution(resolve)
@@ -377,7 +377,7 @@ impl UpstreamPool {
 
         let resolve = Self::resolve_udp_addrs(entry);
         #[cfg(feature = "native-api")]
-        let (addresses, witness) = crate::native_api::flows::dns::scope_purpose(
+        let (addresses, witness) = crate::observe::flows::dns::scope_purpose(
             "proxy_server",
             std::pin::pin!(honk_outbound::runtime::flow_observation::observe_resolution(resolve)),
         )
@@ -508,7 +508,7 @@ impl UpstreamPool {
 
         let resolve = entry.endpoint.resolve_addrs();
         #[cfg(feature = "native-api")]
-        let (targets, witness) = crate::native_api::flows::dns::scope_purpose(
+        let (targets, witness) = crate::observe::flows::dns::scope_purpose(
             "proxy_server",
             std::pin::pin!(honk_outbound::runtime::flow_observation::observe_resolution(resolve)),
         )
@@ -546,7 +546,7 @@ impl UpstreamPool {
                 #[cfg(feature = "native-api")]
                 let exchange = std::pin::pin!(exchange);
                 #[cfg(feature = "native-api")]
-                let exchange = crate::native_api::flows::dns::outbound_scope(
+                let exchange = crate::observe::flows::dns::outbound_scope(
                     route.observation.as_ref(),
                     exchange,
                 );
@@ -608,7 +608,7 @@ impl DnsUpstreamPool for UpstreamPool {
         #[cfg(feature = "native-api")]
         let query = std::pin::pin!(query);
         #[cfg(feature = "native-api")]
-        let query = crate::native_api::flows::dns::exchange_scope(raw_query, upstream_name, query);
+        let query = crate::observe::flows::dns::exchange_scope(raw_query, upstream_name, query);
         query.await
     }
 }

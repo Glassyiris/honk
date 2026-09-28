@@ -12,7 +12,7 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
     ));
     controller
         .dns_service()
-        .attach_observer(Arc::downgrade(&api));
+        .attach_observer(Arc::downgrade(&api.recorder));
     let source: SocketAddr = "[2001:db8::12]:53000".parse().unwrap();
     let admission = controller.try_admit_query(true).unwrap();
     controller

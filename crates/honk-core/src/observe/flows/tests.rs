@@ -1,13 +1,20 @@
 use super::record::{FlowError, OutboundAttempt, Selection};
 use super::*;
+use crate::native_api::events::EventHub;
 use honk_config::types::DialMode;
 
 fn store() -> Arc<FlowStore> {
+    store_with_hub().0
+}
+
+fn store_with_hub() -> (Arc<FlowStore>, Arc<EventHub>) {
     let instance = Uuid::new_v4().to_string();
-    Arc::new(FlowStore::new(
-        instance.clone(),
-        Arc::new(EventHub::new(instance)),
-    ))
+    let hub = Arc::new(EventHub::new(instance.clone()));
+    let store = Arc::new(FlowStore::new(
+        instance,
+        Arc::clone(&hub) as Arc<dyn Events>,
+    ));
+    (store, hub)
 }
 
 fn begin(store: &Arc<FlowStore>, network: &'static str) -> FlowGuard {
@@ -18,23 +25,8 @@ fn begin(store: &Arc<FlowStore>, network: &'static str) -> FlowGuard {
     )
 }
 
-fn request_id() -> RequestId {
-    RequestId("flow-test".to_owned())
-}
-
 fn filters(network: &str, state: &str, full: bool, limit: usize) -> Filters {
-    Filters {
-        network: network.to_owned(),
-        state: state.to_owned(),
-        connection_id: None,
-        full,
-        limit,
-    }
-}
-
-fn error_code(error: ApiError, status: StatusCode, code: &str) {
-    assert_eq!(serde_json::to_value(&error).unwrap()["error"]["code"], code);
-    assert_eq!(error.into_response().status(), status);
+    Filters::new(network.to_owned(), state.to_owned(), None, full, limit)
 }
 
 fn dial_mode() -> StepData {
@@ -53,10 +45,8 @@ fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_popula
     let store = store();
     let flow = begin(&store, "tcp");
     flow.transition("active", "transport_ready", "transport_ready", None);
-    let page = store
-        .page(filters("tcp", "all", true, 100), None, &request_id())
-        .unwrap();
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let page = store.page(filters("tcp", "all", true, 100), None).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace_status"], "complete");
     assert_eq!(detail["trace"]["status"], "complete");
     assert_eq!(detail["trace"]["missing"], json!([]));
@@ -67,10 +57,8 @@ fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_popula
     flow.mark_gap("not_instrumented");
     flow.step(Some(7), dial_mode());
     flow.finish("closed", "relay_finished");
-    let changed = store.get(flow.id(), &request_id()).unwrap();
-    let next = store
-        .page(filters("tcp", "all", false, 100), None, &request_id())
-        .unwrap();
+    let changed = store.get(flow.id()).unwrap();
+    let next = store.page(filters("tcp", "all", false, 100), None).unwrap();
     assert_eq!(changed["state"], "closed");
     assert_eq!(changed["trace"]["status"], "partial");
     assert_eq!(changed["trace_status"], "partial");
@@ -91,7 +79,7 @@ fn rejected_source_writes_never_authorize_causal_references() {
     assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
     flow.finish("failed", "capture_lost");
     assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert!(
         detail["trace"]["missing"]
             .as_array()
@@ -190,7 +178,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
             dns_action: None,
         },
     );
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace_status"], "complete");
     assert_eq!(detail["trace"]["missing"], json!([]));
 }
@@ -208,7 +196,7 @@ fn reply_evidence_survives_later_send_bookkeeping_and_terminal_publication() {
         Some(false),
     );
     flow.finish("closed", "idle_after_reply");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     for step in detail["trace"]["steps"].as_array().unwrap().iter().skip(1) {
         assert_eq!(step["data"]["reply_received"], true);
     }
@@ -220,19 +208,16 @@ fn observer_identity_cannot_be_rebound_to_another_retained_flow() {
     let store = store();
     let first = Arc::new(begin(&store, "tcp"));
     let second = begin(&store, "tcp");
-    let before_first = store.get(first.id(), &request_id()).unwrap();
-    let before_second = store.get(second.id(), &request_id()).unwrap();
+    let before_first = store.get(first.id()).unwrap();
+    let before_second = store.get(second.id()).unwrap();
     let observer = first.observer(1, None, "dial_target").unwrap();
     let mut context = observer.context();
     context.flow_id = second.id().parse().unwrap();
     observer
         .with_context(context)
         .publish(FlowEvent::Gap("not_instrumented"));
-    assert_eq!(store.get(first.id(), &request_id()).unwrap(), before_first);
-    assert_eq!(
-        store.get(second.id(), &request_id()).unwrap(),
-        before_second
-    );
+    assert_eq!(store.get(first.id()).unwrap(), before_first);
+    assert_eq!(store.get(second.id()).unwrap(), before_second);
 }
 
 #[test]
@@ -252,7 +237,7 @@ fn physical_dns_attempt_without_its_lookup_cannot_claim_complete_evidence() {
             resolution_location: "unknown",
             error: None,
         });
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["status"], "partial");
     assert_eq!(detail["trace"]["missing"], json!(["not_instrumented"]));
 }
@@ -279,7 +264,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     assert_ne!(first.id(), second.id());
     let evidence = store.connection_evidence(first.id()).unwrap();
     assert_eq!(evidence.chain, ["original-group-id", "original-node-id"]);
-    let detail = store.get(first.id(), &request_id()).unwrap();
+    let detail = store.get(first.id()).unwrap();
     assert_eq!(detail["outbound"], "original-group");
     assert_eq!(
         detail["trace"]["steps"]
@@ -292,7 +277,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     );
     let mut query = filters("all", "all", true, 100);
     query.connection_id = Some("connection-old".to_owned());
-    let page = store.page(query, None, &request_id()).unwrap();
+    let page = store.page(query, None).unwrap();
     assert_eq!(page["flows"].as_array().unwrap().len(), 1);
     assert_eq!(page["flows"][0]["id"], first.id());
     assert_eq!(page["flows"][0]["input"]["src"], "127.0.0.1:31000");
@@ -306,11 +291,11 @@ fn guards_finalize_once_and_do_not_fabricate_kernel_connection_close() {
     assert!(!flow.first_reply());
     flow.finish("closed", "idle_after_reply");
     let id = flow.id().to_owned();
-    let terminal = store.get(&id, &request_id()).unwrap();
+    let terminal = store.get(&id).unwrap();
     flow.finish("failed", "late_error");
     flow.routed("late-outbound", None, None, "unknown");
     drop(flow);
-    assert_eq!(store.get(&id, &request_id()).unwrap(), terminal);
+    assert_eq!(store.get(&id).unwrap(), terminal);
     assert_eq!(
         terminal["trace"]["steps"][1]["data"]["reply_received"],
         true
@@ -319,13 +304,13 @@ fn guards_finalize_once_and_do_not_fabricate_kernel_connection_close() {
     let cancelled = begin(&store, "tcp");
     let id = cancelled.id().to_owned();
     drop(cancelled);
-    let detail = store.get(&id, &request_id()).unwrap();
+    let detail = store.get(&id).unwrap();
     assert_eq!(detail["state"], "failed");
     assert_eq!(detail["trace"]["steps"][1]["data"]["reason"], "cancelled");
 
     let handoff = begin(&store, "udp");
     handoff.finish("unknown", "kernel_handoff");
-    let detail = store.get(handoff.id(), &request_id()).unwrap();
+    let detail = store.get(handoff.id()).unwrap();
     assert_eq!(detail["state"], "unknown");
     assert!(detail["ended_at"].is_string());
 }
@@ -340,15 +325,13 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
     let recent = begin(&store, "tcp");
     recent.transition("active", "ready", "transport_ready", None);
     let query = filters("tcp", "active", true, 1);
-    let first = store.page(query.clone(), None, &request_id()).unwrap();
+    let first = store.page(query.clone(), None).unwrap();
     assert_eq!(first["flows"][0]["id"], recent.id());
     let cursor = first["next_cursor"].as_str().unwrap();
     old.finish("closed", "relay_finished");
     let newcomer = begin(&store, "tcp");
     newcomer.transition("active", "ready", "transport_ready", None);
-    let second = store
-        .page(query.clone(), Some(cursor), &request_id())
-        .unwrap();
+    let second = store.page(query.clone(), Some(cursor)).unwrap();
     assert_eq!(second["observed_at"], first["observed_at"]);
     assert_eq!(second["flows"][0]["id"], old.id());
     assert_eq!(second["flows"][0]["state"], "active");
@@ -358,27 +341,22 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
         filters("tcp", "closed", true, 1),
         filters("tcp", "active", false, 1),
     ] {
-        error_code(
-            store
-                .page(changed, Some(cursor), &request_id())
-                .unwrap_err(),
-            StatusCode::GONE,
-            "snapshot_expired",
+        assert_eq!(
+            store.page(changed, Some(cursor)).unwrap_err(),
+            PageRefusal::Expired
         );
     }
     let other_instance = super::tests::store();
-    error_code(
+    assert_eq!(
         other_instance
-            .page(query.clone(), Some(cursor), &request_id())
+            .page(query.clone(), Some(cursor))
             .unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+        PageRefusal::Expired
     );
     store.inner.lock().snapshots[0].created = Instant::now() - SNAPSHOT_TTL;
-    error_code(
-        store.page(query, Some(cursor), &request_id()).unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+    assert_eq!(
+        store.page(query, Some(cursor)).unwrap_err(),
+        PageRefusal::Expired
     );
 }
 
@@ -392,7 +370,7 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     let mut cursor = String::new();
     let mut oldest = String::new();
     for round in 0..MAX_SNAPSHOTS {
-        let page = store.page(query.clone(), None, &request_id()).unwrap();
+        let page = store.page(query.clone(), None).unwrap();
         cursor = page["next_cursor"].as_str().unwrap().to_owned();
         if round == 0 {
             oldest = cursor.clone();
@@ -400,32 +378,24 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     }
     // A full table makes room by dropping its oldest snapshot; only that
     // reader starts over, the newest cursors stay valid.
-    let page = store.page(query.clone(), None, &request_id()).unwrap();
+    let page = store.page(query.clone(), None).unwrap();
     assert!(page["next_cursor"].is_string());
     assert_eq!(store.inner.lock().snapshots.len(), MAX_SNAPSHOTS);
-    error_code(
-        store
-            .page(query.clone(), Some(&oldest), &request_id())
-            .unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+    assert_eq!(
+        store.page(query.clone(), Some(&oldest)).unwrap_err(),
+        PageRefusal::Expired
     );
-    store
-        .page(query.clone(), Some(&cursor), &request_id())
-        .unwrap();
+    store.page(query.clone(), Some(&cursor)).unwrap();
     store.set_recording(false);
     let inert = begin(&store, "tcp");
     assert!(inert.id().is_empty());
     assert!(!inert.first_reply());
     first.finish("closed", "late_finish");
-    error_code(
-        store
-            .page(query.clone(), Some(&cursor), &request_id())
-            .unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+    assert_eq!(
+        store.page(query.clone(), Some(&cursor)).unwrap_err(),
+        PageRefusal::Expired
     );
-    let page = store.page(query, None, &request_id()).unwrap();
+    let page = store.page(query, None).unwrap();
     assert_eq!(page["flows"], json!([]));
     assert_eq!(page["coverage"]["userspace_tcp"], "none");
     let inner = store.inner.lock();
@@ -446,11 +416,9 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
 
 #[test]
 fn aged_out_records_report_one_gap_per_interval_with_the_running_count() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     let gaps = || {
-        store
-            .events
-            .buffered_kinds()
+        hub.buffered_kinds()
             .into_iter()
             .filter(|kind| *kind == "flow.gap")
             .count()
@@ -476,10 +444,8 @@ fn aged_out_records_report_one_gap_per_interval_with_the_running_count() {
     assert_eq!((gaps(), store.inner.lock().dropped), (2, 7));
 }
 
-fn count(store: &FlowStore, kind: &str) -> usize {
-    store
-        .events
-        .buffered_kinds()
+fn count(hub: &EventHub, kind: &str) -> usize {
+    hub.buffered_kinds()
         .into_iter()
         .filter(|buffered| *buffered == kind)
         .count()
@@ -487,39 +453,39 @@ fn count(store: &FlowStore, kind: &str) -> usize {
 
 #[test]
 fn room_making_eviction_is_reported_once_per_interval() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     // Keep going until twenty records had to make room for newer ones.
     while store.inner.lock().dropped < 20 {
         begin(&store, "tcp").finish("closed", "relay_finished");
     }
-    assert_eq!(count(&store, "flow.gap"), 1);
+    assert_eq!(count(&hub, "flow.gap"), 1);
 }
 
 #[test]
 fn step_overflow_updates_the_record_without_a_gap() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     let flow = begin(&store, "tcp");
     while store.inner.lock().records[0].steps.len() < MAX_STEPS {
         flow.step(Some(1), dial_mode());
     }
-    let updates = count(&store, "flow.updated");
+    let updates = count(&hub, "flow.updated");
     let revision = store.inner.lock().records[0].summary.revision;
     flow.step(Some(1), dial_mode());
     let inner = store.inner.lock();
     assert!(inner.records[0].overflow);
     assert_eq!(inner.records[0].summary.revision, revision + 1);
     drop(inner);
-    assert_eq!(count(&store, "flow.updated"), updates + 1);
-    assert_eq!(count(&store, "flow.gap"), 0);
+    assert_eq!(count(&hub, "flow.updated"), updates + 1);
+    assert_eq!(count(&hub, "flow.gap"), 0);
     // Later steps find the record already truncated and publish nothing.
     flow.step(Some(1), dial_mode());
-    assert_eq!(count(&store, "flow.updated"), updates + 1);
-    assert_eq!(count(&store, "flow.gap"), 0);
+    assert_eq!(count(&hub, "flow.updated"), updates + 1);
+    assert_eq!(count(&hub, "flow.gap"), 0);
 }
 
 #[test]
 fn revision_exhaustion_joins_the_interval_notice() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     for _ in 0..2 {
         let flow = begin(&store, "tcp");
         store
@@ -536,7 +502,7 @@ fn revision_exhaustion_joins_the_interval_notice() {
     assert!(inner.records.is_empty());
     assert_eq!(inner.dropped, 2);
     drop(inner);
-    assert_eq!(count(&store, "flow.gap"), 1);
+    assert_eq!(count(&hub, "flow.gap"), 1);
 }
 
 #[test]
@@ -549,14 +515,11 @@ fn a_userspace_evaluation_is_recomputed_evidence_on_the_wire() {
         Some("dip(<redacted>)"),
         "evaluation",
     );
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["rule_id"], "gen:0:rule:0");
     assert_eq!(detail["rule_source"], "recomputed");
     flow.routed("group", None, None, "forced");
-    assert_eq!(
-        store.get(flow.id(), &request_id()).unwrap()["rule_source"],
-        "unknown"
-    );
+    assert_eq!(store.get(flow.id()).unwrap()["rule_source"], "unknown");
 }
 
 #[test]
@@ -567,26 +530,14 @@ fn retention_distinguishes_expired_unknown_and_active_records() {
     let active = begin(&store, "udp");
     let future = Instant::now() + TERMINAL_TTL;
     store.prune(&mut store.inner.lock(), future);
-    error_code(
-        store.get(terminal.id(), &request_id()).unwrap_err(),
-        StatusCode::GONE,
-        "flow_expired",
-    );
-    error_code(
-        store.get("not-a-recorded-id", &request_id()).unwrap_err(),
-        StatusCode::NOT_FOUND,
-        "resource_not_found",
-    );
+    assert_eq!(store.get(terminal.id()).unwrap_err(), FlowMissing::Expired);
     assert_eq!(
-        store.get(active.id(), &request_id()).unwrap()["state"],
-        "observed"
+        store.get("not-a-recorded-id").unwrap_err(),
+        FlowMissing::NotFound
     );
+    assert_eq!(store.get(active.id()).unwrap()["state"], "observed");
     store.prune(&mut store.inner.lock(), future + TERMINAL_TTL);
-    error_code(
-        store.get(terminal.id(), &request_id()).unwrap_err(),
-        StatusCode::NOT_FOUND,
-        "resource_not_found",
-    );
+    assert_eq!(store.get(terminal.id()).unwrap_err(), FlowMissing::NotFound);
 }
 
 #[test]
@@ -602,7 +553,7 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
         flow.step(Some(1), dial_mode());
     }
     flow.finish("failed", "dial_failed");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["state"], "failed");
     assert!(detail["ended_at"].is_string());
     assert_eq!(
@@ -636,7 +587,7 @@ fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
         },
     );
     flow.finish("failed", "transport_failed");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
     assert_eq!(detail["state"], "failed");
     assert_eq!(
@@ -656,7 +607,7 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
         "[2001:db8::1]:443".parse().unwrap(),
     );
     flow.update_input(None, None, Some("client"), Some(42), None, Some(0), Some(0));
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 1);
     assert_eq!(detail["input"]["pid"], 42);
     flow.update_input(
@@ -682,7 +633,7 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
             server_addr: None,
         },
     );
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["input"]["domain"], "secret.example.test");
     assert_eq!(detail["trace"]["steps"][1]["data"]["source"], "sniffer");
     assert_eq!(
@@ -741,7 +692,7 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
             },
         );
     }
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 3);
     for (index, status) in [(1, "started"), (2, "succeeded")] {
         let data = &detail["trace"]["steps"][index]["data"];
@@ -780,9 +731,7 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
     drop(inner);
     // The ring at its own limit still leaves the listing its reserved share:
     // a walk over every record starts, and the whole store stays in budget.
-    let page = store
-        .page(filters("all", "all", true, 1), None, &request_id())
-        .unwrap();
+    let page = store.page(filters("all", "all", true, 1), None).unwrap();
     assert!(page["next_cursor"].is_string());
     let inner = store.inner.lock();
     assert!(inner.snapshot_bytes > 0);
@@ -791,11 +740,7 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
     // A result that fits in one page keeps nothing.
     let before = store.inner.lock().snapshot_bytes;
     store
-        .page(
-            filters("all", "all", true, MAX_RECORDS),
-            None,
-            &request_id(),
-        )
+        .page(filters("all", "all", true, MAX_RECORDS), None)
         .unwrap();
     assert_eq!(store.inner.lock().snapshot_bytes, before);
 }
@@ -816,7 +761,7 @@ fn step_capacity_not_only_string_length_counts_toward_retention() {
         },
     );
     flow.finish("closed", "relay_finished");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
     assert_eq!(detail["trace"]["missing"], json!(["buffer_overflow"]));
     assert_eq!(detail["state"], "closed");
@@ -829,8 +774,8 @@ fn room_making_prunes_expired_records_before_evicting_live_ones() {
     let live = begin(&store, "tcp");
     begin(&store, "tcp").finish("closed", "relay_finished");
     let newcomer = begin(&store, "tcp");
-    assert!(store.get(live.id(), &request_id()).is_ok());
-    assert!(store.get(newcomer.id(), &request_id()).is_ok());
+    assert!(store.get(live.id()).is_ok());
+    assert!(store.get(newcomer.id()).is_ok());
     assert_eq!(store.inner.lock().records.len(), 2);
 }
 
@@ -858,7 +803,7 @@ fn room_making_evicts_ended_records_before_the_oldest_live_one() {
         })
         .collect();
     let newcomer = begin(&store, "tcp");
-    assert!(store.get(live.id(), &request_id()).is_ok());
+    assert!(store.get(live.id()).is_ok());
     let inner = store.inner.lock();
     let retained: Vec<&str> = inner.records.iter().map(|record| record.id()).collect();
     assert_eq!(retained, [live.id(), ended[2].as_str(), newcomer.id()]);
@@ -866,7 +811,8 @@ fn room_making_evicts_ended_records_before_the_oldest_live_one() {
 
 #[test]
 fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
-    let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
+    let owner =
+        crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
     assert!(!owner.flows.recording.load(Ordering::Acquire));
     let inner = owner.flows.inner.lock();
     let guard = begin(&owner.flows, "tcp");
@@ -932,7 +878,7 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
         Some("domain(<redacted>)"),
         "evaluation",
     );
-    let before = store.get(flow.id(), &request_id()).unwrap();
+    let before = store.get(flow.id()).unwrap();
     assert_eq!(before["rule_expression"], expression);
     let later = begin(&store, "tcp");
     later.routed(
@@ -941,7 +887,7 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
         Some("pname(\"new\")"),
         "evaluation",
     );
-    assert_eq!(store.get(flow.id(), &request_id()).unwrap(), before);
+    assert_eq!(store.get(flow.id()).unwrap(), before);
     assert_eq!(
         before["trace"]["steps"][1]["generation_id"],
         format!("{}:7", store.instance_id)
@@ -960,7 +906,7 @@ fn oversized_utf8_display_is_explicit_capture_loss() {
     }
     flow.step(Some(1), data);
     flow.finish("closed", "relay_finished");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace_status"], "partial");
     assert!(
         detail["trace"]["missing"]
@@ -983,8 +929,5 @@ fn rendered_rule_text_is_not_interpreted_as_an_internal_placeholder() {
         Some(expression),
         "evaluation",
     );
-    assert_eq!(
-        store.get(flow.id(), &request_id()).unwrap()["rule_expression"],
-        expression
-    );
+    assert_eq!(store.get(flow.id()).unwrap()["rule_expression"], expression);
 }

@@ -139,7 +139,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         None
     };
     #[cfg(feature = "native-api")]
-    crate::native_api::flows::dns::cache_entry(entry_id.as_deref());
+    crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     debug!(
         ttl = expiry.ttl().as_secs(),
         bytes = response.len(),
@@ -194,7 +194,7 @@ async fn stale_outcome(
         .await
         .entry_id_for_revision(&context.cache_key, _revision);
     #[cfg(feature = "native-api")]
-    crate::native_api::flows::dns::cache_entry(entry_id.as_deref());
+    crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let stale = context
         .forwarder
         .apply_prefer_strategy(

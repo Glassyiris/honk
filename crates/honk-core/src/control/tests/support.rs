@@ -672,7 +672,7 @@ pub(in crate::control) fn score_reload_config(revision: u64) -> Config {
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) struct NativeFlowApi {
-    pub(in crate::control) flows: Arc<crate::native_api::flows::FlowStore>,
+    pub(in crate::control) flows: Arc<crate::observe::flows::FlowStore>,
     addr: SocketAddr,
     client: reqwest::Client,
     server: crate::native_api::NativeServer,

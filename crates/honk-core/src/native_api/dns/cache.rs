@@ -92,7 +92,7 @@ pub(super) async fn serve(
             .iter()
             .find(|snapshot| {
                 snapshot.id == snapshot_id
-                    && snapshot.instance == api.instance
+                    && snapshot.instance == api.recorder.instance()
                     && snapshot.filters == filters
             })
             .ok_or_else(|| invalid_query(id))?;
@@ -109,7 +109,7 @@ pub(super) async fn serve(
         .map(|snapshot| snapshot.bytes)
         .sum::<usize>();
     let overhead = std::mem::size_of::<Snapshot>()
-        + api.instance.len()
+        + api.recorder.instance().len()
         + 256
         + filters.name.as_ref().map_or(0, String::capacity)
         + filters.domain.as_ref().map_or(0, String::capacity)
@@ -147,7 +147,7 @@ pub(super) async fn serve(
         + (entries.capacity() - entries.len()) * std::mem::size_of::<ExactCacheEntry>();
     let snapshot = Snapshot {
         id: Uuid::new_v4().to_string(),
-        instance: api.instance.clone(),
+        instance: api.recorder.instance().to_owned(),
         created,
         observed_at: timestamp(wall),
         filters,

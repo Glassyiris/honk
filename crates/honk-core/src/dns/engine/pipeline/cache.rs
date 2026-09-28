@@ -18,7 +18,7 @@ pub(super) async fn lookup(
     }
     let cache = context.forwarder.cache_service().await;
     #[cfg(feature = "native-api")]
-    crate::native_api::flows::dns::cache_state("miss");
+    crate::observe::flows::dns::cache_state("miss");
     let (entry, revision) = match cache.lookup_exact(
         &context.cache_key,
         matches!(context.mode, ResolveMode::Strict),
@@ -28,11 +28,11 @@ pub(super) async fn lookup(
             revision: _revision,
         } => {
             #[cfg(feature = "native-api")]
-            crate::native_api::flows::dns::cache_state("hit");
+            crate::observe::flows::dns::cache_state("hit");
             #[cfg(feature = "native-api")]
             let entry_id = cache.entry_id_for_revision(&context.cache_key, _revision);
             #[cfg(feature = "native-api")]
-            crate::native_api::flows::dns::cache_entry(entry_id.as_deref());
+            crate::observe::flows::dns::cache_entry(entry_id.as_deref());
             let response =
                 crate::dns::response::build_dns_error_response(context.raw_query, hit.rcode);
             let response = context
@@ -70,7 +70,7 @@ pub(super) async fn lookup(
         }
         ExactLookup::Positive { entry, revision } => {
             #[cfg(feature = "native-api")]
-            crate::native_api::flows::dns::cache_state("hit");
+            crate::observe::flows::dns::cache_state("hit");
             (entry, revision)
         }
         ExactLookup::Miss => return Ok(None),
@@ -78,7 +78,7 @@ pub(super) async fn lookup(
     #[cfg(feature = "native-api")]
     let entry_id = cache.entry_id_for_revision(&context.cache_key, revision);
     #[cfg(feature = "native-api")]
-    crate::native_api::flows::dns::cache_entry(entry_id.as_deref());
+    crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let remaining = entry.remaining_ttl_secs();
     debug!(remaining, "DNS forwarder: positive cache hit");
     let refresh_after = (entry.min_ttl as u64 / 10).max(1);

@@ -2087,8 +2087,8 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
             .observer(active_generation, None, "dial_target")
             .unwrap();
         observer
-            .scope(crate::native_api::flows::dns::scope_api(
-                Arc::downgrade(&native.dns),
+            .scope(crate::observe::flows::dns::scope_api(
+                Arc::downgrade(&native.dns.recorder),
                 lease.run(std::pin::pin!(async {
                     let observer = honk_outbound::runtime::flow_observation::current().unwrap();
                     let plan = observer.sync_scope(|| {
@@ -2100,7 +2100,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
                             OutboundConstraint::Any,
                         )
                     });
-                    let selections = crate::native_api::flows::dns::selection_evaluated(
+                    let selections = crate::observe::flows::dns::selection_evaluated(
                         plan.observation.as_deref(),
                     );
                     assert_eq!(

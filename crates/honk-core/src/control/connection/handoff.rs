@@ -55,7 +55,7 @@ pub(super) struct HandoffResult {
     #[cfg(feature = "native-api")]
     pub(super) trace_id: u32,
     #[cfg(feature = "native-api")]
-    pub(super) capture: Option<crate::native_api::flows::kernel::CapturedKernelRoute>,
+    pub(super) capture: Option<crate::observe::flows::kernel::CapturedKernelRoute>,
     #[cfg(feature = "native-api")]
     pub(super) capture_gap: Option<&'static str>,
 }

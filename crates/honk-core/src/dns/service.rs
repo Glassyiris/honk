@@ -23,7 +23,7 @@ pub struct DnsService {
     backend: Arc<DnsServiceBackend>,
     flush_generation: watch::Sender<u64>,
     #[cfg(feature = "native-api")]
-    observer: Arc<parking_lot::RwLock<std::sync::Weak<crate::native_api::dns::DnsApi>>>,
+    observer: Arc<parking_lot::RwLock<std::sync::Weak<crate::observe::DnsRecorder>>>,
 }
 
 enum DnsServiceBackend {
@@ -35,7 +35,7 @@ struct OperationToken {
     generation: u64,
     updates: watch::Receiver<u64>,
     #[cfg(feature = "native-api")]
-    observer: std::sync::Weak<crate::native_api::dns::DnsApi>,
+    observer: std::sync::Weak<crate::observe::DnsRecorder>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,7 @@ impl OperationToken {
             });
         }
         #[cfg(feature = "native-api")]
-        let operation = crate::native_api::flows::dns::scope_api(self.observer.clone(), operation);
+        let operation = crate::observe::flows::dns::scope_api(self.observer.clone(), operation);
         tokio::pin!(operation);
         tokio::select! {
             biased;
@@ -69,10 +69,7 @@ impl OperationToken {
 
 impl DnsService {
     #[cfg(feature = "native-api")]
-    pub(crate) fn attach_observer(
-        &self,
-        observer: std::sync::Weak<crate::native_api::dns::DnsApi>,
-    ) {
+    pub(crate) fn attach_observer(&self, observer: std::sync::Weak<crate::observe::DnsRecorder>) {
         *self.observer.write() = observer;
     }
 

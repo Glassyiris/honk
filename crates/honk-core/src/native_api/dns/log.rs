@@ -56,6 +56,24 @@ struct Entry {
     bytes: usize,
 }
 
+impl crate::observe::DnsLog for LogStore {
+    fn recording(&self) -> bool {
+        LogStore::recording(self)
+    }
+
+    fn capture(
+        &self,
+        query: &[u8],
+        ingress: IngressProfile,
+        source: Option<SocketAddr>,
+        outcome: Option<&DnsOutcome>,
+        response: &[u8],
+        elapsed: Duration,
+    ) {
+        LogStore::capture(self, query, ingress, source, outcome, response, elapsed);
+    }
+}
+
 impl LogStore {
     pub(crate) fn new(instance: String, recording: bool) -> Self {
         Self {

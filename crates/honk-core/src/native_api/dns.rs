@@ -3,8 +3,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, Write},
-    net::SocketAddr,
-    sync::Weak,
+    sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
 
@@ -24,10 +23,11 @@ use super::{
 use crate::dns::{
     DiagnosticError, DiagnosticFailure,
     forwarder::{CacheAccess, ResolveOptions},
-    outcome::{DnsOutcome, Provenance, RequestRoute},
+    outcome::{Provenance, RequestRoute},
     planner::UpstreamTag,
     query::IngressProfile,
 };
+use crate::observe::{DnsRecorder, flows::FlowStore};
 
 mod cache;
 mod log;
@@ -36,56 +36,34 @@ pub(super) mod rules;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use records::record_type;
 pub(crate) use rules::capability as rules_capability;
 
 pub(super) const MAX_RESPONSE_BYTES: usize = 262_144;
 const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 
 pub(crate) struct DnsApi {
-    instance: String,
     rate: super::security::RequestRate,
     snapshots: tokio::sync::Mutex<VecDeque<cache::Snapshot>>,
-    log: log::LogStore,
-    flows: Weak<super::flows::FlowStore>,
+    log: Arc<log::LogStore>,
+    pub(crate) recorder: Arc<DnsRecorder>,
 }
 
 impl DnsApi {
-    pub(crate) fn new(
-        instance_id: String,
-        recording: bool,
-        flows: Weak<super::flows::FlowStore>,
-    ) -> Self {
+    pub(crate) fn new(instance_id: String, recording: bool, flows: Weak<FlowStore>) -> Self {
+        let log = Arc::new(log::LogStore::new(instance_id.clone(), recording));
         Self {
-            log: log::LogStore::new(instance_id.clone(), recording),
-            instance: instance_id,
+            recorder: Arc::new(DnsRecorder::new(instance_id, flows, log.clone())),
+            log,
             rate: super::security::RequestRate::new(),
             snapshots: tokio::sync::Mutex::new(VecDeque::new()),
-            flows,
         }
     }
 
-    pub(crate) fn instance(&self) -> &str {
-        &self.instance
-    }
-
-    pub(crate) fn record_flow(
-        &self,
-        context: honk_outbound::runtime::flow_observation::FlowContext,
-        data: super::flows::record::StepData,
-    ) -> bool {
-        self.flows.upgrade().is_some_and(|flows| {
-            flows.record_step(&context.flow_id.to_string(), Some(context.generation), data)
-        })
-    }
     pub(crate) fn set_log_limit(&self, limit: usize) {
         self.log.set_limit(limit);
     }
     pub(crate) fn set_recording(&self, recording: bool) {
         self.log.set_recording(recording);
-    }
-    pub(crate) fn recording(&self) -> bool {
-        self.log.recording()
     }
     pub(crate) fn query_capability(&self) -> Value {
         json!({"available":true,"record_types":TYPES.iter().map(|&value| records::record_type(value)).collect::<Vec<_>>(),
@@ -97,18 +75,6 @@ impl DnsApi {
     }
     pub(crate) fn log_capability(&self) -> Value {
         self.log.capability()
-    }
-    pub(crate) fn observe_client(
-        &self,
-        query: &[u8],
-        ingress: IngressProfile,
-        source: Option<SocketAddr>,
-        outcome: Option<&DnsOutcome>,
-        response: &[u8],
-        elapsed: Duration,
-    ) {
-        self.log
-            .capture(query, ingress, source, outcome, response, elapsed);
     }
     #[cfg(test)]
     pub(crate) fn log_for_test(&self) -> &log::LogStore {

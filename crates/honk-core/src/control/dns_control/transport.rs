@@ -28,7 +28,7 @@ impl DnsController {
         #[cfg(feature = "native-api")]
         let operation = std::pin::pin!(operation);
         #[cfg(feature = "native-api")]
-        let operation = crate::native_api::flows::dns::client_scope(
+        let operation = crate::observe::flows::dns::client_scope(
             data,
             validated.ingress(),
             DnsRequestMeta::new(Some(client_addr.ip()), Some(original_dst)),
@@ -70,7 +70,7 @@ impl DnsController {
                 Err(_) => ("cancelled", Some("runtime_retired")),
                 _ => ("delivery_failed", Some("client_send_failed")),
             };
-            crate::native_api::flows::dns::delivery(status, error);
+            crate::observe::flows::dns::delivery(status, error);
         }
         #[cfg(feature = "native-api")]
         self.dns_service.observe_client(
@@ -147,7 +147,7 @@ impl DnsController {
         #[cfg(feature = "native-api")]
         let operation = std::pin::pin!(operation);
         #[cfg(feature = "native-api")]
-        let operation = crate::native_api::flows::dns::client_scope(
+        let operation = crate::observe::flows::dns::client_scope(
             query,
             IngressProfile::Tcp,
             metadata,
@@ -172,11 +172,11 @@ impl DnsController {
             Ok(admission) => admission,
             Err(_) => {
                 #[cfg(feature = "native-api")]
-                crate::native_api::flows::dns::decision("rejected", Some("admission_refused"));
+                crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
                 let response = build_dns_refused(query);
                 let result = write_tcp_dns_response(stream, &response, TCP_DNS_IO_TIMEOUT).await;
                 #[cfg(feature = "native-api")]
-                crate::native_api::flows::dns::delivery(
+                crate::observe::flows::dns::delivery(
                     if result.is_ok() {
                         "delivered"
                     } else {
@@ -218,7 +218,7 @@ impl DnsController {
                 Err(_) => ("cancelled", Some("runtime_retired")),
                 _ => ("delivery_failed", Some("client_write_failed")),
             };
-            crate::native_api::flows::dns::delivery(status, error);
+            crate::observe::flows::dns::delivery(status, error);
         }
         #[cfg(feature = "native-api")]
         self.dns_service.observe_client(

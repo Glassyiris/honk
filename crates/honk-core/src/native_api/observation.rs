@@ -5,8 +5,11 @@ use std::time::SystemTime;
 use honk_config::Config;
 use serde_json::json;
 
-use super::{catalog::NodePages, events::EventHub, flows::FlowStore};
-use crate::observe::catalog::{Catalog, CatalogIdentity};
+use super::{catalog::NodePages, events::EventHub};
+use crate::observe::{
+    catalog::{Catalog, CatalogIdentity},
+    flows::FlowStore,
+};
 
 pub(crate) struct NativeObservation {
     pub(crate) instance_id: String,
@@ -51,7 +54,10 @@ impl NativeObservation {
     ) -> Self {
         let instance_id = uuid::Uuid::new_v4().to_string();
         let events = Arc::new(EventHub::new(instance_id.clone()));
-        let flows = Arc::new(FlowStore::new(instance_id.clone(), Arc::clone(&events)));
+        let flows = Arc::new(FlowStore::new(
+            instance_id.clone(),
+            Arc::clone(&events) as Arc<dyn crate::observe::Events>,
+        ));
         flows.set_recording(config.experimental.native_api.record_flows);
         let operations = Arc::new(super::operations::OperationStore::new(
             instance_id.clone(),

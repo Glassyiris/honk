@@ -80,7 +80,7 @@ impl ControlPlaneHandle {
         let resolution = std::pin::pin!(resolution);
         #[cfg(feature = "native-api")]
         let resolution =
-            crate::native_api::flows::dns::scope_purpose("domain_verification", resolution);
+            crate::observe::flows::dns::scope_purpose("domain_verification", resolution);
         match tokio::time::timeout(dns_timeout, resolution).await {
             Ok(Ok(resolved)) => {
                 match domain_reality_outcome(expected, &resolved.ipv4, &resolved.ipv6) {
@@ -247,7 +247,7 @@ impl ControlPlaneHandle {
                 let observed = router.route_full_observed(
                     &routing_conn_info,
                     None,
-                    crate::native_api::flows::MAX_RULE_VALUES,
+                    crate::observe::flows::MAX_RULE_VALUES,
                 );
                 let rules = crate::observe::rules::observed_rule_evaluations(
                     &native.instance_id,

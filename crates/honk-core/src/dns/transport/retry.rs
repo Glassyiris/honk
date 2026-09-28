@@ -27,7 +27,7 @@ where
         #[cfg(feature = "native-api")]
         let exchange = std::pin::pin!(exchange);
         #[cfg(feature = "native-api")]
-        let exchange = crate::native_api::flows::dns::transport_exchange_scope(raw_query, exchange);
+        let exchange = crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
         exchange.await
     };
     let result = match first_result {
@@ -41,7 +41,7 @@ where
             let exchange = std::pin::pin!(exchange);
             #[cfg(feature = "native-api")]
             let exchange =
-                crate::native_api::flows::dns::transport_exchange_scope(raw_query, exchange);
+                crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
             exchange.await.map_err(|error| {
                 let detail = error.to_string();
                 error.context(format!(

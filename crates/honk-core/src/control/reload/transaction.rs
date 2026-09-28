@@ -516,7 +516,7 @@ impl ControlPlane {
         );
         #[cfg(feature = "native-api")]
         let prepared_dictionary = self.native.as_ref().and_then(|native| {
-            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
                 &native.instance_id,
                 generation.get(),
                 &new_router,

@@ -100,7 +100,7 @@ pub struct UdpEndpoint {
     source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<String>>,
     #[cfg(feature = "native-api")]
-    native_flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
+    native_flow: Option<Arc<crate::observe::flows::FlowGuard>>,
     #[cfg(feature = "native-api")]
     native_pool: std::sync::Weak<UdpEndpointPool>,
     #[cfg(feature = "native-api")]
@@ -229,7 +229,7 @@ impl UdpEndpoint {
     #[cfg(feature = "native-api")]
     pub(in crate::control) fn set_native_flow(
         &mut self,
-        flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
+        flow: Option<Arc<crate::observe::flows::FlowGuard>>,
         pool: &Arc<UdpEndpointPool>,
         terminal: Option<Arc<retirement::NativeUdpTerminal>>,
     ) {
@@ -258,11 +258,11 @@ impl UdpEndpoint {
         if let Some(flow) = &self.native_flow {
             flow.step(
                 None,
-                crate::native_api::flows::record::StepData::Datapath {
+                crate::observe::flows::record::StepData::Datapath {
                     plane: "userspace",
                     action: "drop",
                     reason,
-                    error: error.map(crate::native_api::flows::record::FlowError::Code),
+                    error: error.map(crate::observe::flows::record::FlowError::Code),
                 },
             );
         }
@@ -279,9 +279,7 @@ impl UdpEndpoint {
     }
 
     #[cfg(feature = "native-api")]
-    pub(in crate::control) fn native_flow(
-        &self,
-    ) -> Option<&Arc<crate::native_api::flows::FlowGuard>> {
+    pub(in crate::control) fn native_flow(&self) -> Option<&Arc<crate::observe::flows::FlowGuard>> {
         self.native_flow.as_ref()
     }
 

@@ -380,7 +380,7 @@ impl RuntimeLease {
         let operation = async {
             match observer {
                 Some(observer) => {
-                    crate::native_api::flows::dns::scope_catalog(
+                    crate::observe::flows::dns::scope_catalog(
                         self.runtime.flow_catalog.get().cloned(),
                         observer.scope(operation),
                     )

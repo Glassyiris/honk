@@ -20,24 +20,22 @@ use crate::dns::{
     outcome::{DnsOutcome, OutcomeStatus, Provenance, ResponseClass},
     query::{DnsRequestMeta, IngressProfile, QueryContext},
 };
-use crate::{
-    native_api::dns::DnsApi,
-    observe::{
-        catalog::CatalogIdentity,
-        rules::{RuleCondition, RuleEvaluation},
-    },
+use crate::observe::{
+    DnsRecorder,
+    catalog::CatalogIdentity,
+    rules::{RuleCondition, RuleEvaluation},
 };
 
 const MAX_ADDRESSES: usize = 256;
 
 tokio::task_local! {
-    static DNS_API: Weak<DnsApi>;
+    static DNS_API: Weak<DnsRecorder>;
     static LOOKUP: LookupState;
     static CATALOG: Option<Arc<CatalogIdentity>>;
 }
 
 pub(crate) fn scope_api<F: Future>(
-    api: Weak<DnsApi>,
+    api: Weak<DnsRecorder>,
     future: F,
 ) -> impl Future<Output = F::Output> {
     DNS_API.scope(api, future)
@@ -309,7 +307,7 @@ pub(crate) fn decision(status: &'static str, error: Option<&'static str>) {
 }
 
 pub(crate) fn qtype(value: u16) -> String {
-    crate::native_api::dns::record_type(value)
+    crate::dns::response::native::record_type(value)
 }
 
 fn addresses(values: &[IpAddr], observer: &FlowObserver) -> Vec<IpAddr> {
@@ -327,7 +325,7 @@ fn addresses(values: &[IpAddr], observer: &FlowObserver) -> Vec<IpAddr> {
 
 pub(crate) struct RuleCapture {
     observer: FlowObserver,
-    api: Arc<DnsApi>,
+    api: Arc<DnsRecorder>,
     chain: &'static str,
     input: EvaluationInput,
     rules: Vec<RuleEvaluation>,
@@ -371,7 +369,7 @@ impl RuleCapture {
 
     fn new(
         observer: FlowObserver,
-        api: Arc<DnsApi>,
+        api: Arc<DnsRecorder>,
         chain: &'static str,
         input: EvaluationInput,
     ) -> Self {
@@ -529,7 +527,7 @@ fn with_lookup<T>(capture: impl FnOnce(&LookupState) -> T) -> Option<T> {
         .flatten()
 }
 
-fn authority() -> Option<(FlowObserver, Arc<DnsApi>)> {
+fn authority() -> Option<(FlowObserver, Arc<DnsRecorder>)> {
     let observer = flow_observation::current()?;
     let Some(api) = DNS_API.try_with(Weak::upgrade).ok().flatten() else {
         observer.publish(FlowEvent::Gap("not_instrumented"));
@@ -885,7 +883,7 @@ pub(crate) fn outbound_evidence(
 
 struct OutboundGuard {
     observer: FlowObserver,
-    api: Arc<DnsApi>,
+    api: Arc<DnsRecorder>,
     attempt_id: Uuid,
     attempt: super::record::OutboundAttempt,
     finished: bool,

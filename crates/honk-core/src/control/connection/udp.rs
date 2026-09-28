@@ -17,11 +17,11 @@ fn kernel_enforcement(
     if let Some(flow) = observation.flow() {
         flow.step(
             None,
-            crate::native_api::flows::record::StepData::Datapath {
+            crate::observe::flows::record::StepData::Datapath {
                 plane: "kernel",
                 action,
                 reason: "udp_decision",
-                error: error.map(crate::native_api::flows::record::FlowError::Code),
+                error: error.map(crate::observe::flows::record::FlowError::Code),
             },
         );
     }
@@ -915,7 +915,7 @@ impl ControlPlaneHandle {
             _ = tokio::time::sleep_until(transport_deadline) => {
                 #[cfg(feature = "native-api")]
                 if let Some(attempt) = &mut attempt {
-                    attempt.finish("failed", Some(crate::native_api::flows::record::FlowError::Code("udp_commit_timeout")));
+                    attempt.finish("failed", Some(crate::observe::flows::record::FlowError::Code("udp_commit_timeout")));
                     if let Some(terminal) = &native_terminal { terminal.outcome("failed", "udp_commit_timeout"); }
                 }
                 if let Some(reporter) = &score_reporter {
@@ -947,7 +947,7 @@ impl ControlPlaneHandle {
                 Err(error) => {
                     #[cfg(feature = "native-api")]
                     if let Some(attempt) = &mut attempt {
-                    attempt.finish("failed", Some(crate::native_api::flows::record::FlowError::Code("udp_commit_failed")));
+                    attempt.finish("failed", Some(crate::observe::flows::record::FlowError::Code("udp_commit_failed")));
                     if let Some(terminal) = &native_terminal { terminal.outcome("failed", "udp_commit_failed"); }
                 }
                     if let Some(reporter) = &score_reporter {

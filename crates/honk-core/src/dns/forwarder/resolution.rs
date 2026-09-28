@@ -120,7 +120,7 @@ impl DnsForwarder {
     ) -> Result<DnsOutcome, DnsForwardError> {
         #[cfg(feature = "native-api")]
         let mut observation =
-            crate::native_api::flows::dns::LookupGuard::start(raw_query, ingress, metadata);
+            crate::observe::flows::dns::LookupGuard::start(raw_query, ingress, metadata);
         let publication_epoch = self.cache_service().await.publication_epoch();
         let resolve = crate::dns::engine::pipeline::resolve(
             self,
