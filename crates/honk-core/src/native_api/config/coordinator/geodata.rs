@@ -152,18 +152,25 @@ impl Worker {
                 runtime_registry: &plan.runtime_registry,
             },
         };
+        let mut stopping = self.stopping.clone();
         for (asset, urls) in plan.assets.iter().zip(&plan.urls) {
-            let (bytes, origin) = geodata::fetch(
-                asset.kind,
-                urls,
-                &egress,
-                offline::MAX_ASSET_BYTES,
-                &plan.policy,
-                geodata::file_url(&active.experimental.native_api, asset.kind),
-                plan.verify_checksum,
-            )
-            .await
-            .map_err(|error| {
+            // Shutdown must not wait out `DOWNLOAD_LIMIT`; nothing is written yet.
+            let result = tokio::select! {
+                biased;
+                _ = stopping.wait_for(|stopped| *stopped) => {
+                    return Err(failure("coordinator_stopped", &writes));
+                }
+                result = geodata::fetch(
+                    asset.kind,
+                    urls,
+                    &egress,
+                    offline::MAX_ASSET_BYTES,
+                    &plan.policy,
+                    geodata::file_url(&active.experimental.native_api, asset.kind),
+                    plan.verify_checksum,
+                ) => result,
+            };
+            let (bytes, origin) = result.map_err(|error| {
                 if plan.sources.is_some() && error.code.starts_with("checksum_") {
                     tracing::warn!(
                         "geodata checksum check failed; for a mirror that publishes no usable .sha256sum, setting geodata.verify_checksum to false turns the check off"

@@ -424,6 +424,28 @@ async fn disconnect_and_replay_keep_one_inflight_owner() {
 }
 
 #[tokio::test]
+async fn shutdown_abandons_an_inflight_download() {
+    let mut server = AssetServer::new(geosite("new.example"), geoip(203), true).await;
+    let mut fixture = fixture(server.address, false).await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    timeout(WAIT, &mut server.entered).await.unwrap().unwrap();
+    let coordinator = fixture.coordinator.take().unwrap();
+    timeout(WAIT, coordinator.shutdown())
+        .await
+        .expect("shutdown waited for the download");
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["details"]["stage"], "coordinator_stopped");
+    assert_eq!(terminal["error"]["details"]["committed"], false);
+    assert_eq!(
+        std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
+        geosite("old.example")
+    );
+    fixture.shutdown().await;
+    server.close().await;
+}
+
+#[tokio::test]
 async fn failure_after_first_rename_reports_partial_write_without_activation() {
     let server = AssetServer::new(geosite("new.example"), geoip(203), false).await;
     let fixture = fixture(server.address, false).await;

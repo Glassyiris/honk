@@ -35,6 +35,7 @@ struct Worker {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     subscriptions: SubscriptionSupervisorHandle,
     activation: Activation,
+    stopping: watch::Receiver<bool>,
 }
 
 impl ConfigService {
@@ -74,6 +75,7 @@ impl ConfigService {
                 diagnostics,
                 activation: Activation::new(commands, subscriptions.clone()),
                 subscriptions,
+                stopping: stopping.clone(),
             };
             loop {
                 let work = tokio::select! { biased; _=stopping.changed()=>break, work=receiver.recv()=>match work{Some(work)=>work,None=>break} };
