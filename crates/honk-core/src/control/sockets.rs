@@ -624,6 +624,9 @@ pub(super) async fn send_to_with_src(
 const CMSG_CONTROL_CAPACITY: usize = 256;
 const UDP_RECV_BATCH_SIZE: usize = 8;
 const UDP_RECV_PACKET_CAPACITY: usize = 64 * 1024;
+// The receive trace rejects batches beyond its kernel record.
+const _: () =
+    assert!(UDP_RECV_BATCH_SIZE == honk_ebpf_common::receive_trace::RECEIVE_TRACE_BATCH_SIZE);
 
 /// Raw recvmsg control storage whose first byte is naturally aligned for a
 /// `cmsghdr`. The zero-length field carries `cmsghdr`'s ABI alignment without
@@ -828,7 +831,13 @@ impl UdpRecvBatch {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         let trace_packets = self
             .trace
-            .as_ref()
+            .as_mut()
+            // Nothing was consumed, so the armed batch stays valid for the next receive.
+            .filter(|_| {
+                !receive_error
+                    .as_ref()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            })
             .and_then(|trace| {
                 let packets = trace.finish(count.max(0) as usize);
                 trace_armed.then_some(packets).flatten()
