@@ -96,7 +96,8 @@ impl ControlPlane {
             epoch.health_updates.take();
             #[cfg(feature = "ebpf")]
             if let Some(queue) = epoch.queue.as_mut() {
-                retain_error(&mut error, cleanup_stage(queue.shutdown_service()).await);
+                // Not stage-bounded: see `shutdown_service`.
+                retain_error(&mut error, queue.shutdown_service().await);
                 if let Some(fatal) = queue.take_shutdown_fatal() {
                     error.get_or_insert_with(|| fatal.into());
                 }
@@ -104,6 +105,7 @@ impl ControlPlane {
                     &mut error,
                     cleanup_stage(queue.finish_pending_drain()).await,
                 );
+                queue.abort_tasks().await;
                 self.pending_udp_verdicts = None;
             }
             #[cfg(feature = "ebpf")]
