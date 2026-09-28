@@ -326,7 +326,9 @@ impl AsyncRead for Hy2TcpStream {
             if let Some(header_end) = self.parse_response()? {
                 self.body_offset = Some(header_end);
                 if let Some(observer) = self.observer.take() {
-                    observer.milestone_once("target_confirmed");
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                    );
                 }
                 continue;
             }
@@ -377,7 +379,9 @@ impl AsyncWrite for Hy2TcpStream {
                         self.request = Some(chunks[0].clone());
                     } else {
                         if let Some(observer) = &self.observer {
-                            observer.milestone_once("target_request_sent");
+                            observer.milestone_once(
+                                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                            );
                         }
                     }
                     cx.waker().wake_by_ref();
@@ -385,7 +389,9 @@ impl AsyncWrite for Hy2TcpStream {
                 }
                 Poll::Ready(Ok(written)) => {
                     if let Some(observer) = &self.observer {
-                        observer.milestone_once("target_request_sent");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
                     }
                     Poll::Ready(Ok(written - request_len))
                 }
@@ -410,7 +416,9 @@ impl AsyncWrite for Hy2TcpStream {
                 }
                 Poll::Ready(Ok(_)) => {
                     if let Some(observer) = &self.observer {
-                        observer.milestone_once("target_request_sent");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
                     }
                 }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -935,7 +943,7 @@ impl PacketTransport for Hy2UdpTransport {
                 .map_err(super::quic_carrier_io_error)?;
         }
         if let Some(observer) = self.request_observer.lock().take() {
-            observer.milestone_once("target_request_sent");
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         Ok(())
     }

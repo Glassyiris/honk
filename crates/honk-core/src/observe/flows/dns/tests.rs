@@ -117,7 +117,7 @@ fn observer(store: &Arc<FlowStore>) -> (Arc<FlowGuard>, FlowObserver) {
     let flow = Arc::new(
         store
             .begin(
-                "tcp",
+                crate::observe::vocab::Network::Tcp,
                 "127.0.0.1:31000".parse().unwrap(),
                 "192.0.2.17:443".parse().unwrap(),
             )

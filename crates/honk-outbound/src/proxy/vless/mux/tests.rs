@@ -896,7 +896,7 @@ async fn target_evidence_requires_mux_body_status_not_http_success() {
                 let events = Arc::clone(&events);
                 Arc::new(move |_, event| {
                     if let FlowEvent::Milestone { milestone } = event {
-                        events.lock().push(milestone);
+                        events.lock().push(milestone.as_str());
                     }
                 })
             },

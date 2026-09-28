@@ -63,7 +63,7 @@ async fn physical_tcp_attempts_finish_once_with_distinct_child_ids() {
             } => {
                 assert_eq!(context.attempt_id, observer.context().attempt_id);
                 assert_ne!(Some(*attempt_id), context.attempt_id);
-                Some((*attempt_id, *status))
+                Some((*attempt_id, status.as_str()))
             }
             _ => None,
         })
@@ -92,19 +92,31 @@ async fn physical_tcp_attempts_finish_once_with_distinct_child_ids() {
 #[tokio::test]
 async fn exclusive_child_inherits_but_autonomous_and_unobserved_work_do_not() {
     let (observer, events) = recorder();
-    assert!(TransportAttempt::start(None, "unknown").is_none());
+    assert!(
+        TransportAttempt::start(
+            None,
+            crate::runtime::flow_observation::ResolutionLocation::Unknown
+        )
+        .is_none()
+    );
     observer
         .scope(async {
             let captured = crate::runtime::capture_dial_scope();
             let child = tokio::spawn(captured.clone().scope(async {
-                milestone("transport_ready");
+                milestone(crate::runtime::flow_observation::Milestone::TransportReady);
             }));
             child.await.unwrap();
             crate::runtime::capture_dial_admission()
                 .scope(captured.clone().scope(async {
                     assert!(current().is_none());
-                    assert!(TransportAttempt::start(None, "unknown").is_none());
-                    milestone("target_confirmed");
+                    assert!(
+                        TransportAttempt::start(
+                            None,
+                            crate::runtime::flow_observation::ResolutionLocation::Unknown
+                        )
+                        .is_none()
+                    );
+                    milestone(crate::runtime::flow_observation::Milestone::TargetConfirmed);
                     crate::runtime::admit_physical_dial(async { Ok::<_, ()>(()) })
                         .await
                         .unwrap();
@@ -113,7 +125,7 @@ async fn exclusive_child_inherits_but_autonomous_and_unobserved_work_do_not() {
             without(async {
                 tokio::spawn(captured.scope(async {
                     assert!(current().is_none());
-                    milestone("target_confirmed");
+                    milestone(crate::runtime::flow_observation::Milestone::TargetConfirmed);
                 }))
                 .await
                 .unwrap();
@@ -135,7 +147,7 @@ async fn exclusive_child_inherits_but_autonomous_and_unobserved_work_do_not() {
     assert!(matches!(
         events[0].1,
         FlowEvent::Milestone {
-            milestone: "transport_ready"
+            milestone: crate::runtime::flow_observation::Milestone::TransportReady
         }
     ));
 }
@@ -184,13 +196,13 @@ async fn socks_connect_confirms_only_a_complete_success_reply() {
         assert!(events.lock().iter().any(|(_, event)| matches!(
             event,
             FlowEvent::Milestone {
-                milestone: "target_request_sent"
+                milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
             }
         )));
         assert!(!events.lock().iter().any(|(_, event)| matches!(
             event,
             FlowEvent::Milestone {
-                milestone: "target_confirmed"
+                milestone: crate::runtime::flow_observation::Milestone::TargetConfirmed
             }
         )));
         release_tx.send(()).unwrap();
@@ -203,7 +215,7 @@ async fn socks_connect_confirms_only_a_complete_success_reply() {
                 .filter(|(_, event)| matches!(
                     event,
                     FlowEvent::Milestone {
-                        milestone: "target_confirmed"
+                        milestone: crate::runtime::flow_observation::Milestone::TargetConfirmed
                     }
                 ))
                 .count(),
@@ -242,13 +254,13 @@ async fn trojan_header_write_does_not_fabricate_target_confirmation() {
     assert!(events.lock().iter().any(|(_, event)| matches!(
         event,
         FlowEvent::Milestone {
-            milestone: "target_request_sent"
+            milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
         }
     )));
     assert!(!events.lock().iter().any(|(_, event)| matches!(
         event,
         FlowEvent::Milestone {
-            milestone: "target_confirmed"
+            milestone: crate::runtime::flow_observation::Milestone::TargetConfirmed
         }
     )));
     drop(stream);
@@ -296,18 +308,21 @@ fn shared_milestones_are_once_per_causal_context_not_once_per_carrier() {
     dns_context.lookup_id = Some(Uuid::new_v4());
     dns_context.dns_purpose = "dial_target";
     let dns = observer.with_context(dns_context);
-    dns.milestone_once("target_request_sent");
-    dns.clone().milestone_once("target_request_sent");
-    observer.milestone_once("target_request_sent");
-    observer.clone().milestone_once("target_request_sent");
+    dns.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+    dns.clone()
+        .milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+    observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+    observer
+        .clone()
+        .milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
     observer
         .with_context(observer.context())
-        .milestone_once("target_request_sent");
+        .milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
     let mut context = observer.context();
     context.attempt_id = Some(Uuid::new_v4());
     observer
         .with_context(context)
-        .milestone_once("target_request_sent");
+        .milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
     let events = events.lock();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].0, dns_context);

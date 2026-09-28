@@ -292,11 +292,14 @@ pub(super) fn attached() {
         observer.publish(
             honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
                 server_addr: None,
-                resolution_location: "unknown",
+                resolution_location:
+                    honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
             },
         );
     }
 }
+
+use honk_outbound::runtime::flow_observation::SessionEvent;
 
 pub(super) struct SessionObservation {
     observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
@@ -311,42 +314,28 @@ impl SessionObservation {
         }
     }
 
-    pub(super) fn record(&self, reason: &'static str, error: Option<&'static str>) {
+    pub(super) fn record(&self, event: SessionEvent) {
         if let Some(observer) = &self.observer {
-            observer.publish(
-                honk_outbound::runtime::flow_observation::FlowEvent::Session { reason, error },
-            );
+            observer.publish(honk_outbound::runtime::flow_observation::FlowEvent::Session(event));
         }
     }
 
     pub(super) fn finish<T>(
         mut self,
         result: anyhow::Result<T>,
-        success: &'static str,
+        success: SessionEvent,
     ) -> anyhow::Result<T> {
         if self.observer.is_some() {
-            let cancelled = result.as_ref().err().is_some_and(|error| {
-                honk_outbound::proxy::packet_rejection(error)
-                    == Some(honk_outbound::proxy::PacketRejection::Cancelled)
-            });
-            self.record(
-                if result.is_ok() {
-                    success
-                } else if cancelled {
-                    "dns_session_ready_cancelled"
-                } else {
-                    "dns_session_ready_failed"
-                },
-                result.as_ref().err().map(|error| {
-                    if cancelled {
-                        "cancelled"
-                    } else if honk_outbound::proxy::is_packet_rejection(error) {
-                        "local_refusal"
-                    } else {
-                        "upstream_failed"
+            self.record(match &result {
+                Ok(_) => success,
+                Err(error) => match honk_outbound::proxy::packet_rejection(error) {
+                    Some(honk_outbound::proxy::PacketRejection::Cancelled) => {
+                        SessionEvent::DnsSessionReadyCancelled
                     }
-                }),
-            );
+                    Some(_) => SessionEvent::DnsSessionReadyRefused,
+                    None => SessionEvent::DnsSessionReadyFailed,
+                },
+            });
         }
         self.finished = true;
         result
@@ -356,7 +345,7 @@ impl SessionObservation {
 impl Drop for SessionObservation {
     fn drop(&mut self) {
         if !self.finished {
-            self.record("dns_session_ready_cancelled", Some("cancelled"));
+            self.record(SessionEvent::DnsSessionReadyCancelled);
         }
     }
 }

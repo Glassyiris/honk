@@ -101,20 +101,22 @@ pub async fn connect_marked_addr(
     mark: Option<u32>,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
-    let mut attempt =
-        crate::runtime::flow_observation::TransportAttempt::start(Some(addr), "unknown");
+    use crate::runtime::flow_observation::{
+        ResolutionLocation, TransportAttempt, TransportError, TransportStatus,
+    };
+    let mut attempt = TransportAttempt::start(Some(addr), ResolutionLocation::Unknown);
     let result = connect_marked_addr_inner(addr, mark, connect_timeout).await;
     if let Some(attempt) = &mut attempt {
         attempt.finish(
             if result.is_ok() {
-                "succeeded"
+                TransportStatus::Succeeded
             } else {
-                "failed"
+                TransportStatus::Failed
             },
             result.as_ref().err().map(|error| match error.kind() {
-                io::ErrorKind::TimedOut => "timeout",
-                io::ErrorKind::ConnectionRefused => "connection_refused",
-                _ => "connect_failed",
+                io::ErrorKind::TimedOut => TransportError::Timeout,
+                io::ErrorKind::ConnectionRefused => TransportError::ConnectionRefused,
+                _ => TransportError::ConnectFailed,
             }),
         );
     }

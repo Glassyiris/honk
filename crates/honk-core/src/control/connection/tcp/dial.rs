@@ -678,7 +678,7 @@ impl ControlPlaneHandle {
                     observer.publish(
                         honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
                             server_addr: None,
-                            resolution_location: "reused",
+                            resolution_location: honk_outbound::runtime::flow_observation::ResolutionLocation::Reused,
                         },
                     );
                 }
@@ -700,7 +700,7 @@ impl ControlPlaneHandle {
                     observer.publish(
                         honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
                             server_addr: tcp.peer_addr().ok(),
-                            resolution_location: "reused",
+                            resolution_location: honk_outbound::runtime::flow_observation::ResolutionLocation::Reused,
                         },
                     );
                 }

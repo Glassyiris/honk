@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use honk_outbound::runtime::flow_observation::FlowObserver;
 
-use super::UdpEndpointPool;
+use super::{UdpEndpointPool, UdpTerminal};
 use crate::observe::flows::FlowGuard;
 
 #[derive(Clone)]
@@ -18,7 +18,7 @@ impl SharedTerminal {
     }
 
     #[inline]
-    pub(in crate::control) fn outcome(&self, _state: &'static str, _reason: &'static str) {
+    pub(in crate::control) fn outcome(&self, _outcome: UdpTerminal) {
         match *self {}
     }
 }
@@ -65,5 +65,5 @@ impl EndpointObservation {
     pub(super) fn reply_received(&self) {}
 
     #[inline]
-    pub(super) fn finish(&self, _state: &'static str, _reason: &'static str) {}
+    pub(super) fn finish(&self, _outcome: UdpTerminal) {}
 }

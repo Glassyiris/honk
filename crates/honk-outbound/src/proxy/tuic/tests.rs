@@ -351,8 +351,8 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
                 dns_purpose: "proxy_server",
             },
             Arc::new(move |_, event| {
-                if let FlowEvent::Session { reason, error } = event {
-                    events.lock().push((reason, error));
+                if let FlowEvent::Session(event) = event {
+                    events.lock().push((event.reason(), event.error()));
                 }
             }),
         )

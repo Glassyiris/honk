@@ -506,7 +506,9 @@ impl LookupObservation {
         use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
         let observer = current()?;
         if host.is_empty() || host.len() > 253 {
-            observer.publish(FlowEvent::Gap("redacted"));
+            observer.publish(FlowEvent::Gap(
+                crate::runtime::flow_observation::GapReason::Redacted,
+            ));
             return None;
         }
         let context = observer.context();
@@ -558,7 +560,9 @@ impl LookupObservation {
                         continue;
                     }
                     if self.data.addresses.len() == 32 {
-                        self.observer.publish(FlowEvent::Gap("buffer_overflow"));
+                        self.observer.publish(FlowEvent::Gap(
+                            crate::runtime::flow_observation::GapReason::BufferOverflow,
+                        ));
                         break;
                     }
                     self.data.addresses.push(address);

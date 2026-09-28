@@ -852,7 +852,7 @@ mod tests {
             .core
             .flows
             .begin(
-                "tcp",
+                crate::observe::vocab::Network::Tcp,
                 "127.0.0.1:31000".parse().unwrap(),
                 "127.0.0.2:443".parse().unwrap(),
             )

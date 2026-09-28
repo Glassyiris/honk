@@ -861,7 +861,7 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
         .core
         .flows
         .begin(
-            "tcp",
+            crate::observe::vocab::Network::Tcp,
             "192.0.2.1:31000".parse().unwrap(),
             "198.51.100.1:443".parse().unwrap(),
         )
@@ -871,7 +871,7 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
         "group/name@host",
         Some(&rule_id),
         Some(&format!("pname(\"/usr/bin/{SECRET}\")")),
-        "evaluation",
+        crate::observe::vocab::RoutingSource::Evaluation,
     );
     state.tracker.register(ConnectionEntry {
         id: "connection-visible-id".into(),

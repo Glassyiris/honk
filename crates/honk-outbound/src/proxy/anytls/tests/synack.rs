@@ -419,7 +419,7 @@ async fn target_evidence_is_scoped_to_sid_and_uot_ack_is_not_target_confirmation
             },
             Arc::new(move |context, event| {
                 if let FlowEvent::Milestone { milestone } = event {
-                    events.lock().push((context.flow_id, milestone));
+                    events.lock().push((context.flow_id, milestone.as_str()));
                 }
             }),
         )

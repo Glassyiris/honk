@@ -449,7 +449,7 @@ mod observation {
         events
             .iter()
             .filter_map(|event| match event {
-                FlowEvent::Session { reason, error } => Some((*reason, *error)),
+                FlowEvent::Session(event) => Some((event.reason(), event.error())),
                 _ => None,
             })
             .collect()

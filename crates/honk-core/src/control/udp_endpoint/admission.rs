@@ -387,7 +387,7 @@ impl UdpInitLease {
                 *native_terminal = Some(Arc::clone(&terminal));
             }
         } else {
-            flow.mark_gap("retirement_owner_lost");
+            flow.mark_gap(honk_outbound::runtime::flow_observation::GapReason::RetirementOwnerLost);
         }
         Some(terminal)
     }

@@ -24,6 +24,93 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tracing::debug;
 
+/// How an observed UDP connection ended.
+#[cfg_attr(
+    not(all(feature = "native-api", feature = "ebpf")),
+    allow(
+        dead_code,
+        reason = "builds name only the outcomes their engine paths report"
+    )
+)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::control) enum UdpTerminal {
+    PolicyBlock,
+    IntentionalRetirement,
+    ReplyIdle,
+    Shutdown,
+    CleanupFailed,
+    ClientDeliveryFailed,
+    Congestion,
+    DriverCancelled,
+    InitializerCancelled,
+    InitializerFirstPacketMissing,
+    InitializerQueueMissing,
+    InternalAddressSkipped,
+    LocalRefusal,
+    NoAvailableCandidate,
+    PacketRejected,
+    QuicSniffIncomplete,
+    ReplyFamilyMismatch,
+    ReplySocketCapacity,
+    ReplySocketFailed,
+    SetupFailed,
+    SpecialAddressSkipped,
+    TimeoutAfterReply,
+    TimeoutBeforeReply,
+    TransportError,
+    TransportTimeout,
+    UdpCommitFailed,
+    UdpCommitTimeout,
+    UdpPrepareFailed,
+    UdpPrepareTimeout,
+    WinnerBindCancelled,
+    WinnerIneligible,
+    DriverCompleted,
+    KernelHandoff,
+}
+
+#[cfg(feature = "native-api")]
+impl UdpTerminal {
+    fn outcome(self) -> (crate::observe::vocab::ConnectionState, &'static str) {
+        use crate::observe::vocab::ConnectionState::{Blocked, Closed, Failed, Unknown};
+        match self {
+            Self::PolicyBlock => (Blocked, "policy_block"),
+            Self::IntentionalRetirement => (Closed, "intentional_retirement"),
+            Self::ReplyIdle => (Closed, "reply_idle"),
+            Self::Shutdown => (Closed, "shutdown"),
+            Self::CleanupFailed => (Failed, "cleanup_failed"),
+            Self::ClientDeliveryFailed => (Failed, "client_delivery_failed"),
+            Self::Congestion => (Failed, "congestion"),
+            Self::DriverCancelled => (Failed, "driver_cancelled"),
+            Self::InitializerCancelled => (Failed, "initializer_cancelled"),
+            Self::InitializerFirstPacketMissing => (Failed, "initializer_first_packet_missing"),
+            Self::InitializerQueueMissing => (Failed, "initializer_queue_missing"),
+            Self::InternalAddressSkipped => (Failed, "internal_address_skipped"),
+            Self::LocalRefusal => (Failed, "local_refusal"),
+            Self::NoAvailableCandidate => (Failed, "no_available_candidate"),
+            Self::PacketRejected => (Failed, "packet_rejected"),
+            Self::QuicSniffIncomplete => (Failed, "quic_sniff_incomplete"),
+            Self::ReplyFamilyMismatch => (Failed, "reply_family_mismatch"),
+            Self::ReplySocketCapacity => (Failed, "reply_socket_capacity"),
+            Self::ReplySocketFailed => (Failed, "reply_socket_failed"),
+            Self::SetupFailed => (Failed, "setup_failed"),
+            Self::SpecialAddressSkipped => (Failed, "special_address_skipped"),
+            Self::TimeoutAfterReply => (Failed, "timeout_after_reply"),
+            Self::TimeoutBeforeReply => (Failed, "timeout_before_reply"),
+            Self::TransportError => (Failed, "transport_error"),
+            Self::TransportTimeout => (Failed, "transport_timeout"),
+            Self::UdpCommitFailed => (Failed, "udp_commit_failed"),
+            Self::UdpCommitTimeout => (Failed, "udp_commit_timeout"),
+            Self::UdpPrepareFailed => (Failed, "udp_prepare_failed"),
+            Self::UdpPrepareTimeout => (Failed, "udp_prepare_timeout"),
+            Self::WinnerBindCancelled => (Failed, "winner_bind_cancelled"),
+            Self::WinnerIneligible => (Failed, "winner_ineligible"),
+            Self::DriverCompleted => (Unknown, "driver_completed"),
+            Self::KernelHandoff => (Unknown, "kernel_handoff"),
+        }
+    }
+}
+
 mod admission;
 #[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
 mod observation;
@@ -212,21 +299,21 @@ impl UdpEndpoint {
 
     #[cfg(all(feature = "native-api", feature = "rprx"))]
     fn finish_native_source(&self, retirement: SourceRetirement) {
-        let (state, reason) = match retirement {
+        let outcome = match retirement {
             SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.has_reply() => {
-                ("closed", "reply_idle")
+                UdpTerminal::ReplyIdle
             }
             SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.native.received_reply() => {
-                ("failed", "timeout_after_reply")
+                UdpTerminal::TimeoutAfterReply
             }
-            SourceRetirement::Neutral(ScoreOutcome::Timeout) => ("failed", "timeout_before_reply"),
-            SourceRetirement::Neutral(_) => ("closed", "intentional_retirement"),
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) => UdpTerminal::TimeoutBeforeReply,
+            SourceRetirement::Neutral(_) => UdpTerminal::IntentionalRetirement,
             SourceRetirement::Failure(
                 ScoreOutcome::Timeout | ScoreOutcome::Io(io::ErrorKind::TimedOut),
-            ) => ("failed", "transport_timeout"),
-            SourceRetirement::Failure(_) => ("failed", "transport_error"),
+            ) => UdpTerminal::TransportTimeout,
+            SourceRetirement::Failure(_) => UdpTerminal::TransportError,
         };
-        self.native.finish(state, reason);
+        self.native.finish(outcome);
     }
 
     /// Bind the clash-API tracker entry to this endpoint: the entry shares
@@ -296,7 +383,12 @@ impl UdpEndpoint {
     pub fn mark_reply(&self) {
         let first = !self.has_reply.swap(true, Ordering::Relaxed);
         if first && let Some(flow) = self.native.flow() {
-            flow.transition("active", "client_delivery_succeeded", "unknown", Some(true));
+            flow.transition(
+                crate::observe::vocab::ConnectionState::Active,
+                "client_delivery_succeeded",
+                crate::observe::vocab::ConnectionMilestone::Unknown,
+                Some(true),
+            );
         }
         self.refresh();
         self.reply_epoch.fetch_add(1, Ordering::Release);

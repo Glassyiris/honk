@@ -339,7 +339,9 @@ impl ShadowsocksHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
     ) -> anyhow::Result<ProxyStream> {
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         let stream: Box<dyn super::AsyncReadWrite> = if is_2022_method(method) {
             let method_2022 = Ss2022Method::new(method, password)?;
             Box::new(aead2022::dial_stream(server, method_2022, header).await?)
@@ -374,7 +376,9 @@ impl ShadowsocksHandler {
                 prologue,
             ))
         };
-        crate::runtime::flow_observation::milestone("target_request_sent");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+        );
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -500,7 +504,9 @@ impl ShadowsocksHandler {
         };
         let outbound = crate::util::udp_marked_bind(bind_addr).await?;
         outbound.connect(server_addr).await?;
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         debug!(
             "Shadowsocks UDP: session to {} for target {}",
             server_addr, target

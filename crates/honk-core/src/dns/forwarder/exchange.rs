@@ -32,7 +32,7 @@ impl DnsForwarder {
                 let query = self.query_asis(raw_query, *destination, ingress);
                 let observation = crate::observe::flows::dns::outbound_evidence(
                     "direct",
-                    "builtin",
+                    crate::observe::vocab::RoutingSource::Builtin,
                     None,
                     None,
                     *destination,
@@ -283,7 +283,7 @@ impl DnsForwarder {
         crate::observe::flows::dns::transport("udp", "udp");
         let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
             Some(destination),
-            "original_ip",
+            honk_outbound::runtime::flow_observation::ResolutionLocation::OriginalIp,
         );
         let socket = async {
             let sock2 = new_asis_socket_with_mark(destination, |socket| {
@@ -312,11 +312,13 @@ impl DnsForwarder {
         if let Some(observation) = &mut observation {
             observation.finish(
                 if socket.is_ok() {
-                    "succeeded"
+                    honk_outbound::runtime::flow_observation::TransportStatus::Succeeded
                 } else {
-                    "failed"
+                    honk_outbound::runtime::flow_observation::TransportStatus::Failed
                 },
-                socket.as_ref().err().map(|_| "udp_socket_failed"),
+                socket.as_ref().err().map(|_| {
+                    honk_outbound::runtime::flow_observation::TransportError::UdpSocketFailed
+                }),
             );
         }
         let socket = socket?;

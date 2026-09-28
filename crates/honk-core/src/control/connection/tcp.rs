@@ -148,6 +148,47 @@ async fn wait_for_cold_urltest_release(index: usize) {
     }
 }
 
+/// How an observed TCP connection ended.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy)]
+enum TcpTerminal {
+    DnsInterceptCompleted,
+    NoAvailableNodes,
+    PolicyBlock,
+    DialFailed,
+    IntentionalRetirement,
+    PrefixWriteFailed,
+    RelayClosed,
+    RelayFailed,
+    ConnectionFailed,
+}
+
+#[cfg(feature = "native-api")]
+impl TcpTerminal {
+    fn outcome(self) -> (crate::observe::vocab::ConnectionState, &'static str) {
+        use crate::observe::vocab::ConnectionState::{Blocked, Closed, Failed};
+        match self {
+            Self::DnsInterceptCompleted => (Closed, "dns_intercept_completed"),
+            Self::NoAvailableNodes => (Failed, "no_available_nodes"),
+            Self::PolicyBlock => (Blocked, "policy_block"),
+            Self::DialFailed => (Failed, "dial_failed"),
+            Self::IntentionalRetirement => (Closed, "intentional_retirement"),
+            Self::PrefixWriteFailed => (Failed, "prefix_write_failed"),
+            Self::RelayClosed => (Closed, "relay_closed"),
+            Self::RelayFailed => (Failed, "relay_failed"),
+            Self::ConnectionFailed => (Failed, "connection_failed"),
+        }
+    }
+}
+
+/// Block nodes "dial" by failing and the dial path reports no other signal,
+/// so a failure where every tried node is a block node is the policy's doing.
+pub(super) fn only_block_nodes<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> bool {
+    nodes
+        .into_iter()
+        .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block)
+}
+
 impl ControlPlaneHandle {
     async fn pin_tcp_dns_route(
         &self,
@@ -235,8 +276,12 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-        let mut observation =
-            ConnectionObservation::begin(self.native.as_deref(), "tcp", client_addr, original_dst);
+        let mut observation = ConnectionObservation::begin(
+            self.native.as_deref(),
+            crate::observe::vocab::Network::Tcp,
+            client_addr,
+            original_dst,
+        );
         #[cfg(feature = "native-api")]
         let native_observer = observation.flow().and_then(|flow| {
             flow.observer(self.diagnostics.read().generation, None, "dial_target")
@@ -274,7 +319,7 @@ impl ControlPlaneHandle {
                             .await?;
                         #[cfg(feature = "native-api")]
                         {
-                            terminal = Some(("closed", "dns_intercept_completed"));
+                            terminal = Some(TcpTerminal::DnsInterceptCompleted);
                         }
                         return Ok(());
                     }
@@ -532,7 +577,7 @@ impl ControlPlaneHandle {
                     drop(outbound_guard);
                     #[cfg(feature = "native-api")]
                     {
-                        terminal = Some(("failed", "no_available_nodes"));
+                        terminal = Some(TcpTerminal::NoAvailableNodes);
                     }
                     return Ok(());
                 }
@@ -557,7 +602,12 @@ impl ControlPlaneHandle {
                 let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
                 let candidate_refs: Vec<&Node> = candidates.iter().collect();
                 if let Some(flow) = observation.flow() {
-                    flow.transition("dialing", "tcp_dial_started", "unknown", Some(false));
+                    flow.transition(
+                        crate::observe::vocab::ConnectionState::Dialing,
+                        "tcp_dial_started",
+                        crate::observe::vocab::ConnectionMilestone::Unknown,
+                        Some(false),
+                    );
                 }
                 let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
                 let raced = self
@@ -715,12 +765,8 @@ impl ControlPlaneHandle {
                                     }
                                 };
                                 #[cfg(feature = "native-api")]
-                                if retried.is_none()
-                                    && retry_nodes.iter().take(3).all(|node| {
-                                        node.protocol() == honk_config::types::NodeProtocol::Block
-                                    })
-                                {
-                                    terminal = Some(("blocked", "policy_block"));
+                                if retried.is_none() && only_block_nodes(nodes.iter().copied()) {
+                                    terminal = Some(TcpTerminal::PolicyBlock);
                                 }
                                 if retried.is_some() {
                                     selection_chains = retry_chains;
@@ -734,15 +780,11 @@ impl ControlPlaneHandle {
                                 #[cfg(feature = "native-api")]
                                 if terminal.is_none() {
                                     terminal = Some(
-                                        if outbound_name == "block"
-                                            || candidates.iter().all(|node| {
-                                                node.protocol()
-                                                    == honk_config::types::NodeProtocol::Block
-                                            })
+                                        if outbound_name == "block" || only_block_nodes(&candidates)
                                         {
-                                            ("blocked", "policy_block")
+                                            TcpTerminal::PolicyBlock
                                         } else {
-                                            ("failed", "dial_failed")
+                                            TcpTerminal::DialFailed
                                         },
                                     );
                                 }
@@ -895,9 +937,9 @@ impl ControlPlaneHandle {
                         #[cfg(feature = "native-api")]
                         {
                             terminal = Some(if intentionally_closed {
-                                ("closed", "intentional_retirement")
+                                TcpTerminal::IntentionalRetirement
                             } else {
-                                ("failed", "prefix_write_failed")
+                                TcpTerminal::PrefixWriteFailed
                             });
                         }
                         if !intentionally_closed {
@@ -993,7 +1035,7 @@ impl ControlPlaneHandle {
                     }
                     #[cfg(feature = "native-api")]
                     {
-                        terminal = Some(("closed", "intentional_retirement"));
+                        terminal = Some(TcpTerminal::IntentionalRetirement);
                     }
                     anyhow::ensure!(flow.retire().await, "TCP retirement failed");
                     return Ok(());
@@ -1001,9 +1043,9 @@ impl ControlPlaneHandle {
                 #[cfg(feature = "native-api")]
                 {
                     terminal = Some(if relay_result.is_ok() {
-                        ("closed", "relay_closed")
+                        TcpTerminal::RelayClosed
                     } else {
-                        ("failed", "relay_failed")
+                        TcpTerminal::RelayFailed
                     });
                 }
                 anyhow::ensure!(flow.retire().await, "TCP retirement failed");
@@ -1065,9 +1107,12 @@ impl ControlPlaneHandle {
             close.0.finish(result.is_ok());
         }
         #[cfg(feature = "native-api")]
-        if result.is_err() {
-            observation.finish("failed", "connection_failed");
-        } else if let Some((state, reason)) = terminal {
+        if let Some(terminal) = if result.is_err() {
+            Some(TcpTerminal::ConnectionFailed)
+        } else {
+            terminal
+        } {
+            let (state, reason) = terminal.outcome();
             observation.finish(state, reason);
         }
         result

@@ -209,7 +209,7 @@ impl UpstreamPool {
             return Ok(DnsDialRoute {
                 observation: crate::observe::flows::dns::outbound_evidence(
                     tag,
-                    "forced",
+                    crate::observe::vocab::RoutingSource::Forced,
                     None,
                     selected.node.as_ref(),
                     target,
@@ -247,7 +247,7 @@ impl UpstreamPool {
                     return Ok(DnsDialRoute {
                         observation: crate::observe::flows::dns::outbound_evidence(
                             "direct",
-                            "builtin",
+                            crate::observe::vocab::RoutingSource::Builtin,
                             None,
                             None,
                             target,
@@ -278,7 +278,7 @@ impl UpstreamPool {
             return Ok(DnsDialRoute {
                 observation: crate::observe::flows::dns::outbound_evidence(
                     &outbound_name,
-                    "evaluation",
+                    crate::observe::vocab::RoutingSource::Evaluation,
                     evaluation_id,
                     None,
                     target,
@@ -304,7 +304,7 @@ impl UpstreamPool {
         Ok(DnsDialRoute {
             observation: crate::observe::flows::dns::outbound_evidence(
                 &outbound_name,
-                "evaluation",
+                crate::observe::vocab::RoutingSource::Evaluation,
                 evaluation_id,
                 selected.node.as_ref(),
                 target,

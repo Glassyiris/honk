@@ -417,7 +417,7 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
     ));
     let flow = store
         .begin(
-            "tcp",
+            crate::observe::vocab::Network::Tcp,
             (capture.input.src_ip, capture.input.src_port).into(),
             (capture.input.dst_ip, capture.input.dst_port).into(),
         )
@@ -427,7 +427,7 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
         StepData::Route {
             evaluation_id: capture.evaluation_id,
             chain: "traffic",
-            plane: "kernel",
+            plane: crate::observe::vocab::Plane::Kernel,
             rule_id: capture.rule_id,
             outbound: capture.outbound,
             must: Some(capture.must),

@@ -5,6 +5,7 @@ pub(crate) mod catalog;
 mod dns;
 pub(crate) mod flows;
 pub(crate) mod rules;
+pub(crate) mod vocab;
 
 pub(crate) use dns::{DnsLog, DnsObserver, DnsOperation, DnsRecorder};
 

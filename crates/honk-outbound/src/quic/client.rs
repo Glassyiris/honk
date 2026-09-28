@@ -225,7 +225,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 observer.publish(
                     crate::runtime::flow_observation::FlowEvent::TransportAttached {
                         server_addr: Some(conn.remote_address()),
-                        resolution_location: "unknown",
+                        resolution_location:
+                            crate::runtime::flow_observation::ResolutionLocation::Unknown,
                     },
                 );
             }
@@ -280,9 +281,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 // races addresses for this node, never protocol attempts or nodes.
                 for attempt in 1..=3u8 {
                     let mut observation = crate::runtime::flow_observation::TransportAttempt::start(
-                        Some(server_addr),
-                        "unknown",
-                    );
+                        Some(server_addr), crate::runtime::flow_observation::ResolutionLocation::Unknown);
                     let connecting = match endpoint.connect_with(
                         dial_config.clone(),
                         server_addr,
@@ -291,7 +290,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                         Ok(connecting) => connecting,
                         Err(error) => {
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("failed", Some("quic_connect_failed"));
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectFailed));
                             }
                             return Err(error.into());
                         }
@@ -299,7 +298,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                     match tokio::time::timeout(connect_timeout, connecting).await {
                         Err(_) => {
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("failed", Some("quic_connect_timeout"));
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectTimeout));
                             }
                             last_error = Some(anyhow!(
                                 "QUIC connect to {server_addr} timed out (attempt {attempt})"
@@ -307,7 +306,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                         }
                         Ok(Err(error)) => {
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("failed", Some("quic_connect_failed"));
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectFailed));
                             }
                             last_error = Some(
                                 crate::proxy::NodeFailure(anyhow::Error::new(error).context(
@@ -318,7 +317,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                         }
                         Ok(Ok(connection)) => {
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("succeeded", None);
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Succeeded, None);
                             }
                             return Ok((connection, endpoint, ipv6));
                         }
@@ -342,7 +341,9 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 return Err(crate::proxy::quic_carrier_error(error));
             }
         };
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         let ctx = Arc::new(ctx);
         if state.quality.is_some() {
             on_publish(ctx.as_ref(), &conn);

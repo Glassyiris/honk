@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use honk_outbound::runtime::flow_observation::FlowObserver;
 use parking_lot::Mutex;
 
-use super::UdpEndpointPool;
+use super::{UdpEndpointPool, UdpTerminal};
 use crate::observe::flows::FlowGuard;
 
 pub(in crate::control) struct NativeUdpTerminal {
@@ -16,7 +16,7 @@ pub(in crate::control) struct NativeUdpTerminal {
 }
 
 struct NativeUdpState {
-    outcome: Option<(&'static str, &'static str)>,
+    outcome: Option<UdpTerminal>,
     cleaned: Option<bool>,
     initializer_done: bool,
 }
@@ -41,7 +41,7 @@ impl Drop for NativeInitializerGuard {
         if !self.completed {
             state
                 .outcome
-                .get_or_insert(("failed", "initializer_cancelled"));
+                .get_or_insert(UdpTerminal::InitializerCancelled);
         }
         state.initializer_done = true;
         self.terminal.publish(&state);
@@ -69,15 +69,20 @@ impl NativeUdpTerminal {
     }
 
     pub(super) fn packet_drop(&self, reason: &'static str) {
-        self.flow.datapath("userspace", "drop", reason, None);
+        self.flow.datapath(
+            crate::observe::vocab::Plane::Userspace,
+            "drop",
+            reason,
+            None,
+        );
     }
 
-    pub(in crate::control) fn outcome(&self, state: &'static str, reason: &'static str) {
+    /// The first outcome wins, except that a cleanup failure overrides any
+    /// earlier one: a flow whose teardown failed did not end cleanly.
+    pub(in crate::control) fn outcome(&self, outcome: UdpTerminal) {
         let mut terminal = self.state.lock();
-        if reason == "cleanup_failed" {
-            terminal.outcome = Some((state, reason));
-        } else {
-            terminal.outcome.get_or_insert((state, reason));
+        if terminal.outcome.is_none() || outcome == UdpTerminal::CleanupFailed {
+            terminal.outcome = Some(outcome);
         }
         self.publish(&terminal);
     }
@@ -92,11 +97,13 @@ impl NativeUdpTerminal {
         if !terminal.initializer_done {
             return;
         }
-        match (terminal.outcome, terminal.cleaned) {
-            (_, Some(false)) => self.flow.finish("failed", "cleanup_failed"),
-            (Some((state, reason)), Some(true)) => self.flow.finish(state, reason),
-            _ => {}
-        }
+        let outcome = match (terminal.outcome, terminal.cleaned) {
+            (_, Some(false)) => UdpTerminal::CleanupFailed,
+            (Some(outcome), Some(true)) => outcome,
+            _ => return,
+        };
+        let (state, reason) = outcome.outcome();
+        self.flow.finish(state, reason);
     }
 }
 
@@ -144,7 +151,12 @@ impl EndpointObservation {
 
     pub(super) fn dropped(&self, reason: &'static str, error: Option<&'static str>) {
         if let Some(flow) = &self.flow {
-            flow.datapath("userspace", "drop", reason, error);
+            flow.datapath(
+                crate::observe::vocab::Plane::Userspace,
+                "drop",
+                reason,
+                error,
+            );
         }
     }
 
@@ -152,21 +164,26 @@ impl EndpointObservation {
         if let Some(flow) = &self.flow {
             self.received_reply.store(true, Ordering::Relaxed);
             if flow.first_reply() {
-                flow.transition("active", "reply_received", "first_reply", Some(true));
+                flow.transition(
+                    crate::observe::vocab::ConnectionState::Active,
+                    "reply_received",
+                    crate::observe::vocab::ConnectionMilestone::FirstReply,
+                    Some(true),
+                );
             }
         }
     }
 
-    pub(super) fn finish(&self, state: &'static str, reason: &'static str) {
+    pub(super) fn finish(&self, outcome: UdpTerminal) {
         if let Some(terminal) = &self.terminal {
             let shutdown = self
                 .pool
                 .upgrade()
                 .is_some_and(|pool| pool.terminal.load(Ordering::Acquire));
             if shutdown {
-                terminal.outcome("closed", "shutdown");
+                terminal.outcome(UdpTerminal::Shutdown);
             } else {
-                terminal.outcome(state, reason);
+                terminal.outcome(outcome);
             }
         }
     }

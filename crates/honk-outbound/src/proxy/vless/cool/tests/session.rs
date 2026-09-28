@@ -51,7 +51,7 @@ async fn shared_xudp_records_each_business_target_once_without_carrying_opener_c
             },
             Arc::new(move |context, event| {
                 if let FlowEvent::Milestone { milestone } = event {
-                    events.lock().push((context.flow_id, milestone));
+                    events.lock().push((context.flow_id, milestone.as_str()));
                 }
             }),
         )

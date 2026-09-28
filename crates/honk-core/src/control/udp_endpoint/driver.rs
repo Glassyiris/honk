@@ -1,3 +1,4 @@
+use super::UdpTerminal;
 use super::*;
 use honk_outbound::proxy::QuicSendAttempt;
 
@@ -258,7 +259,7 @@ pub(super) struct UdpDriverContext {
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
-        self.endpoint.native.finish("failed", "driver_cancelled");
+        self.endpoint.native.finish(UdpTerminal::DriverCancelled);
         self.endpoint
             .finish_score(if self.pool.terminal.load(Ordering::Acquire) {
                 ScoreOutcome::Shutdown
@@ -371,31 +372,29 @@ impl UdpEndpoint {
             self.finish_native_source(retirement);
             return;
         }
-        let (state, reason) = if self.dead.load(Ordering::Acquire) {
-            ("closed", "intentional_retirement")
+        let outcome = if self.dead.load(Ordering::Acquire) {
+            UdpTerminal::IntentionalRetirement
         } else {
             match result {
                 Err(error) if is_reply_idle_timeout(error) => {
                     if self.has_reply() {
-                        ("closed", "reply_idle")
+                        UdpTerminal::ReplyIdle
                     } else if self.native.received_reply() {
-                        ("failed", "timeout_after_reply")
+                        UdpTerminal::TimeoutAfterReply
                     } else {
-                        ("failed", "timeout_before_reply")
+                        UdpTerminal::TimeoutBeforeReply
                     }
                 }
                 Err(error) => match honk_outbound::proxy::packet_error_class(error) {
-                    honk_outbound::proxy::PacketErrorClass::Rejected => {
-                        ("failed", "packet_rejected")
-                    }
-                    honk_outbound::proxy::PacketErrorClass::Congestion => ("failed", "congestion"),
-                    _ if error.kind() == io::ErrorKind::TimedOut => ("failed", "transport_timeout"),
-                    _ => ("failed", "transport_error"),
+                    honk_outbound::proxy::PacketErrorClass::Rejected => UdpTerminal::PacketRejected,
+                    honk_outbound::proxy::PacketErrorClass::Congestion => UdpTerminal::Congestion,
+                    _ if error.kind() == io::ErrorKind::TimedOut => UdpTerminal::TransportTimeout,
+                    _ => UdpTerminal::TransportError,
                 },
-                Ok(()) => ("unknown", "driver_completed"),
+                Ok(()) => UdpTerminal::DriverCompleted,
             }
         };
-        self.native.finish(state, reason);
+        self.native.finish(outcome);
     }
 }
 
@@ -935,7 +934,7 @@ async fn receive_loop(
             endpoint
                 .native
                 .dropped("reply_family_mismatch", Some("reply_family_mismatch"));
-            endpoint.native.finish("failed", "reply_family_mismatch");
+            endpoint.native.finish(UdpTerminal::ReplyFamilyMismatch);
             return Err(local_reply_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -957,7 +956,7 @@ async fn receive_loop(
                         endpoint
                             .native
                             .dropped("reply_socket_capacity", Some("capacity"));
-                        endpoint.native.finish("failed", "reply_socket_capacity");
+                        endpoint.native.finish(UdpTerminal::ReplySocketCapacity);
                         return Err(local_reply_error(io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
                             "UDP endpoint reply-source socket cache is full",
@@ -980,7 +979,7 @@ async fn receive_loop(
                             endpoint
                                 .native
                                 .dropped("reply_socket_failed", Some("reply_socket_failed"));
-                            endpoint.native.finish("failed", "reply_socket_failed");
+                            endpoint.native.finish(UdpTerminal::ReplySocketFailed);
                             return Err(local_reply_error(error));
                         }
                     };
@@ -995,7 +994,7 @@ async fn receive_loop(
             endpoint
                 .native
                 .dropped("client_delivery_failed", Some("client_send_failed"));
-            endpoint.native.finish("failed", "client_delivery_failed");
+            endpoint.native.finish(UdpTerminal::ClientDeliveryFailed);
         }
         delivered.map_err(local_reply_error)?;
         endpoint.mark_reply();

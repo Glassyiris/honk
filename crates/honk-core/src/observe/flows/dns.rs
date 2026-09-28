@@ -6,7 +6,9 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use honk_outbound::runtime::flow_observation::{self, DnsLookup, FlowEvent, FlowObserver};
+use honk_outbound::runtime::flow_observation::{
+    self, DnsLookup, FlowEvent, FlowObserver, GapReason, SessionEvent, TransportStatus,
+};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -20,6 +22,7 @@ use crate::dns::{
     outcome::{DnsOutcome, OutcomeStatus, Provenance, ResponseClass},
     query::{DnsRequestMeta, IngressProfile, QueryContext},
 };
+use crate::observe::vocab::{ConnectionMilestone, ConnectionState, Plane, RoutingSource};
 use crate::observe::{
     DnsRecorder,
     catalog::CatalogIdentity,
@@ -98,13 +101,13 @@ impl LookupGuard {
         let query = match QueryContext::parse_with_profile(raw, ingress) {
             Ok(query) => query,
             Err(_) => {
-                observer.publish(FlowEvent::Gap("not_instrumented"));
+                observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
                 return None;
             }
         };
         let name = query.qname().and_then(|name| name.to_domain_name());
         let Some((name, query_type)) = name.zip(query.qtype()) else {
-            observer.publish(FlowEvent::Gap("not_instrumented"));
+            observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
             return None;
         };
         let parent = observer.context();
@@ -277,10 +280,9 @@ pub(crate) fn transport(upstream: &'static str, carrier: &'static str) {
 
 pub(crate) fn tcp_fallback() {
     if let Some(observer) = flow_observation::current() {
-        observer.publish(FlowEvent::Session {
-            reason: "dns_response_truncated_tcp_fallback",
-            error: None,
-        });
+        observer.publish(FlowEvent::Session(
+            SessionEvent::DnsResponseTruncatedTcpFallback,
+        ));
     }
 }
 
@@ -327,7 +329,7 @@ pub(crate) fn qtype(value: u16) -> String {
 
 fn addresses(values: &[IpAddr], observer: &FlowObserver) -> Vec<IpAddr> {
     if values.len() > MAX_ADDRESSES {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
+        observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
     let mut result = Vec::with_capacity(values.len().min(MAX_ADDRESSES));
     for value in values.iter().take(MAX_ADDRESSES) {
@@ -491,7 +493,8 @@ impl RuleCapture {
     pub(crate) fn finish(self, action: &'static str, outbound: Option<&str>) {
         let context = self.observer.context();
         if self.overflow {
-            self.observer.publish(FlowEvent::Gap("buffer_overflow"));
+            self.observer
+                .publish(FlowEvent::Gap(GapReason::BufferOverflow));
         }
         let evaluation_id = Uuid::new_v4().to_string();
         let rule_id = self
@@ -504,7 +507,7 @@ impl RuleCapture {
             StepData::Route {
                 evaluation_id: evaluation_id.clone(),
                 chain: self.chain,
-                plane: "userspace",
+                plane: Plane::Userspace,
                 rule_id,
                 rules: self.rules,
                 outbound: outbound.map(bounded),
@@ -515,7 +518,8 @@ impl RuleCapture {
             },
         );
         if !accepted {
-            self.observer.publish(FlowEvent::Gap("not_instrumented"));
+            self.observer
+                .publish(FlowEvent::Gap(GapReason::NotInstrumented));
             return;
         }
         let _ = with_lookup(|lookup| {
@@ -524,7 +528,8 @@ impl RuleCapture {
                 data.route_evaluation_ids.push(evaluation_id);
             } else {
                 drop(data);
-                self.observer.publish(FlowEvent::Gap("buffer_overflow"));
+                self.observer
+                    .publish(FlowEvent::Gap(GapReason::BufferOverflow));
             }
         });
     }
@@ -545,7 +550,7 @@ fn with_lookup<T>(capture: impl FnOnce(&LookupState) -> T) -> Option<T> {
 fn authority() -> Option<(FlowObserver, Arc<DnsRecorder>)> {
     let observer = flow_observation::current()?;
     let Some(api) = DNS_API.try_with(Weak::upgrade).ok().flatten() else {
-        observer.publish(FlowEvent::Gap("not_instrumented"));
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
         return None;
     };
     Some((observer, api))
@@ -702,7 +707,7 @@ pub(crate) fn route_upstream(
     let outbound = action.outbound.as_str();
     let context = observer.context();
     if observed.truncated {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
+        observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
     let evaluation_id = Uuid::new_v4().to_string();
     let rule_id = crate::observe::rules::rule_id(
@@ -721,7 +726,7 @@ pub(crate) fn route_upstream(
         StepData::Route {
             evaluation_id: evaluation_id.clone(),
             chain: "dns_upstream",
-            plane: "userspace",
+            plane: Plane::Userspace,
             rule_id: Some(rule_id),
             rules,
             outbound: Some(bounded(outbound)),
@@ -745,7 +750,7 @@ pub(crate) fn route_upstream(
         },
     );
     if !accepted {
-        observer.publish(FlowEvent::Gap("not_instrumented"));
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
         return (outbound.to_owned(), None);
     }
     let _ = with_lookup(|lookup| {
@@ -754,7 +759,7 @@ pub(crate) fn route_upstream(
             data.route_evaluation_ids.push(evaluation_id.clone());
         } else {
             drop(data);
-            observer.publish(FlowEvent::Gap("buffer_overflow"));
+            observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
         }
     });
     (outbound.to_owned(), Some(evaluation_id))
@@ -770,11 +775,11 @@ pub(crate) fn selection_evaluated(
         return Vec::new();
     };
     let Some(observation) = observation else {
-        observer.publish(FlowEvent::Gap("not_instrumented"));
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
         return Vec::new();
     };
     let Some(catalog) = CATALOG.try_with(Clone::clone).ok().flatten() else {
-        observer.publish(FlowEvent::Gap("not_instrumented"));
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
         return Vec::new();
     };
     let selections = map_selection_observation(observation, &catalog, &observer);
@@ -782,9 +787,9 @@ pub(crate) fn selection_evaluated(
     if !api.record_flow(
         context,
         StepData::Connection {
-            state: "observed",
+            state: ConnectionState::Observed,
             reason: "selection_evaluated",
-            milestone: "unknown",
+            milestone: ConnectionMilestone::Unknown,
             attempt_id: context.attempt_id.map(|id| id.to_string()),
             reply_received: None,
             error: None,
@@ -793,7 +798,7 @@ pub(crate) fn selection_evaluated(
             selections: selections.clone(),
         },
     ) {
-        observer.publish(FlowEvent::Gap("not_instrumented"));
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
         return Vec::new();
     }
     selections
@@ -809,12 +814,12 @@ pub(crate) fn selection_path(
         return Vec::new();
     };
     let Some(catalog) = CATALOG.try_with(Clone::clone).ok().flatten() else {
-        observer.publish(FlowEvent::Gap("not_instrumented"));
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
         return Vec::new();
     };
     let family = Some(super::producer::ip_family(family));
     if chain.len() > MAX_RULE_VALUES {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
+        observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
     chain
         .iter()
@@ -833,7 +838,7 @@ pub(crate) fn selection_path(
                 .unwrap_or_else(|| (node.id.to_string(), bounded(&node.name)));
             let Some(captured) = captured_selection(selections, group_id, family, &member_id)
             else {
-                observer.publish(FlowEvent::Gap("not_instrumented"));
+                observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
                 return None;
             };
             let mut captured = captured.clone();
@@ -849,7 +854,7 @@ pub(crate) fn selection_path(
 
 pub(crate) fn outbound_evidence(
     outbound: &str,
-    routing_source: &'static str,
+    routing_source: RoutingSource,
     evaluation_id: Option<String>,
     node: Option<&honk_config::node::Node>,
     target: SocketAddr,
@@ -877,7 +882,7 @@ pub(crate) fn outbound_evidence(
         server_addr: node
             .is_none_or(|node| node.protocol() == honk_config::types::NodeProtocol::Direct)
             .then_some(target),
-        resolution_location: "unknown",
+        resolution_location: honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
     })
 }
 
@@ -902,12 +907,12 @@ impl OutboundGuard {
             attempt: attempt.clone(),
             finished: false,
         };
-        if !guard.publish("started", None) {
+        if !guard.publish(TransportStatus::Started, None) {
             return None;
         }
         Some(guard)
     }
-    fn publish(&self, status: &'static str, error: Option<super::record::FlowError>) -> bool {
+    fn publish(&self, status: TransportStatus, error: Option<super::record::FlowError>) -> bool {
         self.api.record_flow(
             self.observer.context(),
             StepData::Outbound {
@@ -918,7 +923,7 @@ impl OutboundGuard {
             },
         )
     }
-    fn finish(&mut self, status: &'static str, error: Option<super::record::FlowError>) {
+    fn finish(&mut self, status: TransportStatus, error: Option<super::record::FlowError>) {
         if !self.finished {
             self.finished = true;
             self.publish(status, error);
@@ -927,7 +932,10 @@ impl OutboundGuard {
 }
 impl Drop for OutboundGuard {
     fn drop(&mut self) {
-        self.finish("cancelled", Some(super::record::FlowError::Cancelled));
+        self.finish(
+            TransportStatus::Cancelled,
+            Some(super::record::FlowError::Cancelled),
+        );
     }
 }
 
@@ -942,11 +950,11 @@ pub(crate) async fn outbound_scope<T, F: Future<Output = anyhow::Result<T>>>(
     let was_cancelled = result.as_ref().err().is_some_and(cancelled);
     guard.finish(
         if result.is_ok() {
-            "succeeded"
+            TransportStatus::Succeeded
         } else if was_cancelled {
-            "cancelled"
+            TransportStatus::Cancelled
         } else {
-            "failed"
+            TransportStatus::Failed
         },
         result.as_ref().err().map(|error| {
             if was_cancelled {

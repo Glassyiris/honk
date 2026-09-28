@@ -191,7 +191,7 @@ async fn websocket_request_event_waits_for_real_frame_flush() {
             assert!(matches!(
                 events.lock().as_slice(),
                 [FlowEvent::Milestone {
-                    milestone: "target_request_sent"
+                    milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
                 }]
             ));
             bridge.abort();

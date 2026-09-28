@@ -2,6 +2,13 @@
 //! uninhabited or zero-sized types keep fields free and every hook folds away,
 //! so engine call sites need no feature gates.
 
+#[path = "vocab.rs"]
+#[allow(
+    dead_code,
+    reason = "only the variants engine call sites name are built"
+)]
+pub(crate) mod vocab;
+
 pub(crate) enum Observation {}
 
 #[derive(Clone, Default)]
@@ -35,9 +42,9 @@ pub(crate) mod flows {
         #[inline]
         pub(crate) fn transition(
             &self,
-            _state: &'static str,
+            _state: crate::observe::vocab::ConnectionState,
             _reason: &'static str,
-            _milestone: &'static str,
+            _milestone: crate::observe::vocab::ConnectionMilestone,
             _reply_received: Option<bool>,
         ) {
             match *self {}
@@ -167,7 +174,7 @@ pub(crate) mod flows {
         #[inline]
         pub(crate) fn outbound_evidence(
             _outbound: &str,
-            _routing_source: &'static str,
+            _routing_source: crate::observe::vocab::RoutingSource,
             _evaluation_id: Option<String>,
             _node: Option<&Node>,
             _target: SocketAddr,

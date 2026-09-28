@@ -151,7 +151,9 @@ impl Socks5Handler {
             );
 
             stream.write_all(&request).await?;
-            crate::runtime::flow_observation::milestone("target_request_sent");
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+            );
 
             // Reply: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
             let mut reply_header = [0u8; 4];
@@ -213,7 +215,9 @@ impl Socks5Handler {
             }
 
             debug!("SOCKS5 handshake complete");
-            crate::runtime::flow_observation::milestone("target_confirmed");
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetConfirmed,
+            );
             Ok(())
         })
         .await
@@ -563,7 +567,9 @@ impl TcpOutbound for Socks5Handler {
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         let config = node.socks5().unwrap();
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         Self::handshake(
             &mut stream,
             target,
@@ -593,7 +599,9 @@ impl PacketOutbound for Socks5Handler {
         let (udp_socket, relay_addr, control) =
             Self::udp_association(node, connect_timeout).await?;
         udp_socket.connect(relay_addr).await?;
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
 
         Ok(Arc::new(Socks5UdpTransport {
             socket: udp_socket,

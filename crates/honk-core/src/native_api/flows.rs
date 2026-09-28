@@ -10,7 +10,7 @@ use super::{
     NativeState, error, full_detail, invalid_query, parse_query,
     types::{ApiError, ErrorCode, RequestId},
 };
-use crate::observe::flows::{Filters, FlowMissing, PageRefusal, producer};
+use crate::observe::flows::{Filters, FlowMissing, PageRefusal};
 
 pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {
     let query = parse_query(
@@ -34,7 +34,10 @@ pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Res
         .map_err(|_| invalid_query(id))?
         .unwrap_or(100);
     if !matches!(network, "tcp" | "udp" | "all")
-        || !(state_filter == "all" || producer::connection_state(state_filter) == state_filter)
+        || !(state_filter == "all"
+            || crate::observe::vocab::ConnectionState::ALL
+                .iter()
+                .any(|state| state.as_str() == state_filter))
         || !(1..=1000).contains(&limit)
         || query
             .get("connection_id")

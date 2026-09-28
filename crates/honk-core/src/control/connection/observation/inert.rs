@@ -18,7 +18,7 @@ impl ConnectionObservation {
     #[inline]
     pub(in crate::control) fn begin(
         _native: Option<&Observation>,
-        _network: &'static str,
+        _network: crate::observe::vocab::Network,
         _source: SocketAddr,
         _destination: SocketAddr,
     ) -> Self {
@@ -89,7 +89,12 @@ impl ConnectionObservation {
     }
 
     #[inline]
-    pub(in crate::control) fn finish(&self, _state: &'static str, _reason: &'static str) {}
+    pub(in crate::control) fn finish(
+        &self,
+        _state: crate::observe::vocab::ConnectionState,
+        _reason: &'static str,
+    ) {
+    }
 
     #[inline]
     pub(super) fn first_response(

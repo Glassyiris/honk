@@ -64,7 +64,8 @@ impl UpstreamPool {
                 observer.publish(
                     honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
                         server_addr: Some(address),
-                        resolution_location: "local",
+                        resolution_location:
+                            honk_outbound::runtime::flow_observation::ResolutionLocation::Local,
                     },
                 );
             }
@@ -100,7 +101,8 @@ impl UpstreamPool {
                 observer.publish(
                     honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
                         server_addr: Some(address),
-                        resolution_location: "local",
+                        resolution_location:
+                            honk_outbound::runtime::flow_observation::ResolutionLocation::Local,
                     },
                 );
             }

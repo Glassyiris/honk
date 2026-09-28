@@ -87,7 +87,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         observer.publish(
                             crate::runtime::flow_observation::FlowEvent::TransportAttached {
                                 server_addr: None,
-                                resolution_location: "unknown",
+                                resolution_location:
+                                    crate::runtime::flow_observation::ResolutionLocation::Unknown,
                             },
                         );
                     }

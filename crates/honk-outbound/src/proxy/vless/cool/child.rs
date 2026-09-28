@@ -288,7 +288,7 @@ pub(super) async fn open_tcp(
         });
     }
     if let Some(observer) = crate::runtime::flow_observation::current() {
-        observer.milestone_once("target_request_sent");
+        observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
     }
     cancellation.disarm();
     Ok(VlessCoolStream {
@@ -463,7 +463,9 @@ impl VlessXudpTransport {
             Ok(()) => {
                 cancellation.complete();
                 if let Some(observer) = crate::runtime::flow_observation::current() {
-                    observer.milestone_once("target_request_sent");
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                    );
                 }
                 Ok(())
             }

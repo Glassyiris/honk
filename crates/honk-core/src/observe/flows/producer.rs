@@ -3,13 +3,18 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Instant, SystemTime};
 
-use honk_outbound::runtime::flow_observation::{self, FlowContext, FlowEvent, FlowObserver};
+use honk_outbound::runtime::flow_observation::{
+    self, FlowContext, FlowEvent, FlowObserver, GapReason, Milestone,
+};
 use uuid::Uuid;
 
 use super::{
     FlowGuard, MAX_RULE_VALUES, MAX_STEPS, MAX_TEXT, bounded_display,
     record::{FlowError, Input, InputValues, OutboundAttempt, Selection, StepData},
     safe_optional, safe_text, timestamp,
+};
+use crate::observe::vocab::{
+    ConnectionMilestone, ConnectionState, DomainSource, RoutingSource, RuleSource,
 };
 
 impl FlowGuard {
@@ -61,7 +66,7 @@ impl FlowGuard {
                         && context.lookup_id != data.parent_lookup_id)
                     || data.parent_lookup_id == Some(data.lookup_id)
                 {
-                    self.mark_gap("not_instrumented");
+                    self.mark_gap(GapReason::NotInstrumented);
                     return;
                 }
                 store.record_step(&self.id, Some(context.generation), StepData::Dns(data));
@@ -74,7 +79,7 @@ impl FlowGuard {
                 error,
             } => {
                 if context.attempt_id == Some(attempt_id) {
-                    self.mark_gap("not_instrumented");
+                    self.mark_gap(GapReason::NotInstrumented);
                     return;
                 }
                 store.record_with(&self.id, Some(context.generation), |record| {
@@ -96,9 +101,9 @@ impl FlowGuard {
                         evaluation_id: parent.and_then(|parent| parent.evaluation_id.clone()),
                         routing_source: parent.map_or(
                             if parent_id.is_some() {
-                                "unknown"
+                                RoutingSource::Unknown
                             } else {
-                                "builtin"
+                                RoutingSource::Builtin
                             },
                             |parent| parent.routing_source,
                         ),
@@ -130,7 +135,7 @@ impl FlowGuard {
                         attempt_id: attempt_id.to_string(),
                         attempt: data,
                         status,
-                        error: error.map(FlowError::Code),
+                        error: error.map(|error| FlowError::Code(error.as_str())),
                     })
                 });
             }
@@ -143,7 +148,7 @@ impl FlowGuard {
                         } else {
                             "transport_attached"
                         },
-                        milestone: "transport_ready",
+                        milestone: ConnectionMilestone::TransportReady,
                         attempt_id: context.attempt_id.map(|id| id.to_string()),
                         reply_received: None,
                         error: None,
@@ -153,15 +158,15 @@ impl FlowGuard {
                     })
                 });
             }
-            FlowEvent::Session { reason, error } => {
+            FlowEvent::Session(event) => {
                 store.record_with(&self.id, Some(context.generation), |record| {
                     Some(StepData::Connection {
                         state: record.summary.state,
-                        reason,
-                        milestone: "unknown",
+                        reason: event.reason(),
+                        milestone: ConnectionMilestone::Unknown,
                         attempt_id: context.attempt_id.map(|id| id.to_string()),
                         reply_received: None,
-                        error: error.map(FlowError::Code),
+                        error: event.error().map(FlowError::Code),
                         selections: Vec::new(),
                         lookup_id: context.lookup_id.map(|id| id.to_string()),
                         server_addr: None,
@@ -170,22 +175,18 @@ impl FlowGuard {
             }
             FlowEvent::Milestone { milestone } => {
                 let reason = match (context.lookup_id.is_some(), milestone) {
-                    (false, "transport_ready") => "transport_ready",
-                    (false, "target_request_sent") => "protocol_request_sent",
-                    (false, "target_confirmed") => "target_confirmed",
-                    (true, "transport_ready") => "dns_transport_ready",
-                    (true, "target_request_sent") => "dns_request_sent",
-                    (true, "target_confirmed") => "dns_target_confirmed",
-                    _ => {
-                        self.mark_gap("not_instrumented");
-                        return;
-                    }
+                    (false, Milestone::TransportReady) => "transport_ready",
+                    (false, Milestone::TargetRequestSent) => "protocol_request_sent",
+                    (false, Milestone::TargetConfirmed) => "target_confirmed",
+                    (true, Milestone::TransportReady) => "dns_transport_ready",
+                    (true, Milestone::TargetRequestSent) => "dns_request_sent",
+                    (true, Milestone::TargetConfirmed) => "dns_target_confirmed",
                 };
                 store.record_with(&self.id, Some(context.generation), |record| {
                     Some(StepData::Connection {
                         state: record.summary.state,
                         reason,
-                        milestone,
+                        milestone: milestone.into(),
                         attempt_id: context.attempt_id.map(|id| id.to_string()),
                         reply_received: None,
                         error: None,
@@ -207,7 +208,7 @@ impl FlowGuard {
                 Some(StepData::Connection {
                     state: record.summary.state,
                     reason: "selection_evaluated",
-                    milestone: "unknown",
+                    milestone: ConnectionMilestone::Unknown,
                     attempt_id: None,
                     reply_received: None,
                     error: None,
@@ -228,7 +229,7 @@ impl FlowGuard {
                 Some(StepData::Connection {
                     state: record.summary.state,
                     reason: "application_send_accepted",
-                    milestone: "unknown",
+                    milestone: ConnectionMilestone::Unknown,
                     attempt_id: record.selected_attempt.clone(),
                     reply_received: Some(self.replied.load(Ordering::Relaxed)),
                     error: None,
@@ -267,7 +268,7 @@ impl FlowGuard {
 
     pub(crate) fn datapath(
         &self,
-        plane: &'static str,
+        plane: crate::observe::vocab::Plane,
         action: &'static str,
         reason: &'static str,
         error: Option<&'static str>,
@@ -283,21 +284,21 @@ impl FlowGuard {
         );
     }
 
-    pub(crate) fn mark_gap(&self, reason: &'static str) {
+    pub(crate) fn mark_gap(&self, reason: GapReason) {
         if let Some(store) = self.store.upgrade() {
             store.mark_gap(&self.id, reason);
         }
     }
 
     pub(crate) fn mark_overflow(&self) {
-        self.mark_gap("buffer_overflow");
+        self.mark_gap(GapReason::BufferOverflow);
     }
 
     pub(crate) fn select_attempt(&self, attempt: &str) {
         if let Some(store) = self.store.upgrade() {
             store.mutate(&self.id, |record| {
                 if !safe_text(attempt) {
-                    return record.mark_gap("redacted");
+                    return record.mark_gap(GapReason::Redacted);
                 }
                 if record.selected_attempt.as_deref() == Some(attempt) {
                     return false;
@@ -312,7 +313,7 @@ impl FlowGuard {
     pub(crate) fn update_input(
         &self,
         domain: Option<&str>,
-        source: Option<&'static str>,
+        source: Option<DomainSource>,
         pname: Option<&str>,
         pid: Option<u32>,
         src_mac: Option<String>,
@@ -331,7 +332,6 @@ impl FlowGuard {
             let src_mac = src_mac
                 .as_deref()
                 .and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
-            let source = source.map(domain_source);
             let dscp = dscp.filter(|value| *value <= 63);
             let input = Input {
                 src: record.input.src,
@@ -354,11 +354,10 @@ impl FlowGuard {
             record.input = input;
             record.summary.pname = pname;
             record.summary.domain_source = source;
-            let input_source = match source {
-                Some("dns_mapping") => Some("dns_mapping"),
-                Some("tls_sni" | "http_host" | "quic_sni") => Some("sniffer"),
-                _ => None,
-            };
+            let input_source = source.map(|source| match source {
+                DomainSource::DnsMapping => "dns_mapping",
+                DomainSource::TlsSni | DomainSource::HttpHost | DomainSource::QuicSni => "sniffer",
+            });
             if changed && let Some(input_source) = input_source {
                 record.push_step(
                     None,
@@ -380,7 +379,7 @@ impl FlowGuard {
         outbound: &str,
         rule_id: Option<&str>,
         expression: Option<&str>,
-        source: &'static str,
+        source: RoutingSource,
     ) {
         let Some(store) = self.store.upgrade() else {
             return;
@@ -405,8 +404,9 @@ impl FlowGuard {
             } else {
                 "mode_global"
             };
-            let gap_changed = source == "unknown" && record.mark_gap("not_instrumented");
-            let source = rule_source(source);
+            let gap_changed =
+                source == RoutingSource::Unknown && record.mark_gap(GapReason::NotInstrumented);
+            let source = RuleSource::from(source);
             let changed = record.summary.outbound != outbound
                 || record.summary.rule_id != rule_id
                 || record.summary.rule_expression != expression
@@ -426,7 +426,7 @@ impl FlowGuard {
                     StepData::Connection {
                         state: record.summary.state,
                         reason,
-                        milestone: "unknown",
+                        milestone: ConnectionMilestone::Unknown,
                         attempt_id: None,
                         reply_received: None,
                         error: None,
@@ -446,7 +446,7 @@ impl FlowGuard {
         };
         store.mutate(&self.id, |record| {
             if chain.len() > MAX_STEPS {
-                return record.mark_gap("buffer_overflow");
+                return record.mark_gap(GapReason::BufferOverflow);
             }
             let chain = chain
                 .iter()
@@ -481,35 +481,26 @@ impl FlowGuard {
 
     pub(crate) fn transition(
         &self,
-        state: &'static str,
+        state: ConnectionState,
         reason: &'static str,
-        milestone: &'static str,
+        milestone: ConnectionMilestone,
         reply_received: Option<bool>,
     ) {
         let Some(store) = self.store.upgrade() else {
             return;
         };
         store.mutate(&self.id, |record| {
-            let state = connection_state(state);
-            let milestone = match milestone {
-                "transport_ready"
-                | "target_request_sent"
-                | "target_confirmed"
-                | "first_reply"
-                | "terminal" => milestone,
-                _ => "unknown",
-            };
             let redacted = !safe_text(reason);
             let reason = if redacted { "redacted" } else { reason };
             let changed = record.summary.state != state
-                || milestone == "terminal"
-                || matches!(state, "closed" | "blocked" | "failed")
+                || milestone == ConnectionMilestone::Terminal
+                || state.is_terminal()
                 || (redacted && !record.redacted);
             record.redacted |= redacted;
             record.summary.state = state;
-            if milestone == "terminal" || matches!(state, "closed" | "blocked" | "failed") {
-                if state == "unknown" || record.has_open_operations() {
-                    record.mark_gap("not_instrumented");
+            if milestone == ConnectionMilestone::Terminal || state.is_terminal() {
+                if state == ConnectionState::Unknown || record.has_open_operations() {
+                    record.mark_gap(GapReason::NotInstrumented);
                 }
                 record.ended = Some(Instant::now());
                 record.summary.ended_at = Some(timestamp(SystemTime::now()));
@@ -531,15 +522,17 @@ impl FlowGuard {
         });
     }
 
-    pub(crate) fn finish(&self, state: &'static str, reason: &'static str) {
-        let state = match state {
-            "closed" | "blocked" | "failed" => state,
-            _ => "unknown",
+    /// Only a terminal state survives; anything else ends the flow as unknown.
+    pub(crate) fn finish(&self, state: ConnectionState, reason: &'static str) {
+        let state = if state.is_terminal() {
+            state
+        } else {
+            ConnectionState::Unknown
         };
         self.transition(
             state,
             reason,
-            "terminal",
+            ConnectionMilestone::Terminal,
             Some(self.replied.load(Ordering::Relaxed)),
         );
     }
@@ -547,42 +540,7 @@ impl FlowGuard {
 
 impl Drop for FlowGuard {
     fn drop(&mut self) {
-        self.finish("failed", "cancelled");
-    }
-}
-
-pub(crate) fn connection_state(value: &str) -> &'static str {
-    match value {
-        "observed" => "observed",
-        "routing" => "routing",
-        "dialing" => "dialing",
-        "active" => "active",
-        "closed" => "closed",
-        "blocked" => "blocked",
-        "failed" => "failed",
-        _ => "unknown",
-    }
-}
-
-fn domain_source(value: &str) -> &'static str {
-    match value {
-        "tls_sni" => "tls_sni",
-        "http_host" => "http_host",
-        "quic_sni" => "quic_sni",
-        "dns_mapping" => "dns_mapping",
-        "explicit" => "explicit",
-        _ => "unknown",
-    }
-}
-
-/// The wire vocabulary knows a kernel decision and userspace evidence. The
-/// userspace connection paths name their route `evaluation`; that is the
-/// recomputed kind, not an unknown one.
-fn rule_source(value: &str) -> &'static str {
-    match value {
-        "kernel" => "kernel",
-        "recomputed" | "evaluation" => "recomputed",
-        _ => "unknown",
+        self.finish(ConnectionState::Failed, "cancelled");
     }
 }
 
@@ -590,7 +548,7 @@ pub(crate) fn bounded(value: &str) -> String {
     if value.len() > MAX_TEXT
         && let Some(observer) = flow_observation::current()
     {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
+        observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
     let mut end = value.len().min(MAX_TEXT);
     while !value.is_char_boundary(end) {
@@ -645,14 +603,14 @@ pub(crate) fn map_selection_observation(
             ObservedMember::Group { name } => match catalog.groups.get(name) {
                 Some(id) => Some((id.clone(), Some(bounded(name)))),
                 None => {
-                    observer.publish(FlowEvent::Gap("not_instrumented"));
+                    observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
                     None
                 }
             },
         }
     }
     if observation.truncated || observation.decisions.len() > 64 {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
+        observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
     let mut remaining = MAX_RULE_VALUES;
     observation
@@ -661,7 +619,7 @@ pub(crate) fn map_selection_observation(
         .take(64)
         .filter_map(|decision| {
             let Some(group_id) = catalog.groups.get(&decision.group_name) else {
-                observer.publish(FlowEvent::Gap("not_instrumented"));
+                observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
                 return None;
             };
             let selected = decision
@@ -675,7 +633,7 @@ pub(crate) fn map_selection_observation(
             let count = decision.candidates.len().min(remaining);
             remaining -= count;
             if count != decision.candidates.len() {
-                observer.publish(FlowEvent::Gap("buffer_overflow"));
+                observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
             }
             let candidates = decision
                 .candidates

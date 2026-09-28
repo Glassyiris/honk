@@ -876,7 +876,8 @@ async fn observed_target_requires_deferred_request_and_positive_response() {
         assert!(!events.lock().iter().any(|event| matches!(
             event,
             FlowEvent::Milestone {
-                milestone: "target_request_sent" | "target_confirmed"
+                milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
+                    | crate::runtime::flow_observation::Milestone::TargetConfirmed
             }
         )));
         // I/O is deliberately outside the dial scope: the exclusive stream owns its evidence.
@@ -893,8 +894,8 @@ async fn observed_target_requires_deferred_request_and_positive_response() {
             .lock()
             .iter()
             .filter_map(|event| match event {
-                FlowEvent::Milestone { milestone } if milestone.starts_with("target_") => {
-                    Some(*milestone)
+                FlowEvent::Milestone { milestone } if milestone.as_str().starts_with("target_") => {
+                    Some(milestone.as_str())
                 }
                 _ => None,
             })

@@ -8,6 +8,127 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+/// A closed wire vocabulary: `as_str` is the only spelling, and serde reuses it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! wire_enum {
+    ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        $vis enum $name { $($variant),+ }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+
+        impl ::serde::Serialize for $name {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+    };
+}
+
+wire_enum! {
+    /// Progress a source reports once per business context.
+    pub enum Milestone {
+        TransportReady => "transport_ready",
+        TargetRequestSent => "target_request_sent",
+        TargetConfirmed => "target_confirmed",
+    }
+}
+
+#[cfg(feature = "flow-observation")]
+impl Milestone {
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+wire_enum! {
+    pub enum TransportStatus {
+        Started => "started",
+        Succeeded => "succeeded",
+        Failed => "failed",
+        Cancelled => "cancelled",
+    }
+}
+
+wire_enum! {
+    pub enum ResolutionLocation {
+        Unknown => "unknown",
+        Local => "local",
+        Reused => "reused",
+        OriginalIp => "original_ip",
+        NotApplicable => "not_applicable",
+    }
+}
+
+wire_enum! {
+    pub enum TransportError {
+        Cancelled => "cancelled",
+        Timeout => "timeout",
+        ConnectionRefused => "connection_refused",
+        ConnectFailed => "connect_failed",
+        QuicConnectFailed => "quic_connect_failed",
+        QuicConnectTimeout => "quic_connect_timeout",
+        UdpSocketFailed => "udp_socket_failed",
+    }
+}
+
+wire_enum! {
+    /// Why evidence is incomplete; recorders fold these into trace flags.
+    pub enum GapReason {
+        NotInstrumented => "not_instrumented",
+        StartedLate => "started_late",
+        BufferOverflow => "buffer_overflow",
+        Redacted => "redacted",
+        SharedDialContinuesAfterWaiter => "shared_dial_continues_after_waiter",
+        RetirementOwnerLost => "retirement_owner_lost",
+    }
+}
+
+wire_enum! {
+    /// A session-level step: each variant fixes its wire reason and error.
+    pub enum SessionEvent {
+        OpenStarted => "session_open_started",
+        OpenSucceeded => "session_open_succeeded",
+        OpenRefused => "session_open_refused",
+        OpenDraining => "session_open_draining",
+        OpenFailed => "session_open_failed",
+        OpenCancelled => "session_open_cancelled",
+        OpenCapacity => "session_open_capacity",
+        DnsResponseTruncatedTcpFallback => "dns_response_truncated_tcp_fallback",
+        DnsSessionReadySucceeded => "dns_session_ready_succeeded",
+        DnsSessionAcquired => "dns_session_acquired",
+        DnsSessionReadyFailed => "dns_session_ready_failed",
+        DnsSessionReadyRefused => "dns_session_ready_failed",
+        DnsSessionReadyCancelled => "dns_session_ready_cancelled",
+        DnsSessionRetryStarted => "dns_session_retry_started",
+    }
+}
+
+impl SessionEvent {
+    pub const fn reason(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub const fn error(self) -> Option<&'static str> {
+        match self {
+            Self::OpenRefused => Some("refused"),
+            Self::OpenDraining => Some("draining"),
+            Self::OpenFailed => Some("session"),
+            Self::OpenCancelled | Self::DnsSessionReadyCancelled => Some("cancelled"),
+            Self::OpenCapacity => Some("capacity"),
+            Self::DnsSessionReadyFailed => Some("upstream_failed"),
+            Self::DnsSessionReadyRefused => Some("local_refusal"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowContext {
     pub flow_id: Uuid,
@@ -64,14 +185,8 @@ impl FlowObserver {
         (self.callback)(self.context, event);
     }
 
-    /// Shared streams may carry many business flows; deduplicate only this context.
-    pub fn milestone_once(&self, milestone: &'static str) {
-        let bit = match milestone {
-            "transport_ready" => 1,
-            "target_request_sent" => 2,
-            "target_confirmed" => 4,
-            _ => return,
-        };
+    pub fn milestone_once(&self, milestone: Milestone) {
+        let bit = milestone.bit();
         if self
             .milestones
             .fetch_or(bit, std::sync::atomic::Ordering::Relaxed)
@@ -127,7 +242,7 @@ pub fn without<F: Future>(future: F) -> impl Future<Output = F::Output> {
 }
 
 #[cfg(feature = "flow-observation")]
-pub fn milestone(milestone: &'static str) {
+pub fn milestone(milestone: Milestone) {
     if let Some(observer) = current() {
         observer.milestone_once(milestone);
     }
@@ -168,7 +283,7 @@ impl RequestWrite {
             state.finished && state.delivered >= state.required
         };
         if publish {
-            self.observer.milestone_once("target_request_sent");
+            self.observer.milestone_once(Milestone::TargetRequestSent);
         }
     }
 
@@ -179,7 +294,7 @@ impl RequestWrite {
             state.delivered >= state.required
         };
         if publish {
-            self.observer.milestone_once("target_request_sent");
+            self.observer.milestone_once(Milestone::TargetRequestSent);
         }
     }
 }
@@ -211,23 +326,20 @@ pub enum FlowEvent {
     Transport {
         attempt_id: Uuid,
         server_addr: Option<SocketAddr>,
-        status: &'static str,
-        resolution_location: &'static str,
-        error: Option<&'static str>,
+        status: TransportStatus,
+        resolution_location: ResolutionLocation,
+        error: Option<TransportError>,
     },
     TransportAttached {
         server_addr: Option<SocketAddr>,
-        resolution_location: &'static str,
+        resolution_location: ResolutionLocation,
     },
     Milestone {
-        milestone: &'static str,
+        milestone: Milestone,
     },
-    Session {
-        reason: &'static str,
-        error: Option<&'static str>,
-    },
+    Session(SessionEvent),
     Dns(DnsLookup),
-    Gap(&'static str),
+    Gap(GapReason),
 }
 
 #[derive(Clone, Debug)]
@@ -273,7 +385,9 @@ impl LookupSelection {
             (selected.cloned(), ambiguous)
         };
         if ambiguous {
-            self.observer.publish(FlowEvent::Gap("not_instrumented"));
+            self.observer.publish(FlowEvent::Gap(
+                crate::runtime::flow_observation::GapReason::NotInstrumented,
+            ));
             return;
         }
         if let Some((context, mut lookup)) = selected {
@@ -315,7 +429,9 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
                     }
                 };
                 if overflow {
-                    output.publish(FlowEvent::Gap("buffer_overflow"));
+                    output.publish(FlowEvent::Gap(
+                        crate::runtime::flow_observation::GapReason::BufferOverflow,
+                    ));
                 }
             }
             (output.callback)(source, event);
@@ -331,7 +447,7 @@ pub struct TransportAttempt {
     observer: FlowObserver,
     attempt_id: Uuid,
     server_addr: Option<SocketAddr>,
-    resolution_location: &'static str,
+    resolution_location: ResolutionLocation,
     finished: bool,
 }
 
@@ -339,7 +455,7 @@ pub struct TransportAttempt {
 impl TransportAttempt {
     pub fn start(
         server_addr: Option<SocketAddr>,
-        resolution_location: &'static str,
+        resolution_location: ResolutionLocation,
     ) -> Option<Self> {
         let observer = current()?;
         let attempt = Self {
@@ -349,18 +465,18 @@ impl TransportAttempt {
             resolution_location,
             finished: false,
         };
-        attempt.publish("started", None);
+        attempt.publish(TransportStatus::Started, None);
         Some(attempt)
     }
 
-    pub fn finish(&mut self, status: &'static str, error: Option<&'static str>) {
+    pub fn finish(&mut self, status: TransportStatus, error: Option<TransportError>) {
         if !self.finished {
             self.finished = true;
             self.publish(status, error);
         }
     }
 
-    fn publish(&self, status: &'static str, error: Option<&'static str>) {
+    fn publish(&self, status: TransportStatus, error: Option<TransportError>) {
         self.observer.publish(FlowEvent::Transport {
             attempt_id: self.attempt_id,
             server_addr: self.server_addr,
@@ -374,7 +490,7 @@ impl TransportAttempt {
 #[cfg(feature = "flow-observation")]
 impl Drop for TransportAttempt {
     fn drop(&mut self) {
-        self.finish("cancelled", Some("cancelled"));
+        self.finish(TransportStatus::Cancelled, Some(TransportError::Cancelled));
     }
 }
 
@@ -388,7 +504,9 @@ mod inert {
 
     use futures_util::FutureExt;
 
-    use super::{FlowContext, FlowEvent};
+    use super::{
+        FlowContext, FlowEvent, Milestone, ResolutionLocation, TransportError, TransportStatus,
+    };
 
     #[derive(Clone, Debug)]
     pub enum FlowObserver {}
@@ -410,7 +528,7 @@ mod inert {
         }
 
         #[inline]
-        pub fn milestone_once(&self, _milestone: &'static str) {
+        pub fn milestone_once(&self, _milestone: Milestone) {
             match *self {}
         }
 
@@ -448,7 +566,7 @@ mod inert {
     }
 
     #[inline]
-    pub fn milestone(_milestone: &'static str) {}
+    pub fn milestone(_milestone: Milestone) {}
 
     #[derive(Clone, Debug)]
     pub(crate) enum RequestWrite {}
@@ -497,13 +615,13 @@ mod inert {
         #[inline]
         pub fn start(
             _server_addr: Option<SocketAddr>,
-            _resolution_location: &'static str,
+            _resolution_location: ResolutionLocation,
         ) -> Option<Self> {
             None
         }
 
         #[inline]
-        pub fn finish(&mut self, _status: &'static str, _error: Option<&'static str>) {
+        pub fn finish(&mut self, _status: TransportStatus, _error: Option<TransportError>) {
             match *self {}
         }
     }

@@ -102,7 +102,8 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                     observer.publish(
                         crate::runtime::flow_observation::FlowEvent::TransportAttached {
                             server_addr: tcp.peer_addr().ok(),
-                            resolution_location: "unknown",
+                            resolution_location:
+                                crate::runtime::flow_observation::ResolutionLocation::Unknown,
                         },
                     );
                 }
@@ -156,7 +157,9 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                     Err(error) => return Err(error),
                 };
             tls_stream.get_mut().activate();
-            crate::runtime::flow_observation::milestone("transport_ready");
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TransportReady,
+            );
             Ok(MaybeTls::Tls(tls_stream))
         };
         return tokio::time::timeout_at(deadline, setup)
@@ -171,11 +174,15 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
         let mut tls_stream = connector.connect(&server_name, tcp).await?;
         tls_stream.get_mut().activate();
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         return Ok(MaybeTls::Tls(tls_stream));
     }
     tcp.activate();
-    crate::runtime::flow_observation::milestone("transport_ready");
+    crate::runtime::flow_observation::milestone(
+        crate::runtime::flow_observation::Milestone::TransportReady,
+    );
     Ok(MaybeTls::Plain(Box::new(tcp)))
 }
 

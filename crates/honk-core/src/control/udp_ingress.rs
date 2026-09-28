@@ -534,7 +534,7 @@ impl UdpLoopState {
                 let mut observation =
                     crate::control::connection::observation::ConnectionObservation::begin(
                         self.handle.native.as_deref(),
-                        "udp",
+                        crate::observe::vocab::Network::Udp,
                         src_addr,
                         original_dst,
                     );
@@ -564,7 +564,10 @@ impl UdpLoopState {
                             Some(observer) => observer.scope(operation).await,
                             None => operation.await,
                         }
-                        observation.finish("closed", "dns_query_completed");
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_query_completed",
+                        );
                     }
                     #[cfg(not(feature = "native-api"))]
                     operation.await;
@@ -588,7 +591,7 @@ impl UdpLoopState {
                 let mut observation =
                     crate::control::connection::observation::ConnectionObservation::begin(
                         self.handle.native.as_deref(),
-                        "udp",
+                        crate::observe::vocab::Network::Udp,
                         src_addr,
                         original_dst,
                     );
@@ -635,10 +638,16 @@ impl UdpLoopState {
                             Some(observer) => observer.scope(operation).await,
                             None => operation.await,
                         }
-                        observation.finish("closed", "dns_refusal_completed");
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_refusal_completed",
+                        );
                     } else {
                         operation.await;
-                        observation.finish("closed", "dns_refusal_completed");
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_refusal_completed",
+                        );
                     }
                     #[cfg(not(feature = "native-api"))]
                     operation.await;

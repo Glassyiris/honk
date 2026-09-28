@@ -442,9 +442,13 @@ impl AnyTlsSession {
             return;
         }
         observation.request_sent = true;
-        observation.observer.milestone_once("target_request_sent");
+        observation
+            .observer
+            .milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         if !observation.uot && observation.confirmation == Some(true) {
-            observation.observer.milestone_once("target_confirmed");
+            observation
+                .observer
+                .milestone_once(crate::runtime::flow_observation::Milestone::TargetConfirmed);
         }
         if observation.uot || observation.confirmation.is_some() {
             observations.remove(&sid);
@@ -463,7 +467,9 @@ impl AnyTlsSession {
         observation.confirmation = Some(accepted);
         if observation.request_sent {
             if accepted {
-                observation.observer.milestone_once("target_confirmed");
+                observation
+                    .observer
+                    .milestone_once(crate::runtime::flow_observation::Milestone::TargetConfirmed);
             }
             observations.remove(&sid);
         }
@@ -1399,7 +1405,9 @@ async fn connect_transport(
             anyhow::anyhow!("AnyTLS TLS handshake timed out after {connect_timeout:?}")
         })??;
     tls.get_mut().activate();
-    crate::runtime::flow_observation::milestone("transport_ready");
+    crate::runtime::flow_observation::milestone(
+        crate::runtime::flow_observation::Milestone::TransportReady,
+    );
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
 

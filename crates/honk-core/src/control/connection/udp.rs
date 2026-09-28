@@ -1,7 +1,7 @@
 use super::overall_dial_timeout;
 use super::routing::{RoutingDecision, build_connection_info, connection_chains};
 use crate::control::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
-use crate::control::udp_endpoint::{RawDnsRoute, UdpEndpoint, UdpInitLease};
+use crate::control::udp_endpoint::{RawDnsRoute, UdpEndpoint, UdpInitLease, UdpTerminal};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
@@ -14,7 +14,12 @@ fn kernel_enforcement(
     error: Option<&'static str>,
 ) {
     if let Some(flow) = observation.flow() {
-        flow.datapath("kernel", action, "udp_decision", error);
+        flow.datapath(
+            crate::observe::vocab::Plane::Kernel,
+            action,
+            "udp_decision",
+            error,
+        );
     }
 }
 
@@ -75,7 +80,7 @@ impl ControlPlaneHandle {
         #[cfg_attr(not(feature = "native-api"), allow(unused_mut))]
         let mut observation = ConnectionObservation::begin(
             self.native.as_deref(),
-            "udp",
+            crate::observe::vocab::Network::Udp,
             lease.client_addr(),
             lease.original_dst(),
         );
@@ -92,10 +97,10 @@ impl ControlPlaneHandle {
                     if let Some((verdicts, identity)) = &pending_cleanup
                         && let Err(error) = verdicts.cancel(*identity).await
                     {
-                            if let Some(terminal) = &native_terminal { terminal.outcome("failed", "cleanup_failed"); }
+                            if let Some(terminal) = &native_terminal { terminal.outcome(UdpTerminal::CleanupFailed); }
                             return Err(error.into());
                         }
-                    if let Some(terminal) = &native_terminal { terminal.outcome("failed", "initializer_cancelled"); }
+                    if let Some(terminal) = &native_terminal { terminal.outcome(UdpTerminal::InitializerCancelled); }
                     Ok(())
                 }
                 result = self.initialize_udp_connection(
@@ -110,16 +115,16 @@ impl ControlPlaneHandle {
                     if let Some((verdicts, identity)) = &pending_cleanup
                         && let Err(cancel_error) = verdicts.cancel(*identity).await
                     {
-                        if let Some(terminal) = &native_terminal { terminal.outcome("failed", "cleanup_failed"); }
+                        if let Some(terminal) = &native_terminal { terminal.outcome(UdpTerminal::CleanupFailed); }
                         return Err(error.context(format!(
                             "staged UDP cleanup also failed: {cancel_error}"
                         )));
                     }
                     if let Some(terminal) = &native_terminal {
-                        terminal.outcome("failed", if honk_outbound::proxy::is_packet_rejection(&error) {
-                            "local_refusal"
+                        terminal.outcome(if honk_outbound::proxy::is_packet_rejection(&error) {
+                            UdpTerminal::LocalRefusal
                         } else {
-                            "setup_failed"
+                            UdpTerminal::SetupFailed
                         });
                     }
                     Err(error)
@@ -204,7 +209,7 @@ impl ControlPlaneHandle {
                 verdicts.cancel(*identity).await?;
             }
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "internal_address_skipped");
+                terminal.outcome(UdpTerminal::InternalAddressSkipped);
             }
             return Ok(());
         }
@@ -218,7 +223,7 @@ impl ControlPlaneHandle {
                 verdicts.cancel(*identity).await?;
             }
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "special_address_skipped");
+                terminal.outcome(UdpTerminal::SpecialAddressSkipped);
             }
             return Ok(());
         }
@@ -285,7 +290,7 @@ impl ControlPlaneHandle {
                     verdicts.cancel(*identity).await?;
                 }
                 if let Some(terminal) = &native_terminal {
-                    terminal.outcome("failed", "quic_sniff_incomplete");
+                    terminal.outcome(UdpTerminal::QuicSniffIncomplete);
                 }
                 return Ok(());
             }
@@ -396,7 +401,7 @@ impl ControlPlaneHandle {
                         original_dst,
                     );
                     if let Some(terminal) = &native_terminal {
-                        terminal.outcome("unknown", "kernel_handoff");
+                        terminal.outcome(UdpTerminal::KernelHandoff);
                     }
                     return Ok(());
                 }
@@ -411,7 +416,7 @@ impl ControlPlaneHandle {
                     #[cfg(feature = "native-api")]
                     kernel_enforcement(observation, "drop", None);
                     if let Some(terminal) = &native_terminal {
-                        terminal.outcome("blocked", "policy_block");
+                        terminal.outcome(UdpTerminal::PolicyBlock);
                     }
                     return Ok(());
                 }
@@ -547,14 +552,11 @@ impl ControlPlaneHandle {
             }
             outbound_tracker.increment_errors();
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "no_available_candidate");
+                terminal.outcome(UdpTerminal::NoAvailableCandidate);
             }
             return Ok(());
         }
-        let all_block = plan
-            .nodes
-            .iter()
-            .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block);
+        let all_block = super::tcp::only_block_nodes(&plan.nodes);
 
         let (connect_timeout, transport_deadline) = {
             let config = self.config.read().await;
@@ -800,14 +802,14 @@ impl ControlPlaneHandle {
                 outbound_tracker.increment_errors();
             }
             if let Some(terminal) = &native_terminal {
-                let (state, reason) = if all_block {
-                    ("blocked", "policy_block")
+                let outcome = if all_block {
+                    UdpTerminal::PolicyBlock
                 } else if tokio::time::Instant::now() >= transport_deadline {
-                    ("failed", "udp_prepare_timeout")
+                    UdpTerminal::UdpPrepareTimeout
                 } else {
-                    ("failed", "udp_prepare_failed")
+                    UdpTerminal::UdpPrepareFailed
                 };
-                terminal.outcome(state, reason);
+                terminal.outcome(outcome);
             }
             return Ok(());
         };
@@ -832,7 +834,7 @@ impl ControlPlaneHandle {
         // creating endpoint state or allowing the driver to send.
         if !lease.bind_selected_node(node.id) {
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "winner_bind_cancelled");
+                terminal.outcome(UdpTerminal::WinnerBindCancelled);
             }
             if let Some(reporter) = &score_reporter {
                 reporter.finish(crate::group::ScoreOutcome::Cancelled);
@@ -849,7 +851,7 @@ impl ControlPlaneHandle {
             )
         {
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "winner_ineligible");
+                terminal.outcome(UdpTerminal::WinnerIneligible);
             }
             lease.clear_selected_node();
             if let Some(reporter) = &score_reporter {
@@ -871,8 +873,8 @@ impl ControlPlaneHandle {
             _ = tokio::time::sleep_until(transport_deadline) => {
                 #[cfg(feature = "native-api")]
                 if let Some(attempt) = &mut attempt {
-                    attempt.finish("failed", Some(crate::observe::flows::record::FlowError::Code("udp_commit_timeout")));
-                    if let Some(terminal) = &native_terminal { terminal.outcome("failed", "udp_commit_timeout"); }
+                    attempt.finish(honk_outbound::runtime::flow_observation::TransportStatus::Failed, Some(crate::observe::flows::record::FlowError::Code("udp_commit_timeout")));
+                    if let Some(terminal) = &native_terminal { terminal.outcome(UdpTerminal::UdpCommitTimeout); }
                 }
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::Timeout);
@@ -903,8 +905,8 @@ impl ControlPlaneHandle {
                 Err(error) => {
                     #[cfg(feature = "native-api")]
                     if let Some(attempt) = &mut attempt {
-                    attempt.finish("failed", Some(crate::observe::flows::record::FlowError::Code("udp_commit_failed")));
-                    if let Some(terminal) = &native_terminal { terminal.outcome("failed", "udp_commit_failed"); }
+                    attempt.finish(honk_outbound::runtime::flow_observation::TransportStatus::Failed, Some(crate::observe::flows::record::FlowError::Code("udp_commit_failed")));
+                    if let Some(terminal) = &native_terminal { terminal.outcome(UdpTerminal::UdpCommitFailed); }
                 }
                     if let Some(reporter) = &score_reporter {
                         reporter.finish(score_runtime_outcome(&runtime_generation, &error));
@@ -936,7 +938,7 @@ impl ControlPlaneHandle {
             Ok(socket) => Arc::new(socket),
             Err(error) => {
                 if let Some(terminal) = &native_terminal {
-                    terminal.outcome("failed", "reply_socket_failed");
+                    terminal.outcome(UdpTerminal::ReplySocketFailed);
                 }
                 self.stats
                     .record_udp_reply_ready_latency(reply_ready_started.elapsed());
@@ -990,7 +992,7 @@ impl ControlPlaneHandle {
             Some(rx) => rx,
             None => lease.take_queue_receiver().ok_or_else(|| {
                 if let Some(terminal) = &native_terminal {
-                    terminal.outcome("failed", "initializer_queue_missing");
+                    terminal.outcome(UdpTerminal::InitializerQueueMissing);
                 }
                 anyhow::anyhow!("UDP initializer lost its bounded queue before driver start")
             })?,
@@ -1010,15 +1012,15 @@ impl ControlPlaneHandle {
         driver.wait_ready().await?;
         if let Some(flow) = endpoint.native.flow() {
             flow.transition(
-                "active",
+                crate::observe::vocab::ConnectionState::Active,
                 "udp_transport_ready",
-                "transport_ready",
+                crate::observe::vocab::ConnectionMilestone::TransportReady,
                 Some(false),
             );
         }
         if !lease.still_initializing() {
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "initializer_cancelled");
+                terminal.outcome(UdpTerminal::InitializerCancelled);
             }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was retired before ready commit"
@@ -1026,7 +1028,7 @@ impl ControlPlaneHandle {
         }
         if !lease.commit_ready(Arc::clone(&endpoint)) {
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "initializer_cancelled");
+                terminal.outcome(UdpTerminal::InitializerCancelled);
             }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before ready commit"
@@ -1087,7 +1089,7 @@ impl ControlPlaneHandle {
         }
         let first = lease.take_first().ok_or_else(|| {
             if let Some(terminal) = &native_terminal {
-                terminal.outcome("failed", "initializer_first_packet_missing");
+                terminal.outcome(UdpTerminal::InitializerFirstPacketMissing);
             }
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;

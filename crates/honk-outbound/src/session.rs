@@ -282,7 +282,7 @@ impl Drop for ObservedSharedDialWait {
             // Cancelling a waiter does not cancel the pool-owned physical dial.
             self.observer
                 .publish(crate::runtime::flow_observation::FlowEvent::Gap(
-                    "shared_dial_continues_after_waiter",
+                    crate::runtime::flow_observation::GapReason::SharedDialContinuesAfterWaiter,
                 ));
         }
     }
@@ -296,39 +296,36 @@ impl ObservedSessionOpen {
     pub(crate) fn start() -> Self {
         let observer = crate::runtime::flow_observation::current();
         if let Some(observer) = &observer {
-            observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
-                reason: "session_open_started",
-                error: None,
-            });
+            observer.publish(crate::runtime::flow_observation::FlowEvent::Session(
+                crate::runtime::flow_observation::SessionEvent::OpenStarted,
+            ));
         }
         Self { observer }
     }
 
-    pub(crate) fn finish(mut self, reason: &'static str, error: Option<&'static str>) {
+    pub(crate) fn finish(mut self, event: crate::runtime::flow_observation::SessionEvent) {
         if let Some(observer) = self.observer.take() {
-            observer
-                .publish(crate::runtime::flow_observation::FlowEvent::Session { reason, error });
+            observer.publish(crate::runtime::flow_observation::FlowEvent::Session(event));
         }
     }
 
     pub(crate) fn finish_open<T>(self, result: &Result<T, OpenError>) {
-        let (reason, error) = match result {
-            Ok(_) => ("session_open_succeeded", None),
-            Err(OpenError::Refused(_)) => ("session_open_refused", Some("refused")),
-            Err(OpenError::Draining(_)) => ("session_open_draining", Some("draining")),
-            Err(OpenError::Session(_)) => ("session_open_failed", Some("session")),
-        };
-        self.finish(reason, error);
+        use crate::runtime::flow_observation::SessionEvent;
+        self.finish(match result {
+            Ok(_) => SessionEvent::OpenSucceeded,
+            Err(OpenError::Refused(_)) => SessionEvent::OpenRefused,
+            Err(OpenError::Draining(_)) => SessionEvent::OpenDraining,
+            Err(OpenError::Session(_)) => SessionEvent::OpenFailed,
+        });
     }
 }
 
 impl Drop for ObservedSessionOpen {
     fn drop(&mut self) {
         if let Some(observer) = &self.observer {
-            observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
-                reason: "session_open_cancelled",
-                error: Some("cancelled"),
-            });
+            observer.publish(crate::runtime::flow_observation::FlowEvent::Session(
+                crate::runtime::flow_observation::SessionEvent::OpenCancelled,
+            ));
         }
     }
 }
@@ -849,10 +846,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             let session = self.offer(dial.clone()).await?;
             let Some(permit) = self.try_reserve(&session) else {
                 if let Some(observer) = crate::runtime::flow_observation::current() {
-                    observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
-                        reason: "session_open_capacity",
-                        error: Some("capacity"),
-                    });
+                    observer.publish(crate::runtime::flow_observation::FlowEvent::Session(
+                        crate::runtime::flow_observation::SessionEvent::OpenCapacity,
+                    ));
                 }
                 if session.state() == SessionState::Closed {
                     self.invalidate(&session);
@@ -874,7 +870,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 observer.publish(
                     crate::runtime::flow_observation::FlowEvent::TransportAttached {
                         server_addr: None,
-                        resolution_location: "unknown",
+                        resolution_location:
+                            crate::runtime::flow_observation::ResolutionLocation::Unknown,
                     },
                 );
             }

@@ -237,7 +237,7 @@ impl JuicityHandler {
             .context("Juicity: send request header")
             .map_err(super::quic_carrier_error)?;
         if let Some(observer) = crate::runtime::flow_observation::current() {
-            observer.milestone_once("target_request_sent");
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         Ok((send, recv))
     }
@@ -296,7 +296,8 @@ impl JuicityHandler {
             let observation = crate::session::ObservedSessionOpen::start();
             match Self::open_stream(&conn, NETWORK_UDP, &stream_addr).await {
                 Ok((send, recv)) => {
-                    observation.finish("session_open_succeeded", None);
+                    observation
+                        .finish(crate::runtime::flow_observation::SessionEvent::OpenSucceeded);
                     state.open.fetch_add(1, Ordering::Relaxed);
                     let open = Arc::clone(&state.open);
                     let stream_state = Arc::clone(&state);
@@ -316,7 +317,7 @@ impl JuicityHandler {
                     }));
                 }
                 Err(error) => {
-                    observation.finish("session_open_failed", Some("session"));
+                    observation.finish(crate::runtime::flow_observation::SessionEvent::OpenFailed);
                     client.quic.invalidate(&conn).await;
                     last_error = Some(error);
                 }

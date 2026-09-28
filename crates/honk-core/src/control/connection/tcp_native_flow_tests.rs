@@ -1029,8 +1029,12 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             .find(|node| node.name == "peer")
             .unwrap();
         let target = fixture.listener.local_addr()?;
-        let mut observation =
-            ConnectionObservation::begin(Some(native), "tcp", fixture.client.local_addr()?, target);
+        let mut observation = ConnectionObservation::begin(
+            Some(native),
+            crate::observe::vocab::Network::Tcp,
+            fixture.client.local_addr()?,
+            target,
+        );
         observation.pin_selection(
             fixture.handle.diagnostics.read().generation,
             &native.catalog.snapshot(),
@@ -1086,7 +1090,10 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             step["data"]["milestone"].as_str(),
             Some("target_confirmed" | "first_reply")
         )));
-        observation.finish("failed", "dial_failed");
+        observation.finish(
+            crate::observe::vocab::ConnectionState::Failed,
+            "dial_failed",
+        );
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })

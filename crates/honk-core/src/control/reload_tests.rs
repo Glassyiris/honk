@@ -2084,7 +2084,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
                 .core
                 .flows
                 .begin(
-                    "tcp",
+                    crate::observe::vocab::Network::Tcp,
                     "127.0.0.1:31000".parse().unwrap(),
                     "192.0.2.17:443".parse().unwrap(),
                 )

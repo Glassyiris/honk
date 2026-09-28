@@ -21,7 +21,10 @@ pub(crate) mod dns;
 pub(crate) mod kernel;
 pub(crate) mod producer;
 pub(crate) mod record;
+use honk_outbound::runtime::flow_observation::{GapReason, TransportStatus};
 use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
+
+use super::vocab::{ConnectionState, DomainSource, Network, Plane, RuleSource};
 
 const MAX_RECORDS: usize = 1024;
 const MAX_STEPS: usize = 64;
@@ -109,8 +112,8 @@ pub(crate) struct ConnectionEvidence {
     pub(crate) chain_source: &'static str,
     pub(crate) rule_id: Option<String>,
     pub(crate) rule_expression: Option<String>,
-    pub(crate) rule_source: &'static str,
-    pub(crate) domain_source: Option<&'static str>,
+    pub(crate) rule_source: RuleSource,
+    pub(crate) domain_source: Option<DomainSource>,
     pub(crate) started_at: String,
 }
 
@@ -192,7 +195,7 @@ impl FlowStore {
 
     pub(crate) fn begin(
         self: &Arc<Self>,
-        network: &'static str,
+        network: Network,
         src: SocketAddr,
         dst: SocketAddr,
     ) -> Option<FlowGuard> {
@@ -200,7 +203,7 @@ impl FlowStore {
             return None;
         }
         let mut store = self.inner.lock();
-        if !store.recording || !matches!(network, "tcp" | "udp") {
+        if !store.recording {
             return None;
         }
         let now = Instant::now();
@@ -211,7 +214,7 @@ impl FlowStore {
                 instance_id: self.instance_id.clone(),
                 revision: 1,
                 network,
-                state: "observed",
+                state: ConnectionState::Observed,
                 pname: None,
                 connection_id: None,
                 outbound: None,
@@ -219,7 +222,7 @@ impl FlowStore {
                 chain_source: "unknown",
                 rule_id: None,
                 rule_expression: None,
-                rule_source: "unknown",
+                rule_source: RuleSource::Unknown,
                 ingress: (),
                 domain_source: None,
                 observed_by: "userspace",
@@ -334,7 +337,7 @@ impl FlowStore {
         let mut accepted = false;
         let retained = self.mutate(id, |record| {
             if record.steps.len() == MAX_STEPS {
-                return record.mark_gap("buffer_overflow");
+                return record.mark_gap(GapReason::BufferOverflow);
             }
             let Some(mut data) = build(record) else {
                 return false;
@@ -343,13 +346,13 @@ impl FlowStore {
             let mut overflow = false;
             if !data.sanitize(&mut redacted, &mut overflow) {
                 return record.mark_gap(if overflow {
-                    "buffer_overflow"
+                    GapReason::BufferOverflow
                 } else {
-                    "redacted"
+                    GapReason::Redacted
                 });
             }
             if size_of::<StepData>() + data.heap_bytes() > MAX_STEP_BYTES {
-                return record.mark_gap("buffer_overflow");
+                return record.mark_gap(GapReason::BufferOverflow);
             }
             let changed = (redacted && !record.redacted) || (overflow && !record.overflow);
             record.redacted |= redacted;
@@ -365,7 +368,7 @@ impl FlowStore {
         accepted && retained
     }
 
-    pub(crate) fn mark_gap(&self, id: &str, reason: &'static str) {
+    pub(crate) fn mark_gap(&self, id: &str, reason: GapReason) {
         self.mutate(id, |record| record.mark_gap(reason));
     }
 
@@ -597,10 +600,10 @@ impl Record {
             return !std::mem::replace(&mut self.overflow, true);
         }
         if !self.references_known(&data) && self.missing == 0 && !self.overflow && !self.redacted {
-            self.mark_gap("not_instrumented");
+            self.mark_gap(GapReason::NotInstrumented);
         }
         if missing_source_evidence(&data) {
-            self.mark_gap("not_instrumented");
+            self.mark_gap(GapReason::NotInstrumented);
         }
         if let StepData::Connection { reply_received, .. } = &mut data {
             self.reply_observed |= *reply_received == Some(true);
@@ -626,10 +629,9 @@ impl Record {
                     .filter(|rule| record::safe_expression(&rule.expression))
                     .map(|rule| rule.expression.clone())
             });
-            self.summary.rule_source = if *plane == "kernel" {
-                "kernel"
-            } else {
-                "recomputed"
+            self.summary.rule_source = match plane {
+                Plane::Kernel => RuleSource::Kernel,
+                Plane::Userspace => RuleSource::Recomputed,
             };
             self.mode_recorded = false;
         }
@@ -645,12 +647,16 @@ impl Record {
         true
     }
 
-    fn mark_gap(&mut self, reason: &'static str) -> bool {
+    fn mark_gap(&mut self, reason: GapReason) -> bool {
         match reason {
-            "buffer_overflow" => !std::mem::replace(&mut self.overflow, true),
-            "redacted" => !std::mem::replace(&mut self.redacted, true),
+            GapReason::BufferOverflow => !std::mem::replace(&mut self.overflow, true),
+            GapReason::Redacted => !std::mem::replace(&mut self.redacted, true),
             reason => {
-                let flag = if reason == "started_late" { 2 } else { 1 };
+                let flag = if reason == GapReason::StartedLate {
+                    2
+                } else {
+                    1
+                };
                 let changed = self.missing & flag == 0;
                 self.missing |= flag;
                 changed
@@ -723,9 +729,9 @@ impl Record {
 
     fn has_open_operations(&self) -> bool {
         self.steps.iter().enumerate().any(|(index, step)| match &step.data {
-            StepData::Outbound { attempt_id, status: "started", .. } => {
+            StepData::Outbound { attempt_id, status: TransportStatus::Started, .. } => {
                 !self.steps[index + 1..].iter().any(|later| {
-                    matches!(&later.data, StepData::Outbound { attempt_id: id, status, .. } if id == attempt_id && *status != "started")
+                    matches!(&later.data, StepData::Outbound { attempt_id: id, status, .. } if id == attempt_id && *status != TransportStatus::Started)
                 })
             }
             StepData::Dns(data) if data.status == "started" => {
@@ -787,7 +793,7 @@ fn missing_source_evidence(data: &StepData) -> bool {
                 || (matches!(*chain, "dns_request" | "dns_response") && dns_action.is_none())
         }
         StepData::Outbound { attempt, .. } => {
-            attempt.routing_source == "unknown"
+            attempt.routing_source == super::vocab::RoutingSource::Unknown
                 || attempt.mode_override == "unknown"
                 || incomplete_selection(&attempt.selection_path)
         }
@@ -814,8 +820,8 @@ impl Filters {
     }
 
     fn matches(&self, record: &Record) -> bool {
-        (self.network == "all" || record.summary.network == self.network)
-            && (self.state == "all" || record.summary.state == self.state)
+        (self.network == "all" || record.summary.network.as_str() == self.network)
+            && (self.state == "all" || record.summary.state.as_str() == self.state)
             && self
                 .connection_id
                 .as_ref()

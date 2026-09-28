@@ -565,7 +565,9 @@ impl MuxResponse {
                 0 => {
                     self.status_ready = true;
                     if let Some(observer) = self.observer.take() {
-                        observer.milestone_once("target_confirmed");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                        );
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -710,7 +712,7 @@ impl VlessMuxUdpTransport {
         let writer = &mut *writer;
         send_owned(&mut writer.send, &writer.carrier, frame).await?;
         if let Some(observer) = writer.request_observer.take() {
-            observer.milestone_once("target_request_sent");
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         writer.setup = None;
         writer.pending = false;
@@ -789,7 +791,9 @@ impl MuxSession for VlessMuxSession {
             send_owned(&mut opened.send, &opened.failure, request)
                 .await
                 .map_err(|error| OpenError::Draining(anyhow::Error::new(error)))?;
-            crate::runtime::flow_observation::milestone("target_request_sent");
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+            );
             Ok(VlessMuxStream {
                 send: MuxSendStream::new(opened.send, Arc::clone(&opened.failure)),
                 response: MuxResponse::new(opened.response, opened.failure),

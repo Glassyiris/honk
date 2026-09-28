@@ -131,8 +131,12 @@ impl DoqClient {
         let result = async {
             let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
             if connection.connection.close_reason().is_some() {
-                observation.record("dns_session_ready_failed", Some("upstream_failed"));
-                observation.record("dns_session_retry_started", None);
+                observation.record(
+                    honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed,
+                );
+                observation.record(
+                    honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted,
+                );
                 self.retire_connection(&connection).await;
                 let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
                 if reused {
@@ -146,7 +150,10 @@ impl DoqClient {
             Ok(connection)
         }
         .await;
-        observation.finish(result, "dns_session_acquired")
+        observation.finish(
+            result,
+            honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionAcquired,
+        )
     }
     async fn dial(&self) -> anyhow::Result<DoqConnection> {
         let (connection, endpoint) = quic_connect_endpoint(
@@ -233,7 +240,11 @@ mod tests {
             #[cfg(feature = "native-api")]
             let flow = Arc::new(
                 store
-                    .begin("udp", "127.0.0.1:31000".parse().unwrap(), address)
+                    .begin(
+                        crate::observe::vocab::Network::Udp,
+                        "127.0.0.1:31000".parse().unwrap(),
+                        address,
+                    )
                     .unwrap(),
             );
             #[cfg(feature = "native-api")]

@@ -532,7 +532,9 @@ fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Conne
             .and_then(|value| value.rule_expression.clone()),
         rule_source: evidence
             .as_ref()
-            .map_or("unknown", |value| value.rule_source),
+            .map_or(crate::observe::vocab::RuleSource::Unknown, |value| {
+                value.rule_source
+            }),
         ingress: None,
         domain_source: evidence.as_ref().and_then(|value| value.domain_source),
         started_at: evidence.map(|value| value.started_at),

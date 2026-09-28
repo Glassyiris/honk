@@ -538,7 +538,9 @@ impl TuicHandler {
                         .await
                         .context("TUIC: send CONNECT")?;
                     if let Some(observer) = crate::runtime::flow_observation::current() {
-                        observer.milestone_once("target_request_sent");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
                     }
                     Ok((send, recv))
                 }
@@ -566,7 +568,7 @@ impl TuicHandler {
             let (conn, state) = client.connection(connect_timeout).await?;
             let observation = crate::session::ObservedSessionOpen::start();
             let Some(session_id) = state.alloc_session() else {
-                observation.finish("session_open_capacity", Some("capacity"));
+                observation.finish(crate::runtime::flow_observation::SessionEvent::OpenCapacity);
                 client.quic.invalidate(&conn).await;
                 continue;
             };
@@ -574,7 +576,7 @@ impl TuicHandler {
             let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
             state.sessions.lock().insert(session_id, tx);
             state.open.fetch_add(1, Ordering::Relaxed);
-            observation.finish("session_open_succeeded", None);
+            observation.finish(crate::runtime::flow_observation::SessionEvent::OpenSucceeded);
             return Ok(Arc::new(TuicUdpTransport {
                 state,
                 session_id,
@@ -837,7 +839,7 @@ impl PacketTransport for TuicUdpTransport {
         .map_err(|error| io::Error::other(crate::SharedError::new(error)))
         .map_err(super::quic_carrier_io_error)?;
         if let Some(observer) = self.request_observer.lock().take() {
-            observer.milestone_once("target_request_sent");
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         Ok(())
     }

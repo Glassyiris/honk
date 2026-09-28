@@ -515,7 +515,7 @@ async fn deferred_request_observation_follows_relay_write_not_stream_constructio
     assert!(matches!(
         events.lock().as_slice(),
         [FlowEvent::Milestone {
-            milestone: "target_request_sent"
+            milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
         }]
     ));
     drop(stream);

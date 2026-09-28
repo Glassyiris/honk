@@ -401,7 +401,7 @@ async fn run_udp_supervisor(
                 #[cfg(feature = "native-api")]
                 let started = std::time::Instant::now();
                 let observation = crate::control::connection::observation::ConnectionObservation::begin(
-                    native.as_deref(), "udp", client_addr, SocketAddr::new(response_source.0, local_addr.port()),
+                    native.as_deref(), crate::observe::vocab::Network::Udp, client_addr, SocketAddr::new(response_source.0, local_addr.port()),
                 );
                 let observer = observation.observer(|| diagnostics.read().generation, "client_dns");
 
@@ -498,7 +498,7 @@ async fn run_udp_supervisor(
                         Some(observer) => observer.scope(operation).await,
                         None => operation.await,
                     }
-                    observation.finish("closed", "dns_query_completed");
+                    observation.finish(crate::observe::vocab::ConnectionState::Closed, "dns_query_completed");
                 });
             }
         }
@@ -554,7 +554,10 @@ async fn observe_bound_error(
         Some(observer) => observer.scope(operation).await,
         None => operation.await,
     };
-    observation.finish("closed", "dns_error_reply_completed");
+    observation.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "dns_error_reply_completed",
+    );
     result
 }
 
@@ -613,7 +616,7 @@ async fn run_tcp_supervisor(
                 #[cfg(feature = "native-api")]
                 let observation = stream.local_addr().ok().map(|destination| {
                     crate::control::connection::observation::ConnectionObservation::begin(
-                        native.as_deref(), "tcp", client_addr, destination,
+                        native.as_deref(), crate::observe::vocab::Network::Tcp, client_addr, destination,
                     )
                 });
                 #[cfg(feature = "native-api")]
@@ -635,7 +638,7 @@ async fn run_tcp_supervisor(
                     #[cfg(feature = "native-api")]
                     if let Some(observation) = observation {
                         observation.finish(
-                            if result.is_ok() { "closed" } else { "failed" },
+                            if result.is_ok() { crate::observe::vocab::ConnectionState::Closed } else { crate::observe::vocab::ConnectionState::Failed },
                             if result.is_ok() { "dns_connection_closed" } else { "dns_connection_failed" },
                         );
                     }

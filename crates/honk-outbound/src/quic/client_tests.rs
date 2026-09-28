@@ -794,7 +794,7 @@ async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once()
             .filter_map(|(context, event)| match event {
                 FlowEvent::Transport {
                     attempt_id, status, ..
-                } => Some((context, attempt_id, *status)),
+                } => Some((context, attempt_id, status.as_str())),
                 _ => None,
             })
             .collect();
@@ -815,7 +815,8 @@ async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once()
         assert!(!events.iter().any(|(_, event)| matches!(
             event,
             FlowEvent::Milestone {
-                milestone: "target_confirmed" | "target_request_sent"
+                milestone: crate::runtime::flow_observation::Milestone::TargetConfirmed
+                    | crate::runtime::flow_observation::Milestone::TargetRequestSent
             }
         )));
     }
@@ -842,7 +843,7 @@ async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once()
         .filter_map(|(_, event)| match event {
             FlowEvent::Transport {
                 attempt_id, status, ..
-            } => Some((*attempt_id, *status)),
+            } => Some((*attempt_id, status.as_str())),
             _ => None,
         })
         .collect();
