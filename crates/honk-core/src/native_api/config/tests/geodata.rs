@@ -859,6 +859,32 @@ async fn a_failed_download_names_its_asset_and_the_rejected_status() {
 }
 
 #[tokio::test]
+async fn a_missing_file_keeps_its_404_in_the_failure() {
+    let mirror = Mirror::new(vec![("/geosite.dat", "200 OK", geosite("new.example"))]).await;
+    let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
+        setup_rules(root, files);
+        allow(files, mirror.address);
+    })
+    .await;
+    ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geosite": {"urls": [mirror.url("/geosite.dat")]},
+            "geoip": {"urls": [mirror.url("/geoip.dat")]}}}),
+    )
+    .await)
+    .await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    let details = &terminal["error"]["details"];
+    assert_eq!(details["stage"], "http_not_found");
+    assert_eq!(details["asset"], "geoip");
+    assert_eq!(details["http_status"], 404);
+    fixture.shutdown().await;
+    mirror.close().await;
+}
+
+#[tokio::test]
 async fn update_refuses_a_file_without_a_used_category_and_keeps_the_old_one() {
     let server = AssetServer::new(geosite_code(b"other", "new.example"), geoip(203), false).await;
     let fixture = fixture(server.address, false).await;

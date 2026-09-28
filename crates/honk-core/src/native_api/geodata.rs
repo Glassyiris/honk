@@ -24,8 +24,10 @@ mod tests;
 pub(crate) use sources::{Fetched, Patch as SourcesPatch, Route, Sources};
 
 pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
-/// The checksum is at most `MAX_CHECKSUM_BYTES`, so it gets its own short
-/// deadline instead of whatever a slow file download left of `NETWORK_TIMEOUT`.
+/// The checksum request gets its own deadline instead of whatever a slow file
+/// download left of `NETWORK_TIMEOUT`. It covers the whole request: a fresh
+/// route decision, resolution, the tunnel, TLS and a body of at most
+/// `MAX_CHECKSUM_BYTES`.
 const CHECKSUM_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_PATH: &str = "/api/v1/geodata/update";
 const MAX_CHECKSUM_BYTES: usize = 1024;
@@ -668,9 +670,11 @@ where
     .await?;
     match reply.status {
         StatusCode::OK => Ok(reply.body),
-        StatusCode::NOT_FOUND => Err("http_not_found".into()),
         status => Err(Failure {
-            code: "http_status_rejected",
+            code: match status {
+                StatusCode::NOT_FOUND => "http_not_found",
+                _ => "http_status_rejected",
+            },
             status: Some(status.as_u16()),
         }),
     }
