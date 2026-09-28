@@ -349,31 +349,56 @@ async fn native_catalog_masks_listener_secrets_without_changing_membership_or_cu
     );
     assert_eq!(first["nodes"][0]["group_ids"], json!([child_id]));
     let cursor = first["next_cursor"].as_str().unwrap();
-    let resumed = response_json(
-        app.get(&format!(
-            "/api/v1/nodes?group_id={child_id}&limit=100&cursor={cursor}"
-        ))
-        .send()
-        .await
-        .unwrap(),
-    )
-    .await;
+    let resume = |cursor: String| {
+        let request = app.get(&format!(
+            "/api/v1/nodes?group_id={child_id}&limit=1&cursor={cursor}"
+        ));
+        async move { response_json(request.send().await.unwrap()).await }
+    };
+    let resumed = resume(cursor.to_owned()).await;
     clean(&resumed);
     assert_eq!(resumed["observed_at"], first["observed_at"]);
     assert_eq!(resumed["nodes"][0]["id"], nodes[1].id.to_string());
     assert_eq!(resumed["nodes"][0]["name"], "node-1-<redacted>-<redacted>");
-    assert_eq!(resumed["nodes"][1]["id"], nodes[2].id.to_string());
-    assert_eq!(resumed["nodes"][1]["name"], "ordinary-node");
-    assert!(resumed["next_cursor"].is_null());
-    error_response(
-        app.get(&format!("/api/v1/nodes?cursor={cursor}"))
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-    )
-    .await;
+    let last = resume(resumed["next_cursor"].as_str().unwrap().to_owned()).await;
+    assert_eq!(last["nodes"][0]["id"], nodes[2].id.to_string());
+    assert_eq!(last["nodes"][0]["name"], "ordinary-node");
+    assert!(last["next_cursor"].is_null());
+    for (query, status, code) in [
+        (
+            format!("group_id={child_id}&limit=100&cursor={cursor}"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            format!("limit=1&cursor={cursor}"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            format!(
+                "group_id={child_id}&limit=1&cursor={}:1",
+                uuid::Uuid::new_v4()
+            ),
+            StatusCode::GONE,
+            "snapshot_expired",
+        ),
+        (
+            "cursor=bad".to_owned(),
+            StatusCode::GONE,
+            "snapshot_expired",
+        ),
+    ] {
+        error_response(
+            app.get(&format!("/api/v1/nodes?{query}"))
+                .send()
+                .await
+                .unwrap(),
+            status,
+            code,
+        )
+        .await;
+    }
 
     let single = response_json(
         app.get(&format!("/api/v1/nodes/{}", nodes[0].id))
@@ -624,11 +649,7 @@ async fn native_only_successful_observation_gets_attach() {
             ),
             (Method::GET, "/api/v1/flows?cursor=bad", StatusCode::GONE),
             (Method::GET, "/api/v1/flows/unknown", StatusCode::NOT_FOUND),
-            (
-                Method::GET,
-                "/api/v1/dns/log?cursor=bad",
-                StatusCode::BAD_REQUEST,
-            ),
+            (Method::GET, "/api/v1/dns/log?cursor=bad", StatusCode::GONE),
             (
                 Method::GET,
                 "/api/v1/events?kinds=invalid",

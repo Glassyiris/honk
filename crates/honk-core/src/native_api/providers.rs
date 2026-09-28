@@ -178,6 +178,7 @@ impl Provider {
 struct Snapshot {
     id: Uuid,
     instance: String,
+    limit: usize,
     created: Instant,
     rows: Vec<Provider>,
     bytes: usize,
@@ -233,16 +234,20 @@ impl ProviderApi {
         limit: usize,
         id: &RequestId,
     ) -> Result<Response, ApiError> {
-        let (snapshot, offset) = cursor.split_once(':').ok_or_else(|| invalid_query(id))?;
-        let snapshot = Uuid::parse_str(snapshot).map_err(|_| invalid_query(id))?;
-        let offset: usize = offset.parse().map_err(|_| invalid_query(id))?;
+        let expired = || super::catalog::snapshot_expired(id);
+        let (snapshot, offset) = cursor.split_once(':').ok_or_else(expired)?;
+        let snapshot = Uuid::parse_str(snapshot).map_err(|_| expired())?;
+        let offset: usize = offset.parse().map_err(|_| expired())?;
         let mut snapshots = self.snapshots.lock();
         snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
         let snapshot = snapshots
             .iter()
             .find(|candidate| candidate.id == snapshot && candidate.instance == instance)
-            .ok_or_else(|| invalid_query(id))?;
+            .ok_or_else(expired)?;
         if offset == 0 || offset >= snapshot.rows.len() {
+            return Err(expired());
+        }
+        if snapshot.limit != limit {
             return Err(invalid_query(id));
         }
         Ok(snapshot.page(offset, limit))
@@ -336,6 +341,7 @@ pub(super) async fn list(
         Snapshot {
             id: Uuid::new_v4(),
             instance: state.observation.instance_id.clone(),
+            limit,
             created: Instant::now(),
             rows,
             bytes,

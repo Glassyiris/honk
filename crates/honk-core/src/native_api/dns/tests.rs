@@ -112,6 +112,17 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
         .0,
         StatusCode::BAD_REQUEST
     );
+    let (limit, _) = filters.rsplit_once("&limit=").unwrap();
+    for (query, status) in [
+        (
+            format!("{limit}&limit=2&cursor={cursor}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (format!("{filters}&cursor=missing:1"), StatusCode::GONE),
+        (format!("{filters}&cursor=bad"), StatusCode::GONE),
+    ] {
+        assert_eq!(cache_page(&state, &query).await.0, status);
+    }
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ pub(super) struct Snapshot {
     created: Instant,
     observed_at: String,
     filters: Filters,
+    limit: usize,
     entries: Vec<ExactCacheEntry>,
     usage: CacheUsage,
     bytes: usize,
@@ -86,17 +87,17 @@ pub(super) async fn serve(
     let mut snapshots = api.snapshots.lock().await;
     snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
     if let Some(cursor) = values.get("cursor") {
-        let (snapshot_id, position) = cursor.rsplit_once(':').ok_or_else(|| invalid_query(id))?;
-        let position = position.parse::<usize>().map_err(|_| invalid_query(id))?;
+        let expired = || super::super::catalog::snapshot_expired(id);
+        let (snapshot_id, position) = cursor.rsplit_once(':').ok_or_else(expired)?;
+        let position = position.parse::<usize>().map_err(|_| expired())?;
         let snapshot = snapshots
             .iter()
-            .find(|snapshot| {
-                snapshot.id == snapshot_id
-                    && snapshot.instance == api.instance
-                    && snapshot.filters == filters
-            })
-            .ok_or_else(|| invalid_query(id))?;
+            .find(|snapshot| snapshot.id == snapshot_id && snapshot.instance == api.instance)
+            .ok_or_else(expired)?;
         if position == 0 || position >= snapshot.entries.len() {
+            return Err(expired());
+        }
+        if snapshot.filters != filters || snapshot.limit != limit {
             return Err(invalid_query(id));
         }
         return page(snapshot, position, limit, id).map(|(response, _)| response);
@@ -152,6 +153,7 @@ pub(super) async fn serve(
         created,
         observed_at: timestamp(wall),
         filters,
+        limit,
         entries,
         usage: inspection.usage,
         bytes,

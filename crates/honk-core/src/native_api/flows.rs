@@ -488,10 +488,13 @@ impl FlowStore {
                 .snapshots
                 .iter()
                 .find(|snapshot| snapshot.token == token)
-                .filter(|snapshot| snapshot.filters == filters)
                 .ok_or_else(|| snapshot_expired(id))?;
-            if offset == 0 || offset >= snapshot.rows.len() || offset % filters.limit != 0 {
+            if offset == 0 || offset >= snapshot.rows.len() || offset % snapshot.filters.limit != 0
+            {
                 return Err(snapshot_expired(id));
+            }
+            if snapshot.filters != filters {
+                return Err(invalid_query(id));
             }
             return Ok(self.snapshot_page(snapshot, offset, store.recording));
         }
