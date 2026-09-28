@@ -32,7 +32,7 @@ use crate::dns::{
 mod cache;
 mod log;
 mod records;
-mod rules;
+pub(super) mod rules;
 #[cfg(test)]
 mod tests;
 
@@ -341,13 +341,6 @@ pub(super) async fn cache(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     cache::serve(state, uri, id).await
-}
-pub(super) async fn rules(
-    state: &NativeState,
-    uri: &Uri,
-    id: &RequestId,
-) -> Result<Response, ApiError> {
-    rules::serve(state, uri, id).await
 }
 pub(super) async fn log(
     state: &NativeState,

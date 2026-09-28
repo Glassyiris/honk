@@ -26,15 +26,6 @@ pub(crate) fn capability() -> Value {
     json!({"available":true,"max_rules":MAX_RULES})
 }
 
-/// Mirrors `/rules` ids with the list name in front of the ordinal:
-/// `{instance}:{generation}:dns_request:rule:{index}` or `…:dns_request:fallback`.
-fn rule_id(instance: &str, generation: u64, list: &str, index: Option<usize>) -> String {
-    match index {
-        Some(index) => format!("{instance}:{generation}:{list}:rule:{index}"),
-        None => format!("{instance}:{generation}:{list}:fallback"),
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct DnsRule {
     rule_id: String,
@@ -55,13 +46,6 @@ pub(super) struct DnsRuleList {
 
 /// A wire `action` and its `upstream`.
 type Action = (&'static str, Option<String>);
-
-/// One list's parsed rules, with their conditions, and its fallback.
-struct Parsed<'c> {
-    response: bool,
-    rules: Vec<(&'c [DnsCond], Action)>,
-    fallback: Action,
-}
 
 pub(in crate::native_api) async fn serve(
     state: &NativeState,
@@ -100,28 +84,8 @@ fn list(
     id: &RequestId,
 ) -> Result<DnsRuleList, ApiError> {
     let request = routing.effective_request();
-    let lists = [
-        Parsed {
-            response: false,
-            rules: request
-                .rules
-                .iter()
-                .map(|rule| (rule.conditions.as_slice(), request_action(&rule.action)))
-                .collect(),
-            fallback: request_action(&request.fallback),
-        },
-        Parsed {
-            response: true,
-            rules: routing
-                .response
-                .rules
-                .iter()
-                .map(|rule| (rule.conditions.as_slice(), response_action(&rule.action)))
-                .collect(),
-            fallback: response_action(&routing.response.fallback),
-        },
-    ];
-    if lists.iter().any(|list| list.rules.len() >= MAX_RULES) {
+    let response = &routing.response;
+    if request.rules.len().max(response.rules.len()) >= MAX_RULES {
         return Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::TemporarilyUnavailable,
@@ -130,16 +94,39 @@ fn list(
         )
         .with_retry_after(1));
     }
-    let [request, response] = lists.map(|list| entries(state, generation, list));
     Ok(DnsRuleList {
         generation_id: format!("{}:{generation}", state.instance_id),
-        request,
-        response,
+        request: entries(
+            state,
+            generation,
+            false,
+            request
+                .rules
+                .iter()
+                .map(|rule| (rule.conditions.as_slice(), request_action(&rule.action))),
+            request_action(&request.fallback),
+        ),
+        response: entries(
+            state,
+            generation,
+            true,
+            response
+                .rules
+                .iter()
+                .map(|rule| (rule.conditions.as_slice(), response_action(&rule.action))),
+            response_action(&response.fallback),
+        ),
     })
 }
 
-fn entries(state: &NativeState, generation: u64, list: Parsed<'_>) -> Vec<DnsRule> {
-    let name = if list.response {
+fn entries<'c>(
+    state: &NativeState,
+    generation: u64,
+    response: bool,
+    parsed: impl ExactSizeIterator<Item = (&'c [DnsCond], Action)>,
+    fallback: Action,
+) -> Vec<DnsRule> {
+    let list = if response {
         "dns_response"
     } else {
         "dns_request"
@@ -148,14 +135,19 @@ fn entries(state: &NativeState, generation: u64, list: Parsed<'_>) -> Vec<DnsRul
         state
             .observation
             .configuration
-            .dns_rule_source(list.response, index)
+            .dns_rule_source(response, index)
             .map(super::super::routing::located)
     };
-    let count = list.rules.len();
+    let count = parsed.len();
     let entry = |index: Option<usize>, (action, upstream): Action| {
         let (source, expression) = located(index).unzip();
+        let instance = &state.instance_id;
         DnsRule {
-            rule_id: rule_id(&state.instance_id, generation, name, index),
+            // Mirrors `/rules` ids with the list name in front of the ordinal.
+            rule_id: match index {
+                Some(index) => format!("{instance}:{generation}:{list}:rule:{index}"),
+                None => format!("{instance}:{generation}:{list}:fallback"),
+            },
             index: index.unwrap_or(count),
             expression: expression.unwrap_or_default(),
             action,
@@ -165,14 +157,14 @@ fn entries(state: &NativeState, generation: u64, list: Parsed<'_>) -> Vec<DnsRul
         }
     };
     let mut rules = Vec::with_capacity(count + 1);
-    for (index, (conditions, action)) in list.rules.into_iter().enumerate() {
+    for (index, (conditions, action)) in parsed.enumerate() {
         let mut rule = entry(Some(index), action);
         if rule.expression.is_empty() {
             rule.expression = format!("{} -> {}", display(conditions), target(&rule));
         }
         rules.push(rule);
     }
-    let mut fallback = entry(None, list.fallback);
+    let mut fallback = entry(None, fallback);
     if fallback.expression.is_empty() {
         fallback.expression = format!("fallback: {}", target(&fallback));
     }

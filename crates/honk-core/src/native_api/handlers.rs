@@ -554,7 +554,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             resource(
                 get(
                     |State(state): App, Extension(id): Id, uri: Uri| async move {
-                        respond(dns::rules(&state, &uri, &id).await, id)
+                        respond(dns::rules::serve(&state, &uri, &id).await, id)
                     },
                 ),
                 &["GET"],
