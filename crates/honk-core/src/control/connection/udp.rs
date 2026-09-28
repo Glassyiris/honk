@@ -567,7 +567,7 @@ impl ControlPlaneHandle {
                 } else {
                     std::collections::HashMap::new()
                 };
-            let kind = crate::stats::OutboundKind::routed(&config, &outbound_name);
+            let kind = crate::stats::OutboundKind::routed(&gm, &outbound_name);
             (plan, selection_chains, close_group_ids, kind)
         };
         let outbound_tracker = self.stats.outbound_tracker(&outbound_name, outbound_kind);

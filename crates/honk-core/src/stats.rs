@@ -18,13 +18,15 @@ pub enum OutboundKind {
 }
 
 impl OutboundKind {
-    pub(crate) fn routed(config: &honk_config::Config, name: &str) -> Self {
-        if matches!(name, "direct" | "block") {
-            Self::Builtin
-        } else if config.nodes.iter().any(|node| node.name == name) {
-            Self::Node
-        } else {
-            Self::Group
+    /// Validated configs reject unknown outbounds and group/node name clashes,
+    /// so a routed name that is neither builtin nor group is a node.
+    pub(crate) fn routed(groups: &crate::group::GroupManager, name: &str) -> Self {
+        match name {
+            "direct" | "block" => Self::Builtin,
+            // Internal handoff verdicts are neither node nor group; stats file them under groups.
+            "must_rules" | "control_plane_routing" => Self::Group,
+            _ if groups.get_group_policy(name).is_some() => Self::Group,
+            _ => Self::Node,
         }
     }
 
@@ -1426,8 +1428,14 @@ mod tests {
     #[test]
     fn native_counters_retain_kind_and_full_width_across_config_changes() {
         let stats = StatsManager::new();
-        let mut config = honk_config::Config::default();
-        let old_kind = OutboundKind::routed(&config, "shared");
+        let old_groups = crate::group::GroupManager::new(
+            &[honk_config::group::Group {
+                name: "shared".into(),
+                ..Default::default()
+            }],
+            &[],
+        );
+        let old_kind = OutboundKind::routed(&old_groups, "shared");
         assert_eq!(old_kind, OutboundKind::Group);
         let old = stats.outbound_tracker("shared", old_kind);
         let wide = u32::MAX as u64 + 17;
@@ -1435,11 +1443,14 @@ mod tests {
         old.active_connections.store(wide, Ordering::Relaxed);
         old.errors.store(wide, Ordering::Relaxed);
         old.add_bytes(wide, wide + 1);
-        config.nodes.push(honk_config::node::Node {
-            name: "shared".into(),
-            ..Default::default()
-        });
-        let new_kind = OutboundKind::routed(&config, "shared");
+        let new_groups = crate::group::GroupManager::new(
+            &[],
+            &[honk_config::node::Node {
+                name: "shared".into(),
+                ..Default::default()
+            }],
+        );
+        let new_kind = OutboundKind::routed(&new_groups, "shared");
         assert_eq!(new_kind, OutboundKind::Node);
         let guard = stats.track_outbound(stats.outbound_tracker("shared", new_kind));
         stats.record_bytes("shared", new_kind, 3, 5);
@@ -1481,8 +1492,12 @@ mod tests {
         assert_eq!(legacy["shared"].total_conns, u32::MAX);
         assert_eq!(legacy["shared"].tx_bytes, wide + 10);
         assert_eq!(
-            OutboundKind::routed(&config, "direct"),
+            OutboundKind::routed(&new_groups, "direct"),
             OutboundKind::Builtin
+        );
+        assert_eq!(
+            OutboundKind::routed(&new_groups, "must_rules"),
+            OutboundKind::Group
         );
     }
 }

@@ -466,7 +466,7 @@ impl ControlPlaneHandle {
                     mode_constraint
                 };
                 let outbound_kind =
-                    crate::stats::OutboundKind::routed(&generation_config, &outbound_name);
+                    crate::stats::OutboundKind::routed(&generation_group_manager, &outbound_name);
                 let outbound_guard = self.stats.track_connection(&outbound_name, outbound_kind);
                 #[cfg(feature = "native-api")]
                 let close_catalog = pinned_native
