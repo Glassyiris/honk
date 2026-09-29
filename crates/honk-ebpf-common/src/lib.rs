@@ -5,6 +5,7 @@ use crate::dae_ip::In6Addr;
 pub mod conn;
 pub mod dae_ip;
 pub mod event;
+pub mod receive_trace;
 pub mod redirect_need;
 pub mod routing_policy;
 
@@ -15,10 +16,15 @@ pub use crate::redirect_need::{
     TuplesKey,
 };
 pub use routing_policy::{
-    ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
-    ROUTING_FEATURE_PROCESS, ROUTING_POLICY_ROOT_NAME, ROUTING_PROCESS_MAX_LEN, ROUTING_SLOT_NAMES,
-    RoutingDecision, RoutingInput, RoutingPolicyDescriptor, RoutingTestResult,
-    normalize_process_name,
+    KernelRouteOutput, KernelRouteWitness, ROUTE_FACT_DESTINATION, ROUTE_FACT_DOMAIN,
+    ROUTE_FACT_MAC, ROUTE_FACT_PRESENT_SHIFT, ROUTE_FACT_SOURCE, ROUTE_TRACE_AMBIGUOUS,
+    ROUTE_TRACE_CAPACITY, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_DNS_OVERRIDE, ROUTE_TRACE_ENABLED,
+    ROUTE_TRACE_LOST, ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW,
+    ROUTE_TRACE_SKIPPED, ROUTE_TRACE_UNAVAILABLE, ROUTE_TRACE_VALUES, ROUTE_TRACE_VERSION,
+    ROUTE_TRACE_VERSION_MASK, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
+    ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_POLICY_ROOT_NAME,
+    ROUTING_PROCESS_MAX_LEN, ROUTING_SLOT_NAMES, RoutingDecision, RoutingInput,
+    RoutingPolicyDescriptor, RoutingTestResult, normalize_process_name,
 };
 
 pub const TASK_COMM_LEN: usize = 16;
