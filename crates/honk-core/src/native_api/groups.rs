@@ -243,7 +243,7 @@ impl GroupPatch {
             let path = field(operation, "path")?;
             match op {
                 "add" | "replace" | "test" => {
-                    if operation.len() != 3 || !operation.contains_key("value") {
+                    if !operation.contains_key("value") {
                         return Err(invalid());
                     }
                     let value =
@@ -265,14 +265,11 @@ impl GroupPatch {
                     }
                 }
                 "remove" => {
-                    if operation.len() != 2 || values[path].take().is_none() {
+                    if values[path].take().is_none() {
                         return Err(invalid());
                     }
                 }
                 "copy" | "move" => {
-                    if operation.len() != 3 {
-                        return Err(invalid());
-                    }
                     let from = field(operation, "from")?;
                     let value = values[from].as_ref().ok_or_else(invalid)?;
                     let value = normalized(path, value).ok_or_else(|| rejected(op, path))?;
@@ -616,6 +613,33 @@ mod tests {
             ]),
         ] {
             assert!(request(operations).changes().is_err());
+        }
+    }
+
+    #[test]
+    fn operation_members_outside_the_operation_are_ignored() {
+        let patch = request(json!([
+            {"op":"test","path":"/config/tolerance","value":50,"comment":"current"},
+            {"op":"copy","from":"/config/tolerance","path":"/config/idle_timeout","value":1},
+            {"op":"remove","path":"/config/final_outbound","from":"/policy"},
+            {"op":"replace","path":"/config/tolerance","value":60,"x":null}
+        ]));
+        assert_eq!(
+            patch.changes().unwrap(),
+            vec![
+                (GroupField::Final, None),
+                (GroupField::Tolerance, Some("60".into())),
+                (GroupField::IdleTimeout, Some("50".into()))
+            ]
+        );
+        for operations in [
+            json!([{"op":"replace","path":"/config/tolerance","comment":"no value"}]),
+            json!([{"op":"copy","path":"/config/idle_timeout","value":1}]),
+        ] {
+            assert_eq!(
+                request(operations).changes().unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
         }
     }
 
