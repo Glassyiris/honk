@@ -245,7 +245,14 @@ pub(super) async fn list(
             id,
         );
     }
-    let config = state.config.read().await;
+    let (config, identity, supervisor) = {
+        let config = state.config.read().await;
+        (
+            Arc::clone(&config),
+            state.observation.core.catalog.snapshot(),
+            service.supervisor.read().clone(),
+        )
+    };
     if config
         .subscriptions
         .iter()
@@ -268,7 +275,6 @@ pub(super) async fn list(
             inline_count += 1;
         }
     }
-    let supervisor = service.supervisor.read().clone();
     let inline = Provider::inline(inline_count);
     let mut bytes =
         size_of::<Snapshot>() + state.observation.core.instance_id.len() + inline.retained_bytes();
@@ -280,9 +286,7 @@ pub(super) async fn list(
             .map(|owner| owner.observation(subscription))
             .unwrap_or_default();
         let row = Provider::observed(subscription, load, counts[&subscription.id])
-            .routed(subscription, |name| {
-                super::geodata::group_id(&state.observation.core.catalog, name)
-            })
+            .routed(subscription, |name| identity.groups.get(name).cloned())
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {

@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
     ops::Range,
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -304,10 +305,15 @@ pub(super) async fn nodes(
             id,
         );
     }
-    let config = state.config.read().await;
-    let identity = state.observation.core.catalog.snapshot();
-    let manager = state.group_manager.read().clone();
-    let secrets = listener_secrets(state);
+    let (config, identity, manager, secrets) = {
+        let config = state.config.read().await;
+        (
+            Arc::clone(&config),
+            state.observation.core.catalog.snapshot(),
+            state.group_manager.read().clone(),
+            listener_secrets(state),
+        )
+    };
     let snapshot = node_snapshot(
         &config,
         &manager,
@@ -317,7 +323,6 @@ pub(super) async fn nodes(
         id,
         &secrets,
     )?;
-    drop(config);
     state.observation.node_pages.first(snapshot, limit, id)
 }
 
@@ -354,7 +359,7 @@ pub(super) async fn node(
         })
 }
 
-fn listener_secrets(state: &NativeState) -> std::sync::Arc<ListenerSecrets> {
+fn listener_secrets(state: &NativeState) -> Arc<ListenerSecrets> {
     let accepted = state.observation.configuration.sources.accepted.read();
     state.observation.configuration.secrets(accepted.as_ref())
 }
