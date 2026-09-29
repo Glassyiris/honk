@@ -1,11 +1,11 @@
 use sha2::{Digest, Sha256};
 
-use super::{CompiledCondition, CompiledPredicate, CompiledRoute, DomainMatcher, RouteAction};
+use super::{CompiledCondition, CompiledPredicate, CompiledRoute, DomainMatcherKey, RouteAction};
 
 /// Hash the policy's semantic inputs without depending on derived compiler state.
 pub(super) fn policy(
     routes: &[CompiledRoute],
-    domain_matchers: &[DomainMatcher],
+    domain_keys: &[DomainMatcherKey],
     fallback: &RouteAction,
     geo_fingerprint: [u8; 32],
 ) -> [u8; 32] {
@@ -15,7 +15,7 @@ pub(super) fn policy(
     encode_action(&mut encoder, fallback);
     encoder.fixed(&geo_fingerprint);
     encoder.list(routes, encode_route);
-    encoder.list(domain_matchers, encode_domain_key);
+    encoder.list(domain_keys, encode_domain_key);
     hash.finalize().into()
 }
 
@@ -150,8 +150,7 @@ fn encode_ip_nets(encoder: &mut Encoder<'_>, nets: &[ipnet::IpNet]) {
     });
 }
 
-fn encode_domain_key(encoder: &mut Encoder<'_>, matcher: &DomainMatcher) {
-    let key = matcher.key();
+fn encode_domain_key(encoder: &mut Encoder<'_>, key: &DomainMatcherKey) {
     encoder.u8(key.class);
     encoder.list(&key.alternatives, |encoder, (tag, alternative)| {
         encoder.u8(*tag);
@@ -162,7 +161,7 @@ fn encode_domain_key(encoder: &mut Encoder<'_>, matcher: &DomainMatcher) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::{GeositeDomain, IpMatcher, PortRange};
+    use crate::routing::{DomainMatcher, GeositeDomain, IpMatcher, PortRange};
     use std::sync::Arc;
 
     fn route(condition: CompiledPredicate) -> CompiledRoute {
@@ -171,6 +170,9 @@ mod tests {
             name: "rule".into(),
             rule_type: "Match".into(),
             rule_payload: String::new(),
+            expression: String::new(),
+            #[cfg(feature = "native-api")]
+            condition_expressions: Vec::new(),
             priority: 0,
             conditions: vec![CompiledCondition {
                 not: false,
@@ -185,14 +187,14 @@ mod tests {
         }
     }
 
-    fn digest(routes: &[CompiledRoute], matchers: &[DomainMatcher]) -> [u8; 32] {
+    fn digest(routes: &[CompiledRoute], keys: &[DomainMatcherKey]) -> [u8; 32] {
         let fallback = RouteAction {
             outbound: "direct".into(),
             must: false,
             mark: None,
             direct_mark_index: None,
         };
-        policy(routes, matchers, &fallback, [0; 32])
+        policy(routes, keys, &fallback, [0; 32])
     }
 
     #[test]
@@ -239,14 +241,17 @@ mod tests {
 
     #[test]
     fn semantic_encoder_preserves_domain_class_tags_and_registry_order() {
-        let ordinary = DomainMatcher::ordinary(&[], &[], &["example.com".into()], &[]).unwrap();
-        let geosite = DomainMatcher::geosite(vec![GeositeDomain::Keyword("example.com".into())]);
+        let (ordinary, _) =
+            DomainMatcher::ordinary(&[], &[], &["example.com".into()], &[]).unwrap();
+        let (geosite, _) =
+            DomainMatcher::geosite(&[GeositeDomain::Keyword("example.com".into())], Vec::new());
         assert_ne!(
             digest(&[], std::slice::from_ref(&ordinary)),
             digest(&[], std::slice::from_ref(&geosite))
         );
 
-        let full = DomainMatcher::geosite(vec![GeositeDomain::Full("example.com".into())]);
+        let (full, _) =
+            DomainMatcher::geosite(&[GeositeDomain::Full("example.com".into())], Vec::new());
         assert_ne!(
             digest(&[], std::slice::from_ref(&geosite)),
             digest(&[], &[full])

@@ -13,7 +13,12 @@ mod ir;
 mod lan_protection;
 mod lpm;
 
+#[cfg(feature = "native-api")]
+pub(crate) mod native;
+#[cfg(feature = "native-api")]
+pub(crate) use geo::GeoAssetSnapshot;
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
+pub(crate) use ir::SharedMatchers;
 pub use ir::{CompiledCondition, CompiledPredicate, IpMatcher, PortRange};
 pub(crate) use lpm::BinaryLpmTrie;
 
@@ -55,6 +60,12 @@ pub struct CompiledRoute {
     pub priority: u32,
     pub conditions: Vec<CompiledCondition>,
     pub action: RouteAction,
+    /// The configured conditions as dae text, bounded; rendered once here so
+    /// every API projection shows the same spelling without touching matchers.
+    pub expression: String,
+    /// Source-spelled conditions in compiled order; never expanded GeoIP networks.
+    #[cfg(feature = "native-api")]
+    pub condition_expressions: Vec<String>,
 }
 
 impl CompiledRoute {
@@ -116,13 +127,21 @@ impl GeositeMatcher {
     }
 
     pub(crate) fn matches(&self, domain: &str) -> bool {
-        let lower = domain.to_lowercase();
-        if self.full.contains(lower.as_str()) {
+        self.matches_bounded::<false>(domain, &domain.to_lowercase(), None)
+    }
+
+    fn matches_bounded<const BOUNDED: bool>(
+        &self,
+        domain: &str,
+        lower: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
+        if self.full.contains(lower) {
             return true;
         }
         // Dot-boundary suffix walk: check the host itself, then each parent.
         if !self.suffix.is_empty() {
-            let mut d = lower.as_str();
+            let mut d = lower;
             loop {
                 if self.suffix.contains(d) {
                     return true;
@@ -138,7 +157,7 @@ impl GeositeMatcher {
         {
             return true;
         }
-        self.regex.iter().any(|re| re.is_match(domain))
+        bounded_any::<BOUNDED, _>(&self.regex, deadline, |re| re.is_match(domain))
     }
 }
 
@@ -151,15 +170,12 @@ struct DomainMatcherKey {
 #[derive(Debug, Clone)]
 enum DomainMatcher {
     Ordinary {
-        key: DomainMatcherKey,
         patterns: Vec<Regex>,
         suffixes: Vec<String>,
         keywords: Vec<String>,
     },
-    Geosite {
-        key: DomainMatcherKey,
-        matcher: GeositeMatcher,
-    },
+    /// One matcher per configured selector, matched as their union.
+    Geosite(Vec<Arc<GeositeMatcher>>),
 }
 
 impl DomainMatcher {
@@ -168,7 +184,7 @@ impl DomainMatcher {
         suffixes: &[String],
         keywords: &[String],
         regexes: &[String],
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(DomainMatcherKey, Self)> {
         let mut patterns = Vec::with_capacity(regexes.len() + domains.len());
         for pattern in regexes {
             patterns.push(
@@ -191,18 +207,24 @@ impl DomainMatcher {
             .collect::<Vec<_>>();
         alternatives.sort();
         alternatives.dedup();
-        Ok(Self::Ordinary {
-            key: DomainMatcherKey {
-                class: 0,
-                alternatives,
+        let key = DomainMatcherKey {
+            class: 0,
+            alternatives,
+        };
+        Ok((
+            key,
+            Self::Ordinary {
+                patterns,
+                suffixes: suffixes.to_vec(),
+                keywords: keywords.to_vec(),
             },
-            patterns,
-            suffixes: suffixes.to_vec(),
-            keywords: keywords.to_vec(),
-        })
+        ))
     }
 
-    fn geosite(domains: Vec<GeositeDomain>) -> Self {
+    fn geosite(
+        domains: &[GeositeDomain],
+        matchers: Vec<Arc<GeositeMatcher>>,
+    ) -> (DomainMatcherKey, Self) {
         let mut alternatives = domains
             .iter()
             .map(|domain| match domain {
@@ -214,22 +236,22 @@ impl DomainMatcher {
             .collect::<Vec<_>>();
         alternatives.sort();
         alternatives.dedup();
-        Self::Geosite {
-            key: DomainMatcherKey {
-                class: 1,
-                alternatives,
-            },
-            matcher: GeositeMatcher::build(&domains),
-        }
-    }
-
-    fn key(&self) -> &DomainMatcherKey {
-        match self {
-            Self::Ordinary { key, .. } | Self::Geosite { key, .. } => key,
-        }
+        let key = DomainMatcherKey {
+            class: 1,
+            alternatives,
+        };
+        (key, Self::Geosite(matchers))
     }
 
     fn matches(&self, domain: &str) -> bool {
+        self.matches_bounded::<false>(domain, None)
+    }
+
+    fn matches_bounded<const BOUNDED: bool>(
+        &self,
+        domain: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
         match self {
             Self::Ordinary {
                 patterns,
@@ -237,33 +259,56 @@ impl DomainMatcher {
                 keywords,
                 ..
             } => {
-                patterns.iter().any(|pattern| pattern.is_match(domain))
-                    || suffixes.iter().any(|suffix| domain.ends_with(suffix))
-                    || keywords.iter().any(|keyword| domain.contains(keyword))
+                bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| pattern.is_match(domain))
+                    || bounded_any::<BOUNDED, _>(suffixes, deadline, |suffix| {
+                        domain.ends_with(suffix)
+                    })
+                    || bounded_any::<BOUNDED, _>(keywords, deadline, |keyword| {
+                        domain.contains(keyword)
+                    })
             }
-            Self::Geosite { matcher, .. } => matcher.matches(domain),
+            Self::Geosite(matchers) => {
+                let lower = domain.to_lowercase();
+                matchers
+                    .iter()
+                    .any(|matcher| matcher.matches_bounded::<BOUNDED>(domain, &lower, deadline))
+            }
         }
     }
 }
 
+// The untimed production specialization has no clock reads or per-alternative budget branch.
+fn bounded_any<const BOUNDED: bool, T>(
+    values: &[T],
+    deadline: Option<std::time::Instant>,
+    mut matches: impl FnMut(&T) -> bool,
+) -> bool {
+    values
+        .iter()
+        .take_while(|_| !BOUNDED || deadline.is_some_and(|end| std::time::Instant::now() < end))
+        .any(&mut matches)
+}
+
+/// Keys copy each matcher's whole expansion and are read only by interning and
+/// the policy fingerprint, so the built router keeps just `matchers`.
 #[derive(Debug, Default)]
-struct DomainRegistry(Vec<DomainMatcher>);
+struct DomainRegistry {
+    keys: Vec<DomainMatcherKey>,
+    matchers: Vec<DomainMatcher>,
+}
 
 impl DomainRegistry {
-    fn intern(&mut self, matcher: DomainMatcher) -> anyhow::Result<u32> {
-        if let Some(id) = self
-            .0
-            .iter()
-            .position(|candidate| candidate.key() == matcher.key())
-        {
+    fn intern(&mut self, (key, matcher): (DomainMatcherKey, DomainMatcher)) -> anyhow::Result<u32> {
+        if let Some(id) = self.keys.iter().position(|candidate| *candidate == key) {
             return Ok(id as u32);
         }
         anyhow::ensure!(
-            self.0.len() < ROUTING_FACT_CAPACITY,
+            self.matchers.len() < ROUTING_FACT_CAPACITY,
             "routing policy has more than {ROUTING_FACT_CAPACITY} domain predicates"
         );
-        let id = self.0.len() as u32;
-        self.0.push(matcher);
+        let id = self.matchers.len() as u32;
+        self.keys.push(key);
+        self.matchers.push(matcher);
         Ok(id)
     }
 }
@@ -279,6 +324,19 @@ pub struct ConnectionInfo {
     pub process_name: Option<String>,
     pub mac: Option<String>,
     pub dscp: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PredicateInput<'a> {
+    pub(crate) domain: Option<&'a str>,
+    pub(crate) dst_ip: Option<IpAddr>,
+    pub(crate) dst_port: Option<u16>,
+    pub(crate) src_ip: Option<IpAddr>,
+    pub(crate) src_port: Option<u16>,
+    pub(crate) protocol: &'a str,
+    pub(crate) process_name: Option<&'a str>,
+    pub(crate) mac: Option<&'a str>,
+    pub(crate) dscp: Option<u8>,
 }
 
 /// Human-readable connection identity for routing debug logs.
@@ -301,18 +359,23 @@ struct CompiledRoutes {
     routes: Arc<[CompiledRoute]>,
     geo_fingerprint: [u8; 32],
     geo_requirements: GeoRequirements,
+    #[cfg(feature = "native-api")]
+    geo_assets: Arc<[GeoAssetSnapshot]>,
 }
 
 impl CompiledRoutes {
     fn new(
         routes: Vec<CompiledRoute>,
         geo_fingerprint: [u8; 32],
+        #[cfg(feature = "native-api")] geo_assets: Vec<GeoAssetSnapshot>,
         geo_requirements: GeoRequirements,
     ) -> Self {
         Self {
             routes: routes.into(),
             geo_fingerprint,
             geo_requirements,
+            #[cfg(feature = "native-api")]
+            geo_assets: geo_assets.into(),
         }
     }
 }
@@ -321,7 +384,13 @@ impl From<Vec<CompiledRoute>> for CompiledRoutes {
     fn from(routes: Vec<CompiledRoute>) -> Self {
         let requirements = GeoRequirements::default();
         let sources = GeoSourceSet::load(&requirements);
-        Self::new(routes, sources.fingerprint(), requirements)
+        Self::new(
+            routes,
+            sources.fingerprint(),
+            #[cfg(feature = "native-api")]
+            Vec::new(),
+            requirements,
+        )
     }
 }
 
@@ -361,6 +430,7 @@ impl Router {
                 direct_mark_index: None,
             },
             &sources,
+            &mut SharedMatchers::default(),
         )
     }
 
@@ -373,19 +443,29 @@ impl Router {
         routing: &RoutingConfig,
         geo_sources: &GeoSourceSet,
     ) -> anyhow::Result<Self> {
+        Self::from_config_sharing(routing, geo_sources, &mut SharedMatchers::default())
+    }
+
+    /// Builds with matchers shared with the other router of the same build.
+    pub(crate) fn from_config_sharing(
+        routing: &RoutingConfig,
+        geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
+    ) -> anyhow::Result<Self> {
         let fallback = RouteAction {
             outbound: routing.default_outbound.clone(),
             must: routing.default_must,
             mark: DirectMark::new(routing.default_mark),
             direct_mark_index: None,
         };
-        Self::build(&routing.rules, fallback, geo_sources)
+        Self::build(&routing.rules, fallback, geo_sources, shared)
     }
 
     fn build(
         rules: &[RoutingRule],
         mut fallback: RouteAction,
         geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let requirements = GeoRequirements::for_traffic(rules);
         let assets = GeoAssets::from_sources(&requirements, geo_sources);
@@ -395,8 +475,9 @@ impl Router {
 
         for (source_index, rule) in rules.iter().enumerate() {
             let mut conditions = Vec::new();
-            append_conditions(&mut conditions, false, rule, &assets, &mut registry)?;
-            append_conditions(&mut conditions, true, rule, &assets, &mut registry)?;
+            for not in [false, true] {
+                append_conditions(&mut conditions, not, rule, &assets, &mut registry, shared)?;
+            }
 
             let outbound = rule.outbound.as_str().to_owned();
             let (rule_type, rule_payload) = rule
@@ -417,7 +498,25 @@ impl Router {
                     mark: DirectMark::new(rule.mark),
                     direct_mark_index: None,
                 },
+                expression: String::new(),
+                #[cfg(feature = "native-api")]
+                condition_expressions: Vec::new(),
             });
+        }
+        #[cfg(feature = "native-api")]
+        for route in &mut compiled {
+            route.condition_expressions = route
+                .conditions
+                .iter()
+                .map(|condition| {
+                    native::bounded_expression(native::condition_display(
+                        &registry.matchers,
+                        condition,
+                        &rules[route.id as usize].condition,
+                    ))
+                })
+                .collect();
+            route.expression = native::join_expressions(route.condition_expressions.iter());
         }
 
         // `sort_by_key` is stable, so equal priorities retain source order.
@@ -454,11 +553,17 @@ impl Router {
         index_for(&mut fallback);
 
         let policy_fingerprint =
-            fingerprint::policy(&compiled, &registry.0, &fallback, geo_fingerprint);
+            fingerprint::policy(&compiled, &registry.keys, &fallback, geo_fingerprint);
         Ok(Self {
-            routes: CompiledRoutes::new(compiled, geo_fingerprint, requirements),
+            routes: CompiledRoutes::new(
+                compiled,
+                geo_fingerprint,
+                #[cfg(feature = "native-api")]
+                geo_sources.snapshots(&requirements),
+                requirements,
+            ),
             fallback,
-            domain_matchers: registry.0.into(),
+            domain_matchers: registry.matchers.into(),
             direct_marks: direct_marks.into(),
             policy_fingerprint,
         })
@@ -481,8 +586,23 @@ impl Router {
                 .any(|route| route.action.outbound == "direct" && route.action.mark.is_some())
     }
 
+    /// Whether any rule has a `pname()` condition, positive or negated.
+    pub(crate) fn uses_process_name(&self) -> bool {
+        self.routes.iter().any(|route| {
+            route
+                .conditions
+                .iter()
+                .any(|condition| matches!(condition.predicate, CompiledPredicate::ProcessName(_)))
+        })
+    }
+
     pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
         self.routes.geo_fingerprint
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn geo_assets(&self) -> &[GeoAssetSnapshot] {
+        &self.routes.geo_assets
     }
 
     pub(crate) fn geo_requirements(&self) -> &GeoRequirements {
@@ -491,6 +611,18 @@ impl Router {
 
     pub fn policy_fingerprint(&self) -> [u8; 32] {
         self.policy_fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn geosite_matchers(&self) -> Vec<&Arc<GeositeMatcher>> {
+        self.domain_matchers
+            .iter()
+            .filter_map(|matcher| match matcher {
+                DomainMatcher::Geosite(matchers) => Some(matchers),
+                DomainMatcher::Ordinary { .. } => None,
+            })
+            .flatten()
+            .collect()
     }
 
     pub fn domain_predicate_count(&self) -> usize {
@@ -542,8 +674,22 @@ impl Router {
         conn: &ConnectionInfo,
         domain_bitmap: Option<&DomainRouting>,
     ) -> Option<RouteMatch<'a>> {
-        self.routes.iter().find_map(|route| {
-            if !self.matches_route(route, conn, domain_bitmap) {
+        self.route_full_with_observer(conn, domain_bitmap, |_, _, _| {})
+    }
+
+    #[inline]
+    fn route_full_with_observer<'a>(
+        &'a self,
+        conn: &ConnectionInfo,
+        domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, Option<usize>, bool),
+    ) -> Option<RouteMatch<'a>> {
+        self.routes.iter().enumerate().find_map(|(index, route)| {
+            let matched = self.matches_route(route, conn, domain_bitmap, |condition, matched| {
+                observe(index, Some(condition), matched);
+            });
+            observe(index, None, matched);
+            if !matched {
                 return None;
             }
             tracing::debug!(
@@ -569,20 +715,47 @@ impl Router {
         route: &CompiledRoute,
         conn: &ConnectionInfo,
         domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, bool),
     ) -> bool {
+        let input = PredicateInput {
+            domain: conn.domain.as_deref(),
+            dst_ip: Some(conn.dst_ip),
+            dst_port: Some(conn.dst_port),
+            src_ip: Some(conn.src_ip),
+            src_port: Some(conn.src_port),
+            protocol: conn.protocol,
+            process_name: conn.process_name.as_deref(),
+            mac: conn.mac.as_deref(),
+            dscp: conn.dscp,
+        };
         !route.conditions.is_empty()
-            && route.conditions.iter().all(|condition| {
-                let matched = self.matches_predicate(&condition.predicate, conn, domain_bitmap);
-                if condition.not { !matched } else { matched }
-            })
+            && route
+                .conditions
+                .iter()
+                .enumerate()
+                .all(|(index, condition)| {
+                    // Production absence is a miss before negation; simulations retain unknown.
+                    let matched = self
+                        .evaluate_predicate::<false>(
+                            &condition.predicate,
+                            input,
+                            domain_bitmap,
+                            None,
+                        )
+                        .unwrap_or(false);
+                    let matched = if condition.not { !matched } else { matched };
+                    observe(index, matched);
+                    matched
+                })
     }
 
-    fn matches_predicate(
+    fn evaluate_predicate<const BOUNDED: bool>(
         &self,
         predicate: &CompiledPredicate,
-        conn: &ConnectionInfo,
+        input: PredicateInput<'_>,
         domain_bitmap: Option<&DomainRouting>,
-    ) -> bool {
+        deadline: Option<std::time::Instant>,
+    ) -> Option<bool> {
         match predicate {
             CompiledPredicate::Domain(id) => domain_bitmap
                 .map(|bitmap| {
@@ -590,36 +763,40 @@ impl Router {
                     id < ROUTING_FACT_CAPACITY && bitmap.bitmap[id / 32] & (1 << (id % 32)) != 0
                 })
                 .or_else(|| {
-                    conn.domain.as_deref().map(|domain| {
+                    input.domain.map(|domain| {
                         self.domain_matchers
                             .get(*id as usize)
-                            .is_some_and(|matcher| matcher.matches(domain))
+                            .is_some_and(|matcher| {
+                                matcher.matches_bounded::<BOUNDED>(domain, deadline)
+                            })
                     })
-                })
-                .unwrap_or(false),
-            CompiledPredicate::DestinationIp(matcher) => matcher.matches(&conn.dst_ip),
-            CompiledPredicate::SourceIp(matcher) => matcher.matches(&conn.src_ip),
-            CompiledPredicate::DestinationPort(ranges) => {
-                ranges.iter().any(|range| range.contains(conn.dst_port))
+                }),
+            CompiledPredicate::DestinationIp(matcher) => {
+                input.dst_ip.map(|ip| matcher.matches(&ip))
             }
-            CompiledPredicate::SourcePort(ranges) => {
-                ranges.iter().any(|range| range.contains(conn.src_port))
-            }
-            CompiledPredicate::Protocol(mask) => protocol_value(conn.protocol) & *mask != 0,
-            CompiledPredicate::IpVersion(mask) => {
-                let version = if conn.dst_ip.is_ipv4() { 1 } else { 2 };
+            CompiledPredicate::SourceIp(matcher) => input.src_ip.map(|ip| matcher.matches(&ip)),
+            CompiledPredicate::DestinationPort(ranges) => input.dst_port.map(|port| {
+                bounded_any::<BOUNDED, _>(ranges, deadline, |range| range.contains(port))
+            }),
+            CompiledPredicate::SourcePort(ranges) => input.src_port.map(|port| {
+                bounded_any::<BOUNDED, _>(ranges, deadline, |range| range.contains(port))
+            }),
+            CompiledPredicate::Protocol(mask) => Some(protocol_value(input.protocol) & *mask != 0),
+            CompiledPredicate::IpVersion(mask) => input.dst_ip.map(|ip| {
+                let version = if ip.is_ipv4() { 1 } else { 2 };
                 *mask & version != 0
-            }
-            CompiledPredicate::Dscp(values) => conn.dscp.is_some_and(|dscp| values.contains(&dscp)),
-            CompiledPredicate::ProcessName(patterns) => conn
-                .process_name
-                .as_deref()
-                .is_some_and(|name| patterns.iter().any(|pattern| name.contains(pattern))),
-            CompiledPredicate::Mac(macs) => conn
-                .mac
-                .as_deref()
-                .and_then(normalize_mac_bytes)
-                .is_some_and(|mac| macs.contains(&mac)),
+            }),
+            CompiledPredicate::Dscp(values) => input
+                .dscp
+                .map(|dscp| bounded_any::<BOUNDED, _>(values, deadline, |value| *value == dscp)),
+            CompiledPredicate::ProcessName(patterns) => input.process_name.map(|name| {
+                bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| name.contains(pattern))
+            }),
+            CompiledPredicate::Mac(macs) => input.mac.map(|mac| {
+                normalize_mac_bytes(mac).is_some_and(|mac| {
+                    bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)
+                })
+            }),
         }
     }
 
@@ -629,6 +806,17 @@ impl Router {
 
     pub fn compiled_routes(&self) -> &[CompiledRoute] {
         self.routes.as_ref()
+    }
+
+    pub(crate) fn ip_matchers(&self) -> impl Iterator<Item = &Arc<IpMatcher>> {
+        self.compiled_routes()
+            .iter()
+            .flat_map(|route| &route.conditions)
+            .filter_map(|condition| match &condition.predicate {
+                CompiledPredicate::DestinationIp(matcher)
+                | CompiledPredicate::SourceIp(matcher) => Some(matcher),
+                _ => None,
+            })
     }
 }
 
@@ -647,6 +835,7 @@ fn append_conditions(
     rule: &RoutingRule,
     assets: &GeoAssets,
     registry: &mut DomainRegistry,
+    shared: &mut SharedMatchers,
 ) -> anyhow::Result<()> {
     macro_rules! field {
         ($name:ident) => {
@@ -689,7 +878,13 @@ fn append_conditions(
         });
     }
     if !geosites.is_empty() {
-        let id = registry.intern(DomainMatcher::geosite(assets.geosite_domains(geosites)))?;
+        let (mut domains, mut matchers) = (Vec::new(), Vec::new());
+        for code in geosites {
+            let selected = assets.geosite_domains(std::slice::from_ref(code));
+            matchers.push(shared.geosite(code, &selected));
+            domains.extend(selected);
+        }
+        let id = registry.intern(DomainMatcher::geosite(&domains, matchers))?;
         conditions.push(CompiledCondition {
             not,
             predicate: CompiledPredicate::Domain(id),
@@ -703,7 +898,7 @@ fn append_conditions(
         nets.extend(assets.geoip_nets(geo_ips));
         conditions.push(CompiledCondition {
             not,
-            predicate: CompiledPredicate::DestinationIp(Arc::new(IpMatcher::new(nets))),
+            predicate: CompiledPredicate::DestinationIp(shared.ip(nets)),
         });
     }
     if !source_ips.is_empty() {
@@ -713,7 +908,7 @@ fn append_conditions(
             .collect();
         conditions.push(CompiledCondition {
             not,
-            predicate: CompiledPredicate::SourceIp(Arc::new(IpMatcher::new(nets))),
+            predicate: CompiledPredicate::SourceIp(shared.ip(nets)),
         });
     }
     if !ports.is_empty() {

@@ -182,6 +182,11 @@ async fn pump(
     } else {
         &progress.download
     };
+    let aggregate = if upload {
+        &progress.outbound_upload
+    } else {
+        &progress.outbound_download
+    };
     let mut first_response = if upload {
         None
     } else {
@@ -230,6 +235,9 @@ async fn pump(
             staged -= n;
             total += n as u64;
             counter.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some(counter) = aggregate {
+                counter.fetch_add(n as u64, Ordering::Relaxed);
+            }
             if let Some(callback) = &progress.on_transfer {
                 if upload {
                     callback(n as u64, 0);
@@ -287,9 +295,15 @@ async fn run(
     let mut progress = progress.unwrap_or_else(|| super::RelayProgress {
         upload: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         download: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outbound_upload: None,
+        outbound_download: None,
         first_response: None,
         on_transfer: None,
     });
+    let baseline = (
+        progress.upload.load(Ordering::Relaxed),
+        progress.download.load(Ordering::Relaxed),
+    );
     if staged_p2c > 0
         && let Some(callback) = progress.first_response.take()
     {
@@ -322,8 +336,8 @@ async fn run(
         Err(e) => return Err(SpliceError::Io(e)),
     }
     Ok((
-        progress.upload.load(Ordering::Relaxed),
-        progress.download.load(Ordering::Relaxed),
+        progress.upload.load(Ordering::Relaxed) - baseline.0,
+        progress.download.load(Ordering::Relaxed) - baseline.1,
     ))
 }
 
@@ -448,6 +462,7 @@ where
                 super::RelayIo::wrap(
                     client,
                     progress.upload,
+                    progress.outbound_upload,
                     None,
                     progress.on_transfer.clone(),
                     false,
@@ -455,6 +470,7 @@ where
                 super::RelayIo::wrap(
                     proxy,
                     progress.download,
+                    progress.outbound_download,
                     first_response,
                     progress.on_transfer,
                     true,

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use parking_lot::Mutex as SyncMutex;
 use quinn::{ClientConfig, Endpoint, VarInt};
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 use super::endpoint::endpoint_config_with_mtu;
@@ -89,28 +90,34 @@ struct TransportQuinnSocket {
     send_error: SharedTransportError,
     recv_error: SharedTransportError,
     recv_waker: SharedRecvWaker,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    tasks: std::sync::OnceLock<[crate::runtime::SharedTask; 2]>,
     metrics_enabled: bool,
 }
 
 impl TransportQuinnSocket {
     #[cfg(test)]
     fn new(transport: Arc<dyn PacketTransport>, remote: SocketAddr) -> Arc<Self> {
-        Self::new_with_metrics(transport, remote, false)
+        let (socket, sender, receiver) = Self::prepare(transport, remote, false);
+        socket.start_workers(None, sender, receiver).unwrap();
+        socket
     }
 
-    fn new_with_metrics(
+    fn prepare(
         transport: Arc<dyn PacketTransport>,
         remote: SocketAddr,
         metrics_enabled: bool,
-    ) -> Arc<Self> {
+    ) -> (
+        Arc<Self>,
+        impl Future<Output = ()> + Send + 'static,
+        impl Future<Output = ()> + Send + 'static,
+    ) {
         let (outbound_tx, mut outbound_rx) =
             tokio::sync::mpsc::channel::<QueuedTransportPacket>(TRANSPORT_QUEUE_CAP);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TRANSPORT_QUEUE_CAP);
         let send_error = Arc::new(SyncMutex::new(None));
         let recv_error = Arc::new(SyncMutex::new(None));
         let recv_waker = Arc::new(SyncMutex::new(None));
-        let sender = tokio::spawn({
+        let sender = {
             let transport = Arc::clone(&transport);
             let send_error = Arc::clone(&send_error);
             let recv_waker = Arc::clone(&recv_waker);
@@ -176,9 +183,9 @@ impl TransportQuinnSocket {
                     }
                 }
             }
-        });
+        };
         let allows_full_cone_replies = transport.allows_full_cone_replies();
-        let receiver = tokio::spawn({
+        let receiver = {
             let recv_error = Arc::clone(&recv_error);
             let recv_waker = Arc::clone(&recv_waker);
             async move {
@@ -226,17 +233,38 @@ impl TransportQuinnSocket {
                     }
                 }
             }
-        });
-        Arc::new(Self {
+        };
+        let socket = Arc::new(Self {
             remote,
             outbound: outbound_tx,
             inbound: SyncMutex::new(inbound_rx),
             send_error,
             recv_error,
             recv_waker,
-            tasks: Mutex::new(vec![sender, receiver]),
+            tasks: std::sync::OnceLock::new(),
             metrics_enabled,
-        })
+        });
+        (socket, sender, receiver)
+    }
+
+    fn start_workers(
+        &self,
+        owner: Option<&Arc<crate::runtime::TaskOwner>>,
+        sender: impl Future<Output = ()> + Send + 'static,
+        receiver: impl Future<Output = ()> + Send + 'static,
+    ) -> io::Result<()> {
+        let sender = crate::runtime::spawn_joinable(owner, sender)?;
+        let receiver = match crate::runtime::spawn_joinable(owner, receiver) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                sender.abort();
+                return Err(error);
+            }
+        };
+        self.tasks
+            .set([sender, receiver])
+            .expect("workers start once");
+        Ok(())
     }
 
     fn send_error(&self) -> Option<io::Error> {
@@ -257,21 +285,21 @@ impl TransportQuinnSocket {
         self.recv_error().or_else(|| self.send_error())
     }
 
-    async fn close_tasks(&self) {
-        let mut tasks = self.tasks.lock().await;
-        for task in tasks.iter() {
+    async fn close_tasks(&self) -> bool {
+        let mut joined = true;
+        for task in self.tasks.get().into_iter().flatten() {
             task.abort();
         }
-        for task in tasks.iter_mut() {
-            let _ = task.await;
+        for task in self.tasks.get().into_iter().flatten() {
+            joined &= task.join().await;
         }
-        tasks.clear();
+        joined
     }
 }
 
 impl Drop for TransportQuinnSocket {
     fn drop(&mut self) {
-        for task in self.tasks.get_mut().drain(..) {
+        for task in self.tasks.get().into_iter().flatten() {
             task.abort();
         }
     }
@@ -453,12 +481,60 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
     }
 }
 
-/// Owns a client-only quinn endpoint and the bounded [`PacketTransport`]
-/// adapter workers that drive it.
+#[derive(Debug)]
+struct PacketTransportRuntime {
+    inner: Arc<dyn quinn::Runtime>,
+    tasks: std::sync::Weak<crate::runtime::TaskOwner>,
+    parent: Option<std::sync::Weak<crate::runtime::TaskOwner>>,
+}
+
+impl quinn::Runtime for PacketTransportRuntime {
+    fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+        self.inner.new_timer(deadline)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        let Some(tasks) = self.tasks.upgrade() else {
+            return;
+        };
+        let (start, started) = tokio::sync::oneshot::channel();
+        let Ok(task) = crate::runtime::spawn_joinable(Some(&tasks), async move {
+            if started.await.is_ok() {
+                future.await;
+            }
+        }) else {
+            return;
+        };
+        if self.parent.as_ref().is_some_and(|parent| {
+            parent
+                .upgrade()
+                .is_none_or(|parent| !parent.retain_joinable(task.clone()))
+        }) {
+            task.abort();
+            return;
+        }
+        let _ = start.send(());
+    }
+
+    fn wrap_udp_socket(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+        self.inner.wrap_udp_socket(socket)
+    }
+
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+}
+
+/// Owns a client-only quinn endpoint, its drivers, and the bounded
+/// [`PacketTransport`] adapter workers that drive it.
 #[derive(Debug)]
 pub struct PacketTransportEndpoint {
     endpoint: Endpoint,
     socket: Arc<TransportQuinnSocket>,
+    drivers: Arc<crate::runtime::TaskOwner>,
 }
 
 impl PacketTransportEndpoint {
@@ -474,16 +550,20 @@ impl PacketTransportEndpoint {
         self.socket.terminal_error()
     }
 
-    /// Close the Quinn endpoint and wait up to `timeout` for it to drain.
-    /// A zero timeout leaves the adapter workers alive until Quinn releases
-    /// the socket; other closes abort and join them.
-    pub async fn close(&self, timeout: Duration) {
+    /// Request closure, allow `timeout` for peer notification, then stop and join
+    /// adapter workers and Quinn drivers. Returns false only for a worker panic.
+    /// Zero only requests closure; retained owners still own all jobs.
+    pub async fn close(&self, timeout: Duration) -> bool {
         self.endpoint.close(VarInt::from_u32(0), b"shutdown");
         if timeout.is_zero() {
-            return;
+            return true;
         }
+        // Quinn's normal close linger is three PTOs and may exceed the grace.
+        // Expiry ends peer notification, not successful owned teardown.
         let _ = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
-        self.socket.close_tasks().await;
+        let joined = self.socket.close_tasks().await;
+        self.drivers.close().await;
+        joined && !self.drivers.has_failed()
     }
 }
 
@@ -494,15 +574,17 @@ pub fn packet_transport_endpoint(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
 ) -> io::Result<PacketTransportEndpoint> {
-    packet_transport_endpoint_with_metrics(transport, remote, false)
+    packet_transport_endpoint_with_metrics(transport, remote, false, None)
 }
 
 /// Create a packet-backed endpoint whose adapter pressure counters belong to a
 /// persistent pooled DNS connection.
+/// `owner` retains unpublished worker joins even without a native runtime scope.
 pub fn packet_transport_endpoint_with_metrics(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
     metrics_enabled: bool,
+    owner: Option<&Arc<crate::runtime::TaskOwner>>,
 ) -> io::Result<PacketTransportEndpoint> {
     if transport.relay_addr() != remote {
         return Err(io::Error::new(
@@ -512,14 +594,22 @@ pub fn packet_transport_endpoint_with_metrics(
     }
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    let socket = TransportQuinnSocket::new_with_metrics(transport, remote, metrics_enabled);
-    let endpoint = Endpoint::new_with_abstract_socket(
-        endpoint_config_with_mtu(1252)?,
-        None,
-        socket.clone(),
-        runtime,
-    )?;
-    Ok(PacketTransportEndpoint { endpoint, socket })
+    let drivers = Arc::new(crate::runtime::TaskOwner::production());
+    let runtime = Arc::new(PacketTransportRuntime {
+        inner: runtime,
+        tasks: Arc::downgrade(&drivers),
+        parent: owner.map(Arc::downgrade),
+    });
+    let config = endpoint_config_with_mtu(1252)?;
+    let (socket, sender, receiver) =
+        TransportQuinnSocket::prepare(transport, remote, metrics_enabled);
+    let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime)?;
+    socket.start_workers(owner, sender, receiver)?;
+    Ok(PacketTransportEndpoint {
+        endpoint,
+        socket,
+        drivers,
+    })
 }
 
 /// Establish a QUIC connection through a proxied UDP tunnel and time the
@@ -534,24 +624,51 @@ pub async fn quic_handshake_probe(
     server_name: &str,
     config: &ClientConfig,
     timeout: Duration,
-) -> anyhow::Result<Duration> {
-    let endpoint = packet_transport_endpoint(transport, target)?;
-
-    let start = Instant::now();
-    let connecting = endpoint
-        .endpoint()
-        .connect_with(config.clone(), target, server_name)
-        .context("create QUIC connecting")?;
-    let conn = tokio::time::timeout(timeout, connecting)
-        .await
-        .context("QUIC handshake timeout")
-        .and_then(|result| result.map_err(anyhow::Error::from))
-        .map_err(|error| endpoint.terminal_error().map_or(error, anyhow::Error::from))?;
-    let elapsed = start.elapsed();
-    conn.close(quinn::VarInt::from_u32(0), b"probe");
-    drop(conn);
-    endpoint.close(Duration::ZERO).await;
-    Ok(elapsed)
+    cancel: crate::alive::ProbeCancellation,
+) -> anyhow::Result<crate::alive::ProbeMeasurement> {
+    if cancel.is_cancelled() {
+        return Err(crate::alive::HealthCheckError::Stopped.into());
+    }
+    let tasks = Arc::new(crate::runtime::TaskOwner::production());
+    let endpoint =
+        match packet_transport_endpoint_with_metrics(transport, target, false, Some(&tasks)) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tasks.close().await;
+                if tasks.has_failed() {
+                    cancel.report_cleanup_failure();
+                }
+                return Err(error.into());
+            }
+        };
+    let result = async {
+        let start = Instant::now();
+        let connecting = endpoint
+            .endpoint()
+            .connect_with(config.clone(), target, server_name)
+            .context("create QUIC connecting")?;
+        let conn = cancel
+            .run(tokio::time::timeout(timeout, connecting))
+            .await
+            .ok_or(crate::alive::HealthCheckError::Stopped)?
+            .context("QUIC handshake timeout")
+            .and_then(|result| result.map_err(anyhow::Error::from))
+            .map_err(|error| endpoint.terminal_error().map_or(error, anyhow::Error::from))?;
+        let measured = crate::alive::ProbeMeasurement {
+            latency: start.elapsed(),
+            observed_at: std::time::SystemTime::now(),
+        };
+        conn.close(quinn::VarInt::from_u32(0), b"probe");
+        Ok(measured)
+    }
+    .await;
+    let joined = endpoint.close(Duration::from_secs(2)).await;
+    tasks.close().await;
+    if !joined || tasks.has_failed() {
+        cancel.report_cleanup_failure();
+        return result.and_then(|_| Err(crate::alive::HealthCheckError::WorkerFailed.into()));
+    }
+    result
 }
 
 #[cfg(test)]
