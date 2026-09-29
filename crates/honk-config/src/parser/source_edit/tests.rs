@@ -254,6 +254,35 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
 }
 
 #[test]
+fn managed_subscription_options_equal_to_built_in_defaults_override_assets() {
+    let text = "subscription {\n    a: 'https://example.test/a'\n}\nassets {\n    subscription {\n        ua: 'clash.meta'\n        interval: 3600s\n        cache: false\n    }\n}\n";
+    let loaded = managed_source(text);
+    let options = SubscriptionOptions {
+        update_interval: Some(86400),
+        user_agent: None,
+        cache: Some(true),
+    };
+    let edited =
+        append_subscription_source(&loaded.sources[0], "b", "https://example.test/b", &options)
+            .unwrap();
+    assert!(
+        edited.contains(
+            "    b: 'https://example.test/b' {\n        interval: 86400s\n        cache: true\n    }"
+        ),
+        "{edited}"
+    );
+    let config = managed_source(&edited).config;
+    let [first, added] = config.subscriptions.as_slice() else {
+        panic!("two subscriptions");
+    };
+    assert_eq!(first.update_interval, 3600);
+    assert!(!first.cache);
+    assert_eq!(added.update_interval, 86400);
+    assert!(added.cache);
+    assert_eq!(added.user_agent.as_deref(), Some("clash.meta"));
+}
+
+#[test]
 fn managed_subscription_deletion_matches_fetch_identity_not_parser_uuid() {
     let declaration = "'same # name': 'https://example.test/sub'('agent:A')";
     let text = format!(

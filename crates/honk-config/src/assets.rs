@@ -30,7 +30,7 @@ pub struct SubscriptionDefaults {
 
 impl AssetsConfig {
     /// The subscription an entry starts from before its own options apply.
-    pub(crate) fn subscription_base(&self) -> Subscription {
+    pub fn subscription_base(&self) -> Subscription {
         let defaults = Subscription::default();
         Subscription {
             user_agent: self.subscription.ua.clone(),

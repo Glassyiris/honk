@@ -355,7 +355,7 @@ const SUBSCRIPTION_STORE_DIR: &str = ".sub";
 pub(crate) const DEFAULT_SUBSCRIPTION_USER_AGENT: &str =
     concat!("honk/", env!("CARGO_PKG_VERSION"));
 
-fn effective_subscription_user_agent(sub: &Subscription) -> &str {
+pub(crate) fn effective_subscription_user_agent(sub: &Subscription) -> &str {
     sub.user_agent
         .as_deref()
         .filter(|value| !value.is_empty())
