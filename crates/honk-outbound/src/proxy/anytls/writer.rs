@@ -254,7 +254,17 @@ pub(super) async fn session_writer(
                 } if succeeded => {
                     session.start_synack_deadline(*sid, pre_write_activity);
                 }
-                FrameCommand::Data { completion, .. } => {
+                FrameCommand::Control {
+                    cmd: CMD_PSH, sid, ..
+                } if succeeded => {
+                    session.observe_request(*sid, false);
+                }
+                FrameCommand::Data {
+                    sid, completion, ..
+                } => {
+                    if succeeded {
+                        session.observe_request(*sid, true);
+                    }
                     if let Some(completion) = completion.take() {
                         let _ = completion.send(succeeded);
                     }
