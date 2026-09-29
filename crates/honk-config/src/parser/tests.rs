@@ -3275,6 +3275,19 @@ mod assets_block {
     }
 
     #[test]
+    fn each_legacy_key_occurrence_warns_at_its_line() {
+        let (_, diagnostics) = parse(&format!(
+            "{GROUP}experimental {{\n native_api {{\n  geosite_download_url: 'https://a.test'\n  geosite_download_url: 'https://b.test'\n }}\n}}"
+        ));
+        let lines: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "legacy-assets-key")
+            .map(|d| (d.line, d.span.is_some()))
+            .collect();
+        assert_eq!(lines, [(Some(6), true), (Some(7), true)], "{diagnostics:?}");
+    }
+
+    #[test]
     fn a_setting_in_both_places_is_refused_naming_both() {
         for (new, old) in [
             (
@@ -3298,11 +3311,17 @@ mod assets_block {
                 "clash_api {\n  external_ui_download_detour: direct\n }",
             ),
         ] {
+            let mut diagnostics = Vec::new();
             let error = parse_dae_config_with_detailed_diagnostics(
                 &format!("assets {{\n {new}\n}}\nexperimental {{\n {old}\n}}"),
-                &mut Vec::new(),
+                &mut diagnostics,
             )
             .unwrap_err();
+            let warning = diagnostics
+                .iter()
+                .find(|d| d.code == "legacy-assets-key")
+                .unwrap();
+            assert_eq!(warning.line, Some(8), "{warning:?}");
             let d = &error.diagnostic;
             assert_eq!(d.code, "conflicting-assets-setting");
             assert!(d.setting.to_string().starts_with("assets."), "{d:?}");

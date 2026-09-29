@@ -747,20 +747,21 @@ pub(super) fn parse_experimental_section(
                     continue;
                 }
                 diagnostics.register_field(key.raw(), value);
-                if name == "clash_api" && key.raw() == "external_controller" {
-                    api_location = Some(diagnostics.field_location("external_controller"));
-                }
-                value.warn_glued_hash(diagnostics);
-                values.insert(key.raw(), value);
-            }
-            for (block, key, _) in crate::diagnostic::LEGACY_ASSETS_KEYS {
-                if block == name && values.contains_key(key) {
+                if let Some(&(block, key, _)) = crate::diagnostic::LEGACY_ASSETS_KEYS
+                    .iter()
+                    .find(|(block, legacy, _)| *block == name && *legacy == key.raw())
+                {
                     diagnostics.emit(crate::diagnostic::legacy_assets_warning(
                         diagnostics.source(),
                         block,
                         key,
                     ));
                 }
+                if name == "clash_api" && key.raw() == "external_controller" {
+                    api_location = Some(diagnostics.field_location("external_controller"));
+                }
+                value.warn_glued_hash(diagnostics);
+                values.insert(key.raw(), value);
             }
             match name {
                 "clash_api" => {
