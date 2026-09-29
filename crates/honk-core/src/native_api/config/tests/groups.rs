@@ -421,7 +421,10 @@ async fn group_config_reports_unset_options_as_null_and_null_clears_them() {
         }
     };
     // Honk still applies its defaults; the group itself sets neither option.
-    let config = fixture.get(&path).await["config"].take();
+    let mut detail = fixture.get(&path).await;
+    let mutable = detail["capabilities"]["mutable_config"].as_array().unwrap();
+    assert!(mutable.contains(&json!("tolerance")));
+    let config = detail["config"].take();
     assert_eq!(config["tolerance"], Value::Null);
     assert_eq!(config["interrupt_connections"], Value::Null);
     let config = edit(json!([

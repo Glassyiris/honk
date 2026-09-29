@@ -14,7 +14,10 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use honk_config::{Config, group::Group};
+use honk_config::{
+    Config,
+    group::{Group, GroupPolicy},
+};
 use honk_outbound::{
     alive::{AliveDialerSet, HealthObservation},
     group::{GroupManager, GroupMember, SelectionNetwork},
@@ -529,7 +532,7 @@ pub(super) async fn group(
         let mutable: Vec<_> = super::groups::FIELDS
             .into_iter()
             .map(|(field, ..)| field)
-            .filter(|field| *field != "tolerance" || tolerance(group).is_some())
+            .filter(|field| *field != "tolerance" || group.policy == GroupPolicy::URLTest)
             .collect();
         value["capabilities"]["mutable_config"] = json!(mutable);
     }
