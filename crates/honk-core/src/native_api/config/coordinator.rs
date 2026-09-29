@@ -187,7 +187,6 @@ impl Worker {
                         self.service.operations.reject(&id, error);
                     }
                 }
-                drop(reservation);
             }
             Work::Validate { request, response } => {
                 let result = self.validate(request).await;
@@ -229,7 +228,6 @@ impl Worker {
                         self.service.operations.reject(&id, error);
                     }
                 }
-                drop(reservation);
             }
             Work::Create {
                 path,
@@ -241,13 +239,11 @@ impl Worker {
                     .prepare_create(path, content, &reservation.principal)
                     .await;
                 self.tree_operation(&id, prepared).await;
-                drop(reservation);
             }
             Work::Import { reservation } => {
                 let id = reservation.id.clone();
                 let prepared = self.prepare_import(&reservation.principal).await;
                 self.tree_operation(&id, prepared).await;
-                drop(reservation);
             }
             Work::ActivateRevision {
                 number,
@@ -284,7 +280,6 @@ impl Worker {
                         .await;
                     self.tree_operation(&id, prepared).await;
                 }
-                drop(reservation);
             }
             Work::Reload { reservation } => {
                 let id = reservation.id.clone();
@@ -326,7 +321,6 @@ impl Worker {
                         self.failed(&id, code, message, details);
                     }
                 }
-                drop(reservation);
             }
             Work::Sighup => match self.load().await {
                 Ok((candidate, sources, diagnostics)) => {
