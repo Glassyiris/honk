@@ -892,3 +892,27 @@ fn subscription_download_detour_names_direct_routing_or_a_group() {
         "routing by default"
     );
 }
+
+#[test]
+fn subscription_entry_route_is_validated_as_download_detour() {
+    use honk_config::parser::parse_dae_config_with_detailed_diagnostics;
+    let parse = |route: &str| {
+        parse_dae_config_with_detailed_diagnostics(
+            &format!(
+                "group {{\n proxy {{ policy: min_moving_avg }}\n}}\nsubscription {{\n own: 'https://example.test/sub' {{ route: {route} }}\n}}"
+            ),
+            &mut Vec::new(),
+        )
+        .unwrap()
+    };
+    for route in ["routing", "direct", "proxy"] {
+        let config = parse(route);
+        assert_eq!(config.subscriptions[0].download_detour, route);
+        config.validate_detailed().unwrap();
+    }
+    let error = parse("missing").validate_detailed().unwrap_err();
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "subscriptions[1].download_detour"
+    );
+}

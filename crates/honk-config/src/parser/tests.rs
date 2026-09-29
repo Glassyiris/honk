@@ -2879,3 +2879,233 @@ group {
     assert_eq!(names("negated"), vec!["b"]);
     assert!(names("tag").is_empty());
 }
+
+#[cfg(test)]
+mod subscription_entry_options {
+    use crate::diagnostic::{DetailedDiagnostic, Severity};
+    use crate::parser::parse_dae_config_with_detailed_diagnostics;
+    use crate::subscription::Subscription;
+
+    fn parse(input: &str) -> (Vec<Subscription>, Vec<DetailedDiagnostic>) {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        (config.subscriptions, diagnostics)
+    }
+
+    type Fetch<'a> = (&'a str, &'a str, Option<&'a str>, u64, bool, &'a str);
+
+    fn fetch(subscription: &Subscription) -> Fetch<'_> {
+        (
+            &subscription.name,
+            &subscription.url,
+            subscription.user_agent.as_deref(),
+            subscription.update_interval,
+            subscription.cache,
+            &subscription.download_detour,
+        )
+    }
+
+    #[test]
+    fn options_follow_the_link_on_the_entry_line() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n b: 'https://example.test/b' {\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  route: direct\n }\n c: 'https://example.test/c' { ua: 'v2rayN' }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [
+                (
+                    "b",
+                    "https://example.test/b",
+                    Some("v2rayN"),
+                    3600,
+                    false,
+                    "direct"
+                ),
+                (
+                    "c",
+                    "https://example.test/c",
+                    Some("v2rayN"),
+                    Subscription::default().update_interval,
+                    true,
+                    ""
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_option_is_read_on_its_own_and_comments_are_skipped() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n ua: 'https://example.test/ua' { # own agent\n  ua: 'clash.meta' # trailing\n }\n \
+             interval: 'https://example.test/interval' {\n  # manual refresh\n  interval: 0\n }\n \
+             cache: 'https://example.test/cache' {\n  cache: false\n }\n \
+             route: 'https://example.test/route' {\n  route: proxy\n }\n \
+             empty: 'https://example.test/empty' {}\n}\ngroup {\n proxy { policy: min_moving_avg }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let defaults = Subscription::default();
+        let default = |name, url| {
+            (
+                name,
+                url,
+                None,
+                defaults.update_interval,
+                defaults.cache,
+                "",
+            )
+        };
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [
+                (
+                    "ua",
+                    "https://example.test/ua",
+                    Some("clash.meta"),
+                    defaults.update_interval,
+                    true,
+                    ""
+                ),
+                (
+                    "interval",
+                    "https://example.test/interval",
+                    None,
+                    0,
+                    true,
+                    ""
+                ),
+                (
+                    "cache",
+                    "https://example.test/cache",
+                    None,
+                    defaults.update_interval,
+                    false,
+                    ""
+                ),
+                (
+                    "route",
+                    "https://example.test/route",
+                    None,
+                    defaults.update_interval,
+                    true,
+                    "proxy"
+                ),
+                default("empty", "https://example.test/empty"),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_forms_read_unchanged_without_warnings() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n a: 'https://example.test/a'\n b: 'https://example.test/b'('clash.meta')\n \
+             c: {\n  url: 'https://example.test/c'\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  download_detour: direct\n }\n \
+             d: {\n  url: 'https://example.test/d'\n  route: direct\n }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let interval = Subscription::default().update_interval;
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [
+                ("a", "https://example.test/a", None, interval, true, ""),
+                (
+                    "b",
+                    "https://example.test/b",
+                    Some("clash.meta"),
+                    interval,
+                    true,
+                    ""
+                ),
+                (
+                    "c",
+                    "https://example.test/c",
+                    Some("v2rayN"),
+                    3600,
+                    false,
+                    "direct"
+                ),
+                (
+                    "d",
+                    "https://example.test/d",
+                    None,
+                    interval,
+                    true,
+                    "direct"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_block_and_entry_options_read_the_same_subscription() {
+        let (old, old_diagnostics) = parse(
+            "subscription {\n s: {\n  url: 'https://example.test/s'\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  download_detour: direct\n }\n}",
+        );
+        let (new, new_diagnostics) = parse(
+            "subscription {\n s: 'https://example.test/s' {\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  route: direct\n }\n}",
+        );
+        assert!(old_diagnostics.is_empty() && new_diagnostics.is_empty());
+        assert_eq!(
+            old.iter().map(fetch).collect::<Vec<_>>(),
+            new.iter().map(fetch).collect::<Vec<_>>()
+        );
+        assert_eq!(old[0].headers, new[0].headers);
+        assert_eq!(old[0].enabled, new[0].enabled);
+    }
+
+    #[test]
+    fn route_and_download_detour_together_are_refused_at_the_entry() {
+        let input = "subscription {\n a: 'https://example.test/a'\n b: {\n  url: 'https://example.test/b'\n  download_detour: direct\n  route: routing\n }\n}";
+        let error = parse_dae_config_with_detailed_diagnostics(input, &mut Vec::new())
+            .expect_err("both keys must be refused");
+        assert_eq!(error.diagnostic.code, "conflicting-subscription-route");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "subscriptions[2].route"
+        );
+        assert_eq!(error.diagnostic.line, Some(6));
+    }
+
+    #[test]
+    fn entry_options_reject_unknown_keys_including_url_and_download_detour() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n a: 'https://example.test/a' {\n  url: 'https://example.test/other'\n  download_detour: direct\n  proxy: x\n  ua: 'v2rayN'\n }\n}",
+        );
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [(
+                "a",
+                "https://example.test/a",
+                Some("v2rayN"),
+                Subscription::default().update_interval,
+                true,
+                ""
+            )]
+        );
+        let unknown = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "unknown-key")
+            .map(|diagnostic| (diagnostic.severity, diagnostic.line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unknown,
+            [
+                (Severity::Warning, Some(3)),
+                (Severity::Warning, Some(4)),
+                (Severity::Warning, Some(5))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_header_that_is_not_a_quoted_link_stays_a_legacy_wrapper() {
+        let (subscriptions, diagnostics) =
+            parse("subscription {\n a: b: {\n  url: 'http://example.test/sub'\n }\n}");
+        assert_eq!(subscriptions.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "legacy-wrapper")
+        );
+    }
+}
