@@ -112,11 +112,11 @@ impl<'d, 'a> ParsedAssets<'d, 'a> {
         match (block, key) {
             ("geodata", "geosite") => self.geosite = Some(value),
             ("geodata", "geoip") => self.geoip = Some(value),
-            ("geodata", _) => self.geodata_route = Some(value),
+            ("geodata", "route") => self.geodata_route = Some(value),
             ("ui", "url") => self.ui_url = Some(value),
-            ("ui", _) => self.ui_route = Some(value),
-            (_, "ua") => defaults.ua = Some(value.raw().to_owned()),
-            (_, "interval") => {
+            ("ui", "route") => self.ui_route = Some(value),
+            ("subscription", "ua") => defaults.ua = Some(value.raw().to_owned()),
+            ("subscription", "interval") => {
                 let raw = value.raw();
                 defaults.interval = Some(super::lenient(
                     crate::types::parse_duration_secs(raw),
@@ -129,7 +129,7 @@ impl<'d, 'a> ParsedAssets<'d, 'a> {
                     },
                 ));
             }
-            _ => {
+            ("subscription", "cache") => {
                 let raw = value.raw();
                 defaults.cache = Some(super::lenient(
                     super::scalars::strict_bool(raw),
@@ -142,6 +142,8 @@ impl<'d, 'a> ParsedAssets<'d, 'a> {
                     },
                 ));
             }
+            // `SUB_BLOCKS` admits only the keys matched above.
+            _ => unreachable!("assets.{block}.{key} is not in SUB_BLOCKS"),
         }
     }
 }
