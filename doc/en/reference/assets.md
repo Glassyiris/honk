@@ -23,7 +23,7 @@ assets {
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `route` | `routing` | Default for every download. `routing` follows the routing rules, `direct` connects directly, and a group name forces that group; an unknown group fails validation. |
+| `route` | `routing` | Default route for the downloads the file configures; when the file sets no route, a geodata route stored through the API stays in effect. `routing` follows the routing rules, `direct` connects directly, and a group name forces that group; an unknown group fails validation. |
 | `geodata.geosite` | Built-in URLs (with a state db) | HTTP(S) source for the loaded geosite asset, at most 4096 bytes. Without a state db, updates require a configured URL. |
 | `geodata.geoip` | Built-in URLs (with a state db) | HTTP(S) source for the loaded geoip asset, with the same limits. |
 | `geodata.route` | `assets.route` | Route for geodata downloads, including checksum requests. With a state db, the URLs and route are written into the stored sources at startup; API changes override them until the next startup. |
@@ -33,9 +33,9 @@ assets {
 | `subscription.interval` | `86400s` | Default periodic refresh interval; `0` disables scheduled refresh. |
 | `subscription.cache` | `true` | Default per-entry body caching, subject to `global.store_subscribe`. |
 
-An entry's options override `assets.subscription` and `assets.route`; `geodata.route` and `ui.route` override `assets.route`. Omitted values use built-in defaults. See the [subscription reference](./subscription.md) for entry syntax and the [API reference](./api.md#geodata-sources-and-automatic-updates) for stored geodata settings.
+An entry's options override `assets.subscription` and `assets.route`; `geodata.route` and `ui.route` override `assets.route`. Built-in defaults apply only where neither of them sets a value. See the [subscription reference](./subscription.md) for entry syntax and the [API reference](./api.md#geodata-sources-and-automatic-updates) for stored geodata settings.
 
-The following `experimental` fields remain accepted as aliases and emit `legacy-assets-key` warnings at each occurrence. Use only one spelling of each setting: specifying its old and new spelling together fails with `conflicting-assets-setting`. A legacy route setting without a corresponding `assets` sub-block route can still override `assets.route`.
+The following `experimental` fields remain accepted as aliases; each occurrence emits its own `legacy-assets-key` warning at that line. A nonempty legacy value together with the matching `assets` setting fails with `conflicting-assets-setting`; an empty legacy value does not conflict. A legacy route setting without a corresponding `assets` sub-block route can still override `assets.route`.
 
 | Legacy setting | Replacement |
 | --- | --- |

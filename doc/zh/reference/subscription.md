@@ -19,7 +19,7 @@ subscription {
 }
 ```
 
-条目块接受 `ua`、`interval`、`cache` 和 `route`。`interval` 是 duration，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。`route` 指定拉取的出口（见下文）。未设置的项依次取 `assets.subscription` 的默认值（出口取 `assets.route`）和内置默认值：User-Agent `honk/<version>`、`86400s`、开启缓存、`routing`。见 [assets 参考](./assets.md)。
+条目块接受 `ua`、`interval`、`cache` 和 `route`。`interval` 是 duration，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。`route` 指定拉取的出口（见下文）。未设置的项依次取 `assets.subscription` 的默认值（出口取 `assets.route`）和内置默认值：User-Agent `honk/<version>`、`86400s`、开启缓存、`routing`。见 [Assets 配置参考](./assets.md)。
 
 两种旧写法仍可读取，且不产生警告：带引号的 URL 后追加 `(UA)`（`compatible: 'https://example.net/sub'(honk/1.0 like)`），以及把 URL 写在块内（`detailed: { url: '…' ua: '…' }`）；后者也接受 `download_detour` 作为 `route` 的别名，两者同时设置时报 `conflicting-subscription-route`。下文关于后缀和紧贴注释的规则适用于 `(UA)` 写法。
 
@@ -85,7 +85,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 订阅正文及其产生的节点都只属于 runtime 状态；两者都不会写回 dae 配置。
 
-订阅拉取默认经过路由，与 honk 自身发起的其他下载一致，除非条目的 `route`（或 `assets.route`）另行指定。`routing` 时拉取目标与用户流量一样经过路由规则，因此规则可将其发往节点、组、`direct` 或 `block`；每次重定向都重新路由。组名则强制经过该组。经路由的请求与 geodata、外部 UI 下载共用路由决策和隧道，发送相同的 `User-Agent` 与 header，并保持 30 秒超时、8 MiB 上限和重定向规则（只跟随 301、302、303、307 和 308，最多 5 次，不从 HTTPS 转到 HTTP，不从公网地址转到私有字面地址）。URL 中的 userinfo 以 basic 认证发送；重定向到其他 scheme、主机或端口时，与直连客户端一样去掉 `Authorization`、`Cookie` 和 `Proxy-Authorization`。`direct` 沿用原有传输：bootstrap resolver 加绕过标记，不经过路由。未启用 `native-api` feature 的构建没有经路由的传输，因此默认值直连，显式的 `routing` 或组名则失败。
+订阅拉取默认经过路由，与 honk 自身发起的其他下载一致，除非条目的 `route`（或 `assets.route`）另行指定。`routing` 时拉取目标与用户流量一样经过路由规则，因此规则可将其发往节点、组、`direct` 或 `block`；每次重定向都重新路由。组名则强制经过该组。经路由的请求与 geodata、外部 UI 下载共用路由决策和隧道，发送相同的 `User-Agent` 与 header，并保持 30 秒超时、8 MiB 上限和重定向规则（只跟随 301、302、303、307 和 308，最多 5 次，不从 HTTPS 转到 HTTP，不从公网地址转到私有字面地址）。URL 中的 userinfo 以 basic 认证发送；重定向到其他 scheme、主机或端口时，与直连客户端一样去掉 `Authorization`、`Cookie` 和 `Proxy-Authorization`。`direct` 沿用原有传输：bootstrap resolver 加绕过标记，不经过路由。未启用 `native-api` feature 的构建同样按上述方式经路由拉取。
 
 订阅可能经由自身提供的节点拉取，例如规则把订阅 URL 发往一个只含该订阅节点的组。全新安装时这些节点尚不存在。honk 不会回退到直连：所选路由没有可用节点时，拉取失败，错误信息指明订阅名和出站，说明该路由暂时无法承载这次下载，并建议为该订阅设置 `route: direct`。原生 API 的 provider 状态中 `last_error.code` 为 `route_unavailable`。期间从已存正文恢复的节点继续生效。
 

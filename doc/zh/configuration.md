@@ -274,7 +274,7 @@ dns {
 
 ## 订阅
 
-每个来源写作 `tag: 'url'`；要单独覆盖 `ua`、`interval`、`cache` 或 `route`，在带引号的 URL 后接一个块。`assets.subscription` 提供共用的 `ua`、`interval` 和 `cache` 默认值；未单独设置出口时使用 `assets.route`。`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会存入状态数据库。请求默认使用 `honk/<version>`，可由 `ua` 覆盖；缓存 key 包含配置中的覆盖值，因此不同请求身份会使用不同的已存正文。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 沿用活动订阅节点，不从存储恢复。获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文。订阅节点仅存在于 runtime。修改 `store_subscribe` 后需重启。
+每个来源写作 `tag: 'url'`；要单独覆盖 `ua`、`interval`、`cache` 或 `route`，在带引号的 URL 后接一个块。`assets.subscription` 提供共用的 `ua`、`interval` 和 `cache` 默认值；未单独设置出口时使用 `assets.route`。`subtag(...)` 匹配的就是该 tag。仅当 `global.store_subscribe`（默认 `true`）与条目生效的 `cache` 均为 `true` 时，成功获取并解析的原始正文才会存入状态数据库。请求默认使用 `honk/<version>`，条目或 `assets.subscription` 设置的 `ua` 会覆盖它；缓存 key 包含配置中的覆盖值，因此不同请求身份会使用不同的已存正文。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 沿用活动订阅节点，不从存储恢复。获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文。订阅节点仅存在于 runtime。修改 `store_subscribe` 后需重启。
 
 详见 [订阅参考](./reference/subscription.md)。
 

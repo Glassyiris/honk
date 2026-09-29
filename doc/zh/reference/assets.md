@@ -23,7 +23,7 @@ assets {
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
-| `route` | `routing` | 所有下载的默认出口。`routing` 遵循流量路由规则，`direct` 直连，组名强制经过该组；未知组在配置校验时被拒绝。 |
+| `route` | `routing` | 配置文件中各项下载的默认出口；文件未指定出口时，已通过 API 保存的 geodata 出口继续生效。`routing` 遵循流量路由规则，`direct` 直连，组名强制经过该组；未知组在配置校验时被拒绝。 |
 | `geodata.geosite` | 内置 URL（有状态库时） | 已加载 geosite 资产的 HTTP(S) 下载来源，最长 4096 字节。没有状态库时，更新要求配置来源。 |
 | `geodata.geoip` | 内置 URL（有状态库时） | 已加载 geoip 资产的 HTTP(S) 下载来源，限制与 geosite 相同。 |
 | `geodata.route` | `assets.route` | Geodata 下载及校验请求的出口。有状态库时，配置中的 URL 和出口在启动时写入已存储来源；API 的修改可在下次启动前覆盖。 |
@@ -33,9 +33,9 @@ assets {
 | `subscription.interval` | `86400s` | 默认定期刷新间隔；`0` 关闭定期刷新。 |
 | `subscription.cache` | `true` | 条目正文的默认缓存开关，仍受 `global.store_subscribe` 限制。 |
 
-条目中的设置优先于 `assets.subscription` 和 `assets.route`；`geodata.route` 与 `ui.route` 优先于 `assets.route`；未设置时使用内置默认值。条目语法见[订阅参考](./subscription.md)，已存储的 geodata 设置见 [API 参考](./api.md#geodata-来源与自动更新)。
+条目中的设置优先于 `assets.subscription` 和 `assets.route`；`geodata.route` 与 `ui.route` 优先于 `assets.route`；两处均未设置时才使用内置默认值。条目语法见[订阅参考](./subscription.md)，已存储的 geodata 设置见 [API 参考](./api.md#geodata-来源与自动更新)。
 
-以下 `experimental` 字段仍作为别名读取，每次出现都会产生 `legacy-assets-key` 警告。同一设置的新旧写法不能并用，否则报 `conflicting-assets-setting`。没有对应 `assets` 子块出口时，旧出口设置仍可覆盖 `assets.route`。
+以下 `experimental` 字段仍作为别名读取，每次出现都会在所在行产生一条 `legacy-assets-key` 警告。旧配置项的值非空且同时设置了对应的新配置项时，报 `conflicting-assets-setting`；旧值为空时不冲突。没有对应 `assets` 子块出口时，旧出口设置仍可覆盖 `assets.route`。
 
 | 旧配置项 | 新配置项 |
 | --- | --- |
