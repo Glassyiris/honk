@@ -135,6 +135,7 @@ impl Worker {
             || geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
                 .await
                 .map_err(|_| failure("loaded_assets_unavailable", &writes))?
+                .0
                 != plan.assets
         {
             return Err(failure("revision_conflict", &writes));
@@ -224,9 +225,10 @@ impl Worker {
             if let Some(sources) = &plan.sources {
                 sources.record(Ok((fetched, false)));
             }
-            let assets = geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
-                .await
-                .map_err(|_| failure("loaded_assets_unavailable", &writes))?;
+            let (assets, _) =
+                geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
+                    .await
+                    .map_err(|_| failure("loaded_assets_unavailable", &writes))?;
             return Ok(self.project(plan, assets).await);
         };
         *activated = true;
@@ -246,7 +248,7 @@ impl Worker {
                 );
                 details
             })?;
-        let assets = geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
+        let (assets, _) = geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
             .await
             .map_err(|_| {
                 let mut details = failure(

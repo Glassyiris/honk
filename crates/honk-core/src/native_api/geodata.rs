@@ -100,7 +100,10 @@ pub(crate) struct Egress<'a> {
     pub(crate) outbounds: Outbounds<'a>,
 }
 
-pub(crate) async fn capture(state: &NativeState) -> Result<Vec<GeoAssetSnapshot>, ApiError> {
+/// The loaded assets and the configuration published with them.
+pub(crate) async fn capture(
+    state: &NativeState,
+) -> Result<(Vec<GeoAssetSnapshot>, Arc<honk_config::Config>), ApiError> {
     capture_assets(&state.traffic_router, &state.config, &state.dns).await
 }
 
@@ -108,10 +111,10 @@ pub(crate) async fn capture_assets(
     traffic_router: &tokio::sync::RwLock<crate::routing::Router>,
     config: &tokio::sync::RwLock<Arc<honk_config::Config>>,
     dns: &crate::dns::DnsService,
-) -> Result<Vec<GeoAssetSnapshot>, ApiError> {
+) -> Result<(Vec<GeoAssetSnapshot>, Arc<honk_config::Config>), ApiError> {
     // Reload publishes under the same router-before-config lock order.
     let router = traffic_router.read().await;
-    let _config = config.read().await;
+    let config = config.read().await;
     let mut assets = router.geo_assets().to_vec();
     for asset in dns.geo_assets() {
         if let Some(previous) = assets
@@ -132,7 +135,7 @@ pub(crate) async fn capture_assets(
         }
     }
     assets.sort_by_key(|asset| if asset.kind == "geosite" { 0 } else { 1 });
-    Ok(assets)
+    Ok((assets, Arc::clone(&config)))
 }
 
 /// The configuration file's download URL for `kind`, empty when it names none.
@@ -323,8 +326,7 @@ fn updatable(state: &NativeState, settings: &NativeApiConfig, assets: &[GeoAsset
 
 pub(super) async fn capability(state: &NativeState) -> Value {
     match capture(state).await {
-        Ok(assets) => {
-            let active = state.config.read().await;
+        Ok((assets, active)) => {
             let can_update = updatable(state, &active.experimental.native_api, &assets);
             let mut value = json!({"available": true, "can_update": can_update,
                 "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>(),
@@ -350,8 +352,7 @@ pub(super) async fn get(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    let assets = capture(state).await?;
-    let active = state.config.read().await;
+    let (assets, active) = capture(state).await?;
     Ok(axum::Json(project(
         assets,
         state.geodata.as_deref(),
@@ -398,9 +399,9 @@ pub(super) async fn update(
 /// reason no update can run.
 async fn queue(state: &Arc<NativeState>, reservation: Reservation) -> bool {
     let prepared = async {
-        let assets = capture(state).await?;
-        let settings = state.config.read().await.experimental.native_api.clone();
-        if !updatable(state, &settings, &assets) {
+        let (assets, active) = capture(state).await?;
+        let settings = &active.experimental.native_api;
+        if !updatable(state, settings, &assets) {
             return Err(unsupported());
         }
         let revision = state
@@ -415,9 +416,9 @@ async fn queue(state: &Arc<NativeState>, reservation: Reservation) -> bool {
             dns: state.dns.clone(),
             urls: assets
                 .iter()
-                .map(|asset| urls(&settings, sources.as_deref(), asset.kind))
+                .map(|asset| urls(settings, sources.as_deref(), asset.kind))
                 .collect(),
-            route: route(&settings, sources.as_deref()),
+            route: route(settings, sources.as_deref()),
             verify_checksum: sources
                 .as_deref()
                 .is_none_or(|sources| sources.effective().verify_checksum),
