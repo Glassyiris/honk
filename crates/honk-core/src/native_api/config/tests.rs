@@ -443,6 +443,13 @@ fn source_path(source: &Value) -> String {
 fn etag(source: &Value) -> String {
     format!("\"{}\"", source["content_sha256"].as_str().unwrap())
 }
+/// `GET /config/sources/{id}` leaves out the list members that change while the bytes do.
+fn source_content(row: &Value) -> Value {
+    let mut row = row.clone();
+    let object = row.as_object_mut().unwrap();
+    assert!(object.remove("writable").is_some() && object.remove("loaded_at").is_some());
+    row
+}
 fn source<'a>(config: &'a Value, content: &str) -> &'a Value {
     config["sources"]
         .as_array()
@@ -620,7 +627,7 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         );
         assert!(!config.to_string().contains(SECRET));
         let main = source(&config, &fixture.originals["main.dae"]);
-        assert_eq!(fixture.get(&source_path(main)).await, *main);
+        assert_eq!(fixture.get(&source_path(main)).await, source_content(main));
         let before = disk(fixture.directory.path());
         error(
             fixture
@@ -671,7 +678,20 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
                 row["content_sha256"]
             );
         }
-        assert_eq!(fixture.get(&source_path(row)).await, *row);
+        let response = fixture
+            .request(Method::GET, &source_path(row))
+            .send()
+            .await
+            .unwrap();
+        // The auth source masks a listener secret, so its body is not what PUT replaces.
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .map(|value| value.to_str().unwrap().to_owned()),
+            (*name != "auth.dae").then(|| etag(row)),
+        );
+        assert_eq!(ok(response).await, source_content(row));
     }
     assert!(!config.to_string().contains(SECRET));
     let before = disk(fixture.directory.path());
@@ -738,7 +758,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
                 &fixture.originals["editable.dae"]
             )))
             .await,
-        *source(&config, &fixture.originals["editable.dae"])
+        source_content(source(&config, &fixture.originals["editable.dae"]))
     );
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;

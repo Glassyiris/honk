@@ -310,7 +310,7 @@ async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
         candidate
     );
     assert_eq!(fixture.get(CONFIG).await, before);
-    assert_eq!(fixture.get(&source_path(main)).await, *main);
+    assert_eq!(fixture.get(&source_path(main)).await, source_content(main));
     fixture.assert_last_reload(&rejected).await;
     let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
     assert_eq!(

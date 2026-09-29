@@ -1,6 +1,7 @@
 //! HTTP adapters for source reads, validation and coordinator admission.
 
 use super::*;
+use axum::http::{HeaderValue, header};
 
 fn if_match(request: &Request) -> Result<IfMatch, ApiError> {
     IfMatch::from_request(request)?.ok_or_else(|| {
@@ -94,14 +95,23 @@ pub(in crate::native_api) async fn source(
         .position(|source| accepted.ids[&source.path] == source_id)
         .ok_or_else(not_found)?;
     let secrets = state.observation.configuration.secrets(Some(accepted));
-    Ok(Json(
-        state
-            .observation
-            .configuration
-            .source_value(accepted, index, &secrets)
-            .0,
-    )
-    .into_response())
+    let (mut value, redacted) = state
+        .observation
+        .configuration
+        .source_value(accepted, index, &secrets);
+    // Both change while the bytes stay the same, so they would break content_sha256 as the tag.
+    let object = value.as_object_mut().expect("source value is an object");
+    object.remove("writable");
+    object.remove("loaded_at");
+    let mut response = Json(value).into_response();
+    // A masked body is not the representation that PUT replaces.
+    if !redacted {
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&format!("\"{}\"", accepted.hashes[index])).expect("hex digest"),
+        );
+    }
+    Ok(response)
 }
 
 pub(in crate::native_api) async fn replace(
