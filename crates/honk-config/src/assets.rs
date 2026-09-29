@@ -5,12 +5,13 @@
 //! the file used. The parser resolves the precedence once, when the file is
 //! read: an entry or sub-block value, then `assets`, then the built-in default.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::subscription::Subscription;
 
 /// Settings of the `assets {}` block that apply to more than one download.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AssetsConfig {
     /// `assets.route`: `routing`, `direct` or a group name; empty follows the
     /// routing rules.
@@ -20,7 +21,8 @@ pub struct AssetsConfig {
 }
 
 /// `assets.subscription { … }`; `None` keeps the built-in default.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SubscriptionDefaults {
     pub ua: Option<String>,
     /// Seconds; `0` turns scheduled refresh off.

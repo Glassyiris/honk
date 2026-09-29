@@ -99,6 +99,24 @@ mod empty_subgroups {
     };
 
     #[test]
+    fn structured_configs_keep_the_assets_block() {
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(config.assets.route, "proxy");
+        for restored in [
+            serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
+            serde_yaml::from_str::<Config>(&serde_yaml::to_string(&config).unwrap()).unwrap(),
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+        ] {
+            assert_eq!(restored.assets, config.assets);
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"assets": {"routes": "direct"}}"#).is_err());
+    }
+
+    #[test]
     fn explicit_empty_contributions_survive_roundtrip_and_refresh() {
         let mut diagnostics = Vec::new();
         let config = parse_dae_config_with_detailed_diagnostics("node {\n edge: 'socks5://127.0.0.1:1080'\n}\nsubscription {\n paid: 'https://example.test/sub'\n}\ngroup {\n empty { filter: group() }\n blank { filter: }\n nested { filter: group(empty) }\n late { filter: subtag(paid) }\n sibling {\n filter: group()\n filter: name(edge)\n final: direct\n }\n}", &mut diagnostics).unwrap();
