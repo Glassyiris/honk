@@ -28,8 +28,6 @@ fn if_match(request: &Request) -> Result<String, ApiError> {
 #[serde(deny_unknown_fields)]
 struct Replacement {
     content: String,
-    #[serde(default, rename = "secrets_redacted")]
-    _secrets_redacted: Option<bool>,
 }
 
 #[derive(Deserialize)]

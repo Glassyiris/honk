@@ -171,33 +171,86 @@ fn route(settings: &NativeApiConfig, sources: Option<&Sources>) -> Route {
     }
 }
 
-/// A URL as `source_redacted` shows it.
+/// A URL as `source_redacted` and `fetched_url_redacted` show it, listener
+/// secrets masked; None when it cannot be shown safely.
 pub(crate) fn redact(
     url: &str,
     secrets: &config::ListenerSecrets,
     service: &config::ConfigService,
-) -> String {
-    service.mask_text(&secrets.mask(url).0).0
+) -> Option<String> {
+    let secret = |text: &str| secrets.contains(text) || service.mask_text(text).1;
+    display_url(url, secret).map(|url| service.mask_text(&secrets.mask(&url).0).0)
 }
 
-/// A URL without userinfo, query and fragment, then masked like
-/// `source_redacted`, for `fetched_url_redacted` and callers without control.
-pub(crate) fn redact_fully(
-    url: &str,
-    secrets: &config::ListenerSecrets,
-    service: &config::ConfigService,
-) -> String {
-    let stripped = match parse_geodata_url(url) {
-        Some(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string()
-        }
-        None => url.split(['?', '#']).next().unwrap_or_default().to_owned(),
-    };
-    redact(&stripped, secrets, service)
+/// The URL without query and fragment, and with every path segment that may
+/// hold a credential replaced. Segments are also checked decoded, because the
+/// parser percent-encodes characters a listener secret may contain. A URL with
+/// userinfo does not parse.
+fn display_url(url: &str, secret: impl Fn(&str) -> bool) -> Option<String> {
+    let mut parsed = parse_geodata_url(url)?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut previous = "";
+    let path = parsed
+        .path()
+        .split('/')
+        .map(|segment| {
+            let hidden = !segment.is_empty()
+                && CREDENTIAL_NAMES
+                    .iter()
+                    .any(|name| previous.eq_ignore_ascii_case(name))
+                || segment.contains([':', '='])
+                || looks_like_token(segment)
+                || secret(&percent_encoding::percent_decode_str(segment).decode_utf8_lossy());
+            previous = segment;
+            if hidden { "[redacted]" } else { segment }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    parsed.set_path(&path);
+    Some(parsed.into())
+}
+
+const CREDENTIAL_NAMES: [&str; 15] = [
+    "access_key",
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "auth_token",
+    "client_secret",
+    "credential",
+    "key",
+    "password",
+    "private_token",
+    "secret",
+    "sig",
+    "signature",
+    "token",
+];
+
+/// Random tokens mix cases and digits, or run long without separators; UUIDs
+/// and 32-digit hex are subscription tokens. Git commit hashes (40-digit
+/// lower-case hex) and dash-separated release tags stay.
+fn looks_like_token(segment: &str) -> bool {
+    let hex = |part: &str| part.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let uuid =
+        segment.split('-').map(str::len).eq([8, 4, 4, 4, 12]) && hex(&segment.replace('-', ""));
+    if uuid || segment.len() == 32 && hex(segment) {
+        return true;
+    }
+    let has = |class: fn(&u8) -> bool| segment.bytes().any(|byte| class(&byte));
+    let url_safe = segment
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    let mixed =
+        has(u8::is_ascii_uppercase) && has(u8::is_ascii_lowercase) && has(u8::is_ascii_digit);
+    let lower_hex = segment
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    url_safe
+        && (segment.len() >= 16 && mixed
+            || segment.len() >= 32 && !segment.contains('-') && !lower_hex)
 }
 
 pub(crate) fn project(
@@ -227,7 +280,7 @@ pub(crate) fn project(
             .map(|asset| {
                 let source_redacted = urls(&active.experimental.native_api, geodata, asset.kind)
                     .first()
-                    .map(|url| redact(url, &secrets, sources));
+                    .and_then(|url| redact(url, &secrets, sources));
                 let origin = geodata.map(|geodata| {
                     let fetched = geodata.fetched(asset.kind, &asset.sha256);
                     Origin {
@@ -238,7 +291,7 @@ pub(crate) fn project(
                             route
                         }),
                         fetched_url_redacted: fetched
-                            .map(|fetched| redact_fully(&fetched.url, &secrets, sources)),
+                            .and_then(|fetched| redact(&fetched.url, &secrets, sources)),
                     }
                 });
                 GeoAsset {

@@ -92,6 +92,8 @@ Routing starts after the startup subscription pass. Only `direct` subscriptions 
 
 Startup parses stored bodies before launching network refreshes. A valid restored body supplies active nodes immediately, so that subscription does not participate in the five-second first-fetch wait. Its network refresh still runs in the background. A missing or invalid stored body is ignored and keeps that subscription in the bounded first-fetch wait until the fetch finishes or the deadline expires; a later valid refresh replaces the corrupt file.
 
+A restored or first-fetched body whose node ID is already used by an inline node or another subscription's node leaves that subscription out of the startup configuration instead of failing startup; a runtime publication rejects the same collision. A body may still replace the subscription's own nodes. The native API provider reports `last_error.code` `publication_rejected` with `last_error.details.diagnostic_code` `duplicate-node-id`. A restored body rejected this way still counts as restored: the subscription does not join the first-fetch wait, and its background refresh still runs and repeats the check.
+
 On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + headers) retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, commits the rebuilt configuration, and then starts an immediate background refresh. It does not read stored bodies, even when no nodes survive for a subscription; stored-body recovery runs only at startup.
 
 Failure handling preserves a usable runtime rather than clearing it:

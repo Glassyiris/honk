@@ -130,6 +130,16 @@ pub(super) fn conflict() -> ApiError {
     )
 }
 
+pub(super) fn referenced(groups: &[&String]) -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        ErrorCode::StateConflict,
+        "Groups still name this node as their final outbound",
+        None,
+    )
+    .with_details(json!({"groups":groups}))
+}
+
 pub(super) fn activation_error(
     stage: &'static str,
     written: Option<bool>,
@@ -147,7 +157,8 @@ pub(super) fn activation_error(
 }
 
 /// The management error contract: every failure carries activation details, and
-/// anything but a request-shaped rejection of a create is retryable unavailability.
+/// anything but a conflict, a stale revision or a request-shaped rejection of a
+/// create is retryable unavailability.
 fn contract_error(mut error: ApiError, deleting: bool) -> ApiError {
     let stage = match error.status {
         StatusCode::PRECONDITION_FAILED => "revision_conflict",
@@ -158,12 +169,14 @@ fn contract_error(mut error: ApiError, deleting: bool) -> ApiError {
     };
     if !matches!(
         error.status,
-        StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::NOT_FOUND
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::CONFLICT
+            | StatusCode::PRECONDITION_FAILED
     ) && (deleting
         || !matches!(
             error.status,
-            StatusCode::CONFLICT
-                | StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::UNPROCESSABLE_ENTITY
                 | StatusCode::BAD_REQUEST
                 | StatusCode::PAYLOAD_TOO_LARGE
                 | StatusCode::UNSUPPORTED_MEDIA_TYPE
@@ -194,16 +207,16 @@ pub(super) async fn mutate(
         return Err(unsupported());
     }
     let deleting = matches!(action, Action::Delete(_));
+    parse_query(request.uri(), &[], id)?;
+    if !deleting {
+        config::json_type(&request)?;
+    }
+    let body = super::body::buffered(request.into_body()).await;
+    if deleting && !body.is_empty() {
+        return Err(invalid());
+    }
     let result = async {
-        parse_query(request.uri(), &[], id)?;
-        if !deleting {
-            config::json_type(&request)?;
-        }
-        let body = super::body::buffered(request.into_body()).await;
         let mutation = match action {
-            Action::Delete(_) if !body.is_empty() => {
-                return Err(invalid());
-            }
             Action::Delete(mutation) => mutation,
             Action::CreateNode => {
                 let input: NodeCreate = super::body::decode(&body, invalid)?;

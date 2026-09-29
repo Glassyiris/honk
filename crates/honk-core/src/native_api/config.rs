@@ -816,16 +816,12 @@ struct ValidationSource {
     id: Option<String>,
     path: Option<String>,
     content: String,
-    #[serde(default, rename = "secrets_redacted")]
-    _secrets_redacted: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ValidationRequest {
     sources: Vec<ValidationSource>,
     mode: String,
-    #[serde(default, rename = "secrets_redacted")]
-    _secrets_redacted: Option<bool>,
 }
 
 fn project_diagnostic(

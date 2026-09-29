@@ -422,6 +422,16 @@ impl Worker {
                 {
                     return Err(management::unsupported());
                 }
+                let identity = catalog.snapshot();
+                let groups: Vec<_> = active
+                    .groups
+                    .iter()
+                    .filter(|group| group.final_outbound.as_deref() == Some(node.name.as_str()))
+                    .filter_map(|group| identity.groups.get(&group.name))
+                    .collect();
+                if !groups.is_empty() {
+                    return Err(management::referenced(&groups));
+                }
                 remove_node_source(main, node.id)
                     .map_err(|_| management::unsupported())?
                     .ok_or_else(management::unsupported)?

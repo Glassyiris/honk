@@ -777,31 +777,40 @@ async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
 }
 
 #[tokio::test]
-async fn echoed_redaction_flag_does_not_grant_write_authority() {
+async fn redaction_flag_is_unknown_in_config_write_bodies() {
     let fixture = Fixture::new(Access::Admin, false).await;
     let config = fixture.get(CONFIG).await;
     let row = source(&config, &fixture.originals["locked.dae"]);
     assert_eq!(row["content"], fixture.originals["locked.dae"]);
     assert_eq!(row["writable"], true);
     let candidate = "# accepted include without an allowlist\n";
-    let admission = accepted(
+    error(
         fixture
             .replace(row, candidate)
             .json(&json!({"content": candidate, "secrets_redacted": false}))
             .send()
             .await
             .unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
     )
     .await;
+    let admission = accepted(fixture.replace(row, candidate).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&admission).await["status"], "succeeded");
-    let response = fixture
-        .request(Method::POST, "/api/v1/config/validate")
-        .json(&json!({"mode":"syntax", "secrets_redacted":true,
-            "sources":[{"content":"routing { fallback: direct }", "secrets_redacted":false}]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok(response).await["valid"], true);
+    for body in [
+        json!({"mode":"syntax", "secrets_redacted":true,
+            "sources":[{"content":"routing { fallback: direct }"}]}),
+        json!({"mode":"syntax",
+            "sources":[{"content":"routing { fallback: direct }", "secrets_redacted":false}]}),
+    ] {
+        let response = fixture
+            .request(Method::POST, "/api/v1/config/validate")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        error(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    }
     fixture.shutdown().await;
 }
 
