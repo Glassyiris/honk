@@ -636,7 +636,7 @@ async fn same_uuid_replacement_cannot_publish_old_fetch_or_borrow_new_authorizat
 }
 
 #[tokio::test]
-async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
+async fn provider_snapshot_is_immutable_and_unknown_cursor_is_expired() {
     let mut origin = Origin::new().await;
     let mut config = Config::default();
     for _ in 0..3 {
@@ -651,25 +651,37 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
     let mut changed = fixture.state.config.read().await.as_ref().clone();
     changed.subscriptions.clear();
     *fixture.state.config.write().await = Arc::new(changed);
-    let rest = fixture
-        .get(&format!("/api/v1/providers?limit=1000&cursor={cursor}"))
-        .await;
-    assert_eq!(rest["providers"].as_array().unwrap().len(), 3);
+    let mut rest = Vec::new();
+    let mut next = cursor.to_owned();
+    loop {
+        let page = fixture
+            .get(&format!("/api/v1/providers?limit=1&cursor={next}"))
+            .await;
+        rest.extend(page["providers"].as_array().unwrap().iter().cloned());
+        match page["next_cursor"].as_str() {
+            Some(cursor) => next = cursor.to_owned(),
+            None => break,
+        }
+    }
+    assert_eq!(rest.len(), 3);
     assert!(
-        rest["providers"]
-            .as_array()
-            .unwrap()
-            .iter()
+        rest.iter()
             .all(|row| row["id"] != first["providers"][0]["id"])
     );
     assert_eq!(origin.count.load(Ordering::SeqCst), 0);
-    let response = fixture
-        .client
-        .get(fixture.url(&format!("/api/v1/providers?cursor={}:1", Uuid::new_v4())))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    for (query, status) in [
+        (format!("limit=2&cursor={cursor}"), StatusCode::BAD_REQUEST),
+        (format!("cursor={}:1", Uuid::new_v4()), StatusCode::GONE),
+        ("cursor=bad".to_owned(), StatusCode::GONE),
+    ] {
+        let response = fixture
+            .client
+            .get(fixture.url(&format!("/api/v1/providers?{query}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
     fixture.stop().await;
     origin.stop().await;
 }
@@ -680,6 +692,7 @@ async fn provider_snapshot_over_budget_is_retryable_snapshot_unavailable() {
     let snapshot = Snapshot {
         id: Uuid::new_v4(),
         instance: "instance".into(),
+        limit: 1,
         created: Instant::now(),
         rows: vec![Provider::inline(0), Provider::inline(0)],
         bytes: MAX_SNAPSHOT_BYTES + 1,

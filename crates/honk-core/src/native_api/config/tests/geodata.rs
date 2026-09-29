@@ -1127,8 +1127,19 @@ async fn the_download_route_names_a_current_group_by_id() {
             json!({"geodata": {"download": {"route": "group", "group_id": "missing"}}}),
         )
         .await,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_value",
+        StatusCode::CONFLICT,
+        "state_conflict",
+    )
+    .await;
+    error(
+        patch_settings(
+            &fixture,
+            json!({"geodata": {"download": {"route": "group", "group_id": "missing"}},
+                "log": {"buffered_records": 1}}),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
     )
     .await;
     assert_eq!(fixture.get(SETTINGS).await["geodata"], before["geodata"]);

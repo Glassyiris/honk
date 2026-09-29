@@ -274,35 +274,46 @@ impl Target {
     }
 }
 
-/// A file `create_new` installed, identified by inode so removal never touches a successor.
+/// A file `create_new` installed, identified by inode and content so removal never
+/// touches a successor or a file edited in place.
 pub(crate) struct CreatedFile {
     directory: File,
     name: OsString,
     // Keeps the inode allocated after an external unlink, so no successor can reuse its number.
     file: File,
+    content: Box<[u8]>,
 }
 
 impl CreatedFile {
-    /// Unlinks the file while its name still holds it. True when the name no longer does.
+    /// Unlinks the file while its name still holds it unchanged. True when the name no
+    /// longer holds it.
     pub(crate) fn remove(&self) -> bool {
+        // O_NONBLOCK: a FIFO put at the name must not stall the open.
         let current = openat(
             &self.directory,
             self.name.as_os_str(),
-            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
             Mode::empty(),
         );
         match current.map(File::from) {
-            Ok(current) => current.metadata().is_ok_and(|metadata| {
-                self.file
-                    .metadata()
-                    .is_ok_and(|created| same_inode(&metadata, &created))
+            Ok(current) => {
+                let mut read = Vec::new();
+                current.metadata().is_ok_and(|metadata| {
+                    self.file
+                        .metadata()
+                        .is_ok_and(|created| same_inode(&metadata, &created))
+                }) && (&current)
+                    .take(self.content.len() as u64 + 1)
+                    .read_to_end(&mut read)
+                    .is_ok()
+                    && *read == *self.content
                     && unlinkat(
                         &self.directory,
                         self.name.as_os_str(),
                         UnlinkatFlags::NoRemoveDir,
                     )
                     .is_ok()
-            }),
+            }
             Err(error) => error == Errno::ENOENT,
         }
     }
@@ -339,6 +350,7 @@ pub(crate) fn create_new(
         directory: target.directory,
         name: target.filename,
         file,
+        content: content.into(),
     })
 }
 

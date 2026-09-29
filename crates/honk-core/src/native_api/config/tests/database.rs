@@ -539,10 +539,11 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     let terminal = fixture.terminal(&admitted).await;
     assert_eq!(terminal["status"], "failed", "{terminal}");
     assert_eq!(terminal["error"]["code"], "store_unavailable");
-    assert_eq!(
-        terminal["error"]["details"],
-        json!({"stage":"store","committed":true,"durable":false})
-    );
+    let details = &terminal["error"]["details"];
+    assert_eq!(details["committed"], true);
+    assert_eq!(details["written"], false);
+    assert!(details["active_generation_id"].is_string(), "{details}");
+    assert!(details.get("stage").is_none());
     assert_eq!(store.head(), Ok(Some(1)));
     let config = fixture.get(CONFIG).await;
     assert_eq!(
@@ -622,9 +623,10 @@ async fn unconfirmed_activation_blocks_writes() {
     .await;
     let terminal = fixture.terminal(&operation).await;
     assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["code"], "activation_unconfirmed");
     assert_eq!(
         terminal["error"]["details"],
-        json!({"stage":"store","committed":null})
+        json!({"committed":null,"written":false})
     );
     assert_eq!(store.head(), Ok(Some(1)));
     assert_eq!(fixture.get(CONFIG).await["store"]["recorded"], false);

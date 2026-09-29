@@ -415,6 +415,17 @@ fn created_file_is_removed_only_while_its_name_holds_it() {
     assert!(!target.exists());
     assert!(created.remove(), "already gone");
 
+    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&target)
+        .unwrap()
+        .write_all(b"# edited\n")
+        .unwrap();
+    assert!(!created.remove(), "edited in place");
+    assert!(target.exists());
+    fs::remove_file(&target).unwrap();
+
     // ext4 hands a freed inode number to the next file it creates; repeat to give it the chance.
     for _ in 0..32 {
         let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();

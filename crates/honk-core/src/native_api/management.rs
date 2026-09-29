@@ -147,15 +147,25 @@ pub(super) fn activation_error(
     written: Option<bool>,
     durability: Option<bool>,
     committed: Option<bool>,
+    active_generation_id: Option<String>,
 ) -> ApiError {
+    let mut details = json!({"stage":stage,"committed":committed});
+    if let Some(written) = written {
+        details["written"] = json!(written);
+    }
+    if let Some(durability) = durability {
+        details["durability_confirmed"] = json!(durability);
+    }
+    if committed == Some(true) {
+        details["active_generation_id"] = json!(active_generation_id);
+    }
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::TemporarilyUnavailable,
         "Managed configuration change did not complete successfully",
         None,
     )
-    .with_details(json!({"stage":stage,"written":written,
-            "durability_confirmed":durability,"committed":committed}))
+    .with_details(details)
 }
 
 pub(super) async fn mutate(

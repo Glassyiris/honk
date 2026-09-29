@@ -349,31 +349,56 @@ async fn native_catalog_masks_listener_secrets_without_changing_membership_or_cu
     );
     assert_eq!(first["nodes"][0]["group_ids"], json!([child_id]));
     let cursor = first["next_cursor"].as_str().unwrap();
-    let resumed = response_json(
-        app.get(&format!(
-            "/api/v1/nodes?group_id={child_id}&limit=100&cursor={cursor}"
-        ))
-        .send()
-        .await
-        .unwrap(),
-    )
-    .await;
+    let resume = |cursor: String| {
+        let request = app.get(&format!(
+            "/api/v1/nodes?group_id={child_id}&limit=1&cursor={cursor}"
+        ));
+        async move { response_json(request.send().await.unwrap()).await }
+    };
+    let resumed = resume(cursor.to_owned()).await;
     clean(&resumed);
     assert_eq!(resumed["observed_at"], first["observed_at"]);
     assert_eq!(resumed["nodes"][0]["id"], nodes[1].id.to_string());
     assert_eq!(resumed["nodes"][0]["name"], "node-1-<redacted>-<redacted>");
-    assert_eq!(resumed["nodes"][1]["id"], nodes[2].id.to_string());
-    assert_eq!(resumed["nodes"][1]["name"], "ordinary-node");
-    assert!(resumed["next_cursor"].is_null());
-    error_response(
-        app.get(&format!("/api/v1/nodes?cursor={cursor}"))
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-    )
-    .await;
+    let last = resume(resumed["next_cursor"].as_str().unwrap().to_owned()).await;
+    assert_eq!(last["nodes"][0]["id"], nodes[2].id.to_string());
+    assert_eq!(last["nodes"][0]["name"], "ordinary-node");
+    assert!(last["next_cursor"].is_null());
+    for (query, status, code) in [
+        (
+            format!("group_id={child_id}&limit=100&cursor={cursor}"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            format!("limit=1&cursor={cursor}"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            format!(
+                "group_id={child_id}&limit=1&cursor={}:1",
+                uuid::Uuid::new_v4()
+            ),
+            StatusCode::GONE,
+            "snapshot_expired",
+        ),
+        (
+            "cursor=bad".to_owned(),
+            StatusCode::GONE,
+            "snapshot_expired",
+        ),
+    ] {
+        error_response(
+            app.get(&format!("/api/v1/nodes?{query}"))
+                .send()
+                .await
+                .unwrap(),
+            status,
+            code,
+        )
+        .await;
+    }
 
     let single = response_json(
         app.get(&format!("/api/v1/nodes/{}", nodes[0].id))
@@ -554,9 +579,28 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
         }
     }
     let before = response_json(app.get(path).send().await.unwrap()).await;
+    for patch in [
+        json!({"record_flows": true, "record_logs": true}),
+        json!({"log": {"level": "debug"}}),
+    ] {
+        error_response(
+            app.client
+                .patch(app.url(path))
+                .bearer_auth(SECRET)
+                .json(&patch)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_value",
+        )
+        .await;
+        let after = response_json(app.get(path).send().await.unwrap()).await;
+        assert_eq!(after["recording"], before["recording"]);
+    }
     for (patch, details) in [
         (
-            json!({"record_flows": true, "record_logs": true}),
+            json!({"record_logs": true, "dns_log": {"max_records": 1}}),
             Value::Null,
         ),
         (json!({"record_flows": null}), Value::Null),
@@ -605,11 +649,7 @@ async fn native_only_successful_observation_gets_attach() {
             ),
             (Method::GET, "/api/v1/flows?cursor=bad", StatusCode::GONE),
             (Method::GET, "/api/v1/flows/unknown", StatusCode::NOT_FOUND),
-            (
-                Method::GET,
-                "/api/v1/dns/log?cursor=bad",
-                StatusCode::BAD_REQUEST,
-            ),
+            (Method::GET, "/api/v1/dns/log?cursor=bad", StatusCode::GONE),
             (
                 Method::GET,
                 "/api/v1/events?kinds=invalid",
@@ -762,10 +802,14 @@ async fn native_rejected_flow_streams_cannot_activate_capture() {
         next_event(&mut stream, &mut String::new()).await;
         streams.push(stream);
     }
-    assert_eq!(
-        app.get(path).send().await.unwrap().status(),
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    let full = app.get(path).send().await.unwrap();
+    assert!(full.headers().contains_key("retry-after"));
+    error_response(
+        full,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
     let settings = response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
     assert_eq!(settings["recording"]["flows"]["active"], false);
     assert_eq!(settings["recording"]["events"]["active"], true);

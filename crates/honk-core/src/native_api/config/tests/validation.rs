@@ -250,7 +250,7 @@ async fn request_bodies_name_the_failing_field_without_echoing_values() {
             json!({"name":"PRIVATE"}),
             json!({
                 "field":"link","kind":"missing","stage":"admission",
-                "written":false,"durability_confirmed":false,"committed":false
+                "written":false,"committed":false
             }),
         ),
         (

@@ -564,13 +564,24 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
     for access in [Access::Metadata, Access::Anonymous] {
         let fixture = Fixture::new(access, false).await;
         let capabilities = fixture.get("/api/v1/capabilities").await;
-        assert_eq!(capabilities["resources"]["config"]["content"], true);
+        assert!(capabilities["resources"]["config"].get("content").is_none());
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
         assert_eq!(capabilities["resources"]["config"]["create"], false);
-        // Replacement content travels in one JSON body, so it cannot exceed that body limit.
+        assert!(
+            capabilities["resources"]["config"]["max_bytes"]
+                .as_u64()
+                .unwrap()
+                < capabilities["limits"]["max_json_body_bytes"]
+                    .as_u64()
+                    .unwrap()
+        );
         assert_eq!(
-            capabilities["resources"]["config"]["max_bytes"],
-            capabilities["limits"]["max_json_body_bytes"]
+            capabilities["resources"]["operations"]["max_replay_keys"],
+            1024
+        );
+        assert_eq!(
+            capabilities["resources"]["providers"]["create_unfetched"],
+            true
         );
         // Full validation also counts dependencies read from disk, not only the request body.
         assert_eq!(
@@ -800,6 +811,16 @@ async fn retired_content_flag_grants_no_write_authority_and_the_redaction_flag_i
             .unwrap(),
         StatusCode::BAD_REQUEST,
         "invalid_request",
+    )
+    .await;
+    error(
+        fixture
+            .replace(row, &"#".repeat(super::MAX_CONTENT_BYTES + 1))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request_too_large",
     )
     .await;
     let admission = accepted(fixture.replace(row, candidate).send().await.unwrap()).await;

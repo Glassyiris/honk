@@ -357,13 +357,14 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
         filters("udp", "active", true, 1),
         filters("tcp", "closed", true, 1),
         filters("tcp", "active", false, 1),
+        filters("tcp", "active", true, 2),
     ] {
         error_code(
             store
                 .page(changed, Some(cursor), &request_id())
                 .unwrap_err(),
-            StatusCode::GONE,
-            "snapshot_expired",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
         );
     }
     let other_instance = super::tests::store();
@@ -379,6 +380,15 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
         store.page(query, Some(cursor), &request_id()).unwrap_err(),
         StatusCode::GONE,
         "snapshot_expired",
+    );
+}
+
+#[test]
+fn a_snapshot_over_its_budget_is_snapshot_unavailable() {
+    error_code(
+        super::snapshot_busy(&request_id()),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "snapshot_unavailable",
     );
 }
 

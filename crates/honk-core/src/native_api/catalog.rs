@@ -100,10 +100,11 @@ impl Catalog {
 
     fn page(
         &self,
-        snapshot: NodeSnapshot,
+        mut snapshot: NodeSnapshot,
         limit: usize,
         id: &RequestId,
     ) -> Result<Response, ApiError> {
+        snapshot.limit = limit;
         let response = snapshot.page(0, limit);
         if snapshot.nodes.len() > limit {
             let mut snapshots = self.snapshots.lock();
@@ -132,17 +133,19 @@ impl Catalog {
         limit: usize,
         id: &RequestId,
     ) -> Result<Response, ApiError> {
-        let (snapshot_id, offset) = cursor.split_once(':').ok_or_else(|| invalid_query(id))?;
-        let snapshot_id = Uuid::parse_str(snapshot_id).map_err(|_| invalid_query(id))?;
-        let offset: usize = offset.parse().map_err(|_| invalid_query(id))?;
+        let (snapshot_id, offset) = cursor.split_once(':').ok_or_else(|| snapshot_expired(id))?;
+        let snapshot_id = Uuid::parse_str(snapshot_id).map_err(|_| snapshot_expired(id))?;
+        let offset: usize = offset.parse().map_err(|_| snapshot_expired(id))?;
         let mut snapshots = self.snapshots.lock();
         snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
         let snapshot = snapshots
             .iter()
             .find(|snapshot| snapshot.id == snapshot_id)
-            .ok_or_else(|| invalid_query(id))?;
-        if snapshot.group_id.as_deref() != group_id || offset == 0 || offset >= snapshot.nodes.len()
-        {
+            .ok_or_else(|| snapshot_expired(id))?;
+        if offset == 0 || offset >= snapshot.nodes.len() {
+            return Err(snapshot_expired(id));
+        }
+        if snapshot.group_id.as_deref() != group_id || snapshot.limit != limit {
             return Err(invalid_query(id));
         }
         Ok(snapshot.page(offset, limit))
@@ -231,6 +234,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
 struct NodeSnapshot {
     id: Uuid,
     group_id: Option<String>,
+    limit: usize,
     observed_at: String,
     created: Instant,
     nodes: Vec<Box<str>>,
@@ -427,6 +431,7 @@ fn node_snapshot(
     let mut snapshot = NodeSnapshot {
         id: Uuid::new_v4(),
         group_id: group_id.map(str::to_owned),
+        limit: 0,
         observed_at: timestamp(SystemTime::now()),
         created: Instant::now(),
         nodes: Vec::new(),
@@ -786,6 +791,15 @@ fn group_not_found(id: &RequestId) -> ApiError {
         StatusCode::NOT_FOUND,
         ErrorCode::ResourceNotFound,
         "Group not found",
+        id,
+    )
+}
+
+pub(super) fn snapshot_expired(id: &RequestId) -> ApiError {
+    error(
+        StatusCode::GONE,
+        ErrorCode::SnapshotExpired,
+        "Page cursor expired",
         id,
     )
 }
