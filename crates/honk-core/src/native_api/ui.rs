@@ -161,6 +161,7 @@ fn embedded_response(path: &str, navigation: bool, head: bool) -> Response {
         "json" => "application/json",
         "webmanifest" => "application/manifest+json",
         "png" => "image/png",
+        "webp" => "image/webp",
         "txt" => "text/plain",
         _ => "application/octet-stream",
     };
