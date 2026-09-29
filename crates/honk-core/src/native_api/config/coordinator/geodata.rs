@@ -225,11 +225,11 @@ impl Worker {
             if let Some(sources) = &plan.sources {
                 sources.record(Ok((fetched, false)));
             }
-            let (assets, _) =
+            let (assets, published) =
                 geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
                     .await
                     .map_err(|_| failure("loaded_assets_unavailable", &writes))?;
-            return Ok(self.project(plan, assets).await);
+            return Ok(self.project(plan, assets, &published));
         };
         *activated = true;
         self.activation
@@ -248,16 +248,17 @@ impl Worker {
                 );
                 details
             })?;
-        let (assets, _) = geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
-            .await
-            .map_err(|_| {
-                let mut details = failure(
-                    "published_assets_unavailable",
-                    prepared.iter().map(|asset| &asset.receipt),
-                );
-                details["committed"] = json!(true);
-                details
-            })?;
+        let (assets, published) =
+            geodata::capture_assets(&plan.traffic_router, &self.active, &plan.dns)
+                .await
+                .map_err(|_| {
+                    let mut details = failure(
+                        "published_assets_unavailable",
+                        prepared.iter().map(|asset| &asset.receipt),
+                    );
+                    details["committed"] = json!(true);
+                    details
+                })?;
         // A kept file may still be published under the path its unchanged router recorded.
         if assets.len() != prepared.len()
             || assets.iter().zip(&prepared).any(|(actual, prepared)| {
@@ -283,19 +284,19 @@ impl Worker {
                 .any(|(original, prepared)| original.sha256 != prepared.snapshot.sha256);
             sources.record(Ok((fetched, replaced)));
         }
-        Ok(self.project(plan, assets).await)
+        Ok(self.project(plan, assets, &published))
     }
 
-    async fn project(
+    fn project(
         &self,
         plan: &GeoUpdatePlan,
         assets: Vec<GeoAssetSnapshot>,
+        published: &Config,
     ) -> geodata::GeoData {
-        let active = self.active.read().await;
         geodata::project(
             assets,
             plan.sources.as_deref(),
-            &active,
+            published,
             &self.service,
             |name| geodata::group_id(&plan.catalog, name),
         )
