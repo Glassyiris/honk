@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ipnet::IpNet;
 
@@ -45,6 +46,24 @@ impl IpMatcher {
 
     pub fn matches(&self, ip: &IpAddr) -> bool {
         self.trie.matches(ip)
+    }
+}
+
+/// Matchers shared by the traffic and DNS routers of one build. Keep it local
+/// to the build so a reload never pins the previous generation's matchers.
+#[derive(Default)]
+pub(crate) struct SharedMatchers {
+    ip: Vec<Arc<IpMatcher>>,
+}
+
+impl SharedMatchers {
+    pub(crate) fn ip(&mut self, nets: Vec<IpNet>) -> Arc<IpMatcher> {
+        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
+            return Arc::clone(matcher);
+        }
+        let matcher = Arc::new(IpMatcher::new(nets));
+        self.ip.push(Arc::clone(&matcher));
+        matcher
     }
 }
 

@@ -18,6 +18,7 @@ pub(crate) mod native;
 #[cfg(feature = "native-api")]
 pub(crate) use geo::GeoAssetSnapshot;
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
+pub(crate) use ir::SharedMatchers;
 pub use ir::{CompiledCondition, CompiledPredicate, IpMatcher, PortRange};
 pub(crate) use lpm::BinaryLpmTrie;
 
@@ -157,24 +158,6 @@ impl GeositeMatcher {
             return true;
         }
         bounded_any::<BOUNDED, _>(&self.regex, deadline, |re| re.is_match(domain))
-    }
-}
-
-/// Matchers shared by the traffic and DNS routers of one build. Keep it local
-/// to the build so a reload never pins the previous generation's matchers.
-#[derive(Default)]
-pub(crate) struct SharedMatchers {
-    ip: Vec<Arc<IpMatcher>>,
-}
-
-impl SharedMatchers {
-    pub(crate) fn ip(&mut self, nets: Vec<ipnet::IpNet>) -> Arc<IpMatcher> {
-        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
-            return Arc::clone(matcher);
-        }
-        let matcher = Arc::new(IpMatcher::new(nets));
-        self.ip.push(Arc::clone(&matcher));
-        matcher
     }
 }
 
