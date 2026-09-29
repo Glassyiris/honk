@@ -3,15 +3,15 @@
 use std::sync::Arc;
 
 use axum::extract::{Extension, Request, State};
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, any, delete, get, post, put};
+use axum::routing::{MethodRouter, delete, get, post, put};
 use axum::{Json, Router};
 
 use super::{
     ApiError, ErrorCode, NativeState, catalog, config, connections, datapath, dns, error, events,
-    flows, geodata, groups, logs, management, not_found, parse_query, probes, providers, routing,
-    security, settings, telemetry, types,
+    flows, geodata, groups, logs, management, parse_query, probes, providers, routing, security,
+    settings, telemetry, types,
 };
 use types::RequestId;
 
@@ -652,8 +652,26 @@ fn resource(
             security::preflight(&request, methods, &id.0)
                 .unwrap_or_else(IntoResponse::into_response)
         })
-        // Unlike the default 405 fallback, this preserves the native JSON 404 without Allow.
-        .merge(any(not_found))
+        // Replaces axum's empty 405 with the native JSON error.
+        .fallback(move |Extension(id): Id| async move {
+            let mut response = error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                ErrorCode::MethodNotAllowed,
+                "Method not allowed",
+                &id,
+            )
+            .into_response();
+            // `get()` also serves HEAD, so a GET resource must advertise it.
+            let mut allow = methods.join(", ");
+            if methods.contains(&"GET") {
+                allow.push_str(", HEAD");
+            }
+            response.headers_mut().insert(
+                header::ALLOW,
+                HeaderValue::from_str(&allow).expect("static method names"),
+            );
+            response
+        })
 }
 
 async fn discovery(

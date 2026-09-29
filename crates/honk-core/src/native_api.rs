@@ -962,4 +962,49 @@ mod tests {
             assert_eq!(observed, timestamp(parsed.into()));
         }
     }
+
+    #[tokio::test]
+    async fn known_paths_answer_405_with_allow_and_unknown_paths_404() {
+        use tower::ServiceExt as _;
+
+        let app = router(state().await).layer(axum::Extension(Peer("127.0.0.1".parse().unwrap())));
+        for (method, path, status, code, allow) in [
+            (
+                "DELETE",
+                "/api/v1/runtime",
+                405,
+                "method_not_allowed",
+                Some("GET, HEAD"),
+            ),
+            ("PUT", "/api/v1/nowhere", 404, "resource_not_found", None),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("host", "127.0.0.1:9527")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("allow")
+                    .map(|value| value.to_str().unwrap()),
+                allow,
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], code);
+        }
+    }
 }
