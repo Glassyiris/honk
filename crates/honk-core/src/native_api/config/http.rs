@@ -2,26 +2,15 @@
 
 use super::*;
 
-fn if_match(request: &Request) -> Result<String, ApiError> {
-    let tag = request_header(request, "if-match")?.ok_or_else(|| {
+fn if_match(request: &Request) -> Result<IfMatch, ApiError> {
+    IfMatch::from_request(request)?.ok_or_else(|| {
         ApiError::new(
             StatusCode::PRECONDITION_REQUIRED,
             ErrorCode::PreconditionRequired,
             "A strong source revision is required",
             None,
         )
-    })?;
-    let hash = tag
-        .strip_prefix('"')
-        .and_then(|tag| tag.strip_suffix('"'))
-        .filter(|hash| {
-            hash.len() == 64
-                && hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or_else(|| invalid().with_details(json!({"header":"if-match","kind":"malformed"})))?;
-    Ok(hash.to_owned())
+    })
 }
 
 #[derive(Deserialize)]

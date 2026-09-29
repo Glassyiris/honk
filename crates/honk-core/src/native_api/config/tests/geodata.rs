@@ -263,8 +263,8 @@ async fn source_write_rejects_swapped_geo_readers_before_rename() {
             .unwrap()
             .unwrap()
             .unwrap(),
-        StatusCode::PRECONDITION_FAILED,
-        "stale_revision",
+        StatusCode::CONFLICT,
+        "state_conflict",
     )
     .await;
     assert_eq!(

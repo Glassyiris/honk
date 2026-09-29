@@ -322,7 +322,7 @@ enum Work {
     Replace {
         source_id: String,
         content: String,
-        if_match: String,
+        if_match: IfMatch,
         reservation: Reservation,
     },
     Create {
@@ -797,6 +797,72 @@ pub(super) fn request_header<'a>(
         .map(|value| value.to_str().map_err(|_| rejected("not_text")))
         .transpose()
 }
+/// An `If-Match` condition evaluated as RFC 9110 §13.1.1 defines. Weak tags are dropped on
+/// parsing because they never match.
+#[derive(Clone, Debug)]
+pub(super) enum IfMatch {
+    Any,
+    Tags(Vec<String>),
+}
+
+impl IfMatch {
+    /// Reads every `If-Match` field line as one list; `None` when the header is absent.
+    pub(super) fn from_request(request: &Request) -> Result<Option<Self>, ApiError> {
+        let rejected = |kind| invalid().with_details(json!({"header":"if-match","kind":kind}));
+        let mut lines = Vec::new();
+        for value in request.headers().get_all("if-match") {
+            lines.push(value.to_str().map_err(|_| rejected("not_text"))?);
+        }
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        Self::parse(&lines.join(","))
+            .map(Some)
+            .ok_or_else(|| rejected("malformed"))
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        const OWS: [char; 2] = [' ', '\t'];
+        let mut rest = value.trim_matches(OWS);
+        if rest == "*" {
+            return Some(Self::Any);
+        }
+        // An empty value, or one made only of empty list elements, is not a list of tags.
+        let mut elements = 0;
+        let mut tags = Vec::new();
+        while !rest.is_empty() {
+            if let Some(next) = rest.strip_prefix(',') {
+                rest = next.trim_start_matches(OWS);
+                continue;
+            }
+            let weak = rest.starts_with("W/");
+            let quoted = rest.strip_prefix("W/").unwrap_or(rest).strip_prefix('"')?;
+            let end = quoted.find('"')?;
+            let opaque = &quoted[..end];
+            if !opaque.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return None;
+            }
+            rest = quoted[end + 1..].trim_start_matches(OWS);
+            if !rest.is_empty() && !rest.starts_with(',') {
+                return None;
+            }
+            elements += 1;
+            if !weak {
+                tags.push(opaque.to_owned());
+            }
+        }
+        (elements > 0).then_some(Self::Tags(tags))
+    }
+
+    /// Whether the condition holds for an existing resource whose strong tag is `current`.
+    pub(super) fn matches(&self, current: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Tags(tags) => tags.iter().any(|tag| tag == current),
+        }
+    }
+}
+
 pub(super) fn json_type(request: &Request) -> Result<(), ApiError> {
     if request_header(request, "content-type")?
         .and_then(|value| value.split(';').next())

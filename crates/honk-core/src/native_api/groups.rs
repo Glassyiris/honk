@@ -57,7 +57,7 @@ pub(super) struct GroupPatch {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) revision: String,
-    pub(super) expected: Result<String, ApiError>,
+    pub(super) expected: Result<config::IfMatch, ApiError>,
     group: Group,
     members: Vec<(String, String)>,
     operations: Value,
@@ -371,26 +371,15 @@ pub(super) async fn patch(
             None,
         ));
     }
-    let expected = config::request_header(&request, "if-match").and_then(|tag| {
-        let tag = tag.ok_or_else(|| {
+    let expected = config::IfMatch::from_request(&request).and_then(|condition| {
+        condition.ok_or_else(|| {
             ApiError::new(
                 StatusCode::PRECONDITION_REQUIRED,
                 ErrorCode::PreconditionRequired,
                 "A strong group revision is required",
                 None,
             )
-        })?;
-        let value = tag
-            .strip_prefix('"')
-            .and_then(|tag| tag.strip_suffix('"'))
-            .filter(|tag| {
-                !tag.is_empty()
-                    && tag
-                        .bytes()
-                        .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b',')
-            })
-            .ok_or_else(invalid)?;
-        Ok(value.to_owned())
+        })
     });
     let key = config::request_header(&request, "idempotency-key")?.map(str::to_owned);
     let path = request.uri().path().to_owned();
@@ -586,7 +575,7 @@ mod tests {
             id: "group".into(),
             name: "G".into(),
             revision: "r".into(),
-            expected: Ok("r".into()),
+            expected: Ok(config::IfMatch::Tags(vec!["r".into()])),
             group: Group {
                 policy: honk_config::group::GroupPolicy::URLTest,
                 own: honk_config::group::OwnOptions {

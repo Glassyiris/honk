@@ -423,6 +423,7 @@ async fn dependency_change_before_rename_rejects_without_overwriting_external_co
         .unwrap()
         .hash = sha256("# Manual dependency edit must win.\n");
     resume.send(()).unwrap();
+    // The source hash still matches `If-Match`, so the stale candidate is a conflict.
     error(
         timeout(WAIT, requests.join_next())
             .await
@@ -430,13 +431,91 @@ async fn dependency_change_before_rename_rejects_without_overwriting_external_co
             .unwrap()
             .unwrap()
             .unwrap(),
-        StatusCode::PRECONDITION_FAILED,
-        "stale_revision",
+        StatusCode::CONFLICT,
+        "state_conflict",
     )
     .await;
     assert_eq!(disk(fixture.directory.path()), external);
     assert_eq!(fixture.get(CONFIG).await, before);
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn if_match_is_evaluated_again_against_the_source_the_commit_replaces() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    let external = format!("{}# external editor\n", fixture.originals["main.dae"]);
+    for (condition, status, code) in [
+        ("*".to_owned(), StatusCode::CONFLICT, "state_conflict"),
+        (
+            format!("\"{}\", {}", sha256(&external), etag(main)),
+            StatusCode::CONFLICT,
+            "state_conflict",
+        ),
+        (
+            etag(main),
+            StatusCode::PRECONDITION_FAILED,
+            "stale_revision",
+        ),
+    ] {
+        std::fs::write(fixture.path("main.dae"), &fixture.originals["main.dae"]).unwrap();
+        let (entered, resume) = fixture.pause_before_replace();
+        let request = fixture
+            .request(Method::PUT, &source_path(main))
+            .header("if-match", &condition)
+            .json(&json!({"content":candidate}));
+        let mut requests = JoinSet::new();
+        requests.spawn(async move { request.send().await });
+        timeout(WAIT, entered).await.unwrap().unwrap();
+        std::fs::write(fixture.path("main.dae"), &external).unwrap();
+        resume.send(()).unwrap();
+        error(
+            timeout(WAIT, requests.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            status,
+            code,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+            external,
+            "{condition}"
+        );
+    }
+    assert_eq!(fixture.get(CONFIG).await, before);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    std::fs::write(fixture.path("main.dae"), &fixture.originals["main.dae"]).unwrap();
+    // `*` and a list holding the current hash both match on arrival and at commit.
+    for (condition, content) in [
+        (
+            format!("\"{}\", W/{}, {}", "0".repeat(64), etag(main), etag(main)),
+            candidate.clone(),
+        ),
+        ("*".to_owned(), fixture.originals["main.dae"].clone()),
+    ] {
+        let operation = accepted(
+            fixture
+                .request(Method::PUT, &source_path(main))
+                .header("if-match", &condition)
+                .json(&json!({"content":content}))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+            content
+        );
+    }
     fixture.shutdown().await;
 }
 
@@ -491,17 +570,48 @@ async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
             StatusCode::PRECONDITION_REQUIRED,
             "precondition_required",
         ),
+        // A weak tag never matches, even alongside other tags.
         (
             Some(format!("W/{strong}")),
+            StatusCode::PRECONDITION_FAILED,
+            "stale_revision",
+        ),
+        (
+            Some(format!("\"{}\", ,W/{strong}", "0".repeat(64))),
+            StatusCode::PRECONDITION_FAILED,
+            "stale_revision",
+        ),
+        // An empty value or a list of empty elements names no entity tag.
+        (
+            Some(String::new()),
             StatusCode::BAD_REQUEST,
             "invalid_request",
         ),
         (
-            Some(format!("{strong}, {strong}")),
+            Some(" \t".to_owned()),
             StatusCode::BAD_REQUEST,
             "invalid_request",
         ),
-        (Some("*".into()), StatusCode::BAD_REQUEST, "invalid_request"),
+        (
+            Some(" , ,".to_owned()),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some(format!("*, {strong}")),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some(format!("{strong} {strong}")),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some(main["content_sha256"].as_str().unwrap().to_owned()),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
         (
             Some(format!("\"{}\"", "0".repeat(64))),
             StatusCode::PRECONDITION_FAILED,
@@ -538,7 +648,7 @@ async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
             "precondition_required",
         ),
         (
-            Some("*".to_owned()),
+            Some("\"unterminated".to_owned()),
             "text/plain",
             "{}",
             StatusCode::BAD_REQUEST,
@@ -566,7 +676,7 @@ async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
     let malformed = error(
         fixture
             .request(Method::PUT, &source_path(main))
-            .header("if-match", "W/\"PRIVATE\"")
+            .header("if-match", "\"PRIVATE")
             .json(&json!({"content":"routing { fallback: block }"}))
             .send()
             .await

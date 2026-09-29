@@ -83,13 +83,14 @@ async fn group_patch_keeps_source_bytes_and_separates_group_revision_from_disk_h
     assert_eq!(disk(fixture.directory.path()), original);
     let external = format!("{source_text}# external editor\r\n");
     std::fs::write(fixture.path("editable.dae"), &external).unwrap();
+    // The configuration revision still matches `If-Match`, so the moved source is a conflict.
     error(
         patch(&fixture, group, revision, &body)
             .send()
             .await
             .unwrap(),
-        StatusCode::PRECONDITION_FAILED,
-        "stale_revision",
+        StatusCode::CONFLICT,
+        "state_conflict",
     )
     .await;
     assert_eq!(
