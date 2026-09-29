@@ -187,7 +187,47 @@ fn check_url(value: &str) -> Option<String> {
     })
 }
 
+/// The body checks that precede the `If-Match` comparison: a non-empty array
+/// within the operation limit whose operations name a known `op`, their
+/// required members and supported paths.
+fn operation_list(value: &Value) -> Result<&Vec<Value>, ApiError> {
+    let operations = value
+        .as_array()
+        .filter(|operations| !operations.is_empty())
+        .ok_or_else(invalid)?;
+    if operations.len() > 32 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "Group patch operation limit exceeded",
+            None,
+        ));
+    }
+    for operation in operations {
+        let operation = operation.as_object().ok_or_else(invalid)?;
+        let op = operation.get("op").and_then(Value::as_str);
+        let complete = match op {
+            Some("add" | "replace" | "test") => operation.contains_key("value"),
+            Some("remove" | "copy" | "move") => true,
+            _ => false,
+        };
+        if !complete {
+            return Err(invalid());
+        }
+        field(operation, "path")?;
+        if matches!(op, Some("copy" | "move")) {
+            field(operation, "from")?;
+        }
+    }
+    Ok(operations)
+}
+
 impl GroupPatch {
+    /// Body checks that the coordinator runs before the revision comparison.
+    pub(super) fn validate_shape(&self) -> Result<(), ApiError> {
+        operation_list(&self.operations).map(drop)
+    }
+
     pub(super) fn changes(&self) -> Result<Vec<(GroupField, Option<String>)>, ApiError> {
         let policy = serde_json::to_value(self.group.policy).map_err(|_| invalid())?;
         let default = self
@@ -206,11 +246,7 @@ impl GroupPatch {
             json!(crate::observe::catalog::check_url(&self.group)),
         ];
         let mut values = initial.clone().map(Some);
-        let operations = self
-            .operations
-            .as_array()
-            .filter(|operations| !operations.is_empty())
-            .ok_or_else(invalid)?;
+        let operations = operation_list(&self.operations)?;
         let rejected = |op: &str, path: usize| {
             // Without a policy write the group cannot become URLTest, so any
             // tolerance write fails on the policy rule whatever its value.
@@ -226,14 +262,6 @@ impl GroupPatch {
                 unsupported_value(path)
             }
         };
-        if operations.len() > 32 {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Group patch operation limit exceeded",
-                None,
-            ));
-        }
         for operation in operations {
             let operation = operation.as_object().ok_or_else(invalid)?;
             let op = operation

@@ -671,6 +671,7 @@ impl Worker {
         principal: &str,
     ) -> Result<Option<Prepared>, ApiError> {
         let if_match = patch.expected.clone()?;
+        patch.validate_shape()?;
         let accepted = self
             .service
             .sources

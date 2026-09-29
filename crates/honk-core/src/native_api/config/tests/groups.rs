@@ -153,6 +153,66 @@ async fn group_patch_keeps_source_bytes_and_separates_group_revision_from_disk_h
 }
 
 #[tokio::test]
+async fn group_patch_body_errors_precede_the_stale_revision() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    std::fs::write(
+        fixture.path("editable.dae"),
+        "group {\n G {\n  policy: selector\n  final: direct\n }\n}\n",
+    )
+    .unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let test = json!({"op":"test","path":"/config/final_outbound","value":"direct"});
+    for (body, status, code) in [
+        (json!([]), StatusCode::BAD_REQUEST, "invalid_request"),
+        (json!({}), StatusCode::BAD_REQUEST, "invalid_request"),
+        (
+            json!([test, {"op":"merge","path":"/policy","value":null}]),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!([{"op":"replace","path":"/config/tolerance"}]),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!([{"op":"move","path":"/config/tolerance"}]),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!([{"op":"remove","path":"/config/members"}]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_value",
+        ),
+        (
+            json!(vec![test.clone(); 33]),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ),
+    ] {
+        error(
+            patch(&fixture, group, "stale", &body).send().await.unwrap(),
+            status,
+            code,
+        )
+        .await;
+    }
+    error(
+        patch(&fixture, group, "stale", &json!([test]))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::PRECONDITION_FAILED,
+        "stale_revision",
+    )
+    .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn group_patch_without_writable_source_is_unsupported() {
     let fixture = Fixture::new(Access::Metadata, false).await;
     error(
