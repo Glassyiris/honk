@@ -254,7 +254,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api)。
 
-M5 的出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
+出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
 
 `configuration/accepted.rs` 持有启动捕获的 `.dae` accepted 源及发布栅栏，`native_api/config.rs` 只投影权限与 HTTP。原生协调器在读盘前串行化 API 写入和 SIGHUP 加载，`configuration::Activation` 为 native 与 nonnative 调用方共用 reload、reply、订阅 reconciliation 链。HTTP 断开不取消 daemon-owned 任务，同 scope/key/body 重放共用结果；PUT 的 202 仅代表耐久写入且真实 reload 已排队。外部编辑器仍可能在最后检查与 rename 间竞争，rename 后目录 fsync 失败必须报告已写但耐久性未确认，不能称为回滚。
 
@@ -264,7 +264,7 @@ Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，
 
 Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，不用 tracker 删除充数。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span、原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash/依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分；自动 override 仍关闭。
 
-M9 主文件创建/删除复用相同协调器、parser span、revision fence 与 reload reply，但等真实激活后才返回 201/200。订阅 supervisor 持有绑定身份的初次拉取延迟，所有离线准入都携带这些排除项和有效运行时数据目录。Geodata 先暂存并验证所有资产，再经 FD 相对替换；临时不可变 `SourceUpdate.geo_sources` 同时进入 reload 的两条路径，发布后不再由 accepted 源元数据保留。Router/DnsRouter 保留实际加载字节的元数据，观测按 router-before-config 锁序且不重读磁盘；部分文件替换与提交后降级如实报告，不承诺回滚。
+主文件创建/删除复用相同协调器、parser span、revision fence 与 reload reply，但等真实激活后才返回 201/200。订阅 supervisor 持有绑定身份的初次拉取延迟，所有离线准入都携带这些排除项和有效运行时数据目录。Geodata 先暂存并验证所有资产，再经 FD 相对替换；临时不可变 `SourceUpdate.geo_sources` 同时进入 reload 的两条路径，发布后不再由 accepted 源元数据保留。Router/DnsRouter 保留实际加载字节的元数据，观测按 router-before-config 锁序且不重读磁盘；部分文件替换与提交后降级如实报告，不承诺回滚。
 
 暂存 writer 返回保留的 installed-file FD 及耐久结果；geodata 从待替换文件推进到 installed guards，不再重新打开文件重建所有权。路径、inode 与字节复查仍拒绝外部编辑；可见但未确认耐久的替换仍明确报告。
 
