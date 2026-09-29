@@ -232,6 +232,46 @@ async fn legacy_bodies_are_copied_at_open_and_removed_only_by_remove() {
     );
 
     legacy.remove();
+    assert_eq!(
+        fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>(),
+        [SubscriptionStore::key(&orphan)],
+        "a body that was not copied stays"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_legacy_body_is_imported_when_a_later_start_enables_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(".sub");
+    let (on, mut off) = (subscription("on"), subscription("off"));
+    legacy_directory(
+        &root,
+        &[
+            (&on, "socks5://127.0.0.1:1080#on".into()),
+            (&off, "socks5://127.0.0.1:1080#off".into()),
+        ],
+    );
+    off.enabled = false;
+    let store = SubscriptionStore::in_dir(temp.path());
+    LegacySubscriptionStore::import(store.state(), [root.clone()], &[on.clone(), off.clone()])
+        .unwrap()
+        .remove();
+    assert!(store.body(&off).is_none());
+    drop(store);
+
+    // Restart without network, with the subscription enabled again.
+    off.enabled = true;
+    let store = SubscriptionStore::in_dir(temp.path());
+    LegacySubscriptionStore::import(store.state(), [root.clone()], &[on.clone(), off.clone()])
+        .unwrap()
+        .remove();
+    assert_eq!(
+        store.load_nodes(&off).await.unwrap().unwrap()[0].name,
+        "off"
+    );
     assert!(!root.exists());
 }
 
@@ -251,14 +291,16 @@ async fn a_legacy_import_stops_at_the_cap_and_skips_an_unsafe_directory() {
         .collect();
     legacy_directory(&root, &bodies);
     let store = SubscriptionStore::in_dir(temp.path());
-    assert!(
-        LegacySubscriptionStore::import(store.state(), [writable.clone(), root.clone()], &subs)
-            .is_none(),
-        "the store with a body left behind is kept"
-    );
+    LegacySubscriptionStore::import(store.state(), [writable.clone(), root.clone()], &subs)
+        .unwrap()
+        .remove();
     let stored = subs.iter().filter(|sub| store.body(sub).is_some()).count();
     assert_eq!(stored, 4, "32 MiB holds four bodies of 7.5 MiB");
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 6);
+    assert_eq!(
+        fs::read_dir(&root).unwrap().count(),
+        1,
+        "the body left behind stays"
+    );
     assert_eq!(
         fs::metadata(writable).unwrap().permissions().mode() & 0o7777,
         0o777
@@ -266,7 +308,7 @@ async fn a_legacy_import_stops_at_the_cap_and_skips_an_unsafe_directory() {
 }
 
 #[tokio::test]
-async fn a_legacy_body_that_cannot_be_copied_keeps_the_store_for_a_retry() {
+async fn a_legacy_body_that_cannot_be_copied_stays_for_a_retry() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join(".sub");
     let (large, small) = (subscription("large"), subscription("small"));
@@ -280,15 +322,15 @@ async fn a_legacy_body_that_cannot_be_copied_keeps_the_store_for_a_retry() {
     let store = SubscriptionStore::in_dir(temp.path());
     let subscriptions = [large.clone(), small.clone()];
     let import = || LegacySubscriptionStore::import(store.state(), [root.clone()], &subscriptions);
-    // The large body is left behind, so nothing is recorded or removed.
-    assert!(import().is_none());
+    import().unwrap().remove();
     assert!(store.body(&large).is_none());
     assert_eq!(
         store.body(&small).as_deref(),
         Some("socks5://127.0.0.1:1080#small")
     );
     assert!(root.join(SubscriptionStore::key(&large)).exists());
-    // A later start retries; once every enabled body copies, the store goes.
+    assert!(!root.join(SubscriptionStore::key(&small)).exists());
+    // A later start retries; once every body is copied, the store goes.
     fs::write(
         root.join(SubscriptionStore::key(&large)),
         "socks5://127.0.0.1:1080#large",

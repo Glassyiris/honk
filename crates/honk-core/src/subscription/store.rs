@@ -361,20 +361,21 @@ pub(crate) fn prune_bodies(
     Ok(())
 }
 
-/// A `.sub` directory from before the state db; its files are removed after
-/// the instance lock by `remove`.
+/// A `.sub` directory from before the state db; the copied files are removed
+/// after the instance lock by `remove`.
 pub(crate) struct LegacySubscriptionStore {
     root: PathBuf,
     directory: File,
+    /// Files whose body the state db now holds.
+    copied: HashSet<String>,
 }
 
 impl LegacySubscriptionStore {
     /// Copies the bodies of `subscriptions` that are enabled from the first
-    /// private `.sub` directory in the order older releases searched, unless
-    /// an earlier start already did. Existing rows win. `None` when there is
-    /// nothing to remove: no store, or an enabled body that exists but could
-    /// not be copied, so the store stays and the next start tries again.
-    /// Nothing is removed here.
+    /// private `.sub` directory in the order older releases searched. Existing
+    /// rows win. Other bodies, and those that could not be copied, stay for a
+    /// later start that enables them. `None` when there is no store or the
+    /// copy failed. Nothing is removed here.
     pub(crate) fn import(
         state: &StateDb,
         roots: impl IntoIterator<Item = PathBuf>,
@@ -385,17 +386,12 @@ impl LegacySubscriptionStore {
             inspect_store_directory(&directory).ok()?;
             Some((root, directory))
         })?;
-        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        let source = format!("subscription:{}", canonical.display());
-        match copy_legacy(state, &directory, &source, subscriptions) {
-            Ok(true) => Some(Self { root, directory }),
-            Ok(false) => {
-                tracing::warn!(
-                    directory = %root.display(),
-                    "a legacy subscription body could not be copied; the store is kept and retried at the next start"
-                );
-                None
-            }
+        match copy_legacy(state, &directory, subscriptions) {
+            Ok(copied) => Some(Self {
+                root,
+                directory,
+                copied,
+            }),
             Err(error) => {
                 tracing::warn!(%error, directory = %root.display(), "legacy subscription store import failed");
                 None
@@ -403,9 +399,9 @@ impl LegacySubscriptionStore {
         }
     }
 
-    /// Unlinks every `*.sub` and `.*.tmp` in the directory through its FD, then
-    /// removes the directory if that left it empty. Other legacy locations are
-    /// not touched.
+    /// Unlinks the copied `*.sub` and every `.*.tmp` in the directory through
+    /// its FD, then removes the directory if that left it empty. Other legacy
+    /// locations are not touched.
     pub(crate) fn remove(self) {
         let result = (|| -> io::Result<()> {
             use std::os::fd::AsRawFd as _;
@@ -414,7 +410,8 @@ impl LegacySubscriptionStore {
                 std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))?;
             for entry in listing {
                 let name = entry?.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".sub") || (name.starts_with('.') && name.ends_with(".tmp")) {
+                if self.copied.contains(&name) || (name.starts_with('.') && name.ends_with(".tmp"))
+                {
                     nix::unistd::unlinkat(
                         &self.directory,
                         name.as_str(),
@@ -437,28 +434,15 @@ impl LegacySubscriptionStore {
     }
 }
 
-/// `Ok(false)` when an enabled body exists but was not copied: the copied ones
-/// are kept, and the import is not recorded.
+/// The keys of the enabled bodies the state db holds after the copy.
 fn copy_legacy(
     state: &StateDb,
     directory: &File,
-    source: &str,
     subscriptions: &[Subscription],
-) -> Result<bool, PutError> {
+) -> Result<HashSet<String>, PutError> {
     let mut connection = state.strict();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if transaction
-        .query_row(
-            "SELECT 1 FROM legacy_import WHERE source = ?1",
-            [source],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    let mut complete = true;
+    let mut copied = HashSet::new();
     let enabled: HashSet<String> = subscriptions
         .iter()
         .filter(|sub| sub.enabled)
@@ -474,37 +458,25 @@ fn copy_legacy(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 tracing::warn!(%error, "legacy subscription body is unreadable; not copied");
-                complete = false;
                 continue;
             }
         }
         if body.len() > super::MAX_SUBSCRIPTION_BYTES {
             tracing::warn!("legacy subscription body exceeds 8 MiB; not copied");
-            complete = false;
             continue;
         }
         match put_body_in(&transaction, key, &body, Some(&enabled), false) {
-            Ok(_) => {}
+            Ok(_) => {
+                copied.insert(key.clone());
+            }
             Err(PutError::TooLarge) => {
                 tracing::warn!("legacy subscription body would pass 32 MiB in total; not copied");
-                complete = false;
             }
             Err(error) => return Err(error),
         }
     }
-    if !complete {
-        transaction.commit()?;
-        return Ok(false);
-    }
-    let done_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64);
-    transaction.execute(
-        "INSERT INTO legacy_import (source, done_at) VALUES (?1, ?2)",
-        params![source, done_at],
-    )?;
     transaction.commit()?;
-    Ok(true)
+    Ok(copied)
 }
 
 /// Where older releases kept `.sub`, in their search order.

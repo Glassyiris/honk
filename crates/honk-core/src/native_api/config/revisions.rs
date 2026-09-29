@@ -168,26 +168,36 @@ pub(in crate::native_api) async fn activate(
     }
     let bytes = body::buffered(request.into_body()).await;
     body::no_inputs(&bytes, invalid)?;
-    let exists = tokio::task::spawn_blocking(move || store.revision_exists(number))
-        .await
-        .map_err(|_| unavailable())?;
-    match exists {
-        Ok(true) => {}
-        Ok(false) => return Err(not_found()),
-        Err(_) => return Err(unavailable().with_details(json!({"stage":"store"}))),
-    }
-    admit(
-        state,
+    // A replay answers even after retention pruned the revision.
+    let reservation = service.operations.reserve(
+        state.principal(),
         "POST",
         &path,
         key.as_deref(),
         &bytes,
-        |reservation| Work::ActivateRevision {
-            number,
-            reservation,
-        },
-    )
-    .await
+        crate::native_api::operations::OperationKind::Reload,
+    )?;
+    let admission = reservation.admission();
+    if reservation.fresh {
+        let exists = tokio::task::spawn_blocking(move || store.revision_exists(number))
+            .await
+            .map_err(|_| unavailable())?;
+        let error = match exists {
+            Ok(true) => None,
+            Ok(false) => Some(not_found()),
+            Err(_) => Some(unavailable().with_details(json!({"stage":"store"}))),
+        };
+        match error {
+            None => service.enqueue(Work::ActivateRevision {
+                number,
+                reservation,
+            })?,
+            Some(error) => {
+                service.operations.reject(&reservation.id, error);
+            }
+        }
+    }
+    Ok(admission.await?.into_response())
 }
 
 fn precondition_required() -> ApiError {

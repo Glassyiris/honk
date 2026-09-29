@@ -168,7 +168,7 @@ async fn directory_swapped_before_the_rename_writes_nothing() {
 }
 
 #[tokio::test]
-async fn failed_activation_removes_the_created_file() {
+async fn failed_activation_keeps_the_created_file() {
     let fixture = Fixture::new_custom(Access::Admin, false, with_include).await;
     let before = fixture.get(CONFIG).await;
     fixture
@@ -178,22 +178,23 @@ async fn failed_activation_removes_the_created_file() {
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["code"], "reload_rejected");
-    assert_eq!(failed["error"]["details"]["written"], false);
+    assert_eq!(failed["error"]["details"]["written"], true);
     assert_eq!(failed["error"]["details"]["committed"], false);
-    assert!(!fixture.path(NEW).exists());
+    assert_eq!(std::fs::read_to_string(fixture.path(NEW)).unwrap(), CONTENT);
     assert_eq!(fixture.get(CONFIG).await, before);
 
-    // A degraded commit is active, so the file stays and the failure says so.
+    // A degraded commit is active; the failure says so.
     fixture
         .reject_reloads
         .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
-    let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
+    let other = "config.d/other.dae";
+    let operation = accepted(fixture.create(other, CONTENT).send().await.unwrap()).await;
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["details"]["written"], true);
     assert_eq!(failed["error"]["details"]["committed"], true);
     assert!(failed["error"]["details"]["active_generation_id"].is_string());
-    assert!(fixture.path(NEW).exists());
+    assert!(fixture.path(other).exists());
     fixture.shutdown().await;
 }
 
