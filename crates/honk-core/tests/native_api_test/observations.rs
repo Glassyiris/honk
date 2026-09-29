@@ -422,20 +422,19 @@ async fn native_catalog_masks_listener_secrets_without_changing_membership_or_cu
     }
 
     for summary in [parent, child] {
-        let response = app
-            .get(&format!(
-                "/api/v1/groups/{}",
-                summary["id"].as_str().unwrap()
-            ))
-            .send()
-            .await
-            .unwrap();
+        let path = format!("/api/v1/groups/{}", summary["id"].as_str().unwrap());
+        let response = app.get(&path).send().await.unwrap();
+        assert!(response.headers().get("etag").is_none());
+        let detail = response_json(response).await;
+        clean(&detail);
+        let response = app.get(&format!("{path}/config")).send().await.unwrap();
         assert_eq!(
             response.headers()["etag"].to_str().unwrap(),
             format!("\"{}\"", summary["config_revision"].as_str().unwrap())
         );
-        let detail = response_json(response).await;
-        clean(&detail);
+        let document = response_json(response).await;
+        clean(&document);
+        assert_eq!(document["config"], detail["config"]);
         assert_eq!(detail["id"], summary["id"]);
         assert_eq!(detail["config_revision"], summary["config_revision"]);
         assert_eq!(

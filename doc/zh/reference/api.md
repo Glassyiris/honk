@@ -24,10 +24,11 @@
 | POST | `/api/v1/nodes` | 用 `{name,link}` 创建主文件节点；真实激活后才返回 201。 |
 | GET | `/api/v1/nodes/{id}` | 单个节点，字段与列表相同；未知 ID 返回 404。 |
 | DELETE | `/api/v1/nodes/{id}` | 删除主文件 inline 节点；激活后返回 `{deleted:0\|1}`。 |
-| GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision/ETag 与捕获的健康数据。 |
+| GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision 与捕获的健康数据。 |
+| GET | `/api/v1/groups/{groupId}/config` | 组的 `policy` 与 `config`，以配置 revision 作为 `ETag`。 |
 | PUT | `/api/v1/groups/{groupId}/selection` | 按直接成员 ID 设置 Selector 的 `tcp`、`udp` 或 `both` 选择。 |
 | DELETE | `/api/v1/groups/{groupId}/selection` | 清除自动策略组在 `tcp`、`udp` 或 `both` 上的固定成员。 |
-| PATCH | `/api/v1/groups/{groupId}` | 对可写 `.dae` 来源执行受限 JSON Patch，返回真实更新 operation。 |
+| PATCH | `/api/v1/groups/{groupId}/config` | 对可写 `.dae` 来源执行受限 JSON Patch，返回真实更新 operation。 |
 | GET | `/api/v1/events` | 有界且需认证的 SSE，支持绑定过滤器的续传游标。 |
 | GET | `/api/v1/runtime/outbounds` | 共用计数生命周期内按 `kind/name` 区分的全宽出站计数。 |
 | GET | `/api/v1/runtime/memory` | 实际进程 RSS 与可读的 cgroup v2 内存事实。 |
@@ -144,7 +145,7 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 ### 节点与组
 
-节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无法识别的游标返回 `410 snapshot_expired`，可识别但过滤器或 `limit` 不同的游标返回 `400 invalid_request`。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
+节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无法识别的游标返回 `410 snapshot_expired`，可识别但过滤器或 `limit` 不同的游标返回 `400 invalid_request`。Groups 返回摘要数组；detail 含 `config_revision`，不带 `ETag`；`GET /groups/{groupId}/config` 返回 `{policy, config}`，并以该 revision 作为带引号的 `ETag`。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
 节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，复用源内容/flow 显示的监听凭据遮罩。节点快照在有界序列化前遮罩，续页保留同一份已遮罩字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
 既有遮罩阈值不变：不足八字节的监听凭据值不遮罩，启动时会发出警告。
@@ -153,7 +154,7 @@ Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、
 
 Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，network 必填且接受 `tcp/udp/both`。TCP 与 UDP 分开保存，`both` 一次校验并原子发布；对自动策略组（`can_override: true`）的写入会固定该成员，报告 `source: override`；固定成员不可用时不改选同组其他成员。固定只存在于运行时，不持久化，每次配置激活（包括订阅刷新）都会清除，健康检查照常执行。`DELETE /groups/{groupId}/selection?network=` 清除 `tcp`、`udp` 或 `both`（默认）的固定，返回 `GroupOverrideCleared` 与各网络当前选择；未固定的网络保持原选择，对 Selector 返回 `409 state_conflict`。原生与 Clash 写入都由共同 control/reload owner 串行化，Clash 写入等价于 both，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧 owner，而非按当前可达叶名称删除记录；已有选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
 
-组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`、`/config/check_url`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数或 null，`interrupt_connections` 用布尔值或 null；`check_url` 为 null，或以小写 `http://`/`https://` 开头、含主机的 URL，不含 userinfo、空白、控制字符与逗号，也不同时含单引号和双引号；PATCH 写入 GET 显示且探测实际发送的规范化形式（去掉 fragment、空路径补 `/`、主机转小写、省略默认端口），不超过 2048 字节，`test` 也按此形式比较。Selector 组接受并保存 `check_url`，但不据此探测。只有 URLTest 组报告并接受 `tolerance`：其他策略报告 `null`，`mutable_config` 不含该字段，把它设为非 null 值的 PATCH 返回 422 `unsupported_value`；允许 `remove`，同一 PATCH 把策略改为 URLTest 时可以设置。删除字段或设为 null 会恢复 dae 默认值。组来源未设置 `tolerance` 与 `interrupt_connections` 时，GET 报告 `null`，honk 仍按默认值（`interrupt_connections` 为 false）或 `global.check_tolerance` 生效。此接口不改成员列表或 icon。
+组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 `GET /groups/{groupId}/config` 的带引号强 `If-Match`；缺失 428、过期 412。操作对象中 `op`、`path`、`from`、`value` 以外的成员一律忽略。请求体错误（400、413）先于过期的 `If-Match`（412）报告。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`、`/config/check_url`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数或 null，`interrupt_connections` 用布尔值或 null；`check_url` 为 null，或以小写 `http://`/`https://` 开头、含主机的 URL，不含 userinfo、空白、控制字符与逗号，也不同时含单引号和双引号；PATCH 写入 GET 显示且探测实际发送的规范化形式（去掉 fragment、空路径补 `/`、主机转小写、省略默认端口），不超过 2048 字节，`test` 也按此形式比较。Selector 组接受并保存 `check_url`，但不据此探测。只有 URLTest 组报告并接受 `tolerance`：其他策略报告 `null`，`mutable_config` 不含该字段，把它设为非 null 值的 PATCH 返回 422 `unsupported_value`；允许 `remove`，同一 PATCH 把策略改为 URLTest 时可以设置。删除字段或设为 null 会恢复 dae 默认值。组来源未设置 `tolerance` 与 `interrupt_connections` 时，GET 报告 `null`，honk 仍按默认值（`interrupt_connections` 为 false）或 `global.check_tolerance` 生效。此接口不改成员列表或 icon。
 
 源不可写时 `mutable_config` 为空，PATCH 返回 `404 capability_not_supported`。PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用配置来源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
 

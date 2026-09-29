@@ -380,10 +380,22 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                             id,
                         )
                     },
+                ),
+                &["GET"],
+            ),
+        )
+        .route(
+            "/api/v1/groups/{groupId}/config",
+            resource(
+                get(
+                    |State(state): App, Extension(id): Id, uri: Uri| async move {
+                        let group_id = config_group_id(uri.path());
+                        respond(catalog::group_config(&state, group_id, &uri, &id).await, id)
+                    },
                 )
                 .patch(
                     |State(state): App, Extension(id): Id, request: Request| async move {
-                        let group_id = path_id(request.uri().path()).to_owned();
+                        let group_id = config_group_id(request.uri().path()).to_owned();
                         respond(groups::patch(&state, &group_id, request, &id).await, id)
                     },
                 ),
@@ -695,6 +707,14 @@ fn respond(result: Result<Response, ApiError>, id: RequestId) -> Response {
 fn path_id(path: &str) -> &str {
     // IDs remain raw URI segments: percent-encoded bytes must not alias another resource.
     path.rsplit('/').next().expect("matched resource path")
+}
+
+/// The group segment of `/groups/{groupId}/config`, even for a group whose id is `config`.
+fn config_group_id(path: &str) -> &str {
+    path_id(
+        path.strip_suffix("/config")
+            .expect("matched group config path"),
+    )
 }
 
 async fn unsupported(Extension(id): Id) -> Response {

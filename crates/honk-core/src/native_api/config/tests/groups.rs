@@ -6,12 +6,21 @@ fn patch(
     revision: &str,
     body: &Value,
 ) -> reqwest::RequestBuilder {
+    patch_if_match(fixture, group, &format!("\"{revision}\""), body)
+}
+
+fn patch_if_match(
+    fixture: &Fixture,
+    group: &Value,
+    condition: &str,
+    body: &Value,
+) -> reqwest::RequestBuilder {
     fixture
         .request(
             Method::PATCH,
-            &format!("/api/v1/groups/{}", group["id"].as_str().unwrap()),
+            &format!("/api/v1/groups/{}/config", group["id"].as_str().unwrap()),
         )
-        .header("if-match", format!("\"{revision}\""))
+        .header("if-match", condition)
         .header("content-type", "application/json-patch+json")
         .body(body.to_string())
 }
@@ -153,6 +162,70 @@ async fn group_patch_keeps_source_bytes_and_separates_group_revision_from_disk_h
 }
 
 #[tokio::test]
+async fn group_config_document_carries_the_etag_that_patch_compares() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    std::fs::write(
+        fixture.path("editable.dae"),
+        "group {\n G {\n  policy: selector\n  final: direct\n }\n}\n",
+    )
+    .unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let path = format!("/api/v1/groups/{}", group["id"].as_str().unwrap());
+    let detail = fixture.request(Method::GET, &path).send().await.unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    assert!(detail.headers().get("etag").is_none());
+    let detail: Value = detail.json().await.unwrap();
+    let revision = detail["config_revision"].as_str().unwrap();
+    let document = fixture
+        .request(Method::GET, &format!("{path}/config"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(document.status(), StatusCode::OK);
+    assert_eq!(
+        document.headers()["etag"],
+        format!("\"{revision}\"").as_str()
+    );
+    let document: Value = document.json().await.unwrap();
+    assert_eq!(
+        document,
+        json!({"policy": detail["policy"], "config": detail["config"]})
+    );
+    let body = json!([{"op":"replace","path":"/config/final_outbound","value":"block"}]);
+    let legacy = fixture
+        .request(Method::PATCH, &path)
+        .header("if-match", format!("\"{revision}\""))
+        .header("content-type", "application/json-patch+json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(legacy.status().is_client_error());
+    let operation = accepted(
+        patch(&fixture, group, revision, &body)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+    let document = fixture
+        .request(Method::GET, &format!("{path}/config"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        document.headers()["etag"],
+        format!("\"{revision}\"").as_str()
+    );
+    let document: Value = document.json().await.unwrap();
+    assert_eq!(document["config"]["final_outbound"], "block");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn group_patch_body_errors_precede_the_stale_revision() {
     let fixture = Fixture::new(Access::Admin, false).await;
     std::fs::write(
@@ -209,6 +282,70 @@ async fn group_patch_body_errors_precede_the_stale_revision() {
         "stale_revision",
     )
     .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_patch_evaluates_a_malformed_or_wildcard_if_match() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    std::fs::write(
+        fixture.path("editable.dae"),
+        "group {\n G {\n  policy: selector\n  final: direct\n }\n}\n",
+    )
+    .unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let group = &fixture.get("/api/v1/groups").await[0];
+    let original = disk(fixture.directory.path());
+    let change =
+        json!([{"op":"replace","path":"/policy","value":{"kind":"fallback","native":"fallback"}}]);
+    for condition in ["\"PRIVATE", "W/", "\"a\" \"b\""] {
+        let malformed = error(
+            patch_if_match(&fixture, group, condition, &change)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        )
+        .await;
+        assert_eq!(
+            malformed["error"]["details"],
+            json!({"header":"if-match","kind":"malformed"})
+        );
+        assert!(!malformed.to_string().contains("PRIVATE"), "{malformed}");
+    }
+    assert_eq!(disk(fixture.directory.path()), original);
+    // `*` holds for any revision, so a failed `test` is a conflict where a stale tag is a 412.
+    let failed = json!([{"op":"test","path":"/config/final_outbound","value":"block"}]);
+    error(
+        patch(&fixture, group, "stale", &failed)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::PRECONDITION_FAILED,
+        "stale_revision",
+    )
+    .await;
+    error(
+        patch_if_match(&fixture, group, "*", &failed)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::CONFLICT,
+        "state_conflict",
+    )
+    .await;
+    assert_eq!(disk(fixture.directory.path()), original);
+    let operation = accepted(
+        patch_if_match(&fixture, group, "*", &change)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+    assert_ne!(disk(fixture.directory.path()), original);
     fixture.shutdown().await;
 }
 
