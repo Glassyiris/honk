@@ -10,9 +10,7 @@ mod compiler {
     };
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
-    use crate::routing::{
-        GeoAssets, GeoRequirements, GeositeMatcher, SharedMatchers, parse_ip_net_str,
-    };
+    use crate::routing::{GeoAssets, GeoRequirements, SharedMatchers, parse_ip_net_str};
 
     #[derive(Clone)]
     pub(super) struct CompiledRequestRule {
@@ -120,7 +118,7 @@ mod compiler {
                     not: *not,
                     matchers: matchers
                         .iter()
-                        .map(|matcher| compile_domain_matcher(matcher, assets))
+                        .map(|matcher| compile_domain_matcher(matcher, assets, shared))
                         .collect::<anyhow::Result<_>>()?,
                 }),
                 DnsCond::Qtype { not, types } => Ok(CompiledCond::Qtype {
@@ -168,6 +166,7 @@ mod compiler {
     fn compile_domain_matcher(
         matcher: &DnsDomainMatcher,
         assets: &GeoAssets,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<CompiledDomainMatcher> {
         Ok(match matcher {
             DnsDomainMatcher::Full(value) => CompiledDomainMatcher::Full(value.to_lowercase()),
@@ -183,7 +182,7 @@ mod compiler {
             DnsDomainMatcher::Geosite(code) => {
                 // `geosite_domains` already warns when a code expands to nothing.
                 let domains = assets.geosite_domains(std::slice::from_ref(code));
-                CompiledDomainMatcher::Geosite(GeositeMatcher::build(&domains))
+                CompiledDomainMatcher::Geosite(shared.geosite(code, &domains))
             }
         })
     }
@@ -217,7 +216,7 @@ mod matcher {
         Suffix(String),
         Keyword(String),
         Regex(regex::Regex),
-        Geosite(GeositeMatcher),
+        Geosite(Arc<GeositeMatcher>),
     }
 
     impl CompiledDomainMatcher {
@@ -644,6 +643,23 @@ impl DnsRouter {
 
     pub(crate) fn geo_requirements_snapshot(&self) -> &GeoRequirements {
         &self.geo_requirements
+    }
+    #[cfg(test)]
+    pub(crate) fn geosite_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::GeositeMatcher>> {
+        self.request_rules
+            .iter()
+            .flat_map(|rule| &rule.conditions)
+            .chain(self.response_rules.iter().flat_map(|rule| &rule.conditions))
+            .filter_map(|condition| match condition {
+                matcher::CompiledCond::Qname { matchers, .. } => Some(matchers),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|matcher| match matcher {
+                matcher::CompiledDomainMatcher::Geosite(matcher) => Some(matcher),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn answer_ip_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::IpMatcher>> {

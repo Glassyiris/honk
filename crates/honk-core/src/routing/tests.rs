@@ -870,6 +870,83 @@ fn test_geosite_route() {
 }
 
 #[test]
+fn geosite_selectors_share_one_matcher_across_routing_and_dns() {
+    use crate::dns::routing::DnsRouter;
+
+    use_repo_geo_assets();
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n u: 'udp://127.0.0.1:53'\n }\n routing {\n\
+         request {\n qname(geosite:category-games@CN) -> reject\n qname(geosite:CN) -> u\n\
+         fallback: asis\n }\n response {\n qname(geosite:category-games) -> reject\n\
+         fallback: accept\n } } }\n\
+         routing {\n domain(geosite:cn, geosite:category-games@cn) -> direct\n\
+         domain(geosite:category-games) -> games\n !domain(geosite:private) && dport(53) -> alt\n\
+         fallback: fb\n }",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let sources = GeoSourceSet::load(&requirements);
+    let mut shared = SharedMatchers::default();
+    let router =
+        Router::from_config_with_geo_sources(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut shared).unwrap();
+    drop(shared);
+    let unshared_router =
+        Router::from_config_with_geo_sources(&config.routing, &sources, &mut Default::default())
+            .unwrap();
+    let unshared_dns =
+        DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut Default::default()).unwrap();
+
+    let [cn, games_cn, games, private] = router.geosite_matchers()[..] else {
+        panic!("expected four routing geosite selectors");
+    };
+    let [dns_games_cn, dns_cn, dns_games] = dns.geosite_matchers()[..] else {
+        panic!("expected three DNS geosite selectors");
+    };
+    assert!(Arc::ptr_eq(cn, dns_cn) && Arc::ptr_eq(games_cn, dns_games_cn));
+    assert!(Arc::ptr_eq(games, dns_games));
+    assert!(!Arc::ptr_eq(games, games_cn) && !Arc::ptr_eq(cn, private));
+    assert_eq!(
+        router.policy_fingerprint(),
+        unshared_router.policy_fingerprint()
+    );
+
+    let mut conn = make_conn(None, None);
+    for domain in [
+        "www.baidu.com",
+        "WWW.QQ.com",
+        "store.steampowered.com",
+        "www.steamchina.com",
+        "localhost",
+        "example.org",
+    ] {
+        conn.domain = Some(domain.into());
+        for port in [53, 443] {
+            conn.dst_port = port;
+            let route = router.route(&conn);
+            assert_eq!(route, unshared_router.route(&conn), "{domain}");
+        }
+        let lower = domain.to_ascii_lowercase();
+        assert_eq!(
+            dns.select_request(&lower, 1),
+            unshared_dns.select_request(&lower, 1)
+        );
+        assert_eq!(
+            dns.select_response(&lower, 1, &[], "u"),
+            unshared_dns.select_response(&lower, 1, &[], "u")
+        );
+    }
+
+    let old = Arc::downgrade(cn);
+    drop((router, dns));
+    assert!(
+        old.upgrade().is_none(),
+        "the build must not outlive its routers"
+    );
+}
+
+#[test]
 fn test_must_flag_on_rule() {
     let rules = vec![RoutingRule {
         name: "must-rule".into(),
@@ -1149,8 +1226,11 @@ fn test_geosite_matcher_semantics() {
 fn geosite_matchers_intern_on_exact_expansions() {
     use GeositeDomain::{Domain, Full, Keyword};
     let mut registry = DomainRegistry::default();
-    let mut intern =
-        |domains: Vec<GeositeDomain>| registry.intern(DomainMatcher::geosite(domains)).unwrap();
+    let mut intern = |domains: Vec<GeositeDomain>| {
+        registry
+            .intern(DomainMatcher::geosite(&domains, Vec::new()))
+            .unwrap()
+    };
     let base = intern(vec![Domain("Example.COM".into()), Keyword("Tube".into())]);
     let normalized = intern(vec![
         Keyword("Tube".into()),
@@ -1183,7 +1263,8 @@ fn geosite_policy_fingerprint_covers_the_exact_expansion() {
     let requirements = GeoRequirements::for_traffic(&rules);
     let sources = GeoSourceSet::load(&requirements);
     let (exact, _) = DomainMatcher::geosite(
-        GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
+        &GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
+        Vec::new(),
     );
     assert!(!exact.alternatives.is_empty());
     assert_eq!(

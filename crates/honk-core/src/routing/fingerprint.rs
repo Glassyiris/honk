@@ -244,13 +244,14 @@ mod tests {
         let (ordinary, _) =
             DomainMatcher::ordinary(&[], &[], &["example.com".into()], &[]).unwrap();
         let (geosite, _) =
-            DomainMatcher::geosite(vec![GeositeDomain::Keyword("example.com".into())]);
+            DomainMatcher::geosite(&[GeositeDomain::Keyword("example.com".into())], Vec::new());
         assert_ne!(
             digest(&[], std::slice::from_ref(&ordinary)),
             digest(&[], std::slice::from_ref(&geosite))
         );
 
-        let (full, _) = DomainMatcher::geosite(vec![GeositeDomain::Full("example.com".into())]);
+        let (full, _) =
+            DomainMatcher::geosite(&[GeositeDomain::Full("example.com".into())], Vec::new());
         assert_ne!(
             digest(&[], std::slice::from_ref(&geosite)),
             digest(&[], &[full])
