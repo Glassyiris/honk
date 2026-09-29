@@ -14,12 +14,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::super::{
-    ApiError, NativeState, catalog::snapshot_unavailable, parse_query, routing::RuleSource,
+    ApiError, NativeState,
+    catalog::snapshot_unavailable,
+    parse_query,
+    routing::{MAX_RULES, RuleSource},
     types::RequestId,
 };
 
-/// Bounds each list, including its fallback.
-const MAX_RULES: usize = 4096;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Never below either running list, so both are always served whole.

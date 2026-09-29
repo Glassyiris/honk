@@ -30,7 +30,8 @@ use super::{
     security::REQUESTS_PER_MINUTE, types::RequestId,
 };
 
-const MAX_RULES: usize = 4096;
+/// Bounds each list, including its fallback.
+pub(super) const MAX_RULES: usize = 4096;
 const MAX_STEPS: usize = 256;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
