@@ -1400,6 +1400,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
     dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
     info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
+    // The initial runtime owns the pool now; keeping this handle would pin the
+    // startup traffic router snapshot after that runtime retires.
+    drop(dns_upstream_pool);
 
     // Runtime state (selector choices, clash mode): with
     // `experimental.cache_file` enabled, imports a legacy cache.db, restores
