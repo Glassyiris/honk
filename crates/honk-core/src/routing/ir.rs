@@ -49,8 +49,8 @@ impl IpMatcher {
     }
 }
 
-/// Matchers shared by the traffic and DNS routers of one build. Keep it local
-/// to the build so a reload never pins the previous generation's matchers.
+/// Hands out one matcher per exact ordered network list. Equal lists build
+/// identical tries, so any holder's matcher is interchangeable.
 #[derive(Default)]
 pub(crate) struct SharedMatchers {
     ip: Vec<Arc<IpMatcher>>,
@@ -64,6 +64,15 @@ impl SharedMatchers {
         let matcher = Arc::new(IpMatcher::new(nets));
         self.ip.push(Arc::clone(&matcher));
         matcher
+    }
+
+    /// Offers live matchers so a rebuild keeps them for unchanged network lists.
+    pub(crate) fn offer<'a>(&mut self, matchers: impl IntoIterator<Item = &'a Arc<IpMatcher>>) {
+        for matcher in matchers {
+            if !self.ip.iter().any(|known| known.nets() == matcher.nets()) {
+                self.ip.push(Arc::clone(matcher));
+            }
+        }
     }
 }
 

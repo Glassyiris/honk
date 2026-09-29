@@ -778,6 +778,17 @@ impl Router {
     pub fn compiled_routes(&self) -> &[CompiledRoute] {
         self.routes.as_ref()
     }
+
+    pub(crate) fn ip_matchers(&self) -> impl Iterator<Item = &Arc<IpMatcher>> {
+        self.compiled_routes()
+            .iter()
+            .flat_map(|route| &route.conditions)
+            .filter_map(|condition| match &condition.predicate {
+                CompiledPredicate::DestinationIp(matcher)
+                | CompiledPredicate::SourceIp(matcher) => Some(matcher),
+                _ => None,
+            })
+    }
 }
 
 #[derive(Debug, Clone)]

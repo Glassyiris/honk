@@ -444,8 +444,8 @@ async fn shared_geoip_matchers_follow_reload_ownership() {
     let (_, _, live_routed, live_answered) = live(&cp).await;
     assert!(shared(&live_routed, &routed) && shared(&live_answered, &routed));
 
-    // Only DNS rebuilds: the reused traffic router does not seed the build,
-    // so this generation decides correctly without cross-router sharing.
+    // Only DNS rebuilds: its unchanged network list keeps the reused traffic
+    // router's matcher instead of building a second copy.
     let mut dns_only = config.clone();
     dns_only
         .dns
@@ -459,7 +459,7 @@ async fn shared_geoip_matchers_follow_reload_ownership() {
     ));
     let (router, dns, live_routed, live_answered) = live(&cp).await;
     assert!(shared(&live_routed, &routed));
-    assert!(!shared(&live_answered, &routed));
+    assert!(shared(&live_answered, &routed));
     assert!(blocks(&router, "203.0.113.1") && rejects(&dns, "203.0.113.1"));
     assert!(!rejects(&dns, "198.51.100.1"));
 }

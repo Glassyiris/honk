@@ -646,7 +646,6 @@ impl DnsRouter {
         &self.geo_requirements
     }
 
-    #[cfg(test)]
     pub(crate) fn answer_ip_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::IpMatcher>> {
         self.response_rules
             .iter()

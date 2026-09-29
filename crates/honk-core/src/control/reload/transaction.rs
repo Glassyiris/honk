@@ -401,8 +401,14 @@ impl ControlPlane {
         let old_has_direct_marks = current_router.has_direct_marks();
         let reuse_routing_state = routing_state_reusable(&current_config, &new_config)
             && current_router.geo_fingerprint() == traffic_geo_fingerprint;
-        // Build the candidate completely before mutating live state; reused routers share nothing.
+        // Build the candidate completely before mutating live state. Unchanged
+        // network lists keep the live matchers, even when only one router rebuilds.
         let mut shared = crate::routing::SharedMatchers::default();
+        shared.offer(
+            current_router
+                .ip_matchers()
+                .chain(current_dns_router.answer_ip_matchers()),
+        );
         let new_router = if reuse_routing_state {
             current_router
         } else {
