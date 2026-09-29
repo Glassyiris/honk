@@ -27,14 +27,14 @@ impl Worker {
                     .map_err(|error| match error {
                         ImportError::SecretCopy(_) => management::unsupported_value(
                             "A listener secret also appears outside its secret field",
-                            json!({"resource":"/config/import","check":"secret_copy"}),
+                            json!({"resource":"/x-honk/config/import","check":"secret_copy"}),
                         ),
                         ImportError::Load(error) => {
                             config_error(error, diagnostics, &[], None, None)
                         }
                         ImportError::Changed => management::unsupported_value(
                             "Removing listener secrets changes the configuration",
-                            json!({"resource":"/config/import","check":"stripped_config"}),
+                            json!({"resource":"/x-honk/config/import","check":"stripped_config"}),
                         ),
                     })?;
                 Ok(loaded)

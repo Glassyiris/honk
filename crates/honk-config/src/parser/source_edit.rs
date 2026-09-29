@@ -609,7 +609,7 @@ pub struct RuleSourceLocation {
     pub bytes: Range<usize>,
     pub line: usize,
     pub column: usize,
-    /// Comment-free condition display, or `fallback` for the terminal entry.
+    /// Comment-free condition display, or the whole fallback statement.
     pub expression: String,
 }
 
