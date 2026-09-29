@@ -150,9 +150,12 @@ async fn lease_held_past_the_deadline_delays_release_until_it_drops() {
 async fn pause_after_release_shuts_down_outbound_and_reports_cleanup_failure() {
     let old_outbound = outbound();
     let (old, retained) = failing_runtime(1, Arc::clone(&old_outbound));
-    let provider = DnsServiceProvider::new(old);
+    // Past a zero deadline the pause reports `Deadline` unless an entry fails.
+    let provider = DnsServiceProvider::with_deadline(old, Duration::ZERO);
     provider.publish(runtime(2, 0).0);
     assert!(eventually(|| retained.released()).await);
+    // Reap the failed supervisor so only the released entry can report it.
+    provider.publish(runtime(3, 0).0);
 
     provider.begin_pause();
 
