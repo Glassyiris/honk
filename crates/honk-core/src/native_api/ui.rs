@@ -160,7 +160,6 @@ fn embedded_response(path: &str, navigation: bool, head: bool) -> Response {
         "svg" => "image/svg+xml",
         "json" => "application/json",
         "webmanifest" => "application/manifest+json",
-        "woff2" => "font/woff2",
         "png" => "image/png",
         "txt" => "text/plain",
         _ => "application/octet-stream",
