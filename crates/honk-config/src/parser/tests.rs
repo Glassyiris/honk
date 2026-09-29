@@ -3109,3 +3109,207 @@ mod subscription_entry_options {
         );
     }
 }
+
+#[cfg(test)]
+mod assets_block {
+    use crate::Config;
+    use crate::diagnostic::DetailedDiagnostic;
+    use crate::parser::parse_dae_config_with_detailed_diagnostics;
+
+    const GROUP: &str = "group {\n proxy { policy: min_moving_avg }\n}\n";
+
+    fn parse(input: &str) -> (Config, Vec<DetailedDiagnostic>) {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        (config, diagnostics)
+    }
+
+    fn legacy(diagnostics: &[DetailedDiagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .filter(|d| d.code == "legacy-assets-key")
+            .map(|d| d.setting.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_key_reaches_the_field_its_download_reads() {
+        let (config, diagnostics) = parse(&format!(
+            "{GROUP}assets {{\n route: proxy\n geodata {{\n  geosite: 'https://example.test/geosite.dat'\n  geoip: 'https://example.test/geoip.dat'\n  route: direct\n }}\n ui {{\n  url: 'https://example.test/ui.zip'\n  route: proxy\n }}\n subscription {{\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }}\n}}"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let native = &config.experimental.native_api;
+        assert_eq!(
+            native.geosite_download_url,
+            "https://example.test/geosite.dat"
+        );
+        assert_eq!(native.geoip_download_url, "https://example.test/geoip.dat");
+        assert_eq!(native.geodata_download_detour, "direct");
+        let clash = &config.experimental.clash_api;
+        assert_eq!(
+            clash.external_ui_download_url,
+            "https://example.test/ui.zip"
+        );
+        assert_eq!(clash.external_ui_download_detour, "proxy");
+        assert_eq!(config.assets.route, "proxy");
+        let defaults = &config.assets.subscription;
+        assert_eq!(defaults.ua.as_deref(), Some("clash.meta"));
+        assert_eq!(defaults.interval, Some(3600));
+        assert_eq!(defaults.cache, Some(false));
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn a_subscription_entry_wins_over_assets_and_assets_over_the_built_in() {
+        // The assets block comes after the entries on purpose.
+        let (config, diagnostics) = parse(&format!(
+            "{GROUP}subscription {{\n a: 'https://example.test/a'\n b: 'https://example.test/b' {{\n  ua: 'v2rayN'\n  interval: 0s\n  cache: true\n  route: direct\n }}\n c: 'https://example.test/c'(legacy-ua)\n d: {{\n  url: 'https://example.test/d'\n  download_detour: routing\n }}\n}}\nassets {{\n route: proxy\n subscription {{\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }}\n}}"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let fetch = config
+            .subscriptions
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    s.user_agent.as_deref(),
+                    s.update_interval,
+                    s.cache,
+                    s.download_detour.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fetch,
+            [
+                ("a", Some("clash.meta"), 3600, false, "proxy"),
+                ("b", Some("v2rayN"), 0, true, "direct"),
+                ("c", Some("legacy-ua"), 3600, false, "proxy"),
+                ("d", Some("clash.meta"), 3600, false, "routing"),
+            ]
+        );
+
+        let (config, _) = parse("subscription {\n a: 'https://example.test/a'\n}");
+        let a = &config.subscriptions[0];
+        assert_eq!(
+            (a.user_agent.as_deref(), a.update_interval, a.cache),
+            (None, 86400, true),
+            "no assets block keeps the built-in defaults"
+        );
+        assert_eq!(a.download_detour, "");
+    }
+
+    #[test]
+    fn a_sub_block_route_wins_over_assets_route_and_that_over_routing() {
+        let (config, _) = parse(&format!(
+            "{GROUP}assets {{\n route: proxy\n geodata {{\n  route: direct\n }}\n}}"
+        ));
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "direct"
+        );
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour,
+            "proxy"
+        );
+
+        let (config, _) = parse("assets {\n route: direct\n ui {\n  route: routing\n }\n}");
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "direct"
+        );
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour, "",
+            "routing is the UI download's empty default"
+        );
+
+        let (config, _) = parse("assets {\n route: routing\n}");
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "routing"
+        );
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour,
+            ""
+        );
+
+        let (config, _) = parse("global {\n}");
+        assert_eq!(config.experimental.native_api.geodata_download_detour, "");
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour,
+            ""
+        );
+    }
+
+    #[test]
+    fn assets_route_is_validated_as_a_download_detour() {
+        let (config, _) = parse("assets {\n route: missing\n}");
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-assets-route");
+        assert_eq!(error.diagnostic.setting.to_string(), "assets.route");
+    }
+
+    #[test]
+    fn old_experimental_keys_keep_working_and_warn_at_each_occurrence() {
+        let (config, diagnostics) = parse(&format!(
+            "{GROUP}assets {{\n route: direct\n}}\nexperimental {{\n native_api {{\n  geosite_download_url: 'https://old.test/geosite.dat'\n  geoip_download_url: 'https://old.test/geoip.dat'\n  geodata_download_detour: proxy\n }}\n clash_api {{\n  external_ui_download_url: 'https://old.test/ui.zip'\n  external_ui_download_detour: proxy\n }}\n clash_api {{\n  external_ui_download_url: 'https://old.test/ui.zip'\n }}\n}}"
+        ));
+        assert_eq!(
+            legacy(&diagnostics),
+            [
+                "experimental.native_api.geosite_download_url",
+                "experimental.native_api.geoip_download_url",
+                "experimental.native_api.geodata_download_detour",
+                "experimental.clash_api.external_ui_download_url",
+                "experimental.clash_api.external_ui_download_detour",
+                "experimental.clash_api.external_ui_download_url",
+            ]
+        );
+        let native = &config.experimental.native_api;
+        assert_eq!(native.geosite_download_url, "https://old.test/geosite.dat");
+        assert_eq!(native.geoip_download_url, "https://old.test/geoip.dat");
+        assert_eq!(native.geodata_download_detour, "proxy");
+        let clash = &config.experimental.clash_api;
+        assert_eq!(clash.external_ui_download_url, "https://old.test/ui.zip");
+        assert_eq!(clash.external_ui_download_detour, "proxy");
+    }
+
+    #[test]
+    fn a_setting_in_both_places_is_refused_naming_both() {
+        for (new, old) in [
+            (
+                "geodata {\n  geosite: 'https://a.test'\n }",
+                "native_api {\n  geosite_download_url: 'https://b.test'\n }",
+            ),
+            (
+                "geodata {\n  geoip: 'https://a.test'\n }",
+                "native_api {\n  geoip_download_url: 'https://b.test'\n }",
+            ),
+            (
+                "geodata {\n  route: direct\n }",
+                "native_api {\n  geodata_download_detour: direct\n }",
+            ),
+            (
+                "ui {\n  url: 'https://a.test'\n }",
+                "clash_api {\n  external_ui_download_url: 'https://b.test'\n }",
+            ),
+            (
+                "ui {\n  route: direct\n }",
+                "clash_api {\n  external_ui_download_detour: direct\n }",
+            ),
+        ] {
+            let error = parse_dae_config_with_detailed_diagnostics(
+                &format!("assets {{\n {new}\n}}\nexperimental {{\n {old}\n}}"),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            let d = &error.diagnostic;
+            assert_eq!(d.code, "conflicting-assets-setting");
+            assert!(d.setting.to_string().starts_with("assets."), "{d:?}");
+            let old_key = old.split(['{', ':']).nth(1).unwrap().trim();
+            assert!(d.message.contains(&d.setting.to_string()), "{d:?}");
+            assert!(d.message.contains(old_key), "{d:?}");
+            assert_eq!(d.line, Some(3), "{d:?}");
+        }
+    }
+}

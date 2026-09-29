@@ -465,3 +465,37 @@ fn checksum_verification_is_on_until_a_patch_turns_it_off() {
     assert!(sources.apply(None).unwrap().verify_checksum);
     assert!(Patch::parse(json!({"verify_checksum": "no"}), invalid).is_err());
 }
+
+#[test]
+fn the_assets_block_seeds_the_stored_sources_at_startup() {
+    let config = honk_config::parser::parse_dae_config(
+        "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n geodata {\n  geosite: 'https://assets.example/geosite.dat'\n  geoip: 'https://assets.example/geoip.dat'\n }\n}",
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let sources = Sources::open(db(directory.path()), &config.experimental.native_api).unwrap();
+    let seeded = sources.effective();
+    assert_eq!(seeded.source, Source::Config);
+    assert_eq!(
+        seeded.urls,
+        [
+            vec!["https://assets.example/geosite.dat".to_owned()],
+            vec!["https://assets.example/geoip.dat".to_owned()],
+        ]
+    );
+    assert_eq!(seeded.download, Route::Group("proxy".into()));
+    sources
+        .apply(named(json!({"download": {"route": "routing"}})))
+        .unwrap();
+    drop(sources);
+    let config = honk_config::parser::parse_dae_config(
+        "assets {\n route: routing\n geodata {\n  geosite: 'https://assets.example/geosite.dat'\n  route: direct\n }\n}",
+    )
+    .unwrap();
+    let sources = Sources::open(db(directory.path()), &config.experimental.native_api).unwrap();
+    assert_eq!(
+        sources.effective().download,
+        Route::Direct,
+        "assets.geodata.route wins over assets.route"
+    );
+}
