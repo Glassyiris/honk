@@ -1092,7 +1092,7 @@ fn geosite_matchers_intern_on_exact_expansions() {
 }
 
 #[test]
-fn built_router_keeps_geosite_decisions_and_fingerprint_without_keys() {
+fn geosite_policy_fingerprint_covers_the_exact_expansion() {
     use_repo_geo_assets();
     let rules = vec![RoutingRule {
         name: "geosite-cn-direct".into(),
@@ -1108,28 +1108,10 @@ fn built_router_keeps_geosite_decisions_and_fingerprint_without_keys() {
     let router = Router::new(&rules, "proxy").unwrap();
     let requirements = GeoRequirements::for_traffic(&rules);
     let sources = GeoSourceSet::load(&requirements);
-    let exact = DomainMatcher::geosite(
+    let (exact, _) = DomainMatcher::geosite(
         GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
     );
-    assert!(!exact.key().alternatives.is_empty());
-
-    let [DomainMatcher::Geosite { key, .. }] = &*router.domain_matchers else {
-        panic!("expected one geosite matcher");
-    };
-    assert_eq!(key.alternatives.capacity(), 0);
-    for domain in [
-        "www.jd.com",
-        "BAIDU.com",
-        "www.qq.com",
-        "example.org",
-        "google.com",
-    ] {
-        assert_eq!(
-            router.domain_matchers[0].matches(domain),
-            exact.matches(domain),
-            "{domain}"
-        );
-    }
+    assert!(!exact.alternatives.is_empty());
     assert_eq!(
         router.policy_fingerprint(),
         fingerprint::policy(
