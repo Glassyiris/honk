@@ -67,23 +67,21 @@ async fn trace_displays_configured_values_in_compiled_condition_order() {
             .map(|row| row["expression"].as_str().unwrap())
             .collect::<Vec<_>>(),
         [
-            r#"domain(keyword: example)"#,
-            r#"domain(geosite: test)"#,
+            r#"domain(keyword: example, geosite: test)"#,
             r#"dip(192.0.2.0/24, geoip: test)"#,
             r#"pname(curl)"#,
             r#"!dport(53)"#,
         ]
     );
     assert!(conditions.iter().all(|row| row["result"] == "matched"));
-    let not_matched = ok(trace("other.example").send().await.unwrap()).await;
+    let not_matched = ok(trace("other.org").send().await.unwrap()).await;
     let evaluation = &not_matched["evaluations"][0];
     assert_eq!(evaluation["outbound"], "direct");
-    assert_eq!(evaluation["rules"][0]["conditions"][0]["result"], "matched");
     assert_eq!(
-        evaluation["rules"][0]["conditions"][1]["result"],
+        evaluation["rules"][0]["conditions"][0]["result"],
         "not_matched"
     );
-    assert_eq!(evaluation["rules"][0]["conditions"][2]["result"], "skipped");
+    assert_eq!(evaluation["rules"][0]["conditions"][1]["result"], "skipped");
     assert_eq!(
         evaluation["rules"][1]["conditions"][0]["expression"],
         r#"!domain(geosite: test)"#
