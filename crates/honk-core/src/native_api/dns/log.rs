@@ -98,7 +98,7 @@ impl LogStore {
     }
 
     pub(crate) fn capability(&self) -> serde_json::Value {
-        serde_json::json!({"available": self.allowed, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
+        serde_json::json!({"available": self.allowed, "min_records": crate::native_api::settings::MIN_RECORDS, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
     }
 
     #[allow(clippy::too_many_arguments)]

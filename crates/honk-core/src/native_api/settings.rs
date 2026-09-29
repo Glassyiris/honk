@@ -18,6 +18,9 @@ use super::{
     ApiError, ErrorCode, NativeState, observation::NativeObservation, parse_query, types::RequestId,
 };
 
+/// The smallest log, DNS log or flow ring a PATCH may set.
+pub(super) const MIN_RECORDS: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Level {
@@ -229,10 +232,6 @@ impl Settings {
     pub(crate) fn flow_recording(&self) -> bool {
         self.values.lock().active()[0]
     }
-    pub(crate) fn flow_limits(&self) -> (usize, u64) {
-        let values = self.values.lock();
-        (values.flows, values.retention)
-    }
     fn snapshot(&self) -> Value {
         let current = self.values.lock();
         self.json(*current)
@@ -361,7 +360,7 @@ impl Settings {
                 next.level_overridden = true;
             }
             if let Some(count) = log.buffered_records {
-                if !(64..=512).contains(&count) {
+                if !(MIN_RECORDS..=512).contains(&count) {
                     return Err(invalid(id));
                 }
                 next.logs = count;
@@ -371,7 +370,7 @@ impl Settings {
             let Some(count) = dns.max_records else {
                 return Err(invalid(id));
             };
-            if !(64..=512).contains(&count) {
+            if !(MIN_RECORDS..=512).contains(&count) {
                 return Err(invalid(id));
             }
             unadvertised |= !settings.record_dns_log;
@@ -383,13 +382,13 @@ impl Settings {
             }
             unadvertised |= !settings.record_flows;
             if let Some(count) = flows.max_flows {
-                if !(64..=1024).contains(&count) {
+                if !(MIN_RECORDS..=super::flows::MAX_RECORDS).contains(&count) {
                     return Err(invalid(id));
                 }
                 next.flows = count;
             }
             if let Some(seconds) = flows.retention_seconds {
-                if !(1..=300).contains(&seconds) {
+                if !(1..=super::flows::TERMINAL_TTL.as_secs()).contains(&seconds) {
                     return Err(invalid(id));
                 }
                 next.retention = seconds;
@@ -478,22 +477,12 @@ pub(super) async fn get(
     .into_response())
 }
 
-/// Adds the geodata sources: URLs as written, apart from listener secrets, for
-/// an authenticated caller, who may edit them, and as `source_redacted` shows
-/// them for the anonymous loopback caller.
+/// Adds the geodata sources, URLs as written apart from listener secrets.
 fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value {
     if let Some(sources) = state.geodata.as_ref() {
         let secrets = super::config::ListenerSecrets::from_config(active);
-        let reveal = state.settings.credentialed();
         value["geodata"] = sources.effective().json(
-            |url| {
-                if reveal {
-                    secrets.mask(url).0
-                } else {
-                    super::geodata::redact(url, &secrets, &state.observation.configuration)
-                        .unwrap_or_else(|| "[redacted]".to_owned())
-                }
-            },
+            |url| secrets.mask(url).0,
             |name| super::geodata::group_id(&state.observation.catalog, name),
         );
     }

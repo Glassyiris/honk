@@ -14,8 +14,8 @@ use crate::native_api::ApiError;
 use crate::state::StateDb;
 
 pub(crate) const KINDS: [&str; 2] = ["geosite", "geoip"];
-const MAX_URLS: usize = 4;
-const INTERVAL_HOURS: std::ops::RangeInclusive<u64> = 6..=168;
+pub(super) const MAX_URLS: usize = 4;
+pub(super) const INTERVAL_HOURS: std::ops::RangeInclusive<u64> = 6..=168;
 const MAX_JITTER_SECS: u64 = 3600;
 const FIRST_BACKOFF: Duration = Duration::from_secs(3600);
 /// MetaCubeX full, raw first; jsDelivr serves the same bytes where GitHub is slow.
@@ -148,7 +148,7 @@ fn valid_urls(urls: &[String]) -> bool {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Source {
     Config,
-    Db,
+    Override,
     Default,
 }
 
@@ -424,18 +424,13 @@ impl Sources {
             None => Stored::default(),
             Some(patch) => {
                 let mut next = stored.clone();
-                if patch.geosite.is_some() || patch.geoip.is_some() {
-                    let [geosite, geoip] = current.urls.clone();
-                    next.urls = [
-                        patch.geosite.map_or(geosite, |patch| patch.urls),
-                        patch.geoip.map_or(geoip, |patch| patch.urls),
-                    ]
-                    .map(|urls| {
-                        Some(StoredUrls {
-                            urls,
+                for (list, patch) in next.urls.iter_mut().zip([patch.geosite, patch.geoip]) {
+                    if let Some(patch) = patch {
+                        *list = Some(StoredUrls {
+                            urls: patch.urls,
                             from_config: false,
-                        })
-                    });
+                        });
+                    }
                 }
                 if let Some(auto) = patch.auto_update {
                     let mut value = current.auto_update;
@@ -575,7 +570,7 @@ fn effective(stored: &Stored) -> Effective {
     } else if lists.all(|list| list.from_config) {
         Source::Config
     } else {
-        Source::Db
+        Source::Override
     };
     Effective {
         source,
