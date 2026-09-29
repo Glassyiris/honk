@@ -400,6 +400,7 @@ impl FlowGuard {
                 || !record.mode_recorded
                 || gap_changed;
             record.summary.outbound = outbound;
+            record.summary.rule_generation_id = record.rule_generation(rule_id.as_deref());
             record.summary.rule_id = rule_id;
             record.summary.rule_expression = expression;
             record.summary.rule_source = source;

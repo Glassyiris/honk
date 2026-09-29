@@ -75,7 +75,7 @@ pub(in crate::native_api) async fn get(
         .expect("source snapshot pinned by config publication guard");
     let active = state.diagnostics.read();
     value["generation_id"] = json!(format!("{}:{}", state.instance_id, active.generation));
-    value["store"] = store;
+    value["x-honk"] = json!({"store": store});
     let diagnostics = active
         .buckets
         .static_diagnostics

@@ -10,7 +10,7 @@
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
-| GET | `/api`、`/api/v1/discovery` | 公共 discovery：所有请求都能获得认证状态与登录 links；已放行的请求另外获得固定 `/api/v1` base 与全部契约 links。 |
+| GET | `/api` | 公共 discovery：所有请求都能获得认证状态与登录 links；已放行的请求另外获得固定 `/api/v1` base 与全部契约 links。 |
 | POST | `/api/v1/auth/setup` | 创建首个密码模式管理员并签发会话。 |
 | POST | `/api/v1/auth/login` | 校验密码模式管理员并签发会话。 |
 | POST | `/api/v1/auth/logout` | 撤销已认证的密码模式会话。 |
@@ -32,11 +32,12 @@
 | GET | `/api/v1/runtime/outbounds` | 共用计数生命周期内按 `kind/name` 区分的全宽出站计数。 |
 | GET | `/api/v1/runtime/memory` | 实际进程 RSS 与可读的 cgroup v2 内存事实。 |
 | GET | `/api/v1/runtime/traffic/history`、`/api/v1/runtime/memory/history` | 可选 `window_seconds`、`max_points`，均默认 600、范围 1–600。 |
-| GET / PUT | `/api/v1/runtime/mode` | 失败契约未完整固定，保持 `404 capability_not_supported`。 |
+| GET / PUT | `/api/v1/x-honk/runtime/mode` | 失败契约未完整固定，保持 `404 capability_not_supported`。 |
 | GET / PATCH | `/api/v1/runtime/settings` | 原子读取/合并支持的日志、DNS 日志与 flow 留存设置。 |
 | GET | `/api/v1/datapath` | 后端实际观测的程序、hooks、路由发布和 map 状态，未知项不推测。 |
 | POST | `/api/v1/probes` | 有界的节点/组 TCP、HTTP、DNS 测量 operation。 |
-| GET | `/api/v1/dns/query`、`/api/v1/dns/cache`、`/api/v1/dns/log` | 显式 DNS 诊断、精确缓存快照与客户端查询历史。 |
+| POST | `/api/v1/dns/query` | 显式 DNS 诊断。 |
+| GET | `/api/v1/dns/cache`、`/api/v1/dns/log` | 精确缓存快照与客户端查询历史。 |
 | DELETE | `/api/v1/dns/cache/{entry_id}`、`/api/v1/dns/cache?name=example.org` | 删除精确缓存 incarnation，或按完整名称及可选 type 删除。 |
 | POST | `/api/v1/dns/cache/flush` | 等待内存与启用的持久化缓存失效确认，不清空域名路由事实。 |
 | POST | `/api/v1/routing/trace` | 固定当前 generation 的无联网路由模拟，仅支持 `resolve=none`。 |
@@ -67,7 +68,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 `degradations` 列出因故障降级但仍在运行的功能，每个组件最多一项。每项是一个安全错误（`code`、`message`、`details.reason`），另带 `component` 与 `since`；`since` 是该组件首次降级的时间，重复故障不更新。空列表表示没有已知降级；这些条目不改变 `lifecycle.state`。条目新增、变化或清除时发布 `runtime.updated`。组件：`persistence`（启动时无法打开或重置状态数据库）与 `state_cache`（无法打开其缓存表）在重启后清除；`quic_probe`（Score 组需要 QUIC 探测，但第一个 `tcp_check_url` 不是 HTTPS URL、主机无法解析或无法创建 QUIC 客户端；原因为 `restart_required` 时，启动时没有 Score 组，由重载加入）在应用的配置不再含 Score 组时清除，否则在重启后目标解析成功时清除；探测目标在启动时确定。`pname_routing`（路由规则使用了 `pname()`，但数据路径没有 cgroup v2 hook，`pname()` 条件取不到进程名，肯定条件永不匹配，否定条件总是匹配；原因为 `comm_fallback` 时规则匹配线程名而非 argv）在每次应用配置后重新判定。使用真实 eBPF 后端时，`iface_watch`（接口监视器无法启动）在重启后清除；`udp_trace`（记录流时内核 UDP 接收追踪不可用）在每次启动 UDP 监听器时重新判定。
 
-所有认证模式都公开 `GET /api` 及其等价别名 `/api/v1/discovery`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
+所有认证模式都公开 `GET /api`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
 已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。普通观测读取不触发 probe 或选择变化；显式 `/dns/query` 是可联网的诊断请求。
 
@@ -154,7 +155,7 @@ Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、
 
 Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，network 必填且接受 `tcp/udp/both`。TCP 与 UDP 分开保存，`both` 一次校验并原子发布；对自动策略组（`can_override: true`）的写入会固定该成员，报告 `source: override`；固定成员不可用时不改选同组其他成员。固定只存在于运行时，不持久化，每次配置激活（包括订阅刷新）都会清除，健康检查照常执行。`DELETE /groups/{groupId}/selection?network=` 清除 `tcp`、`udp` 或 `both`（默认）的固定，返回 `GroupOverrideCleared` 与各网络当前选择；未固定的网络保持原选择，对 Selector 返回 `409 state_conflict`。原生与 Clash 写入都由共同 control/reload owner 串行化，Clash 写入等价于 both，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧 owner，而非按当前可达叶名称删除记录；已有选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
 
-组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`、`/config/check_url`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数；`check_url` 为 null，或以小写 `http://`/`https://` 开头、含主机的 URL，不含 userinfo、空白、控制字符与逗号，也不同时含单引号和双引号；PATCH 写入 GET 显示且探测实际发送的规范化形式（去掉 fragment、空路径补 `/`、主机转小写、省略默认端口），不超过 2048 字节，`test` 也按此形式比较。Selector 组接受并保存 `check_url`，但不据此探测。只有 URLTest 组报告并接受 `tolerance`：其他策略报告 `null`，`mutable_config` 不含该字段，把它设为非 null 值的 PATCH 返回 422 `unsupported_value`；允许 `remove`，同一 PATCH 把策略改为 URLTest 时可以设置。此接口不改成员列表或 icon。
+组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`、`/config/check_url`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数或 null，`interrupt_connections` 用布尔值或 null；`check_url` 为 null，或以小写 `http://`/`https://` 开头、含主机的 URL，不含 userinfo、空白、控制字符与逗号，也不同时含单引号和双引号；PATCH 写入 GET 显示且探测实际发送的规范化形式（去掉 fragment、空路径补 `/`、主机转小写、省略默认端口），不超过 2048 字节，`test` 也按此形式比较。Selector 组接受并保存 `check_url`，但不据此探测。只有 URLTest 组报告并接受 `tolerance`：其他策略报告 `null`，`mutable_config` 不含该字段，把它设为非 null 值的 PATCH 返回 422 `unsupported_value`；允许 `remove`，同一 PATCH 把策略改为 URLTest 时可以设置。删除字段或设为 null 会恢复 dae 默认值。组来源未设置 `tolerance` 与 `interrupt_connections` 时，GET 报告 `null`，honk 仍按默认值（`interrupt_connections` 为 false）或 `global.check_tolerance` 生效。此接口不改成员列表或 icon。
 
 源不可写时 `mutable_config` 为空，PATCH 返回 `404 capability_not_supported`。PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用配置来源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
 
@@ -227,7 +228,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 新 accepted 源已发布、但耐久记录尚未完成时，`store.recorded` 为 false，导出文件名为 `honk.dae`；`revision` 和 `parent` 仍描述耐久 head。读取尚未变化的旧 accepted 源时仍可报告已记录。协调器等待阻塞 SQLite promotion 结束，才完成操作、处理下一项修改或确认关闭。
 
-`GET /config` 增加 `store {kind, revision, parent, recorded}`，`kind` 为 `file` 或 `db`。capabilities 增加 `config.store`、`config_export {available}`、`config_import {available, replace_required}` 与 `config_revisions {available, can_activate, max_revisions}`；discovery 增加 `config_export`、`config_import` 与 `config_revisions` 链接。
+以下路由与字段是 honk 扩展，按契约的 Engine extensions 规则放在 `x-honk` 下。`GET /config` 增加 `x-honk.store {kind, revision, parent, recorded}`，`kind` 为 `file` 或 `db`。capabilities 增加 `config.x-honk.store`，并在 `resources.x-honk` 中增加 `config_export {available}`、`config_import {available, replace_required}` 与 `config_revisions {available, can_activate, max_revisions}`；已放行的 discovery 在 `links.x-honk` 中给出这三个链接。下列路径均位于 `/api/v1/x-honk` 下。
 
 - `GET /config/export` 把已接受的源合并为一份文档返回：`text/plain; charset=utf-8`、`Content-Disposition: attachment; filename="honk-r<n>.dae"`（文件模式为 `honk.dae`）、基于正文的强 `ETag` 与 `Cache-Control: no-store`。正文不含监听凭据；有凭据被省略时，首行为 `# listener secrets omitted`，补回凭据后才能运行。两种模式均可用。
 - `POST /config/import`（数据库模式，需可写）接受严格 JSON `{"replace":bool}`，必须带 `Idempotency-Key`。它重新读取 `-c` 源树，经 reload 操作记录为 origin 为 `import` 的新 revision。因为启动过程总会记录 revision 1，所以必须提交 `replace:true`，其他请求返回 `409 state_conflict`。凭据副本在删除后仍残留时返回 `422 unsupported_value`。源树必须保持入口路径、监听凭据、`native_api` 设置与 `data_dir` 不变，否则返回 403。
@@ -244,7 +245,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/测量共享 30 秒 deadline。最终 transport owner 清理即使超期也必须等待 join，因此 operation 总耗时可能超过 30 秒。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。即使已有 4 个 active job，也立即返回 202 与 `queued` 操作；202 只表示 daemon 接管。测量开始前结束的 job 以 `probe_cancelled`、`probe_deadline`、`unsupported_value`（目标端口、解析出的地址或本地解析被拒绝，或节点不能向探测端口转发 UDP）或 `engine_unavailable` 失败；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。最终清理失败时 operation 以 `probe_cleanup_failed` 失败，`result` 保持 null，已完成的测量放在 `error.details`。
 
-`GET /dns/query` 必填 `domain`，`type` 默认 A，可重复指定最多 8 个不同类型，超过时返回 `413 request_too_large`；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
+`POST /dns/query` 接受严格 JSON body（`Content-Type` 须为 `application/json`，否则返回 `415`）：必填 `domain`；`type` 为数组，默认 `["A"]`，最多 8 个不同类型，超过时返回 `413 request_too_large`；`detail=summary|full` 仍放在 query string；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
 
 字面值 `.` 表示 DNS 根，支持实际查询、精确缓存列表和按名称删除。普通输入名称不区分大小写，末尾点可省略；展示名称保留规范化末尾点。合法根域 wire 问题也进入普通严格 DNS 路径；非 UTF-8 label 仍不属于该消费者契约。
 
@@ -254,7 +255,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 每页还带 `usage {entries, entry_capacity}`，描述快照时刻的整个运行时缓存，不受过滤器影响。`entry_capacity` 为 `max_cache_size` 钳制到 1–100,000 后的值。两个值均为十进制字符串，在所有分片同时加锁时读取；同一快照的后续页重复相同的值。淘汰按分片进行，因此单个热点分片可能已在淘汰，而合计值仍显示有余量。`usage.entries` 还计入 `total` 不包含的过期记录与非 exact-key 记录。
 
-获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。两者在期限内无法固定 router 时返回 `503 snapshot_unavailable` 并带 `Retry-After`。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
+获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，从不截断；`max_rules` 取 4096 与当前字典行数中的较大值，`dns_rules.max_rules` 同样不小于较长的 DNS 列表。fallback 条目的 `expression` 为其源语句，例如 `fallback: proxy`；未保留源文本时为 `fallback: <outbound>`。路由模拟的求值结果使用 `fallback: <outbound>`。两者在期限内无法固定 router 时返回 `503 snapshot_unavailable` 并带 `Retry-After`。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
 对已接受 `.dae` 配置中的规则，包括含凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序以 dae 写法显示配置值，不加引号：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。监听凭据值仍被遮蔽；普通条件文本无需写权限即可读取，`config_content` 不产生作用。没有已接受来源元数据的规则显示编译后条件值，来源保持 null。编译后展示反映规范化的谓词，不等同于原始编写语法，也不展开 geodata。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 保留各自代次捕获的有界编译后值，包括程序内构造路由器的值。
 
@@ -321,7 +322,7 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 ### 共用模式与数据面生命周期
 
-原生 `runtime_mode` 暂不可用：固定 PUT 契约未声明暂停冲突与 owner/backend 不可用的错误响应，capability 又不区分读写。GET/HEAD/PUT 均返回 `404 capability_not_supported`，不宣告接受任何 mode。内部共享的 `DatapathFlagsHandle` 及 Clash 控制仍保留；它不是 `dial_mode`，不覆盖 must/block 终态，也不合成网关规则。**仅 native 启用时**，mode/global target 是临时状态，不恢复或写入模式缓存；启动及成功显式配置激活（含 no-op）重置 rule，provider/network refresh 保留。Global 绑定稳定身份，目标消失后新流量 fail closed，不回退普通路由或改投同名替代者。Native 未启用时保留原有 Clash 缓存行为。
+原生 `x-honk` 扩展 `runtime_mode` 暂不可用：固定 PUT 契约未声明暂停冲突与 owner/backend 不可用的错误响应，capability 又不区分读写。GET/HEAD/PUT 均返回 `404 capability_not_supported`，不宣告接受任何 mode。内部共享的 `DatapathFlagsHandle` 及 Clash 控制仍保留；它不是 `dial_mode`，不覆盖 must/block 终态，也不合成网关规则。**仅 native 启用时**，mode/global target 是临时状态，不恢复或写入模式缓存；启动及成功显式配置激活（含 no-op）重置 rule，provider/network refresh 保留。Global 绑定稳定身份，目标消失后新流量 fail closed，不回退普通路由或改投同名替代者。Native 未启用时保留原有 Clash 缓存行为。
 
 显式激活的提交与模式 reset 是不同结果：若 routing/config 已提交但 backend mode 写入失败，settings 已恢复配置值，而 mode/source 保留先前值，控制面关闭准入并返回 committed-degraded，operation 失败。此时既不能声称 Rule 已生效，也不能声称配置回滚；通过 Clash `/configs`（启用时）与 operation 结果检查实际状态。正常 no-op 接受也触发 reset，provider/network 更新不触发。
 

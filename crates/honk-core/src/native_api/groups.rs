@@ -144,7 +144,7 @@ fn normalized(index: usize, value: &Value) -> Option<Value> {
         }),
         1 | 2 => value.is_null() || value.as_str().is_some_and(|value| !value.is_empty()),
         3 | 4 if !value.is_null() => return integer(value).map(Value::from),
-        5 => value.is_boolean(),
+        5 => value.is_null() || value.is_boolean(),
         6 if !value.is_null() => return value.as_str().and_then(check_url).map(Value::from),
         3 | 4 | 6 => true,
         _ => false,
@@ -188,7 +188,7 @@ impl GroupPatch {
             json!(self.group.final_outbound),
             json!(super::catalog::tolerance(&self.group)),
             json!(self.group.idle_timeout),
-            json!(self.group.interrupt_connections),
+            json!(super::catalog::interrupt_connections(&self.group)),
             json!(super::catalog::check_url(&self.group)),
         ];
         let mut values = initial.clone().map(Some);
@@ -612,6 +612,10 @@ mod tests {
             expected: Ok("r".into()),
             group: Group {
                 policy: honk_config::group::GroupPolicy::URLTest,
+                own: honk_config::group::OwnOptions {
+                    tolerance: true,
+                    ..Default::default()
+                },
                 ..Group::default()
             },
             members: vec![("node".into(), "A".into())],

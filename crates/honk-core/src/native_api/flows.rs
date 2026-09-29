@@ -239,6 +239,7 @@ impl FlowStore {
                 chain: Vec::new(),
                 chain_source: "unknown",
                 rule_id: None,
+                rule_generation_id: None,
                 rule_expression: None,
                 rule_source: "unknown",
                 ingress: (),
@@ -616,6 +617,18 @@ impl Record {
             + self.steps.iter().map(Step::heap_bytes).sum::<usize>()
     }
 
+    /// The generation of the latest traffic-route step that carries `rule_id`.
+    fn rule_generation(&self, rule_id: Option<&str>) -> Option<String> {
+        let rule_id = rule_id?;
+        self.steps
+            .iter()
+            .rev()
+            .find(|step| {
+                matches!(&step.data, StepData::Route { chain: "traffic", rule_id: Some(id), .. } if id == rule_id)
+            })
+            .and_then(|step| step.generation_id.clone())
+    }
+
     fn push_step(&mut self, generation_id: Option<String>, mut data: StepData) -> bool {
         if self.steps.len() == MAX_STEPS {
             return !std::mem::replace(&mut self.overflow, true);
@@ -643,6 +656,7 @@ impl Record {
         {
             self.summary.outbound = outbound.clone();
             self.summary.rule_id = rule_id.clone();
+            self.summary.rule_generation_id = rule_id.as_ref().and(generation_id.clone());
             self.summary.rule_expression = rule_id.as_ref().and_then(|id| {
                 rules
                     .iter()

@@ -21,8 +21,6 @@ type Id = Extension<RequestId>;
 pub(super) fn routes() -> Router<Arc<NativeState>> {
     Router::new()
         .route("/api", resource(get(discovery), &["GET"]))
-        // The contract's own spelling of the discovery path; the short one stays for existing clients.
-        .route("/api/v1/discovery", resource(get(discovery), &["GET"]))
         .route(
             "/api/v1/auth/setup",
             resource(post(super::auth::setup), &["POST"]),
@@ -84,7 +82,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
-            "/api/v1/config/export",
+            "/api/v1/x-honk/config/export",
             resource(
                 get(
                     |State(state): App, Extension(id): Id, uri: Uri| async move {
@@ -95,7 +93,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
-            "/api/v1/config/import",
+            "/api/v1/x-honk/config/import",
             resource(
                 post(
                     |State(state): App, Extension(id): Id, request: Request| async move {
@@ -106,7 +104,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
-            "/api/v1/config/revisions",
+            "/api/v1/x-honk/config/revisions",
             resource(
                 get(
                     |State(state): App, Extension(id): Id, uri: Uri| async move {
@@ -117,7 +115,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
-            "/api/v1/config/revisions/{number}/activate",
+            "/api/v1/x-honk/config/revisions/{number}/activate",
             resource(
                 post(
                     |State(state): App, Extension(id): Id, request: Request| async move {
@@ -214,7 +212,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
-            "/api/v1/runtime/mode",
+            "/api/v1/x-honk/runtime/mode",
             resource(get(unsupported).put(unsupported), &["GET", "PUT"]),
         )
         .route(
@@ -541,12 +539,12 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
         .route(
             "/api/v1/dns/query",
             resource(
-                get(
-                    |State(state): App, Extension(id): Id, uri: Uri| async move {
-                        respond(dns::query(&state, &uri, &id).await, id)
+                post(
+                    |State(state): App, Extension(id): Id, request: Request| async move {
+                        respond(dns::query(&state, request, &id).await, id)
                     },
                 ),
-                &["GET"],
+                &["POST"],
             ),
         )
         .route(

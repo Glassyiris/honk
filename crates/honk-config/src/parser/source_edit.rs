@@ -674,14 +674,12 @@ pub fn source_indices(
                 bytes: span.start..span.end,
                 line,
                 column,
-                expression: if ordinal.is_some() {
-                    statement
-                        .sub(span.start, statement.find("->").unwrap())
-                        .trim()
-                        .display()
-                } else {
-                    "fallback".into()
-                },
+                expression: match ordinal {
+                    Some(_) => statement.sub(span.start, statement.find("->").unwrap()),
+                    None => statement,
+                }
+                .trim()
+                .display(),
             };
             if ordinal.is_some() {
                 result.rules.push(location);

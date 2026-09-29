@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    http::{StatusCode, Uri},
+    http::Uri,
     response::{IntoResponse, Response},
 };
 use honk_config::dns::{
@@ -14,16 +14,23 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::super::{
-    ApiError, ErrorCode, NativeState, catalog::snapshot_unavailable, error, parse_query,
-    routing::RuleSource, types::RequestId,
+    ApiError, NativeState, catalog::snapshot_unavailable, parse_query, routing::RuleSource,
+    types::RequestId,
 };
 
 /// Bounds each list, including its fallback.
 const MAX_RULES: usize = 4096;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn capability() -> Value {
-    json!({"available":true,"max_rules":MAX_RULES})
+/// Never below either running list, so both are always served whole.
+pub(crate) fn capability(routing: &DnsRouting) -> Value {
+    let size = routing
+        .effective_request()
+        .rules
+        .len()
+        .max(routing.response.rules.len())
+        + 1;
+    json!({"available":true,"max_rules":MAX_RULES.max(size)})
 }
 
 #[derive(Debug, Serialize)]
@@ -71,30 +78,16 @@ pub(super) async fn snapshot(
         // sources under the config write lock, so this read pins all three.
         let config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
-        list(state, &config.dns.routing, generation, id)
+        list(state, &config.dns.routing, generation)
     })
     .await
-    .map_err(|_| snapshot_unavailable(id))?
+    .map_err(|_| snapshot_unavailable(id))
 }
 
-fn list(
-    state: &NativeState,
-    routing: &DnsRouting,
-    generation: u64,
-    id: &RequestId,
-) -> Result<DnsRuleList, ApiError> {
+fn list(state: &NativeState, routing: &DnsRouting, generation: u64) -> DnsRuleList {
     let request = routing.effective_request();
     let response = &routing.response;
-    if request.rules.len().max(response.rules.len()) >= MAX_RULES {
-        return Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::TemporarilyUnavailable,
-            "A DNS rule list exceeds resources.dns_rules.max_rules",
-            id,
-        )
-        .with_retry_after(1));
-    }
-    Ok(DnsRuleList {
+    DnsRuleList {
         generation_id: format!("{}:{generation}", state.instance_id),
         request: entries(
             state,
@@ -116,7 +109,7 @@ fn list(
                 .map(|rule| (rule.conditions.as_slice(), response_action(&rule.action))),
             response_action(&response.fallback),
         ),
-    })
+    }
 }
 
 fn entries<'c>(
