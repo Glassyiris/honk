@@ -157,43 +157,48 @@ pub(super) fn apply(
 ) -> Result<(), super::ParseFailure> {
     let native = &mut config.experimental.native_api;
     let clash = &mut config.experimental.clash_api;
-    for (value, target, (block, key), field) in [
+    for (value, target, (block, key), field, message) in [
         (
             parsed.geosite,
             &mut native.geosite_download_url,
             ("geodata", "geosite"),
             "geosite_download_url",
+            "assets.geodata.geosite and experimental.native_api.geosite_download_url are both set; keep assets.geodata.geosite",
         ),
         (
             parsed.geoip,
             &mut native.geoip_download_url,
             ("geodata", "geoip"),
             "geoip_download_url",
+            "assets.geodata.geoip and experimental.native_api.geoip_download_url are both set; keep assets.geodata.geoip",
         ),
         (
             parsed.geodata_route,
             &mut native.geodata_download_detour,
             ("geodata", "route"),
             "geodata_download_detour",
+            "assets.geodata.route and experimental.native_api.geodata_download_detour are both set; keep assets.geodata.route",
         ),
         (
             parsed.ui_url,
             &mut clash.external_ui_download_url,
             ("ui", "url"),
             "external_ui_download_url",
+            "assets.ui.url and experimental.clash_api.external_ui_download_url are both set; keep assets.ui.url",
         ),
         (
             parsed.ui_route,
             &mut clash.external_ui_download_detour,
             ("ui", "route"),
             "external_ui_download_detour",
+            "assets.ui.route and experimental.clash_api.external_ui_download_detour are both set; keep assets.ui.route",
         ),
     ] {
         let Some(value) = value else {
             continue;
         };
         if !target.is_empty() {
-            return Err(conflict(value, block, key, field).into());
+            return Err(conflict(value, block, key, field, message).into());
         }
         *target = value.raw().to_owned();
     }
@@ -217,24 +222,8 @@ fn conflict(
     block: &'static str,
     key: &'static str,
     field: &'static str,
+    message: &'static str,
 ) -> DetailedConfigError {
-    let message = match field {
-        "geosite_download_url" => {
-            "assets.geodata.geosite and experimental.native_api.geosite_download_url are both set; keep assets.geodata.geosite"
-        }
-        "geoip_download_url" => {
-            "assets.geodata.geoip and experimental.native_api.geoip_download_url are both set; keep assets.geodata.geoip"
-        }
-        "geodata_download_detour" => {
-            "assets.geodata.route and experimental.native_api.geodata_download_detour are both set; keep assets.geodata.route"
-        }
-        "external_ui_download_url" => {
-            "assets.ui.url and experimental.clash_api.external_ui_download_url are both set; keep assets.ui.url"
-        }
-        _ => {
-            "assets.ui.route and experimental.clash_api.external_ui_download_detour are both set; keep assets.ui.route"
-        }
-    };
     let (line, column) = value.source.location(value.span.start);
     let mut error = DetailedConfigError::new(
         ErrorCategory::Parse,
