@@ -558,7 +558,7 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
     let path = "/api/v1/runtime/settings";
     let initial = response_json(app.get(path).send().await.unwrap()).await;
     assert_eq!(initial["recording"]["logs"]["allowed"], false);
-    for mode in [json!(true), json!(false), json!("auto")] {
+    for (mode, active) in [("on", Some(true)), ("off", Some(false)), ("auto", None)] {
         let response = app
             .client
             .patch(app.url(path))
@@ -568,19 +568,17 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
             .await
             .unwrap();
         let value = response_json(response).await;
-        let expected = match mode.as_bool() {
-            Some(true) => "on",
-            Some(false) => "off",
-            None => "auto",
-        };
-        assert_eq!(value["recording"]["flows"]["mode"], expected);
-        if let Some(active) = mode.as_bool() {
+        assert_eq!(value["recording"]["flows"]["mode"], mode);
+        if let Some(active) = active {
             assert_eq!(value["recording"]["flows"]["active"], active);
         }
+        let capabilities =
+            response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await;
+        assert_eq!(capabilities["resources"]["flows"]["recording"], mode);
     }
     let before = response_json(app.get(path).send().await.unwrap()).await;
     for patch in [
-        json!({"record_flows": true, "record_logs": true}),
+        json!({"record_flows": "on", "record_logs": "on"}),
         json!({"log": {"level": "debug"}}),
     ] {
         error_response(
@@ -600,12 +598,12 @@ async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
     }
     for (patch, details) in [
         (
-            json!({"record_logs": true, "dns_log": {"max_records": 1}}),
+            json!({"record_logs": "on", "dns_log": {"max_records": 1}}),
             Value::Null,
         ),
         (json!({"record_flows": null}), Value::Null),
         (
-            json!({"record_flows": "on"}),
+            json!({"record_flows": true}),
             json!({"field":"record_flows","kind":"invalid_value"}),
         ),
         (

@@ -66,11 +66,11 @@ enum RecorderMode {
 
 impl<'de> Deserialize<'de> for RecorderMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match Value::deserialize(deserializer)? {
-            Value::Bool(true) => Ok(Self::On),
-            Value::Bool(false) => Ok(Self::Off),
-            Value::String(value) if value == "auto" => Ok(Self::Auto),
-            _ => Err(serde::de::Error::custom("expected true, false, or auto")),
+        match Value::deserialize(deserializer)?.as_str() {
+            Some("on") => Ok(Self::On),
+            Some("off") => Ok(Self::Off),
+            Some("auto") => Ok(Self::Auto),
+            _ => Err(serde::de::Error::custom("expected on, off, or auto")),
         }
     }
 }
@@ -229,8 +229,20 @@ impl Settings {
         next.apply(owner);
         *current = next;
     }
+    #[cfg(test)]
     pub(crate) fn flow_recording(&self) -> bool {
         self.values.lock().active()[0]
+    }
+    /// The flow recorder's policy for `resources.flows.recording`, not
+    /// whether it captures now.
+    pub(crate) fn flow_recording_policy(&self) -> &'static str {
+        let values = self.values.lock();
+        match values.modes[0] {
+            _ if !values.allowed[0] => "off",
+            RecorderMode::Auto => "auto",
+            RecorderMode::On => "on",
+            RecorderMode::Off => "off",
+        }
     }
     fn snapshot(&self) -> Value {
         let current = self.values.lock();
@@ -619,8 +631,9 @@ mod tests {
         let unchanged = owner.settings.snapshot();
         assert_eq!(unchanged["log"], current["log"]);
         assert_eq!(unchanged["flows"], current["flows"]);
+        assert!(serde_json::from_value::<Patch>(json!({"record_flows":true})).is_err());
         let modes: Patch = serde_json::from_value(
-            json!({"record_flows":true,"record_logs":false,"record_dns_log":"auto"}),
+            json!({"record_flows":"on","record_logs":"off","record_dns_log":"auto"}),
         )
         .unwrap();
         let changed = owner
@@ -632,18 +645,20 @@ mod tests {
         assert_eq!(changed["recording"]["logs"]["mode"], "off");
         assert_eq!(changed["recording"]["logs"]["active"], false);
         assert_eq!(changed["recording"]["dns_log"]["mode"], "auto");
+        assert_eq!(owner.settings.flow_recording_policy(), "on");
         owner.settings.activate(&owner, &config);
         let restored = owner.settings.snapshot();
         assert_eq!(restored["source"], "config");
         assert_eq!(restored["log"]["level"], "warn");
         assert_eq!(restored["flows"]["max_flows"], 1024);
         assert_eq!(restored["recording"]["flows"]["mode"], "auto");
+        assert_eq!(owner.settings.flow_recording_policy(), "auto");
         assert_eq!(restored["recording"]["logs"]["mode"], "auto");
 
         config.experimental.native_api.record_flows = false;
         let forbidden = NativeObservation::new(&config);
         let mixed =
-            serde_json::from_value(json!({"record_flows":true,"log":{"level":"trace"}})).unwrap();
+            serde_json::from_value(json!({"record_flows":"on","log":{"level":"trace"}})).unwrap();
         assert!(
             forbidden
                 .settings
@@ -664,6 +679,7 @@ mod tests {
         );
         forbidden.settings.renew(&forbidden, true);
         assert!(!forbidden.settings.flow_recording());
+        assert_eq!(forbidden.settings.flow_recording_policy(), "off");
         assert_eq!(
             forbidden.settings.snapshot()["recording"]["flows"]["active"],
             false
@@ -906,14 +922,14 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(patch(true)["recording"]["flows"]["active"], true);
+        assert_eq!(patch("on")["recording"]["flows"]["active"], true);
         tokio::time::advance(Duration::from_secs(61)).await;
         owner.settings.maintain(&owner);
         assert!(owner.settings.flow_recording());
         owner.settings.activate(&owner, &config);
         assert!(!owner.settings.flow_recording());
         let diagnostic = stream(&owner, true);
-        assert_eq!(patch(false)["recording"]["flows"]["active"], false);
+        assert_eq!(patch("off")["recording"]["flows"]["active"], false);
         owner.settings.renew(&owner, true);
         assert!(!owner.settings.flow_recording());
         owner.settings.activate(&owner, &config);

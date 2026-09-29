@@ -443,7 +443,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
                 "can_close": true,
                 "max_bulk_close": super::connections::MAX_BULK_CLOSE,
             },
-            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":crate::observe::flows::MAX_RECORDS, "max_steps_per_flow":64, "retention_seconds":crate::observe::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": state.observation.settings.flow_recording_policy(), "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":crate::observe::flows::MAX_RECORDS, "max_steps_per_flow":64, "retention_seconds":crate::observe::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": routing_trace,
             "rules": rules,
             "events": {"available":true,"kinds":kinds,"retention_seconds":super::events::RETENTION.as_secs(),"max_buffered_events":super::events::MAX_EVENTS,"max_clients":super::events::MAX_CLIENTS,"heartbeat_seconds":super::events::HEARTBEAT.as_secs()},
