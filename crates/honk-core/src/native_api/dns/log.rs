@@ -12,20 +12,19 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::records::{self, DnsAnswer, DnsQuestion, MAX_JSON_BYTES};
-use crate::dns::outcome::{DnsOutcome, Provenance, RequestRoute};
+use crate::dns::outcome::{DnsOutcome, RequestRoute};
 use crate::dns::query::IngressProfile;
 use crate::dns::response::native;
 use crate::native_api::{
-    ApiError, ErrorCode, NativeState, canonical_ip, error, invalid_query, parse_query, timestamp,
+    ApiError, ErrorCode, NativeState, error, invalid_query, parse_query, timestamp,
     types::RequestId,
 };
 
 pub(crate) const MAX_RECORDS: usize = 512;
 pub(crate) const MAX_PAGE_SIZE: usize = 500;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SAFE_UINT: u128 = 9_007_199_254_740_991;
 
-pub(crate) struct LogStore {
+pub(crate) struct DnsHistory {
     instance: String,
     allowed: bool,
     recording: AtomicBool,
@@ -56,7 +55,25 @@ struct Entry {
     bytes: usize,
 }
 
-impl LogStore {
+impl crate::observe::DnsLog for DnsHistory {
+    fn recording(&self) -> bool {
+        DnsHistory::recording(self)
+    }
+
+    fn capture(
+        &self,
+        query: &[u8],
+        ingress: IngressProfile,
+        source: Option<SocketAddr>,
+        outcome: Option<&DnsOutcome>,
+        response: &[u8],
+        elapsed: Duration,
+    ) {
+        DnsHistory::capture(self, query, ingress, source, outcome, response, elapsed);
+    }
+}
+
+impl DnsHistory {
     pub(crate) fn new(instance: String, recording: bool) -> Self {
         Self {
             instance,
@@ -98,7 +115,7 @@ impl LogStore {
     }
 
     pub(crate) fn capability(&self) -> serde_json::Value {
-        serde_json::json!({"available": self.allowed, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
+        serde_json::json!({"available": self.allowed, "min_records": crate::native_api::settings::MIN_RECORDS, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -127,9 +144,7 @@ impl LogStore {
         let Some(qtype) = context.qtype().map(|value| value.get()) else {
             return;
         };
-        let cached = outcome.is_some_and(|outcome| {
-            matches!(outcome.provenance(), Provenance::Cache | Provenance::Stale)
-        });
+        let cached = outcome.is_some_and(DnsOutcome::is_cached);
         let upstream = outcome
             .filter(|_| !cached)
             .and_then(DnsOutcome::final_upstream);
@@ -185,15 +200,20 @@ impl LogStore {
             cached,
             upstream: upstream.map(Into::into),
             route: route.cloned().unwrap_or_default(),
-            elapsed_ms: elapsed.as_millis().min(MAX_SAFE_UINT) as u64,
+            elapsed_ms: elapsed
+                .as_millis()
+                .min(u128::from(crate::observe::MAX_SAFE_UINT)) as u64,
             bytes,
         });
     }
 
-    fn cursor(&self, sequence: u64, filter: &Filter) -> String {
+    /// `{sequence}:{issued}:{bound}`: `issued` proves this process issued
+    /// the cursor, `bound` ties it to the filter and `limit`.
+    fn cursor(&self, sequence: u64, filter: &Filter, limit: usize) -> String {
+        let issued = self.issued(sequence);
         let mut digest = Sha256::new();
-        digest.update(self.instance.as_bytes());
-        digest.update(sequence.to_be_bytes());
+        digest.update(issued.as_bytes());
+        digest.update(limit.to_be_bytes());
         let name = filter.name.as_deref().unwrap_or_default();
         digest.update(name.len().to_be_bytes());
         digest.update(name.as_bytes());
@@ -211,9 +231,17 @@ impl LogStore {
             }
         }
         format!(
-            "{sequence}:{}",
+            "{sequence}:{issued}:{}",
             crate::configuration::encode_digest(&digest.finalize())
         )
+    }
+
+    fn issued(&self, sequence: u64) -> String {
+        let digest = Sha256::new()
+            .chain_update(self.instance.as_bytes())
+            .chain_update(sequence.to_be_bytes())
+            .finalize();
+        crate::configuration::encode_digest(&digest)
     }
 
     fn page(
@@ -226,13 +254,18 @@ impl LogStore {
         // ponytail: at most 512 records under one lock; indexed snapshots only if this ceiling grows.
         let ring = self.inner.lock();
         let anchor = if let Some(cursor) = cursor {
-            let sequence = cursor
-                .split_once(':')
-                .and_then(|(value, _)| value.parse::<u64>().ok())
-                .ok_or_else(|| invalid_query(id))?;
-            if self.cursor(sequence, &filter) != cursor
+            let expired = || super::super::catalog::snapshot_expired(id);
+            let mut parts = cursor.split(':');
+            let sequence = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(expired)?;
+            if parts.next() != Some(self.issued(sequence).as_str())
                 || !ring.entries.iter().any(|entry| entry.sequence == sequence)
             {
+                return Err(expired());
+            }
+            if self.cursor(sequence, &filter, limit) != cursor {
                 return Err(invalid_query(id));
             }
             sequence
@@ -293,7 +326,7 @@ impl LogStore {
             total: ring.entries.len(),
             next_cursor: last
                 .filter(|_| more)
-                .map(|sequence| self.cursor(sequence, &filter)),
+                .map(|sequence| self.cursor(sequence, &filter, limit)),
             records: rows,
         };
         let bytes = records::json_size(&page).map_err(|_| unavailable(id))?;
@@ -328,7 +361,7 @@ impl Filter {
             && self.source.is_none_or(|source| {
                 entry
                     .source
-                    .is_some_and(|actual| canonical_ip(actual.ip()) == source)
+                    .is_some_and(|actual| actual.ip().to_canonical() == source)
             })
             && self.name.as_deref().is_none_or(|name| {
                 entry
@@ -414,7 +447,7 @@ pub(super) async fn serve(
         .map(|value| {
             value
                 .parse::<IpAddr>()
-                .map(canonical_ip)
+                .map(|ip| ip.to_canonical())
                 .map_err(|_| invalid_query(id))
         })
         .transpose()?;
@@ -431,7 +464,7 @@ pub(super) async fn serve(
 }
 
 #[cfg(test)]
-impl LogStore {
+impl DnsHistory {
     pub(crate) fn page_for_test(&self) -> Response {
         self.page(
             Filter::default(),
@@ -447,7 +480,7 @@ impl LogStore {
 mod tests {
     use super::*;
 
-    fn capture(store: &LogStore, name: &str, source: Option<SocketAddr>) {
+    fn capture(store: &DnsHistory, name: &str, source: Option<SocketAddr>) {
         let query = crate::dns::forwarder::build_dns_query(name, 1);
         let response = crate::dns::response::build_dns_refused(&query);
         store.capture(
@@ -471,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipv6_socket_filter_and_cursor_are_bound_to_retained_records() {
-        let store = LogStore::new("first-instance".into(), true);
+        let store = DnsHistory::new("first-instance".into(), true);
         let source: SocketAddr = "[2001:db8::12]:53210".parse().unwrap();
         capture(&store, "older.example", Some(source));
         capture(&store, "newer.example", Some(source));
@@ -492,13 +525,32 @@ mod tests {
         let cursor = first["next_cursor"].as_str().unwrap();
         let second = value(store.page(filter(), 1, Some(cursor), &id).unwrap()).await;
         assert_eq!(second["records"][0]["question"]["name"], "older.example.");
-        assert!(store.page(Filter::default(), 1, Some(cursor), &id).is_err());
-        let other = LogStore::new("second-instance".into(), true);
+        let status =
+            |result: Result<Response, ApiError>| result.unwrap_err().into_response().status();
+        assert_eq!(
+            status(store.page(Filter::default(), 1, Some(cursor), &id)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(store.page(filter(), 2, Some(cursor), &id)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(store.page(filter(), 1, Some("1:forged:forged"), &id)),
+            StatusCode::GONE
+        );
+        let other = DnsHistory::new("second-instance".into(), true);
         capture(&other, "older.example", Some(source));
         capture(&other, "newer.example", Some(source));
-        assert!(other.page(filter(), 1, Some(cursor), &id).is_err());
+        assert_eq!(
+            status(other.page(filter(), 1, Some(cursor), &id)),
+            StatusCode::GONE
+        );
         store.set_limit(1);
-        assert!(store.page(filter(), 1, Some(cursor), &id).is_err());
+        assert_eq!(
+            status(store.page(filter(), 1, Some(cursor), &id)),
+            StatusCode::GONE
+        );
         assert_eq!(value(store.page_for_test()).await["total"], 1);
     }
 
@@ -560,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn byte_eviction_retains_whole_unknown_records_and_never_clips_projection() {
-        let store = LogStore::new("instance".into(), true);
+        let store = DnsHistory::new("instance".into(), true);
         let query = crate::dns::forwarder::build_dns_query("large.example", 65000);
         let mut response = query.clone();
         response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
@@ -590,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn pages_end_early_at_the_projection_budget_and_walk_every_record_once() {
-        let store = LogStore::new("instance".into(), true);
+        let store = DnsHistory::new("instance".into(), true);
         let query = crate::dns::forwarder::build_dns_query("large.example", 65000);
         let mut response = query.clone();
         response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
@@ -639,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_record_larger_than_any_page_is_served_alone_and_the_walk_continues() {
-        let store = LogStore::new("instance".into(), true);
+        let store = DnsHistory::new("instance".into(), true);
         let domain = [
             "a".repeat(63),
             "b".repeat(63),

@@ -12,8 +12,13 @@ use parking_lot::Mutex;
 pub(crate) enum Component {
     Persistence,
     StateCache,
+    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
     IfaceWatch,
     PnameRouting,
+    #[cfg_attr(
+        not(all(feature = "native-api", feature = "ebpf", target_os = "linux")),
+        allow(dead_code)
+    )]
     UdpTrace,
     QuicProbe,
 }
@@ -55,13 +60,10 @@ pub(crate) struct Degradation {
 
 type Notify = Box<dyn Fn() + Send + Sync>;
 
-/// An issue, its rule and its `since`.
-type Entry = (Issue, Option<&'static str>, SystemTime);
-
 /// One entry per component, so the list is bounded by `Component::COUNT`.
 #[derive(Default)]
 pub(crate) struct Degradations {
-    entries: Mutex<[Option<Entry>; Component::COUNT]>,
+    entries: Mutex<[Option<Degradation>; Component::COUNT]>,
     notify: Mutex<Option<Notify>>,
 }
 
@@ -82,15 +84,18 @@ impl Degradations {
             let mut entries = self.entries.lock();
             let slot = &mut entries[component as usize];
             match slot {
-                Some((current, current_rule, _)) if (*current, *current_rule) == (issue, rule) => {
-                    false
-                }
-                Some((current, current_rule, _)) => {
-                    (*current, *current_rule) = (issue, rule);
+                Some(current) if (current.issue, current.rule) == (issue, rule) => false,
+                Some(current) => {
+                    (current.issue, current.rule) = (issue, rule);
                     true
                 }
                 None => {
-                    *slot = Some((issue, rule, SystemTime::now()));
+                    *slot = Some(Degradation {
+                        component,
+                        issue,
+                        rule,
+                        since: SystemTime::now(),
+                    });
                     true
                 }
             }
@@ -108,30 +113,14 @@ impl Degradations {
 
     #[cfg(test)]
     pub(crate) fn get(&self, component: Component) -> Option<Issue> {
-        self.entries.lock()[component as usize].map(|(issue, _, _)| issue)
+        self.entries.lock()[component as usize]
+            .as_ref()
+            .map(|entry| entry.issue)
     }
 
     #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> Vec<Degradation> {
-        const ALL: [Component; Component::COUNT] = [
-            Component::Persistence,
-            Component::StateCache,
-            Component::IfaceWatch,
-            Component::PnameRouting,
-            Component::UdpTrace,
-            Component::QuicProbe,
-        ];
-        let entries = self.entries.lock();
-        ALL.into_iter()
-            .filter_map(|component| {
-                entries[component as usize].map(|(issue, rule, since)| Degradation {
-                    component,
-                    issue,
-                    rule,
-                    since,
-                })
-            })
-            .collect()
+        self.entries.lock().iter().flatten().cloned().collect()
     }
 
     /// Runs `notify` after every change; it must not call back into the registry.

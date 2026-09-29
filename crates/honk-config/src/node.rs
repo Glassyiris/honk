@@ -348,6 +348,9 @@ pub struct Group {
     /// Close owned connections when the selected member changes.
     #[serde(default)]
     pub interrupt_connections: bool,
+    /// Which defaulted options the group's own source sets.
+    #[serde(skip)]
+    pub own: OwnOptions,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -369,12 +372,23 @@ impl Default for Group {
             tolerance: default_tolerance(),
             idle_timeout: None,
             interrupt_connections: false,
+            own: OwnOptions::default(),
             created_at: chrono::Utc::now(),
         }
     }
 }
 
+/// Group options whose effective value otherwise comes from a default or `global`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnOptions {
+    pub tolerance: bool,
+    pub interrupt_connections: bool,
+}
+
 impl Group {
+    pub(crate) const INVALID_ICON: &'static str =
+        "icon must be an absolute http(s) URL or data URI of at most 2048 characters";
+
     pub fn valid_icon(value: &str) -> bool {
         if value.chars().count() > 2048
             || value.chars().any(char::is_whitespace)
@@ -426,6 +440,19 @@ pub enum GroupPolicy {
     Fallback,
     /// Reliability-aware automatic selection trained by real connection outcomes.
     Score,
+}
+
+impl GroupPolicy {
+    /// Serde wire name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selector => "selector",
+            Self::URLTest => "urltest",
+            Self::LoadBalance => "loadbalance",
+            Self::Fallback => "fallback",
+            Self::Score => "score",
+        }
+    }
 }
 
 #[cfg(test)]

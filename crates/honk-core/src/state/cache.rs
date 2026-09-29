@@ -11,7 +11,7 @@
 //! is not enough the batch is rolled back, so cache writes can never take the
 //! room a strict write needs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 
 use honk_outbound::group::{SelectionNetwork, SelectorMember};
@@ -731,6 +731,100 @@ impl CacheDb {
     pub(crate) fn write_attempted_for_test(&self) -> bool {
         self.write_attempted
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Delay samples older than this are pruned.
+pub(crate) const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
+
+/// Names the config holds when a tick starts.
+pub(crate) struct Live {
+    selector_groups: HashSet<String>,
+    nodes: HashSet<String>,
+}
+
+impl Live {
+    pub(crate) fn of(config: &honk_config::Config) -> Self {
+        Self {
+            selector_groups: config
+                .groups
+                .iter()
+                .filter(|group| group.policy == honk_config::group::GroupPolicy::Selector)
+                .map(|group| group.name.clone())
+                .collect(),
+            nodes: config.nodes.iter().map(|node| node.name.clone()).collect(),
+        }
+    }
+}
+
+/// Keys that were missing from the config at the previous tick, one per row.
+#[derive(Default)]
+pub(crate) struct Missing {
+    groups: HashSet<String>,
+    nodes: HashSet<String>,
+    bodies: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TickOwners {
+    pub(crate) store_dns: bool,
+    pub(crate) store_subscribe: bool,
+}
+
+/// One maintenance tick. With `store_subscribe`, deletes subscription bodies
+/// whose subscription was not enabled at this tick and the previous one. With
+/// the cache open, writes `samples`, deletes Selector and delay rows whose
+/// group or node was missing at this tick and the previous one, delay rows
+/// older than 24 h and, with `store_dns`, expired DNS rows, then runs
+/// `incremental_vacuum`. The two-tick rule keeps rows across a config that
+/// briefly drops and restores a group, node or subscription.
+pub(crate) fn maintenance_tick(
+    state: &StateDb,
+    db: Option<&CacheDb>,
+    live: &Live,
+    samples: Vec<(String, u64, u64)>,
+    missing: &mut Missing,
+    owners: TickOwners,
+    now: u64,
+) {
+    if owners.store_subscribe
+        && let Err(error) = crate::subscription::prune_bodies(state, &mut missing.bodies)
+    {
+        tracing::warn!(%error, "state db subscription body maintenance failed");
+    }
+    let Some(db) = db else {
+        return;
+    };
+    db.save_delay_samples(samples);
+    let stale = |rows: Result<Vec<String>, _>,
+                 present: &HashSet<String>,
+                 previous: &mut HashSet<String>| {
+        let current: HashSet<String> = match rows {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|key| !present.contains(key))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "state db maintenance read failed");
+                HashSet::new()
+            }
+        };
+        let expired = current.intersection(previous).cloned().collect();
+        *previous = current;
+        expired
+    };
+    let work = Maintenance {
+        groups: stale(
+            db.selector_groups(),
+            &live.selector_groups,
+            &mut missing.groups,
+        ),
+        nodes: stale(db.delay_nodes(), &live.nodes, &mut missing.nodes),
+        delay_cutoff: now.saturating_sub(DELAY_SAMPLE_MAX_AGE_SECS),
+        dns_expired_at: owners.store_dns.then_some(now),
+    };
+    if let Err(error) = db.maintain(work) {
+        tracing::warn!(%error, "state db maintenance failed");
     }
 }
 

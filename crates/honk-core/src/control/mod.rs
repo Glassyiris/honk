@@ -94,10 +94,14 @@ pub use client::ControlClient;
 pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
+pub(crate) use reload::LogFiles;
+#[cfg(feature = "native-api")]
+pub(crate) use reload::restart_required_fields;
 use reload::*;
-pub(crate) use reload::{LogFiles, restart_required_fields};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
+#[cfg(all(test, feature = "native-api"))]
+pub(crate) use tests::reload_harness::ReloadBehavior;
 
 /// Re-send `NetworkChanged` with bounded backoff after a rejected refresh.
 /// Duplicate deliveries after the interface-dependent state converges are
@@ -163,7 +167,7 @@ pub struct ControlPlane {
     mode_db: Option<Arc<crate::state::cache::CacheDb>>,
     /// The state database handed to `init_cache_db`.
     state_db: Option<Arc<crate::state::StateDb>>,
-    state_tick: cache::StateTick,
+    state_tick: lifecycle::OwnedTasks,
     /// Features running reduced; shared with startup and the native API.
     degradations: Arc<crate::degradations::Degradations>,
     /// Built by `configure_health_loop`; a reload updates whether it is needed.
@@ -204,11 +208,11 @@ pub struct ControlPlane {
     phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
     #[cfg(feature = "native-api")]
     configuration: Option<Arc<crate::configuration::AcceptedSources>>,
+    native: Option<Arc<crate::observe::Observation>>,
     #[cfg(feature = "native-api")]
-    native: Option<Arc<crate::native_api::observation::NativeObservation>>,
+    native_owner: Option<Arc<dyn crate::observe::Owner>>,
     #[cfg(feature = "native-api")]
     subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
-    #[cfg(feature = "native-api")]
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "clash-api")]
     ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
@@ -251,14 +255,8 @@ impl ControlPlane {
     }
 
     #[cfg(feature = "native-api")]
-    pub(crate) fn native_observation(
-        &mut self,
-    ) -> Arc<crate::native_api::observation::NativeObservation> {
-        Arc::clone(
-            self.native
-                .as_ref()
-                .expect("native observation configured at control-plane construction"),
-        )
+    pub(crate) fn degradations_handle(&self) -> Arc<crate::degradations::Degradations> {
+        Arc::clone(&self.degradations)
     }
 
     #[cfg(feature = "native-api")]
@@ -314,6 +312,7 @@ impl ControlPlane {
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
     }
+    #[cfg(feature = "native-api")]
     pub(crate) fn log_files(&self) -> LogFiles {
         self.log_files.clone()
     }
@@ -408,7 +407,6 @@ impl ControlPlane {
         self.subscriptions = Some(subscriptions);
     }
 
-    #[cfg(feature = "native-api")]
     pub(crate) fn shutdown_intent(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.shutdown_requested)
     }

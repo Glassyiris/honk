@@ -31,6 +31,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
         tolerance: 50,
         idle_timeout: None,
         interrupt_connections: false,
+        own: Default::default(),
         created_at: Utc::now(),
     }
 }

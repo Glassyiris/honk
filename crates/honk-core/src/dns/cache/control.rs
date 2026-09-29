@@ -59,8 +59,6 @@ pub(crate) enum CacheInvalidation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheMutation {
     #[cfg(any(feature = "native-api", test))]
-    pub matched: usize,
-    #[cfg(any(feature = "native-api", test))]
     pub deleted: usize,
     pub persistent: bool,
 }
@@ -84,12 +82,7 @@ impl DnsCacheService {
         let mut digest = Sha256::new();
         digest.update(self.identity_nonce.as_bytes());
         digest.update(revision.to_be_bytes());
-        use std::fmt::Write;
-        let mut id = String::with_capacity(64);
-        for byte in digest.finalize() {
-            write!(id, "{byte:02x}").expect("writing to a String is infallible");
-        }
-        id
+        crate::configuration::encode_digest(&digest.finalize())
     }
 
     #[cfg(test)]
@@ -223,15 +216,13 @@ impl DnsCacheService {
                 {
                     let selected: Vec<_> = shard
                         .iter()
-                        .filter(|(_slot, _value)| match &selection {
+                        .filter(|(slot, value)| match &selection {
                             CacheInvalidation::All => true,
-                            #[cfg(any(feature = "native-api", test))]
                             CacheInvalidation::Id(id) => {
-                                matches!(_slot, CacheSlot::Exact(_))
-                                    && self.incarnation_id(_value.revision) == *id
+                                matches!(slot, CacheSlot::Exact(_))
+                                    && self.incarnation_id(value.revision) == *id
                             }
-                            #[cfg(any(feature = "native-api", test))]
-                            CacheInvalidation::Name { name, types } => match _slot {
+                            CacheInvalidation::Name { name, types } => match slot {
                                 CacheSlot::Exact(key) => {
                                     question_matches(key.wire_identity(), name, types)
                                 }
@@ -241,7 +232,6 @@ impl DnsCacheService {
                         .map(|(slot, _)| slot.clone())
                         .collect();
                     for slot in selected {
-                        #[cfg(any(feature = "native-api", test))]
                         if let CacheSlot::Exact(key) = &slot
                             && matches!(selection, CacheInvalidation::Id(_))
                         {
@@ -270,8 +260,6 @@ impl DnsCacheService {
         }
         drop(fence);
         Ok(CacheMutation {
-            #[cfg(any(feature = "native-api", test))]
-            matched: deleted,
             #[cfg(any(feature = "native-api", test))]
             deleted,
             persistent: persister.is_some(),

@@ -172,8 +172,8 @@ impl DohClient {
                         return Ok((session, sender));
                     }
                     Err(error) if attempt == 0 => {
-                        observation.record("dns_session_ready_failed", Some("upstream_failed"));
-                        observation.record("dns_session_retry_started", None);
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed);
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted);
                         debug!(error = %error, transport = "doh", "DoH session is dead; rebuilding");
                         self.retire_session(&session).await;
                     }
@@ -189,7 +189,10 @@ impl DohClient {
             unreachable!("the loop returns or fails on its second pass")
         }
         .await;
-        observation.finish(result, "dns_session_ready_succeeded")
+        observation.finish(
+            result,
+            honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadySucceeded,
+        )
     }
 
     async fn handshake(&self) -> anyhow::Result<H2Session> {
@@ -268,7 +271,8 @@ mod tests {
     async fn native_h2_reuse_and_stale_readiness_keep_inner_retry_evidence() {
         use super::*;
         use crate::dns::{endpoint::DnsEndpoint, forwarder::build_dns_query};
-        use crate::native_api::{events::EventHub, flows::FlowStore};
+        use crate::native_api::events::EventHub;
+        use crate::observe::flows::FlowStore;
         use honk_config::types::DnsProtocol;
         use uuid::Uuid;
 
@@ -344,7 +348,15 @@ mod tests {
                     .unwrap();
                 session.driver.shutdown(Duration::ZERO).await;
             }
-            let flow = Arc::new(store.begin("udp", "127.0.0.1:31000".parse().unwrap(), address));
+            let flow = Arc::new(
+                store
+                    .begin(
+                        crate::observe::vocab::Network::Udp,
+                        "127.0.0.1:31000".parse().unwrap(),
+                        address,
+                    )
+                    .unwrap(),
+            );
             let observer = flow.observer(11, None, "intercepted_query").unwrap();
             let query = build_dns_query(name, 1);
             let response = tokio::time::timeout(

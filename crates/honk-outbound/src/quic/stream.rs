@@ -249,12 +249,10 @@ where
     for attempt in 0..2 {
         let (conn, state) = connect(connect_timeout).await?;
         state.touch();
-        #[cfg(feature = "native-api")]
         let observation = crate::session::ObservedSessionOpen::start();
         match make(conn.clone()).await.map_err(quic_carrier_error) {
             Ok((send, recv)) => {
-                #[cfg(feature = "native-api")]
-                observation.finish("session_open_succeeded", None);
+                observation.finish(crate::runtime::flow_observation::SessionEvent::OpenSucceeded);
                 let open = Arc::clone(state.open_counter());
                 open.fetch_add(1, Ordering::Relaxed);
                 let stream_state = Arc::clone(&state);
@@ -265,15 +263,13 @@ where
                 return Ok(stream);
             }
             Err(e) if retryable(&e) => {
-                #[cfg(feature = "native-api")]
-                observation.finish("session_open_failed", Some("session"));
+                observation.finish(crate::runtime::flow_observation::SessionEvent::OpenFailed);
                 debug!("{proto}: stream open failed (attempt {attempt}): {e}");
                 client.invalidate(&conn).await;
                 last_err = Some(e);
             }
             Err(e) => {
-                #[cfg(feature = "native-api")]
-                observation.finish("session_open_refused", Some("refused"));
+                observation.finish(crate::runtime::flow_observation::SessionEvent::OpenRefused);
                 return Err(e);
             }
         }

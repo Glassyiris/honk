@@ -269,13 +269,11 @@ enum DialSignal {
     Failed(crate::SharedError),
 }
 
-#[cfg(feature = "native-api")]
 struct ObservedSharedDialWait {
     observer: crate::runtime::flow_observation::FlowObserver,
     completion: tokio::sync::watch::Receiver<DialSignal>,
 }
 
-#[cfg(feature = "native-api")]
 impl Drop for ObservedSharedDialWait {
     fn drop(&mut self) {
         let pending = self.completion.has_changed().is_ok()
@@ -284,56 +282,50 @@ impl Drop for ObservedSharedDialWait {
             // Cancelling a waiter does not cancel the pool-owned physical dial.
             self.observer
                 .publish(crate::runtime::flow_observation::FlowEvent::Gap(
-                    "shared_dial_continues_after_waiter",
+                    crate::runtime::flow_observation::GapReason::SharedDialContinuesAfterWaiter,
                 ));
         }
     }
 }
 
-#[cfg(feature = "native-api")]
 pub(crate) struct ObservedSessionOpen {
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
-#[cfg(feature = "native-api")]
 impl ObservedSessionOpen {
     pub(crate) fn start() -> Self {
         let observer = crate::runtime::flow_observation::current();
         if let Some(observer) = &observer {
-            observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
-                reason: "session_open_started",
-                error: None,
-            });
+            observer.publish(crate::runtime::flow_observation::FlowEvent::Session(
+                crate::runtime::flow_observation::SessionEvent::OpenStarted,
+            ));
         }
         Self { observer }
     }
 
-    pub(crate) fn finish(mut self, reason: &'static str, error: Option<&'static str>) {
+    pub(crate) fn finish(mut self, event: crate::runtime::flow_observation::SessionEvent) {
         if let Some(observer) = self.observer.take() {
-            observer
-                .publish(crate::runtime::flow_observation::FlowEvent::Session { reason, error });
+            observer.publish(crate::runtime::flow_observation::FlowEvent::Session(event));
         }
     }
 
     pub(crate) fn finish_open<T>(self, result: &Result<T, OpenError>) {
-        let (reason, error) = match result {
-            Ok(_) => ("session_open_succeeded", None),
-            Err(OpenError::Refused(_)) => ("session_open_refused", Some("refused")),
-            Err(OpenError::Draining(_)) => ("session_open_draining", Some("draining")),
-            Err(OpenError::Session(_)) => ("session_open_failed", Some("session")),
-        };
-        self.finish(reason, error);
+        use crate::runtime::flow_observation::SessionEvent;
+        self.finish(match result {
+            Ok(_) => SessionEvent::OpenSucceeded,
+            Err(OpenError::Refused(_)) => SessionEvent::OpenRefused,
+            Err(OpenError::Draining(_)) => SessionEvent::OpenDraining,
+            Err(OpenError::Session(_)) => SessionEvent::OpenFailed,
+        });
     }
 }
 
-#[cfg(feature = "native-api")]
 impl Drop for ObservedSessionOpen {
     fn drop(&mut self) {
         if let Some(observer) = &self.observer {
-            observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
-                reason: "session_open_cancelled",
-                error: Some("cancelled"),
-            });
+            observer.publish(crate::runtime::flow_observation::FlowEvent::Session(
+                crate::runtime::flow_observation::SessionEvent::OpenCancelled,
+            ));
         }
     }
 }
@@ -638,7 +630,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
             };
 
-            #[cfg(feature = "native-api")]
             let mut dial_observer = None;
             let mut rx = match step {
                 Step::Closed => return Err(Self::pool_closed_err()),
@@ -669,7 +660,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     // Subscribe before spawning: a fast failure can clear the
                     // pool's entry before this caller gets to await it.
                     let rx = done.subscribe();
-                    #[cfg(feature = "native-api")]
                     {
                         dial_observer = crate::runtime::flow_observation::current();
                     }
@@ -792,7 +782,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     rx
                 }
             };
-            #[cfg(feature = "native-api")]
             let _observation = dial_observer.map(|observer| ObservedSharedDialWait {
                 observer,
                 completion: rx.clone(),
@@ -856,12 +845,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         for _attempt in 0..2 {
             let session = self.offer(dial.clone()).await?;
             let Some(permit) = self.try_reserve(&session) else {
-                #[cfg(feature = "native-api")]
                 if let Some(observer) = crate::runtime::flow_observation::current() {
-                    observer.publish(crate::runtime::flow_observation::FlowEvent::Session {
-                        reason: "session_open_capacity",
-                        error: Some("capacity"),
-                    });
+                    observer.publish(crate::runtime::flow_observation::FlowEvent::Session(
+                        crate::runtime::flow_observation::SessionEvent::OpenCapacity,
+                    ));
                 }
                 if session.state() == SessionState::Closed {
                     self.invalidate(&session);
@@ -879,19 +866,17 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             // logical open before protocol negotiation can block or cancel.
             // A cold offer has already fired this one-shot hook on admission.
             crate::runtime::start_scoped_dial();
-            #[cfg(feature = "native-api")]
             if let Some(observer) = crate::runtime::flow_observation::current() {
                 observer.publish(
                     crate::runtime::flow_observation::FlowEvent::TransportAttached {
                         server_addr: None,
-                        resolution_location: "unknown",
+                        resolution_location:
+                            crate::runtime::flow_observation::ResolutionLocation::Unknown,
                     },
                 );
             }
-            #[cfg(feature = "native-api")]
             let observation = ObservedSessionOpen::start();
             let result = open(Arc::clone(&session), permit).await;
-            #[cfg(feature = "native-api")]
             observation.finish_open(&result);
             match result {
                 Ok(t) => return Ok(t),

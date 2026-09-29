@@ -853,7 +853,7 @@ impl Config {
                     source,
                     SettingPath::new("groups").index(index + 1).field("icon"),
                     "invalid-config-value",
-                    "icon must be an absolute http(s) URL or data URI of at most 2048 characters",
+                    crate::node::Group::INVALID_ICON,
                 ));
             }
             if group.name.is_empty() {

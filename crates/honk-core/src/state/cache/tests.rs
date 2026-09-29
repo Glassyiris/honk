@@ -332,3 +332,125 @@ fn a_batch_that_would_cross_the_budget_is_rolled_back() {
     assert_eq!(db.write_dns(batch).unwrap(), DnsWrite::Skipped);
     assert!(used(&db) <= 256, "{} pages", used(&db));
 }
+
+#[test]
+fn a_dropped_group_and_node_keep_their_rows_for_one_tick() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateDb::open(directory.path()).unwrap());
+    let db = CacheDb::open(Arc::clone(&state)).unwrap();
+    let now = 1_700_000_000;
+    for group in ["kept", "dropped"] {
+        db.save_network_selector(group, SelectionNetwork::Tcp, &member("m"));
+    }
+    db.save_delay_samples(vec![
+        ("kept-node".into(), 5, now),
+        ("dropped-node".into(), 5, now),
+    ]);
+    db.write_dns(vec![
+        ("expired".into(), now - 1, vec![0]),
+        ("fresh".into(), now + 60, vec![0]),
+    ])
+    .unwrap();
+    db.maintain(Maintenance::default()).unwrap();
+    let live = Live {
+        selector_groups: HashSet::from(["kept".to_owned()]),
+        nodes: HashSet::from(["kept-node".to_owned()]),
+    };
+    let rows = |db: &CacheDb| {
+        let mut groups = db.selector_groups().unwrap();
+        let mut nodes = db.delay_nodes().unwrap();
+        groups.sort();
+        nodes.sort();
+        let dns: Vec<String> = db
+            .load_dns()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        (groups, nodes, dns)
+    };
+    let mut missing = Missing::default();
+    let owners = TickOwners {
+        store_dns: true,
+        store_subscribe: false,
+    };
+
+    maintenance_tick(
+        &state,
+        Some(&db),
+        &live,
+        Vec::new(),
+        &mut missing,
+        owners,
+        now,
+    );
+    assert_eq!(
+        rows(&db),
+        (
+            vec!["dropped".to_owned(), "kept".to_owned()],
+            vec!["dropped-node".to_owned(), "kept-node".to_owned()],
+            vec!["fresh".to_owned()],
+        )
+    );
+    maintenance_tick(
+        &state,
+        Some(&db),
+        &live,
+        Vec::new(),
+        &mut missing,
+        owners,
+        now,
+    );
+    assert_eq!(
+        rows(&db),
+        (
+            vec!["kept".to_owned()],
+            vec!["kept-node".to_owned()],
+            vec!["fresh".to_owned()],
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_subscription_keeps_its_body_for_one_tick() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateDb::open(directory.path()).unwrap());
+    let store = crate::subscription::SubscriptionStore::new(Arc::clone(&state));
+    let subscription = |name: &str| honk_config::subscription::Subscription {
+        url: format!("https://example.invalid/{name}"),
+        ..Default::default()
+    };
+    let (kept, dropped) = (subscription("kept"), subscription("dropped"));
+    for sub in [&kept, &dropped] {
+        store.store_content(sub, "body".into()).await.unwrap();
+    }
+    store.set_enabled([&kept]);
+    let live = Live {
+        selector_groups: HashSet::new(),
+        nodes: HashSet::new(),
+    };
+    let owners = TickOwners {
+        store_dns: false,
+        store_subscribe: true,
+    };
+    let mut missing = Missing::default();
+    let bodies = || -> i64 {
+        state
+            .strict()
+            .query_row("SELECT count(*) FROM subscription_body", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    maintenance_tick(&state, None, &live, Vec::new(), &mut missing, owners, 0);
+    assert_eq!(bodies(), 2);
+    maintenance_tick(&state, None, &live, Vec::new(), &mut missing, owners, 0);
+    let remaining: String = state
+        .strict()
+        .query_row("SELECT key FROM subscription_body", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        remaining,
+        crate::subscription::SubscriptionStore::key(&kept)
+    );
+}

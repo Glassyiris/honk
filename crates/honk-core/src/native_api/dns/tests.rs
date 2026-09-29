@@ -1,4 +1,5 @@
 use super::*;
+use axum::body::to_bytes;
 
 #[test]
 fn query_parameters_reject_semantic_duplicates_and_name_wire_overflow() {
@@ -73,10 +74,9 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     expected_ids.sort();
 
     for query in ["", "?type=TXT"] {
-        assert_eq!(
-            cache_page(&state, query).await.0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        let (status, body) = cache_page(&state, query).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "snapshot_unavailable");
     }
     for query in ["?name=missing.example", "?domain=missing", "?type=AAAA"] {
         let (status, page) = cache_page(&state, query).await;
@@ -113,6 +113,17 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
         .0,
         StatusCode::BAD_REQUEST
     );
+    let (limit, _) = filters.rsplit_once("&limit=").unwrap();
+    for (query, status) in [
+        (
+            format!("{limit}&limit=2&cursor={cursor}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (format!("{filters}&cursor=missing:1"), StatusCode::GONE),
+        (format!("{filters}&cursor=bad"), StatusCode::GONE),
+    ] {
+        assert_eq!(cache_page(&state, &query).await.0, status);
+    }
 }
 
 #[tokio::test]
@@ -310,10 +321,8 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
     let state = dns_state(config).await;
     let id = RequestId("root-dns".into());
     for name in ["", "..", "ordinary..example"] {
-        let uri = format!("/api/v1/dns/query?domain={name}&type=NS")
-            .parse()
-            .unwrap();
-        let response = query(&state, &uri, &id)
+        let request = query_request("", json!({"domain": name, "type": ["NS"]}));
+        let response = query(&state, request, &id)
             .await
             .unwrap_or_else(IntoResponse::into_response);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -325,10 +334,8 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
         ("OrDiNaRy.Example.", "ordinary.example.", false),
         ("ordinary.example", "ordinary.example.", true),
     ] {
-        let uri = format!("/api/v1/dns/query?domain={name}&type=NS&detail=full")
-            .parse()
-            .unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(2), query(&state, &uri, &id))
+        let request = query_request("?detail=full", json!({"domain": name, "type": ["NS"]}));
+        let response = tokio::time::timeout(Duration::from_secs(2), query(&state, request, &id))
             .await
             .unwrap()
             .unwrap();
@@ -401,21 +408,70 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
     state.dns.provider().unwrap().shutdown().await;
 }
 
+fn query_request(query: &str, body: Value) -> Request {
+    Request::post(format!("/api/v1/dns/query{query}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn query_type_count_over_limit_is_too_large() {
+async fn query_takes_a_json_body_with_bounded_types() {
     let state = crate::native_api::tests::state().await;
-    let types = (1..=9)
-        .map(|value| format!("type=TYPE{value}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let uri = format!("/api/v1/dns/query?domain=example.com&{types}")
-        .parse()
-        .unwrap();
-    let response = query(&state, &uri, &RequestId("dns-test".into()))
-        .await
-        .unwrap_err()
-        .into_response();
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let status = |request| {
+        let state = &state;
+        async move {
+            query(state, request, &RequestId("dns-test".into()))
+                .await
+                .unwrap_err()
+                .into_response()
+                .status()
+        }
+    };
+    let types: Vec<_> = (1..=9).map(|value| format!("TYPE{value}")).collect();
+    let body = json!({"domain": "example.com", "type": types});
+    assert_eq!(
+        status(query_request("", body)).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let mut request = query_request("", json!({"domain": "example.com"}));
+    request.headers_mut().remove("content-type");
+    assert_eq!(status(request).await, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    for (query, body) in [
+        ("?domain=example.com", json!({"domain": "example.com"})),
+        ("", json!({"domain": "example.com", "type": []})),
+        ("", json!({"domain": "example.com", "type": ["A", "TYPE1"]})),
+        ("", json!({"domain": "example.com", "detail": "full"})),
+        ("", json!({"type": ["A"]})),
+    ] {
+        assert_eq!(
+            status(query_request(query, body.clone())).await,
+            StatusCode::BAD_REQUEST,
+            "{query} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rule_limit_never_hides_a_running_list() {
+    let state = crate::native_api::tests::state().await;
+    let rule = honk_config::dns::DnsResponseRule {
+        conditions: Vec::new(),
+        action: honk_config::dns::DnsResponseAction::Accept,
+    };
+    let mut config = (**state.config.read().await).clone();
+    config.dns.routing.response.rules = vec![rule; 4096];
+    *state.config.write().await = std::sync::Arc::new(config);
+    let list = rules::snapshot(
+        &state,
+        std::time::Instant::now() + Duration::from_secs(5),
+        &RequestId("test".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(json!(list)["response"].as_array().unwrap().len(), 4097);
+    let routing = &state.config.read().await.dns.routing;
+    assert_eq!(rules_capability(routing)["max_rules"], 4097);
 }
 
 #[tokio::test]

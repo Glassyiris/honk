@@ -83,12 +83,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             match step {
                 Step::Closed => return Err(Self::pool_closed_err()),
                 Step::Shared(session, permit) => {
-                    #[cfg(feature = "native-api")]
                     if let Some(observer) = crate::runtime::flow_observation::current() {
                         observer.publish(
                             crate::runtime::flow_observation::FlowEvent::TransportAttached {
                                 server_addr: None,
-                                resolution_location: "unknown",
+                                resolution_location:
+                                    crate::runtime::flow_observation::ResolutionLocation::Unknown,
                             },
                         );
                     }

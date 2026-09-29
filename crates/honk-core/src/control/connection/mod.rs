@@ -35,7 +35,7 @@ pub(super) use handoff::{TcpFlowKey, TcpFlowPins};
 
 mod context;
 
-#[cfg(feature = "native-api")]
+#[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
 pub(in crate::control) mod observation;
 
 pub(super) use context::{ConnectionGuard, ControlPlaneHandle};

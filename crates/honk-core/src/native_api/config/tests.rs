@@ -12,13 +12,13 @@ mod validation;
 use super::ConfigService;
 use super::coordinator::ConfigCoordinator;
 use crate::configuration::SourceUpdate;
-use crate::control::{ControlCommand, ControlPlane};
+use crate::control::{ControlCommand, ControlPlane, ReloadBehavior};
 use crate::dns::DnsResolver;
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
 use crate::dns::routing::DnsRouter;
 use crate::ebpf::mock::MockEbpfBackend;
-use crate::native_api::store::{DatabaseStartup, DbStore, FileStore, SourceStore};
+use crate::native_api::store::{DatabaseStartup, DbStore, SourceStore};
 use crate::native_api::{NativeServer, NativeState};
 use crate::routing::Router;
 use crate::subscription::SubscriptionSupervisor;
@@ -77,7 +77,7 @@ struct Fixture {
     reloads: Arc<AtomicUsize>,
     gates: Option<mpsc::UnboundedReceiver<oneshot::Sender<()>>>,
     database: Option<Arc<DbStore>>,
-    /// 1: the engine answers every reload `Rejected`; 2: it drops the reply. Neither applies it.
+    /// A [`ReloadBehavior`] stored as `u8`.
     reject_reloads: Arc<AtomicU8>,
 }
 
@@ -126,9 +126,7 @@ impl Fixture {
         let addr = listener.local_addr().unwrap();
         let settings = match access {
             Access::Metadata => format!("secret: '{SECRET}'"),
-            Access::Admin => format!(
-                "secret: '{SECRET}'\n config_write: true\n config_content: true\n writable_includes: 'editable.dae'"
-            ),
+            Access::Admin => format!("secret: '{SECRET}'\n config_write: true"),
             Access::Anonymous => "allow_anonymous_loopback: true".into(),
         };
         let main = format!(
@@ -166,7 +164,7 @@ impl Fixture {
             (
                 startup.config,
                 startup.sources,
-                Arc::clone(&store) as Arc<dyn SourceStore>,
+                SourceStore::Db(Arc::clone(&store)),
                 Some(store),
             )
         } else {
@@ -177,13 +175,13 @@ impl Fixture {
                 &mut diagnostics,
             )
             .unwrap();
-            let store = Arc::new(FileStore::new(loaded.sources[0].path.clone()));
+            let store = SourceStore::File(loaded.sources[0].path.clone().into());
             let initial = SourceUpdate {
                 sources: loaded.sources,
                 dependencies: Vec::new(),
                 geo_sources: None,
             };
-            (loaded.config, initial, store as Arc<dyn SourceStore>, None)
+            (loaded.config, initial, store, None)
         };
         config.validate_detailed().unwrap();
         config.ensure_builtin_nodes();
@@ -249,7 +247,7 @@ impl Fixture {
         control_plane.attach_subscriptions(subscriptions.handle());
         let coordinator = service
             .start(
-                Some(store),
+                store,
                 Some(initial),
                 directory.path().join("state"),
                 control_plane.config_handle(),
@@ -571,13 +569,24 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
     for access in [Access::Metadata, Access::Anonymous] {
         let fixture = Fixture::new(access, false).await;
         let capabilities = fixture.get("/api/v1/capabilities").await;
-        assert_eq!(capabilities["resources"]["config"]["content"], true);
+        assert!(capabilities["resources"]["config"].get("content").is_none());
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
         assert_eq!(capabilities["resources"]["config"]["create"], false);
-        // Replacement content travels in one JSON body, so it cannot exceed that body limit.
+        assert!(
+            capabilities["resources"]["config"]["max_bytes"]
+                .as_u64()
+                .unwrap()
+                < capabilities["limits"]["max_json_body_bytes"]
+                    .as_u64()
+                    .unwrap()
+        );
         assert_eq!(
-            capabilities["resources"]["config"]["max_bytes"],
-            capabilities["limits"]["max_json_body_bytes"]
+            capabilities["resources"]["operations"]["max_replay_keys"],
+            1024
+        );
+        assert_eq!(
+            capabilities["resources"]["providers"]["create_unfetched"],
+            true
         );
         // Full validation also counts dependencies read from disk, not only the request body.
         assert_eq!(
@@ -784,12 +793,8 @@ async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
 }
 
 #[tokio::test]
-async fn retired_content_flag_grants_no_write_authority_and_the_redaction_flag_is_unknown() {
-    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
-        let auth = files.get_mut("auth.dae").unwrap();
-        *auth = auth.replace("config_content: true", "config_content: false");
-    })
-    .await;
+async fn redaction_flag_is_unknown_in_config_write_bodies() {
+    let fixture = Fixture::new(Access::Admin, false).await;
     let config = fixture.get(CONFIG).await;
     let row = source(&config, &fixture.originals["locked.dae"]);
     assert_eq!(row["content"], fixture.originals["locked.dae"]);
@@ -804,6 +809,16 @@ async fn retired_content_flag_grants_no_write_authority_and_the_redaction_flag_i
             .unwrap(),
         StatusCode::BAD_REQUEST,
         "invalid_request",
+    )
+    .await;
+    error(
+        fixture
+            .replace(row, &"#".repeat(super::MAX_CONTENT_BYTES + 1))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request_too_large",
     )
     .await;
     let admission = accepted(fixture.replace(row, candidate).send().await.unwrap()).await;
@@ -876,17 +891,22 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
     let fixture = Fixture::new(Access::Metadata, false).await;
     let state = fixture.state.upgrade().unwrap();
     state.observation.attach_for_test();
-    let flow = state.observation.flows.begin(
-        "tcp",
-        "192.0.2.1:31000".parse().unwrap(),
-        "198.51.100.1:443".parse().unwrap(),
-    );
+    let flow = state
+        .observation
+        .core
+        .flows
+        .begin(
+            crate::observe::vocab::Network::Tcp,
+            "192.0.2.1:31000".parse().unwrap(),
+            "198.51.100.1:443".parse().unwrap(),
+        )
+        .unwrap();
     let rule_id = format!("{}:1:rule:0", state.instance_id);
     flow.routed(
         "group/name@host",
         Some(&rule_id),
         Some(&format!("pname(\"/usr/bin/{SECRET}\")")),
-        "evaluation",
+        crate::observe::vocab::RoutingSource::Evaluation,
     );
     state.tracker.register(ConnectionEntry {
         id: "connection-visible-id".into(),

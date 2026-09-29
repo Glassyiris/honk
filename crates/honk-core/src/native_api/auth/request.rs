@@ -70,7 +70,7 @@ fn rejected(id: &RequestId) -> ApiError {
 }
 
 fn issued(session: Issued) -> Response {
-    let expires_at = crate::native_api::timestamp(session.expires_at);
+    let expires_at = crate::observe::timestamp(session.expires_at);
     Json(json!({"token": session.token, "expires_at": expires_at})).into_response()
 }
 

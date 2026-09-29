@@ -187,15 +187,17 @@ impl DnsController {
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
         self.routing_projection.shutdown(timeout).await;
+        // The provider's pause JoinSet, not this wait, owns every close task,
+        // so abandoning the wait on timeout detaches nothing.
         let provider = self.runtime_provider();
-        let shutdown = provider.shutdown();
-        tokio::pin!(shutdown);
-        if tokio::time::timeout(timeout, &mut shutdown).await.is_err() {
+        if tokio::time::timeout(timeout, provider.shutdown())
+            .await
+            .is_err()
+        {
             warn!(
-                "DNS runtime provider shutdown exceeded {:?}; retaining cleanup until joined",
+                "DNS runtime provider shutdown exceeded {:?}; continuing",
                 timeout
             );
-            shutdown.await;
         }
     }
 

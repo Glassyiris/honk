@@ -57,6 +57,8 @@ struct EbpfDetail {
 #[derive(Serialize)]
 struct Attachment {
     name: String,
+    /// honk reports only its tc attachments.
+    kind: &'static str,
     interface: String,
     direction: &'static str,
     state: &'static str,
@@ -223,6 +225,7 @@ fn detail(observation: DatapathObservation, instance: &str, healthy: bool, full:
                     .into_iter()
                     .map(|attachment| Attachment {
                         name: attachment.program,
+                        kind: "interface",
                         interface: attachment.interface,
                         direction: if attachment.egress {
                             "egress"
@@ -388,6 +391,22 @@ mod tests {
             });
         }
         observation
+    }
+
+    #[test]
+    fn attachments_report_their_interface_kind() {
+        let body = serde_json::to_value(detail(
+            tcx_observation(&[DatapathCheck::Verified]),
+            "instance",
+            true,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            body["ebpf"]["attachments"],
+            json!([{"name": "tc_ingress", "kind": "interface", "interface": "eth0",
+                "direction": "ingress", "state": "attached"}])
+        );
     }
 
     #[test]

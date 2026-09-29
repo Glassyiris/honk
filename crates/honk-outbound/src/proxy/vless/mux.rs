@@ -394,7 +394,6 @@ struct MuxResponse {
     error_message: Vec<u8>,
     failed: Option<crate::SharedError>,
     carrier: CarrierFailure,
-    #[cfg(feature = "native-api")]
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
@@ -412,7 +411,6 @@ impl MuxResponse {
             error_remaining: None,
             error_message: Vec::new(),
             failed: None,
-            #[cfg(feature = "native-api")]
             observer: crate::runtime::flow_observation::current(),
             carrier,
         }
@@ -566,9 +564,10 @@ impl MuxResponse {
             match byte {
                 0 => {
                     self.status_ready = true;
-                    #[cfg(feature = "native-api")]
                     if let Some(observer) = self.observer.take() {
-                        observer.milestone_once("target_confirmed");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                        );
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -668,7 +667,6 @@ struct MuxUdpWriter {
     carrier: CarrierFailure,
     setup: Option<Bytes>,
     pending: bool,
-    #[cfg(feature = "native-api")]
     request_observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
@@ -713,9 +711,8 @@ impl VlessMuxUdpTransport {
         writer.pending = true;
         let writer = &mut *writer;
         send_owned(&mut writer.send, &writer.carrier, frame).await?;
-        #[cfg(feature = "native-api")]
         if let Some(observer) = writer.request_observer.take() {
-            observer.milestone_once("target_request_sent");
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         writer.setup = None;
         writer.pending = false;
@@ -794,8 +791,9 @@ impl MuxSession for VlessMuxSession {
             send_owned(&mut opened.send, &opened.failure, request)
                 .await
                 .map_err(|error| OpenError::Draining(anyhow::Error::new(error)))?;
-            #[cfg(feature = "native-api")]
-            crate::runtime::flow_observation::milestone("target_request_sent");
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+            );
             Ok(VlessMuxStream {
                 send: MuxSendStream::new(opened.send, Arc::clone(&opened.failure)),
                 response: MuxResponse::new(opened.response, opened.failure),
@@ -820,7 +818,6 @@ impl MuxSession for VlessMuxSession {
                     carrier: Arc::clone(&opened.failure),
                     setup: Some(setup),
                     pending: false,
-                    #[cfg(feature = "native-api")]
                     request_observer: crate::runtime::flow_observation::current(),
                 }),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {

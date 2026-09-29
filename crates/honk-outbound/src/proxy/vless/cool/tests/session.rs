@@ -34,7 +34,7 @@ async fn fragmented_and_coalesced_responses_are_demultiplexed() {
     session.close();
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn shared_xudp_records_each_business_target_once_without_carrying_opener_context() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
@@ -51,7 +51,7 @@ async fn shared_xudp_records_each_business_target_once_without_carrying_opener_c
             },
             Arc::new(move |context, event| {
                 if let FlowEvent::Milestone { milestone } = event {
-                    events.lock().push((context.flow_id, milestone));
+                    events.lock().push((context.flow_id, milestone.as_str()));
                 }
             }),
         )

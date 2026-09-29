@@ -374,7 +374,7 @@ async fn test_selector_switch_releases_the_group_manager_lock() {
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();
-    app.state.mode_state.write().global_selection = "Proxy".to_string();
+    *app.state.mode_state.write() = ModeState::new("Rule", "Proxy");
 
     let body: serde_json::Value = client
         .get(app.url("/proxies"))
@@ -1141,7 +1141,7 @@ async fn test_global_selection_and_mode_persisted() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert_eq!(app.state.mode_state.read().global_selection, "proxy");
+    assert_eq!(app.state.mode_state.read().global_selection(), "proxy");
 
     // Virtual and unknown GLOBAL targets do not resolve.
     for invalid in ["Proxy", "nope"] {

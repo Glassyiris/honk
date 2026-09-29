@@ -2,6 +2,8 @@ use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
+#[cfg(feature = "native-api")]
+pub(super) mod reload_harness;
 pub(super) mod support;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use support::KernelUdpReplySocketFactory;
@@ -254,15 +256,6 @@ async fn startup_failure_drops_saturated_control_receiver() {
             .is_err(),
         "the abandoned producer must observe the closed control channel"
     );
-}
-
-#[test]
-fn test_build_dns_probe_query() {
-    let q = build_dns_probe_query();
-    assert_eq!(&q[..2], &[0x12, 0x34]); // fixed id, validated on the response
-    assert_eq!(q[2], 0x01); // RD (recursion desired)
-    assert_eq!(q[5], 1); // QDCOUNT = 1
-    assert_eq!(&q[q.len() - 4..], &[0, 1, 0, 1]); // QTYPE A / QCLASS IN
 }
 
 #[tokio::test]
@@ -4275,6 +4268,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
         tolerance: 50,
         idle_timeout: None,
         interrupt_connections: false,
+        own: Default::default(),
         created_at: chrono::Utc::now(),
     }
 }
@@ -4482,8 +4476,8 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     cp.datapath_flags.as_ref().unwrap().disable().await.unwrap();
 }
 
-/// Shutdown with a flow that never finishes must still detach the hooks and
-/// return in bounded time (the drain tracker caps the wait).
+/// Shutdown before an epoch exists must still detach the hooks and return in
+/// bounded time, even with a flow that never finishes.
 #[tokio::test]
 async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     use std::sync::atomic::Ordering;
@@ -4491,19 +4485,12 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     let detach = backend.detach_calls.clone();
     let mut cp = link_lifecycle_cp(backend);
 
-    // A flow that never finishes: the drain tracker must cap the wait.
     cp.drain_tracker.increment();
-    let drain = cp.drain_tracker.clone();
-    let mut removal_task = tokio::spawn(async {});
 
-    tokio::time::timeout(Duration::from_secs(30), async {
-        cp.shutdown_datapath(&drain, &mut removal_task)
-            .await
-            .unwrap();
-        cp.finalize_shutdown().await.unwrap();
-    })
-    .await
-    .expect("shutdown must stay bounded with a stuck flow");
+    tokio::time::timeout(Duration::from_secs(30), cp.shutdown_runtime(None, None))
+        .await
+        .expect("shutdown must stay bounded with a stuck flow")
+        .unwrap();
     assert!(
         detach.load(Ordering::Relaxed) >= 1,
         "shutdown must detach the datapath hooks"
@@ -4947,7 +4934,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             nfqueue.pending.open_admission();
             control.ebpf.write().await.set_datapath_ready(true)?;
             let (removal_fatal_tx, mut removal_fatal_rx) = mpsc::unbounded_channel();
-            let mut removal_task = spawn_udp_removal_worker(
+            let removal_task = spawn_udp_removal_worker(
                 Arc::clone(&control.udp_pool),
                 Arc::clone(&control.ebpf),
                 Arc::clone(&control.connection_tracker),
@@ -5118,12 +5105,8 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let service_shutdown = nfqueue.shutdown_service().await;
             let pending_shutdown = nfqueue.finish_pending_drain().await;
             control.pending_udp_verdicts = None;
-            let drain = Arc::clone(&control.drain_tracker);
-            let datapath_shutdown = control.shutdown_datapath(&drain, &mut removal_task).await;
-            if let Some(flags) = control.datapath_flags.as_ref() {
-                let _ = flags.disable().await;
-            }
-            let backend_shutdown = control.finalize_shutdown().await;
+            let shutdown = control.shutdown_runtime(None, None).await;
+            let removed = removal_task.await;
             let _ = std::fs::remove_file(pin_root.join(crate::ebpf::UDP_DECISION_SEQUENCE_MAP));
             let _ = std::fs::remove_file(pin_root.join("ROUTING_GENERATION_SEQUENCE"));
             let _ = std::fs::remove_dir(&pin_root);
@@ -5140,8 +5123,8 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                     == stats_errors_before_shutdown,
                 "stats sampler read the queue after teardown"
             );
-            datapath_shutdown?;
-            backend_shutdown?;
+            shutdown?;
+            removed?;
             Ok(())
         })
     })

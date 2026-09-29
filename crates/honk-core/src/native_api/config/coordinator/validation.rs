@@ -7,7 +7,7 @@ impl Worker {
         let log_files = self.log_files.clone();
         let generation = self.diagnostics.read().generation;
         let instance = self.service.instance_id.clone();
-        let store = self.store.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone();
         let accepted = self.service.sources.accepted.read().clone();
         let data_dir = self.data_dir.clone();
         let deferred = if request.mode == "syntax" {
@@ -35,7 +35,7 @@ impl Worker {
             }
             let mut diagnostics=Vec::new();
             let mut initial_sources=Vec::new();
-            let result=if request.mode=="syntax" {parse_dae_sources(&documents,limits(),&mut diagnostics)}
+            let result=if request.mode=="syntax" {parse_dae_sources(&documents,SourceLimits::DEFAULT,&mut diagnostics)}
                 else {(||{
                     let overlay=documents.iter().cloned().collect();
                     let loaded=store.load(&overlay,&mut diagnostics)?;
@@ -45,7 +45,7 @@ impl Worker {
                             check_dae_source(path,content)?;
                         }
                     }
-                    let validated=offline::validate_for_coordinator(loaded,store.dependency_root(),&active,&data_dir,limits(),&mut diagnostics,&deferred,None,&documents)?;
+                    let validated=offline::validate_for_coordinator(loaded,store.dependency_root(),&active,&data_dir,SourceLimits::DEFAULT,&mut diagnostics,&deferred,None,&documents)?;
                     // A save of this candidate would be refused; a dry run only warns.
                     diagnostics.extend(restart_diagnostics(&active,&validated.config,&log_files,&validated.sources[0].source,Severity::Warning));
                     Ok(LoadedConfig {config:validated.config,sources:validated.sources})

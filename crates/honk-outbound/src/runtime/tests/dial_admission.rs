@@ -397,7 +397,7 @@ async fn overlapping_generations_bound_physical_address_attempts() {
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn captured_factory_keeps_pinned_server_address_outside_initial_scope() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

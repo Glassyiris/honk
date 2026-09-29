@@ -24,11 +24,14 @@ use super::NativeState;
 use super::auth::SessionLease;
 use super::types::{Admitted, ApiError, ErrorCode, RequestId};
 
-const MAX_TARGET_BYTES: usize = 4096;
-const MAX_HEADER_BYTES: usize = 16384;
+pub(super) const MAX_TARGET_BYTES: usize = 4096;
+pub(super) const MAX_HEADER_BYTES: usize = 16384;
 pub(super) const MAX_BODY_BYTES: usize = 65536;
 const ALLOW_HEADERS: &str =
     "Authorization, Last-Event-ID, Content-Type, If-Match, Idempotency-Key, Accept";
+
+/// Admissions per minute through one `RequestRate`, as capabilities advertise it.
+pub(crate) const REQUESTS_PER_MINUTE: u32 = 30;
 
 pub(crate) struct RequestRate(parking_lot::Mutex<(Instant, u32)>);
 
@@ -37,14 +40,14 @@ impl RequestRate {
         Self(parking_lot::Mutex::new((Instant::now(), 0)))
     }
 
-    pub(crate) fn admit(&self, id: &RequestId) -> Result<(), ApiError> {
+    pub(super) fn admit(&self, id: &RequestId) -> Result<(), ApiError> {
         let now = Instant::now();
         let mut window = self.0.lock();
         let elapsed = now.duration_since(window.0);
         if elapsed >= std::time::Duration::from_secs(60) {
             *window = (now, 0);
         }
-        if window.1 == 30 {
+        if window.1 == REQUESTS_PER_MINUTE {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::RateLimited,
@@ -195,15 +198,9 @@ impl Security {
             return Ok(Some(lease));
         }
         match (&self.expected, authorization) {
-            (Some(expected), Some(value)) => {
-                let (_, token) = value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| value.split_once(' '))
-                    .filter(|(scheme, token)| {
-                        scheme.eq_ignore_ascii_case("Bearer")
-                            && honk_config::experimental::valid_native_bearer_token(token)
-                    })
+            (Some(expected), Some(_)) => {
+                let token = self
+                    .bearer(request)
                     .ok_or_else(|| unauthorized(request_id))?;
                 let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
                 if !bool::from(expected.ct_eq(&actual)) {
@@ -217,46 +214,46 @@ impl Security {
         Ok(None)
     }
 
-    // Decode keys with the same form parser as API queries; never accept query credentials.
     fn reject_query_credentials(
         &self,
         request: &Request,
         request_id: &str,
     ) -> Result<(), ApiError> {
-        let Query(parameters) = Query::<Vec<(String, IgnoredAny)>>::try_from_uri(request.uri())
-            .map_err(|_| {
-                invalid_request(request_id, json!({"field":"query","kind":"malformed"}))
-            })?;
-        if parameters
-            .iter()
-            .any(|(name, _)| name == "token" || name == "access_token")
-        {
-            return Err(unauthorized(request_id));
+        match query_credential(request) {
+            None => Err(invalid_request(
+                request_id,
+                json!({"field":"query","kind":"malformed"}),
+            )),
+            Some(true) => Err(unauthorized(request_id)),
+            Some(false) => Ok(()),
         }
-        Ok(())
     }
 }
 
-/// An Authorization header or a token query parameter, parsed as `reject_query_credentials` parses it.
+/// Whether the query names `token` or `access_token`, decoded with the same form parser as API
+/// queries; `None` when the query is malformed.
+fn query_credential(request: &Request) -> Option<bool> {
+    let Query(parameters) = Query::<Vec<(String, IgnoredAny)>>::try_from_uri(request.uri()).ok()?;
+    Some(
+        parameters
+            .iter()
+            .any(|(name, _)| name == "token" || name == "access_token"),
+    )
+}
+
+/// An Authorization header, a token query parameter or a query too malformed to rule one out.
 fn carries_credential(request: &Request) -> bool {
     request
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION)
-        || Query::<Vec<(String, IgnoredAny)>>::try_from_uri(request.uri()).map_or(
-            true,
-            |Query(parameters)| {
-                parameters
-                    .iter()
-                    .any(|(name, _)| name == "token" || name == "access_token")
-            },
-        )
+        || query_credential(request) != Some(false)
 }
 
 /// Discovery and the password endpoints answer a request that carries no credential; everything else, and
 /// any request that does carry one, is authenticated.
 fn public_route(method: &Method, path: &str) -> bool {
     match path {
-        "/api" | "/api/v1/discovery" => matches!(*method, Method::GET | Method::HEAD),
+        "/api" => matches!(*method, Method::GET | Method::HEAD),
         "/api/v1/auth/setup" | "/api/v1/auth/login" => *method == Method::POST,
         _ => false,
     }

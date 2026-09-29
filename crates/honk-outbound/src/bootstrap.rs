@@ -101,7 +101,6 @@ async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
         let addrs = hosts_addresses(&contents, host);
         if !addrs.is_empty() {
-            #[cfg(feature = "native-api")]
             if let Some(mut observation) =
                 LookupObservation::start(host, "UNKNOWN", LookupOrigin::Hosts)
             {
@@ -160,7 +159,6 @@ impl BootstrapResolver {
     }
 
     async fn query_family(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        #[cfg(feature = "native-api")]
         let mut observation = LookupObservation::start(
             host,
             qtype_name(qtype),
@@ -174,14 +172,10 @@ impl BootstrapResolver {
                 })??;
             parse_answers(&msg, qtype)
         };
-        #[cfg(feature = "native-api")]
         let result = match &observation {
             Some(observation) => observation.child().scope(result).await,
             None => result.await,
         };
-        #[cfg(not(feature = "native-api"))]
-        let result = result.await;
-        #[cfg(feature = "native-api")]
         if let Some(observation) = &mut observation {
             observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
         }
@@ -305,7 +299,6 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
             }
         }
     };
-    #[cfg(feature = "native-api")]
     let mut observation = LookupObservation::start(
         host,
         "HTTPS",
@@ -315,14 +308,10 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
         ),
     );
     let operation = resolver.query_raw(host, QTYPE_HTTPS);
-    #[cfg(feature = "native-api")]
     let result = match &observation {
         Some(observation) => observation.child().scope(operation).await,
         None => operation.await,
     };
-    #[cfg(not(feature = "native-api"))]
-    let result = operation.await;
-    #[cfg(feature = "native-api")]
     if let Some(observation) = &mut observation {
         observation.finish(result.as_ref().map(|_| std::iter::empty()));
     }
@@ -484,10 +473,14 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
     }
 }
 
-#[cfg(feature = "native-api")]
-fn qtype_name(qtype: u16) -> &'static str {
+/// Human-readable qtype name for logs and flow observations.
+pub fn qtype_name(qtype: u16) -> &'static str {
     match qtype {
         1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        15 => "MX",
+        16 => "TXT",
         28 => "AAAA",
         65 => "HTTPS",
         _ => "UNKNOWN",
@@ -495,7 +488,6 @@ fn qtype_name(qtype: u16) -> &'static str {
 }
 
 /// Where an observed lookup's answer comes from.
-#[cfg(feature = "native-api")]
 enum LookupOrigin {
     /// `/etc/hosts`, without a DNS exchange.
     Hosts,
@@ -503,20 +495,20 @@ enum LookupOrigin {
     Upstream(SocketAddr, &'static str),
 }
 
-#[cfg(feature = "native-api")]
 struct LookupObservation {
     observer: crate::runtime::flow_observation::FlowObserver,
     data: crate::runtime::flow_observation::DnsLookup,
     finished: bool,
 }
 
-#[cfg(feature = "native-api")]
 impl LookupObservation {
     fn start(host: &str, qtype: &str, origin: LookupOrigin) -> Option<Self> {
         use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
         let observer = current()?;
         if host.is_empty() || host.len() > 253 {
-            observer.publish(FlowEvent::Gap("redacted"));
+            observer.publish(FlowEvent::Gap(
+                crate::runtime::flow_observation::GapReason::Redacted,
+            ));
             return None;
         }
         let context = observer.context();
@@ -568,7 +560,9 @@ impl LookupObservation {
                         continue;
                     }
                     if self.data.addresses.len() == 32 {
-                        self.observer.publish(FlowEvent::Gap("buffer_overflow"));
+                        self.observer.publish(FlowEvent::Gap(
+                            crate::runtime::flow_observation::GapReason::BufferOverflow,
+                        ));
                         break;
                     }
                     self.data.addresses.push(address);
@@ -587,7 +581,6 @@ impl LookupObservation {
     }
 }
 
-#[cfg(feature = "native-api")]
 impl Drop for LookupObservation {
     fn drop(&mut self) {
         if !self.finished {

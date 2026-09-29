@@ -18,6 +18,7 @@ pub(crate) mod native;
 #[cfg(feature = "native-api")]
 pub(crate) use geo::GeoAssetSnapshot;
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
+pub(crate) use ir::SharedMatchers;
 pub use ir::{CompiledCondition, CompiledPredicate, IpMatcher, PortRange};
 pub(crate) use lpm::BinaryLpmTrie;
 
@@ -160,31 +161,6 @@ impl GeositeMatcher {
     }
 }
 
-/// Matchers shared by the traffic and DNS routers of one build. Keep it local
-/// to the build so a reload never pins the previous generation's matchers.
-#[derive(Default)]
-pub(crate) struct SharedMatchers {
-    ip: Vec<Arc<IpMatcher>>,
-    geosite: std::collections::HashMap<String, Arc<GeositeMatcher>>,
-}
-
-impl SharedMatchers {
-    pub(crate) fn ip(&mut self, nets: Vec<ipnet::IpNet>) -> Arc<IpMatcher> {
-        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
-            return Arc::clone(matcher);
-        }
-        let matcher = Arc::new(IpMatcher::new(nets));
-        self.ip.push(Arc::clone(&matcher));
-        matcher
-    }
-
-    /// One matcher per selector (a category plus its attribute filter).
-    pub(crate) fn geosite(&mut self, code: &str, domains: &[GeositeDomain]) -> Arc<GeositeMatcher> {
-        let matcher = self.geosite.entry(code.trim().to_lowercase());
-        Arc::clone(matcher.or_insert_with(|| Arc::new(GeositeMatcher::build(domains))))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DomainMatcherKey {
     class: u8,
@@ -194,16 +170,12 @@ struct DomainMatcherKey {
 #[derive(Debug, Clone)]
 enum DomainMatcher {
     Ordinary {
-        key: DomainMatcherKey,
         patterns: Vec<Regex>,
         suffixes: Vec<String>,
         keywords: Vec<String>,
     },
-    Geosite {
-        key: DomainMatcherKey,
-        /// One matcher per configured selector, matched as their union.
-        matchers: Vec<Arc<GeositeMatcher>>,
-    },
+    /// One matcher per configured selector, matched as their union.
+    Geosite(Vec<Arc<GeositeMatcher>>),
 }
 
 impl DomainMatcher {
@@ -212,7 +184,7 @@ impl DomainMatcher {
         suffixes: &[String],
         keywords: &[String],
         regexes: &[String],
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(DomainMatcherKey, Self)> {
         let mut patterns = Vec::with_capacity(regexes.len() + domains.len());
         for pattern in regexes {
             patterns.push(
@@ -235,18 +207,24 @@ impl DomainMatcher {
             .collect::<Vec<_>>();
         alternatives.sort();
         alternatives.dedup();
-        Ok(Self::Ordinary {
-            key: DomainMatcherKey {
-                class: 0,
-                alternatives,
+        let key = DomainMatcherKey {
+            class: 0,
+            alternatives,
+        };
+        Ok((
+            key,
+            Self::Ordinary {
+                patterns,
+                suffixes: suffixes.to_vec(),
+                keywords: keywords.to_vec(),
             },
-            patterns,
-            suffixes: suffixes.to_vec(),
-            keywords: keywords.to_vec(),
-        })
+        ))
     }
 
-    fn geosite(domains: &[GeositeDomain], matchers: Vec<Arc<GeositeMatcher>>) -> Self {
+    fn geosite(
+        domains: &[GeositeDomain],
+        matchers: Vec<Arc<GeositeMatcher>>,
+    ) -> (DomainMatcherKey, Self) {
         let mut alternatives = domains
             .iter()
             .map(|domain| match domain {
@@ -258,19 +236,11 @@ impl DomainMatcher {
             .collect::<Vec<_>>();
         alternatives.sort();
         alternatives.dedup();
-        Self::Geosite {
-            key: DomainMatcherKey {
-                class: 1,
-                alternatives,
-            },
-            matchers,
-        }
-    }
-
-    fn key(&self) -> &DomainMatcherKey {
-        match self {
-            Self::Ordinary { key, .. } | Self::Geosite { key, .. } => key,
-        }
+        let key = DomainMatcherKey {
+            class: 1,
+            alternatives,
+        };
+        (key, Self::Geosite(matchers))
     }
 
     fn matches(&self, domain: &str) -> bool {
@@ -297,7 +267,7 @@ impl DomainMatcher {
                         domain.contains(keyword)
                     })
             }
-            Self::Geosite { matchers, .. } => {
+            Self::Geosite(matchers) => {
                 let lower = domain.to_lowercase();
                 matchers
                     .iter()
@@ -319,36 +289,27 @@ fn bounded_any<const BOUNDED: bool, T>(
         .any(&mut matches)
 }
 
+/// Keys copy each matcher's whole expansion and are read only by interning and
+/// the policy fingerprint, so the built router keeps just `matchers`.
 #[derive(Debug, Default)]
-struct DomainRegistry(Vec<DomainMatcher>);
+struct DomainRegistry {
+    keys: Vec<DomainMatcherKey>,
+    matchers: Vec<DomainMatcher>,
+}
 
 impl DomainRegistry {
-    fn intern(&mut self, matcher: DomainMatcher) -> anyhow::Result<u32> {
-        if let Some(id) = self
-            .0
-            .iter()
-            .position(|candidate| candidate.key() == matcher.key())
-        {
+    fn intern(&mut self, (key, matcher): (DomainMatcherKey, DomainMatcher)) -> anyhow::Result<u32> {
+        if let Some(id) = self.keys.iter().position(|candidate| *candidate == key) {
             return Ok(id as u32);
         }
         anyhow::ensure!(
-            self.0.len() < ROUTING_FACT_CAPACITY,
+            self.matchers.len() < ROUTING_FACT_CAPACITY,
             "routing policy has more than {ROUTING_FACT_CAPACITY} domain predicates"
         );
-        let id = self.0.len() as u32;
-        self.0.push(matcher);
+        let id = self.matchers.len() as u32;
+        self.keys.push(key);
+        self.matchers.push(matcher);
         Ok(id)
-    }
-
-    /// Geosite keys copy the whole expansion and are read only by interning
-    /// and the policy fingerprint, so they are released before routing starts.
-    fn into_runtime(mut self) -> Arc<[DomainMatcher]> {
-        for matcher in &mut self.0 {
-            if let DomainMatcher::Geosite { key, .. } = matcher {
-                key.alternatives = Vec::new();
-            }
-        }
-        self.0.into()
     }
 }
 
@@ -541,7 +502,7 @@ impl Router {
                 .iter()
                 .map(|condition| {
                     native::bounded_expression(native::condition_display(
-                        &registry.0,
+                        &registry.matchers,
                         condition,
                         &rules[route.id as usize].condition,
                     ))
@@ -584,7 +545,7 @@ impl Router {
         index_for(&mut fallback);
 
         let policy_fingerprint =
-            fingerprint::policy(&compiled, &registry.0, &fallback, geo_fingerprint);
+            fingerprint::policy(&compiled, &registry.keys, &fallback, geo_fingerprint);
         Ok(Self {
             routes: CompiledRoutes::new(
                 compiled,
@@ -594,7 +555,7 @@ impl Router {
                 requirements,
             ),
             fallback,
-            domain_matchers: registry.into_runtime(),
+            domain_matchers: registry.matchers.into(),
             direct_marks: direct_marks.into(),
             policy_fingerprint,
         })
@@ -649,7 +610,7 @@ impl Router {
         self.domain_matchers
             .iter()
             .filter_map(|matcher| match matcher {
-                DomainMatcher::Geosite { matchers, .. } => Some(matchers),
+                DomainMatcher::Geosite(matchers) => Some(matchers),
                 DomainMatcher::Ordinary { .. } => None,
             })
             .flatten()
@@ -837,6 +798,17 @@ impl Router {
 
     pub fn compiled_routes(&self) -> &[CompiledRoute] {
         self.routes.as_ref()
+    }
+
+    pub(crate) fn ip_matchers(&self) -> impl Iterator<Item = &Arc<IpMatcher>> {
+        self.compiled_routes()
+            .iter()
+            .flat_map(|route| &route.conditions)
+            .filter_map(|condition| match &condition.predicate {
+                CompiledPredicate::DestinationIp(matcher)
+                | CompiledPredicate::SourceIp(matcher) => Some(matcher),
+                _ => None,
+            })
     }
 }
 

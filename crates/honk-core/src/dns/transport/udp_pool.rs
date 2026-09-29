@@ -92,21 +92,21 @@ impl UdpPool {
         timeout: Duration,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
-        #[cfg(feature = "native-api")]
         let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
             Some(address),
-            "unknown",
+            honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
         );
         let result = Self::new_tracked_inner(address, timeout, active_tasks).await;
-        #[cfg(feature = "native-api")]
         if let Some(observation) = &mut observation {
             observation.finish(
                 if result.is_ok() {
-                    "succeeded"
+                    honk_outbound::runtime::flow_observation::TransportStatus::Succeeded
                 } else {
-                    "failed"
+                    honk_outbound::runtime::flow_observation::TransportStatus::Failed
                 },
-                result.as_ref().err().map(|_| "udp_socket_failed"),
+                result.as_ref().err().map(|_| {
+                    honk_outbound::runtime::flow_observation::TransportError::UdpSocketFailed
+                }),
             );
         }
         result

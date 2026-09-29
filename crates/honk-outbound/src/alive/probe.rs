@@ -34,7 +34,7 @@ pub enum HealthCheckError {
 #[derive(Clone, Default)]
 pub struct ProbeCancellation {
     mode: Option<tokio::sync::watch::Sender<HealthMode>>,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     resolver_tasks: Option<Arc<crate::runtime::TaskOwner>>,
 }
 
@@ -79,7 +79,7 @@ impl ProbeCancellation {
         &self,
         future: impl Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.resolver_tasks {
             return owner.scope(future).await;
         }
@@ -152,8 +152,8 @@ impl AliveDialerSet {
         control.active += 1;
         Ok(ProbeCancellation {
             mode: Some(self.health_mode.clone()),
-            #[cfg(feature = "native-api")]
-            resolver_tasks: self.native_observations.read().is_some().then(|| {
+            #[cfg(feature = "owned-tasks")]
+            resolver_tasks: self.health_observations.read().is_some().then(|| {
                 Arc::clone(
                     self.health_resolver_tasks
                         .lock()
@@ -222,7 +222,7 @@ impl AliveDialerSet {
             true
         });
         if closed {
-            self.advance_native_probe_epoch();
+            self.advance_probe_epoch();
         }
     }
 
@@ -239,7 +239,7 @@ impl AliveDialerSet {
                         && self.external_probes.lock().is_empty()
                 };
                 if drained {
-                    #[cfg(feature = "native-api")]
+                    #[cfg(feature = "owned-tasks")]
                     {
                         let owner = self.health_resolver_tasks.lock().clone();
                         if let Some(owner) = owner {
@@ -509,7 +509,7 @@ impl AliveDialerSet {
                     .probe_http(node_id, *a, &check_url, timeout, cancel.clone())
                     .await;
                 if let Some(observation) = outcome.observation {
-                    self.record_native_observation(node_id, Some(registered), observation);
+                    self.record_health_observation(node_id, Some(registered), observation);
                 }
                 match outcome.result {
                     HttpProbeResult::Cancelled => {
@@ -599,7 +599,7 @@ impl AliveDialerSet {
         leaf: Uuid,
         url: &str,
         timeout: Duration,
-        native: Option<(NativeGroupProbeContext, Uuid)>,
+        native: Option<(GroupProbeContext, Uuid)>,
     ) -> bool {
         let Ok(permit) = self.acquire_health_probe() else {
             return false;
@@ -648,7 +648,7 @@ impl AliveDialerSet {
                 .probe_http(leaf, a, url, timeout, cancel.clone())
                 .await;
             if let (Some(observation), Some((context, epoch))) = (outcome.observation, native) {
-                self.record_native_group_observation(
+                self.record_group_health_observation(
                     leaf,
                     registration.as_ref(),
                     context,
@@ -811,10 +811,10 @@ impl AliveDialerSet {
                 return any_ok;
             };
             let elapsed = start.elapsed();
-            self.record_native_observation(
+            self.record_health_observation(
                 node_id,
                 registration,
-                NativeHealthObservation::probe(
+                HealthObservation::probe(
                     ProbeDomain::Tcp,
                     HealthMeasurement::TcpConnect,
                     ipver,
@@ -953,7 +953,7 @@ impl AliveDialerSet {
             .probe_udp(node_id, timeout, permit.cancellation())
             .await;
         for observation in outcome.observations.into_iter().flatten() {
-            self.record_native_observation(node_id, registration.as_ref(), observation);
+            self.record_health_observation(node_id, registration.as_ref(), observation);
         }
         let measured = |result: Option<anyhow::Result<Duration>>| {
             result.filter(|result| {
@@ -1205,7 +1205,7 @@ impl AliveDialerSet {
         // member the probe dials its CURRENT pick, and the result is
         // recorded under the sub-group's tag (sing-box RealTag semantics),
         // so nested groups rank correctly even as sub-picks change.
-        let native_epoch = self.native_group_epoch();
+        let native_epoch = self.health_epoch();
         for (group, url) in self.group_check_urls() {
             if self.is_urltest_group_idle(&group) {
                 tracing::trace!(

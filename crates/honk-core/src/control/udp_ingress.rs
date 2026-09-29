@@ -5,7 +5,7 @@ use super::*;
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) type PacketRoute =
-    Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str>;
+    Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str>;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UdpOriginalDst {
@@ -366,7 +366,7 @@ impl UdpLoopState {
                         src_addr.port(),
                         17,
                     ),
-                    crate::native_api::flows::kernel::KernelRouteReference {
+                    crate::observe::flows::kernel::KernelRouteReference {
                         trace_id,
                         decision_token: 0,
                         routing_generation: u64::from(route.generation()),
@@ -534,7 +534,7 @@ impl UdpLoopState {
                 let mut observation =
                     crate::control::connection::observation::ConnectionObservation::begin(
                         self.handle.native.as_deref(),
-                        "udp",
+                        crate::observe::vocab::Network::Udp,
                         src_addr,
                         original_dst,
                     );
@@ -543,8 +543,8 @@ impl UdpLoopState {
                     observation.packet_route(capture);
                 }
                 #[cfg(feature = "native-api")]
-                let observer =
-                    observation.observer(self.handle.diagnostics.read().generation, "client_dns");
+                let observer = observation
+                    .observer(|| self.handle.diagnostics.read().generation, "client_dns");
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let operation = async {
@@ -564,7 +564,10 @@ impl UdpLoopState {
                             Some(observer) => observer.scope(operation).await,
                             None => operation.await,
                         }
-                        observation.finish("closed", "dns_query_completed");
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_query_completed",
+                        );
                     }
                     #[cfg(not(feature = "native-api"))]
                     operation.await;
@@ -588,7 +591,7 @@ impl UdpLoopState {
                 let mut observation =
                     crate::control::connection::observation::ConnectionObservation::begin(
                         self.handle.native.as_deref(),
-                        "udp",
+                        crate::observe::vocab::Network::Udp,
                         src_addr,
                         original_dst,
                     );
@@ -597,19 +600,15 @@ impl UdpLoopState {
                     observation.packet_route(capture);
                 }
                 #[cfg(feature = "native-api")]
-                let observer =
-                    observation.observer(self.handle.diagnostics.read().generation, "client_dns");
+                let observer = observation
+                    .observer(|| self.handle.diagnostics.read().generation, "client_dns");
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let _permit = udp_permit;
                     #[cfg(feature = "native-api")]
                     let started = std::time::Instant::now();
                     let operation = async {
-                        #[cfg(feature = "native-api")]
-                        crate::native_api::flows::dns::decision(
-                            "rejected",
-                            Some("admission_refused"),
-                        );
+                        crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
                         let result = runtime
                             .run_reply(send_udp_reply_from_orig_dst(
                                 &response,
@@ -617,22 +616,16 @@ impl UdpLoopState {
                                 original_dst,
                             ))
                             .await;
-                        #[cfg(feature = "native-api")]
-                        {
-                            let (status, error) = match result {
-                                Ok(Ok(length)) if length == response.len() => ("delivered", None),
-                                Ok(_) => ("delivery_failed", Some("client_send_failed")),
-                                Err(_) => ("cancelled", Some("runtime_retired")),
-                            };
-                            crate::native_api::flows::dns::delivery(status, error);
-                        }
-                        #[cfg(not(feature = "native-api"))]
-                        let _ = result;
+                        crate::observe::flows::dns::reply_delivery(
+                            &result,
+                            |length| *length == response.len(),
+                            "client_send_failed",
+                        );
                     };
                     #[cfg(feature = "native-api")]
                     if let Some(raw) = query.as_deref() {
                         let operation = std::pin::pin!(operation);
-                        let operation = crate::native_api::flows::dns::client_scope(
+                        let operation = crate::observe::flows::dns::client_scope(
                             raw,
                             ingress,
                             crate::dns::query::DnsRequestMeta::new(
@@ -645,16 +638,22 @@ impl UdpLoopState {
                             Some(observer) => observer.scope(operation).await,
                             None => operation.await,
                         }
-                        observation.finish("closed", "dns_refusal_completed");
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_refusal_completed",
+                        );
                     } else {
                         operation.await;
-                        observation.finish("closed", "dns_refusal_completed");
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_refusal_completed",
+                        );
                     }
                     #[cfg(not(feature = "native-api"))]
                     operation.await;
                     #[cfg(feature = "native-api")]
                     if let Some(query) = query {
-                        dns_controller.dns_service().observe_client(
+                        dns_controller.dns_service().observer.observe_client(
                             &query,
                             ingress,
                             Some(src_addr),

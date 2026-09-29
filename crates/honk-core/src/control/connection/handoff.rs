@@ -55,7 +55,7 @@ pub(super) struct HandoffResult {
     #[cfg(feature = "native-api")]
     pub(super) trace_id: u32,
     #[cfg(feature = "native-api")]
-    pub(super) capture: Option<crate::native_api::flows::kernel::CapturedKernelRoute>,
+    pub(super) capture: Option<crate::observe::flows::kernel::CapturedKernelRoute>,
     #[cfg(feature = "native-api")]
     pub(super) capture_gap: Option<&'static str>,
 }
@@ -561,7 +561,7 @@ impl ControlPlaneHandle {
         }
         let state = mode_state.read().clone();
         #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
-        if state.native_enabled {
+        if state.is_native() {
             let config = self.config.read().await;
             let state = mode_state.read().clone();
             let Some(native) = &self.native else {
@@ -590,17 +590,12 @@ impl ControlPlaneHandle {
             }
             return result;
         }
-        let selection_resolvable = if state.is_global() && !state.global_selection.is_empty() {
+        let selection = state.global_selection();
+        let selection_resolvable = if state.is_global() && !selection.is_empty() {
             let config = self.config.read().await;
-            matches!(state.global_selection.as_str(), "direct" | "block")
-                || config
-                    .groups
-                    .iter()
-                    .any(|group| group.name == state.global_selection)
-                || config
-                    .nodes
-                    .iter()
-                    .any(|node| node.name == state.global_selection)
+            matches!(selection, "direct" | "block")
+                || config.groups.iter().any(|group| group.name == selection)
+                || config.nodes.iter().any(|node| node.name == selection)
         } else {
             false
         };

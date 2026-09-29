@@ -766,7 +766,7 @@ jobs:
       - name: Run eBPF-feature unit tests
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
-        run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
+        run: cargo nextest run -p honk-core --features ebpf,native-api --lib --profile ci
       - name: Upload eBPF unit-test JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -896,7 +896,7 @@ jobs:
           echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
-      - run: cargo check -p honk-core --features ebpf --tests
+      - run: cargo check -p honk-core --features ebpf,native-api --tests
       - name: Write eBPF compile-guard CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -1082,7 +1082,7 @@ jobs:
       - name: Run eBPF-feature unit tests
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
-        run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
+        run: cargo nextest run -p honk-core --features ebpf,native-api --lib --profile ci
       - name: Upload eBPF unit-test JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

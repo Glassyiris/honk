@@ -7,6 +7,7 @@
 
 pub mod cache;
 pub(crate) mod import;
+pub(crate) mod startup;
 
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
@@ -22,7 +23,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavio
 pub(crate) const STATE_DIR: &str = "state";
 pub(crate) const DB_FILE: &str = "honk.db";
 pub(crate) const APPLICATION_ID: i64 = 0x686f_6e6b;
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 const PAGE_SIZE: i64 = 4096;
 /// 112 MiB of 4 KiB pages.
 const MAX_PAGE_COUNT: i64 = 28672;
@@ -35,7 +36,7 @@ pub(crate) const VACUUM_PAGES: i64 = 256;
 const CACHE_KIB: i64 = 256;
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
-pub(crate) const DIR_FLAGS: OFlag = OFlag::O_RDONLY
+const DIR_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_NOFOLLOW)
     .union(OFlag::O_CLOEXEC);
@@ -65,12 +66,8 @@ CREATE TABLE dns_answer (key TEXT PRIMARY KEY, expire_at INTEGER NOT NULL,
   entry BLOB NOT NULL CHECK (length(entry) <= 4096));
 CREATE INDEX dns_answer_expiry ON dns_answer(expire_at);
 CREATE TABLE clash_state (key TEXT PRIMARY KEY CHECK (key IN ('mode','global')), value TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE geodata_settings (id INTEGER PRIMARY KEY CHECK (id=1), record TEXT NOT NULL CHECK (length(record) <= 65536));
 ";
-
-/// Upgrades after schema v1, in order: entry `n` takes version `n + 1` to `n + 2`.
-const MIGRATIONS: [&str; 1] = [
-    "CREATE TABLE geodata_settings (id INTEGER PRIMARY KEY CHECK (id=1), record TEXT NOT NULL CHECK (length(record) <= 65536));",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StateError {
@@ -114,8 +111,6 @@ pub struct Refusal {
 pub(crate) enum Target {
     StateDir,
     Database,
-    LegacyDir,
-    LegacyRecord,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,13 +130,11 @@ impl Target {
         match self {
             Self::StateDir => STATE_DIR,
             Self::Database => "state/honk.db",
-            Self::LegacyDir => "native-api",
-            Self::LegacyRecord => "native-api/admin.json",
         }
     }
 
     fn directory(self) -> bool {
-        matches!(self, Self::StateDir | Self::LegacyDir)
+        matches!(self, Self::StateDir)
     }
 }
 
@@ -297,9 +290,8 @@ impl StateDb {
     }
 }
 
-/// Deletes the administrator record, for `honk-core admin reset`, and a legacy
-/// `native-api/admin.json` that no start has imported yet; `Ok(false)` when
-/// there was neither. Refused while any process has the db open through
+/// Deletes the administrator record, for `honk-core admin reset`; `Ok(false)`
+/// when there was none. Refused while any process has the db open through
 /// `StateDb`, because each holds a shared lock on `state/`.
 pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
     let directory = state_directory(data_dir, true, tighten)?;
@@ -309,13 +301,13 @@ pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
             _ => StateError::Unavailable,
         },
     )?;
-    // Startup takes the shared lock before creating the db or importing credentials.
+    // Startup takes the shared lock before creating the db.
     match nix::sys::stat::fstatat(
         &*directory,
         DB_FILE,
         nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
     ) {
-        Err(Errno::ENOENT) => return remove_legacy_admin(data_dir),
+        Err(Errno::ENOENT) => return Ok(false),
         Err(error) => return Err(path_error(Target::Database, error)),
         Ok(_) => {}
     }
@@ -343,43 +335,7 @@ pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
     } else {
         connection.execute("DELETE FROM admin", []).map_err(sql)?
     };
-    Ok(remove_legacy_admin(data_dir)? || deleted > 0)
-}
-
-fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
-    const LEGACY_DIR: &str = "native-api";
-    let parent =
-        File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StateError::Unavailable)?);
-    let directory = match openat(&parent, LEGACY_DIR, DIR_FLAGS, Mode::empty()) {
-        Ok(fd) => File::from(fd),
-        Err(Errno::ENOENT) => return Ok(false),
-        Err(error) => return Err(path_error(Target::LegacyDir, error)),
-    };
-    private(&directory, Target::LegacyDir)?;
-    let record = match openat(
-        &directory,
-        "admin.json",
-        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => File::from(fd),
-        Err(Errno::ENOENT) => return Ok(false),
-        Err(error) => return Err(path_error(Target::LegacyRecord, error)),
-    };
-    private(&record, Target::LegacyRecord)?;
-    match nix::unistd::unlinkat(
-        &directory,
-        "admin.json",
-        nix::unistd::UnlinkatFlags::NoRemoveDir,
-    ) {
-        Ok(()) => {}
-        Err(Errno::ENOENT) => return Ok(false),
-        Err(error) => return Err(path_error(Target::LegacyRecord, error)),
-    }
-    nix::unistd::fsync(&directory).map_err(|_| StateError::Unavailable)?;
-    // Fails while anything else is left in it.
-    let _ = nix::unistd::unlinkat(&parent, LEGACY_DIR, nix::unistd::UnlinkatFlags::RemoveDir);
-    Ok(true)
+    Ok(deleted > 0)
 }
 
 /// Which owners of the cache tables are configured.
@@ -475,15 +431,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
     }
     // The `-wal` moves first: a crash in between must not leave it beside a new file.
     for (from, to) in [("honk.db-wal", "honk.db.corrupt-wal"), (DB_FILE, CORRUPT)] {
-        match rustix::fs::renameat_with(
-            &*directory,
-            from,
-            &*directory,
-            to,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| Errno::from_raw(error.raw_os_error()))
-        {
+        match rename_noreplace(&directory, from, to) {
             Ok(()) | Err(Errno::ENOENT) => {}
             Err(Errno::EEXIST) => {
                 tracing::warn!(
@@ -686,8 +634,7 @@ fn verify(connection: &Connection, check: &str) -> Result<(), StateError> {
     }
 }
 
-/// Creation-time pragmas and the schema on an empty file, or the missing
-/// migrations on an older one.
+/// Creation-time pragmas and the schema on an empty file.
 fn create_schema(connection: &mut Connection) -> Result<(), StateError> {
     match pragma(connection, "user_version")? {
         SCHEMA_VERSION => return Ok(()),
@@ -701,13 +648,12 @@ fn create_schema(connection: &mut Connection) -> Result<(), StateError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Exclusive)
         .map_err(sql)?;
-    // A concurrent start may have created or upgraded the schema since the read above.
+    // A concurrent start may have created the schema since the read above.
     let current = pragma(&transaction, "user_version")?;
     let application_id = pragma(&transaction, "application_id")?;
     let schema = match (application_id, current) {
         (APPLICATION_ID, SCHEMA_VERSION) => return Ok(()),
-        (0, 0) => format!("{SCHEMA}{}", MIGRATIONS.concat()),
-        (APPLICATION_ID, 1..SCHEMA_VERSION) => MIGRATIONS[current as usize - 1..].concat(),
+        (0, 0) => SCHEMA,
         _ => return Err(StateError::Unsupported),
     };
     transaction
@@ -790,7 +736,6 @@ fn tighten(file: &File, target: Target) -> Result<(), StateError> {
     };
     if rule == Rule::GroupOrOtherBits
         && mode & 0o022 == 0
-        && matches!(target, Target::StateDir | Target::Database)
         // `fchmod` refuses the `O_PATH` descriptor of the database, while
         // `/proc/self/fd` reaches the same checked inode without a path lookup.
         && std::fs::set_permissions(
@@ -841,6 +786,33 @@ fn path_error(target: Target, error: Errno) -> StateError {
         Errno::ENOTDIR => Refusal::new(target, Rule::NotDirectory).into(),
         _ => StateError::Unavailable,
     }
+}
+
+/// Renames `from` to `to` within `directory`, failing with `EEXIST` rather
+/// than replacing `to`. A raw `renameat2` syscall: nix wraps it only for glibc,
+/// and releases also target musl.
+pub(crate) fn rename_noreplace<P1, P2>(directory: &File, from: &P1, to: &P2) -> nix::Result<()>
+where
+    P1: ?Sized + nix::NixPath,
+    P2: ?Sized + nix::NixPath,
+{
+    let fd = directory.as_raw_fd();
+    let result = from.with_nix_path(|from| {
+        to.with_nix_path(|to| {
+            // SAFETY: both paths are NUL-terminated and outlive the call.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    fd,
+                    from.as_ptr(),
+                    fd,
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            }
+        })
+    })??;
+    Errno::result(result).map(drop)
 }
 
 pub(crate) fn log_sql(error: &rusqlite::Error) {

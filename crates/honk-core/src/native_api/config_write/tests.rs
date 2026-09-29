@@ -30,9 +30,8 @@ fn replacement_preserves_exact_bytes_mode_and_old_open_inode() {
     let mut old_file = File::open(&path).unwrap();
     let old_metadata = old_file.metadata().unwrap();
     let source = SourceFile::open(&path, LIMIT).unwrap();
-    let hash = source.sha256();
     source
-        .replace(&hash, REPLACEMENT, || {
+        .replace(REPLACEMENT, || {
             assert_eq!(fs::read(&path).unwrap(), ORIGINAL.as_bytes());
             Ok(())
         })
@@ -59,7 +58,6 @@ fn conflicting_disk_edits_never_overwrite_the_editor() {
     for rename in [false, true] {
         let (directory, path) = fixture();
         let source = SourceFile::open(&path, LIMIT).unwrap();
-        let hash = source.sha256();
         let editor_content = if rename {
             ORIGINAL
         } else {
@@ -74,9 +72,7 @@ fn conflicting_disk_edits_never_overwrite_the_editor() {
             fs::write(&path, editor_content).unwrap();
         }
         assert_eq!(
-            source.replace(&hash, REPLACEMENT, || panic!(
-                "changed target reached admission"
-            )),
+            source.replace(REPLACEMENT, || panic!("changed target reached admission")),
             Err(WriteError::Conflict)
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), editor_content);
@@ -89,18 +85,15 @@ fn wrong_precondition_and_dependency_rejection_leave_disk_unchanged() {
     let (directory, path) = fixture();
     let source = SourceFile::open(&path, LIMIT).unwrap();
     assert_eq!(
-        source.replace(&"0".repeat(64), REPLACEMENT, || panic!(
-            "wrong hash reached admission"
-        )),
-        Err(WriteError::Conflict)
+        source.stage(&"0".repeat(64), REPLACEMENT.as_bytes()).err(),
+        Some(WriteError::Conflict)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
     assert_only_config(directory.path());
 
     let source = SourceFile::open(&path, LIMIT).unwrap();
-    let hash = source.sha256();
     assert_eq!(
-        source.replace(&hash, REPLACEMENT, || Err(WriteError::Conflict)),
+        source.replace(REPLACEMENT, || Err(WriteError::Conflict)),
         Err(WriteError::Conflict)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
@@ -111,10 +104,9 @@ fn wrong_precondition_and_dependency_rejection_leave_disk_unchanged() {
 fn target_edit_during_dependency_admission_is_preserved() {
     let (directory, path) = fixture();
     let source = SourceFile::open(&path, LIMIT).unwrap();
-    let hash = source.sha256();
     let external = "# edited while dependencies were being validated\n";
     assert_eq!(
-        source.replace(&hash, REPLACEMENT, || {
+        source.replace(REPLACEMENT, || {
             fs::write(&path, external).unwrap();
             Ok(())
         }),
@@ -128,7 +120,6 @@ fn target_edit_during_dependency_admission_is_preserved() {
 fn target_symlinks_are_never_read_or_replaced() {
     let (directory, path) = fixture();
     let source = SourceFile::open(&path, LIMIT).unwrap();
-    let hash = source.sha256();
     let outside = tempfile::tempdir().unwrap();
     let private = outside.path().join("private.dae");
     fs::write(&private, "private content").unwrap();
@@ -140,7 +131,7 @@ fn target_symlinks_are_never_read_or_replaced() {
         Err(WriteError::UnsafePath)
     ));
     assert_eq!(
-        source.replace(&hash, REPLACEMENT, || panic!("symlink reached admission")),
+        source.replace(REPLACEMENT, || panic!("symlink reached admission")),
         Err(WriteError::UnsafePath)
     );
     assert!(
@@ -165,7 +156,6 @@ fn moved_parent_cannot_redirect_writes_or_leave_temporary_files() {
         fs::write(parent.join("config.dae"), ORIGINAL).unwrap();
         fs::write(outside.join("config.dae"), "outside").unwrap();
         let source = SourceFile::open(&parent.join("config.dae"), LIMIT).unwrap();
-        let hash = source.sha256();
         fs::rename(&parent, &retained).unwrap();
         if replace_with_symlink {
             symlink(&outside, &parent).unwrap();
@@ -175,9 +165,7 @@ fn moved_parent_cannot_redirect_writes_or_leave_temporary_files() {
         }
 
         assert_eq!(
-            source.replace(&hash, REPLACEMENT, || panic!(
-                "changed parent reached admission"
-            )),
+            source.replace(REPLACEMENT, || panic!("changed parent reached admission")),
             Err(if replace_with_symlink {
                 WriteError::UnsafePath
             } else {
@@ -226,11 +214,8 @@ fn reads_and_replacements_enforce_byte_limit_and_regular_utf8_files() {
         Err(WriteError::TooLarge)
     ));
     let source = SourceFile::open(&path, ORIGINAL.len()).unwrap();
-    let hash = source.sha256();
     assert_eq!(
-        source.replace(&hash, REPLACEMENT, || panic!(
-            "oversized write reached admission"
-        )),
+        source.replace(REPLACEMENT, || panic!("oversized write reached admission")),
         Err(WriteError::TooLarge)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
@@ -261,10 +246,9 @@ fn file_sync_failure_is_invisible_but_directory_sync_failure_keeps_new_bytes() {
         let (directory, path) = fixture();
         let old_inode = fs::metadata(&path).unwrap().ino();
         let mut source = SourceFile::open(&path, LIMIT).unwrap();
-        let hash = source.sha256();
         source.sync_fault = Some(fault);
         let mut admitted = false;
-        let result = source.replace(&hash, REPLACEMENT, || {
+        let result = source.replace(REPLACEMENT, || {
             admitted = true;
             assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
             Ok(())
@@ -372,12 +356,34 @@ fn staging_beside_creates_a_new_file_and_never_replaces_one() {
 }
 
 #[test]
+fn staging_beside_refuses_a_swapped_target_directory() {
+    let (_packaged, path) = fixture();
+    let data = tempfile::tempdir().unwrap();
+    let parent = data.path().join("config.d");
+    fs::create_dir(&parent).unwrap();
+    let source = SourceFile::open_binary(&path, LIMIT).unwrap();
+    let hash = source.sha256();
+    let staged = source
+        .stage_beside(&hash, &parent.join("config.dae"), REPLACEMENT.as_bytes())
+        .unwrap();
+    let moved = data.path().join("moved.d");
+    let result = staged.replace(|| {
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&moved, &parent).unwrap();
+        Ok(())
+    });
+    assert_eq!(result.err(), Some(WriteError::UnsafePath));
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    assert_eq!(fs::read(&path).unwrap(), ORIGINAL.as_bytes());
+}
+
+#[test]
 fn create_new_never_replaces_and_refuses_a_swapped_directory() {
     let directory = tempfile::tempdir().unwrap();
     let parent = directory.path().join("config.d");
     fs::create_dir(&parent).unwrap();
     let target = parent.join("new.dae");
-    let created = create_new(&target, REPLACEMENT.as_bytes(), 0o100640, || Ok(())).unwrap();
+    create_new(&target, REPLACEMENT.as_bytes(), 0o100640, || Ok(())).unwrap();
     assert_eq!(fs::read(&target).unwrap(), REPLACEMENT.as_bytes());
     assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o640);
     assert_eq!(
@@ -403,40 +409,4 @@ fn create_new_never_replaces_and_refuses_a_swapped_directory() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names, [OsString::from("new.dae")]);
-    drop(created);
-}
-
-#[test]
-fn created_file_is_removed_only_while_its_name_holds_it() {
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("new.dae");
-    let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
-    assert!(created.remove());
-    assert!(!target.exists());
-    assert!(created.remove(), "already gone");
-
-    // ext4 hands a freed inode number to the next file it creates; repeat to give it the chance.
-    for _ in 0..32 {
-        let created = create_new(&target, ORIGINAL.as_bytes(), 0o640, || Ok(())).unwrap();
-        let inode = fs::metadata(&target).unwrap().ino();
-        fs::remove_file(&target).unwrap();
-        assert!(holds_unlinked(&target));
-        fs::write(&target, REPLACEMENT).unwrap();
-        assert_ne!(fs::metadata(&target).unwrap().ino(), inode);
-        assert!(!created.remove());
-        assert_eq!(fs::read_to_string(&target).unwrap(), REPLACEMENT);
-        fs::remove_file(&target).unwrap();
-    }
-}
-
-/// Whether this process still has the unlinked file that was at `path` open.
-fn holds_unlinked(path: &Path) -> bool {
-    let parent = path.parent().unwrap().canonicalize().unwrap();
-    let deleted = format!(
-        "{} (deleted)",
-        parent.join(path.file_name().unwrap()).display()
-    );
-    fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
-        fs::read_link(entry.unwrap().path()).is_ok_and(|link| link.as_os_str() == deleted.as_str())
-    })
 }

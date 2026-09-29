@@ -195,7 +195,7 @@ async fn source_resolution_logs_real_ipv6_client_but_diagnostic_does_not() {
         true,
         std::sync::Weak::new(),
     ));
-    service.attach_observer(Arc::downgrade(&api));
+    service.attach_observer(Arc::downgrade(&api.recorder));
     let source: SocketAddr = "[2001:db8::1]:53123".parse().unwrap();
     let resolved = service
         .resolve_name_for_source("example.com", source)

@@ -260,10 +260,7 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
         })
         .await
         .unwrap();
-    assert_eq!(
-        (result.matched, result.deleted, result.persistent),
-        (2, 2, false)
-    );
+    assert_eq!((result.deleted, result.persistent), (2, false));
     assert!(service.entry_id(&first).is_none());
     assert!(service.entry_id(&second).is_none());
     assert!(service.entry_id(&other_type).is_some());

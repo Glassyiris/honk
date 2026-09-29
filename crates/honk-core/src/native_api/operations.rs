@@ -22,8 +22,8 @@ use uuid::Uuid;
 use super::{ApiError, ErrorCode, events::EventHub, timestamp};
 
 const MAX_OPERATIONS: usize = 32;
-const RETENTION: Duration = Duration::from_secs(300);
-const MAX_TOMBSTONES: usize = 1024;
+pub(super) const RETENTION: Duration = Duration::from_secs(300);
+pub(super) const MAX_TOMBSTONES: usize = 1024;
 const MAX_ERROR_DETAILS: usize = 4096;
 const MAX_RESULT_BYTES: usize = 262144;
 

@@ -287,9 +287,8 @@ pub(super) async fn open_tcp(
             OpenError::Session(anyhow::Error::new(error.failure.io()))
         });
     }
-    #[cfg(feature = "native-api")]
     if let Some(observer) = crate::runtime::flow_observation::current() {
-        observer.milestone_once("target_request_sent");
+        observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
     }
     cancellation.disarm();
     Ok(VlessCoolStream {
@@ -463,9 +462,10 @@ impl VlessXudpTransport {
         match result {
             Ok(()) => {
                 cancellation.complete();
-                #[cfg(feature = "native-api")]
                 if let Some(observer) = crate::runtime::flow_observation::current() {
-                    observer.milestone_once("target_request_sent");
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                    );
                 }
                 Ok(())
             }

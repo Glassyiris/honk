@@ -483,9 +483,8 @@ impl DnsRouter {
         source_ip: Option<IpAddr>,
     ) -> (DnsRequestDecision, crate::dns::outcome::RouteSource) {
         let evaluation = Evaluation::request(domain, qtype, source_ip);
-        #[cfg(feature = "native-api")]
         let mut capture =
-            crate::native_api::flows::dns::RuleCapture::request(domain, qtype, source_ip);
+            crate::observe::flows::dns::RuleCapture::request(domain, qtype, source_ip);
         for (_index, rule) in self.request_rules.iter().enumerate() {
             #[cfg(feature = "native-api")]
             if let Some(capture) = &mut capture {
@@ -494,19 +493,16 @@ impl DnsRouter {
             let matched = matcher::eval_conditions_observed(
                 &rule.conditions,
                 &evaluation,
-                |_index, _matched| {
-                    #[cfg(feature = "native-api")]
+                |index, matched| {
                     if let Some(capture) = &mut capture {
-                        capture.condition(_index, _matched);
+                        capture.condition(index, matched);
                     }
                 },
             );
-            #[cfg(feature = "native-api")]
             if let Some(capture) = &mut capture {
                 capture.rule_result(matched);
             }
             if matched {
-                #[cfg(feature = "native-api")]
                 if let Some(capture) = capture {
                     let (action, upstream) = request_evidence(&rule.action);
                     capture.finish(action, upstream);
@@ -518,7 +514,6 @@ impl DnsRouter {
                 );
             }
         }
-        #[cfg(feature = "native-api")]
         if let Some(mut capture) = capture {
             capture.begin_rule(None, &[]);
             capture.rule_result(true);
@@ -554,8 +549,7 @@ impl DnsRouter {
                 from_upstream,
             },
         );
-        #[cfg(feature = "native-api")]
-        let mut capture = crate::native_api::flows::dns::RuleCapture::response(
+        let mut capture = crate::observe::flows::dns::RuleCapture::response(
             domain,
             qtype,
             answer_ips,
@@ -569,19 +563,16 @@ impl DnsRouter {
             let matched = matcher::eval_conditions_observed(
                 &rule.conditions,
                 &evaluation,
-                |_index, _matched| {
-                    #[cfg(feature = "native-api")]
+                |index, matched| {
                     if let Some(capture) = &mut capture {
-                        capture.condition(_index, _matched);
+                        capture.condition(index, matched);
                     }
                 },
             );
-            #[cfg(feature = "native-api")]
             if let Some(capture) = &mut capture {
                 capture.rule_result(matched);
             }
             if matched {
-                #[cfg(feature = "native-api")]
                 if let Some(capture) = capture {
                     let (action, upstream) = response_evidence(&rule.action);
                     capture.finish(action, upstream);
@@ -590,7 +581,6 @@ impl DnsRouter {
                 return map_response_action(&rule.action);
             }
         }
-        #[cfg(feature = "native-api")]
         if let Some(mut capture) = capture {
             capture.begin_rule(None, &[]);
             capture.rule_result(true);
@@ -654,7 +644,6 @@ impl DnsRouter {
     pub(crate) fn geo_requirements_snapshot(&self) -> &GeoRequirements {
         &self.geo_requirements
     }
-
     #[cfg(test)]
     pub(crate) fn geosite_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::GeositeMatcher>> {
         self.request_rules
@@ -673,7 +662,6 @@ impl DnsRouter {
             .collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn answer_ip_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::IpMatcher>> {
         self.response_rules
             .iter()
@@ -733,7 +721,6 @@ fn request_action_name(action: &DnsRequestAction, fallback: bool) -> &str {
     }
 }
 
-#[cfg(feature = "native-api")]
 fn request_evidence(action: &DnsRequestAction) -> (&'static str, Option<&str>) {
     match action {
         DnsRequestAction::Reject => ("reject", None),
@@ -742,7 +729,6 @@ fn request_evidence(action: &DnsRequestAction) -> (&'static str, Option<&str>) {
     }
 }
 
-#[cfg(feature = "native-api")]
 fn response_evidence(action: &DnsResponseAction) -> (&'static str, Option<&str>) {
     match action {
         DnsResponseAction::Accept => ("accept", None),

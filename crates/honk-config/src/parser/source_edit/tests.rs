@@ -509,15 +509,22 @@ fn group_scalars_keep_inheritance_and_icons_keep_exact_values() {
         assert!(config.validate_detailed().is_err());
         assert!(config.validate_assembled().is_err());
     }
-    for setting in [
-        "tolerance: -1",
-        "idle_timeout: 1.5",
-        "interrupt_connections: maybe",
-        "icon { ignored: value }",
+    for (setting, path) in [
+        ("tolerance: -1", "groups[2].tolerance"),
+        ("idle_timeout: 1.5", "groups[2].idle_timeout"),
+        (
+            "interrupt_connections: maybe",
+            "groups[2].interrupt_connections",
+        ),
+        ("icon { ignored: value }", "groups[2].icon"),
+        ("icon: 'data:x'", "groups[2].icon"),
     ] {
-        assert!(
-            crate::parser::parse_dae_config(&format!("group {{ G {{ {setting} }} }}")).is_err()
-        );
+        let error = crate::parser::parse_dae_config_with_detailed_diagnostics(
+            &format!("group {{ F {{}} G {{ {setting} }} }}"),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostic.setting.to_string(), path, "{setting}");
     }
 }
 
@@ -655,5 +662,7 @@ fn routing_positions_follow_parser_ordinals_across_includes() {
         "domain(\r\n 'example.test'\r\n ) -> direct"
     );
     assert_eq!((index.rules[1].source_index, index.rules[1].line), (1, 3));
-    assert_eq!(index.fallback.unwrap().source_index, 1);
+    let fallback = index.fallback.unwrap();
+    assert_eq!(fallback.source_index, 1);
+    assert_eq!(fallback.expression, "fallback: block");
 }

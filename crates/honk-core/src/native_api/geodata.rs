@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -9,12 +9,13 @@ use honk_config::experimental::{NativeApiConfig, parse_geodata_url};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
 
+use super::destination::Policy;
 use super::operations::{OperationKind, Reservation};
-use super::probes::Policy;
 use super::{ApiError, ErrorCode, NativeState, config, parse_query, timestamp, types::RequestId};
-use crate::download_route::{self, Deadline, Outbounds};
+use crate::download_route::{self, Detour, Failed, Outbounds};
+use crate::marked_http::Deadline;
 use crate::routing::{GeoAssetSnapshot, GeoRequirements};
 
 mod sources;
@@ -87,7 +88,7 @@ pub(crate) struct GeoUpdatePlan {
     pub(crate) group_manager: honk_outbound::group::SharedGroupManager,
     pub(crate) proxy_registry: Arc<crate::proxy::ProxyRegistry>,
     pub(crate) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
-    pub(crate) catalog: Arc<super::catalog::Catalog>,
+    pub(crate) catalog: Arc<crate::observe::catalog::Catalog>,
     pub(crate) policy: Arc<Policy>,
     pub(crate) sources: Option<Arc<Sources>>,
 }
@@ -308,7 +309,7 @@ pub(crate) fn project(
 }
 
 /// The API id of the group named `name`, while it exists.
-pub(crate) fn group_id(catalog: &super::catalog::Catalog, name: &str) -> Option<String> {
+pub(crate) fn group_id(catalog: &crate::observe::catalog::Catalog, name: &str) -> Option<String> {
     catalog.snapshot().groups.get(name).cloned()
 }
 
@@ -326,9 +327,16 @@ pub(super) async fn capability(state: &NativeState) -> Value {
             let active = state.config.read().await;
             let can_update = updatable(state, &active.experimental.native_api, &assets);
             let mut value = json!({"available": true, "can_update": can_update,
-                "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>()});
+                "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>(),
+                "checksum": "sha256sum"});
             if state.geodata.as_ref().is_some() {
                 value["configurable_sources"] = json!(true);
+                value["max_urls"] = json!(sources::MAX_URLS);
+                value["interval_hours"] = json!({"min": sources::INTERVAL_HOURS.start(),
+                    "max": sources::INTERVAL_HOURS.end(),
+                    "default": sources::AutoUpdate::default().interval_hours});
+                // The file is read at startup only; patches live in the state db.
+                value["lifecycle"] = json!({"file_values": "start", "overrides_persist": true});
             }
             value
         }
@@ -349,7 +357,7 @@ pub(super) async fn get(
         state.geodata.as_deref(),
         &active,
         &state.observation.configuration,
-        |name| group_id(&state.observation.catalog, name),
+        |name| group_id(&state.observation.core.catalog, name),
     ))
     .into_response())
 }
@@ -416,7 +424,7 @@ async fn queue(state: &Arc<NativeState>, reservation: Reservation) -> bool {
             group_manager: Arc::clone(&state.group_manager),
             proxy_registry: Arc::clone(&state.proxy_registry),
             runtime_registry: Arc::clone(&state.runtime_registry),
-            catalog: Arc::clone(&state.observation.catalog),
+            catalog: Arc::clone(&state.observation.core.catalog),
             assets,
             revision,
             policy: Arc::new(Policy::new(&state.settings)),
@@ -609,66 +617,17 @@ async fn download(
     max_bytes: usize,
     policy: Option<&Policy>,
 ) -> Result<(Arc<[u8]>, Option<String>), Failure> {
-    let url = parse_geodata_url(url).ok_or("invalid_source")?;
-    let host = url.host_str().ok_or("invalid_source")?;
-    let port = url.port_or_known_default().ok_or("invalid_source")?;
-    if policy.is_some_and(|policy| !policy.http_port(port, url.scheme() == "https")) {
-        return Err("destination_rejected".into());
-    }
-    let detour = match egress.route {
-        Route::Direct => {
-            return download_direct(url.as_str(), egress.bootstrap, deadline, max_bytes, policy)
-                .await
-                .map(|bytes| (bytes, None));
-        }
-        Route::Routing => None,
-        Route::Group(group) => Some(group.as_str()),
+    let routed = match egress.route {
+        Route::Direct => None,
+        Route::Routing => Some((egress.outbounds, Detour::Routing)),
+        Route::Group(group) => Some((egress.outbounds, Detour::Group(group))),
     };
-    let decision = timeout_at(
-        deadline.headers,
-        egress
-            .outbounds
-            .decide(detour, DETOUR_SETTING, PURPOSE, (host, port), None),
-    )
-    .await
-    .map_err(|_| "download_timeout")?
-    .map_err(|_| "group_unavailable")?;
-    match decision.route {
-        download_route::Route::Block => Err("route_blocked".into()),
-        download_route::Route::Direct { .. } => {
-            download_direct(url.as_str(), egress.bootstrap, deadline, max_bytes, policy)
-                .await
-                .map(|bytes| (bytes, decision.group))
-        }
-        download_route::Route::Proxy { node, .. } => {
-            // The node's egress resolves a domain; only a literal address can be checked here.
-            if let Some(ip) = download_route::parse_host_ip(host)
-                && policy.is_some_and(|policy| !policy.address(ip))
-            {
-                return Err("destination_rejected".into());
-            }
-            let tunnel = timeout_at(
-                deadline.headers,
-                egress.outbounds.tunnel(&node, (host, port)),
-            )
-            .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "connection_failed")?;
-            let result = match timeout_at(deadline.headers, tunnel.dial()).await {
-                Err(_) => Err("download_timeout".into()),
-                Ok(Err(_)) => Err("connection_failed".into()),
-                Ok(Ok(stream)) => exchange(stream, &url, deadline, max_bytes).await,
-            };
-            if let Err(error) = tunnel.close().await {
-                tracing::warn!(%error, "geodata download tunnel did not close cleanly");
-            }
-            result.map(|bytes| (bytes, decision.group))
-        }
-    }
+    exchange(url, egress.bootstrap, routed, deadline, max_bytes, policy).await
 }
 
 /// Fetches `url` straight from its host, resolved with the bootstrap
 /// resolver, over the bypass mark.
+#[cfg(test)]
 pub(crate) async fn download_direct(
     url: &str,
     bootstrap: &str,
@@ -676,77 +635,50 @@ pub(crate) async fn download_direct(
     max_bytes: usize,
     policy: Option<&Policy>,
 ) -> Result<Arc<[u8]>, Failure> {
+    exchange(url, bootstrap, None, deadline, max_bytes, policy)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+/// One GET that only a 200 answers, through `routed` or straight to the
+/// host; another status is kept for the failure. `policy` limits the port
+/// and the addresses the request may reach.
+async fn exchange(
+    url: &str,
+    bootstrap: &str,
+    routed: Option<(Outbounds<'_>, Detour<'_>)>,
+    deadline: Deadline,
+    max_bytes: usize,
+    policy: Option<&Policy>,
+) -> Result<(Arc<[u8]>, Option<String>), Failure> {
     let url = parse_geodata_url(url).ok_or("invalid_source")?;
-    let host = url
-        .host_str()
-        .ok_or("invalid_source")?
-        .trim_matches(['[', ']']);
     let port = url.port_or_known_default().ok_or("invalid_source")?;
     if policy.is_some_and(|policy| !policy.http_port(port, url.scheme() == "https")) {
         return Err("destination_rejected".into());
     }
-    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![ip]
-    } else {
-        let resolver = honk_outbound::bootstrap::BootstrapResolver::parse(bootstrap)
-            .ok_or("bootstrap_unavailable")?;
-        timeout_at(deadline.headers, resolver.query(host))
-            .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "resolution_failed")?
-    };
-    let mut connected = None;
-    let mut rejected = false;
-    for ip in addresses {
-        if policy.is_some_and(|policy| !policy.address(ip)) {
-            rejected = true;
-            continue;
-        }
-        let remaining = deadline.headers.saturating_duration_since(Instant::now());
-        let result = timeout_at(
-            deadline.headers,
-            honk_outbound::util::connect_marked_addr(
-                SocketAddr::new(ip, port),
-                Some(honk_outbound::util::bypass_mark()),
-                remaining,
-            ),
-        )
-        .await
-        .map_err(|_| "download_timeout")?;
-        if let Ok(stream) = result {
-            connected = Some(stream);
-            break;
-        }
-    }
-    let stream = connected.ok_or(if rejected {
-        "destination_rejected"
-    } else {
-        "connection_failed"
-    })?;
-    exchange(stream, &url, deadline, max_bytes).await
-}
-
-/// One GET that only a 200 answers; another status is kept for the failure.
-async fn exchange<S>(
-    stream: S,
-    url: &reqwest::Url,
-    deadline: Deadline,
-    max_bytes: usize,
-) -> Result<Arc<[u8]>, Failure>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let reply = download_route::get(
-        stream,
-        url,
-        &http::HeaderMap::new(),
-        |status, _| status == StatusCode::OK,
+    let admits = |ip: IpAddr| policy.is_none_or(|policy| policy.address(ip));
+    let headers = http::HeaderMap::new();
+    let request = download_route::Request {
+        url: &url,
+        headers: &headers,
+        wants_body: |status, _| status == StatusCode::OK,
         deadline,
         max_bytes,
-    )
-    .await?;
+        bootstrap: Some(bootstrap),
+        admits: &admits,
+    };
+    let (reply, group) = match routed {
+        None => (download_route::fetch_direct(&request).await?, None),
+        Some((outbounds, detour)) => outbounds
+            .fetch(detour, DETOUR_SETTING, PURPOSE, &request)
+            .await
+            .map_err(|failed| match failed {
+                Failed::Route(_) => "group_unavailable",
+                Failed::Stage(stage) => stage,
+            })?,
+    };
     match reply.status {
-        StatusCode::OK => Ok(reply.body),
+        StatusCode::OK => Ok((reply.body, group)),
         status => Err(Failure {
             code: match status {
                 StatusCode::NOT_FOUND => "http_not_found",

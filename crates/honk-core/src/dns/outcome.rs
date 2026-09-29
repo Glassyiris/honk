@@ -203,6 +203,11 @@ impl DnsOutcome {
         self.provenance
     }
 
+    /// Answered from the cache, fresh or stale, rather than an upstream exchange.
+    pub const fn is_cached(&self) -> bool {
+        matches!(self.provenance, Provenance::Cache | Provenance::Stale)
+    }
+
     pub const fn expiry(&self) -> EffectiveExpiry {
         self.expiry
     }

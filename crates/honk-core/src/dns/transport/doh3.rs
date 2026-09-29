@@ -194,8 +194,8 @@ impl Doh3Client {
                         return Ok((session, sender));
                     }
                     Some(reason) if attempt == 0 => {
-                        observation.record("dns_session_ready_failed", Some("upstream_failed"));
-                        observation.record("dns_session_retry_started", None);
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed);
+                        observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted);
                         debug!(error = %reason, transport = "doh3", "DoH3 connection is closed; rebuilding");
                         self.retire_session(&session).await;
                     }
@@ -209,7 +209,10 @@ impl Doh3Client {
             unreachable!("the loop returns or fails on its second pass")
         }
         .await;
-        observation.finish(result, "dns_session_ready_succeeded")
+        observation.finish(
+            result,
+            honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadySucceeded,
+        )
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {

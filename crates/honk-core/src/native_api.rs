@@ -7,6 +7,7 @@ pub(crate) mod config;
 mod config_write;
 mod connections;
 mod datapath;
+mod destination;
 pub(crate) mod dns;
 pub(crate) mod events;
 pub(crate) mod flows;
@@ -18,18 +19,21 @@ mod management;
 pub(crate) mod observation;
 pub(crate) mod offline;
 pub(crate) mod operations;
+mod pages;
 pub(crate) mod probes;
 pub(crate) mod providers;
 pub(crate) mod routing;
 mod security;
 mod server;
 mod settings;
+mod startup;
 pub(crate) mod store;
 pub(crate) mod telemetry;
 mod types;
 mod ui;
 
 pub use server::NativeServer;
+pub(crate) use startup::NativeRuntime;
 pub use types::{ApiError, ErrorCode};
 
 use std::collections::{BinaryHeap, HashMap};
@@ -47,15 +51,13 @@ use tokio::sync::{RwLock, watch};
 
 use crate::connection_tracker::{ConnectionEntry, ConnectionTracker};
 use crate::control::{ControlPlane, EnginePhase};
+use crate::observe::timestamp;
 use crate::stats::StatsManager;
 use types::*;
 
 /// Process-owned handles; constructing a router never starts observers or I/O.
 pub struct NativeState {
     settings: NativeApiConfig,
-    /// Restart-required like every listener secret; read here so masking never
-    /// waits on the configuration lock.
-    clash_secret: String,
     security: security::Security,
     /// Present only in password mode: the administrator record, the live sessions and login admission.
     pub(crate) auth: Option<Arc<auth::Auth>>,
@@ -69,7 +71,7 @@ pub struct NativeState {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     stats: Arc<StatsManager>,
     tracker: Arc<ConnectionTracker>,
-    observation: Arc<observation::NativeObservation>,
+    pub(crate) observation: Arc<observation::NativeObservation>,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     group_manager: honk_outbound::group::SharedGroupManager,
     dns: crate::dns::DnsService,
@@ -89,6 +91,17 @@ pub struct NativeState {
 impl NativeState {
     pub async fn new(
         control: &mut ControlPlane,
+        listen: SocketAddr,
+        started_at: SystemTime,
+        started: Instant,
+    ) -> anyhow::Result<Self> {
+        let observation = observation::NativeObservation::attach(control).await;
+        Self::with_observation(control, observation, listen, started_at, started).await
+    }
+
+    pub(crate) async fn with_observation(
+        control: &mut ControlPlane,
+        observation: Arc<observation::NativeObservation>,
         listen: SocketAddr,
         started_at: SystemTime,
         started: Instant,
@@ -129,7 +142,7 @@ impl NativeState {
                             })?)
                         }
                     };
-                    auth::Auth::open(db, &data_dir).map_err(|error| {
+                    auth::Auth::open(db).map_err(|error| {
                         anyhow::anyhow!(
                             "native API password login cannot use the state db: {error}"
                         )
@@ -151,7 +164,6 @@ impl NativeState {
                 .ok()
                 .map(Arc::new)
         });
-        let observation = control.native_observation();
         observation.telemetry.discover().await;
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
@@ -161,8 +173,7 @@ impl NativeState {
             geodata,
             ui: ui::load(&settings.ui).await?,
             settings,
-            clash_secret,
-            instance_id: observation.instance_id.clone(),
+            instance_id: observation.core.instance_id.clone(),
             observation,
             alive_set: control.alive_set(),
             group_manager: control.group_manager(),
@@ -249,14 +260,6 @@ impl Peer {
                     || (ip.segments()[0] & 0xffc0) == 0xfe80
             }
         }
-    }
-}
-
-/// An IPv4-mapped IPv6 peer is the IPv4 address it carries, so one rule covers both stacks.
-pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        other => other,
     }
 }
 
@@ -374,10 +377,6 @@ fn full_detail(values: &HashMap<String, String>, id: &RequestId) -> Result<bool,
     }
 }
 
-fn timestamp(time: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
 async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["detail"], id)?;
     let full = full_detail(&query, id)?;
@@ -406,8 +405,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             generation,
             phase,
             state.healthy.load(Ordering::Acquire),
-            state.observation.reloading(),
-            state.observation.activated_at(generation),
+            state.observation.core.reloading(),
+            state.observation.core.activated_at(generation),
             state.observation.configuration.sources.revision(),
             state.observation.configuration.last_reload(),
             state.backend.read().await.observe_datapath(),
@@ -510,7 +509,7 @@ fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Conne
     let evidence = entry
         .native_flow_id
         .as_deref()
-        .and_then(|id| state.observation.flows.connection_evidence(id));
+        .and_then(|id| state.observation.core.flows.connection_evidence(id));
     Connection {
         id: entry.id.clone(),
         flow_id: entry.native_flow_id.clone(),
@@ -533,7 +532,9 @@ fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Conne
             .and_then(|value| value.rule_expression.clone()),
         rule_source: evidence
             .as_ref()
-            .map_or("unknown", |value| value.rule_source),
+            .map_or(crate::observe::vocab::RuleSource::Unknown, |value| {
+                value.rule_source
+            }),
         ingress: None,
         domain_source: evidence.as_ref().and_then(|value| value.domain_source),
         started_at: evidence.map(|value| value.started_at),
@@ -694,7 +695,7 @@ mod tests {
             .as_str()
             .expect("startup generation has an activation time")
             .to_owned();
-        let reloading = state.observation.begin_reload();
+        let reloading = state.observation.core.begin_reload();
         let during = runtime_body(&state).await;
         assert_eq!(during["lifecycle"]["state"], "reloading");
         assert_eq!(during["generation"]["state"], "reloading");
@@ -708,7 +709,8 @@ mod tests {
         assert!(uncommitted["generation"]["activated_at"].is_null());
         state
             .observation
-            .committed(state.observation.catalog.snapshot(), 0, 1);
+            .core
+            .committed(state.observation.core.catalog.snapshot(), 0, 1);
         let after = runtime_body(&state).await;
         assert_eq!(after["lifecycle"]["state"], "running");
         assert_eq!(after["generation"]["state"], "active");
@@ -889,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flow_capability_reports_runtime_limits() {
+    async fn setting_capabilities_report_patch_bounds_not_current_values() {
         let state = state().await;
         let request = axum::http::Request::patch("/api/v1/runtime/settings")
             .header("content-type", "application/json")
@@ -900,9 +902,17 @@ mod tests {
         settings::patch(&state, request, &RequestId("test".into()))
             .await
             .unwrap();
-        let flows = &types::capabilities(&state).await["resources"]["flows"];
-        assert_eq!(flows["max_flows"], 64);
-        assert_eq!(flows["retention_seconds"], 60);
+        let resources = &types::capabilities(&state).await["resources"];
+        let flows = &resources["flows"];
+        assert_eq!(flows["min_flows"], 64);
+        assert_eq!(flows["max_flows"], 1024);
+        assert_eq!(flows["retention_seconds"], 300);
+        assert_eq!(resources["logs"]["min_buffered_records"], 64);
+        assert_eq!(
+            resources["logs"]["filters"],
+            serde_json::json!(["level", "target"])
+        );
+        assert_eq!(resources["dns_log"]["min_records"], 64);
     }
 
     #[tokio::test]

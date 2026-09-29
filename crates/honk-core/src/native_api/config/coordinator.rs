@@ -9,7 +9,7 @@ use super::super::management::{self, Completion, Mutation};
 use super::super::{
     config_write::WriteError,
     offline,
-    store::{Committed, SourceStore, StoreKind},
+    store::{Committed, SourceStore},
 };
 use super::*;
 use crate::configuration::{Activation, ActivationRequest};
@@ -27,7 +27,7 @@ pub(crate) struct ConfigCoordinator {
 
 struct Worker {
     service: Arc<ConfigService>,
-    store: Option<Arc<dyn SourceStore>>,
+    store: SourceStore,
     data_dir: PathBuf,
     source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -35,13 +35,14 @@ struct Worker {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     subscriptions: SubscriptionSupervisorHandle,
     activation: Activation,
+    stopping: watch::Receiver<bool>,
 }
 
 impl ConfigService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start(
         self: &Arc<Self>,
-        store: Option<Arc<dyn SourceStore>>,
+        store: SourceStore,
         initial: Option<SourceUpdate>,
         data_dir: PathBuf,
         active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -56,9 +57,9 @@ impl ConfigService {
             self.sources
                 .accept(self.sources.prepare_accept(initial), generation);
             self.sources
-                .generation_committed(&super::super::catalog::revision_for(&config), generation);
+                .generation_committed(&crate::observe::catalog::revision_for(&config), generation);
         }
-        *self.store.write() = store.clone();
+        *self.store.write() = Some(store.clone());
         let (sender, mut receiver) = mpsc::channel(16);
         *self.sender.lock() = Some(sender);
         let (stop, mut stopping) = watch::channel(false);
@@ -74,6 +75,7 @@ impl ConfigService {
                 diagnostics,
                 activation: Activation::new(commands, subscriptions.clone()),
                 subscriptions,
+                stopping: stopping.clone(),
             };
             loop {
                 let work = tokio::select! { biased; _=stopping.changed()=>break, work=receiver.recv()=>match work{Some(work)=>work,None=>break} };
@@ -86,7 +88,7 @@ impl ConfigService {
                         let _ = response.send(Err(unavailable()));
                     }
                     Work::Manage { response, .. } => {
-                        let _ = response.send(Err(unavailable().for_management(true)));
+                        let _ = response.send(Err(unavailable()));
                     }
                     _ => {}
                 }
@@ -114,10 +116,8 @@ impl Worker {
     async fn perform(&mut self, work: Work) {
         if let Err(error) = self.service.check_phase(&work) {
             match work {
-                Work::Manage {
-                    mutation, response, ..
-                } => {
-                    let _ = response.send(Err(error.for_management(mutation.deleting())));
+                Work::Manage { response, .. } => {
+                    let _ = response.send(Err(error));
                 }
                 Work::Replace { reservation, .. }
                 | Work::Create { reservation, .. }
@@ -144,11 +144,9 @@ impl Worker {
                 alive_set,
                 response,
             } => {
-                let deleting = mutation.deleting();
                 let result = self
                     .manage(mutation, &catalog, &group_manager, &alive_set)
-                    .await
-                    .map_err(|error| error.for_management(deleting));
+                    .await;
                 let _ = response.send(result);
             }
             Work::GroupPatch { patch, reservation } => {
@@ -166,7 +164,7 @@ impl Worker {
                                 candidate,
                                 sources: Some(sources),
                                 diagnostics,
-                                expected_revision: Some(revision),
+                                expected_group_revision: Some(revision),
                                 deferred_provider: None,
                             },
                             Some(&group_id),
@@ -220,7 +218,7 @@ impl Worker {
                                 candidate,
                                 sources: Some(sources),
                                 diagnostics,
-                                expected_revision: None,
+                                expected_group_revision: None,
                                 deferred_provider: None,
                             },
                             None,
@@ -257,16 +255,13 @@ impl Worker {
                 reservation,
             } => {
                 let id = reservation.id.clone();
-                let (head, blocked) = self
-                    .store
-                    .as_ref()
-                    .and_then(|store| store.database())
-                    .map_or((None, false), |database| {
-                        (
-                            database.cached_head().map(|(head, _)| head),
-                            database.blocked(),
-                        )
-                    });
+                let (head, blocked) = match &self.store {
+                    SourceStore::Db(database) => (
+                        database.cached_head().map(|(head, _)| head),
+                        database.blocked(),
+                    ),
+                    SourceStore::File(_) => (None, false),
+                };
                 let current = head == Some(number);
                 if current && !blocked {
                     self.service.operations.accept(&id);
@@ -283,8 +278,10 @@ impl Worker {
                         },
                     );
                 } else {
+                    let origin =
+                        (!current).then_some(crate::native_api::store::db::Origin::Activate);
                     let prepared = self
-                        .prepare_revision(number, &reservation.principal, current)
+                        .prepare_revision(number, &reservation.principal, origin)
                         .await;
                     self.tree_operation(&id, prepared).await;
                 }
@@ -302,7 +299,7 @@ impl Worker {
                                 candidate,
                                 sources,
                                 diagnostics,
-                                expected_revision: None,
+                                expected_group_revision: None,
                                 deferred_provider: None,
                             },
                         )
@@ -310,6 +307,11 @@ impl Worker {
                     }
                     Err(error) => {
                         let (code, message, mut details) = error.into_safe();
+                        if let Some(details) =
+                            details.get_or_insert_with(|| json!({})).as_object_mut()
+                        {
+                            details.insert("committed".into(), json!(false));
+                        }
                         // Every warning of the files rides along; when they overflow the
                         // operation's details, keep the rows that explain the failure.
                         if let Some(rows) = details
@@ -335,7 +337,7 @@ impl Worker {
                             candidate,
                             sources,
                             diagnostics,
-                            expected_revision: None,
+                            expected_group_revision: None,
                             deferred_provider: None,
                         })
                         .await;
@@ -358,7 +360,7 @@ impl Worker {
     async fn manage(
         &mut self,
         mutation: Mutation,
-        catalog: &super::super::catalog::Catalog,
+        catalog: &crate::observe::catalog::Catalog,
         group_manager: &honk_outbound::group::SharedGroupManager,
         alive_set: &honk_outbound::alive::AliveDialerSet,
     ) -> Result<Completion, ApiError> {
@@ -508,20 +510,30 @@ impl Worker {
                 candidate,
                 sources: Some(sources),
                 diagnostics,
-                expected_revision: Some(accepted.revision),
+                expected_group_revision: Some(accepted.revision),
                 deferred_provider: deferred,
             })
             .await;
         let stored = self
             .record(committed, &completion)
             .await
-            .map_err(|details| unavailable().with_details(details))?;
-        completion.map_err(|failure| failure.management_error(stored))?;
+            .map_err(|mut details| {
+                details["stage"] = json!(completion::record_failure(&completion).0);
+                unavailable().with_details(details)
+            })?;
+        completion
+            .map_err(|failure| failure.management_error(stored, &self.service.instance_id))?;
         if mutation.deleting() {
             return Ok(Completion::Deleted(1));
         }
         let (collection, id) = created.ok_or_else(|| {
-            management::activation_error("resource_unavailable", Some(true), Some(true), Some(true))
+            management::activation_error(
+                "resource_unavailable",
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+            )
         })?;
         // Capture under the publication barrier before the queue can delete this resource.
         let active = self.active.read().await;
@@ -532,7 +544,7 @@ impl Worker {
                     .secrets(accepted.as_ref())
                     .as_ref()
                     .clone()
-                    .with_clash(&active.experimental.clash_api.secret)
+                    .with_secret(&active.experimental.clash_api.secret)
             };
             super::super::catalog::node_value(
                 &active,
@@ -552,7 +564,13 @@ impl Worker {
             )
         }
         .ok_or_else(|| {
-            management::activation_error("resource_unavailable", Some(true), Some(true), Some(true))
+            management::activation_error(
+                "resource_unavailable",
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+            )
         })?;
         Ok(Completion::Created {
             collection,
@@ -570,7 +588,7 @@ impl Worker {
                         candidate,
                         sources: Some(sources),
                         diagnostics,
-                        expected_revision: None,
+                        expected_group_revision: None,
                         deferred_provider: None,
                     },
                     None,
@@ -587,7 +605,7 @@ impl Worker {
     async fn load(
         &self,
     ) -> Result<(Config, Option<SourceUpdate>, Vec<DetailedDiagnostic>), ApiError> {
-        let store = self.store.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone();
         let source_managed = self.source_managed;
         // Diagnostics name the accepted source IDs, as a write to the same file would.
         let accepted = self
@@ -682,7 +700,7 @@ impl Worker {
         )
         .map_err(|_| invalid())?;
         if content == accepted.update.sources[index].content.as_ref() {
-            let store = self.store.clone().ok_or_else(unsupported)?;
+            let store = self.store.clone();
             let service = Arc::clone(&self.service);
             tokio::task::spawn_blocking(move || {
                 let mut diagnostics = Vec::new();
@@ -742,19 +760,17 @@ impl Worker {
             return Err(denied());
         }
         let target = accepted.update.sources[index].path.clone();
-        let mut check = self.candidate_check(accepted).await?;
+        let mut check = self.candidate_check().await?;
         let source_id = source_id.to_owned();
         let principal = principal.to_owned();
         #[cfg(test)]
         let before_replace = self.service.before_replace.lock().take();
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
-            let store = Arc::clone(&check.store);
-            let accepted = &check.accepted;
-            let kind = store.kind();
+            let store = check.store.clone();
             let pin = store
                 .pin(&target)
-                .map_err(|error| store_write_error(kind, error))?;
+                .map_err(|error| store_write_error(&store, error))?;
             if pin.sha256() != expected {
                 return Err(stale());
             }
@@ -807,10 +823,9 @@ impl Worker {
             let validated = check.validate(
                 loaded,
                 &mut diagnostics,
-                &target,
-                &content,
+                Some((&accepted, &target, &content)),
                 Some(&source_id),
-                &check.accepted.ids,
+                Some(&accepted.ids),
             )?;
             let recheck = Box::new(|| {
                 #[cfg(test)]
@@ -825,9 +840,9 @@ impl Worker {
                 }
                 check.recheck(&overlay, &validated)
             });
-            let committed = store
-                .commit(pin, &content, &validated.sources, &principal, recheck)
-                .map_err(|error| store_write_error(kind, error))?;
+            let committed = pin
+                .commit(&content, &validated.sources, &principal, recheck)
+                .map_err(|error| store_write_error(&store, error))?;
             Ok(prepared(validated, diagnostics, committed))
         })
         .await
@@ -850,16 +865,16 @@ impl Worker {
             .read()
             .clone()
             .ok_or_else(unsupported)?;
-        let check = self.candidate_check(accepted).await?;
+        let check = self.candidate_check().await?;
         let principal = principal.to_owned();
         #[cfg(test)]
         let before_replace = self.service.before_replace.lock().take();
         tokio::task::spawn_blocking(move || {
             let store = &check.store;
-            let accepted = &check.accepted;
+            let accepted = &accepted;
             let target = store.resolve(&label)?;
             if accepted.ids.contains_key(&target)
-                || (store.kind() == StoreKind::File && target.symlink_metadata().is_ok())
+                || (matches!(store, SourceStore::File(_)) && target.symlink_metadata().is_ok())
             {
                 return Err(exists());
             }
@@ -881,10 +896,9 @@ impl Worker {
             let validated = check.validate(
                 loaded,
                 &mut diagnostics,
-                &target,
-                &content,
+                Some((accepted, &target, &content)),
                 Some(main),
-                &ids,
+                Some(&ids),
             )?;
             if !validated.sources.iter().any(|source| source.path == target) {
                 return Err(not_included(main));
@@ -902,7 +916,7 @@ impl Worker {
                     WriteError::Conflict => changed(),
                     // The parent became a symlink after resolution: still a path outside the root.
                     WriteError::UnsafePath => invalid(),
-                    error => store_write_error(store.kind(), error),
+                    error => store_write_error(store, error),
                 })?;
             Ok(prepared(validated, diagnostics, committed))
         })
@@ -910,9 +924,9 @@ impl Worker {
         .map_err(|_| unavailable())?
     }
 
-    async fn candidate_check(&self, accepted: Accepted) -> Result<CandidateCheck, ApiError> {
+    async fn candidate_check(&self) -> Result<CandidateCheck, ApiError> {
         Ok(CandidateCheck {
-            store: self.store.clone().ok_or_else(unsupported)?,
+            store: self.store.clone(),
             active: self.active.read().await.clone(),
             log_files: self.log_files.clone(),
             data_dir: self.data_dir.clone(),
@@ -921,32 +935,30 @@ impl Worker {
                 .deferred_subscriptions()
                 .await
                 .map_err(|_| unavailable())?,
-            accepted,
         })
     }
 }
 
-/// What a source write validates its candidate against, captured before blocking work.
+/// What a candidate validates against, captured before blocking work.
 struct CandidateCheck {
-    store: Arc<dyn SourceStore>,
+    store: SourceStore,
     active: Arc<Config>,
     log_files: LogFiles,
     data_dir: PathBuf,
     deferred: Vec<honk_config::subscription::Subscription>,
-    accepted: Accepted,
 }
 
 impl CandidateCheck {
-    /// Full validation of a candidate that puts `content` at `target`, refusing anything
-    /// the write or the following reload must not admit.
+    /// Full validation of a candidate, refusing anything the write or the following reload
+    /// must not admit. `write` is a source write of `content` at `target` over `accepted`;
+    /// `None` is a whole-tree candidate.
     fn validate(
         &self,
         loaded: LoadedConfig,
         diagnostics: &mut Vec<DetailedDiagnostic>,
-        target: &Path,
-        content: &str,
+        write: Option<(&Accepted, &Path, &str)>,
         fallback: Option<&str>,
-        ids: &HashMap<PathBuf, String>,
+        ids: Option<&HashMap<PathBuf, String>>,
     ) -> Result<offline::ValidatedConfig, ApiError> {
         let active = &self.active;
         let parsed_sources = loaded.sources.clone();
@@ -955,13 +967,13 @@ impl CandidateCheck {
             self.store.dependency_root(),
             active,
             &self.data_dir,
-            limits(),
+            SourceLimits::DEFAULT,
             diagnostics,
             &self.deferred,
             None,
             &[],
         )
-        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, Some(ids)))?;
+        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, ids))?;
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == Severity::Error)
@@ -970,52 +982,56 @@ impl CandidateCheck {
                 diagnostics,
                 &validated.sources,
                 fallback,
-                Some(ids),
+                ids,
             ));
         }
         if validated.config.experimental.native_api != active.experimental.native_api
             || validated.config.experimental.clash_api.secret
                 != active.experimental.clash_api.secret
-            || (self.store.kind() == StoreKind::Database
+            || (matches!(self.store, SourceStore::Db(_))
                 && validated.config.global.data_dir != active.global.data_dir)
         {
             return Err(denied());
         }
-        let old_credentials: Vec<_> = self
-            .accepted
-            .update
-            .sources
-            .iter()
-            .filter(|source| source.contains_api_secret)
-            .map(|source| (&source.path, &source.content))
-            .collect();
-        let new_credentials: Vec<_> = validated
-            .sources
-            .iter()
-            .filter(|source| source.contains_api_secret)
-            .map(|source| (&source.path, &source.content))
-            .collect();
-        if old_credentials != new_credentials
-            || validated
+        let mut written = &validated.sources[0];
+        if let Some((accepted, target, content)) = write {
+            let old_credentials: Vec<_> = accepted
+                .update
                 .sources
                 .iter()
-                .any(|source| source.path == target && source.contains_api_secret)
-            || [
-                &active.experimental.native_api.secret,
-                &active.experimental.clash_api.secret,
-            ]
-            .iter()
-            .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
-        {
-            return Err(denied());
+                .filter(|source| source.contains_api_secret)
+                .map(|source| (&source.path, &source.content))
+                .collect();
+            let new_credentials: Vec<_> = validated
+                .sources
+                .iter()
+                .filter(|source| source.contains_api_secret)
+                .map(|source| (&source.path, &source.content))
+                .collect();
+            if old_credentials != new_credentials
+                || validated
+                    .sources
+                    .iter()
+                    .any(|source| source.path == target && source.contains_api_secret)
+                || [
+                    &active.experimental.native_api.secret,
+                    &active.experimental.clash_api.secret,
+                ]
+                .iter()
+                .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
+            {
+                return Err(denied());
+            }
+            if let Some(source) = validated
+                .sources
+                .iter()
+                .find(|source| source.path == target)
+            {
+                written = source;
+            }
         }
         // The reload would reject these, and a rejected reload leaves the written file
         // ahead of the accepted hash; refuse before writing.
-        let written = validated
-            .sources
-            .iter()
-            .find(|source| source.path == target)
-            .unwrap_or(&validated.sources[0]);
         let restart = restart_diagnostics(
             active,
             &validated.config,
@@ -1029,34 +1045,56 @@ impl CandidateCheck {
                 diagnostics,
                 &validated.sources,
                 fallback,
-                Some(ids),
+                ids,
             ));
         }
         Ok(validated)
     }
 
-    /// Fails with `Conflict` unless the store still yields the validated candidate.
     fn recheck(
         &self,
         overlay: &HashMap<PathBuf, Arc<str>>,
         validated: &offline::ValidatedConfig,
     ) -> Result<(), WriteError> {
-        let mut diagnostics = Vec::new();
-        let reloaded = self
-            .store
-            .load(overlay, &mut diagnostics)
-            .map_err(|_| WriteError::Conflict)?;
-        if !same_source_documents(&validated.sources, &reloaded.sources) {
-            return Err(WriteError::Conflict);
-        }
-        let dependencies = validated
-            .recapture_dependencies(&self.active, &self.data_dir, limits(), &self.deferred)
-            .map_err(|_| WriteError::Conflict)?;
-        if !same_dependencies(&validated.dependencies, &dependencies) {
-            return Err(WriteError::Conflict);
-        }
-        Ok(())
+        unchanged(
+            &self.store,
+            overlay,
+            validated,
+            &self.active,
+            &self.data_dir,
+            &self.deferred,
+        )
     }
+}
+
+/// Fails with `Conflict` unless `store` still yields `validated`: the same documents, loading
+/// without errors, over the same dependencies.
+fn unchanged(
+    store: &SourceStore,
+    overlay: &HashMap<PathBuf, Arc<str>>,
+    validated: &offline::ValidatedConfig,
+    active: &Config,
+    data_dir: &Path,
+    deferred: &[honk_config::subscription::Subscription],
+) -> Result<(), WriteError> {
+    let mut notices = Vec::new();
+    let loaded = store
+        .load(overlay, &mut notices)
+        .map_err(|_| WriteError::Conflict)?;
+    if notices
+        .iter()
+        .any(|notice| notice.severity == Severity::Error)
+        || !same_source_documents(&validated.sources, &loaded.sources)
+    {
+        return Err(WriteError::Conflict);
+    }
+    let dependencies = validated
+        .recapture_dependencies(active, data_dir, SourceLimits::DEFAULT, deferred)
+        .map_err(|_| WriteError::Conflict)?;
+    if validated.dependencies != dependencies {
+        return Err(WriteError::Conflict);
+    }
+    Ok(())
 }
 
 fn prepared(
@@ -1074,12 +1112,17 @@ fn prepared(
 
 type Prepared = (Config, SourceUpdate, Vec<DetailedDiagnostic>, Committed);
 
-fn store_write_error(kind: StoreKind, error: WriteError) -> ApiError {
-    match (kind, error) {
-        (StoreKind::Database, WriteError::Unavailable) => {
-            unavailable().with_details(json!({"stage":"store"}))
-        }
-        (_, error) => write_error(error),
+fn store_write_error(store: &SourceStore, error: WriteError) -> ApiError {
+    match store {
+        SourceStore::Db(_) => db_write_error(error),
+        SourceStore::File(_) => write_error(error),
+    }
+}
+
+fn db_write_error(error: WriteError) -> ApiError {
+    match error {
+        WriteError::Unavailable => unavailable().with_details(json!({"stage":"store"})),
+        error => write_error(error),
     }
 }
 

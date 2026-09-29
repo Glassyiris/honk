@@ -229,7 +229,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
             8,
             8,
             1,
-            cfg!(feature = "native-api"),
+            cfg!(feature = "flow-observation"),
             None,
         )
         .unwrap()
@@ -274,7 +274,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
             8,
             8,
             1,
-            cfg!(feature = "native-api"),
+            cfg!(feature = "flow-observation"),
             Some(&generation),
         )
         .unwrap();
@@ -332,7 +332,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
     assert!(!pool.is_warm_retained());
     assert_eq!(pool.live_session_count(), 0);
     replacement.shutdown().await;
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     drop(
         runtime
             .acquire_vless_carrier()

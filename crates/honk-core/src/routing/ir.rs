@@ -1,8 +1,9 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ipnet::IpNet;
 
-use super::BinaryLpmTrie;
+use super::{BinaryLpmTrie, GeositeDomain, GeositeMatcher};
 
 /// One canonical condition in a compiled routing rule.
 #[derive(Debug, Clone)]
@@ -45,6 +46,42 @@ impl IpMatcher {
 
     pub fn matches(&self, ip: &IpAddr) -> bool {
         self.trie.matches(ip)
+    }
+}
+
+/// Hands out one matcher per exact ordered network list. Equal lists build
+/// identical tries, so any holder's matcher is interchangeable.
+#[derive(Default)]
+pub(crate) struct SharedMatchers {
+    ip: Vec<Arc<IpMatcher>>,
+    /// Keyed by selector name, which pins content only within one build's
+    /// assets, so these are never offered across builds.
+    geosite: std::collections::HashMap<String, Arc<GeositeMatcher>>,
+}
+
+impl SharedMatchers {
+    pub(crate) fn ip(&mut self, nets: Vec<IpNet>) -> Arc<IpMatcher> {
+        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
+            return Arc::clone(matcher);
+        }
+        let matcher = Arc::new(IpMatcher::new(nets));
+        self.ip.push(Arc::clone(&matcher));
+        matcher
+    }
+
+    /// One matcher per selector (a category plus its attribute filter).
+    pub(crate) fn geosite(&mut self, code: &str, domains: &[GeositeDomain]) -> Arc<GeositeMatcher> {
+        let matcher = self.geosite.entry(code.trim().to_lowercase());
+        Arc::clone(matcher.or_insert_with(|| Arc::new(GeositeMatcher::build(domains))))
+    }
+
+    /// Offers live matchers so a rebuild keeps them for unchanged network lists.
+    pub(crate) fn offer<'a>(&mut self, matchers: impl IntoIterator<Item = &'a Arc<IpMatcher>>) {
+        for matcher in matchers {
+            if !self.ip.iter().any(|known| known.nets() == matcher.nets()) {
+                self.ip.push(Arc::clone(matcher));
+            }
+        }
     }
 }
 

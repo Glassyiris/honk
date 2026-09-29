@@ -69,14 +69,10 @@ impl DnsResolver {
     }
 
     pub async fn resolve_first_ipv4(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let resolve = self.resolve(domain);
-        #[cfg(feature = "native-api")]
         let (result, witness) =
-            honk_outbound::runtime::flow_observation::observe_resolution(resolve).await;
-        #[cfg(not(feature = "native-api"))]
-        let result = resolve.await;
+            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve(domain))
+                .await;
         let selected = result?.ipv4.first().copied();
-        #[cfg(feature = "native-api")]
         if let (Some(witness), Some(ip)) = (witness, selected) {
             witness.selected_ip(ip);
         }
@@ -84,14 +80,10 @@ impl DnsResolver {
     }
 
     pub async fn resolve_first_ipv6(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let resolve = self.resolve(domain);
-        #[cfg(feature = "native-api")]
         let (result, witness) =
-            honk_outbound::runtime::flow_observation::observe_resolution(resolve).await;
-        #[cfg(not(feature = "native-api"))]
-        let result = resolve.await;
+            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve(domain))
+                .await;
         let selected = result?.ipv6.first().copied();
-        #[cfg(feature = "native-api")]
         if let (Some(witness), Some(ip)) = (witness, selected) {
             witness.selected_ip(ip);
         }

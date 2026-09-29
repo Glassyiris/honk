@@ -145,9 +145,7 @@ impl DialContext {
                                 .await
                         }
                     };
-                    #[cfg(feature = "native-api")]
-                    let dial =
-                        crate::native_api::flows::dns::outbound_dial_scope(&proxy.node, dial);
+                    let dial = crate::observe::flows::dns::outbound_dial_scope(&proxy.node, dial);
                     dial.await
                 },
             )
@@ -196,8 +194,7 @@ impl DialContext {
             };
             Ok(transport)
         };
-        #[cfg(feature = "native-api")]
-        let dial = crate::native_api::flows::dns::outbound_dial_scope(&proxy.node, dial);
+        let dial = crate::observe::flows::dns::outbound_dial_scope(&proxy.node, dial);
         dial.await
     }
 }

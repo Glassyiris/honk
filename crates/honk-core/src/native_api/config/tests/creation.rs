@@ -168,25 +168,33 @@ async fn directory_swapped_before_the_rename_writes_nothing() {
 }
 
 #[tokio::test]
-async fn failed_activation_removes_the_created_file() {
+async fn failed_activation_keeps_the_created_file() {
     let fixture = Fixture::new_custom(Access::Admin, false, with_include).await;
     let before = fixture.get(CONFIG).await;
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["code"], "reload_rejected");
-    assert_eq!(failed["error"]["details"]["written"], false);
-    assert!(!fixture.path(NEW).exists());
+    assert_eq!(failed["error"]["details"]["written"], true);
+    assert_eq!(failed["error"]["details"]["committed"], false);
+    assert_eq!(std::fs::read_to_string(fixture.path(NEW)).unwrap(), CONTENT);
     assert_eq!(fixture.get(CONFIG).await, before);
 
-    // A degraded commit is active, so the file stays and the failure says so.
-    fixture.reject_reloads.store(3, Ordering::SeqCst);
-    let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
+    // A degraded commit is active; the failure says so.
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
+    let other = "config.d/other.dae";
+    let operation = accepted(fixture.create(other, CONTENT).send().await.unwrap()).await;
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["details"]["written"], true);
-    assert!(fixture.path(NEW).exists());
+    assert_eq!(failed["error"]["details"]["committed"], true);
+    assert!(failed["error"]["details"]["active_generation_id"].is_string());
+    assert!(fixture.path(other).exists());
     fixture.shutdown().await;
 }
 
@@ -214,7 +222,7 @@ async fn database_store_records_the_new_source_as_a_revision() {
     let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
     assert!(listed(&fixture.get(CONFIG).await, NEW));
-    let list = fixture.get("/api/v1/config/revisions").await;
+    let list = fixture.get("/api/v1/x-honk/config/revisions").await;
     assert_eq!(list["active"], 2);
     assert_eq!(list["revisions"][0]["revision"], 2);
     assert!(

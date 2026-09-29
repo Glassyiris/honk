@@ -4,29 +4,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-pub(super) fn enable_udp_provenance(
-    v4: &[Arc<UdpSocket>],
-    v6: &[Arc<UdpSocket>],
-) -> anyhow::Result<()> {
-    // Ordinary mock wildcard sockets lack ORIGDST; use real kernel metadata,
-    // as transparent production sockets do, without inventing remote destinations.
-    for socket in v4 {
-        nix::sys::socket::setsockopt(
-            socket.as_ref(),
-            nix::sys::socket::sockopt::Ipv4OrigDstAddr,
-            &true,
-        )?;
-    }
-    for socket in v6 {
-        nix::sys::socket::setsockopt(
-            socket.as_ref(),
-            nix::sys::socket::sockopt::Ipv6OrigDstAddr,
-            &true,
-        )?;
-    }
-    Ok(())
-}
-
 struct Fixture {
     commands: mpsc::Sender<ControlCommand>,
     phase: watch::Receiver<EnginePhase>,
@@ -171,7 +148,7 @@ impl Fixture {
         )
         .await?;
         let phase = plane.observe_phase();
-        let native = plane.native_observation();
+        let native = Arc::clone(&state.observation);
         let commands = plane.command_sender();
         let backend = plane.ebpf_handle();
         let shutdown = plane.shutdown_requested.clone();

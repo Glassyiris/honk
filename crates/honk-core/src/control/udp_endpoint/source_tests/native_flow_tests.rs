@@ -25,7 +25,11 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
     let mut ids = Vec::new();
     let mut owner_ids = Vec::new();
     for target in targets {
-        let flow = Arc::new(api.flows.begin("udp", client_addr, target));
+        let flow = Arc::new(
+            api.flows
+                .begin(crate::observe::vocab::Network::Udp, client_addr, target)
+                .unwrap(),
+        );
         ids.push(flow.id().to_owned());
         let mut lease = reserve_source(&pool, &stats, client_addr, target, node.id);
         let attachment = pool
@@ -57,8 +61,10 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             honk_outbound::alive::IpVersion::V4,
             None,
         );
-        endpoint.set_native_observer(flow.observer(7, None, "dial_target"));
-        endpoint.set_native_flow(Some(flow), &pool, None);
+        endpoint
+            .native
+            .set_observer(flow.observer(7, None, "dial_target"));
+        endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         owner_ids.push(endpoint.source_owner_id().unwrap());

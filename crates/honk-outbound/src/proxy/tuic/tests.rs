@@ -336,9 +336,9 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
         .unwrap();
     assert!(old_state.sessions.lock().contains_key(&u16::MAX));
 
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let observer = {
         use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
         let events = Arc::clone(&events);
@@ -351,17 +351,17 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
                 dns_purpose: "proxy_server",
             },
             Arc::new(move |_, event| {
-                if let FlowEvent::Session { reason, error } = event {
-                    events.lock().push((reason, error));
+                if let FlowEvent::Session(event) = event {
+                    events.lock().push((event.reason(), event.error()));
                 }
             }),
         )
     };
     let fresh = handler.udp_transport_via_client(Arc::clone(&client), target, None, timeout);
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let fresh = observer.scope(fresh);
     let fresh = fresh.await.unwrap();
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     assert_eq!(
         events.lock().as_slice(),
         [

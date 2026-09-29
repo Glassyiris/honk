@@ -208,7 +208,7 @@ fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
     assert_ne!(admitted.trace_policy, 0);
     #[cfg(feature = "native-api")]
     let dictionaries = {
-        use crate::native_api::flows::kernel::{KernelTraceDictionaries, KernelTraceDictionary};
+        use crate::observe::flows::kernel::{KernelTraceDictionaries, KernelTraceDictionary};
         let mut config = honk_config::parser::parse_dae_config(&source).unwrap();
         config.groups.push(honk_config::group::Group {
             name: "proxy".into(),
@@ -272,7 +272,7 @@ fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
             }
             #[cfg(feature = "native-api")]
             {
-                use crate::native_api::flows::kernel::KernelRouteReference;
+                use crate::observe::flows::kernel::KernelRouteReference;
                 let addr = |ip: std::net::IpAddr| match ip {
                     std::net::IpAddr::V4(ip) => {
                         honk_ebpf_common::dae_ip::In6Addr::from_ipv4_bytes(ip.octets())

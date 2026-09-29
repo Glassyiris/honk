@@ -3,18 +3,17 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, Write},
-    net::SocketAddr,
-    sync::Weak,
+    sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
 
 use axum::{
-    body::{Body, to_bytes},
+    body::Body,
     extract::{Query, Request},
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
@@ -24,10 +23,11 @@ use super::{
 use crate::dns::{
     DiagnosticError, DiagnosticFailure,
     forwarder::{CacheAccess, ResolveOptions},
-    outcome::{DnsOutcome, Provenance, RequestRoute},
+    outcome::RequestRoute,
     planner::UpstreamTag,
     query::IngressProfile,
 };
+use crate::observe::{DnsRecorder, flows::FlowStore};
 
 mod cache;
 mod log;
@@ -36,61 +36,39 @@ pub(super) mod rules;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use records::record_type;
 pub(crate) use rules::capability as rules_capability;
 
 pub(super) const MAX_RESPONSE_BYTES: usize = 262_144;
 const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 
 pub(crate) struct DnsApi {
-    instance: String,
     rate: super::security::RequestRate,
     snapshots: tokio::sync::Mutex<VecDeque<cache::Snapshot>>,
-    log: log::LogStore,
-    flows: Weak<super::flows::FlowStore>,
+    log: Arc<log::DnsHistory>,
+    pub(crate) recorder: Arc<DnsRecorder>,
 }
 
 impl DnsApi {
-    pub(crate) fn new(
-        instance_id: String,
-        recording: bool,
-        flows: Weak<super::flows::FlowStore>,
-    ) -> Self {
+    pub(crate) fn new(instance_id: String, recording: bool, flows: Weak<FlowStore>) -> Self {
+        let log = Arc::new(log::DnsHistory::new(instance_id.clone(), recording));
         Self {
-            log: log::LogStore::new(instance_id.clone(), recording),
-            instance: instance_id,
+            recorder: Arc::new(DnsRecorder::new(instance_id, flows, log.clone())),
+            log,
             rate: super::security::RequestRate::new(),
             snapshots: tokio::sync::Mutex::new(VecDeque::new()),
-            flows,
         }
     }
 
-    pub(crate) fn instance(&self) -> &str {
-        &self.instance
-    }
-
-    pub(crate) fn record_flow(
-        &self,
-        context: honk_outbound::runtime::flow_observation::FlowContext,
-        data: super::flows::record::StepData,
-    ) -> bool {
-        self.flows.upgrade().is_some_and(|flows| {
-            flows.record_step(&context.flow_id.to_string(), Some(context.generation), data)
-        })
-    }
     pub(crate) fn set_log_limit(&self, limit: usize) {
         self.log.set_limit(limit);
     }
     pub(crate) fn set_recording(&self, recording: bool) {
         self.log.set_recording(recording);
     }
-    pub(crate) fn recording(&self) -> bool {
-        self.log.recording()
-    }
     pub(crate) fn query_capability(&self) -> Value {
         json!({"available":true,"record_types":TYPES.iter().map(|&value| records::record_type(value)).collect::<Vec<_>>(),
             "limits":{"max_types_per_request":8,"query_timeout_ms":10000,"max_response_bytes":MAX_RESPONSE_BYTES,
-            "per_principal_requests_per_minute":30,"global_requests_per_minute":30}})
+            "per_principal_requests_per_minute":super::security::REQUESTS_PER_MINUTE,"global_requests_per_minute":super::security::REQUESTS_PER_MINUTE}})
     }
     pub(crate) fn cache_capability(&self) -> Value {
         json!({"available":true,"read":true,"delete_entry":true,"delete_name":true,"flush":true,"entry_kinds":["positive","negative"]})
@@ -98,20 +76,8 @@ impl DnsApi {
     pub(crate) fn log_capability(&self) -> Value {
         self.log.capability()
     }
-    pub(crate) fn observe_client(
-        &self,
-        query: &[u8],
-        ingress: IngressProfile,
-        source: Option<SocketAddr>,
-        outcome: Option<&DnsOutcome>,
-        response: &[u8],
-        elapsed: Duration,
-    ) {
-        self.log
-            .capture(query, ingress, source, outcome, response, elapsed);
-    }
     #[cfg(test)]
-    pub(crate) fn log_for_test(&self) -> &log::LogStore {
+    pub(crate) fn log_for_test(&self) -> &log::DnsHistory {
         &self.log
     }
 }
@@ -171,19 +137,54 @@ fn parameters(
     Ok((values, types))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryBody {
+    domain: String,
+    #[serde(rename = "type")]
+    types: Option<Vec<String>>,
+    upstream: Option<String>,
+    cache_mode: Option<String>,
+}
+
 pub(super) async fn query(
     state: &NativeState,
-    uri: &Uri,
+    request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    let (values, mut types) = parameters(
-        uri,
-        &["domain", "type", "upstream", "cache_mode", "detail"],
-        id,
-    )?;
-    let domain = canonical_name(values.get("domain").ok_or_else(|| invalid_query(id))?, id)?;
+    let (values, _) = parameters(request.uri(), &["detail"], id)?;
+    let full = full_detail(&values, id)?;
+    super::config::json_type(&request)?;
+    let bytes = super::body::buffered(request.into_body()).await;
+    if bytes.len() > 4096 {
+        return Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "DNS query body is too large",
+            id,
+        ));
+    }
+    let invalid = || {
+        error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidRequest,
+            "Invalid DNS query body",
+            id,
+        )
+    };
+    let body: QueryBody = super::body::decode(&bytes, invalid)?;
+    let domain = canonical_name(&body.domain, id).map_err(|_| invalid())?;
+    let names = body.types.unwrap_or_else(|| vec!["A".into()]);
+    let mut types = Vec::with_capacity(names.len());
+    for name in &names {
+        let qtype = records::parse_type(name).ok_or_else(invalid)?;
+        if types.contains(&qtype) {
+            return Err(invalid());
+        }
+        types.push(qtype);
+    }
     if types.is_empty() {
-        types.push(1);
+        return Err(invalid());
     }
     if types.len() > 8 {
         return Err(error(
@@ -201,22 +202,19 @@ pub(super) async fn query(
             id,
         ));
     }
-    let full = full_detail(&values, id)?;
-    let cache_mode = values
-        .get("cache_mode")
-        .map(String::as_str)
-        .unwrap_or("normal");
+    let cache_mode = body.cache_mode.as_deref().unwrap_or("normal");
     let options = ResolveOptions {
         cache: match cache_mode {
             "normal" => CacheAccess::Normal,
             "bypass" => CacheAccess::Bypass,
-            _ => return Err(invalid_query(id)),
+            _ => return Err(invalid()),
         },
-        forced_upstream: values
-            .get("upstream")
-            .map(|name| UpstreamTag::new(name))
+        forced_upstream: body
+            .upstream
+            .as_deref()
+            .map(UpstreamTag::new)
             .transpose()
-            .map_err(|_| invalid_query(id))?,
+            .map_err(|_| invalid())?,
     };
     state.require_running().map_err(|_| unavailable(id))?;
     state.observation.dns.rate.admit(id)?;
@@ -239,10 +237,10 @@ pub(super) async fn query(
     for result in results {
         let question =
             records::question(&result.query, IngressProfile::Api).map_err(|_| unavailable(id))?;
-        let mut row = json!({"type": question.rtype, "question": question, "elapsed_ms": result.elapsed.as_millis().min(9_007_199_254_740_991) as u64});
+        let mut row = json!({"type": question.rtype, "question": question, "elapsed_ms": result.elapsed.as_millis().min(u128::from(crate::observe::MAX_SAFE_UINT)) as u64});
         match result.outcome {
             Ok(outcome) => {
-                let cached = matches!(outcome.provenance(), Provenance::Cache | Provenance::Stale);
+                let cached = outcome.is_cached();
                 row["cached"] = json!(cached);
                 row["cache_entry_id"] = json!(outcome.cache_entry_id());
                 row["upstream"] = json!(if cached {
@@ -351,36 +349,15 @@ pub(super) async fn log(
 }
 
 async fn empty_body(request: Request, allow_object: bool, id: &RequestId) -> Result<(), ApiError> {
-    let content_types = request.headers().get_all(header::CONTENT_TYPE);
-    let json_type = content_types.iter().count() == 1
-        && content_types
-            .iter()
-            .next()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
-    let body = to_bytes(request.into_body(), 65_536).await.map_err(|_| {
-        error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::RequestTooLarge,
-            "DNS request body is too large",
-            id,
-        )
-    })?;
+    let json_type = super::config::json_type(&request);
+    let body = super::body::buffered(request.into_body()).await;
     if body.is_empty() {
         return Ok(());
     }
     if !allow_object {
         return Err(invalid_query(id));
     }
-    if !json_type {
-        return Err(error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ErrorCode::UnsupportedMediaType,
-            "Expected application/json",
-            id,
-        ));
-    }
+    json_type?;
     super::body::no_inputs(&body, || invalid_query(id))
 }
 
@@ -398,7 +375,7 @@ pub(super) async fn delete_name(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
-        &json!({"matched":result.matched,"deleted":result.deleted}),
+        &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
 }
@@ -434,7 +411,7 @@ pub(super) async fn flush(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
-        &json!({"matched":result.matched,"deleted":result.deleted}),
+        &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
 }

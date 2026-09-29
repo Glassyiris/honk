@@ -381,7 +381,7 @@ fn resolve_family<'a>(
                 #[cfg(feature = "native-api")]
                 if _service.observation_enabled() {
                     match &result {
-                        Ok(outcome) => _service.observe_client(
+                        Ok(outcome) => _service.observer.observe_client(
                             query,
                             IngressProfile::Internal,
                             Some(_source),
@@ -396,7 +396,7 @@ fn resolve_family<'a>(
                                 crate::dns::response::build_dns_servfail(query),
                                 route,
                             ) {
-                                _service.observe_client(
+                                _service.observer.observe_client(
                                     query,
                                     IngressProfile::Internal,
                                     Some(_source),

@@ -110,7 +110,7 @@ pub(crate) fn spawn_owned<F>(future: F) -> Option<tokio::task::AbortHandle>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     if let Ok(Some(owner)) = OWNER.try_with(Clone::clone) {
         return owner.upgrade().and_then(|owner| owner.spawn(future));
     }
@@ -124,7 +124,7 @@ tokio::task_local! {
 #[derive(Clone, Debug, Default)]
 /// Weak runtime scope for work retained by another supervisor's task set.
 pub struct TaskScope {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     owner: Option<std::sync::Weak<TaskOwner>>,
 }
 
@@ -132,7 +132,7 @@ impl TaskScope {
     /// Capture task ownership without keeping the runtime alive.
     pub fn capture() -> Self {
         Self {
-            #[cfg(feature = "native-api")]
+            #[cfg(feature = "owned-tasks")]
             owner: capture_owner(),
         }
     }
@@ -147,7 +147,7 @@ impl TaskScope {
     }
 
     pub(crate) fn sync_scope<T>(&self, build: impl FnOnce() -> T) -> T {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if self.owner.is_some() {
             return OWNER.sync_scope(self.owner.clone(), build);
         }
@@ -156,7 +156,7 @@ impl TaskScope {
 
     /// Restore ownership for a future already retained by its own supervisor.
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         if self.owner.is_some() {
             return OWNER.scope(self.owner.clone(), future).await;
         }
@@ -172,7 +172,7 @@ impl TaskScope {
 #[derive(Clone)]
 pub(crate) struct RuntimeEndpoint {
     endpoint: quinn::Endpoint,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     _lease: Option<std::sync::Arc<()>>,
 }
 
@@ -187,7 +187,7 @@ impl std::ops::Deref for RuntimeEndpoint {
 pub(crate) fn new_owned_quic_endpoint(
     build: impl FnOnce() -> std::io::Result<quinn::Endpoint>,
 ) -> std::io::Result<RuntimeEndpoint> {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     if let Some(owner) = capture_owner() {
         let owner = owner
             .upgrade()
@@ -218,17 +218,17 @@ pub(crate) fn new_owned_quic_endpoint(
     }
     Ok(RuntimeEndpoint {
         endpoint: build()?,
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "owned-tasks")]
         _lease: None,
     })
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 pub(super) fn capture_owner() -> Option<std::sync::Weak<TaskOwner>> {
     OWNER.try_with(Clone::clone).ok().flatten()
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 pub(super) async fn scope_owner<F: Future>(
     owner: Option<std::sync::Weak<TaskOwner>>,
     future: F,
@@ -236,7 +236,7 @@ pub(super) async fn scope_owner<F: Future>(
     OWNER.scope(owner, future).await
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 pub(super) fn sync_scope_owner<T>(
     owner: Option<std::sync::Weak<TaskOwner>>,
     build: impl FnOnce() -> T,
@@ -290,12 +290,12 @@ impl TaskOwner {
     /// Capture this owner for a child retained by an existing supervisor.
     pub fn task_scope(self: &std::sync::Arc<Self>) -> TaskScope {
         TaskScope {
-            #[cfg(feature = "native-api")]
+            #[cfg(feature = "owned-tasks")]
             owner: Some(std::sync::Arc::downgrade(self)),
         }
     }
 
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     pub(super) fn is_closed(&self) -> bool {
         self.state.lock().closed
     }
@@ -546,7 +546,7 @@ impl Drop for PendingEndpoint<'_> {
     }
 }
 
-#[cfg(all(test, feature = "native-api"))]
+#[cfg(all(test, feature = "owned-tasks"))]
 mod tests {
     use super::*;
     use std::sync::Arc;

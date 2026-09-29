@@ -21,7 +21,11 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
         ("intentional_retirement", "closed", false),
         ("shutdown", "closed", false),
     ] {
-        let flow = Arc::new(api.flows.begin("udp", client, dst));
+        let flow = Arc::new(
+            api.flows
+                .begin(crate::observe::vocab::Network::Udp, client, dst)
+                .unwrap(),
+        );
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", permit, &stats) {
@@ -48,7 +52,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             },
         ));
         let mut endpoint = UdpEndpoint::new(transport, dst, TEST_NODE_ID);
-        endpoint.set_native_flow(Some(flow), &pool, None);
+        endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let death_called = Arc::new(AtomicBool::new(false));
@@ -255,7 +259,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         .await
         .unwrap(),
     );
-    control.native_observation().attach_for_test();
+    state.observation.attach_for_test();
     let server = NativeServer::start(listener, state);
     let handle = control.spawn_handle();
     let hello = crate::control::quic::test_utils::build_client_hello(Some("original-target.test"));
@@ -453,7 +457,11 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = upstream.local_addr().unwrap();
         let client = make_addr("127.0.0.1", 0);
-        let flow = Arc::new(api.flows.begin("udp", client, destination));
+        let flow = Arc::new(
+            api.flows
+                .begin(crate::observe::vocab::Network::Udp, client, destination)
+                .unwrap(),
+        );
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease =
@@ -466,7 +474,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut endpoint =
             UdpEndpoint::new(transport(socket, destination), destination, TEST_NODE_ID);
-        endpoint.set_native_flow(Some(flow), &pool, None);
+        endpoint.native.set_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         let mut driver = pool.spawn_driver(
             client,
@@ -586,11 +594,12 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             2,
             Arc::new(UdpTestReplySocketFactory),
         ));
-        let native = plane.native_observation();
+        let native = crate::native_api::observation::NativeObservation::attach(&mut plane).await;
         native.attach_for_test();
         let state = Arc::new(
-            crate::native_api::NativeState::new(
+            crate::native_api::NativeState::with_observation(
                 &mut plane,
+                Arc::clone(&native),
                 api_addr,
                 std::time::SystemTime::now(),
                 Instant::now(),
@@ -610,8 +619,8 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
         let mut backend = MockEbpfBackend::new();
         backend.publish_routing_plan(&plan, &[]).unwrap();
         backend.bind_kernel_trace_dictionary(
-            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
-                &native.instance_id,
+            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
+                &native.core.instance_id,
                 17,
                 &router,
                 &config,
@@ -640,7 +649,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
         witness.output.input.dscp = 8;
         witness.output.outcomes[0] = ROUTE_TRACE_MATCHED;
         let first_id = backend.capture_route_witness(witness);
-        let reference = crate::native_api::flows::kernel::KernelRouteReference {
+        let reference = crate::observe::flows::kernel::KernelRouteReference {
             trace_id: first_id,
             decision_token: 0,
             routing_generation: descriptor.generation,
@@ -652,7 +661,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             backend
                 .capture_kernel_route(
                     &tuples,
-                    crate::native_api::flows::kernel::KernelRouteReference {
+                    crate::observe::flows::kernel::KernelRouteReference {
                         effective_outbound: OutboundIndex::Block as u8,
                         ..reference
                     },
@@ -765,7 +774,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             assert_eq!(kernel_routes[0]["data"]["rules"][0]["result"], "matched");
             assert_eq!(
                 kernel_routes[0]["data"]["evaluation_id"],
-                format!("{}:kernel:{first_id}", native.instance_id)
+                format!("{}:kernel:{first_id}", native.core.instance_id)
             );
         }
         assert!(plane.udp_pool.shutdown().await.joined);

@@ -6,10 +6,9 @@ use crate::native_api::store::Committed;
 impl ActivationFailure {
     fn reason(self) -> (&'static str, &'static str) {
         match self {
-            Self::RequestExhausted => ("request_exhausted", "Reload request sequence exhausted"),
             Self::EngineUnavailable => ("engine_unavailable", "Reload engine is unavailable"),
             Self::Unconfirmed => (
-                "engine_unavailable",
+                "activation_unconfirmed",
                 "Reload engine stopped before completion",
             ),
             Self::Rejected => ("reload_rejected", "Configuration reload was rejected"),
@@ -24,17 +23,56 @@ impl ActivationFailure {
         }
     }
 
-    pub(super) fn management_error(self, written: bool) -> ApiError {
-        let stage = match self {
-            Self::Unconfirmed => "activation_unconfirmed",
-            failure => failure.reason().0,
-        };
-        let committed = match self {
+    /// Whether the new generation is active; `None` when the server cannot tell.
+    fn committed(self) -> Option<bool> {
+        match self {
             Self::Unconfirmed => None,
             Self::Degraded(_) | Self::Reconciliation(_) => Some(true),
             _ => Some(false),
-        };
-        management::activation_error(stage, Some(written), Some(written), committed)
+        }
+    }
+
+    fn active_generation_id(self, instance: &str) -> Option<String> {
+        match self {
+            Self::Degraded(generation) => Some(format!("{instance}:{generation}")),
+            Self::Reconciliation(generation) => {
+                generation.map(|generation| format!("{instance}:{generation}"))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn management_error(self, written: bool, instance: &str) -> ApiError {
+        management::activation_error(
+            self.reason().0,
+            Some(written),
+            written.then_some(true),
+            self.committed(),
+            self.active_generation_id(instance),
+        )
+    }
+
+    /// The activation outcome of a failed operation; `written` is `None` for a plain reload.
+    fn details(self, written: Option<bool>, instance: &str) -> Value {
+        let mut details = json!({"committed": self.committed()});
+        if let Some(written) = written {
+            details["written"] = json!(written);
+        }
+        if self.committed() == Some(true) {
+            details["active_generation_id"] = json!(self.active_generation_id(instance));
+        }
+        details
+    }
+}
+
+/// The outcome code and message of a failure `Worker::record` reports.
+pub(super) fn record_failure(completion: &ActivationCompletion) -> (&'static str, &'static str) {
+    match completion {
+        Err(ActivationFailure::Unconfirmed) => ActivationFailure::Unconfirmed.reason(),
+        _ => (
+            "store_unavailable",
+            "Configuration is active but was not recorded",
+        ),
     }
 }
 
@@ -56,24 +94,14 @@ impl Worker {
         group: Option<&str>,
         committed: Committed,
     ) {
-        let mut written = committed.written();
-        let created = matches!(committed, Committed::Created(_));
         self.begin_record(&committed);
         let pending = match self.activation.dispatch(request).await {
             Ok(pending) => pending,
             Err(failure) => {
-                if let Committed::Created(file) = &committed {
-                    written = !file.remove();
-                }
-                let error = match failure {
-                    ActivationFailure::EngineUnavailable => {
-                        unavailable().with_details(json!({"written":written}))
-                    }
-                    _ if matches!(committed, Committed::Created(_)) => {
-                        unavailable().with_details(json!({"written":written}))
-                    }
-                    _ => unavailable(),
-                };
+                let written = committed.written();
+                let mut details = failure.details(Some(written), &self.service.instance_id);
+                details["stage"] = json!(failure.reason().0);
+                let error = unavailable().with_details(details);
                 let error = if written {
                     error.without_retry_after()
                 } else {
@@ -87,37 +115,15 @@ impl Worker {
         self.service.operations.accept(id);
         self.service.operations.running(id);
         let completion = self.activation.complete(pending).await;
-        if let (Committed::Created(file), Err(failure)) = (&committed, &completion)
-            && !matches!(
-                failure,
-                ActivationFailure::Unconfirmed
-                    | ActivationFailure::Degraded(_)
-                    | ActivationFailure::Reconciliation(_)
-            )
-        {
-            written = !file.remove();
-        }
         let stored = match self.record(committed, &completion).await {
             Ok(stored) => stored,
             Err(details) => {
-                let (code, message) = match completion {
-                    Err(ActivationFailure::Unconfirmed) => ActivationFailure::Unconfirmed.reason(),
-                    _ => (
-                        "store_unavailable",
-                        "Configuration is active but was not recorded",
-                    ),
-                };
+                let (code, message) = record_failure(&completion);
                 self.failed(id, code, message, Some(details));
                 return;
             }
         };
-        self.publish_operation(
-            id,
-            completion,
-            group,
-            Some(json!({"written":stored && written,"committed":false})),
-            created.then_some(written),
-        );
+        self.publish_operation(id, completion, group, Some(stored));
     }
 
     pub(super) fn begin_record(&self, committed: &Committed) {
@@ -137,23 +143,27 @@ impl Worker {
         if committed.written() {
             return Ok(true);
         }
-        let Some(store) = &self.store else {
-            return Ok(false);
-        };
+        let instance = &self.service.instance_id;
         let result = match completion {
             Ok(_) | Err(ActivationFailure::Degraded(_) | ActivationFailure::Reconciliation(_)) => {
-                let writer = Arc::clone(store);
+                let writer = self.store.clone();
                 match tokio::task::spawn_blocking(move || writer.promote(committed)).await {
                     Ok(Ok(())) => Ok(true),
                     _ => {
-                        store.block();
-                        Err(json!({"stage":"store","committed":true,"durable":false}))
+                        self.store.block();
+                        let active = match completion {
+                            Ok(outcome) => outcome
+                                .generation()
+                                .map(|generation| format!("{instance}:{generation}")),
+                            Err(failure) => failure.active_generation_id(instance),
+                        };
+                        Err(json!({"committed":true,"written":false,"active_generation_id":active}))
                     }
                 }
             }
             Err(ActivationFailure::Unconfirmed) => {
-                store.block();
-                Err(json!({"stage":"store","committed":null}))
+                self.store.block();
+                Err(json!({"committed":null,"written":false}))
             }
             Err(_) => Ok(false),
         };
@@ -163,7 +173,7 @@ impl Worker {
 
     pub(super) async fn reload_operation(&mut self, id: &str, request: ActivationRequest) {
         let completion = self.activation.activate(request).await;
-        self.publish_operation(id, completion, None, None, None);
+        self.publish_operation(id, completion, None, None);
     }
 
     fn publish_operation(
@@ -171,27 +181,14 @@ impl Worker {
         id: &str,
         completion: ActivationCompletion,
         group: Option<&str>,
-        rejected_details: Option<Value>,
-        // For a created source: whether its file remains, reported on every failure.
-        created_written: Option<bool>,
+        // Whether the store holds the change; `None` for a plain reload.
+        written: Option<bool>,
     ) {
         match completion {
             Err(failure) => {
-                let mut details = match failure {
-                    ActivationFailure::Rejected => rejected_details,
-                    ActivationFailure::Degraded(generation) => Some(
-                        json!({"active_generation_id":format!("{}:{generation}",self.service.instance_id),"committed":true}),
-                    ),
-                    ActivationFailure::Reconciliation(generation) => Some(
-                        json!({"active_generation_id":generation.map(|generation|format!("{}:{generation}",self.service.instance_id)),"committed":true}),
-                    ),
-                    _ => None,
-                };
-                if let Some(written) = created_written {
-                    details.get_or_insert_with(|| json!({}))["written"] = json!(written);
-                }
+                let details = failure.details(written, &self.service.instance_id);
                 let (code, message) = failure.reason();
-                self.failed(id, code, message, details);
+                self.failed(id, code, message, Some(details));
             }
             Ok(outcome) => {
                 let result = if let Some(group_id) = group {

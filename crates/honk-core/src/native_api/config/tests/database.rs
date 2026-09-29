@@ -65,7 +65,9 @@ async fn main_source_write_records_a_revision_after_the_tree_is_deleted() {
 async fn rejected_reload_leaves_the_db_head_alone() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     assert_eq!(main["writable"], true);
@@ -79,7 +81,7 @@ async fn rejected_reload_leaves_the_db_head_alone() {
     assert_eq!(revisions(&fixture).len(), 1);
     let after = fixture.get(CONFIG).await;
     assert_eq!(after["revision"], before["revision"]);
-    assert_eq!(after["store"]["recorded"], true);
+    assert_eq!(after["x-honk"]["store"]["recorded"], true);
     fixture.shutdown().await;
 }
 
@@ -107,7 +109,7 @@ async fn restart_only_changes_are_refused_before_recording() {
 
     std::fs::write(fixture.path("etc/main.dae"), &candidate).unwrap();
     let response = fixture
-        .request(Method::POST, "/api/v1/config/import")
+        .request(Method::POST, "/api/v1/x-honk/config/import")
         .header("idempotency-key", "restart")
         .json(&json!({"replace":true}))
         .send()
@@ -191,7 +193,7 @@ async fn operation(fixture: &Fixture, path: &str, key: &str, body: Value) -> Val
 async fn file_mode_has_export_but_no_import_or_revisions() {
     let fixture = Fixture::new(Access::Admin, false).await;
     let response = fixture
-        .request(Method::POST, "/api/v1/config/import")
+        .request(Method::POST, "/api/v1/x-honk/config/import")
         .header("idempotency-key", "import")
         .json(&json!({"replace":true}))
         .send()
@@ -199,19 +201,19 @@ async fn file_mode_has_export_but_no_import_or_revisions() {
         .unwrap();
     error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
     let response = fixture
-        .request(Method::GET, "/api/v1/config/revisions")
+        .request(Method::GET, "/api/v1/x-honk/config/revisions")
         .send()
         .await
         .unwrap();
     error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
     let response = fixture
-        .request(Method::POST, "/api/v1/config/revisions/1/activate")
+        .request(Method::POST, "/api/v1/x-honk/config/revisions/1/activate")
         .send()
         .await
         .unwrap();
     error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
     let response = fixture
-        .request(Method::GET, "/api/v1/config/export")
+        .request(Method::GET, "/api/v1/x-honk/config/export")
         .send()
         .await
         .unwrap();
@@ -224,12 +226,15 @@ async fn file_mode_has_export_but_no_import_or_revisions() {
     assert!(body.starts_with("# listener secrets omitted\n"));
     assert!(!body.contains(SECRET));
     let config = fixture.get(CONFIG).await;
-    assert_eq!(config["store"]["kind"], "file");
+    assert_eq!(config["x-honk"]["store"]["kind"], "file");
     assert!(config["sources"][0]["absolute_path"].is_string());
     let capabilities = fixture.get("/api/v1/capabilities").await;
-    assert_eq!(capabilities["resources"]["config"]["store"], "file");
     assert_eq!(
-        capabilities["resources"]["config_import"]["available"],
+        capabilities["resources"]["config"]["x-honk"]["store"],
+        "file"
+    );
+    assert_eq!(
+        capabilities["resources"]["x-honk"]["config_import"]["available"],
         false
     );
     fixture.shutdown().await;
@@ -245,7 +250,7 @@ async fn import_preserves_subscription_declarations() {
     std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();
     let terminal = operation(
         &fixture,
-        "/api/v1/config/import",
+        "/api/v1/x-honk/config/import",
         "subscription-import",
         json!({"replace":true}),
     )
@@ -262,7 +267,7 @@ async fn import_export_and_activate_record_revisions() {
     let store = Arc::clone(fixture.database.as_ref().unwrap());
     let config = fixture.get(CONFIG).await;
     assert_eq!(
-        config["store"],
+        config["x-honk"]["store"],
         json!({"kind":"db","revision":1,"parent":null,"recorded":true})
     );
     assert!(
@@ -280,14 +285,14 @@ async fn import_export_and_activate_record_revisions() {
         .await;
     assert!(main.get("absolute_path").is_none());
     let capabilities = fixture.get("/api/v1/capabilities").await;
-    assert_eq!(capabilities["resources"]["config"]["store"], "db");
+    assert_eq!(capabilities["resources"]["config"]["x-honk"]["store"], "db");
     assert_eq!(
-        capabilities["resources"]["config_revisions"],
+        capabilities["resources"]["x-honk"]["config_revisions"],
         json!({"available":true,"can_activate":true,"max_revisions":50})
     );
 
     let response = fixture
-        .request(Method::POST, "/api/v1/config/import")
+        .request(Method::POST, "/api/v1/x-honk/config/import")
         .header("idempotency-key", "first")
         .json(&json!({"replace":false}))
         .send()
@@ -299,7 +304,7 @@ async fn import_export_and_activate_record_revisions() {
     std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();
     let terminal = operation(
         &fixture,
-        "/api/v1/config/import",
+        "/api/v1/x-honk/config/import",
         "replace",
         json!({"replace":true}),
     )
@@ -310,7 +315,7 @@ async fn import_export_and_activate_record_revisions() {
     source(&config, &edited);
 
     let response = fixture
-        .request(Method::GET, "/api/v1/config/export")
+        .request(Method::GET, "/api/v1/x-honk/config/export")
         .send()
         .await
         .unwrap();
@@ -349,7 +354,7 @@ async fn import_export_and_activate_record_revisions() {
 
     let terminal = operation(
         &fixture,
-        "/api/v1/config/revisions/1/activate",
+        "/api/v1/x-honk/config/revisions/1/activate",
         "rollback",
         json!({}),
     )
@@ -359,13 +364,13 @@ async fn import_export_and_activate_record_revisions() {
     let config = fixture.get(CONFIG).await;
     source(&config, &fixture.originals["main.dae"]);
     let response = fixture
-        .request(Method::POST, "/api/v1/config/revisions/9/activate")
+        .request(Method::POST, "/api/v1/x-honk/config/revisions/9/activate")
         .send()
         .await
         .unwrap();
     error(response, StatusCode::NOT_FOUND, "resource_not_found").await;
 
-    let list = fixture.get("/api/v1/config/revisions").await;
+    let list = fixture.get("/api/v1/x-honk/config/revisions").await;
     assert_eq!(list["active"], 3);
     assert_eq!(list["max_revisions"], 50);
     let rows: Vec<_> = list["revisions"]
@@ -434,18 +439,21 @@ async fn pending_record_keeps_http_responsive_and_serializes_the_next_work() {
     let candidate = main_edit(&fixture);
     let admitted = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
     let activation = fixture.next_reload().await;
-    assert_eq!(fixture.get(CONFIG).await["store"]["recorded"], true);
+    assert_eq!(
+        fixture.get(CONFIG).await["x-honk"]["store"]["recorded"],
+        true
+    );
     let (release, locked) = hold_database(&fixture).await;
     activation.send(()).unwrap();
 
     let active = changed_config(&fixture, &before).await;
     assert_eq!(source(&active, &candidate)["id"], main["id"]);
     assert_eq!(
-        active["store"],
+        active["x-honk"]["store"],
         json!({"kind":"db","revision":1,"parent":null,"recorded":false})
     );
     let export = fixture
-        .request(Method::GET, "/api/v1/config/export")
+        .request(Method::GET, "/api/v1/x-honk/config/export")
         .send()
         .await
         .unwrap();
@@ -474,7 +482,7 @@ async fn pending_record_keeps_http_responsive_and_serializes_the_next_work() {
     assert_eq!(ok(queued.await.unwrap().unwrap()).await["valid"], true);
     assert_eq!(fixture.terminal(&admitted).await["status"], "succeeded");
     assert_eq!(
-        fixture.get(CONFIG).await["store"],
+        fixture.get(CONFIG).await["x-honk"]["store"],
         json!({"kind":"db","revision":2,"parent":1,"recorded":true})
     );
     fixture.shutdown().await;
@@ -492,7 +500,7 @@ async fn disconnected_management_and_shutdown_retain_pending_record() {
     let (release, locked) = hold_database(&fixture).await;
     activation.send(()).unwrap();
     let active = changed_config(&fixture, &before).await;
-    assert_eq!(active["store"]["recorded"], false);
+    assert_eq!(active["x-honk"]["store"]["recorded"], false);
     assert!(
         active["sources"][0]["content"]
             .as_str()
@@ -520,10 +528,44 @@ async fn disconnected_management_and_shutdown_retain_pending_record() {
     );
     timeout(WAIT, shutdown).await.unwrap().unwrap();
     assert_eq!(
-        fixture.get(CONFIG).await["store"],
+        fixture.get(CONFIG).await["x-honk"]["store"],
         json!({"kind":"db","revision":2,"parent":1,"recorded":true})
     );
     assert_eq!(revisions(&fixture).len(), 2);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn activation_replay_outlives_the_pruned_revision() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();
+    let terminal = operation(
+        &fixture,
+        "/api/v1/x-honk/config/import",
+        "replace",
+        json!({"replace":true}),
+    )
+    .await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    let activate = || {
+        fixture
+            .request(Method::POST, "/api/v1/x-honk/config/revisions/1/activate")
+            .header("idempotency-key", "rollback")
+            .json(&json!({}))
+            .send()
+    };
+    let first = accepted(activate().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&first).await["status"], "succeeded");
+    // Retention pruned the source revision before the client retried.
+    store
+        .state()
+        .strict()
+        .execute("DELETE FROM revision WHERE number = 1", [])
+        .unwrap();
+    let replay = accepted(activate().await.unwrap()).await;
+    assert_eq!(replay["operation_id"], first["operation_id"]);
     fixture.shutdown().await;
 }
 
@@ -539,14 +581,15 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     let terminal = fixture.terminal(&admitted).await;
     assert_eq!(terminal["status"], "failed", "{terminal}");
     assert_eq!(terminal["error"]["code"], "store_unavailable");
-    assert_eq!(
-        terminal["error"]["details"],
-        json!({"stage":"store","committed":true,"durable":false})
-    );
+    let details = &terminal["error"]["details"];
+    assert_eq!(details["committed"], true);
+    assert_eq!(details["written"], false);
+    assert!(details["active_generation_id"].is_string(), "{details}");
+    assert!(details.get("stage").is_none());
     assert_eq!(store.head(), Ok(Some(1)));
     let config = fixture.get(CONFIG).await;
     assert_eq!(
-        config["store"],
+        config["x-honk"]["store"],
         json!({"kind":"db","revision":1,"parent":null,"recorded":false})
     );
     let capabilities = fixture.get("/api/v1/capabilities").await;
@@ -560,11 +603,11 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
         .unwrap();
     error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
     assert_eq!(
-        capabilities["resources"]["config_revisions"]["can_activate"],
+        capabilities["resources"]["x-honk"]["config_revisions"]["can_activate"],
         true
     );
     let response = fixture
-        .request(Method::GET, "/api/v1/config/export")
+        .request(Method::GET, "/api/v1/x-honk/config/export")
         .send()
         .await
         .unwrap();
@@ -588,7 +631,7 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     let reloads = fixture.reloads.load(Ordering::SeqCst);
     let terminal = operation(
         &fixture,
-        "/api/v1/config/revisions/1/activate",
+        "/api/v1/x-honk/config/revisions/1/activate",
         "resync",
         json!({}),
     )
@@ -598,7 +641,7 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     assert_eq!(store.head(), Ok(Some(1)));
     assert_eq!(revisions(&fixture).len(), 1);
     let config = fixture.get(CONFIG).await;
-    assert_eq!(config["store"]["recorded"], true);
+    assert_eq!(config["x-honk"]["store"]["recorded"], true);
     source(&config, &fixture.originals["main.dae"]);
     let capabilities = fixture.get("/api/v1/capabilities").await;
     assert_eq!(capabilities["resources"]["config"]["writable"], true);
@@ -609,7 +652,9 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
 async fn unconfirmed_activation_blocks_writes() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());
-    fixture.reject_reloads.store(2, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Drop as u8, Ordering::SeqCst);
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     let operation = accepted(
@@ -622,13 +667,19 @@ async fn unconfirmed_activation_blocks_writes() {
     .await;
     let terminal = fixture.terminal(&operation).await;
     assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["code"], "activation_unconfirmed");
     assert_eq!(
         terminal["error"]["details"],
-        json!({"stage":"store","committed":null})
+        json!({"committed":null,"written":false})
     );
     assert_eq!(store.head(), Ok(Some(1)));
-    assert_eq!(fixture.get(CONFIG).await["store"]["recorded"], false);
-    fixture.reject_reloads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        fixture.get(CONFIG).await["x-honk"]["store"]["recorded"],
+        false
+    );
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Apply as u8, Ordering::SeqCst);
     fixture.shutdown().await;
 }
 
@@ -658,7 +709,10 @@ async fn db_mode_never_returns_or_keeps_listener_secret_values() {
     assert!(stored.sources.iter().all(|source| !leaked(&source.content)));
     assert!(!leaked(&fixture.get(CONFIG).await.to_string()));
     assert!(!leaked(
-        &fixture.get("/api/v1/config/revisions").await.to_string()
+        &fixture
+            .get("/api/v1/x-honk/config/revisions")
+            .await
+            .to_string()
     ));
     let bare = fixture.path("bare.dae");
     crate::native_api::store::db::export_to(&fixture.path("state"), &bare, false).unwrap();
@@ -671,7 +725,7 @@ async fn db_mode_never_returns_or_keeps_listener_secret_values() {
     );
     std::fs::write(fixture.path("etc/main.dae"), &copied).unwrap();
     let response = fixture
-        .request(Method::POST, "/api/v1/config/import")
+        .request(Method::POST, "/api/v1/x-honk/config/import")
         .header("idempotency-key", "copy")
         .json(&json!({"replace":true}))
         .send()

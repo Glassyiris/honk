@@ -878,7 +878,7 @@ async fn mux_refusal_distinguishes_target_status_from_http_envelope() {
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn target_evidence_requires_mux_body_status_not_http_success() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
@@ -896,7 +896,7 @@ async fn target_evidence_requires_mux_body_status_not_http_success() {
                 let events = Arc::clone(&events);
                 Arc::new(move |_, event| {
                     if let FlowEvent::Milestone { milestone } = event {
-                        events.lock().push(milestone);
+                        events.lock().push(milestone.as_str());
                     }
                 })
             },

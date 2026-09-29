@@ -7,12 +7,13 @@ use std::sync::Arc;
 use anyhow::{Context as _, anyhow, ensure};
 use honk_config::Config;
 use honk_config::diagnostic::DetailedDiagnostic;
-use honk_config::parser::SourceSnapshot;
+use honk_config::error::DetailedConfigError;
 use honk_config::parser::source_edit::strip_listener_secrets;
+use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 
-use super::super::config::ListenerSecrets as MaskSet;
-use super::db::{DbStore, ListenerSecrets, StoreError};
-use crate::configuration::{SourceUpdate, limits};
+use super::super::config::ListenerSecrets;
+use super::db::{DbStore, StoreError, StoredSecrets};
+use crate::configuration::SourceUpdate;
 use crate::state::StateDb;
 
 pub(crate) struct DatabaseStartup {
@@ -26,17 +27,27 @@ pub(crate) struct DatabaseStartup {
 
 struct Import {
     stripped: Vec<SourceSnapshot>,
-    forbidden: MaskSet,
-    secrets: ListenerSecrets,
+    forbidden: ListenerSecrets,
+    secrets: StoredSecrets,
 }
 
-/// The tree with every listener `secret:` removed, keyed by path, and every
-/// secret value it held. Refused when a value survives, for example in a
-/// comment or a file name, because the db would keep it.
-pub(crate) fn strip_tree(
+pub(crate) enum ImportError {
+    /// A listener secret value survives stripping in this file, for example in a comment or
+    /// a file name; the db would keep it.
+    SecretCopy(PathBuf),
+    Load(DetailedConfigError),
+    /// The stripped tree is not the same configuration over the same files.
+    Changed,
+}
+
+/// `originals` of `original` read back from `entry` with every listener `secret:` removed,
+/// and every secret value it held.
+pub(crate) fn import_tree(
+    entry: &Path,
+    original: &Config,
     originals: &[SourceSnapshot],
-) -> Result<(HashMap<PathBuf, Arc<str>>, MaskSet), PathBuf> {
-    let forbidden = MaskSet::new(originals, "");
+) -> Result<(LoadedConfig, ListenerSecrets), ImportError> {
+    let forbidden = ListenerSecrets::new(originals, "");
     let mut overlay = HashMap::new();
     for source in originals {
         let stripped = strip_listener_secrets(&source.content)
@@ -44,10 +55,23 @@ pub(crate) fn strip_tree(
             .filter(|stripped| {
                 !forbidden.contains(stripped) && !forbidden.contains(&source.path.to_string_lossy())
             })
-            .ok_or_else(|| source.path.clone())?;
+            .ok_or_else(|| ImportError::SecretCopy(source.path.clone()))?;
         overlay.insert(source.path.clone(), Arc::<str>::from(stripped));
     }
-    Ok((overlay, forbidden))
+    let mut loaded =
+        Config::from_dae_sources_in_memory(entry, &overlay, SourceLimits::DEFAULT, &mut Vec::new())
+            .map_err(ImportError::Load)?;
+    if !(stripped_config_matches(original, &mut loaded.config)
+        && loaded.sources.len() == originals.len()
+        && loaded
+            .sources
+            .iter()
+            .zip(originals)
+            .all(|(stripped, original)| stripped.path == original.path))
+    {
+        return Err(ImportError::Changed);
+    }
+    Ok((loaded, forbidden))
 }
 
 /// Fresh parses generate identities and timestamps that are not declared source values.
@@ -124,29 +148,22 @@ impl DatabaseStartup {
         );
         no_clash_api(&config)?;
         same_data_dir(&config, data_dir)?;
-        let (overlay, forbidden) = strip_tree(&originals).map_err(|path| {
-            anyhow!(
-                "listener secrets in {} cannot be stripped completely; remove copies of secret values",
-                path.display()
-            )
-        })?;
-        let mut loaded =
-            Config::from_dae_sources_in_memory(store.entry(), &overlay, limits(), &mut Vec::new())?;
-        let secrets = ListenerSecrets {
+        let (loaded, forbidden) =
+            import_tree(store.entry(), &config, &originals).map_err(|error| match error {
+                ImportError::SecretCopy(path) => anyhow!(
+                    "listener secrets in {} cannot be stripped completely; remove copies of secret values",
+                    path.display()
+                ),
+                ImportError::Load(error) => error.into(),
+                ImportError::Changed => anyhow!(
+                    "{} does not read back the same once listener secrets are stripped",
+                    entry.display()
+                ),
+            })?;
+        let secrets = StoredSecrets {
             native_api: config.experimental.native_api.secret.clone(),
             clash_api: config.experimental.clash_api.secret.clone(),
         };
-        ensure!(
-            stripped_config_matches(&config, &mut loaded.config)
-                && loaded.sources.len() == originals.len()
-                && loaded
-                    .sources
-                    .iter()
-                    .zip(&originals)
-                    .all(|(stripped, original)| stripped.path == original.path),
-            "{} does not read back the same once listener secrets are stripped",
-            entry.display()
-        );
         Ok(Self {
             store,
             config,

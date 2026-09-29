@@ -15,15 +15,15 @@ use honk_config::Config;
 use honk_config::diagnostic::{DetailedDiagnostic, DiagnosticSources, SettingPath};
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::parser::source_edit::{inline_sources, restore_listener_secrets};
-use honk_config::parser::{LoadedConfig, SourceSnapshot};
+use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::super::ApiError;
-use super::super::config::ListenerSecrets as MaskSet;
+use super::super::config::ListenerSecrets;
 use super::super::config_write::WriteError;
-use crate::configuration::{MAX_SOURCE_BYTES, MAX_SOURCES, digest, limits};
+use crate::configuration::{MAX_SOURCE_BYTES, MAX_SOURCES, digest};
 use crate::state::{StateDb, StateError, log_sql};
 
 pub(crate) const MAX_REVISIONS: usize = 50;
@@ -95,7 +95,7 @@ pub(crate) struct RevisionInfo {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ListenerSecrets {
+pub(crate) struct StoredSecrets {
     pub(crate) native_api: String,
     pub(crate) clash_api: String,
 }
@@ -140,7 +140,7 @@ pub(crate) struct DbStore {
     blocked: AtomicBool,
     /// `(head, parent)` as last read or written, so readers need no SQLite call.
     head: Mutex<Option<(i64, Option<i64>)>>,
-    secrets: Mutex<ListenerSecrets>,
+    secrets: Mutex<StoredSecrets>,
     #[cfg(test)]
     pub(crate) fail_promote: AtomicBool,
     #[cfg(test)]
@@ -197,7 +197,7 @@ impl DbStore {
         *self.head.lock()
     }
 
-    pub(crate) fn listener_secrets(&self) -> ListenerSecrets {
+    pub(crate) fn listener_secrets(&self) -> StoredSecrets {
         self.secrets.lock().clone()
     }
 
@@ -330,11 +330,15 @@ impl DbStore {
     fn load_sources(
         &self,
         sources: &HashMap<PathBuf, Arc<str>>,
-        secrets: &ListenerSecrets,
+        secrets: &StoredSecrets,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<LoadedConfig, DetailedConfigError> {
-        let mut loaded =
-            Config::from_dae_sources_in_memory(&self.entry, sources, limits(), diagnostics)?;
+        let mut loaded = Config::from_dae_sources_in_memory(
+            &self.entry,
+            sources,
+            SourceLimits::DEFAULT,
+            diagnostics,
+        )?;
         loaded.config.experimental.native_api.secret = secrets.native_api.clone();
         loaded.config.experimental.clash_api.secret = secrets.clash_api.clone();
         Ok(loaded)
@@ -345,8 +349,8 @@ impl DbStore {
     pub(crate) fn initialize(
         &self,
         sources: &[SourceSnapshot],
-        forbidden: &MaskSet,
-        secrets: &ListenerSecrets,
+        forbidden: &ListenerSecrets,
+        secrets: &StoredSecrets,
         principal: &str,
     ) -> Result<i64, StoreError> {
         let stored = self.stored(sources, &forbidden.clone().with_all(secrets))?;
@@ -557,7 +561,7 @@ impl DbStore {
 
     /// `stored` against the listener secrets this db already holds.
     fn stored_now(&self, candidate: &[SourceSnapshot]) -> Result<Vec<StoredSource>, WriteError> {
-        let forbidden = MaskSet::new(&[], "").with_all(&self.secrets.lock());
+        let forbidden = ListenerSecrets::empty().with_all(&self.secrets.lock());
         self.stored(candidate, &forbidden)
             .map_err(|error| match error {
                 StoreError::Invalid => WriteError::UnsafePath,
@@ -570,7 +574,7 @@ impl DbStore {
     fn stored(
         &self,
         sources: &[SourceSnapshot],
-        forbidden: &MaskSet,
+        forbidden: &ListenerSecrets,
     ) -> Result<Vec<StoredSource>, StoreError> {
         let bytes: usize = sources.iter().map(|source| source.content.len()).sum();
         if sources.is_empty()
@@ -626,16 +630,21 @@ pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, Stor
         .into_iter()
         .map(|source| (root.join(source.name), Arc::from(source.content)))
         .collect();
-    let loaded = Config::from_dae_sources_in_memory(&entry, &sources, limits(), &mut Vec::new())
-        .map_err(|_| StoreError::Corrupt)?;
+    let loaded = Config::from_dae_sources_in_memory(
+        &entry,
+        &sources,
+        SourceLimits::DEFAULT,
+        &mut Vec::new(),
+    )
+    .map_err(|_| StoreError::Corrupt)?;
     let text = inline_sources(&loaded.sources).map_err(|_| StoreError::Corrupt)?;
     if with_secrets {
         restore_listener_secrets(&text, &secrets.native_api, &secrets.clash_api)
             .map_err(|_| StoreError::Corrupt)
-    } else if secrets == ListenerSecrets::default() {
+    } else if secrets == StoredSecrets::default() {
         Ok(text)
     } else {
-        let (text, _) = MaskSet::new(&[], "").with_all(&secrets).mask(&text);
+        let (text, _) = ListenerSecrets::empty().with_all(&secrets).mask(&text);
         Ok(format!("# listener secrets omitted\n{text}"))
     }
 }
@@ -744,8 +753,8 @@ fn revision(
     Ok(Some((root, Revision { sources })))
 }
 
-fn listener_secrets(connection: &Connection) -> Result<ListenerSecrets, StoreError> {
-    let mut secrets = ListenerSecrets::default();
+fn listener_secrets(connection: &Connection) -> Result<StoredSecrets, StoreError> {
+    let mut secrets = StoredSecrets::default();
     let mut statement = connection
         .prepare("SELECT api, value FROM listener_secret")
         .map_err(sql)?;

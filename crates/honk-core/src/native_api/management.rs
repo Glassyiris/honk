@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    body::to_bytes,
     extract::Request,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -49,8 +48,7 @@ impl ProviderCreate {
 pub(super) enum Action {
     CreateNode,
     CreateProvider,
-    DeleteNode(String),
-    DeleteProvider(String),
+    Delete(Mutation),
 }
 
 pub(super) enum Mutation {
@@ -147,15 +145,63 @@ pub(super) fn activation_error(
     written: Option<bool>,
     durability: Option<bool>,
     committed: Option<bool>,
+    active_generation_id: Option<String>,
 ) -> ApiError {
+    let mut details = json!({"stage":stage,"committed":committed});
+    if let Some(written) = written {
+        details["written"] = json!(written);
+    }
+    if let Some(durability) = durability {
+        details["durability_confirmed"] = json!(durability);
+    }
+    if committed == Some(true) {
+        details["active_generation_id"] = json!(active_generation_id);
+    }
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::TemporarilyUnavailable,
         "Managed configuration change did not complete successfully",
         None,
     )
-    .with_details(json!({"stage":stage,"written":written,
-            "durability_confirmed":durability,"committed":committed}))
+    .with_details(details)
+}
+
+/// The management error contract: every failure carries activation details, and
+/// anything but a conflict, a stale revision or a request-shaped rejection of a
+/// create is retryable unavailability.
+fn contract_error(mut error: ApiError, deleting: bool) -> ApiError {
+    let stage = match error.status {
+        StatusCode::PRECONDITION_FAILED => "revision_conflict",
+        StatusCode::UNPROCESSABLE_ENTITY => "validation",
+        StatusCode::CONFLICT => "state_conflict",
+        StatusCode::NOT_FOUND => "capability",
+        _ => "admission",
+    };
+    if !matches!(
+        error.status,
+        StatusCode::NOT_FOUND
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::CONFLICT
+            | StatusCode::PRECONDITION_FAILED
+    ) && (deleting
+        || !matches!(
+            error.status,
+            StatusCode::UNPROCESSABLE_ENTITY
+                | StatusCode::BAD_REQUEST
+                | StatusCode::PAYLOAD_TOO_LARGE
+                | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        ))
+    {
+        error.status = StatusCode::SERVICE_UNAVAILABLE;
+        error.error.code = ErrorCode::TemporarilyUnavailable;
+    }
+    let details = error.error.details.get_or_insert_with(|| json!({}));
+    if let Some(details) = details.as_object_mut() {
+        details.entry("stage").or_insert(json!(stage));
+        details.entry("written").or_insert(json!(false));
+        details.entry("committed").or_insert(json!(false));
+    }
+    error
 }
 
 pub(super) async fn mutate(
@@ -167,26 +213,18 @@ pub(super) async fn mutate(
     if !state.observation.configuration.can_manage() {
         return Err(unsupported());
     }
-    let deleting = matches!(action, Action::DeleteNode(_) | Action::DeleteProvider(_));
+    let deleting = matches!(action, Action::Delete(_));
     parse_query(request.uri(), &[], id)?;
     if !deleting {
         config::json_type(&request)?;
     }
-    let body = to_bytes(request.into_body(), 65536).await.map_err(|_| {
-        ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::RequestTooLarge,
-            "Management request body exceeds its limit",
-            None,
-        )
-    })?;
+    let body = super::body::buffered(request.into_body()).await;
     if deleting && !body.is_empty() {
         return Err(invalid());
     }
     let result = async {
         let mutation = match action {
-            Action::DeleteNode(target) => Mutation::DeleteNode(target),
-            Action::DeleteProvider(target) => Mutation::DeleteProvider(target),
+            Action::Delete(mutation) => mutation,
             Action::CreateNode => {
                 let input: NodeCreate = super::body::decode(&body, invalid)?;
                 if !(1..=64).contains(&input.name.chars().count()) {
@@ -268,7 +306,7 @@ pub(super) async fn mutate(
             .configuration
             .manage(
                 mutation,
-                Arc::clone(&state.observation.catalog),
+                Arc::clone(&state.observation.core.catalog),
                 Arc::clone(&state.group_manager),
                 Arc::clone(&state.alive_set),
             )
@@ -276,5 +314,5 @@ pub(super) async fn mutate(
         Ok(completion.response())
     }
     .await;
-    result.map_err(|error| error.for_management(deleting))
+    result.map_err(|error| contract_error(error, deleting))
 }

@@ -53,10 +53,11 @@ impl SourceFile {
     }
 
     fn open_inner(path: &Path, max_bytes: usize, text: bool) -> Result<Self, WriteError> {
-        let path = std::path::absolute(path).map_err(|_| WriteError::Unavailable)?;
-        let parent_path = path.parent().ok_or(WriteError::UnsafePath)?.to_owned();
-        let filename = path.file_name().ok_or(WriteError::UnsafePath)?.to_owned();
-        let directory = open_directory(&parent_path).map_err(path_error)?;
+        let Target {
+            directory,
+            parent_path,
+            filename,
+        } = Target::open(path)?;
         let file = open_source(&directory, &filename).map_err(path_error)?;
         let metadata = regular_metadata(&file, max_bytes)?;
         let (hash, length) = if text {
@@ -110,12 +111,11 @@ impl SourceFile {
     /// Neither this check nor the subsequent rename locks out external editors.
     pub(crate) fn replace(
         self,
-        expected_hash: &str,
         content: &str,
         before_rename: impl FnOnce() -> Result<(), WriteError>,
     ) -> Result<(), WriteError> {
         let installed = self
-            .stage(expected_hash, content.as_bytes())?
+            .stage_into(None, content.as_bytes(), None)?
             .replace(before_rename)?;
         if installed.durability_confirmed {
             Ok(())
@@ -129,7 +129,7 @@ impl SourceFile {
         expected_hash: &str,
         content: &[u8],
     ) -> Result<StagedFile, WriteError> {
-        self.stage_into(expected_hash, content, None)
+        self.stage_into(Some(expected_hash), content, None)
     }
 
     /// Stages `content` as a new file at `target`, leaving this file in place
@@ -141,16 +141,17 @@ impl SourceFile {
         content: &[u8],
     ) -> Result<StagedFile, WriteError> {
         let target = Target::open(target)?;
-        self.stage_into(expected_hash, content, Some(target))
+        self.stage_into(Some(expected_hash), content, Some(target))
     }
 
+    /// `expected_hash`, when given, must match the pinned bytes.
     fn stage_into(
         self,
-        expected_hash: &str,
+        expected_hash: Option<&str>,
         content: &[u8],
         target: Option<Target>,
     ) -> Result<StagedFile, WriteError> {
-        if self.hash != expected_hash {
+        if expected_hash.is_some_and(|expected| self.hash != expected) {
             return Err(WriteError::Conflict);
         }
         if content.len() > self.max_bytes {
@@ -258,53 +259,17 @@ impl Target {
 
     /// Moves `temporary` to the target name; never replaces anything already there.
     fn install(&self, temporary: &mut TemporaryFile) -> Result<(), WriteError> {
-        rustix::fs::renameat_with(
+        crate::state::rename_noreplace(
             &self.directory,
             temporary.name.as_str(),
-            &self.directory,
             self.filename.as_os_str(),
-            rustix::fs::RenameFlags::NOREPLACE,
         )
-        .map_err(|error| match Errno::from_raw(error.raw_os_error()) {
+        .map_err(|error| match error {
             Errno::EEXIST => WriteError::Conflict,
             error => path_error(error),
         })?;
         temporary.renamed = true;
         Ok(())
-    }
-}
-
-/// A file `create_new` installed, identified by inode so removal never touches a successor.
-pub(crate) struct CreatedFile {
-    directory: File,
-    name: OsString,
-    // Keeps the inode allocated after an external unlink, so no successor can reuse its number.
-    file: File,
-}
-
-impl CreatedFile {
-    /// Unlinks the file while its name still holds it. True when the name no longer does.
-    pub(crate) fn remove(&self) -> bool {
-        let current = openat(
-            &self.directory,
-            self.name.as_os_str(),
-            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        );
-        match current.map(File::from) {
-            Ok(current) => current.metadata().is_ok_and(|metadata| {
-                self.file
-                    .metadata()
-                    .is_ok_and(|created| same_inode(&metadata, &created))
-                    && unlinkat(
-                        &self.directory,
-                        self.name.as_os_str(),
-                        UnlinkatFlags::NoRemoveDir,
-                    )
-                    .is_ok()
-            }),
-            Err(error) => error == Errno::ENOENT,
-        }
     }
 }
 
@@ -315,7 +280,7 @@ pub(crate) fn create_new(
     content: &[u8],
     mode: u32,
     before_rename: impl FnOnce() -> Result<(), WriteError>,
-) -> Result<CreatedFile, WriteError> {
+) -> Result<(), WriteError> {
     let target = Target::open(path)?;
     let mut temporary = TemporaryFile::write(&target.directory, content, mode)?;
     recheck_directory(&target.directory, &target.parent_path)?;
@@ -328,18 +293,10 @@ pub(crate) fn create_new(
             WriteError::Conflict => WriteError::Exists,
             error => error,
         })?;
-    let file = temporary
-        .file
-        .try_clone()
-        .map_err(|_| WriteError::ChangedButNotDurable)?;
     if target.directory.sync_all().is_err() {
         return Err(WriteError::ChangedButNotDurable);
     }
-    Ok(CreatedFile {
-        directory: target.directory,
-        name: target.filename,
-        file,
-    })
+    Ok(())
 }
 
 pub(crate) struct InstalledFile {
@@ -397,6 +354,7 @@ impl StagedFile {
                 durability_confirmed,
             });
         };
+        recheck_directory(&target.directory, &target.parent_path)?;
         target.install(&mut self.temporary)?;
         let file = self
             .temporary

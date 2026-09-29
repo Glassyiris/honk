@@ -158,8 +158,11 @@ pub struct RouteTraceSequence {
 pub static ROUTE_TRACE_SEQUENCE: Array<RouteTraceSequence, 1> = Array::new();
 
 #[btf_map]
-pub static ROUTE_TRACE_MAP: LruHashMap<u32, honk_ebpf_common::KernelRouteWitness, 1024> =
-    LruHashMap::new();
+pub static ROUTE_TRACE_MAP: LruHashMap<
+    u32,
+    honk_ebpf_common::KernelRouteWitness,
+    { honk_ebpf_common::ROUTE_TRACE_CAPACITY as usize },
+> = LruHashMap::new();
 
 /// Stable one-entry policy root. The backend atomically swaps the immutable
 /// descriptor map only after every inactive target slot and its generation-owned

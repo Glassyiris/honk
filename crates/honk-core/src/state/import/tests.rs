@@ -106,7 +106,7 @@ fn cache_id_selects_the_imported_prefix_and_keeps_the_file() {
 }
 
 #[test]
-fn empty_cache_id_imports_plain_keys_and_removes_the_file_and_sidecars() {
+fn empty_cache_id_imports_plain_keys_and_removes_the_file_and_sidecars_only() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cache.db");
     let legacy = seed(&path);
@@ -135,14 +135,14 @@ fn empty_cache_id_imports_plain_keys_and_removes_the_file_and_sidecars() {
         ["mode=Rule", "proxy/tcp=\"plain-tcp\""],
         "existing rows win"
     );
-    for gone in [
-        &path,
-        &wal,
-        &directory.path().join("cache.db-shm"),
-        &corrupt,
-    ] {
+    for gone in [&path, &wal, &directory.path().join("cache.db-shm")] {
         assert!(!gone.exists(), "{}", gone.display());
     }
+    assert_eq!(
+        fs::read(&corrupt).unwrap(),
+        b"old",
+        "diagnostic copies stay"
+    );
     drop(legacy);
 }
 

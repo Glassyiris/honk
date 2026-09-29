@@ -174,9 +174,7 @@ pub(in crate::control) fn install_interrupt_callback(
     tracker: &Arc<ConnectionTracker>,
     diagnostics: &crate::config_diagnostics::SharedDiagnostics,
     generation: u64,
-    #[cfg(feature = "native-api")] native: Option<
-        &Arc<crate::native_api::observation::NativeObservation>,
-    >,
+    #[cfg(feature = "native-api")] native: Option<&Arc<crate::observe::Observation>>,
 ) {
     if group_manager.has_interrupt_connections() {
         tracker.enable_for_interrupts();

@@ -1,6 +1,5 @@
 use super::*;
-use anyhow::Context as _;
-use honk_outbound::alive::{HealthMeasurement, NativeHealthObservation, ProbeMeasurement};
+use honk_outbound::alive::{HealthMeasurement, HealthObservation, ProbeMeasurement};
 use honk_outbound::group::{
     ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget,
     SelectionNetwork,
@@ -280,7 +279,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             {
                 None
             } else {
-                Some(honk_outbound::alive::NativeHealthObservation::probe(
+                Some(honk_outbound::alive::HealthObservation::probe(
                     ProbeDomain::Tcp,
                     honk_outbound::alive::HealthMeasurement::HttpHeaders,
                     target_family(addr),
@@ -683,7 +682,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                         )))
                         .await?;
                     measurement = HealthMeasurement::DnsRoundTrip;
-                    let elapsed = udp_probe_exchange(&transport, timeout).await?;
+                    let elapsed = crate::dns::forwarder::udp_dns_probe(&*transport).await?;
                     drop(transport);
                     Ok::<ProbeMeasurement, anyhow::Error>(elapsed)
                 };
@@ -694,7 +693,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error))
                     {
                         let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
-                        dns_observation = Some(NativeHealthObservation::probe(
+                        dns_observation = Some(HealthObservation::probe(
                             ProbeDomain::DnsUdp,
                             measurement,
                             target_family(*dns_target),
@@ -776,32 +775,6 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
     }
 }
 
-/// Send the minimal DNS probe query and await a well-formed answer.
-async fn udp_probe_exchange(
-    transport: &Arc<dyn honk_outbound::proxy::PacketTransport>,
-    timeout: Duration,
-) -> anyhow::Result<ProbeMeasurement> {
-    let query = build_dns_probe_query();
-    let start = std::time::Instant::now();
-    transport
-        .send_packet(&query)
-        .await
-        .context("UDP probe send failed")?;
-    let mut buf = [0u8; 512];
-    let (n, _src) = tokio::time::timeout(timeout, transport.recv_packet(&mut buf))
-        .await
-        .map_err(|_| anyhow::anyhow!("UDP probe recv timeout"))?
-        .context("UDP probe recv failed")?;
-    anyhow::ensure!(
-        n >= 12 && buf[0] == query[0] && buf[1] == query[1] && buf[2] & 0x80 != 0,
-        "malformed DNS probe response"
-    );
-    Ok(ProbeMeasurement {
-        latency: start.elapsed(),
-        observed_at: std::time::SystemTime::now(),
-    })
-}
-
 pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> ScoreSelectionContext {
     let family = target_family(target.addr);
     ScoreSelectionContext {
@@ -824,7 +797,7 @@ async fn score_quic_probe(
     probe_interval: Duration,
     connect_timeout: Duration,
     timeout: Duration,
-    observation: &mut Option<NativeHealthObservation>,
+    observation: &mut Option<HealthObservation>,
     cancel: &honk_outbound::alive::ProbeCancellation,
 ) -> Option<anyhow::Result<Duration>> {
     if !honk_outbound::descriptor::udp_target_allowed(node, target.addr.port()) {
@@ -889,7 +862,7 @@ async fn score_quic_probe(
     };
     if !matches!(&result, Err(error) if honk_outbound::proxy::is_packet_rejection(error)) {
         let sample = result.as_ref().ok();
-        *observation = Some(NativeHealthObservation::probe(
+        *observation = Some(HealthObservation::probe(
             ProbeDomain::DataUdp,
             measurement,
             target_family(target.addr),
@@ -911,17 +884,6 @@ async fn score_quic_probe(
             Err(error)
         }
     })
-}
-
-/// Build the minimal DNS query used by the UDP health probe: a single
-/// A-record question for google.com with a fixed id (0x1234). The id is
-/// echoed back by the resolver and validated in the response.
-pub(super) fn build_dns_probe_query() -> Vec<u8> {
-    let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-    q.extend_from_slice(&[
-        6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
-    ]);
-    q
 }
 
 /// Resolve the UDP health check target from `global.udp_check_dns`

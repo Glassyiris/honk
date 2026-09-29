@@ -520,32 +520,22 @@ async fn measure_http_probe_mode(
 ///
 /// Cold probes time dial, TLS and one configured request; warm probes time the
 /// configured request after a validated HEAD. Host/SNI come from the request URI.
-/// The caller owns runtime teardown. HTTP/2 is driven inline, so returning or
-/// dropping this future releases its connection without a detached driver task.
-#[cfg(feature = "native-api")]
-pub async fn native_http_probe(
+/// `timeout` bounds each phase; the caller owns any absolute deadline,
+/// cancellation and runtime teardown. HTTP/2 is driven inline, so dropping this
+/// future releases its connection without a detached driver task.
+#[cfg(feature = "flow-observation")]
+pub async fn measure_pinned_http_probe(
     runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
     request: &http::Request<()>,
     addr: SocketAddr,
     cold: bool,
-    deadline: tokio::time::Instant,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
+    timeout: Duration,
 ) -> anyhow::Result<ProbeMeasurement> {
-    let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let probe = measure_http_probe_mode(
+    measure_http_probe_mode(
         runtime, handler, request, addr, None, timeout, timeout, None, cold,
-    );
-    tokio::select! {
-        biased;
-        _ = cancel.wait_for(|cancelled| *cancelled) => {
-            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "HTTP probe cancelled").into())
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            Err(phase_timeout("HTTP probe deadline expired"))
-        }
-        result = runtime.scope_tasks(probe) => result,
-    }
+    )
+    .await
 }
 
 /// BoringSSL connector with webpki root verification for HTTP probes.

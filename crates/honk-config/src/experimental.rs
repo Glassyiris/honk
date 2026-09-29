@@ -121,28 +121,12 @@ pub struct NativeApiConfig {
     pub probe_allowed_cidrs: Vec<String>,
     pub probe_allowed_ports: Vec<u16>,
     pub config_write: bool,
-    #[serde(skip_serializing, deserialize_with = "ignore_config_content")]
-    pub config_content: bool,
-    #[serde(skip_serializing, deserialize_with = "ignore_writable_includes")]
-    pub writable_includes: Vec<String>,
     pub geosite_download_url: String,
     pub geoip_download_url: String,
     /// How geodata downloads leave: `direct`, `routing` or a group name.
     /// Empty follows routing, like `external_ui_download_detour`, unless a
     /// route is stored.
     pub geodata_download_detour: String,
-}
-
-fn ignore_config_content<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<bool, D::Error> {
-    bool::deserialize(deserializer).map(|_| false)
-}
-
-fn ignore_writable_includes<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<String>, D::Error> {
-    Vec::<String>::deserialize(deserializer).map(|_| Vec::new())
 }
 
 impl Default for NativeApiConfig {
@@ -164,8 +148,6 @@ impl Default for NativeApiConfig {
             probe_allowed_cidrs: Vec::new(),
             probe_allowed_ports: Vec::new(),
             config_write: false,
-            config_content: false,
-            writable_includes: Vec::new(),
             geosite_download_url: String::new(),
             geoip_download_url: String::new(),
             geodata_download_detour: String::new(),

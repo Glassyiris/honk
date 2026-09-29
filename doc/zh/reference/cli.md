@@ -51,7 +51,7 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
 | `config export --out PATH [--without-secrets]` | 把配置数据库的当前 revision 写成一份 `.dae` 文件；未给 `--without-secrets` 时补回监听凭据。无论 daemon 是否运行，都通过以读写方式打开的 query-only 连接读取数据库。关闭该连接不会执行检查点，也不会删除 `honk.db-wal`；除 SQLite 可能创建的 `-shm` 索引外，唯一可能的写入是回滚崩溃遗留的日志。文件写完后才发布。 | 以 0600 权限新建 `PATH`，拒绝已存在的文件。 |
-| `admin reset` | 从 `--data-dir` 下的状态数据库删除密码模式管理员，并删除尚未导入的旧 `native-api/admin.json`，下次启动时重新开放 setup。 | 任何 honk-core（包括 mock 模式）打开该状态数据库时拒绝执行。 |
+| `admin reset` | 从 `--data-dir` 下的状态数据库删除密码模式管理员，下次启动时重新开放 setup。 | 任何 honk-core（包括 mock 模式）打开该状态数据库时拒绝执行。 |
 | `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
 
 [编译路由发布计数器](../design/routing.md#同步槽与原子发布)耗尽后需重启；它与普通 SIGHUP 及 DNS runtime 重载分开计数。

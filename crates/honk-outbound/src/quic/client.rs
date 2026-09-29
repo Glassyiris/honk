@@ -221,12 +221,12 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             // The QUIC connection is already admitted and reusable; time the
             // logical stream before its protocol open can block or cancel.
             crate::runtime::start_scoped_dial();
-            #[cfg(feature = "native-api")]
             if let Some(observer) = crate::runtime::flow_observation::current() {
                 observer.publish(
                     crate::runtime::flow_observation::FlowEvent::TransportAttached {
                         server_addr: Some(conn.remote_address()),
-                        resolution_location: "unknown",
+                        resolution_location:
+                            crate::runtime::flow_observation::ResolutionLocation::Unknown,
                     },
                 );
             }
@@ -239,11 +239,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
 
         let host = format!("{}:{}", self.server_host, self.server_port);
         let resolution = crate::bootstrap::resolve(&self.server_host);
-        #[cfg(feature = "native-api")]
         let (resolved, selection) =
             crate::runtime::flow_observation::observe_resolution(resolution).await;
-        #[cfg(not(feature = "native-api"))]
-        let resolved = resolution.await;
         let addrs: Vec<SocketAddr> = resolved
             .with_context(|| format!("resolve {host}"))?
             .into_iter()
@@ -264,7 +261,6 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 .as_ref()
                 .filter(|(cached_ipv6, _)| *cached_ipv6 == ipv6)
                 .map(|(_, endpoint)| endpoint.clone());
-            #[cfg(feature = "native-api")]
             let selection = selection.as_ref();
             async move {
                 let endpoint = match endpoint {
@@ -277,7 +273,6 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                         .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?
                     }
                 };
-                #[cfg(feature = "native-api")]
                 if let Some(selection) = selection {
                     selection.selected_ip(server_addr.ip());
                 }
@@ -285,11 +280,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 // Keep retries inside one address job: the shared scheduler
                 // races addresses for this node, never protocol attempts or nodes.
                 for attempt in 1..=3u8 {
-                    #[cfg(feature = "native-api")]
                     let mut observation = crate::runtime::flow_observation::TransportAttempt::start(
-                        Some(server_addr),
-                        "unknown",
-                    );
+                        Some(server_addr), crate::runtime::flow_observation::ResolutionLocation::Unknown);
                     let connecting = match endpoint.connect_with(
                         dial_config.clone(),
                         server_addr,
@@ -297,27 +289,24 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                     ) {
                         Ok(connecting) => connecting,
                         Err(error) => {
-                            #[cfg(feature = "native-api")]
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("failed", Some("quic_connect_failed"));
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectFailed));
                             }
                             return Err(error.into());
                         }
                     };
                     match tokio::time::timeout(connect_timeout, connecting).await {
                         Err(_) => {
-                            #[cfg(feature = "native-api")]
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("failed", Some("quic_connect_timeout"));
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectTimeout));
                             }
                             last_error = Some(anyhow!(
                                 "QUIC connect to {server_addr} timed out (attempt {attempt})"
                             ));
                         }
                         Ok(Err(error)) => {
-                            #[cfg(feature = "native-api")]
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("failed", Some("quic_connect_failed"));
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Failed, Some(crate::runtime::flow_observation::TransportError::QuicConnectFailed));
                             }
                             last_error = Some(
                                 crate::proxy::NodeFailure(anyhow::Error::new(error).context(
@@ -327,9 +316,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                             );
                         }
                         Ok(Ok(connection)) => {
-                            #[cfg(feature = "native-api")]
                             if let Some(observation) = observation.as_mut() {
-                                observation.finish("succeeded", None);
+                                observation.finish(crate::runtime::flow_observation::TransportStatus::Succeeded, None);
                             }
                             return Ok((connection, endpoint, ipv6));
                         }
@@ -353,8 +341,9 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 return Err(crate::proxy::quic_carrier_error(error));
             }
         };
-        #[cfg(feature = "native-api")]
-        crate::runtime::flow_observation::milestone("transport_ready");
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         let ctx = Arc::new(ctx);
         if state.quality.is_some() {
             on_publish(ctx.as_ref(), &conn);

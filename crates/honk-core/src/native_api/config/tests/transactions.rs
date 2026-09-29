@@ -83,7 +83,9 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
 
     std::fs::write(fixture.path("locked.dae"), "routing { dport(\n").unwrap();
     let rejected = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
-    assert_eq!(fixture.terminal(&rejected).await["status"], "failed");
+    let rejected = fixture.terminal(&rejected).await;
+    assert_eq!(rejected["status"], "failed");
+    assert_eq!(rejected["error"]["details"]["committed"], false);
     assert_eq!(fixture.get("/api/v1/rules").await, before);
     assert_eq!(
         ok(trace().send().await.unwrap()).await["evaluations"],
@@ -291,11 +293,17 @@ async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
     let rejected = fixture.terminal(&operation).await;
     assert_eq!(rejected["status"], "failed");
     assert_eq!(rejected["error"]["code"], "reload_rejected");
+    assert_eq!(
+        rejected["error"]["details"],
+        json!({"committed": false, "written": true})
+    );
     assert!(rejected["result"].is_null());
     assert_eq!(
         std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
@@ -304,7 +312,14 @@ async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
     assert_eq!(fixture.get(CONFIG).await, before);
     assert_eq!(fixture.get(&source_path(main)).await, *main);
     fixture.assert_last_reload(&rejected).await;
-    fixture.reject_reloads.store(0, Ordering::SeqCst);
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(
+        fixture.terminal(&reload).await["error"]["details"],
+        json!({"committed": false})
+    );
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Apply as u8, Ordering::SeqCst);
     let repaired = format!("{}# repaired locally\n", fixture.originals["main.dae"]);
     std::fs::write(fixture.path("main.dae"), &repaired).unwrap();
     let recovery = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
@@ -319,7 +334,7 @@ async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
         fixture.get(operation["href"].as_str().unwrap()).await,
         rejected
     );
-    assert_eq!(fixture.reloads.load(Ordering::SeqCst), reloads_before + 2);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), reloads_before + 3);
     fixture.shutdown().await;
 }
 
@@ -729,6 +744,8 @@ async fn written_source_whose_reload_cannot_dispatch_is_not_retryable() {
     )
     .await;
     assert_eq!(failure["error"]["details"]["written"], true);
+    assert_eq!(failure["error"]["details"]["committed"], false);
+    assert!(failure["error"]["details"]["stage"].is_string());
 }
 
 #[tokio::test]

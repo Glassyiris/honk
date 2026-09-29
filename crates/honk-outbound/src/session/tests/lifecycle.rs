@@ -6,9 +6,9 @@ use super::*;
 async fn caller_cancel_does_not_stop_shared_dial() {
     let pool = Arc::new(pool(SessionPoolConfig::default()));
     let (tx, rx) = tokio::sync::oneshot::channel::<Arc<TestSession>>();
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let events = Arc::new(Mutex::new(Vec::new()));
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let observer = {
         use crate::runtime::flow_observation::{FlowContext, FlowObserver};
         let events = Arc::clone(&events);
@@ -29,18 +29,18 @@ async fn caller_cancel_does_not_stop_shared_dial() {
             let s: anyhow::Result<Arc<TestSession>> = Ok(rx.await.expect("trigger"));
             s
         });
-        #[cfg(feature = "native-api")]
+        #[cfg(feature = "flow-observation")]
         let dial = observer.scope(dial);
         dial.await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     leader.abort();
     let _ = leader.await;
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     assert!(matches!(
         events.lock().as_slice(),
         [crate::runtime::flow_observation::FlowEvent::Gap(
-            "shared_dial_continues_after_waiter"
+            crate::runtime::flow_observation::GapReason::SharedDialContinuesAfterWaiter
         )]
     ));
     let dials = Arc::new(AtomicUsize::new(0));
@@ -70,7 +70,7 @@ async fn caller_cancel_does_not_stop_shared_dial() {
     assert_eq!(pool.pool.lock().dial_failures, 0);
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn shared_physical_setup_survives_creator_cancellation_without_reparenting() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
@@ -126,7 +126,7 @@ async fn shared_physical_setup_survives_creator_cancellation_without_reparenting
         .filter_map(|(context, event)| match event {
             FlowEvent::Transport {
                 attempt_id, status, ..
-            } => Some((context, *attempt_id, *status)),
+            } => Some((context, *attempt_id, status.as_str())),
             _ => None,
         })
         .collect();
@@ -140,7 +140,12 @@ async fn shared_physical_setup_survives_creator_cancellation_without_reparenting
     );
     assert!(events.iter().any(|(context, event)| {
         context.flow_id == creator_id
-            && matches!(event, FlowEvent::Gap("shared_dial_continues_after_waiter"))
+            && matches!(
+                event,
+                FlowEvent::Gap(
+                    crate::runtime::flow_observation::GapReason::SharedDialContinuesAfterWaiter
+                )
+            )
     }));
     assert!(
         !events
