@@ -1173,7 +1173,8 @@ impl Precondition {
                 .sources
                 .revision()
                 .is_some_and(|revision| if_match.matches(&revision)),
-            Self::Internal { .. } => false,
+            // No client condition: any concurrent change is a conflict.
+            Self::Internal { .. } => true,
         };
         if still { changed() } else { stale() }
     }
