@@ -1290,7 +1290,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
-    let router = routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources)?;
+    let mut shared = routing::SharedMatchers::default();
+    let router =
+        routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
     ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
@@ -1306,8 +1308,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_with_geo_sources(
         &config.dns,
         &geo_sources,
+        &mut shared,
     )?);
-    drop(geo_sources);
+    drop((geo_sources, shared));
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(

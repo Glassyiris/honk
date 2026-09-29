@@ -770,6 +770,80 @@ fn test_geoip_private_route() {
 }
 
 #[test]
+fn equal_ip_networks_share_one_matcher_across_routing_and_dns() {
+    use crate::dns::routing::DnsRouter;
+
+    use_repo_geo_assets();
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n u: 'udp://127.0.0.1:53'\n }\n routing { response {\n\
+         ip(geoip:private) -> accept\n !ip(198.18.0.0/15, geoip:private) -> reject\n\
+         fallback: u\n } } }\n\
+         routing {\n dip(geoip:private) && dport(443) -> block\n dip(geoip:private) -> direct\n\
+         dip(198.18.0.0/15, geoip:private) -> proxy\n !dip(geoip:private) && dport(53) -> alt\n\
+         fallback: fb\n }",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let sources = GeoSourceSet::load(&requirements);
+    let mut shared = SharedMatchers::default();
+    let router =
+        Router::from_config_with_geo_sources(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut shared).unwrap();
+    drop(shared);
+    let unshared_router =
+        Router::from_config_with_geo_sources(&config.routing, &sources, &mut Default::default())
+            .unwrap();
+    let unshared_dns =
+        DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut Default::default()).unwrap();
+
+    let routed: Vec<_> = router
+        .compiled_routes()
+        .iter()
+        .flat_map(|route| &route.conditions)
+        .filter_map(|condition| match &condition.predicate {
+            CompiledPredicate::DestinationIp(matcher) => Some(matcher),
+            _ => None,
+        })
+        .collect();
+    let answered = dns.answer_ip_matchers();
+    let [geo, geo_again, literal, negated] = routed[..] else {
+        panic!("expected four destination IP conditions");
+    };
+    assert!(Arc::ptr_eq(geo, geo_again) && Arc::ptr_eq(geo, negated));
+    assert!(Arc::ptr_eq(geo, answered[0]) && Arc::ptr_eq(literal, answered[1]));
+    assert!(!Arc::ptr_eq(geo, literal));
+    assert_eq!(
+        router.policy_fingerprint(),
+        unshared_router.policy_fingerprint()
+    );
+
+    let mut conn = make_conn(None, None);
+    for ip in [
+        "10.0.0.1",
+        "8.8.8.8",
+        "198.18.0.1",
+        "fd00::1",
+        "2001:4860::1",
+    ] {
+        conn.dst_ip = ip.parse().unwrap();
+        for port in [53, 80, 443] {
+            conn.dst_port = port;
+            assert_eq!(router.route(&conn), unshared_router.route(&conn), "{ip}");
+        }
+        let response = |dns: &DnsRouter| dns.select_response("a.test", 1, &[conn.dst_ip], "u");
+        assert_eq!(response(&dns), response(&unshared_dns), "{ip}");
+    }
+
+    let old = Arc::downgrade(geo);
+    drop((router, dns));
+    assert!(
+        old.upgrade().is_none(),
+        "the build must not outlive its routers"
+    );
+}
+
+#[test]
 fn test_geosite_route() {
     use_repo_geo_assets();
 

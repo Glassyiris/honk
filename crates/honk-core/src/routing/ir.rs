@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ipnet::IpNet;
 
@@ -45,6 +46,33 @@ impl IpMatcher {
 
     pub fn matches(&self, ip: &IpAddr) -> bool {
         self.trie.matches(ip)
+    }
+}
+
+/// Hands out one matcher per exact ordered network list. Equal lists build
+/// identical tries, so any holder's matcher is interchangeable.
+#[derive(Default)]
+pub(crate) struct SharedMatchers {
+    ip: Vec<Arc<IpMatcher>>,
+}
+
+impl SharedMatchers {
+    pub(crate) fn ip(&mut self, nets: Vec<IpNet>) -> Arc<IpMatcher> {
+        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
+            return Arc::clone(matcher);
+        }
+        let matcher = Arc::new(IpMatcher::new(nets));
+        self.ip.push(Arc::clone(&matcher));
+        matcher
+    }
+
+    /// Offers live matchers so a rebuild keeps them for unchanged network lists.
+    pub(crate) fn offer<'a>(&mut self, matchers: impl IntoIterator<Item = &'a Arc<IpMatcher>>) {
+        for matcher in matchers {
+            if !self.ip.iter().any(|known| known.nets() == matcher.nets()) {
+                self.ip.push(Arc::clone(matcher));
+            }
+        }
     }
 }
 
