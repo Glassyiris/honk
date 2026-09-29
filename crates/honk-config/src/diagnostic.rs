@@ -322,25 +322,42 @@ pub(crate) fn legacy_nfqueue_warning(source: SourceRef) -> DetailedDiagnostic {
     )
 }
 
+macro_rules! legacy_assets_key {
+    ($block:literal, $key:literal, $replacement:literal) => {
+        (
+            $block,
+            $key,
+            concat!(
+                "experimental.",
+                $block,
+                ".",
+                $key,
+                " is deprecated; migrate to ",
+                $replacement
+            ),
+        )
+    };
+}
+
 /// Old `experimental` download keys, the block that holds each, and the
-/// `assets` path that replaces it.
+/// warning that names the `assets` path replacing it.
 pub(crate) const LEGACY_ASSETS_KEYS: [(&str, &str, &str); 5] = [
-    (
+    legacy_assets_key!(
         "native_api",
         "geosite_download_url",
-        "assets.geodata.geosite",
+        "assets.geodata.geosite"
     ),
-    ("native_api", "geoip_download_url", "assets.geodata.geoip"),
-    (
+    legacy_assets_key!("native_api", "geoip_download_url", "assets.geodata.geoip"),
+    legacy_assets_key!(
         "native_api",
         "geodata_download_detour",
-        "assets.geodata.route",
+        "assets.geodata.route"
     ),
-    ("clash_api", "external_ui_download_url", "assets.ui.url"),
-    (
+    legacy_assets_key!("clash_api", "external_ui_download_url", "assets.ui.url"),
+    legacy_assets_key!(
         "clash_api",
         "external_ui_download_detour",
-        "assets.ui.route",
+        "assets.ui.route"
     ),
 ];
 
@@ -348,24 +365,8 @@ pub(crate) fn legacy_assets_warning(
     source: SourceRef,
     block: &'static str,
     key: &'static str,
+    message: &'static str,
 ) -> DetailedDiagnostic {
-    let message = match key {
-        "geosite_download_url" => {
-            "experimental.native_api.geosite_download_url is deprecated; migrate to assets.geodata.geosite"
-        }
-        "geoip_download_url" => {
-            "experimental.native_api.geoip_download_url is deprecated; migrate to assets.geodata.geoip"
-        }
-        "geodata_download_detour" => {
-            "experimental.native_api.geodata_download_detour is deprecated; migrate to assets.geodata.route"
-        }
-        "external_ui_download_url" => {
-            "experimental.clash_api.external_ui_download_url is deprecated; migrate to assets.ui.url"
-        }
-        _ => {
-            "experimental.clash_api.external_ui_download_detour is deprecated; migrate to assets.ui.route"
-        }
-    };
     DetailedDiagnostic::warning(
         "legacy-assets-key",
         source,

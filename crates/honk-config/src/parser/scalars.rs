@@ -747,7 +747,7 @@ pub(super) fn parse_experimental_section(
                     continue;
                 }
                 diagnostics.register_field(key.raw(), value);
-                if let Some(&(block, key, _)) = crate::diagnostic::LEGACY_ASSETS_KEYS
+                if let Some(&(block, key, message)) = crate::diagnostic::LEGACY_ASSETS_KEYS
                     .iter()
                     .find(|(block, legacy, _)| *block == name && *legacy == key.raw())
                 {
@@ -755,6 +755,7 @@ pub(super) fn parse_experimental_section(
                         diagnostics.source(),
                         block,
                         key,
+                        message,
                     ));
                 }
                 if name == "clash_api" && key.raw() == "external_controller" {
