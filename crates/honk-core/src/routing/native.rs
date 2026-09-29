@@ -113,24 +113,22 @@ impl Router {
         compiled: &CompiledCondition,
         configured: &honk_config::routing::RoutingCondition,
     ) -> String {
-        condition_display(&self.domain_matchers, compiled, configured)
+        condition_display(compiled, configured)
     }
 }
 
 pub(super) fn configured_rule_expression(
-    matchers: &[super::DomainMatcher],
     conditions: &[CompiledCondition],
     configured: &honk_config::routing::RoutingCondition,
 ) -> String {
     join_expressions(
         conditions
             .iter()
-            .map(|condition| condition_display(matchers, condition, configured)),
+            .map(|condition| condition_display(condition, configured)),
     )
 }
 
 pub(super) fn condition_display(
-    matchers: &[super::DomainMatcher],
     compiled: &CompiledCondition,
     configured: &honk_config::routing::RoutingCondition,
 ) -> String {
@@ -144,23 +142,17 @@ pub(super) fn condition_display(
                 }
             };
         }
-        // Select by the compiled predicate, not source order: domain/geosite split,
-        // while explicit destination IPs and geoip alternatives share one predicate.
         let (kind, fields): (&str, &[(&str, &[String])]) = match &compiled.predicate {
-            CompiledPredicate::Domain(id) => match &matchers[*id as usize] {
-                super::DomainMatcher::Ordinary { .. } => (
-                    "domain",
-                    &[
-                        ("full: ", field!(domain)),
-                        ("suffix: ", field!(domain_suffix)),
-                        ("keyword: ", field!(domain_keyword)),
-                        ("regex: ", field!(domain_regex)),
-                    ],
-                ),
-                super::DomainMatcher::Geosite { .. } => {
-                    ("domain", &[("geosite: ", field!(geosite))])
-                }
-            },
+            CompiledPredicate::Domain(_) => (
+                "domain",
+                &[
+                    ("full: ", field!(domain)),
+                    ("suffix: ", field!(domain_suffix)),
+                    ("keyword: ", field!(domain_keyword)),
+                    ("regex: ", field!(domain_regex)),
+                    ("geosite: ", field!(geosite)),
+                ],
+            ),
             CompiledPredicate::DestinationIp(_) => {
                 ("dip", &[("", field!(ip)), ("geoip: ", field!(geo_ip))])
             }
@@ -197,7 +189,7 @@ impl Router {
         conditions: &[CompiledCondition],
         configured: &honk_config::routing::RoutingCondition,
     ) -> String {
-        configured_rule_expression(&self.domain_matchers, conditions, configured)
+        configured_rule_expression(conditions, configured)
     }
 
     pub(crate) fn simulate(

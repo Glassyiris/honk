@@ -151,8 +151,7 @@ fn encode_ip_nets(encoder: &mut Encoder<'_>, nets: &[ipnet::IpNet]) {
 }
 
 fn encode_domain_key(encoder: &mut Encoder<'_>, key: &DomainMatcherKey) {
-    encoder.u8(key.class);
-    encoder.list(&key.alternatives, |encoder, (tag, alternative)| {
+    encoder.list(key, |encoder, (tag, alternative)| {
         encoder.u8(*tag);
         encoder.string(alternative);
     });
@@ -241,24 +240,27 @@ mod tests {
 
     #[test]
     fn semantic_encoder_preserves_domain_class_tags_and_registry_order() {
+        let geosite = |domain| {
+            DomainMatcher::new(&[], &[], &[], &[], &[domain], Vec::new())
+                .unwrap()
+                .0
+        };
         let (ordinary, _) =
-            DomainMatcher::ordinary(&[], &[], &["example.com".into()], &[]).unwrap();
-        let (geosite, _) =
-            DomainMatcher::geosite(&[GeositeDomain::Keyword("example.com".into())], Vec::new());
+            DomainMatcher::new(&[], &[], &["example.com".into()], &[], &[], Vec::new()).unwrap();
+        let keyword = geosite(GeositeDomain::Keyword("example.com".into()));
         assert_ne!(
             digest(&[], std::slice::from_ref(&ordinary)),
-            digest(&[], std::slice::from_ref(&geosite))
+            digest(&[], std::slice::from_ref(&keyword))
         );
 
-        let (full, _) =
-            DomainMatcher::geosite(&[GeositeDomain::Full("example.com".into())], Vec::new());
+        let full = geosite(GeositeDomain::Full("example.com".into()));
         assert_ne!(
-            digest(&[], std::slice::from_ref(&geosite)),
+            digest(&[], std::slice::from_ref(&keyword)),
             digest(&[], &[full])
         );
         assert_ne!(
-            digest(&[], &[ordinary.clone(), geosite.clone()]),
-            digest(&[], &[geosite, ordinary]),
+            digest(&[], &[ordinary.clone(), keyword.clone()]),
+            digest(&[], &[keyword, ordinary]),
         );
     }
 

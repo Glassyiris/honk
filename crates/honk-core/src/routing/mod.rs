@@ -161,29 +161,27 @@ impl GeositeMatcher {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DomainMatcherKey {
-    class: u8,
-    alternatives: Vec<(u8, String)>,
-}
+type DomainMatcherKey = Vec<(u8, String)>;
 
+/// One `domain(...)` call. Every entry, including expanded geosite codes, is
+/// an alternative: dae ORs the arguments of a single call.
 #[derive(Debug, Clone)]
-enum DomainMatcher {
-    Ordinary {
-        patterns: Vec<Regex>,
-        suffixes: Vec<String>,
-        keywords: Vec<String>,
-    },
+struct DomainMatcher {
+    patterns: Vec<Regex>,
+    suffixes: Vec<String>,
+    keywords: Vec<String>,
     /// One matcher per configured selector, matched as their union.
-    Geosite(Vec<Arc<GeositeMatcher>>),
+    geosite: Vec<Arc<GeositeMatcher>>,
 }
 
 impl DomainMatcher {
-    fn ordinary(
+    fn new(
         domains: &[String],
         suffixes: &[String],
         keywords: &[String],
         regexes: &[String],
+        geosite: &[GeositeDomain],
+        matchers: Vec<Arc<GeositeMatcher>>,
     ) -> anyhow::Result<(DomainMatcherKey, Self)> {
         let mut patterns = Vec::with_capacity(regexes.len() + domains.len());
         for pattern in regexes {
@@ -199,48 +197,29 @@ impl DomainMatcher {
                 })?,
             );
         }
-        let mut alternatives = patterns
+        let mut key = patterns
             .iter()
             .map(|pattern| (0, pattern.as_str().to_owned()))
             .chain(suffixes.iter().cloned().map(|value| (1, value)))
             .chain(keywords.iter().cloned().map(|value| (2, value)))
+            .chain(geosite.iter().map(|domain| match domain {
+                GeositeDomain::Full(value) => (3, value.to_lowercase()),
+                GeositeDomain::Domain(value) => (4, value.to_lowercase()),
+                GeositeDomain::Keyword(value) => (5, value.clone()),
+                GeositeDomain::Regex(value) => (6, value.as_str().to_owned()),
+            }))
             .collect::<Vec<_>>();
-        alternatives.sort();
-        alternatives.dedup();
-        let key = DomainMatcherKey {
-            class: 0,
-            alternatives,
-        };
+        key.sort();
+        key.dedup();
         Ok((
             key,
-            Self::Ordinary {
+            Self {
                 patterns,
                 suffixes: suffixes.to_vec(),
                 keywords: keywords.to_vec(),
+                geosite: matchers,
             },
         ))
-    }
-
-    fn geosite(
-        domains: &[GeositeDomain],
-        matchers: Vec<Arc<GeositeMatcher>>,
-    ) -> (DomainMatcherKey, Self) {
-        let mut alternatives = domains
-            .iter()
-            .map(|domain| match domain {
-                GeositeDomain::Full(value) => (0, value.to_lowercase()),
-                GeositeDomain::Domain(value) => (1, value.to_lowercase()),
-                GeositeDomain::Keyword(value) => (2, value.clone()),
-                GeositeDomain::Regex(value) => (3, value.as_str().to_owned()),
-            })
-            .collect::<Vec<_>>();
-        alternatives.sort();
-        alternatives.dedup();
-        let key = DomainMatcherKey {
-            class: 1,
-            alternatives,
-        };
-        (key, Self::Geosite(matchers))
     }
 
     fn matches(&self, domain: &str) -> bool {
@@ -252,28 +231,19 @@ impl DomainMatcher {
         domain: &str,
         deadline: Option<std::time::Instant>,
     ) -> bool {
-        match self {
-            Self::Ordinary {
-                patterns,
-                suffixes,
-                keywords,
-                ..
-            } => {
-                bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| pattern.is_match(domain))
-                    || bounded_any::<BOUNDED, _>(suffixes, deadline, |suffix| {
-                        domain.ends_with(suffix)
-                    })
-                    || bounded_any::<BOUNDED, _>(keywords, deadline, |keyword| {
-                        domain.contains(keyword)
-                    })
-            }
-            Self::Geosite(matchers) => {
+        bounded_any::<BOUNDED, _>(&self.patterns, deadline, |pattern| pattern.is_match(domain))
+            || bounded_any::<BOUNDED, _>(&self.suffixes, deadline, |suffix| {
+                domain.ends_with(suffix)
+            })
+            || bounded_any::<BOUNDED, _>(&self.keywords, deadline, |keyword| {
+                domain.contains(keyword)
+            })
+            || (!self.geosite.is_empty() && {
                 let lower = domain.to_lowercase();
-                matchers
-                    .iter()
-                    .any(|matcher| matcher.matches_bounded::<BOUNDED>(domain, &lower, deadline))
-            }
-        }
+                bounded_any::<BOUNDED, _>(&self.geosite, deadline, |matcher| {
+                    matcher.matches_bounded::<BOUNDED>(domain, &lower, deadline)
+                })
+            })
     }
 }
 
@@ -510,7 +480,6 @@ impl Router {
                 .iter()
                 .map(|condition| {
                     native::bounded_expression(native::condition_display(
-                        &registry.matchers,
                         condition,
                         &rules[route.id as usize].condition,
                     ))
@@ -617,11 +586,7 @@ impl Router {
     pub(crate) fn geosite_matchers(&self) -> Vec<&Arc<GeositeMatcher>> {
         self.domain_matchers
             .iter()
-            .filter_map(|matcher| match matcher {
-                DomainMatcher::Geosite(matchers) => Some(matchers),
-                DomainMatcher::Ordinary { .. } => None,
-            })
-            .flatten()
+            .flat_map(|matcher| &matcher.geosite)
             .collect()
     }
 
@@ -865,26 +830,22 @@ fn append_conditions(
         || !domain_suffixes.is_empty()
         || !domain_keywords.is_empty()
         || !domain_regex.is_empty()
+        || !geosites.is_empty()
     {
-        let id = registry.intern(DomainMatcher::ordinary(
+        let (mut geosite_domains, mut matchers) = (Vec::new(), Vec::new());
+        for code in geosites {
+            let selected = assets.geosite_domains(std::slice::from_ref(code));
+            matchers.push(shared.geosite(code, &selected));
+            geosite_domains.extend(selected);
+        }
+        let id = registry.intern(DomainMatcher::new(
             domains,
             domain_suffixes,
             domain_keywords,
             domain_regex,
+            &geosite_domains,
+            matchers,
         )?)?;
-        conditions.push(CompiledCondition {
-            not,
-            predicate: CompiledPredicate::Domain(id),
-        });
-    }
-    if !geosites.is_empty() {
-        let (mut domains, mut matchers) = (Vec::new(), Vec::new());
-        for code in geosites {
-            let selected = assets.geosite_domains(std::slice::from_ref(code));
-            matchers.push(shared.geosite(code, &selected));
-            domains.extend(selected);
-        }
-        let id = registry.intern(DomainMatcher::geosite(&domains, matchers))?;
         conditions.push(CompiledCondition {
             not,
             predicate: CompiledPredicate::Domain(id),

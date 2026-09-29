@@ -1225,7 +1225,7 @@ fn geosite_matchers_intern_on_exact_expansions() {
     let mut registry = DomainRegistry::default();
     let mut intern = |domains: Vec<GeositeDomain>| {
         registry
-            .intern(DomainMatcher::geosite(&domains, Vec::new()))
+            .intern(DomainMatcher::new(&[], &[], &[], &[], &domains, Vec::new()).unwrap())
             .unwrap()
     };
     let base = intern(vec![Domain("Example.COM".into()), Keyword("Tube".into())]);
@@ -1259,11 +1259,16 @@ fn geosite_policy_fingerprint_covers_the_exact_expansion() {
     let router = Router::new(&rules, "proxy").unwrap();
     let requirements = GeoRequirements::for_traffic(&rules);
     let sources = GeoSourceSet::load(&requirements);
-    let (exact, _) = DomainMatcher::geosite(
+    let (exact, _) = DomainMatcher::new(
+        &[],
+        &[],
+        &[],
+        &[],
         &GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
         Vec::new(),
-    );
-    assert!(!exact.alternatives.is_empty());
+    )
+    .unwrap();
+    assert!(!exact.is_empty());
     assert_eq!(
         router.policy_fingerprint(),
         fingerprint::policy(
