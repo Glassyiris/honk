@@ -48,6 +48,7 @@ anyhow = "1"
 
 # HTTP (clash-api in honk-core, h2 probes in honk-outbound)
 axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 reqwest = { version = "0.13", features = [
     "json",
@@ -55,8 +56,12 @@ reqwest = { version = "0.13", features = [
 ], default-features = false }
 h2 = "0.4"
 http = "1"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client-proxy"] }
+hyper = { version = "1.11", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "service",
+    "client-proxy",
+] }
 
 # eBPF / Aya
 aya = "0.14"
@@ -93,6 +98,7 @@ hmac = "0.13"
 hkdf = "0.13"
 md-5 = "0.11"
 blake3 = "1"
+subtle = "2.6.1"
 
 # Networking
 socket2 = { version = "0.6", features = ["all"] }
@@ -109,7 +115,7 @@ percent-encoding = "2"
 aho-corasick = "1"
 
 # Persistence (cache_file / cachedb)
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
