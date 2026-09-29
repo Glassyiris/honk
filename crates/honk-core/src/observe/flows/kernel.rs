@@ -149,24 +149,22 @@ impl KernelTraceDictionary {
         })
     }
 
-    /// `prepare` for a plan about to be published. A plan left without a
-    /// dictionary is published untraced: its witnesses could not be decoded.
-    pub(crate) fn prepare_or_untrace(
-        instance: &str,
-        generation: u64,
+    /// Whether a dictionary for `plan` fits under any instance and generation
+    /// that later binds it: instance IDs are hyphenated UUIDs, and the largest
+    /// generation has the longest rule IDs.
+    pub(crate) fn fits(
         router: &Router,
         config: &honk_config::Config,
-        plan: &mut std::sync::Arc<RoutingPushPlan>,
-    ) -> Option<Self> {
-        let dictionary = Self::prepare(instance, generation, router, config, plan);
-        if dictionary.is_none() && plan.trace_enabled() {
-            tracing::warn!(
-                generation,
-                "routing policy too large for its kernel trace dictionary; kernel route tracing is off"
-            );
-            std::sync::Arc::make_mut(plan).enable_trace(false);
-        }
-        dictionary
+        plan: &RoutingPushPlan,
+    ) -> bool {
+        Self::prepare(
+            &uuid::Uuid::nil().to_string(),
+            u64::MAX,
+            router,
+            config,
+            plan,
+        )
+        .is_some()
     }
 
     fn outbound(&self, index: u8) -> Option<String> {

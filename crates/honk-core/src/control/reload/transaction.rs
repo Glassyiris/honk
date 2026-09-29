@@ -536,15 +536,13 @@ impl ControlPlane {
                 .saturating_add(1),
         );
         #[cfg(feature = "native-api")]
-        let mut new_plan = new_plan;
-        #[cfg(feature = "native-api")]
         let prepared_dictionary = self.native.as_ref().and_then(|native| {
-            crate::observe::flows::kernel::KernelTraceDictionary::prepare_or_untrace(
+            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
                 &native.instance_id,
                 generation.get(),
                 &new_router,
                 &new_config,
-                &mut new_plan,
+                &new_plan,
             )
         });
         let old_projection_snapshot = {

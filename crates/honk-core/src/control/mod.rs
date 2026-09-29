@@ -456,6 +456,16 @@ impl ControlPlane {
                 && config.experimental.native_api.enabled
                 && config.experimental.native_api.record_flows,
         );
+        // Witnesses of a policy without a dictionary could not be decoded.
+        #[cfg(feature = "native-api")]
+        if plan.trace_enabled()
+            && !crate::observe::flows::kernel::KernelTraceDictionary::fits(router, config, &plan)
+        {
+            tracing::warn!(
+                "routing policy too large for its kernel trace dictionary; kernel route tracing is off"
+            );
+            plan.enable_trace(false);
+        }
         Ok(plan)
     }
 }

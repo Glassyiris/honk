@@ -3774,6 +3774,7 @@ async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
     };
     let tracing = |cp: &ControlPlane| cp.active_routing_plan.read().trace_enabled();
 
+    assert!(!tracing(&plane(native_config(80))), "startup");
     let mut cp = plane(native_config(1));
     let _native = crate::native_api::observation::NativeObservation::attach(&mut cp).await;
     assert!(tracing(&cp));
