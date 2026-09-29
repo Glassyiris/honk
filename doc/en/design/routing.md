@@ -40,8 +40,8 @@ directly; use a group (including a one-node filter group).
 Kernel routing preserves the userspace matching contract:
 
 - Ordinary domain pattern/suffix/keyword/regex and geosite alternatives form one
-  condition. Existing suffix, regex, keyword, case, and geosite attribute behavior
-  is retained.
+  condition. Negation applies once to their union. Existing suffix, regex,
+  keyword, case, and geosite attribute behavior is retained.
 - Destination/source IP predicates preserve IPv4/IPv6 identity, including `/0`,
   host addresses and overlapping prefixes.
 - Port ranges are inclusive. TCP/UDP and IPv4/IPv6 masks retain both alternatives.
