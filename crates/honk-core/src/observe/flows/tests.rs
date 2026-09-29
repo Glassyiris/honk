@@ -815,6 +815,8 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
         assert_eq!(data["selection_path"][0]["member_id"], "node-1");
         assert_eq!(data["selection_path"][0]["member_name"], "HK/Trojan");
         assert_eq!(data["routed_outbound"], "Group/Proxy");
+        assert_eq!(data["x-honk"]["mode_override"], "none");
+        assert!(data.get("mode_override").is_none());
     }
     assert_eq!(detail["trace"]["missing"], json!(["not_instrumented"]));
 }
