@@ -292,34 +292,28 @@ pub fn append_subscription_source(
     let mut notices = Vec::new();
     let mut diagnostics =
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
-    let assets = document_assets(&document, &mut diagnostics);
-    let subscriptions =
-        super::entries::parse_subscription_section(&sections, &assets, &mut diagnostics)
-            .map_err(|_| SourceEditError)?;
+    // Only names are compared, and they do not depend on `assets` defaults.
+    let subscriptions = super::entries::parse_subscription_section(
+        &sections,
+        &crate::assets::AssetsConfig::default(),
+        &mut diagnostics,
+    )
+    .map_err(|_| SourceEditError)?;
     if subscriptions.iter().any(|existing| existing.name == name) {
         return Err(SourceEditError);
     }
     Ok(append_entry(&document, "subscription", &entry))
 }
 
-/// Entries inherit the file's `assets` defaults, as they do when it loads.
-fn document_assets(
-    document: &super::cursor::Document<'_>,
-    diagnostics: &mut super::diagnostics::ParserDiagnostics<'_>,
-) -> crate::assets::AssetsConfig {
-    let sections = document
-        .sections()
-        .filter(|root| root.header() == "assets")
-        .collect::<Vec<_>>();
-    super::assets::parse_section(&sections, diagnostics).config
-}
-
 /// Match by name and fetch identity (URL, configured UA, headers), never the
 /// parser's random subscription UUID or mutable refresh metadata. Ambiguous
 /// duplicate declarations and legacy headers owning child entries are rejected.
+/// `assets` is the loaded configuration's block, which any source may declare,
+/// so an entry's effective UA matches the live subscription's.
 pub fn remove_subscription_source(
     source: &SourceSnapshot,
     subscription: &crate::subscription::Subscription,
+    assets: &crate::assets::AssetsConfig,
 ) -> Result<Option<String>, SourceEditError> {
     let document = managed_document(source)?;
     let sections = document
@@ -331,10 +325,9 @@ pub fn remove_subscription_source(
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
     let mut target = None;
     let mut ambiguous = false;
-    let assets = document_assets(&document, &mut diagnostics);
     super::entries::parse_subscription_section_indexed(
         &sections,
-        &assets,
+        assets,
         &mut diagnostics,
         |existing, span| {
             if existing.name == subscription.name

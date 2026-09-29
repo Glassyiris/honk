@@ -468,7 +468,7 @@ impl Worker {
                 {
                     return Err(management::unsupported());
                 }
-                remove_subscription_source(main, subscription)
+                remove_subscription_source(main, subscription, &active.assets)
                     .map_err(|_| management::unsupported())?
                     .ok_or_else(management::unsupported)?
             }
