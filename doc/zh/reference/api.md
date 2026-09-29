@@ -2,9 +2,9 @@
 
 原生与 Clash API 具有独立的 feature、listener、凭证及 HTTP 边界，共用底层引擎 handles 与用户态统计。
 
-## 原生 API (M1)
+## 原生 API
 
-本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
+本节说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
 基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。采用该后续 bundle 的自动策略 override（固定成员与 DELETE selection），不采用其 mode 变更：原生 mode 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
@@ -121,7 +121,7 @@ Setup 占有凭据状态后，discovery 返回 `setup_required:false`，耐久�
 
 Reset 在检查数据库是否存在前取得状态目录的排他锁，因此不会与首次启动的旧凭据导入竞态。旧凭据文件仍须通过所有者、权限和普通文件检查。
 
-### 用户态记录流（M2）
+### 用户态记录流
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 flow 数据。
 
@@ -143,7 +143,7 @@ Flow ID 表示 incarnation，不是五元组。TCP/UDP 捕获真实执行的路�
 
 Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八份有界不可变 snapshot，TTL 30 秒，游标绑定 instance 与原过滤器/detail。表满时淘汰最旧 snapshot；保留字节预算耗尽才返回 503 与 Retry-After。过期或被淘汰的列表返回 `410 snapshot_expired`，已知淘汰 ID 的有界 tombstone 返回 `410 flow_expired`，未知 ID 返回 `404 resource_not_found`。Detail 不接受 query，始终返回保留的 full input/trace。计数为十进制字符串，revision/seq/elapsed_us 为 safe JSON number；显示字段在 512 字节 `MAX_TEXT` 上限内保留路径、`@` 和 URL；标识符仍单独校验。无法表示或超限的文本、步骤/字节预算溢出仍明确报告为不完整证据，不丢弃因果 ID 或结果。保留的规则展示属于捕获时的代次，不从当前配置重建。
 
-### 节点与组（M3）
+### 节点与组
 
 节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
@@ -156,9 +156,9 @@ Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，
 
 组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`、`/config/check_url`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数；`check_url` 为 null，或以小写 `http://`/`https://` 开头、含主机的 URL，不含 userinfo、空白、控制字符与逗号，也不同时含单引号和双引号；PATCH 写入 GET 显示且探测实际发送的规范化形式（去掉 fragment、空路径补 `/`、主机转小写、省略默认端口），不超过 2048 字节，`test` 也按此形式比较。Selector 组接受并保存 `check_url`，但不据此探测。只有 URLTest 组报告并接受 `tolerance`：其他策略报告 `null`，`mutable_config` 不含该字段，把它设为非 null 值的 PATCH 返回 422 `unsupported_value`；允许 `remove`，同一 PATCH 把策略改为 URLTest 时可以设置。此接口不改成员列表或 icon。
 
-源不可写时 `mutable_config` 为空，PATCH 返回 `404 capability_not_supported`。PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用 M6 源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
+源不可写时 `mutable_config` 为空，PATCH 返回 `404 capability_not_supported`。PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用配置来源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
 
-### 原生事件（M4）
+### 原生事件
 
 使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。每 15 秒 heartbeat。每个连接都先发送 ready；有效续传的顺序为 ready→replay→live，ready 保留请求 cursor，之后由 replay 推进，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
 
@@ -170,7 +170,7 @@ Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，
 
 客户端已连接，或获准的记录器通过显式运行时设置持续开启时，事件捕获开启。空闲事件中心仍接受新流；停止捕获后，旧事件游标失效。事件开启时，手动或自动记录切换通过 `flow.gap` 的 `reason=recording_changed` 表示记录连续性中断，不表示丢包或未捕获的 flow 数量。空闲事件中心不重放关闭时的 gap；重新连接建立新的记录边界。
 
-### 出站、内存与历史（M5）
+### 出站、内存与历史
 
 `runtime/outbounds` 复用逐出站账本，不按 HTTP 客户端建立计数器。`kind` 区分 `builtin/node/group`，名称可能相同，不能只按 name 合并。累计连接、upload/download bytes 与 errors 保留完整 UInt64 十进制字符串；`active_connections` 为 safe JSON number。计数与 `counter_since` 属于共用 StatsManager 生命周期，reload 不清零。
 
@@ -180,7 +180,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 `record_traffic` 与 `record_memory` 默认 true。两种 history 共用既有的一秒 sampler（错过 tick 使用 Skip），无客户端也记录；各最多 600 点、600 秒，仅存内存，重启清空。设 false 并重启后释放对应缓冲，history 返回 `404 capability_not_supported`，即时 runtime/outbounds/memory 仍可读。`max_points` 从最新点向前按能满足上限的最小 stride 抽取，再按时间从旧到新返回；`sampled_every_seconds` 表示该名义 stride，不保证无缺口。保留原始时间戳、null 与采样缺口，不插值或补零。
 
-### 配置来源、校验与操作（M6）
+### 配置来源、校验与操作
 
 只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，源 `path` 与规则 `file` 保留规范化的入口目录相对名称（例如 `config.d/routing.dae`），源 `absolute_path` 另行提供规范化绝对路径；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。因此 capabilities 中 `config.max_bytes` 为 65536，即单次请求能携带的最大替换内容；`config_validate.max_bytes` 为 8 MiB 预算，因为完整校验还计入从磁盘读取的依赖。
 
@@ -276,7 +276,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_log` 各含 `{allowed, mode, active}`，其中 `mode` 为 `"auto"`、`"on"` 或 `"off"`；`events.active` 表示事件捕获是否开启，`grace_remaining_seconds` 表示通用连接宽限期剩余秒数，不是独立的 flow 需求宽限期。读取设置不延长任何一个期限。
 
-### 主文件条目与 geodata 管理（M9）
+### 主文件条目与 geodata 管理
 
 `resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted **主文件**可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。`resources.providers.create_options` 列出可选的 provider 字段及省略时采用的值：`update_interval`（秒，最多一年，`0` 表示只在请求时刷新，默认 `86400`）、`user_agent`（1 至 256 个可打印 ASCII 字符，默认 `honk/<version>`），以及仅在 `global.store_subscribe` 打开订阅存储时列出的 `cache`（默认 `true`）。带任一字段的 provider 以块形式写入，使用 `ua`、`interval` 和 `cache`；未列出或超出范围的值返回 `422 unsupported_value`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
 

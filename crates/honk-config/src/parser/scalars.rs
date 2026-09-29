@@ -795,7 +795,11 @@ pub(super) fn parse_experimental_section(
                         config.cache_file.legacy_store_fakeip =
                             Some(strict_bool(value.unquote().raw()).unwrap_or(false));
                     }
-                    for key in config.cache_file.legacy_keys() {
+                    for key in config
+                        .cache_file
+                        .legacy_keys()
+                        .filter(|key| values.contains_key(key))
+                    {
                         diagnostics.emit(crate::diagnostic::legacy_cache_file_warning(
                             diagnostics.source(),
                             key,
@@ -926,6 +930,28 @@ pub(super) fn parse_experimental_section(
                     }
                     if let Some(text) = values.get("writable_includes") {
                         let _ = new_list_value(*text, diagnostics);
+                    }
+                    for (key, message) in [
+                        (
+                            "config_content",
+                            "experimental.native_api.config_content no longer has an effect",
+                        ),
+                        (
+                            "writable_includes",
+                            "experimental.native_api.writable_includes no longer has an effect",
+                        ),
+                    ] {
+                        if values.contains_key(key) {
+                            diagnostics.emit(crate::diagnostic::DetailedDiagnostic::warning(
+                                "legacy-native-api",
+                                diagnostics.source(),
+                                SettingPath::new("experimental")
+                                    .field("native_api")
+                                    .field(key),
+                                crate::diagnostic::SafeValue::Redacted,
+                                message,
+                            ));
+                        }
                     }
                     for (key, setting, target) in [
                         (
