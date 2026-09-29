@@ -1007,4 +1007,14 @@ mod tests {
             assert_eq!(body["error"]["code"], code);
         }
     }
+
+    #[tokio::test]
+    async fn discovery_links_operations_by_operation_id() {
+        let state = state().await;
+        let discovery = types::discovery(state.auth_discovery(), true);
+        assert_eq!(
+            discovery["links"]["operations"],
+            "/api/v1/operations/{operation_id}"
+        );
+    }
 }

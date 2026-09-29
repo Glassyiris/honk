@@ -364,7 +364,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
             "providers": "/api/v1/providers",
             "rules": "/api/v1/rules",
             "geodata": "/api/v1/geodata",
-            "operations": "/api/v1/operations/{id}",
+            "operations": "/api/v1/operations/{operation_id}",
             "auth_setup": link("/api/v1/auth/setup"),
             "auth_login": link("/api/v1/auth/login"),
             "auth_logout": link("/api/v1/auth/logout"),
