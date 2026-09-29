@@ -1005,7 +1005,7 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
     let main = std::fs::read_to_string(fixture.path("main.dae")).unwrap();
     assert!(
         main.contains(
-            "    optioned: {\n        url: 'https://example.test/sub'\n        ua: 'clash.meta'\n        interval: '3600s'\n    }\n"
+            "    optioned: 'https://example.test/sub' {\n        ua: 'clash.meta'\n        interval: 3600s\n    }\n"
         ),
         "{main}"
     );

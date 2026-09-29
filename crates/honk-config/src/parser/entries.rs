@@ -192,7 +192,7 @@ fn warn_glued_comment(tail: Text<'_, '_>, diagnostics: &mut ParserDiagnostics<'_
 pub(super) fn parse_subscription_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Result<Vec<Subscription>, crate::ConfigError> {
+) -> Result<Vec<Subscription>, super::ParseFailure> {
     parse_subscription_section_indexed(section, diagnostics, |_, _| {})
 }
 
@@ -202,7 +202,7 @@ pub(super) fn parse_subscription_section_indexed(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
     mut on_entry: impl FnMut(&Subscription, Option<Span>),
-) -> Result<Vec<Subscription>, crate::ConfigError> {
+) -> Result<Vec<Subscription>, super::ParseFailure> {
     let mut subscriptions = Vec::new();
     let mut entry_index = 0;
     for root in section {
@@ -216,7 +216,7 @@ pub(super) fn parse_subscription_section_indexed(
                 &mut subscriptions,
                 &mut entry_index,
                 &mut on_entry,
-            );
+            )?;
         }
     }
     Ok(subscriptions)
@@ -228,15 +228,18 @@ fn visit_subscription_segment<'d, 'a>(
     subscriptions: &mut Vec<Subscription>,
     entry_index: &mut usize,
     on_entry: &mut impl FnMut(&Subscription, Option<Span>),
-) {
+) -> Result<(), super::ParseFailure> {
     diagnostics.at_section("subscription", Text::segment(segment));
-    if let Some(tag) = block_tag(segment) {
+    let block = block_tag(segment)
+        .map(|tag| (tag, None))
+        .or_else(|| entry_block_header(segment).map(|(tag, url)| (tag, Some(url))));
+    if let Some((tag, url)) = block {
         *entry_index += 1;
         diagnostics.subscription_text(Text::segment(segment).trim(), *entry_index);
-        let subscription = parse_subscription_block(segment, tag, diagnostics);
+        let subscription = parse_subscription_block(segment, tag, url, *entry_index, diagnostics)?;
         on_entry(&subscription, Some(segment.span()));
         subscriptions.push(subscription);
-        return;
+        return Ok(());
     }
 
     if let Some(header) = super::read::block_header(segment) {
@@ -264,15 +267,15 @@ fn visit_subscription_segment<'d, 'a>(
                     subscriptions,
                     entry_index,
                     on_entry,
-                );
+                )?;
             }
         }
-        return;
+        return Ok(());
     }
 
     let text = Text::segment(segment).trim();
     if text.raw().is_empty() {
-        return;
+        return Ok(());
     }
     *entry_index += 1;
     diagnostics.entry_text(text, *entry_index);
@@ -280,6 +283,7 @@ fn visit_subscription_segment<'d, 'a>(
         on_entry(&subscription, Some(span));
         subscriptions.push(subscription);
     }
+    Ok(())
 }
 
 fn block_tag<'d, 'a>(segment: &Segment<'d, 'a>) -> Option<Text<'d, 'a>> {
@@ -288,19 +292,38 @@ fn block_tag<'d, 'a>(segment: &Segment<'d, 'a>) -> Option<Text<'d, 'a>> {
     value.raw().is_empty().then_some(tag)
 }
 
+/// `tag: 'url' { … }`: a whole-quoted link followed by the entry's own options.
+/// Any other header before a block stays a legacy wrapper.
+fn entry_block_header<'d, 'a>(segment: &Segment<'d, 'a>) -> Option<(Text<'d, 'a>, Text<'d, 'a>)> {
+    let header = super::read::block_header(segment)?;
+    if header.has_error() {
+        return None;
+    }
+    let (tag, value) = header.kv()?;
+    let value = value.trim();
+    let quote = value
+        .quoted_prefix()
+        .filter(|quote| quote.span == value.span)?;
+    Some((tag, quote.unquote()))
+}
+
 #[derive(Default)]
 struct SubscriptionFields<'d, 'a> {
     url: Option<Text<'d, 'a>>,
     user_agent: Option<Text<'d, 'a>>,
     interval: Option<Text<'d, 'a>>,
     cache: Option<Text<'d, 'a>>,
+    route: Option<Text<'d, 'a>>,
     download_detour: Option<Text<'d, 'a>>,
 }
 
+/// The old `tag: { url: … }` block also reads `url` and `download_detour`;
+/// the entry form keeps its link on the header and takes only options.
 fn collect_subscription_fields<'d, 'a>(
     segment: &Segment<'d, 'a>,
     diagnostics: &mut ParserDiagnostics<'_>,
     fields: &mut SubscriptionFields<'d, 'a>,
+    legacy: bool,
 ) {
     let Some(body) = segment.body() else {
         return;
@@ -315,11 +338,12 @@ fn collect_subscription_fields<'d, 'a>(
             diagnostics.register_field(key.raw(), value);
             let value = value.unquote();
             match key.raw() {
-                "url" => fields.url = Some(value),
+                "url" if legacy => fields.url = Some(value),
                 "ua" => fields.user_agent = Some(value),
                 "interval" => fields.interval = Some(value),
                 "cache" => fields.cache = Some(value),
-                "download_detour" => fields.download_detour = Some(value),
+                "route" => fields.route = Some(value),
+                "download_detour" if legacy => fields.download_detour = Some(value),
                 _ if super::read::block_header(&child).is_none() => key.notice(
                     diagnostics,
                     Severity::Warning,
@@ -336,30 +360,54 @@ fn collect_subscription_fields<'d, 'a>(
                 "legacy-wrapper",
                 "nested subscription wrapper is retained for compatibility",
             );
-            collect_subscription_fields(&child, diagnostics, fields);
+            collect_subscription_fields(&child, diagnostics, fields, legacy);
         }
     }
 }
 
+/// `url` is the entry form's header link; `None` reads the old block form.
 fn parse_subscription_block<'d, 'a>(
     segment: &Segment<'d, 'a>,
     tag: Text<'d, 'a>,
+    url: Option<Text<'d, 'a>>,
+    index: usize,
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Subscription {
+) -> Result<Subscription, super::ParseFailure> {
     let mut subscription = Subscription {
         name: canonical_tag(tag),
         source: Some(DeclaringSource(Text::segment(segment).source.reference())),
         ..Default::default()
     };
-    let mut fields = SubscriptionFields::default();
-    collect_subscription_fields(segment, diagnostics, &mut fields);
+    let mut fields = SubscriptionFields {
+        url,
+        ..Default::default()
+    };
+    collect_subscription_fields(segment, diagnostics, &mut fields, url.is_none());
+    if let (Some(route), Some(_)) = (fields.route, fields.download_detour) {
+        let (line, column) = route.source.location(route.span.start);
+        let mut error = crate::error::DetailedConfigError::new(
+            crate::error::ErrorCategory::Parse,
+            "conflicting-subscription-route",
+            route.source.reference(),
+            crate::diagnostic::SettingPath::new("subscriptions")
+                .index(index)
+                .field("route"),
+            "subscription entry sets both route and download_detour",
+        );
+        error.diagnostic.value =
+            crate::diagnostic::SafeValue::Fields(vec!["route", "download_detour"]);
+        error.diagnostic.line = Some(line);
+        error.diagnostic.span = Some(route.span.start..route.span.end);
+        error.diagnostic.byte_column = Some(column);
+        return Err(super::ParseFailure::Detailed(error));
+    }
     if let Some(url) = fields.url {
         subscription.url = url.raw().to_owned();
     }
     if let Some(user_agent) = fields.user_agent {
         subscription.user_agent = Some(user_agent.raw().to_owned());
     }
-    if let Some(detour) = fields.download_detour {
+    if let Some(detour) = fields.route.or(fields.download_detour) {
         subscription.download_detour = detour.raw().to_owned();
     }
     if let Some(interval) = fields.interval {
@@ -388,7 +436,7 @@ fn parse_subscription_block<'d, 'a>(
             },
         );
     }
-    subscription
+    Ok(subscription)
 }
 
 fn parse_subscription_entry(

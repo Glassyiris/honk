@@ -262,7 +262,7 @@ pub fn append_subscription_source(
         fields.push(format!("ua: {}", quote(user_agent)?));
     }
     if let Some(seconds) = options.update_interval {
-        fields.push(format!("interval: '{seconds}s'"));
+        fields.push(format!("interval: {seconds}s"));
     }
     if let Some(cache) = options.cache {
         fields.push(format!("cache: {cache}"));
@@ -408,7 +408,7 @@ fn managed_entry(
         let entry = if fields.is_empty() {
             format!("{key}: {value}")
         } else {
-            let mut entry = format!("{key}: {{\n        url: {value}");
+            let mut entry = format!("{key}: {value} {{");
             for field in fields {
                 entry.push_str(&format!("\n        {field}"));
             }

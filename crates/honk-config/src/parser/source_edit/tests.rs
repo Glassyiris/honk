@@ -211,7 +211,7 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
             text.replace(
                 "a'",
                 &format!(
-                    "a'{newline}    b: {{{newline}        url: 'https://example.test/b'{newline}        ua: \"east's agent/1.0\"{newline}        interval: '3600s'{newline}        cache: false{newline}    }}"
+                    "a'{newline}    b: 'https://example.test/b' {{{newline}        ua: \"east's agent/1.0\"{newline}        interval: 3600s{newline}        cache: false{newline}    }}"
                 )
             )
         );
