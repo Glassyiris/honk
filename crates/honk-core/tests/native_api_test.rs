@@ -469,6 +469,10 @@ async fn discovery_withholds_detail_from_callers_without_a_credential() {
     assert_eq!(version["api"]["name"], "daeuniverse/native");
     assert_eq!(version["engine"]["name"], "honk");
     assert_eq!(full["links"]["version"], "/api/v1/version");
+    assert_eq!(
+        full["links"]["operations"],
+        "/api/v1/operations/{operation_id}"
+    );
     assert_eq!(full["auth"]["anonymous_loopback"], false);
     app.shutdown().await;
 }
