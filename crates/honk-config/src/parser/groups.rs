@@ -124,6 +124,7 @@ pub(super) fn parse_group_section(
                 group.icon = Some(value.raw().to_owned());
             }
             if let Some(value) = fields.get("tolerance").copied() {
+                group.own.tolerance = true;
                 group.tolerance = value.raw().parse::<u64>().map_err(|_| {
                     group_scalar_error(
                         value,
@@ -144,6 +145,7 @@ pub(super) fn parse_group_section(
                 })?);
             }
             if let Some(value) = fields.get("interrupt_connections").copied() {
+                group.own.interrupt_connections = true;
                 group.interrupt_connections =
                     super::scalars::strict_bool(value.raw()).ok_or_else(|| {
                         group_scalar_error(

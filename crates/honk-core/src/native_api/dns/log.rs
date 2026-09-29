@@ -115,7 +115,7 @@ impl DnsHistory {
     }
 
     pub(crate) fn capability(&self) -> serde_json::Value {
-        serde_json::json!({"available": self.allowed, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
+        serde_json::json!({"available": self.allowed, "min_records": crate::native_api::settings::MIN_RECORDS, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -207,10 +207,13 @@ impl DnsHistory {
         });
     }
 
-    fn cursor(&self, sequence: u64, filter: &Filter) -> String {
+    /// `{sequence}:{issued}:{bound}`: `issued` proves this process issued
+    /// the cursor, `bound` ties it to the filter and `limit`.
+    fn cursor(&self, sequence: u64, filter: &Filter, limit: usize) -> String {
+        let issued = self.issued(sequence);
         let mut digest = Sha256::new();
-        digest.update(self.instance.as_bytes());
-        digest.update(sequence.to_be_bytes());
+        digest.update(issued.as_bytes());
+        digest.update(limit.to_be_bytes());
         let name = filter.name.as_deref().unwrap_or_default();
         digest.update(name.len().to_be_bytes());
         digest.update(name.as_bytes());
@@ -228,9 +231,17 @@ impl DnsHistory {
             }
         }
         format!(
-            "{sequence}:{}",
+            "{sequence}:{issued}:{}",
             crate::configuration::encode_digest(&digest.finalize())
         )
+    }
+
+    fn issued(&self, sequence: u64) -> String {
+        let digest = Sha256::new()
+            .chain_update(self.instance.as_bytes())
+            .chain_update(sequence.to_be_bytes())
+            .finalize();
+        crate::configuration::encode_digest(&digest)
     }
 
     fn page(
@@ -243,13 +254,18 @@ impl DnsHistory {
         // ponytail: at most 512 records under one lock; indexed snapshots only if this ceiling grows.
         let ring = self.inner.lock();
         let anchor = if let Some(cursor) = cursor {
-            let sequence = cursor
-                .split_once(':')
-                .and_then(|(value, _)| value.parse::<u64>().ok())
-                .ok_or_else(|| invalid_query(id))?;
-            if self.cursor(sequence, &filter) != cursor
+            let expired = || super::super::catalog::snapshot_expired(id);
+            let mut parts = cursor.split(':');
+            let sequence = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(expired)?;
+            if parts.next() != Some(self.issued(sequence).as_str())
                 || !ring.entries.iter().any(|entry| entry.sequence == sequence)
             {
+                return Err(expired());
+            }
+            if self.cursor(sequence, &filter, limit) != cursor {
                 return Err(invalid_query(id));
             }
             sequence
@@ -310,7 +326,7 @@ impl DnsHistory {
             total: ring.entries.len(),
             next_cursor: last
                 .filter(|_| more)
-                .map(|sequence| self.cursor(sequence, &filter)),
+                .map(|sequence| self.cursor(sequence, &filter, limit)),
             records: rows,
         };
         let bytes = records::json_size(&page).map_err(|_| unavailable(id))?;
@@ -509,13 +525,32 @@ mod tests {
         let cursor = first["next_cursor"].as_str().unwrap();
         let second = value(store.page(filter(), 1, Some(cursor), &id).unwrap()).await;
         assert_eq!(second["records"][0]["question"]["name"], "older.example.");
-        assert!(store.page(Filter::default(), 1, Some(cursor), &id).is_err());
+        let status =
+            |result: Result<Response, ApiError>| result.unwrap_err().into_response().status();
+        assert_eq!(
+            status(store.page(Filter::default(), 1, Some(cursor), &id)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(store.page(filter(), 2, Some(cursor), &id)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(store.page(filter(), 1, Some("1:forged:forged"), &id)),
+            StatusCode::GONE
+        );
         let other = DnsHistory::new("second-instance".into(), true);
         capture(&other, "older.example", Some(source));
         capture(&other, "newer.example", Some(source));
-        assert!(other.page(filter(), 1, Some(cursor), &id).is_err());
+        assert_eq!(
+            status(other.page(filter(), 1, Some(cursor), &id)),
+            StatusCode::GONE
+        );
         store.set_limit(1);
-        assert!(store.page(filter(), 1, Some(cursor), &id).is_err());
+        assert_eq!(
+            status(store.page(filter(), 1, Some(cursor), &id)),
+            StatusCode::GONE
+        );
         assert_eq!(value(store.page_for_test()).await["total"], 1);
     }
 

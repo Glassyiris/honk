@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flow_capability_reports_runtime_limits() {
+    async fn setting_capabilities_report_patch_bounds_not_current_values() {
         let state = state().await;
         let request = axum::http::Request::patch("/api/v1/runtime/settings")
             .header("content-type", "application/json")
@@ -902,9 +902,17 @@ mod tests {
         settings::patch(&state, request, &RequestId("test".into()))
             .await
             .unwrap();
-        let flows = &types::capabilities(&state).await["resources"]["flows"];
-        assert_eq!(flows["max_flows"], 64);
-        assert_eq!(flows["retention_seconds"], 60);
+        let resources = &types::capabilities(&state).await["resources"];
+        let flows = &resources["flows"];
+        assert_eq!(flows["min_flows"], 64);
+        assert_eq!(flows["max_flows"], 1024);
+        assert_eq!(flows["retention_seconds"], 300);
+        assert_eq!(resources["logs"]["min_buffered_records"], 64);
+        assert_eq!(
+            resources["logs"]["filters"],
+            serde_json::json!(["level", "target"])
+        );
+        assert_eq!(resources["dns_log"]["min_records"], 64);
     }
 
     #[tokio::test]

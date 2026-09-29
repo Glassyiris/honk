@@ -120,7 +120,9 @@ impl LogStore {
         json!({
             "available": self.allowed && !self.stopped.load(Ordering::Acquire),
             "levels": ["trace", "debug", "info", "warn", "error"],
+            "filters": ["level", "target"],
             "retention_seconds": events::RETENTION.as_secs(),
+            "min_buffered_records": super::settings::MIN_RECORDS,
             "max_buffered_records": MAX_RECORDS,
         })
     }

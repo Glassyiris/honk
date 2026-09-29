@@ -42,6 +42,9 @@ use crate::configuration::{
 /// Shorter secrets are not masked: a one-byte value would erase every
 /// occurrence of that byte from every response.
 pub(crate) const MIN_MASKED_SECRET: usize = 8;
+/// Replacement and creation content bound: the body limit less the creation
+/// envelope with a 1024-byte path, even if JSON escapes every path byte.
+pub(super) const MAX_CONTENT_BYTES: usize = super::security::MAX_BODY_BYTES - 4096;
 
 /// A rule's source id, redacted display file and masked location.
 pub(crate) type LocatedRule = (
@@ -455,7 +458,7 @@ impl ConfigService {
             response,
         })?;
         wait.await.map_err(|_| {
-            super::management::activation_error("coordinator_stopped", None, None, None)
+            super::management::activation_error("coordinator_stopped", None, None, None, None)
         })?
     }
 

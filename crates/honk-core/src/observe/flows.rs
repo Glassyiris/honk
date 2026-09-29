@@ -26,7 +26,7 @@ use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
 
 use super::vocab::{ConnectionState, DomainSource, Network, Plane, RuleSource};
 
-const MAX_RECORDS: usize = 1024;
+pub(crate) const MAX_RECORDS: usize = 1024;
 const MAX_STEPS: usize = 64;
 pub(crate) const MAX_RULE_VALUES: usize = 256;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -34,7 +34,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// has grown to its own limit still leaves room to page through it.
 const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
-const TERMINAL_TTL: Duration = Duration::from_secs(300);
+pub(crate) const TERMINAL_TTL: Duration = Duration::from_secs(300);
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 /// Records leave the ring one at a time as flows end, newer ones need the room
 /// or a revision runs out, so a `flow.gap` per departure would shadow every
@@ -221,6 +221,7 @@ impl FlowStore {
                 chain: Vec::new(),
                 chain_source: "unknown",
                 rule_id: None,
+                rule_generation_id: None,
                 rule_expression: None,
                 rule_source: RuleSource::Unknown,
                 ingress: (),
@@ -469,10 +470,13 @@ impl FlowStore {
                 .snapshots
                 .iter()
                 .find(|snapshot| snapshot.token == token)
-                .filter(|snapshot| snapshot.filters == filters)
                 .ok_or(PageRefusal::Expired)?;
-            if offset == 0 || offset >= snapshot.rows.len() || offset % filters.limit != 0 {
+            if offset == 0 || offset >= snapshot.rows.len() || offset % snapshot.filters.limit != 0
+            {
                 return Err(PageRefusal::Expired);
+            }
+            if snapshot.filters != filters {
+                return Err(PageRefusal::Mismatch);
             }
             return Ok(self.snapshot_page(snapshot, offset, store.recording));
         }
@@ -571,7 +575,10 @@ impl FlowStore {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PageRefusal {
+    /// The cursor is unknown, expired or past its snapshot.
     Expired,
+    /// The cursor belongs to a walk under other filters or page size.
+    Mismatch,
     Busy,
 }
 
@@ -593,6 +600,18 @@ impl Record {
             + self.input.heap_bytes()
             + self.steps.capacity() * size_of::<Step>()
             + self.steps.iter().map(Step::heap_bytes).sum::<usize>()
+    }
+
+    /// The generation of the latest traffic-route step that carries `rule_id`.
+    pub(super) fn rule_generation(&self, rule_id: Option<&str>) -> Option<String> {
+        let rule_id = rule_id?;
+        self.steps
+            .iter()
+            .rev()
+            .find(|step| {
+                matches!(&step.data, StepData::Route { chain: "traffic", rule_id: Some(id), .. } if id == rule_id)
+            })
+            .and_then(|step| step.generation_id.clone())
     }
 
     fn push_step(&mut self, generation_id: Option<String>, mut data: StepData) -> bool {
@@ -622,6 +641,7 @@ impl Record {
         {
             self.summary.outbound = outbound.clone();
             self.summary.rule_id = rule_id.clone();
+            self.summary.rule_generation_id = rule_id.as_ref().and(generation_id.clone());
             self.summary.rule_expression = rule_id.as_ref().and_then(|id| {
                 rules
                     .iter()

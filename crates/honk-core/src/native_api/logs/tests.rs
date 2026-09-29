@@ -393,7 +393,7 @@ async fn log_expiry_heartbeat_capacity_and_overflow_use_shared_stream_rules() {
             .unwrap_err()
             .into_response()
             .status(),
-        StatusCode::TOO_MANY_REQUESTS
+        StatusCode::SERVICE_UNAVAILABLE
     );
     peers.pop();
     drop(response(&store, "", None));

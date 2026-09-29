@@ -28,6 +28,7 @@ pub(super) struct Snapshot {
     created: Instant,
     observed_at: String,
     filters: Filters,
+    limit: usize,
     entries: Vec<ExactCacheEntry>,
     usage: CacheUsage,
     bytes: usize,
@@ -78,23 +79,26 @@ pub(super) async fn serve(
     let mut snapshots = api.snapshots.lock().await;
     snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
     if let Some(cursor) = values.get("cursor") {
-        let (snapshot_id, position) = cursor.rsplit_once(':').ok_or_else(|| invalid_query(id))?;
-        let position = position.parse::<usize>().map_err(|_| invalid_query(id))?;
+        let expired = || super::super::catalog::snapshot_expired(id);
+        let (snapshot_id, position) = cursor.rsplit_once(':').ok_or_else(expired)?;
+        let position = position.parse::<usize>().map_err(|_| expired())?;
         let snapshot = snapshots
             .iter()
             .find(|snapshot| {
-                snapshot.id == snapshot_id
-                    && snapshot.instance == api.recorder.instance()
-                    && snapshot.filters == filters
+                snapshot.id == snapshot_id && snapshot.instance == api.recorder.instance()
             })
-            .ok_or_else(|| invalid_query(id))?;
+            .ok_or_else(expired)?;
         if position == 0 || position >= snapshot.entries.len() {
+            return Err(expired());
+        }
+        if snapshot.filters != filters || snapshot.limit != limit {
             return Err(invalid_query(id));
         }
         return page(snapshot, position, limit, id).map(|(response, _)| response);
     }
+    let full = || super::super::catalog::snapshot_unavailable(id);
     if snapshots.len() == 8 {
-        return Err(unavailable(id));
+        return Err(full());
     }
     let retained = snapshots
         .iter()
@@ -108,7 +112,7 @@ pub(super) async fn serve(
         + filters.types.capacity() * std::mem::size_of::<u16>();
     let available = SNAPSHOT_BYTES
         .checked_sub(retained.saturating_add(overhead))
-        .ok_or_else(|| unavailable(id))?;
+        .ok_or_else(full)?;
     let created = Instant::now();
     let wall = SystemTime::now();
     let inspection = state
@@ -131,7 +135,7 @@ pub(super) async fn serve(
                         .is_some_and(|qtype| filters.types.contains(&qtype)))
         })
         .await
-        .map_err(|_| unavailable(id))?;
+        .map_err(|_| full())?;
     let mut entries = inspection.entries;
     entries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     let bytes = overhead
@@ -143,6 +147,7 @@ pub(super) async fn serve(
         created,
         observed_at: timestamp(wall),
         filters,
+        limit,
         entries,
         usage: inspection.usage,
         bytes,

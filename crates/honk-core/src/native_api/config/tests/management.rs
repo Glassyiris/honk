@@ -889,7 +889,7 @@ async fn db_store_rejected_management_reports_nothing_written() {
     let details = &failure["error"]["details"];
     assert_eq!(details["stage"], "reload_rejected");
     assert_eq!(details["written"], false);
-    assert_eq!(details["durability_confirmed"], false);
+    assert!(details.get("durability_confirmed").is_none());
     assert_eq!(details["committed"], false);
     assert_eq!(
         fixture.database.as_ref().unwrap().head(),
@@ -919,6 +919,7 @@ async fn db_store_degraded_management_reports_recorded_write() {
     assert_eq!(details["written"], true);
     assert_eq!(details["durability_confirmed"], true);
     assert_eq!(details["committed"], true);
+    assert!(details["active_generation_id"].is_string(), "{details}");
     assert_eq!(fixture.database.as_ref().unwrap().head(), Ok(Some(2)));
     fixture.shutdown().await;
 }

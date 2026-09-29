@@ -375,7 +375,7 @@ mod config_loaders {
 
     #[test]
     fn legacy_cache_file_keys_warn_in_dae_and_structured_input() {
-        let dae = "experimental { cache_file { enabled: true\n path: 'cache.db' } }\n";
+        let dae = "experimental { cache_file { enabled: true\n path: 'cache.db' }\n cache_file { cache_id: 'gw' } }\n";
         let mut diagnostics = Vec::new();
         honk_config::parser::parse_dae_config_with_detailed_diagnostics(dae, &mut diagnostics)
             .unwrap();
@@ -386,7 +386,13 @@ mod config_loaders {
                 .map(|d| d.setting.to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(warned(&diagnostics), ["experimental.cache_file.path"]);
+        assert_eq!(
+            warned(&diagnostics),
+            [
+                "experimental.cache_file.path",
+                "experimental.cache_file.cache_id"
+            ]
+        );
 
         let file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         std::fs::write(
@@ -763,6 +769,11 @@ mod detailed_diagnostics {
                 "group {\n PRIVATE_GROUP {\n  policy: honk\n }\n}\n",
                 "unsupported-policy",
                 "groups[1].policy",
+            ),
+            (
+                "group {\n first {\n  policy: selector\n }\n PRIVATE_GROUP {\n  icon: PRIVATE\n }\n}\n",
+                "invalid-config-value",
+                "groups[2].icon",
             ),
             (
                 "node {\n first: 'socks5://192.0.2.1:1080'\n PRIVATE: 'ssr://PRIVATE@192.0.2.2:1'\n}\n",

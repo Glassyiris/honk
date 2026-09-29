@@ -353,14 +353,11 @@ fn rule_and_condition_evidence_bounds_reject_without_truncation() {
     let policy = vec![rule(ip(), "proxy", 0); MAX_RULES];
     let router = Router::new(&policy[..MAX_RULES - 1], "direct").unwrap();
     assert_eq!(rules(&router).rules.len(), MAX_RULES);
+    assert_eq!(rules_capability(&router)["max_rules"], MAX_RULES);
+    // A larger running dictionary raises the advertised bound instead of failing.
     let router = Router::new(&policy, "direct").unwrap();
-    assert_eq!(
-        dictionary(&router, "instance", 7, Instant::now() + TIMEOUT, &id)
-            .unwrap_err()
-            .into_response()
-            .status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(rules(&router).rules.len(), MAX_RULES + 1);
+    assert_eq!(rules_capability(&router)["max_rules"], MAX_RULES + 1);
     let router = Router::new(&[], "direct").unwrap();
     assert_eq!(
         evaluate(&router, "instance", 7, &destination(), Instant::now(), &id)
@@ -475,7 +472,9 @@ fn observed_route_preserves_empty_rule_miss_and_fallback() {
     assert!(observed.rules[0].conditions.is_empty());
     let evaluated = observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(evaluated[2].rule_id, rule_id("instance", 7, None));
-    assert_eq!(evaluated[2].expression, "fallback");
+    assert_eq!(evaluated[2].expression, "fallback: fallback");
+    let dictionary = rules(&router);
+    assert_eq!(dictionary.rules[2].expression, "fallback: fallback");
     let empty = Router::new(&[], "direct").unwrap();
     let observed = empty.route_full_observed(&connection(), None, 1);
     assert!(observed.matched.is_none());

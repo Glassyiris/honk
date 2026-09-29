@@ -332,7 +332,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
     // Discovery is public; a caller that is not admitted learns only how to sign in.
     if !admitted {
         return json!({
-            "name": "dae/honk-native",
+            "name": "daeuniverse/native",
             "api_major": 1,
             "links": {
                 "auth_setup": link("/api/v1/auth/setup"),
@@ -345,7 +345,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
         });
     }
     json!({
-        "name": "dae/honk-native",
+        "name": "daeuniverse/native",
         "status": "draft",
         "api_major": 1,
         "base_path": "/api/v1",
@@ -354,9 +354,6 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
             "capabilities": "/api/v1/capabilities",
             "config": "/api/v1/config",
             "config_validate": "/api/v1/config/validate",
-            "config_export": "/api/v1/config/export",
-            "config_import": "/api/v1/config/import",
-            "config_revisions": "/api/v1/config/revisions",
             "runtime": "/api/v1/runtime",
             "runtime_outbounds": "/api/v1/runtime/outbounds",
             "traffic_history": "/api/v1/runtime/traffic/history",
@@ -369,6 +366,11 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
             "auth_setup": link("/api/v1/auth/setup"),
             "auth_login": link("/api/v1/auth/login"),
             "auth_logout": link("/api/v1/auth/logout"),
+            "x-honk": {
+                "config_export": "/api/v1/x-honk/config/export",
+                "config_import": "/api/v1/x-honk/config/import",
+                "config_revisions": "/api/v1/x-honk/config/revisions",
+            },
         },
         "auth": {
             "mode": auth.mode,
@@ -381,7 +383,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
 pub(super) fn version() -> Value {
     let optional = |value: &str| (!value.is_empty()).then(|| Value::from(value));
     json!({
-        "api": {"name": "dae/honk-native", "major": 1, "status": "draft"},
+        "api": {"name": "daeuniverse/native", "major": 1, "status": "draft"},
         "engine": {"name": "honk", "version": crate::VERSION},
         // No build timestamp: the binary carries none, and inventing one would mislead.
         "build": {"revision": optional(crate::REVISION), "target": optional(crate::TARGET), "built_at": null},
@@ -401,10 +403,11 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     ];
     let mut providers = state.observation.providers.capability();
     providers["can_manage"] = json!(config.can_manage());
+    providers["create_unfetched"] = json!(true);
     let geodata = super::geodata::capability(state).await;
     let routing_trace = super::routing::trace_capability();
-    let rules = super::routing::rules_capability();
-    let (max_flows, flow_retention) = state.observation.settings.flow_limits();
+    let rules = super::routing::rules_capability(&*state.traffic_router.read().await);
+    let dns_rules = super::dns::rules_capability(&state.config.read().await.dns.routing);
     json!({
         "observed_at": super::timestamp(std::time::SystemTime::now()),
         "profiles": ["base"],
@@ -414,17 +417,19 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": super::security::MAX_BODY_BYTES,
         },
         "resources": {
-            "config": {"available":config.sources.available(),"content":config.sources.available(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::security::MAX_BODY_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
-            "config_export": {"available":config.sources.available()},
-            "config_import": config.import_capability(),
-            "config_revisions": config.revisions_capability(),
+            "config": {"available":config.sources.available(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::config::MAX_CONTENT_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"x-honk":{"store":config.store_value()["kind"]}},
+            "x-honk": {
+                "config_export": {"available":config.sources.available()},
+                "config_import": config.import_capability(),
+                "config_revisions": config.revisions_capability(),
+                "runtime_mode": {"available":false},
+            },
             "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
             "runtime": {"available": true},
             "runtime_memory": {"available":true,"metrics":telemetry.metrics()},
             "runtime_outbounds": {"available":true},
             "traffic_history": {"available":telemetry.record_traffic(),"max_window_seconds":600,"max_points":600},
             "memory_history": {"available":telemetry.record_memory(),"max_window_seconds":600,"max_points":600},
-            "runtime_mode": {"available":false},
             "datapath": super::datapath::capability(),
             "nodes": {"available": true, "can_manage":config.can_manage()},
             "providers": providers,
@@ -436,7 +441,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
                 "can_close": true,
                 "max_bulk_close": super::connections::MAX_BULK_CLOSE,
             },
-            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "max_flows":max_flows, "max_steps_per_flow":64, "retention_seconds":flow_retention, "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":crate::observe::flows::MAX_RECORDS, "max_steps_per_flow":64, "retention_seconds":crate::observe::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": routing_trace,
             "rules": rules,
             "events": {"available":true,"kinds":kinds,"retention_seconds":super::events::RETENTION.as_secs(),"max_buffered_events":super::events::MAX_EVENTS,"max_clients":super::events::MAX_CLIENTS,"heartbeat_seconds":super::events::HEARTBEAT.as_secs()},
@@ -444,9 +449,9 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "dns_query": state.observation.dns.query_capability(),
             "dns_cache": state.observation.dns.cache_capability(),
             "dns_log": state.observation.dns.log_capability(),
-            "dns_rules": super::dns::rules_capability(),
+            "dns_rules": dns_rules,
             "runtime_settings": super::settings::capability(&state.settings, state.geodata.as_ref().is_some()),
-            "operations": {"available":true,"retention_seconds":super::operations::RETENTION.as_secs()},
+            "operations": {"available":true,"retention_seconds":super::operations::RETENTION.as_secs(),"max_replay_keys":super::operations::MAX_TOMBSTONES},
             "reload": {"available":config.running()},
             "suspend": {"available":false},
             "resume": {"available":false},

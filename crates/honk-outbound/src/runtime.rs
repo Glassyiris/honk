@@ -899,7 +899,9 @@ impl EphemeralRuntimeGuard {
     }
 
     /// Close and join all owned work. Cancelling this waiter retains ownership
-    /// in the guard so another waiter can finish the same teardown.
+    /// in the guard so another waiter can finish the same teardown. Once a call
+    /// completes, later calls return `Ok(())`; an error only reports that an
+    /// owned task failed, after teardown has finished.
     pub async fn close(&mut self) -> Result<(), RuntimeCleanupError> {
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());

@@ -662,5 +662,7 @@ fn routing_positions_follow_parser_ordinals_across_includes() {
         "domain(\r\n 'example.test'\r\n ) -> direct"
     );
     assert_eq!((index.rules[1].source_index, index.rules[1].line), (1, 3));
-    assert_eq!(index.fallback.unwrap().source_index, 1);
+    let fallback = index.fallback.unwrap();
+    assert_eq!(fallback.source_index, 1);
+    assert_eq!(fallback.expression, "fallback: block");
 }

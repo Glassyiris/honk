@@ -15,6 +15,11 @@ pub(crate) fn rule_id(instance: &str, generation: u64, compiled_id: Option<u32>)
     }
 }
 
+/// The fallback's display text when its source text is not retained, as DNS renders its own.
+pub(crate) fn fallback_expression(router: &Router) -> String {
+    format!("fallback: {}", router.fallback().outbound)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct RuleCondition {
     pub(crate) id: String,
@@ -106,7 +111,7 @@ pub(crate) fn rule_evaluation(
         rule_id,
         expression: compiled
             .map(|rule| rule.expression.clone())
-            .unwrap_or_else(|| "fallback".into()),
+            .unwrap_or_else(|| fallback_expression(router)),
         result: result_name(evaluated.result),
         missing_inputs: missing,
         conditions,

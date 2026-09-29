@@ -10,7 +10,12 @@ use axum::response::Response;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use super::{ApiError, catalog::snapshot_unavailable, invalid_query, types::RequestId};
+use super::{
+    ApiError,
+    catalog::{snapshot_expired, snapshot_unavailable},
+    invalid_query,
+    types::RequestId,
+};
 
 pub(super) const MAX_PAGE_SIZE: usize = 1000;
 pub(super) const MAX_SNAPSHOTS: usize = 8;
@@ -30,6 +35,8 @@ pub(super) struct Held<T> {
     id: Uuid,
     pub(super) created: Instant,
     pub(super) bytes: usize,
+    /// Page size the cursor was issued for; resuming with another is refused.
+    limit: usize,
     snapshot: T,
 }
 
@@ -66,13 +73,16 @@ impl<T: Snapshot> Pages<T> {
                 id: key,
                 created: Instant::now(),
                 bytes,
+                limit,
                 snapshot,
             });
         }
         Ok(response)
     }
 
-    /// `accept` refuses a snapshot taken under other request parameters.
+    /// An unknown, expired or exhausted cursor is `410 snapshot_expired`; one
+    /// resumed with another `limit`, or refused by `accept` as taken under
+    /// other request parameters, is `400 invalid_request`.
     pub(super) fn resume(
         &self,
         cursor: &str,
@@ -80,16 +90,20 @@ impl<T: Snapshot> Pages<T> {
         accept: impl Fn(&T) -> bool,
         id: &RequestId,
     ) -> Result<Response, ApiError> {
-        let (key, offset) = cursor.split_once(':').ok_or_else(|| invalid_query(id))?;
-        let key = Uuid::parse_str(key).map_err(|_| invalid_query(id))?;
-        let offset: usize = offset.parse().map_err(|_| invalid_query(id))?;
+        let expired = || snapshot_expired(id);
+        let (key, offset) = cursor.split_once(':').ok_or_else(expired)?;
+        let key = Uuid::parse_str(key).map_err(|_| expired())?;
+        let offset: usize = offset.parse().map_err(|_| expired())?;
         let mut held = self.0.lock();
         held.retain(|held| held.created.elapsed() < SNAPSHOT_TTL);
         let held = held
             .iter()
-            .find(|held| held.id == key && accept(&held.snapshot))
-            .ok_or_else(|| invalid_query(id))?;
+            .find(|held| held.id == key)
+            .ok_or_else(expired)?;
         if offset == 0 || offset >= held.snapshot.len() {
+            return Err(expired());
+        }
+        if held.limit != limit || !accept(&held.snapshot) {
             return Err(invalid_query(id));
         }
         Ok(page(&held.snapshot, key, offset, limit))

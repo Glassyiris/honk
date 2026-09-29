@@ -13,7 +13,7 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
@@ -137,19 +137,54 @@ fn parameters(
     Ok((values, types))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryBody {
+    domain: String,
+    #[serde(rename = "type")]
+    types: Option<Vec<String>>,
+    upstream: Option<String>,
+    cache_mode: Option<String>,
+}
+
 pub(super) async fn query(
     state: &NativeState,
-    uri: &Uri,
+    request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    let (values, mut types) = parameters(
-        uri,
-        &["domain", "type", "upstream", "cache_mode", "detail"],
-        id,
-    )?;
-    let domain = canonical_name(values.get("domain").ok_or_else(|| invalid_query(id))?, id)?;
+    let (values, _) = parameters(request.uri(), &["detail"], id)?;
+    let full = full_detail(&values, id)?;
+    super::config::json_type(&request)?;
+    let bytes = super::body::buffered(request.into_body()).await;
+    if bytes.len() > 4096 {
+        return Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "DNS query body is too large",
+            id,
+        ));
+    }
+    let invalid = || {
+        error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidRequest,
+            "Invalid DNS query body",
+            id,
+        )
+    };
+    let body: QueryBody = super::body::decode(&bytes, invalid)?;
+    let domain = canonical_name(&body.domain, id).map_err(|_| invalid())?;
+    let names = body.types.unwrap_or_else(|| vec!["A".into()]);
+    let mut types = Vec::with_capacity(names.len());
+    for name in &names {
+        let qtype = records::parse_type(name).ok_or_else(invalid)?;
+        if types.contains(&qtype) {
+            return Err(invalid());
+        }
+        types.push(qtype);
+    }
     if types.is_empty() {
-        types.push(1);
+        return Err(invalid());
     }
     if types.len() > 8 {
         return Err(error(
@@ -167,22 +202,19 @@ pub(super) async fn query(
             id,
         ));
     }
-    let full = full_detail(&values, id)?;
-    let cache_mode = values
-        .get("cache_mode")
-        .map(String::as_str)
-        .unwrap_or("normal");
+    let cache_mode = body.cache_mode.as_deref().unwrap_or("normal");
     let options = ResolveOptions {
         cache: match cache_mode {
             "normal" => CacheAccess::Normal,
             "bypass" => CacheAccess::Bypass,
-            _ => return Err(invalid_query(id)),
+            _ => return Err(invalid()),
         },
-        forced_upstream: values
-            .get("upstream")
-            .map(|name| UpstreamTag::new(name))
+        forced_upstream: body
+            .upstream
+            .as_deref()
+            .map(UpstreamTag::new)
             .transpose()
-            .map_err(|_| invalid_query(id))?,
+            .map_err(|_| invalid())?,
     };
     state.require_running().map_err(|_| unavailable(id))?;
     state.observation.dns.rate.admit(id)?;

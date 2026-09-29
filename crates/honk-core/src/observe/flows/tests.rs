@@ -413,10 +413,11 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
         filters("udp", "active", true, 1),
         filters("tcp", "closed", true, 1),
         filters("tcp", "active", false, 1),
+        filters("tcp", "active", true, 2),
     ] {
         assert_eq!(
             store.page(changed, Some(cursor)).unwrap_err(),
-            PageRefusal::Expired
+            PageRefusal::Mismatch
         );
     }
     let other_instance = super::tests::store();
@@ -607,6 +608,8 @@ fn a_userspace_evaluation_is_recomputed_evidence_on_the_wire() {
     let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["rule_id"], "gen:0:rule:0");
     assert_eq!(detail["rule_source"], "recomputed");
+    // No traffic-route step carries this rule, so its generation is unknown.
+    assert_eq!(detail.get("rule_generation_id"), Some(&Value::Null));
     flow.routed(
         "group",
         None,
@@ -1001,6 +1004,10 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
     );
     let before = store.get(flow.id()).unwrap();
     assert_eq!(before["rule_expression"], expression);
+    assert_eq!(
+        before["rule_generation_id"],
+        format!("{}:7", store.instance_id)
+    );
     let later = begin(&store, crate::observe::vocab::Network::Tcp);
     later.routed(
         "new",

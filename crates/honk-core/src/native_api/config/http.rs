@@ -69,7 +69,7 @@ pub(in crate::native_api) async fn get(
         .expect("source snapshot pinned by config publication guard");
     let active = state.diagnostics.read();
     value["generation_id"] = json!(format!("{}:{}", state.instance_id, active.generation));
-    value["store"] = store;
+    value["x-honk"] = json!({"store": store});
     let diagnostics = active
         .buckets
         .static_diagnostics
@@ -134,6 +134,9 @@ pub(in crate::native_api) async fn replace(
     let path = request.uri().path().to_owned();
     let bytes = body::buffered(request.into_body()).await;
     let replacement: Replacement = body::decode(&bytes, invalid)?;
+    if replacement.content.len() > MAX_CONTENT_BYTES {
+        return Err(too_large());
+    }
     admit(state, "PUT", &path, key.as_deref(), &bytes, |reservation| {
         Work::Replace {
             source_id,
@@ -165,6 +168,9 @@ pub(in crate::native_api) async fn create(
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
     let bytes = body::buffered(request.into_body()).await;
     let creation: Creation = body::decode(&bytes, invalid)?;
+    if creation.content.len() > MAX_CONTENT_BYTES {
+        return Err(too_large());
+    }
     if !new_source_path(&creation.path) {
         return Err(invalid());
     }

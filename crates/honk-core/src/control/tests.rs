@@ -4268,6 +4268,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
         tolerance: 50,
         idle_timeout: None,
         interrupt_connections: false,
+        own: Default::default(),
         created_at: chrono::Utc::now(),
     }
 }

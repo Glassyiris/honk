@@ -98,9 +98,10 @@ fn page_error(refusal: PageRefusal, id: &RequestId) -> ApiError {
             "Flow snapshot expired",
             id,
         ),
+        PageRefusal::Mismatch => invalid_query(id),
         PageRefusal::Busy => error(
             StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::TemporarilyUnavailable,
+            ErrorCode::SnapshotUnavailable,
             "Flow snapshot capacity is full",
             id,
         ),
@@ -144,7 +145,12 @@ mod tests {
         assert_error(
             page_error(PageRefusal::Busy, &id),
             StatusCode::SERVICE_UNAVAILABLE,
-            "temporarily_unavailable",
+            "snapshot_unavailable",
+        );
+        assert_error(
+            page_error(PageRefusal::Mismatch, &id),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
         );
         assert_error(
             missing_error(FlowMissing::Expired, &id),

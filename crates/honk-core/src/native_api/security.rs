@@ -253,7 +253,7 @@ fn carries_credential(request: &Request) -> bool {
 /// any request that does carry one, is authenticated.
 fn public_route(method: &Method, path: &str) -> bool {
     match path {
-        "/api" | "/api/v1/discovery" => matches!(*method, Method::GET | Method::HEAD),
+        "/api" => matches!(*method, Method::GET | Method::HEAD),
         "/api/v1/auth/setup" | "/api/v1/auth/login" => *method == Method::POST,
         _ => false,
     }

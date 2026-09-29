@@ -327,9 +327,16 @@ pub(super) async fn capability(state: &NativeState) -> Value {
             let active = state.config.read().await;
             let can_update = updatable(state, &active.experimental.native_api, &assets);
             let mut value = json!({"available": true, "can_update": can_update,
-                "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>()});
+                "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>(),
+                "checksum": "sha256sum"});
             if state.geodata.as_ref().is_some() {
                 value["configurable_sources"] = json!(true);
+                value["max_urls"] = json!(sources::MAX_URLS);
+                value["interval_hours"] = json!({"min": sources::INTERVAL_HOURS.start(),
+                    "max": sources::INTERVAL_HOURS.end(),
+                    "default": sources::AutoUpdate::default().interval_hours});
+                // The file is read at startup only; patches live in the state db.
+                value["lifecycle"] = json!({"file_values": "start", "overrides_persist": true});
             }
             value
         }

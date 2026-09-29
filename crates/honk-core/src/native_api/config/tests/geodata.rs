@@ -793,7 +793,7 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     )
     .await)
     .await;
-    assert_eq!(settings["geodata"]["source"], "db");
+    assert_eq!(settings["geodata"]["source"], "override");
     assert_eq!(settings["geodata"]["geosite"]["urls"], json!(geosite_urls));
     assert_eq!(settings["source"], "config");
     let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
@@ -958,7 +958,7 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
     )
     .await)
     .await;
-    assert_eq!(patched["geodata"]["source"], "db");
+    assert_eq!(patched["geodata"]["source"], "override");
     assert_eq!(patched["geodata"]["geosite"], before["geodata"]["geosite"]);
     assert_eq!(
         patched["geodata"]["geoip"]["urls"],
@@ -967,9 +967,17 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
     assert_eq!(patched["log"]["level"], "debug");
     assert_eq!(fixture.get(SETTINGS).await["geodata"], patched["geodata"]);
     let capabilities = fixture.get("/api/v1/capabilities").await;
+    let geodata = &capabilities["resources"]["geodata"];
+    assert_eq!(geodata["configurable_sources"], true);
+    assert_eq!(geodata["max_urls"], 4);
     assert_eq!(
-        capabilities["resources"]["geodata"]["configurable_sources"],
-        true
+        geodata["interval_hours"],
+        json!({"min": 6, "max": 168, "default": 24})
+    );
+    assert_eq!(geodata["checksum"], "sha256sum");
+    assert_eq!(
+        geodata["lifecycle"],
+        json!({"file_values": "start", "overrides_persist": true})
     );
     assert!(
         capabilities["resources"]["runtime_settings"]["fields"]
@@ -1045,7 +1053,7 @@ async fn checksum_verification_is_on_by_default_and_settable() {
 }
 
 #[tokio::test]
-async fn anonymous_callers_cannot_change_sources_and_read_masked_urls() {
+async fn anonymous_callers_cannot_change_sources_and_read_urls_as_written() {
     const CLASH: &str = "clash{listener}secret";
     let fixture = Fixture::new_with_state(Access::Anonymous, |root, files| {
         setup_rules(root, files);
@@ -1063,9 +1071,10 @@ async fn anonymous_callers_cannot_change_sources_and_read_masked_urls() {
     let before = fixture.get(SETTINGS).await;
     let urls = before["geodata"]["geosite"]["urls"].as_array().unwrap();
     assert_eq!(urls.len(), 1);
-    let url = urls[0].as_str().unwrap();
-    assert!(!url.contains("listener") && !url.contains('?'), "{url}");
-    assert!(url.starts_with("https://mirror.example/") && url.ends_with("/geosite.dat"));
+    assert_eq!(
+        urls[0],
+        "https://mirror.example/<redacted>/geosite.dat?key=query-secret"
+    );
     let shown = &fixture.get(GEO).await["assets"][0]["source_redacted"];
     assert!(!shown.to_string().contains("listener"), "{shown}");
     for body in [
@@ -1099,7 +1108,7 @@ async fn null_returns_to_the_built_in_sources() {
     )
     .await)
     .await;
-    assert_eq!(stored["geodata"]["source"], "db");
+    assert_eq!(stored["geodata"]["source"], "override");
     assert_eq!(stored["geodata"]["geosite"], defaults["geosite"]);
     assert_eq!(
         stored["geodata"]["geoip"]["urls"],
@@ -1149,8 +1158,19 @@ async fn the_download_route_names_a_current_group_by_id() {
             json!({"geodata": {"download": {"route": "group", "group_id": "missing"}}}),
         )
         .await,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_value",
+        StatusCode::CONFLICT,
+        "state_conflict",
+    )
+    .await;
+    error(
+        patch_settings(
+            &fixture,
+            json!({"geodata": {"download": {"route": "group", "group_id": "missing"}},
+                "log": {"buffered_records": 1}}),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
     )
     .await;
     assert_eq!(fixture.get(SETTINGS).await["geodata"], before["geodata"]);

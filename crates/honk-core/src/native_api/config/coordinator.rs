@@ -307,6 +307,11 @@ impl Worker {
                     }
                     Err(error) => {
                         let (code, message, mut details) = error.into_safe();
+                        if let Some(details) =
+                            details.get_or_insert_with(|| json!({})).as_object_mut()
+                        {
+                            details.insert("committed".into(), json!(false));
+                        }
                         // Every warning of the files rides along; when they overflow the
                         // operation's details, keep the rows that explain the failure.
                         if let Some(rows) = details
@@ -512,13 +517,23 @@ impl Worker {
         let stored = self
             .record(committed, &completion)
             .await
-            .map_err(|details| unavailable().with_details(details))?;
-        completion.map_err(|failure| failure.management_error(stored))?;
+            .map_err(|mut details| {
+                details["stage"] = json!(completion::record_failure(&completion).0);
+                unavailable().with_details(details)
+            })?;
+        completion
+            .map_err(|failure| failure.management_error(stored, &self.service.instance_id))?;
         if mutation.deleting() {
             return Ok(Completion::Deleted(1));
         }
         let (collection, id) = created.ok_or_else(|| {
-            management::activation_error("resource_unavailable", Some(true), Some(true), Some(true))
+            management::activation_error(
+                "resource_unavailable",
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+            )
         })?;
         // Capture under the publication barrier before the queue can delete this resource.
         let active = self.active.read().await;
@@ -549,7 +564,13 @@ impl Worker {
             )
         }
         .ok_or_else(|| {
-            management::activation_error("resource_unavailable", Some(true), Some(true), Some(true))
+            management::activation_error(
+                "resource_unavailable",
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+            )
         })?;
         Ok(Completion::Created {
             collection,

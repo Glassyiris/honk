@@ -135,7 +135,7 @@ pub(in crate::native_api) async fn import(
     admit(
         state,
         "POST",
-        "/api/v1/config/import",
+        "/api/v1/x-honk/config/import",
         Some(&key),
         &bytes,
         |reservation| Work::Import { reservation },

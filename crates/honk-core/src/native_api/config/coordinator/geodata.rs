@@ -235,7 +235,7 @@ impl Worker {
             .await
             .map_err(|failure| {
                 let mut details = failure
-                    .management_error(true)
+                    .management_error(true, &self.service.instance_id)
                     .into_details()
                     .unwrap_or_else(|| json!({"committed":null}));
                 details["assets"] = json!(

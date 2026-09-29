@@ -80,7 +80,12 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     config.nodes[2].name = "new-name".into();
     config.groups.clear();
     catalog.install(&config);
-    let second = body(resume(&pages, cursor, Some(child), 100, &request).unwrap()).await;
+    let status = |result: Result<Response, ApiError>| result.unwrap_err().into_response().status();
+    assert_eq!(
+        status(resume(&pages, cursor, Some(child), 100, &request)),
+        StatusCode::BAD_REQUEST
+    );
+    let second = body(resume(&pages, cursor, Some(child), 1, &request).unwrap()).await;
     assert_eq!(second["observed_at"], first["observed_at"]);
     assert_eq!(second["nodes"][0]["name"], "node-3");
     assert_eq!(second["nodes"][0]["group_ids"], json!([child]));
@@ -89,7 +94,7 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     let error = resume(&pages, cursor, Some(child), 1, &request)
         .unwrap_err()
         .into_response();
-    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error.status(), StatusCode::GONE);
 }
 
 #[tokio::test]

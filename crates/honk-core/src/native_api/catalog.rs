@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::observe::{
-    catalog::{CatalogIdentity, check_url, member_id, selection, tolerance},
+    catalog::{CatalogIdentity, check_url, interrupt_connections, member_id, selection, tolerance},
     timestamp,
 };
 
@@ -457,7 +457,7 @@ fn group_value(
         "default_member_id": default_id, "final_outbound": group.final_outbound,
         "check_url": check_url(group), "check_interval": group.check_interval.filter(|value| *value > 0),
         "tolerance": tolerance(group), "idle_timeout": group.idle_timeout,
-        "interrupt_connections": group.interrupt_connections
+        "interrupt_connections": interrupt_connections(group)
     });
     result["runtime"] = json!({ "selection": { "tcp": tcp, "udp": udp }, "health": group_health(manager, group, identity, alive) });
     result["capabilities"] = json!({
@@ -542,6 +542,15 @@ fn group_not_found(id: &RequestId) -> ApiError {
         StatusCode::NOT_FOUND,
         ErrorCode::ResourceNotFound,
         "Group not found",
+        id,
+    )
+}
+
+pub(super) fn snapshot_expired(id: &RequestId) -> ApiError {
+    error(
+        StatusCode::GONE,
+        ErrorCode::SnapshotExpired,
+        "Page cursor expired",
         id,
     )
 }

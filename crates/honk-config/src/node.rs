@@ -348,6 +348,9 @@ pub struct Group {
     /// Close owned connections when the selected member changes.
     #[serde(default)]
     pub interrupt_connections: bool,
+    /// Which defaulted options the group's own source sets.
+    #[serde(skip)]
+    pub own: OwnOptions,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -369,9 +372,17 @@ impl Default for Group {
             tolerance: default_tolerance(),
             idle_timeout: None,
             interrupt_connections: false,
+            own: OwnOptions::default(),
             created_at: chrono::Utc::now(),
         }
     }
+}
+
+/// Group options whose effective value otherwise comes from a default or `global`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnOptions {
+    pub tolerance: bool,
+    pub interrupt_connections: bool,
 }
 
 impl Group {

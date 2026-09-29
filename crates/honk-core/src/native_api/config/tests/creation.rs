@@ -179,6 +179,7 @@ async fn failed_activation_removes_the_created_file() {
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["code"], "reload_rejected");
     assert_eq!(failed["error"]["details"]["written"], false);
+    assert_eq!(failed["error"]["details"]["committed"], false);
     assert!(!fixture.path(NEW).exists());
     assert_eq!(fixture.get(CONFIG).await, before);
 
@@ -190,6 +191,8 @@ async fn failed_activation_removes_the_created_file() {
     let failed = fixture.terminal(&operation).await;
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"]["details"]["written"], true);
+    assert_eq!(failed["error"]["details"]["committed"], true);
+    assert!(failed["error"]["details"]["active_generation_id"].is_string());
     assert!(fixture.path(NEW).exists());
     fixture.shutdown().await;
 }
@@ -218,7 +221,7 @@ async fn database_store_records_the_new_source_as_a_revision() {
     let operation = accepted(fixture.create(NEW, CONTENT).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
     assert!(listed(&fixture.get(CONFIG).await, NEW));
-    let list = fixture.get("/api/v1/config/revisions").await;
+    let list = fixture.get("/api/v1/x-honk/config/revisions").await;
     assert_eq!(list["active"], 2);
     assert_eq!(list["revisions"][0]["revision"], 2);
     assert!(

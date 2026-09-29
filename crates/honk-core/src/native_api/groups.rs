@@ -156,7 +156,7 @@ fn normalized(index: usize, value: &Value) -> Option<Value> {
         }),
         DEFAULT | FINAL => value.is_null() || value.as_str().is_some_and(|value| !value.is_empty()),
         TOLERANCE | IDLE_TIMEOUT if !value.is_null() => return integer(value).map(Value::from),
-        INTERRUPT => value.is_boolean(),
+        INTERRUPT => value.is_null() || value.is_boolean(),
         CHECK_URL if !value.is_null() => {
             return value.as_str().and_then(check_url).map(Value::from);
         }
@@ -202,7 +202,7 @@ impl GroupPatch {
             json!(self.group.final_outbound),
             json!(crate::observe::catalog::tolerance(&self.group)),
             json!(self.group.idle_timeout),
-            json!(self.group.interrupt_connections),
+            json!(crate::observe::catalog::interrupt_connections(&self.group)),
             json!(crate::observe::catalog::check_url(&self.group)),
         ];
         let mut values = initial.clone().map(Some);
@@ -589,6 +589,10 @@ mod tests {
             expected: Ok("r".into()),
             group: Group {
                 policy: honk_config::group::GroupPolicy::URLTest,
+                own: honk_config::group::OwnOptions {
+                    tolerance: true,
+                    ..Default::default()
+                },
                 ..Group::default()
             },
             members: vec![("node".into(), "A".into())],

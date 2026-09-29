@@ -44,7 +44,7 @@ fn identities_survive_reordering_but_not_removal_or_restart() {
     config.groups[0].tolerance += 1;
     catalog.install(&config);
     assert_eq!(catalog.snapshot().revision, original.revision);
-    config.groups[0].interrupt_connections ^= true;
+    config.groups[0].own.interrupt_connections = true;
     catalog.install(&config);
     assert_ne!(catalog.snapshot().revision, original.revision);
     assert_eq!(catalog.snapshot().groups, original.groups);

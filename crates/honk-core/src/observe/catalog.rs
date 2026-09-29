@@ -95,9 +95,19 @@ fn probed_url(target: &honk_config::check::HttpCheckTarget) -> String {
     )
 }
 
-/// Only URLTest switches on latency; other policies have no tolerance to report.
+/// Only URLTest switches on latency; other policies have no tolerance to report,
+/// and a URLTest group that sets none inherits `global.check_tolerance`.
 pub(crate) fn tolerance(group: &Group) -> Option<u64> {
-    (group.policy == honk_config::group::GroupPolicy::URLTest).then_some(group.tolerance)
+    (group.policy == honk_config::group::GroupPolicy::URLTest && group.own.tolerance)
+        .then_some(group.tolerance)
+}
+
+/// Null when the group leaves it to the default.
+pub(crate) fn interrupt_connections(group: &Group) -> Option<bool> {
+    group
+        .own
+        .interrupt_connections
+        .then_some(group.interrupt_connections)
 }
 
 pub(crate) fn revision_for(config: &Config) -> String {
@@ -138,7 +148,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
                 group.check_interval,
                 tolerance(group),
                 group.idle_timeout,
-                group.interrupt_connections
+                interrupt_connections(group)
             ])
         })
         .collect();
