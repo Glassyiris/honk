@@ -32,6 +32,12 @@ global {
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器必须保持这些对象不变。Direct 释放被保留的 skb，proxy 把一份保留的 payload 提交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄，以及明确的内核统计可用状态和读取失败数。完整不变量与指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)和 [API 参考](doc/zh/reference/api.md)。
 
+## 可选原生观测 API
+
+以 `--features native-api` 构建（release 构建已包含）并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立观测用户态连接/记录流、节点/组健康、出站计数、RSS/cgroup、历史、事件、结构化安全日志、DNS 与 provider 状态；支持有界 probe、路由模拟、精确连接关闭/缓存失效、provider refresh、分网络 Selector 与临时 settings。除显式匿名 loopback 外均要求 bearer secret 或密码登录；可托管可信目录，或以 `--features native-ui` 和 `ui: embedded` 使用固定真实 doona，运行时不下载 UI。
+
+`.dae` 仍是唯一配置权威：启动捕获的源支持元数据、离线校验、授权源 PUT 和受限组 PATCH；另有真实激活后才成功的主文件节点/provider 创建与删除，以及已验证 geodata 更新 operation。编辑已有条目继续使用源 PUT；`--store db` 改为将已接受的源记录为状态数据库中的 revision。凭据源省略正文且只读。Native 启用时与 Clash 共用非持久化模式，成功显式激活（含 no-op）重置 Rule/settings，provider/network refresh 保留。原生 runtime_mode 与完整内核透明观测仍未开放。详见[原生设置](doc/zh/reference/experimental.md#native_api)与 [API 契约](doc/zh/reference/api.md#原生-api)。
+
 ## VLESS UDP 与多路复用
 
 VLESS 现由三个独立选项组合：`udp=0|1` 控制 packet 权限，`packetEncoding=auto|none|xudp|uot-v2` 选择非复用 UDP 回退路径，`mux=off|h2mux|xray` 选择 carrier 多路复用。规范链接默认允许 UDP、使用 `packetEncoding=auto` 和 `mux=off`；例如 `vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#edge`。未启用 Vision 时，Auto 对 53/443 使用原生 VLESS UDP；其他获准目标使用 Single XUDP。
