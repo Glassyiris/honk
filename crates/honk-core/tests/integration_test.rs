@@ -253,19 +253,29 @@ fn test_stats_manager_full_workflow() {
     let mgr = StatsManager::new();
 
     for _ in 0..10 {
-        mgr.record_connection("proxy-us");
+        mgr.record_connection("proxy-us", honk_core::stats::OutboundKind::Node);
     }
     for _ in 0..5 {
-        mgr.record_connection("proxy-jp");
+        mgr.record_connection("proxy-jp", honk_core::stats::OutboundKind::Node);
     }
 
-    mgr.record_close("proxy-us");
-    mgr.record_close("proxy-us");
+    mgr.record_close("proxy-us", honk_core::stats::OutboundKind::Node);
+    mgr.record_close("proxy-us", honk_core::stats::OutboundKind::Node);
 
-    mgr.record_bytes("proxy-us", 1024 * 1024, 2048 * 1024); // 1MB up, 2MB down
-    mgr.record_bytes("proxy-jp", 512 * 1024, 256 * 1024);
+    mgr.record_bytes(
+        "proxy-us",
+        honk_core::stats::OutboundKind::Node,
+        1024 * 1024,
+        2048 * 1024,
+    ); // 1MB up, 2MB down
+    mgr.record_bytes(
+        "proxy-jp",
+        honk_core::stats::OutboundKind::Node,
+        512 * 1024,
+        256 * 1024,
+    );
 
-    mgr.record_error("proxy-jp");
+    mgr.record_error("proxy-jp", honk_core::stats::OutboundKind::Node);
 
     let snap = mgr.snapshot();
 
@@ -327,7 +337,10 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
     .unwrap();
 
     // Runtime selector choice made before the reload.
-    cp.group_manager().read().set_selector_choice("proxy", "b");
+    cp.group_manager()
+        .read()
+        .set_selector_choice("proxy", "b", honk_outbound::group::SelectorNetworks::Both)
+        .unwrap();
 
     // v2: "proxy" unchanged; new group "extra" with c; new URLTest
     // group "ut" with b.
@@ -345,7 +358,10 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
         let gm = cp.group_manager();
         let gm = gm.read();
         // The old runtime choice migrated to the rebuilt manager.
-        assert_eq!(gm.get_selector_choice("proxy"), Some("b".to_string()));
+        assert_eq!(
+            gm.get_selector_choice("proxy", honk_outbound::group::SelectionNetwork::Tcp),
+            Some("b".to_string())
+        );
         assert_eq!(gm.select_node("proxy").map(|n| n.name.as_str()), Some("b"));
         // The new group is selectable right after the reload.
         assert_eq!(gm.select_node("extra").map(|n| n.name.as_str()), Some("c"));
@@ -372,7 +388,10 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
     {
         let gm = cp.group_manager();
         let gm = gm.read();
-        assert_eq!(gm.get_selector_choice("proxy"), None);
+        assert_eq!(
+            gm.get_selector_choice("proxy", honk_outbound::group::SelectionNetwork::Tcp),
+            None
+        );
         assert!(gm.select_node("extra").is_none());
     }
     let registered = cp.alive_set().registered_nodes();

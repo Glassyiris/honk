@@ -94,13 +94,18 @@ impl DnsEndpoint {
 
     /// Resolve host to the first address allowed by the configured strategy.
     pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
-        self.resolve_addrs()
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
-            })
+        let resolve =
+            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve_addrs());
+        crate::observe::scope_pin!(resolve);
+        let (addresses, witness) =
+            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+        let selected = addresses?.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
+        })?;
+        if let Some(witness) = witness {
+            witness.selected_ip(selected.ip());
+        }
+        Ok(selected)
     }
 
     /// Resolve host to every allowed candidate, preferred family first.
@@ -123,7 +128,9 @@ impl DnsEndpoint {
         } else {
             let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
                 .await
-                .map_err(|e| anyhow::anyhow!("bootstrap resolve '{}': {}", self.host, e))?;
+                .map_err(|error| {
+                    anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
+                })?;
             if ips.is_empty() {
                 anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
             }

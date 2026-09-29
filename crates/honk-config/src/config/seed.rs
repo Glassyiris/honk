@@ -2,7 +2,6 @@ use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::Config;
-use crate::config::diagnostics::ineffective_group_option_diagnostic;
 use crate::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SettingPath, SourceRef, report_detailed_diagnostics,
 };
@@ -16,6 +15,7 @@ pub(crate) const CONFIG_FIELDS: &[&str] = &[
     "groups",
     "subscriptions",
     "experimental",
+    "assets",
 ];
 
 /// Public data-only adapter. Its serde errors are always redacted.
@@ -40,6 +40,7 @@ enum Field {
     Groups,
     Subscriptions,
     Experimental,
+    Assets,
     #[serde(other)]
     Ignore,
 }
@@ -95,14 +96,6 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
                 }
                 Field::Groups => {
                     config.groups = map.next_value()?;
-                    for (index, group) in config.groups.iter().enumerate() {
-                        if group.interrupt_connections {
-                            self.diagnostics.push(ineffective_group_option_diagnostic(
-                                self.source.clone(),
-                                index + 1,
-                            ));
-                        }
-                    }
                 }
                 Field::Subscriptions => config.subscriptions = map.next_value()?,
                 Field::Experimental => {
@@ -113,6 +106,13 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
                                 self.source.clone(),
                             ));
                     }
+                    for key in config.experimental.cache_file.legacy_keys() {
+                        self.diagnostics
+                            .push(crate::diagnostic::legacy_cache_file_warning(
+                                self.source.clone(),
+                                key,
+                            ));
+                    }
                     if let Some(diagnostic) = config
                         .experimental
                         .clash_api
@@ -121,6 +121,7 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
                         self.diagnostics.push(diagnostic);
                     }
                 }
+                Field::Assets => config.assets = map.next_value()?,
                 Field::Ignore => unreachable!(),
             }
         }
@@ -138,21 +139,21 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
             })?
             .unwrap_or_default();
         let groups: Vec<crate::node::Group> = seq.next_element()?.unwrap_or_default();
-        for (index, group) in groups.iter().enumerate() {
-            if group.interrupt_connections {
-                self.diagnostics.push(ineffective_group_option_diagnostic(
-                    self.source.clone(),
-                    index + 1,
-                ));
-            }
-        }
         let subscriptions = seq.next_element()?.unwrap_or_default();
         let experimental: crate::experimental::ExperimentalConfig =
             seq.next_element()?.unwrap_or_default();
+        let assets = seq.next_element()?.unwrap_or_default();
         if experimental.legacy_udp_nfqueue.is_some() {
             self.diagnostics
                 .push(crate::diagnostic::legacy_nfqueue_warning(
                     self.source.clone(),
+                ));
+        }
+        for key in experimental.cache_file.legacy_keys() {
+            self.diagnostics
+                .push(crate::diagnostic::legacy_cache_file_warning(
+                    self.source.clone(),
+                    key,
                 ));
         }
         if let Some(diagnostic) = experimental
@@ -169,6 +170,7 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
             groups,
             subscriptions,
             experimental,
+            assets,
         })
     }
 }
