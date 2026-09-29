@@ -44,3 +44,5 @@ The following `experimental` fields remain accepted as aliases; each occurrence 
 | `experimental.native_api.geodata_download_detour` | `assets.geodata.route` |
 | `experimental.clash_api.external_ui_download_url` | `assets.ui.url` |
 | `experimental.clash_api.external_ui_download_detour` | `assets.ui.route` |
+
+Only `.dae` configs resolve `assets`. JSON, YAML and TOML configs store the resolved download fields; there `assets` records the defaults but is not applied again, so set the `experimental` download fields and each subscription's own fields directly in those formats.

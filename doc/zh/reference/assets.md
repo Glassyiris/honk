@@ -44,3 +44,5 @@ assets {
 | `experimental.native_api.geodata_download_detour` | `assets.geodata.route` |
 | `experimental.clash_api.external_ui_download_url` | `assets.ui.url` |
 | `experimental.clash_api.external_ui_download_detour` | `assets.ui.route` |
+
+只有 `.dae` 配置会解析 `assets`。JSON、YAML 与 TOML 配置保存的是已解析的下载字段；其中的 `assets` 只记录默认值，不会再次应用，因此在这些格式中需直接设置 `experimental` 下载字段和各订阅自己的字段。
