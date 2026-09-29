@@ -213,11 +213,13 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 | Listener/数据路径 | `global.tproxy_port`、`global.tproxy_mark`、`global.tproxy_port_protect`、`global.pprof_port`、`global.so_mark_from_dae`、`global.lan_interface`、`global.wan_interface`、`global.auto_config_kernel_parameter` |
 | 进程状态 | `global.log_level`、`global.data_dir`、`global.store_subscribe` |
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
-| Clash API | `experimental.clash_api.external_controller`、`external_ui`、`external_ui_download_url`、`external_ui_download_detour`、`secret`、`default_mode` |
-| 原生 API | 任意 `experimental.native_api` 变更 |
+| Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode`；生效的 `assets.ui.url` 和 `assets.ui.route` |
+| 原生 API | 任意 `experimental.native_api` 变更；生效的 `assets.geodata.geosite`、`assets.geodata.geoip`、`assets.geodata.route` |
 | 持久化 | `experimental.cache_file.enabled`、`store_dns` |
 | NFQUEUE | `global.nfqueue_enable` |
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |
+
+UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认出口的变更若影响任一启动阶段持有的下载出口，则需重启。`assets.subscription` 默认值与订阅条目设置交由订阅协调处理。
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 

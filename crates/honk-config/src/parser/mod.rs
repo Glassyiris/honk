@@ -1,3 +1,4 @@
+mod assets;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod cursor;
@@ -658,6 +659,15 @@ fn parse_documents(
         .filter(|(name, _)| *name == "global")
         .any(|(_, segments)| scalars::nfqueue_present(segments));
     let mut config = Config::default();
+    // Subscriptions start from these defaults, whichever block comes first.
+    let assets = sections
+        .iter()
+        .find(|(name, _)| Root::parse(name) == Some(Root::Assets))
+        .map(|(name, segments)| {
+            diagnostics.at_section(name, read::Text::segment(&segments[0]));
+            assets::parse_section(segments, diagnostics)
+        })
+        .unwrap_or_default();
     for (name, segments) in &sections {
         diagnostics.at_section(name, read::Text::segment(&segments[0]));
         match Root::parse(name) {
@@ -667,7 +677,8 @@ fn parse_documents(
             Some(Root::Node) => config.nodes = parse_node_section(segments, diagnostics)?,
             Some(Root::Group) => {}
             Some(Root::Subscription) => {
-                config.subscriptions = parse_subscription_section(segments, diagnostics)?
+                config.subscriptions =
+                    parse_subscription_section(segments, &assets.config, diagnostics)?
             }
             Some(Root::Experimental) => {
                 config.experimental = parse_experimental_section(segments, diagnostics)?;
@@ -675,9 +686,10 @@ fn parse_documents(
             // Includes were spliced before dispatch; an unknown root never gets here
             // because the document only indexes known roots (K43 notices are emitted
             // there), so the last arm is a compile-time completeness check, not a guard.
-            Some(Root::Include) | None => {}
+            Some(Root::Include | Root::Assets) | None => {}
         }
     }
+    assets::apply(assets, &mut config)?;
     config.apply_legacy_nfqueue(canonical_nfqueue_present);
 
     if let Some((_, segments)) = sections.iter().find(|(name, _)| *name == "group") {

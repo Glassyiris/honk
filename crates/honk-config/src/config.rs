@@ -52,6 +52,8 @@ pub struct Config {
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    #[serde(default)]
+    pub assets: crate::assets::AssetsConfig,
 }
 
 /// Global configuration matching dae `global { ... }` section.
@@ -825,6 +827,14 @@ impl Config {
 
     fn validate_references_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         const MAX_USER_GROUPS: usize = 0xFC - 2;
+        if !self.valid_download_detour(&self.assets.route) {
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("assets").field("route"),
+                "invalid-assets-route",
+                "assets route must be direct, routing or a group",
+            ));
+        }
         if !self.valid_download_detour(&self.experimental.native_api.geodata_download_detour) {
             return Err(config_validation_error(
                 source,

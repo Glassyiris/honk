@@ -19,7 +19,7 @@ pub(crate) fn direct(subscription: &Subscription) -> bool {
 /// the rules send it to a group of the nodes it has not delivered yet.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "subscription '{subscription}': its download route '{outbound}' has no usable node yet, so it cannot carry this download; set download_detour: direct for this subscription to fetch it outside routing"
+    "subscription '{subscription}': its download route '{outbound}' has no usable node yet, so it cannot carry this download; set route: direct for this subscription to fetch it outside routing"
 )]
 pub(crate) struct RouteUnavailable {
     subscription: String,

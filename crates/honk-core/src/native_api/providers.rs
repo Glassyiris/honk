@@ -69,7 +69,7 @@ struct ProviderError {
 fn error_message(code: &str) -> Option<&'static str> {
     match code {
         "route_unavailable" => Some(
-            "The subscription's download route has no usable node yet, so it cannot carry the download. Set download_detour to direct for this subscription.",
+            "The subscription's download route has no usable node yet, so it cannot carry the download. Set route to direct for this subscription.",
         ),
         _ => None,
     }
@@ -205,13 +205,16 @@ impl ProviderApi {
         *self.supervisor.write() = Some(supervisor);
     }
 
-    pub(crate) fn capability(&self) -> Value {
+    /// `create_options` gives the value an omitted field takes, so it reports
+    /// the `assets.subscription` defaults over the built-in ones.
+    pub(crate) fn capability(&self, assets: &honk_config::assets::AssetsConfig) -> Value {
+        let base = assets.subscription_base();
         let mut create_options = json!({
-            "update_interval": honk_config::subscription::Subscription::default().update_interval,
-            "user_agent": crate::subscription::DEFAULT_SUBSCRIPTION_USER_AGENT,
+            "update_interval": base.update_interval,
+            "user_agent": crate::subscription::effective_subscription_user_agent(&base),
         });
         if self.caches() {
-            create_options["cache"] = json!(true);
+            create_options["cache"] = json!(base.cache);
         }
         json!({"available": true, "can_refresh": self.supervisor.read().as_ref().is_some_and(SubscriptionSupervisorHandle::running), "create_options": create_options, "max_page_size": MAX_PAGE_SIZE})
     }

@@ -262,7 +262,7 @@ pub fn append_subscription_source(
         fields.push(format!("ua: {}", quote(user_agent)?));
     }
     if let Some(seconds) = options.update_interval {
-        fields.push(format!("interval: '{seconds}s'"));
+        fields.push(format!("interval: {seconds}s"));
     }
     if let Some(cache) = options.cache {
         fields.push(format!("cache: {cache}"));
@@ -292,8 +292,13 @@ pub fn append_subscription_source(
     let mut notices = Vec::new();
     let mut diagnostics =
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
-    let subscriptions = super::entries::parse_subscription_section(&sections, &mut diagnostics)
-        .map_err(|_| SourceEditError)?;
+    // Only names are compared, and they do not depend on `assets` defaults.
+    let subscriptions = super::entries::parse_subscription_section(
+        &sections,
+        &crate::assets::AssetsConfig::default(),
+        &mut diagnostics,
+    )
+    .map_err(|_| SourceEditError)?;
     if subscriptions.iter().any(|existing| existing.name == name) {
         return Err(SourceEditError);
     }
@@ -303,9 +308,12 @@ pub fn append_subscription_source(
 /// Match by name and fetch identity (URL, configured UA, headers), never the
 /// parser's random subscription UUID or mutable refresh metadata. Ambiguous
 /// duplicate declarations and legacy headers owning child entries are rejected.
+/// `assets` is the loaded configuration's block, which any source may declare,
+/// so an entry's effective UA matches the live subscription's.
 pub fn remove_subscription_source(
     source: &SourceSnapshot,
     subscription: &crate::subscription::Subscription,
+    assets: &crate::assets::AssetsConfig,
 ) -> Result<Option<String>, SourceEditError> {
     let document = managed_document(source)?;
     let sections = document
@@ -319,6 +327,7 @@ pub fn remove_subscription_source(
     let mut ambiguous = false;
     super::entries::parse_subscription_section_indexed(
         &sections,
+        assets,
         &mut diagnostics,
         |existing, span| {
             if existing.name == subscription.name
@@ -408,7 +417,7 @@ fn managed_entry(
         let entry = if fields.is_empty() {
             format!("{key}: {value}")
         } else {
-            let mut entry = format!("{key}: {{\n        url: {value}");
+            let mut entry = format!("{key}: {value} {{");
             for field in fields {
                 entry.push_str(&format!("\n        {field}"));
             }

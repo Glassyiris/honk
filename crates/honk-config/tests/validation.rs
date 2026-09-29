@@ -99,6 +99,24 @@ mod empty_subgroups {
     };
 
     #[test]
+    fn structured_configs_keep_the_assets_block() {
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(config.assets.route, "proxy");
+        for restored in [
+            serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
+            serde_yaml::from_str::<Config>(&serde_yaml::to_string(&config).unwrap()).unwrap(),
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+        ] {
+            assert_eq!(restored.assets, config.assets);
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"assets": {"routes": "direct"}}"#).is_err());
+    }
+
+    #[test]
     fn explicit_empty_contributions_survive_roundtrip_and_refresh() {
         let mut diagnostics = Vec::new();
         let config = parse_dae_config_with_detailed_diagnostics("node {\n edge: 'socks5://127.0.0.1:1080'\n}\nsubscription {\n paid: 'https://example.test/sub'\n}\ngroup {\n empty { filter: group() }\n blank { filter: }\n nested { filter: group(empty) }\n late { filter: subtag(paid) }\n sibling {\n filter: group()\n filter: name(edge)\n final: direct\n }\n}", &mut diagnostics).unwrap();
@@ -890,5 +908,29 @@ fn subscription_download_detour_names_direct_routing_or_a_group() {
     assert_eq!(
         config.subscriptions[1].download_detour, "",
         "routing by default"
+    );
+}
+
+#[test]
+fn subscription_entry_route_is_validated_as_download_detour() {
+    use honk_config::parser::parse_dae_config_with_detailed_diagnostics;
+    let parse = |route: &str| {
+        parse_dae_config_with_detailed_diagnostics(
+            &format!(
+                "group {{\n proxy {{ policy: min_moving_avg }}\n}}\nsubscription {{\n own: 'https://example.test/sub' {{ route: {route} }}\n}}"
+            ),
+            &mut Vec::new(),
+        )
+        .unwrap()
+    };
+    for route in ["routing", "direct", "proxy"] {
+        let config = parse(route);
+        assert_eq!(config.subscriptions[0].download_detour, route);
+        config.validate_detailed().unwrap();
+    }
+    let error = parse("missing").validate_detailed().unwrap_err();
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "subscriptions[1].download_detour"
     );
 }

@@ -1005,8 +1005,45 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
     let main = std::fs::read_to_string(fixture.path("main.dae")).unwrap();
     assert!(
         main.contains(
-            "    optioned: {\n        url: 'https://example.test/sub'\n        ua: 'clash.meta'\n        interval: '3600s'\n    }\n"
+            "    optioned: 'https://example.test/sub' {\n        ua: 'clash.meta'\n        interval: 3600s\n    }\n"
         ),
+        "{main}"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_provider_options_follow_assets_subscription_defaults() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, originals| {
+        originals.get_mut("main.dae").unwrap().push_str(
+            "assets {\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}\n",
+        );
+    })
+    .await;
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(
+        capabilities["resources"]["providers"]["create_options"],
+        json!({"update_interval": 3600, "user_agent": "clash.meta"})
+    );
+    // The built-in default differs from the assets one, so it is written.
+    created(
+        fixture
+            .request(Method::POST, PROVIDERS)
+            .json(&json!({
+                "name": "daily",
+                "kind": "subscription",
+                "url": "https://example.test/sub",
+                "update_interval": 86400
+            }))
+            .send()
+            .await
+            .unwrap(),
+        "providers",
+    )
+    .await;
+    let main = std::fs::read_to_string(fixture.path("main.dae")).unwrap();
+    assert!(
+        main.contains("    daily: 'https://example.test/sub' {\n        interval: 86400s\n    }\n"),
         "{main}"
     );
     fixture.shutdown().await;

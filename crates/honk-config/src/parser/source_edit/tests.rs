@@ -107,10 +107,13 @@ fn managed_entries_write_bare_keys_and_delete_whole_lines() {
             .unwrap()
             .unwrap();
         let loaded = managed_source(&edited);
-        let edited =
-            remove_subscription_source(&loaded.sources[0], &loaded.config.subscriptions[1])
-                .unwrap()
-                .unwrap();
+        let edited = remove_subscription_source(
+            &loaded.sources[0],
+            &loaded.config.subscriptions[1],
+            &loaded.config.assets,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(edited, text);
     }
 }
@@ -211,7 +214,7 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
             text.replace(
                 "a'",
                 &format!(
-                    "a'{newline}    b: {{{newline}        url: 'https://example.test/b'{newline}        ua: \"east's agent/1.0\"{newline}        interval: '3600s'{newline}        cache: false{newline}    }}"
+                    "a'{newline}    b: 'https://example.test/b' {{{newline}        ua: \"east's agent/1.0\"{newline}        interval: 3600s{newline}        cache: false{newline}    }}"
                 )
             )
         );
@@ -226,7 +229,7 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
         assert_eq!(added.user_agent.as_deref(), Some("east's agent/1.0"));
         assert_eq!(added.update_interval, 3600);
         assert!(!added.cache);
-        let removed = remove_subscription_source(&loaded.sources[0], added)
+        let removed = remove_subscription_source(&loaded.sources[0], added, &loaded.config.assets)
             .unwrap()
             .unwrap();
         assert_eq!(removed, text);
@@ -254,6 +257,35 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
 }
 
 #[test]
+fn managed_subscription_options_equal_to_built_in_defaults_override_assets() {
+    let text = "subscription {\n    a: 'https://example.test/a'\n}\nassets {\n    subscription {\n        ua: 'clash.meta'\n        interval: 3600s\n        cache: false\n    }\n}\n";
+    let loaded = managed_source(text);
+    let options = SubscriptionOptions {
+        update_interval: Some(86400),
+        user_agent: None,
+        cache: Some(true),
+    };
+    let edited =
+        append_subscription_source(&loaded.sources[0], "b", "https://example.test/b", &options)
+            .unwrap();
+    assert!(
+        edited.contains(
+            "    b: 'https://example.test/b' {\n        interval: 86400s\n        cache: true\n    }"
+        ),
+        "{edited}"
+    );
+    let config = managed_source(&edited).config;
+    let [first, added] = config.subscriptions.as_slice() else {
+        panic!("two subscriptions");
+    };
+    assert_eq!(first.update_interval, 3600);
+    assert!(!first.cache);
+    assert_eq!(added.update_interval, 86400);
+    assert!(added.cache);
+    assert_eq!(added.user_agent.as_deref(), Some("clash.meta"));
+}
+
+#[test]
 fn managed_subscription_deletion_matches_fetch_identity_not_parser_uuid() {
     let declaration = "'same # name': 'https://example.test/sub'('agent:A')";
     let text = format!(
@@ -264,9 +296,10 @@ fn managed_subscription_deletion_matches_fetch_identity_not_parser_uuid() {
     subscription.id = uuid::Uuid::nil();
     subscription.node_count = 100;
     subscription.update_interval = 17;
-    let edited = remove_subscription_source(&loaded.sources[0], &subscription)
-        .unwrap()
-        .unwrap();
+    let edited =
+        remove_subscription_source(&loaded.sources[0], &subscription, &loaded.config.assets)
+            .unwrap()
+            .unwrap();
     assert_eq!(edited, text.replace(declaration, ""));
     let remaining = managed_source(&edited);
     assert_eq!(remaining.config.subscriptions.len(), 1);
@@ -275,9 +308,13 @@ fn managed_subscription_deletion_matches_fetch_identity_not_parser_uuid() {
         Some("agent:B")
     );
     assert!(
-        remove_subscription_source(&remaining.sources[0], &subscription)
-            .unwrap()
-            .is_none()
+        remove_subscription_source(
+            &remaining.sources[0],
+            &subscription,
+            &remaining.config.assets
+        )
+        .unwrap()
+        .is_none()
     );
     subscription.user_agent = Some("agent:B".into());
     subscription
@@ -287,9 +324,13 @@ fn managed_subscription_deletion_matches_fetch_identity_not_parser_uuid() {
             value: "different".into(),
         });
     assert!(
-        remove_subscription_source(&remaining.sources[0], &subscription)
-            .unwrap()
-            .is_none()
+        remove_subscription_source(
+            &remaining.sources[0],
+            &subscription,
+            &remaining.config.assets
+        )
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -303,9 +344,10 @@ fn managed_subscription_deletion_owns_blocks_but_not_legacy_wrapper_headers() {
     let loaded = managed_source(&text);
     let mut subscription = loaded.config.subscriptions[0].clone();
     subscription.user_agent = Some(String::new());
-    let edited = remove_subscription_source(&loaded.sources[0], &subscription)
-        .unwrap()
-        .unwrap();
+    let edited =
+        remove_subscription_source(&loaded.sources[0], &subscription, &loaded.config.assets)
+            .unwrap()
+            .unwrap();
     assert_eq!(edited, text.replace(declaration, ""));
     let loaded = managed_source(&edited);
     assert_eq!(
@@ -317,9 +359,13 @@ fn managed_subscription_deletion_owns_blocks_but_not_legacy_wrapper_headers() {
             .collect::<Vec<_>>(),
         ["empty", "sibling"]
     );
-    let edited = remove_subscription_source(&loaded.sources[0], &loaded.config.subscriptions[0])
-        .unwrap()
-        .unwrap();
+    let edited = remove_subscription_source(
+        &loaded.sources[0],
+        &loaded.config.subscriptions[0],
+        &loaded.config.assets,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(edited, loaded.sources[0].content.replace("empty: {}", ""));
     assert_eq!(
         managed_source(&edited).config.subscriptions[0].name,
@@ -328,7 +374,12 @@ fn managed_subscription_deletion_owns_blocks_but_not_legacy_wrapper_headers() {
     let legacy =
         managed_source("subscription {\n a: b: {\n url: 'https://example.test/sub'\n }\n}\n");
     assert!(
-        remove_subscription_source(&legacy.sources[0], &legacy.config.subscriptions[0]).is_err()
+        remove_subscription_source(
+            &legacy.sources[0],
+            &legacy.config.subscriptions[0],
+            &legacy.config.assets
+        )
+        .is_err()
     );
 }
 
@@ -338,7 +389,12 @@ fn managed_deletion_rejects_duplicate_declarations_and_never_edits_includes() {
     let loaded = managed_source(text);
     assert!(remove_node_source(&loaded.sources[0], loaded.config.nodes[0].id).is_err());
     assert!(
-        remove_subscription_source(&loaded.sources[0], &loaded.config.subscriptions[0]).is_err()
+        remove_subscription_source(
+            &loaded.sources[0],
+            &loaded.config.subscriptions[0],
+            &loaded.config.assets
+        )
+        .is_err()
     );
     let sources = parse_dae_sources(
         &[
@@ -358,10 +414,42 @@ fn managed_deletion_rejects_duplicate_declarations_and_never_edits_includes() {
             .is_none()
     );
     assert!(
-        remove_subscription_source(&sources.sources[0], &sources.config.subscriptions[0])
-            .unwrap()
-            .is_none()
+        remove_subscription_source(
+            &sources.sources[0],
+            &sources.config.subscriptions[0],
+            &sources.config.assets
+        )
+        .unwrap()
+        .is_none()
     );
+}
+
+#[test]
+fn managed_subscription_deletion_inherits_assets_declared_in_an_include() {
+    let sources = parse_dae_sources(
+        &[
+            (
+                PathBuf::from("main.dae"),
+                Arc::from(
+                    "include { 'assets.dae' }\nsubscription {\n feed: 'https://example.test/sub'\n}\n",
+                ),
+            ),
+            (
+                PathBuf::from("assets.dae"),
+                Arc::from("assets {\n subscription {\n ua: 'agent:A'\n }\n}\n"),
+            ),
+        ],
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let subscription = &sources.config.subscriptions[0];
+    assert_eq!(subscription.user_agent.as_deref(), Some("agent:A"));
+    let edited =
+        remove_subscription_source(&sources.sources[0], subscription, &sources.config.assets)
+            .unwrap()
+            .unwrap();
+    assert!(!edited.contains("feed:"));
 }
 
 #[test]

@@ -401,7 +401,10 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
         "generation.changed",
         "operation.updated",
     ];
-    let mut providers = state.observation.providers.capability();
+    let mut providers = state
+        .observation
+        .providers
+        .capability(&state.config.read().await.assets);
     providers["can_manage"] = json!(config.can_manage());
     providers["create_unfetched"] = json!(true);
     let geodata = super::geodata::capability(state).await;

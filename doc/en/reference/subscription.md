@@ -4,23 +4,24 @@ This reference defines `subscription {}` entries, durable recovery, and the subs
 
 ## `subscription {}` syntax
 
-Each entry has one of these forms:
+Declare the URL on the entry line. To override download settings for one subscription, add a block after the quoted URL, one key per line:
 
 ```dae
 subscription {
     primary: 'https://example.com/sub'
-    compatible: 'https://example.net/sub'(honk/1.0 like)
     'https://example.com/no_tag_link'
-    detailed: {
-        url: 'https://example.org/sub'
+    detailed: 'https://example.org/sub' {
         ua: 'honk/1.0'
-        interval: '10000s'
-        download_detour: direct
+        interval: 10000s
+        cache: false
+        route: direct
     }
 }
 ```
 
-The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append `(UA)` after a quoted URL to override it. The block form accepts `url`, optional `ua`, optional `interval`, optional `cache` and optional `download_detour`; `interval` is a duration and defaults to `86400s`. Set it to `0` to disable periodic refresh. `cache: false` keeps this subscription's body out of the subscription store.
+The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` says how the fetch leaves (see below). A missing option takes the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
+
+Two earlier forms still read, without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block holding the URL (`detailed: { url: '…' ua: '…' }`), which also accepts `download_detour` as another name for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
 
 Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
@@ -37,7 +38,7 @@ After a quoted URL, a glued `#` immediately after the closing quote or one balan
 
 This glued-tail compatibility runs after block recognition; it is not a lexical comment. In `sub: 'http://q'(ua)# }`, the separated `}` still closes the subscription block, so subsequent entries can fall outside it. Write `(ua) # }` to make the brace comment data instead.
 
-Quote-error and block rules are listed in the [dialect reference](./dialect.md). An empty `download_detour` follows routing, in every build.
+Quote-error and block rules are listed in the [dialect reference](./dialect.md). An empty `route` follows routing, in every build.
 
 ## Internal model
 
@@ -47,12 +48,12 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `name` | string | `""` | Yes, as the tag; otherwise the URL host | Display tag and the value used by group `subtag(...)` filters. |
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
-| `update_interval` | u64 | `86400` | Yes, as block `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
-| `user_agent` | string or null | `honk/<version>` | Yes, as `(UA)` or block `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
+| `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
+| `user_agent` | string or null | `honk/<version>` | Yes, as `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
-| `download_detour` | string | `""` | Yes, as block `download_detour` | How the fetch leaves: empty or `routing` follows the routing rules, `direct` connects straight to the host, and a group name always goes through that group. An unknown group is refused at validation. |
+| `download_detour` | string | `""` | Yes, as `route` | How the fetch leaves: empty or `routing` follows the routing rules, `direct` connects straight to the host, and a group name always goes through that group. An unknown group is refused at validation. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
-| `cache` | bool | `true` | Yes, as block `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
+| `cache` | bool | `true` | Yes, as `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
 | `node_count` | u32 | `0` | No | Model metadata; the current core runtime does not update it. |
 | `created_at` | datetime | construction time | No | Model construction time. |
@@ -84,9 +85,9 @@ The internal body-selector behavior is:
 
 Subscription bodies and the nodes created from them remain runtime state; neither is written back into the dae configuration.
 
-Subscription fetches follow routing unless `download_detour` says otherwise, like every other download honk makes itself. With `routing` the fetch target goes through the routing rules as user traffic does, so a rule can send it to a node, a group, `direct`, or `block`; each redirect is routed again. A group name forces that group. Routed requests share the route decision and tunnel of geodata and external UI downloads, send the same `User-Agent` and headers, and keep the 30-second timeout, 8 MiB limit, and redirect rules (only 301, 302, 303, 307 and 308, at most 5, never from HTTPS to HTTP, never to a private literal address from a public one). URL userinfo is sent as basic authentication, and a redirect to another scheme, host or port drops `Authorization`, `Cookie` and `Proxy-Authorization`, as the direct client does. `direct` keeps the previous transport: the bootstrap resolver and the bypass mark, with no routing involved. Builds without the `native-api` feature have no routed transport, so there the default fetches directly and an explicit `routing` or group fails.
+Subscription fetches follow routing unless the entry's `route` (or `assets.route`) says otherwise, like every other download honk makes itself. With `routing` the fetch target goes through the routing rules as user traffic does, so a rule can send it to a node, a group, `direct`, or `block`; each redirect is routed again. A group name forces that group. Routed requests share the route decision and tunnel of geodata and external UI downloads, send the same `User-Agent` and headers, and keep the 30-second timeout, 8 MiB limit, and redirect rules (only 301, 302, 303, 307 and 308, at most 5, never from HTTPS to HTTP, never to a private literal address from a public one). URL userinfo is sent as basic authentication, and a redirect to another scheme, host or port drops `Authorization`, `Cookie` and `Proxy-Authorization`, as the direct client does. `direct` keeps the previous transport: the bootstrap resolver and the bypass mark, with no routing involved. Builds without the `native-api` feature route these fetches the same way.
 
-A subscription can route through nodes it supplies itself, for example when the rules send its URL to a group made only of its own nodes. On a fresh install those nodes do not exist yet. honk never falls back to direct: when the chosen route has no usable node, the fetch fails with an error that names the subscription and the outbound, says the route cannot carry the download yet, and suggests `download_detour: direct` for that subscription. The provider status in the native API reports `last_error.code` `route_unavailable`. Nodes restored from the stored body stay in service throughout.
+A subscription can route through nodes it supplies itself, for example when the rules send its URL to a group made only of its own nodes. On a fresh install those nodes do not exist yet. honk never falls back to direct: when the chosen route has no usable node, the fetch fails with an error that names the subscription and the outbound, says the route cannot carry the download yet, and suggests `route: direct` for that subscription. The provider status in the native API reports `last_error.code` `route_unavailable`. Nodes restored from the stored body stay in service throughout.
 
 Routing starts after the startup subscription pass. Only `direct` subscriptions take part in the five-second first-fetch wait; routed subscriptions restore their stored body there and are fetched as soon as routing is ready.
 

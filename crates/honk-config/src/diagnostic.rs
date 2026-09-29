@@ -322,6 +322,60 @@ pub(crate) fn legacy_nfqueue_warning(source: SourceRef) -> DetailedDiagnostic {
     )
 }
 
+macro_rules! legacy_assets_key {
+    ($block:literal, $key:literal, $replacement:literal) => {
+        (
+            $block,
+            $key,
+            concat!(
+                "experimental.",
+                $block,
+                ".",
+                $key,
+                " is deprecated; migrate to ",
+                $replacement
+            ),
+        )
+    };
+}
+
+/// Old `experimental` download keys, the block that holds each, and the
+/// warning that names the `assets` path replacing it.
+pub(crate) const LEGACY_ASSETS_KEYS: [(&str, &str, &str); 5] = [
+    legacy_assets_key!(
+        "native_api",
+        "geosite_download_url",
+        "assets.geodata.geosite"
+    ),
+    legacy_assets_key!("native_api", "geoip_download_url", "assets.geodata.geoip"),
+    legacy_assets_key!(
+        "native_api",
+        "geodata_download_detour",
+        "assets.geodata.route"
+    ),
+    legacy_assets_key!("clash_api", "external_ui_download_url", "assets.ui.url"),
+    legacy_assets_key!(
+        "clash_api",
+        "external_ui_download_detour",
+        "assets.ui.route"
+    ),
+];
+
+pub(crate) fn legacy_assets_warning(
+    source: SourceRef,
+    block: &'static str,
+    key: &'static str,
+    message: &'static str,
+) -> DetailedDiagnostic {
+    DetailedDiagnostic::warning(
+        "legacy-assets-key",
+        source,
+        SettingPath::new("experimental").field(block).field(key),
+        SafeValue::Redacted,
+        message,
+    )
+}
+
 pub(crate) fn legacy_cache_file_warning(
     source: SourceRef,
     key: &'static str,
