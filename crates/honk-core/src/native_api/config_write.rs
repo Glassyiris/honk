@@ -274,51 +274,6 @@ impl Target {
     }
 }
 
-/// A file `create_new` installed, identified by inode and content so removal never
-/// touches a successor or a file edited in place.
-pub(crate) struct CreatedFile {
-    directory: File,
-    name: OsString,
-    // Keeps the inode allocated after an external unlink, so no successor can reuse its number.
-    file: File,
-    content: Box<[u8]>,
-}
-
-impl CreatedFile {
-    /// Unlinks the file while its name still holds it unchanged. True when the name no
-    /// longer holds it.
-    pub(crate) fn remove(&self) -> bool {
-        // O_NONBLOCK: a FIFO put at the name must not stall the open.
-        let current = openat(
-            &self.directory,
-            self.name.as_os_str(),
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        );
-        match current.map(File::from) {
-            Ok(current) => {
-                let mut read = Vec::new();
-                current.metadata().is_ok_and(|metadata| {
-                    self.file
-                        .metadata()
-                        .is_ok_and(|created| same_inode(&metadata, &created))
-                }) && (&current)
-                    .take(self.content.len() as u64 + 1)
-                    .read_to_end(&mut read)
-                    .is_ok()
-                    && *read == *self.content
-                    && unlinkat(
-                        &self.directory,
-                        self.name.as_os_str(),
-                        UnlinkatFlags::NoRemoveDir,
-                    )
-                    .is_ok()
-            }
-            Err(error) => error == Errno::ENOENT,
-        }
-    }
-}
-
 /// Creates `path` with `content` and `mode` through a temporary file and a rename that
 /// never replaces anything at `path`. The callback must recheck the candidate.
 pub(crate) fn create_new(
@@ -326,7 +281,7 @@ pub(crate) fn create_new(
     content: &[u8],
     mode: u32,
     before_rename: impl FnOnce() -> Result<(), WriteError>,
-) -> Result<CreatedFile, WriteError> {
+) -> Result<(), WriteError> {
     let target = Target::open(path)?;
     let mut temporary = TemporaryFile::write(&target.directory, content, mode)?;
     recheck_directory(&target.directory, &target.parent_path)?;
@@ -339,19 +294,10 @@ pub(crate) fn create_new(
             WriteError::Conflict => WriteError::Exists,
             error => error,
         })?;
-    let file = temporary
-        .file
-        .try_clone()
-        .map_err(|_| WriteError::ChangedButNotDurable)?;
     if target.directory.sync_all().is_err() {
         return Err(WriteError::ChangedButNotDurable);
     }
-    Ok(CreatedFile {
-        directory: target.directory,
-        name: target.filename,
-        file,
-        content: content.into(),
-    })
+    Ok(())
 }
 
 pub(crate) struct InstalledFile {
@@ -409,6 +355,7 @@ impl StagedFile {
                 durability_confirmed,
             });
         };
+        recheck_directory(&target.directory, &target.parent_path)?;
         target.install(&mut self.temporary)?;
         let file = self
             .temporary

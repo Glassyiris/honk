@@ -343,30 +343,17 @@ fn import_row(
 }
 
 /// Sidecars first, so a crash never leaves a `-wal` beside a new file of the
-/// same name; then the file and any `<name>.corrupt-*` copies.
+/// same name. `<name>.corrupt-*` copies are diagnostics, not cache rows, and stay.
 fn remove_cache_db(path: &Path) {
     let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
         return;
     };
-    let name = name.to_string_lossy().into_owned();
-    let mut targets = vec![
+    let name = name.to_string_lossy();
+    let targets = [
         directory.join(format!("{name}-wal")),
         directory.join(format!("{name}-shm")),
         path.to_path_buf(),
     ];
-    if let Ok(entries) = std::fs::read_dir(directory) {
-        targets.extend(
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(&format!("{name}.corrupt-"))
-                })
-                .map(|entry| entry.path()),
-        );
-    }
     for target in targets {
         match std::fs::remove_file(&target) {
             Ok(()) => {}
