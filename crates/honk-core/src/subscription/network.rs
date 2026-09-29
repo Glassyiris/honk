@@ -33,12 +33,17 @@ impl NetworkThread {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|_| "subscription network runtime creation failed")?;
+                    .map_err(|error| {
+                        tracing::error!(%error, "Subscription network runtime creation failed");
+                        "subscription network runtime creation failed"
+                    })?;
                 // Default runtime drop cancels the HTTP client's spawned connection tasks and
                 // waits for started blocking jobs; timeout/background shutdown would detach them.
                 runtime.block_on(async move {
-                    let client =
-                        build_client().map_err(|_| "subscription HTTP client creation failed")?;
+                    let client = build_client().map_err(|error| {
+                        tracing::error!(%error, "Subscription HTTP client creation failed");
+                        "subscription HTTP client creation failed"
+                    })?;
                     if ready.send(Ok(())).is_err() {
                         return Ok(());
                     }

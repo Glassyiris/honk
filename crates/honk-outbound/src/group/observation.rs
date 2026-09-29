@@ -300,7 +300,7 @@ pub(super) fn score_eligible(id: Uuid, eligible: bool) {
 pub(super) fn ordered(candidates: &[Candidate<'_>]) {
     #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
-        state.decisions[index].candidates.sort_by_key(|row| {
+        state.decisions[index].candidates.sort_by_cached_key(|row| {
             candidates
                 .iter()
                 .position(|candidate| {
