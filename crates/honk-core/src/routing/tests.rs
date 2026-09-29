@@ -1072,6 +1072,58 @@ fn test_geosite_matcher_semantics() {
 }
 
 #[test]
+fn geosite_matchers_intern_on_exact_expansions() {
+    use GeositeDomain::{Domain, Full, Keyword};
+    let mut registry = DomainRegistry::default();
+    let mut intern =
+        |domains: Vec<GeositeDomain>| registry.intern(DomainMatcher::geosite(domains)).unwrap();
+    let base = intern(vec![Domain("Example.COM".into()), Keyword("Tube".into())]);
+    let normalized = intern(vec![
+        Keyword("Tube".into()),
+        Domain("example.com".into()),
+        Domain("EXAMPLE.com".into()),
+    ]);
+    let kind = intern(vec![Full("example.com".into()), Keyword("Tube".into())]);
+    let keyword_case = intern(vec![Domain("example.com".into()), Keyword("tube".into())]);
+    assert_eq!(base, normalized);
+    assert_ne!(base, kind);
+    assert_ne!(base, keyword_case);
+    assert_ne!(kind, keyword_case);
+}
+
+#[test]
+fn geosite_policy_fingerprint_covers_the_exact_expansion() {
+    use_repo_geo_assets();
+    let rules = vec![RoutingRule {
+        name: "geosite-cn-direct".into(),
+        condition: RoutingCondition {
+            geosite: vec!["cn".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "proxy").unwrap();
+    let requirements = GeoRequirements::for_traffic(&rules);
+    let sources = GeoSourceSet::load(&requirements);
+    let (exact, _) = DomainMatcher::geosite(
+        GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
+    );
+    assert!(!exact.alternatives.is_empty());
+    assert_eq!(
+        router.policy_fingerprint(),
+        fingerprint::policy(
+            &router.routes.routes,
+            std::slice::from_ref(&exact),
+            &router.fallback,
+            router.routes.geo_fingerprint,
+        )
+    );
+}
+
+#[test]
 fn test_domain_bitmap_does_not_claim_default_as_match() {
     let rules = vec![RoutingRule {
         name: "cn-suffix".into(),
