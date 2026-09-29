@@ -69,7 +69,7 @@ struct ProviderError {
 fn error_message(code: &str) -> Option<&'static str> {
     match code {
         "route_unavailable" => Some(
-            "The subscription's download route has no usable node yet, so it cannot carry the download. Set download_detour to direct for this subscription.",
+            "The subscription's download route has no usable node yet, so it cannot carry the download. Set route to direct for this subscription.",
         ),
         _ => None,
     }

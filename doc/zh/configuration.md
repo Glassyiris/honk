@@ -12,6 +12,7 @@ honk 使用 dae 配置语法的一种方言；与 dae 的已知差异见[方言�
 | `routing` | 应用有序流量规则与默认出站。 | [路由参考](./reference/routing.md) |
 | `dns` | 配置监听、上游、请求/响应策略与缓存行为。 | [DNS 参考](./reference/dns.md) |
 | `subscription` | 获取远程节点列表。 | [订阅参考](./reference/subscription.md) |
+| `assets` | 为 geodata、外部 UI 和订阅设置下载默认值。 | [Assets 参考](./reference/assets.md) |
 | `experimental` | 启用独立原生 API、Clash API 或持久化缓存。 | [Experimental 参考](./reference/experimental.md) |
 | CLI | 选择配置、后端、目标文件或本地命令。 | [CLI 参考](./reference/cli.md) |
 
@@ -139,7 +140,19 @@ node {
 }
 
 subscription {
-    paid: 'https://subscription.example/sub'
+    paid: 'https://subscription.example/sub' {
+        interval: 3600s
+    }
+}
+
+assets {
+    subscription {
+        ua: 'clash.meta'
+    }
+    ui {
+        url: 'https://example.com/dashboard.zip'
+        route: proxy
+    }
 }
 
 group {
@@ -180,8 +193,6 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'ui'
-        external_ui_download_url: 'https://example.com/dashboard.zip'
-        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: 'Rule'
     }
@@ -263,7 +274,7 @@ dns {
 
 ## 订阅
 
-每个来源可写作 `tag: 'url'`，在带引号的 URL 后追加 `(UA)` 可指定该订阅的 User-Agent；需要同时指定刷新周期时使用 `tag: { url, ua, interval }`。`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `<data_dir>/.sub`；如果首选存储不存在，则继续使用已有的 `/var/share/honk/.sub`，再使用已有的 `./.sub`。不会自动移动或删除存储。请求默认使用 `honk/<version>`，可由 `ua` 覆盖；缓存 key 包含配置中的覆盖值，因此不同请求身份会使用不同的已存正文。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于 runtime。修改 `store_subscribe` 后需重启。
+每个来源写作 `tag: 'url'`；要单独覆盖 `ua`、`interval`、`cache` 或 `route`，在带引号的 URL 后接一个块。`assets.subscription` 提供共用的 `ua`、`interval` 和 `cache` 默认值；未单独设置出口时使用 `assets.route`。`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会存入状态数据库。请求默认使用 `honk/<version>`，可由 `ua` 覆盖；缓存 key 包含配置中的覆盖值，因此不同请求身份会使用不同的已存正文。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 沿用活动订阅节点，不从存储恢复。获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文。订阅节点仅存在于 runtime。修改 `store_subscribe` 后需重启。
 
 详见 [订阅参考](./reference/subscription.md)。
 
@@ -273,7 +284,7 @@ dns {
 
 `.dae` 仍是唯一配置权威。启动捕获来源、离线校验和 reload 共用引擎；配置读取返回已接受正文，仅遮蔽监听凭据值，包括重复、被覆盖的值及其在其他位置的出现；凭据源仍只读，哈希仍对应原始字节。源 `path` 保持相对路径，`absolute_path` 另行提供规范化绝对路径。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。`config_write` 默认 false，要求非空 secret 或 `password_auth`。主文件节点/provider 创建删除、授权源 PUT 和受限组 PATCH 复用该权威；启用 `config_write` 后，所有已接受的非凭据 include 均可进行源编辑，但不授予专用条目删除权限。配置的 geodata 更新将不可变已验证字节交给同一 reload owner。激活失败不会自动回滚已写字节，应避免并发外部编辑。详见[原生设置](./reference/experimental.md#native_api)与 [主文件条目与 geodata 契约](./reference/api.md#主文件条目与-geodata-管理)。
 
-**Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
+**Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`assets.ui.url` 选择 ZIP 来源，`assets.ui.route` 选择下载出口，未设置时出口继承 `assets.route`。没有配置 URL 或出口时，分别使用内置 URL 和普通流量路由。`HONK_UI_DOWNLOAD_URL` 可覆盖 ZIP URL。
 
 **缓存文件。** 默认情况下，Selector 选择与延迟样本保存在 `<data_dir>/state/honk.db` 中。设置 `experimental.cache_file.enabled: true` 后还保存 Clash 模式与 GLOBAL 选择，再设置 `store_dns: true` 时还会持久化符合条件的 DNS 应答；设为 `false` 时不保存这些状态。`path`、`cache_id` 与 `store_fakeip` 已不起作用；首次启动时 honk 导入并删除旧 `cache.db`（见[升级说明](./reference/experimental.md#从-cachedb-升级)）。
 

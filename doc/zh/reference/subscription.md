@@ -4,23 +4,24 @@
 
 ## `subscription {}` 语法
 
-每个条目支持以下形式：
+URL 写在条目这一行。要为单个订阅覆盖下载设置，在带引号的 URL 后接一个块，每行一个键：
 
 ```dae
 subscription {
     primary: 'https://example.com/sub'
-    compatible: 'https://example.net/sub'(honk/1.0 like)
     'https://example.com/no_tag_link'
-    detailed: {
-        url: 'https://example.org/sub'
+    detailed: 'https://example.org/sub' {
         ua: 'honk/1.0'
-        interval: '10000s'
-        download_detour: direct
+        interval: 10000s
+        cache: false
+        route: direct
     }
 }
 ```
 
-简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua`、可选的 `interval`、可选的 `cache` 和可选的 `download_detour`；`interval` 是 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。
+条目块接受 `ua`、`interval`、`cache` 和 `route`。`interval` 是 duration，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。`route` 指定拉取的出口（见下文）。未设置的项依次取 `assets.subscription` 的默认值（出口取 `assets.route`）和内置默认值：User-Agent `honk/<version>`、`86400s`、开启缓存、`routing`。见 [assets 参考](./assets.md)。
+
+两种旧写法仍可读取，且不产生警告：带引号的 URL 后追加 `(UA)`（`compatible: 'https://example.net/sub'(honk/1.0 like)`），以及把 URL 写在块内（`detailed: { url: '…' ua: '…' }`）；后者也接受 `download_detour` 作为 `route` 的别名，两者同时设置时报 `conflicting-subscription-route`。下文关于后缀和紧贴注释的规则适用于 `(UA)` 写法。
 
 tag 可以省略。条目不带引号时，第一个 `:` 之前的文本是 tag；如果该冒号属于 `://`，则没有 tag，也不会按 URL 中后续的冒号拆分。tag 和 URL 都可以使用配对的单引号或双引号。带引号的 tag 后接 `:` 表示显式 tag；否则，解析器先去掉 URL 的外层引号，再应用相同的首个冒号规则。因此，`'paid:https://example.com/sub'` 的 tag 是 `paid`，而 `'https://example.com/sub'` 没有 tag。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，会自动识别下文列出的正文格式。
 
@@ -37,7 +38,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 这种紧贴尾部的兼容截断发生在块结构识别之后，并非词法注释。`sub: 'http://q'(ua)# }` 中独立的 `}` 仍会关闭订阅块，后续条目可能因此落在块外。请写成 `(ua) # }`，使花括号成为注释数据。
 
-引号错误与块结构规则见[方言参考](./dialect.md)。空 `download_detour` 在所有构建中都跟随路由。
+引号错误与块结构规则见[方言参考](./dialect.md)。空 `route` 在所有构建中都跟随路由。
 
 ## 内部模型
 
@@ -47,12 +48,12 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | `name` | string | `""` | 是，作为 tag；省略时取 URL 主机名 | 显示 tag，也是组 `subtag(...)` filter 使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
-| `update_interval` | u64 | `86400` | 是，对应块内 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
-| `user_agent` | string 或 null | `honk/<version>` | 是，对应 `(UA)` 或块内 `ua` | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
+| `update_interval` | u64 | `86400` | 是，对应 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
+| `user_agent` | string 或 null | `honk/<version>` | 是，对应 `ua` | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
 | `headers` | `{key,value}[]` | `[]` | 否 | 有序的额外请求 header。 |
-| `download_detour` | string | `""` | 是，对应块内 `download_detour` | 拉取的出口：空值或 `routing` 遵循路由规则，`direct` 直连主机，组名则始终经过该组。未知组在校验时被拒绝。 |
+| `download_detour` | string | `""` | 是，对应 `route` | 拉取的出口：空值或 `routing` 遵循路由规则，`direct` 直连主机，组名则始终经过该组。未知组在校验时被拒绝。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不会恢复、拉取或刷新。 |
-| `cache` | bool | `true` | 是，对应块内 `cache` | 在 `global.store_subscribe` 启用时保存拉取到的正文，供离线启动恢复。设为 `false` 时既不保存也不恢复，维护任务会删除此前保存的正文。 |
+| `cache` | bool | `true` | 是，对应 `cache` | 在 `global.store_subscribe` 启用时保存拉取到的正文，供离线启动恢复。设为 `false` 时既不保存也不恢复，维护任务会删除此前保存的正文。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型元数据；当前 core runtime 不更新它。 |
 | `node_count` | u32 | `0` | 否 | 模型元数据；当前 core runtime 不更新它。 |
 | `created_at` | datetime | 构造时间 | 否 | 模型构造时间。 |
@@ -84,9 +85,9 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 订阅正文及其产生的节点都只属于 runtime 状态；两者都不会写回 dae 配置。
 
-订阅拉取默认经过路由，与 honk 自身发起的其他下载一致，除非 `download_detour` 另行指定。`routing` 时拉取目标与用户流量一样经过路由规则，因此规则可将其发往节点、组、`direct` 或 `block`；每次重定向都重新路由。组名则强制经过该组。经路由的请求与 geodata、外部 UI 下载共用路由决策和隧道，发送相同的 `User-Agent` 与 header，并保持 30 秒超时、8 MiB 上限和重定向规则（只跟随 301、302、303、307 和 308，最多 5 次，不从 HTTPS 转到 HTTP，不从公网地址转到私有字面地址）。URL 中的 userinfo 以 basic 认证发送；重定向到其他 scheme、主机或端口时，与直连客户端一样去掉 `Authorization`、`Cookie` 和 `Proxy-Authorization`。`direct` 沿用原有传输：bootstrap resolver 加绕过标记，不经过路由。未启用 `native-api` feature 的构建没有经路由的传输，因此默认值直连，显式的 `routing` 或组名则失败。
+订阅拉取默认经过路由，与 honk 自身发起的其他下载一致，除非条目的 `route`（或 `assets.route`）另行指定。`routing` 时拉取目标与用户流量一样经过路由规则，因此规则可将其发往节点、组、`direct` 或 `block`；每次重定向都重新路由。组名则强制经过该组。经路由的请求与 geodata、外部 UI 下载共用路由决策和隧道，发送相同的 `User-Agent` 与 header，并保持 30 秒超时、8 MiB 上限和重定向规则（只跟随 301、302、303、307 和 308，最多 5 次，不从 HTTPS 转到 HTTP，不从公网地址转到私有字面地址）。URL 中的 userinfo 以 basic 认证发送；重定向到其他 scheme、主机或端口时，与直连客户端一样去掉 `Authorization`、`Cookie` 和 `Proxy-Authorization`。`direct` 沿用原有传输：bootstrap resolver 加绕过标记，不经过路由。未启用 `native-api` feature 的构建没有经路由的传输，因此默认值直连，显式的 `routing` 或组名则失败。
 
-订阅可能经由自身提供的节点拉取，例如规则把订阅 URL 发往一个只含该订阅节点的组。全新安装时这些节点尚不存在。honk 不会回退到直连：所选路由没有可用节点时，拉取失败，错误信息指明订阅名和出站，说明该路由暂时无法承载这次下载，并建议为该订阅设置 `download_detour: direct`。原生 API 的 provider 状态中 `last_error.code` 为 `route_unavailable`。期间从已存正文恢复的节点继续生效。
+订阅可能经由自身提供的节点拉取，例如规则把订阅 URL 发往一个只含该订阅节点的组。全新安装时这些节点尚不存在。honk 不会回退到直连：所选路由没有可用节点时，拉取失败，错误信息指明订阅名和出站，说明该路由暂时无法承载这次下载，并建议为该订阅设置 `route: direct`。原生 API 的 provider 状态中 `last_error.code` 为 `route_unavailable`。期间从已存正文恢复的节点继续生效。
 
 路由在启动阶段的订阅处理之后才就绪。因此只有 `direct` 订阅参与 5 秒首次拉取等待；经路由的订阅在此阶段恢复已存正文，路由就绪后立即拉取。
 

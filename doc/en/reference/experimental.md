@@ -34,9 +34,8 @@ Requires the opt-in `native-api` Cargo feature (build with `--features native-ap
 | `probe_allowed_cidrs` | empty list | Explicit IP CIDRs authorizing otherwise restricted resolved probe targets and proxy-server addresses. Empty denies restricted addresses, including loopback/private/link-local ranges. |
 | `probe_allowed_ports` | empty list | Additional ports 1–65535 for configured HTTP/DNS probe targets. Defaults permit HTTP 80, HTTPS 443 and DNS 53; raw TCP probes use only the node's configured server port. CIDR authorization remains independently required. |
 | `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, and creation of new include-loaded `.dae` files, excluding listener-credential-bearing sources. Requires a nonempty `secret` or `password_auth`. |
-| `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset, at most 4096 bytes. Requires `config_write`. With a state db, a set URL is written into the stored geodata sources at startup, over a URL patched through the API, and removing it returns the asset to its built-in URLs at the next startup; the stored or built-in URLs are the ones used. Without a state db, an empty URL disables updates. |
-| `geoip_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geoip asset, with the same authorization and bounds. |
-| `geodata_download_detour` | `""` | How geodata downloads leave: `direct`, `routing` or a group name. With a state db it is written into the stored route at startup like the URLs; empty follows routing, like `external_ui_download_detour`, unless a patch stored a route. An unknown group is refused at admission. |
+
+Geodata download URLs and routes now belong to [`assets.geodata`](./assets.md). Their former `native_api` keys remain accepted with warnings; see the replacement table in the assets reference.
 
 ```dae
 experimental {
@@ -64,7 +63,7 @@ Relative UI paths follow the existing dependency search: an existing path under 
 
 For a single binary, build `cargo build -p honk-core --features native-ui` and use `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. Asset/source identities, corresponding-source distribution and the management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
 
-Geodata sources are administrator-controlled, restart-required and cannot be changed through source writes. Userinfo, fragments, redirects and content encoding are rejected. Direct hostname sources require `global.bootstrap_resolver`; no system-DNS fallback is used. `geodata_download_detour` or the stored route can send downloads through the routing rules or a group instead, and a route that cannot carry a request never falls back to direct. All loaded assets need a configured source before updates are available. The [management contract](./api.md#managed-entries-and-geodata) distinguishes network limits, verified-byte activation and partial durable replacement from rollback.
+Geodata sources are administrator-controlled, restart-required and cannot be changed through source writes. Userinfo, fragments, redirects and content encoding are rejected. Direct hostname sources require `global.bootstrap_resolver`; no system-DNS fallback is used. `assets.geodata.route` or the stored route can send downloads through the routing rules or a group instead, and a route that cannot carry a request never falls back to direct. All loaded assets need a configured source before updates are available. The [management contract](./api.md#managed-entries-and-geodata) distinguishes network limits, verified-byte activation and partial durable replacement from rollback.
 
 Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. File settings remain restart-required. `PATCH /api/v1/runtime/settings` can transiently adjust the supported log/DNS-log/flow limits and native log level, but cannot enable a disabled recorder. Accepted explicit activation, including no-op, restores configured values; provider/network refresh preserves overrides.
 
@@ -80,10 +79,10 @@ Probe requests cannot supply URLs or allowlist exceptions. For an intentionally 
 | --- | --- | --- |
 | `external_controller` | `""` | HTTP listen address. An empty value disables the API server. |
 | `external_ui` | `""` | External dashboard directory. An empty value disables dashboard serving and download. |
-| `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL. An empty value uses the built-in zashboard URL. |
-| `external_ui_download_detour` | `""` | Node or group tag used for the download. An empty value follows normal traffic routing. |
 | `secret` | `""` | API authentication secret. An empty value disables authentication. A value shorter than 8 bytes is not masked in native API responses. |
 | `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; with `cache_file.enabled: true`, a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
+
+Dashboard download URL and route belong to [`assets.ui`](./assets.md).
 
 All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configuration that changes any of them.
 
@@ -97,9 +96,9 @@ An explicitly enabled non-loopback bind with an empty secret emits `unsafe-api-b
 
 ### External UI
 
-An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing directory below `/var/share/honk`, then an existing working-directory-relative directory; if none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `external_ui_download_url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
+An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing directory below `/var/share/honk`, then an existing working-directory-relative directory; if none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `assets.ui.url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
 
-A non-empty `external_ui_download_detour` forces the initial request and every redirect through that node or group. `direct` downloads directly, `block` aborts, and a group resolves its authoritative leaf for each exchange. When the field is empty, each URL follows the normal traffic routing decision as before. An unavailable tag, download failure, or extraction failure is logged without stopping the engine. The archive is written to an unnamed private file in the target's parent directory rather than memory; nothing of it remains after extraction or a failed download. Extraction is refused past 10,000 entries or 128 MiB of content, the same bound as the archive itself; the partly written directory is emptied, so the next start downloads again.
+`assets.ui.route` takes precedence over `assets.route` for the initial request and every redirect. `direct` downloads directly, `block` aborts when selected by routing rules, and a group resolves its authoritative leaf for each exchange. With no configured route, each URL follows the normal traffic routing decision. An unavailable tag, download failure, or extraction failure is logged without stopping the engine. The archive is written to an unnamed private file in the target's parent directory rather than memory; nothing of it remains after extraction or a failed download. Extraction is refused past 10,000 entries or 128 MiB of content, the same bound as the archive itself; the partly written directory is emptied, so the next start downloads again.
 
 ### Startup mode
 
@@ -148,14 +147,21 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'zashboard'
-        external_ui_download_url: 'https://example.com/dashboard.zip'
-        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: Rule
     }
     cache_file {
         enabled: true
         store_dns: true
+    }
+}
+```
+
+```dae
+assets {
+    ui {
+        url: 'https://example.com/dashboard.zip'
+        route: proxy
     }
 }
 ```

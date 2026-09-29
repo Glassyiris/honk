@@ -34,9 +34,8 @@
 | `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
 | `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
 | `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，以及新建由 include 模式加载的 `.dae` 文件，含监听凭据的源除外；要求非空 `secret` 或启用 `password_auth`。 |
-| `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源，最长 4096 字节；要求 `config_write`。有状态库时，已设置的 URL 在启动时写入已存储的 geodata 来源，覆盖通过 API 修改的 URL；删除该项后，下次启动时该资产恢复内置 URL。更新使用已存储或内置的 URL。没有状态库时，URL 为空则不能更新。 |
-| `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
-| `geodata_download_detour` | `""` | Geodata 下载的出口：`direct`、`routing` 或组名。有状态库时，启动时按与 URL 相同的规则写入已存储的路由；空值与 `external_ui_download_detour` 相同，遵循路由规则；若已通过 API 存储路由，则保留该路由。未知的组在准入时拒绝。 |
+
+Geodata 下载 URL 与出口现由 [`assets.geodata`](./assets.md) 配置。旧版 `native_api` 字段仍可读取并产生警告；替代关系见 Assets 参考中的表格。
 
 ```dae
 experimental {
@@ -64,7 +63,7 @@ experimental {
 
 单文件部署可使用 `cargo build -p honk-core --features native-ui` 与 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。静态资源不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
 
-Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。直连的域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS。`geodata_download_detour` 或已存储的路由可改为遵循路由规则或经过组下载；路由无法承载请求时不会回退到直连。所有已加载资产都要有配置来源才能更新。[主文件条目与 geodata 契约](./api.md#主文件条目与-geodata-管理)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
+Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。直连的域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS。`assets.geodata.route` 或已存储的路由可改为遵循路由规则或经过组下载；路由无法承载请求时不会回退到直连。所有已加载资产都要有配置来源才能更新。[主文件条目与 geodata 契约](./api.md#主文件条目与-geodata-管理)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
 
 ### 共用采样与可选历史
 
@@ -83,10 +82,10 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 | --- | --- | --- |
 | `external_controller` | `""` | HTTP 监听地址。空值关闭 API server。 |
 | `external_ui` | `""` | 外部 dashboard 目录。空值关闭 dashboard 服务与下载。 |
-| `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL。空值使用内建 zashboard URL。 |
-| `external_ui_download_detour` | `""` | 下载使用的节点或组 tag。空值遵循普通流量路由。 |
 | `secret` | `""` | API 鉴权 secret。空值关闭鉴权。短于 8 字节的值在原生 API 响应里不遮蔽。 |
 | `default_mode` | `"Rule"` | native API 未启用时的启动模式：`Rule`、`Global` 或 `Direct`；`cache_file.enabled: true` 时有效的缓存模式优先。启用 native 时启动改用共享的临时 rule 模式。 |
+
+Dashboard 下载 URL 与出口见 [`assets.ui`](./assets.md)。
 
 所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。
 
@@ -100,9 +99,9 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 ### 外部 UI
 
-绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
+绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `assets.ui.url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
-非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 仍按原有行为遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。压缩包写入目标父目录中一个无文件名的私有文件，不保存在内存中；解压结束或下载失败后不留下任何文件。解压超过 10,000 个条目或 128 MiB 内容（与压缩包本身的上限相同）时拒绝继续，已写入的目录被清空，下次启动时重新下载。
+`assets.ui.route` 优先于 `assets.route`，适用于初始请求及每次重定向。`direct` 直接下载，路由规则选中 `block` 时中止下载，组则为每次请求解析其权威叶节点。未配置出口时，每个 URL 遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。压缩包写入目标父目录中一个无文件名的私有文件，不保存在内存中；解压结束或下载失败后不留下任何文件。解压超过 10,000 个条目或 128 MiB 内容（与压缩包本身的上限相同）时拒绝继续，已写入的目录被清空，下次启动时重新下载。
 
 ### 启动模式
 
@@ -151,14 +150,21 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'zashboard'
-        external_ui_download_url: 'https://example.com/dashboard.zip'
-        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: Rule
     }
     cache_file {
         enabled: true
         store_dns: true
+    }
+}
+```
+
+```dae
+assets {
+    ui {
+        url: 'https://example.com/dashboard.zip'
+        route: proxy
     }
 }
 ```

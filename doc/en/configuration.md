@@ -12,6 +12,7 @@ honk uses dae configuration syntax as a dialect: the known differences from dae 
 | `routing` | Apply ordered traffic rules and a fallback outbound. | [Routing reference](./reference/routing.md) |
 | `dns` | Configure listeners, upstreams, request/response policy, and cache behavior. | [DNS reference](./reference/dns.md) |
 | `subscription` | Fetch remote node lists. | [Subscription reference](./reference/subscription.md) |
+| `assets` | Set download defaults for geodata, the external UI, and subscriptions. | [Assets reference](./reference/assets.md) |
 | `experimental` | Enable the independent native API, Clash API, or persistent cache. | [Experimental reference](./reference/experimental.md) |
 | CLI | Select a config, backend, object file, or local command. | [CLI reference](./reference/cli.md) |
 
@@ -140,7 +141,19 @@ node {
 }
 
 subscription {
-    paid: 'https://subscription.example/sub'
+    paid: 'https://subscription.example/sub' {
+        interval: 3600s
+    }
+}
+
+assets {
+    subscription {
+        ua: 'clash.meta'
+    }
+    ui {
+        url: 'https://example.com/dashboard.zip'
+        route: proxy
+    }
 }
 
 group {
@@ -182,8 +195,6 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'ui'
-        external_ui_download_url: 'https://example.com/dashboard.zip'
-        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: 'Rule'
     }
@@ -261,7 +272,7 @@ See the [DNS reference](./reference/dns.md).
 
 ## Subscriptions
 
-Declare each source as `tag: 'url'`, append `(UA)` after the quoted URL for a per-subscription User-Agent, or use `tag: { url, ua, interval }` when a custom refresh interval is also needed; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `<data_dir>/.sub`; if that store is absent, an existing `/var/share/honk/.sub` and then an existing `./.sub` remain usable. No store is moved or deleted automatically. Requests use `honk/<version>` unless `ua` overrides it; the cache key includes the configured override, so distinct request identities keep distinct stored bodies. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. Subscription nodes remain runtime-only. `store_subscribe` changes require restart.
+Declare each source as `tag: 'url'`; add a block after the quoted URL for per-subscription `ua`, `interval`, `cache`, or `route` overrides. `assets.subscription` supplies shared `ua`, `interval`, and `cache` defaults; `assets.route` supplies the download route unless an entry overrides it. The tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is stored in the state db. Requests use `honk/<version>` unless `ua` overrides it; the cache key includes the configured override, so distinct request identities keep distinct stored bodies. Startup restores valid non-empty stored bodies before background refresh; SIGHUP carries active subscription nodes but does not restore from the store. Fetch, parse, or no-usable-node failures keep the active nodes and last valid body. Subscription nodes remain runtime-only. Changing `store_subscribe` requires restart.
 
 See the [subscription reference](./reference/subscription.md).
 
@@ -271,7 +282,7 @@ See the [subscription reference](./reference/subscription.md).
 
 For a captured `.dae` startup, source metadata, offline validation and real reload operations share the existing engine. Configuration reads return accepted content with only listener-secret values masked, including duplicate/overridden values and their other occurrences; credential-bearing sources remain read-only with original-byte hashes. Source `path` remains relative and `absolute_path` adds the canonical absolute path. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. `config_write` defaults false and requires a nonempty secret or `password_auth`. Main-source node/provider creation and deletion, authorized whole-source PUT and restricted Group PATCH reuse this authority; all accepted noncredential includes qualify for source edits when `config_write` is enabled, but not dedicated entry deletion. Configured geodata updates use verified immutable bytes and the same reload owner. Written bytes are not automatically rolled back after activation failure. Avoid concurrent external edits; see [configuration safety](./reference/api.md#accepted-configuration-and-reload-operations) and [entry and geodata management](./reference/api.md#managed-entries-and-geodata).
 
-**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` prefers an existing directory below `data_dir`, then `/var/share/honk`, then the working directory; if none exists, the dashboard is downloaded under `data_dir`. `external_ui_download_url` selects the ZIP source, while `external_ui_download_detour` forces the download through one node or group; empty values retain the built-in URL and normal traffic routing.
+**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` prefers an existing directory below `data_dir`, then `/var/share/honk`, then the working directory; if none exists, the dashboard is downloaded under `data_dir`. `assets.ui.url` selects the ZIP source, while `assets.ui.route` selects the download route, defaulting to `assets.route`. Without a configured URL or route, the built-in URL and normal traffic routing apply. `HONK_UI_DOWNLOAD_URL` overrides the ZIP URL.
 
 **Cache file.** By default, Selector choices and delay samples persist in `<data_dir>/state/honk.db`. `experimental.cache_file.enabled: true` also persists the Clash mode and GLOBAL selection, and with `store_dns: true` eligible DNS answers; `enabled: false` persists none of them. `path`, `cache_id` and `store_fakeip` no longer have an effect; the first start imports and removes a legacy `cache.db` ([upgrade notes](./reference/experimental.md#upgrading-from-cachedb)).
 
