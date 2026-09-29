@@ -19,6 +19,7 @@ pub(super) struct ReceiveTraceOffsets {
     cookie: u32,
     priority: u32,
     mark: u32,
+    owner: u32,
 }
 
 impl ReceiveTraceOffsets {
@@ -26,7 +27,8 @@ impl ReceiveTraceOffsets {
         loader
             .override_global("RECEIVE_SOCK_COOKIE_OFFSET", &self.cookie, true)
             .override_global("RECEIVE_SKB_PRIORITY_OFFSET", &self.priority, true)
-            .override_global("RECEIVE_SKB_MARK_OFFSET", &self.mark, true);
+            .override_global("RECEIVE_SKB_MARK_OFFSET", &self.mark, true)
+            .override_global("RECEIVE_OWNER_TGID", &self.owner, true);
     }
 }
 
@@ -40,6 +42,8 @@ pub(super) fn detect() -> Option<ReceiveTraceOffsets> {
             cookie,
             priority: btf.sized_member_offset("sk_buff", "priority", 4)?,
             mark: btf.sized_member_offset("sk_buff", "mark", 4)?,
+            // The hooks see host TGIDs; like `control_plane_pid`, this assumes the host PID namespace.
+            owner: std::process::id(),
         })
     }
     if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
@@ -370,6 +374,50 @@ mod tests {
             (batch.epoch, batch.active, batch.count),
             (registration.epoch, 1, 0)
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+    fn receive_trace_ignores_other_processes() -> anyhow::Result<()> {
+        let (_bpf, trace) = ReceiveTrace::load_for_test()?;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut registration = trace.register(receiver.as_raw_fd())?;
+        let mut buffer = [0u8; 8];
+        let mut receive = || unsafe {
+            libc::recv(
+                receiver.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+
+        sender.send_to(b"child", receiver.local_addr()?)?;
+        assert!(registration.begin(receiver.as_raw_fd()));
+        // The child shares the registered socket; only async-signal-safe calls follow fork.
+        match unsafe { libc::fork() } {
+            0 => unsafe { libc::_exit(i32::from(receive() != 5)) },
+            -1 => return Err(io::Error::last_os_error().into()),
+            child => {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            }
+        }
+        assert!(
+            registration.finish(0).is_some(),
+            "another process's receive was traced"
+        );
+
+        sender.send_to(b"owner", receiver.local_addr()?)?;
+        assert!(registration.begin(receiver.as_raw_fd()));
+        assert_eq!(receive(), 5);
+        let packets = registration
+            .finish(1)
+            .expect("the owner's receive is traced");
+        assert_eq!(packets[0].valid, RECEIVE_TRACE_VALID);
         Ok(())
     }
 }

@@ -149,6 +149,26 @@ impl KernelTraceDictionary {
         })
     }
 
+    /// `prepare` for a plan about to be published. A plan left without a
+    /// dictionary is published untraced: its witnesses could not be decoded.
+    pub(crate) fn prepare_or_untrace(
+        instance: &str,
+        generation: u64,
+        router: &Router,
+        config: &honk_config::Config,
+        plan: &mut std::sync::Arc<RoutingPushPlan>,
+    ) -> Option<Self> {
+        let dictionary = Self::prepare(instance, generation, router, config, plan);
+        if dictionary.is_none() && plan.trace_enabled() {
+            tracing::warn!(
+                generation,
+                "routing policy too large for its kernel trace dictionary; kernel route tracing is off"
+            );
+            std::sync::Arc::make_mut(plan).enable_trace(false);
+        }
+        dictionary
+    }
+
     fn outbound(&self, index: u8) -> Option<String> {
         self.outbounds
             .iter()

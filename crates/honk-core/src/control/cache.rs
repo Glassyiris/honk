@@ -4,6 +4,29 @@ use crate::state::cache::{
     CacheDb, DELAY_SAMPLE_MAX_AGE_SECS, Live, Maintenance, Missing, TickOwners, maintenance_tick,
 };
 
+/// The state db maintenance tick, every 60 s while the cache is open.
+#[derive(Default)]
+pub(super) struct StateTick {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StateTick {
+    /// Stops at the next wait; a maintenance write in flight finishes first.
+    pub(super) async fn stop_and_join(&mut self) -> anyhow::Result<()> {
+        self.stop.take();
+        super::lifecycle::joined(&mut self.task).await
+    }
+}
+
+impl Drop for StateTick {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 impl ControlPlane {
     /// Open the cache tables of the state database, import a legacy
     /// `cache.db`, restore and persist Selector choices and delay samples, and
@@ -161,10 +184,11 @@ impl ControlPlane {
     fn start_state_tick(&mut self, state: Arc<StateDb>, db: Option<Arc<CacheDb>>) {
         let alive = self.alive_set.clone();
         let config = self.config.clone();
+        let (stop_tx, mut stop) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let mut missing = Missing::default();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // first tick after one period
+            interval.tick().await;
             loop {
                 let (live, owners, names) = {
                     let config = config.read().await;
@@ -215,10 +239,14 @@ impl ControlPlane {
                 })
                 .await
                 .unwrap_or_default();
-                interval.tick().await;
+                tokio::select! {
+                    _ = &mut stop => break,
+                    _ = interval.tick() => {}
+                }
             }
         });
-        self.state_tick.0.push(task);
+        self.state_tick.stop = Some(stop_tx);
+        self.state_tick.task = Some(task);
     }
 
     /// The state database, when `init_cache_db` had one.
@@ -354,6 +382,35 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn shutdown_waits_for_a_blocked_maintenance_write() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.global.store_subscribe = true;
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDb::open(directory.path()).unwrap());
+        let connection = state.strict();
+        let mut plane = control_plane(config);
+        plane.init_cache_db(Some(Arc::clone(&state)), None).await;
+        // Let the first tick reach its maintenance write, which waits on `connection`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stop = plane.state_tick.stop_and_join();
+        tokio::pin!(stop);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut stop)
+                .await
+                .is_err(),
+            "shutdown finished while a maintenance write was in flight"
+        );
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

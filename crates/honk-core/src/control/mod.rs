@@ -167,7 +167,7 @@ pub struct ControlPlane {
     mode_db: Option<Arc<crate::state::cache::CacheDb>>,
     /// The state database handed to `init_cache_db`.
     state_db: Option<Arc<crate::state::StateDb>>,
-    state_tick: lifecycle::OwnedTasks,
+    state_tick: cache::StateTick,
     /// Features running reduced; shared with startup and the native API.
     degradations: Arc<crate::degradations::Degradations>,
     /// Built by `configure_health_loop`; a reload updates whether it is needed.

@@ -260,7 +260,7 @@ impl ControlPlane {
             cache_db: None,
             mode_db: None,
             state_db: None,
-            state_tick: lifecycle::OwnedTasks::default(),
+            state_tick: cache::StateTick::default(),
             degradations,
             quic_score_target: None,
             outbound_id_map,
