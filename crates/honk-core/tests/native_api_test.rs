@@ -469,6 +469,10 @@ async fn discovery_withholds_detail_from_callers_without_a_credential() {
     assert_eq!(version["api"]["name"], "daeuniverse/native");
     assert_eq!(version["engine"]["name"], "honk");
     assert_eq!(full["links"]["version"], "/api/v1/version");
+    assert_eq!(
+        full["links"]["operations"],
+        "/api/v1/operations/{operation_id}"
+    );
     assert_eq!(full["auth"]["anonymous_loopback"], false);
     app.shutdown().await;
 }
@@ -821,13 +825,6 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
             "/api/v1/no-such-resource",
             "resource_not_found",
         ),
-        (Method::POST, "/api/v1/runtime", "resource_not_found"),
-        (
-            Method::GET,
-            "/api/v1/connections/live-id",
-            "resource_not_found",
-        ),
-        (Method::PUT, "/api/v1/config", "resource_not_found"),
     ] {
         error_response(
             app.client
@@ -838,6 +835,38 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
                 .unwrap(),
             StatusCode::NOT_FOUND,
             code,
+        )
+        .await;
+    }
+    // A known path answers an unsupported method with 405 and its `Allow` list.
+    for (method, path) in [
+        (Method::POST, "/api/v1/runtime"),
+        (Method::PUT, "/api/v1/config"),
+        (Method::GET, "/api/v1/connections/live-id"),
+    ] {
+        let response = app
+            .client
+            .request(method.clone(), app.url(path))
+            .bearer_auth(SECRET)
+            .send()
+            .await
+            .unwrap();
+        let allow = response.headers()["allow"].to_str().unwrap().to_owned();
+        assert!(
+            !allow.is_empty() && !allow.split(", ").any(|allowed| allowed == method.as_str()),
+            "{path}: {allow}"
+        );
+        // axum serves HEAD wherever it serves GET, so `Allow` names both.
+        let listed: Vec<_> = allow.split(", ").collect();
+        assert_eq!(
+            listed.contains(&"GET"),
+            listed.contains(&"HEAD"),
+            "{path}: {allow}"
+        );
+        error_response(
+            response,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
         )
         .await;
     }

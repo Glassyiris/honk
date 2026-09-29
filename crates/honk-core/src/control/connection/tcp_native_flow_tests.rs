@@ -408,7 +408,7 @@ async fn native_tcp_lost_leaf_capture_does_not_invent_physical_routing_provenanc
             .unwrap();
         assert!(physical["data"]["parent_attempt_id"].is_string());
         assert_eq!(physical["data"]["routing_source"], "unknown");
-        assert_eq!(physical["data"]["mode_override"], "unknown");
+        assert_eq!(physical["data"]["x-honk"]["mode_override"], "unknown");
         assert_eq!(flow["trace"]["status"], "partial");
         assert!(
             flow["trace"]["missing"]

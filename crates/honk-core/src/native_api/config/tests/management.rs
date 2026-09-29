@@ -417,7 +417,7 @@ async fn delete_request_errors_and_source_drift_are_not_retryable() {
     let (response, ()) = tokio::join!(request, drift);
     let response = response.unwrap();
     assert!(response.headers().get("retry-after").is_none());
-    error(response, StatusCode::PRECONDITION_FAILED, "stale_revision").await;
+    error(response, StatusCode::CONFLICT, "state_conflict").await;
     reload(&fixture).await;
 
     let (entered, release) = fixture.pause_before_replace();
@@ -521,8 +521,8 @@ async fn management_fences_disk_and_activation_and_reports_written_state() {
             .send()
             .await
             .unwrap(),
-        StatusCode::PRECONDITION_FAILED,
-        "stale_revision",
+        StatusCode::CONFLICT,
+        "state_conflict",
     )
     .await;
     assert_eq!(response["error"]["details"]["written"], false);

@@ -57,7 +57,7 @@ pub(super) struct GroupPatch {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) revision: String,
-    pub(super) expected: Result<String, ApiError>,
+    pub(super) expected: Result<config::IfMatch, ApiError>,
     group: Group,
     members: Vec<(String, String)>,
     operations: Value,
@@ -187,7 +187,47 @@ fn check_url(value: &str) -> Option<String> {
     })
 }
 
+/// The body checks that precede the `If-Match` comparison: a non-empty array
+/// within the operation limit whose operations name a known `op`, their
+/// required members and supported paths.
+fn operation_list(value: &Value) -> Result<&Vec<Value>, ApiError> {
+    let operations = value
+        .as_array()
+        .filter(|operations| !operations.is_empty())
+        .ok_or_else(invalid)?;
+    if operations.len() > 32 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "Group patch operation limit exceeded",
+            None,
+        ));
+    }
+    for operation in operations {
+        let operation = operation.as_object().ok_or_else(invalid)?;
+        let op = operation.get("op").and_then(Value::as_str);
+        let complete = match op {
+            Some("add" | "replace" | "test") => operation.contains_key("value"),
+            Some("remove" | "copy" | "move") => true,
+            _ => false,
+        };
+        if !complete {
+            return Err(invalid());
+        }
+        field(operation, "path")?;
+        if matches!(op, Some("copy" | "move")) {
+            field(operation, "from")?;
+        }
+    }
+    Ok(operations)
+}
+
 impl GroupPatch {
+    /// Body checks that the coordinator runs before the revision comparison.
+    pub(super) fn validate_shape(&self) -> Result<(), ApiError> {
+        operation_list(&self.operations).map(drop)
+    }
+
     pub(super) fn changes(&self) -> Result<Vec<(GroupField, Option<String>)>, ApiError> {
         let policy = serde_json::to_value(self.group.policy).map_err(|_| invalid())?;
         let default = self
@@ -206,11 +246,7 @@ impl GroupPatch {
             json!(crate::observe::catalog::check_url(&self.group)),
         ];
         let mut values = initial.clone().map(Some);
-        let operations = self
-            .operations
-            .as_array()
-            .filter(|operations| !operations.is_empty())
-            .ok_or_else(invalid)?;
+        let operations = operation_list(&self.operations)?;
         let rejected = |op: &str, path: usize| {
             // Without a policy write the group cannot become URLTest, so any
             // tolerance write fails on the policy rule whatever its value.
@@ -226,14 +262,6 @@ impl GroupPatch {
                 unsupported_value(path)
             }
         };
-        if operations.len() > 32 {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Group patch operation limit exceeded",
-                None,
-            ));
-        }
         for operation in operations {
             let operation = operation.as_object().ok_or_else(invalid)?;
             let op = operation
@@ -243,7 +271,7 @@ impl GroupPatch {
             let path = field(operation, "path")?;
             match op {
                 "add" | "replace" | "test" => {
-                    if operation.len() != 3 || !operation.contains_key("value") {
+                    if !operation.contains_key("value") {
                         return Err(invalid());
                     }
                     let value =
@@ -265,14 +293,11 @@ impl GroupPatch {
                     }
                 }
                 "remove" => {
-                    if operation.len() != 2 || values[path].take().is_none() {
+                    if values[path].take().is_none() {
                         return Err(invalid());
                     }
                 }
                 "copy" | "move" => {
-                    if operation.len() != 3 {
-                        return Err(invalid());
-                    }
                     let from = field(operation, "from")?;
                     let value = values[from].as_ref().ok_or_else(invalid)?;
                     let value = normalized(path, value).ok_or_else(|| rejected(op, path))?;
@@ -371,26 +396,15 @@ pub(super) async fn patch(
             None,
         ));
     }
-    let expected = config::request_header(&request, "if-match").and_then(|tag| {
-        let tag = tag.ok_or_else(|| {
+    let expected = config::IfMatch::from_request(&request).and_then(|condition| {
+        condition.ok_or_else(|| {
             ApiError::new(
                 StatusCode::PRECONDITION_REQUIRED,
                 ErrorCode::PreconditionRequired,
                 "A strong group revision is required",
                 None,
             )
-        })?;
-        let value = tag
-            .strip_prefix('"')
-            .and_then(|tag| tag.strip_suffix('"'))
-            .filter(|tag| {
-                !tag.is_empty()
-                    && tag
-                        .bytes()
-                        .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b',')
-            })
-            .ok_or_else(invalid)?;
-        Ok(value.to_owned())
+        })
     });
     let key = config::request_header(&request, "idempotency-key")?.map(str::to_owned);
     let path = request.uri().path().to_owned();
@@ -586,7 +600,7 @@ mod tests {
             id: "group".into(),
             name: "G".into(),
             revision: "r".into(),
-            expected: Ok("r".into()),
+            expected: Ok(config::IfMatch::Tags(vec!["r".into()])),
             group: Group {
                 policy: honk_config::group::GroupPolicy::URLTest,
                 own: honk_config::group::OwnOptions {
@@ -627,6 +641,33 @@ mod tests {
             ]),
         ] {
             assert!(request(operations).changes().is_err());
+        }
+    }
+
+    #[test]
+    fn operation_members_outside_the_operation_are_ignored() {
+        let patch = request(json!([
+            {"op":"test","path":"/config/tolerance","value":50,"comment":"current"},
+            {"op":"copy","from":"/config/tolerance","path":"/config/idle_timeout","value":1},
+            {"op":"remove","path":"/config/final_outbound","from":"/policy"},
+            {"op":"replace","path":"/config/tolerance","value":60,"x":null}
+        ]));
+        assert_eq!(
+            patch.changes().unwrap(),
+            vec![
+                (GroupField::Final, None),
+                (GroupField::Tolerance, Some("60".into())),
+                (GroupField::IdleTimeout, Some("50".into()))
+            ]
+        );
+        for operations in [
+            json!([{"op":"replace","path":"/config/tolerance","comment":"no value"}]),
+            json!([{"op":"copy","path":"/config/idle_timeout","value":1}]),
+        ] {
+            assert_eq!(
+                request(operations).changes().unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
         }
     }
 

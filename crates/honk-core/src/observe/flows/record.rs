@@ -288,6 +288,7 @@ pub(crate) struct OutboundAttempt {
     pub routing_source: RoutingSource,
     pub routed_outbound: Option<String>,
     pub effective_outbound: Option<String>,
+    #[serde(rename = "x-honk", serialize_with = "x_honk_mode_override")]
     pub mode_override: &'static str,
     pub selection_path: Vec<Selection>,
     pub leaf_node_id: Option<String>,
@@ -793,6 +794,16 @@ fn redact_display(value: &mut Option<String>, redacted: &mut bool, overflow: &mu
     if let Some(text) = value {
         *value = super::bounded_display(text, redacted, overflow);
     }
+}
+
+fn x_honk_mode_override<S: serde::Serializer>(
+    mode_override: &&'static str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(1))?;
+    map.serialize_entry("mode_override", mode_override)?;
+    map.end()
 }
 
 fn rfc3339<S: serde::Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {

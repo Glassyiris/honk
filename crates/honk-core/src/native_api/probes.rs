@@ -84,6 +84,13 @@ impl Kind {
             Self::Http => Some(if https { 443 } else { 80 }),
         }
     }
+    /// The health purpose the kind measures; a request cannot choose it.
+    fn purpose(self) -> Purpose {
+        match self {
+            Self::TcpConnect | Self::Http => Purpose::Data,
+            Self::Dns => Purpose::Dns,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -152,7 +159,6 @@ enum MemberScope {
 struct ProbeRequest {
     target: Target,
     kind: Kind,
-    purpose: Purpose,
     transport: Vec<Transport>,
     ip_version: RequestedFamily,
     warmth: Warmth,
@@ -164,7 +170,7 @@ fn present_members<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<Members>, D::Error> {
     Members::deserialize(deserializer).map(Some)
 }
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Purpose {
     Data,
@@ -348,7 +354,7 @@ impl ProbeService {
         }
     }
     pub(crate) fn capability(&self) -> Value {
-        json!({"available": self.running(), "targets":["node","group"], "kinds":["tcp_connect","http","dns"], "purposes":["data","dns"], "transports":["tcp","udp"], "ip_versions":["ipv4","ipv6"], "limits":{"max_members_per_job":MAX_MEMBERS,"max_results_per_job":MAX_RESULTS,"max_active_jobs":MAX_ACTIVE,"max_queued_jobs":MAX_QUEUED,"max_concurrent_per_target":1,"job_timeout_ms":DEADLINE.as_millis(),"per_principal_requests_per_minute":REQUESTS_PER_MINUTE,"global_requests_per_minute":REQUESTS_PER_MINUTE}})
+        json!({"available": self.running(), "targets":["node","group"], "kinds":["tcp_connect","http","dns"], "transports":["tcp","udp"], "ip_versions":["ipv4","ipv6"], "limits":{"max_members_per_job":MAX_MEMBERS,"max_results_per_job":MAX_RESULTS,"max_active_jobs":MAX_ACTIVE,"max_queued_jobs":MAX_QUEUED,"max_concurrent_per_target":1,"job_timeout_ms":DEADLINE.as_millis(),"per_principal_requests_per_minute":REQUESTS_PER_MINUTE,"global_requests_per_minute":REQUESTS_PER_MINUTE}})
     }
     pub(crate) fn start(
         self: &Arc<Self>,

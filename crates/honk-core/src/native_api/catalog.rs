@@ -509,6 +509,29 @@ pub(super) async fn group(
     uri: &Uri,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
+    let (value, _) = group_document(state, group_id, uri, id).await?;
+    Ok(Json(value).into_response())
+}
+
+/// The group's `policy` and `config`, the target of `PATCH`, tagged with the
+/// configuration revision that `If-Match` compares.
+pub(super) async fn group_config(
+    state: &NativeState,
+    group_id: &str,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let (value, revision) = group_document(state, group_id, uri, id).await?;
+    let document = json!({"policy": value["policy"], "config": value["config"]});
+    Ok(([(header::ETAG, format!("\"{revision}\""))], Json(document)).into_response())
+}
+
+async fn group_document(
+    state: &NativeState,
+    group_id: &str,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<(Value, String), ApiError> {
     parse_query(uri, &[], id)?;
     let _config = state.config.read().await;
     let identity = state.observation.core.catalog.snapshot();
@@ -537,7 +560,7 @@ pub(super) async fn group(
         value["capabilities"]["mutable_config"] = json!(mutable);
     }
     let value = super::config::administrative_projection(state, value)?;
-    Ok(([(header::ETAG, format!("\"{revision}\""))], Json(value)).into_response())
+    Ok((value, revision))
 }
 
 fn group_not_found(id: &RequestId) -> ApiError {

@@ -35,7 +35,7 @@ async fn state(mut config: Config) -> Arc<NativeState> {
     Arc::new(state)
 }
 fn request(target: Value, kind: &str, transport: Value, family: &str) -> Value {
-    json!({"target":target,"kind":kind,"purpose":if kind == "dns" { "dns" } else { "data" },"transport":transport,"ip_version":family,"warmth":"cold"})
+    json!({"target":target,"kind":kind,"transport":transport,"ip_version":family,"warmth":"cold"})
 }
 fn http_request(value: &Value, key: &str) -> Request {
     Request::builder()
@@ -879,15 +879,10 @@ async fn unsupported_kind_pairings_name_the_field() {
     let (stop, receiver) = watch::channel(false);
     let worker = state.observation.probes.start(Arc::clone(&state), receiver);
     let node = json!({"type":"node","node_id":"node"});
-    let mut dns_data = request(node.clone(), "dns", json!(["udp"]), "ipv4");
-    dns_data["purpose"] = json!("data");
-    for (index, (input, field)) in [
-        (
-            request(node, "tcp_connect", json!(["udp"]), "ipv4"),
-            "transport",
-        ),
-        (dns_data, "purpose"),
-    ]
+    for (index, (input, field)) in [(
+        request(node, "tcp_connect", json!(["udp"]), "ipv4"),
+        "transport",
+    )]
     .into_iter()
     .enumerate()
     {
@@ -984,6 +979,34 @@ fn probe_request_rejects_explicit_null_members_and_caller_urls() {
     let mut arbitrary_url = input;
     arbitrary_url["url"] = json!("http://169.254.169.254/");
     assert!(serde_json::from_value::<ProbeRequest>(arbitrary_url).is_err());
+}
+
+#[tokio::test]
+async fn probe_request_has_no_purpose_because_the_kind_fixes_it() {
+    let state = state(Config::default()).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let mut input = request(
+        json!({"type":"node","node_id":"node"}),
+        "dns",
+        json!(["udp"]),
+        "ipv4",
+    );
+    input["purpose"] = json!("dns");
+    let key = "purpose".to_owned();
+    let error = create(&state, http_request(&input, &key), &RequestId(key))
+        .await
+        .unwrap_err();
+    let body = serde_json::to_value(&error).unwrap();
+    assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(
+        body["error"]["details"],
+        json!({"field":"body","kind":"unknown_field"})
+    );
+    assert!(state.observation.probes.capability()["purposes"].is_null());
+    stop.send(true).unwrap();
+    worker.await.unwrap();
 }
 
 #[tokio::test]

@@ -62,12 +62,6 @@ fn validate(request: &ProbeRequest) -> Result<(), ApiError> {
     {
         return Err(invalid());
     }
-    if (request.kind == Kind::Dns) != (request.purpose == Purpose::Dns) {
-        return Err(unsupported(
-            "The probe purpose does not match its kind",
-            json!({"field":"purpose"}),
-        ));
-    }
     if request.kind != Kind::Dns && request.transport != [Transport::Tcp] {
         return Err(unsupported(
             "This probe kind runs over TCP only",
@@ -223,7 +217,7 @@ fn plan(
                     member_id: member_id.clone(),
                     resolved_leaf_node_id: leaf.map(|node| node.id.to_string()),
                     kind: request.kind,
-                    purpose: request.purpose,
+                    purpose: request.kind.purpose(),
                     transport,
                     ip_version: family,
                     warmth: "unknown",
@@ -355,7 +349,7 @@ fn plan(
             spec: Specification {
                 target: request.target,
                 kind: request.kind,
-                purpose: request.purpose,
+                purpose: request.kind.purpose(),
                 warmth: request.warmth,
             },
             config,

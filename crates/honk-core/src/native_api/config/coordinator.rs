@@ -204,8 +204,7 @@ impl Worker {
                     .prepare_replace(
                         &source_id,
                         content,
-                        if_match,
-                        None,
+                        Precondition::Source(if_match),
                         None,
                         &reservation.principal,
                     )
@@ -478,8 +477,10 @@ impl Worker {
             .prepare_replace(
                 &accepted.ids[&main.path],
                 content,
-                accepted.hashes[0].clone(),
-                Some(accepted.revision.clone()),
+                Precondition::Internal {
+                    sha256: accepted.hashes[0].clone(),
+                    revision: accepted.revision.clone(),
+                },
                 match &mutation {
                     Mutation::CreateProvider(input) => Some(input.name.clone()),
                     _ => None,
@@ -669,7 +670,8 @@ impl Worker {
         patch: super::super::groups::GroupPatch,
         principal: &str,
     ) -> Result<Option<Prepared>, ApiError> {
-        let expected = patch.expected.as_ref().map_err(Clone::clone)?;
+        let if_match = patch.expected.clone()?;
+        patch.validate_shape()?;
         let accepted = self
             .service
             .sources
@@ -677,13 +679,16 @@ impl Worker {
             .read()
             .clone()
             .ok_or_else(unavailable)?;
-        if accepted.revision != *expected || accepted.revision != patch.revision {
+        if !if_match.matches(&accepted.revision) {
             return Err(ApiError::new(
                 StatusCode::PRECONDITION_FAILED,
                 ErrorCode::StaleRevision,
                 "Group configuration revision changed",
                 None,
             ));
+        }
+        if accepted.revision != patch.revision {
+            return Err(changed());
         }
         let index = *accepted
             .group_sources
@@ -699,18 +704,24 @@ impl Worker {
             &changes,
         )
         .map_err(|_| invalid())?;
+        let condition = Precondition::Group {
+            if_match,
+            sha256: accepted.hashes[index].clone(),
+            revision: patch.revision,
+        };
         if content == accepted.update.sources[index].content.as_ref() {
             let store = self.store.clone();
             let service = Arc::clone(&self.service);
             tokio::task::spawn_blocking(move || {
                 let mut diagnostics = Vec::new();
+                let moved = || condition.refused(&store, None, &service);
                 let baseline = store
                     .load(&HashMap::new(), &mut diagnostics)
-                    .map_err(|_| stale())?;
-                if service.sources.revision().as_ref() != Some(&patch.revision)
+                    .map_err(|_| moved())?;
+                if service.sources.revision().as_deref() != condition.revision()
                     || !same_source_documents(&accepted.update.sources, &baseline.sources)
                 {
-                    return Err(stale());
+                    return Err(moved());
                 }
                 Ok(())
             })
@@ -721,8 +732,7 @@ impl Worker {
         self.prepare_replace(
             &accepted.ids[&accepted.update.sources[index].path],
             content,
-            accepted.hashes[index].clone(),
-            Some(patch.revision),
+            condition,
             None,
             principal,
         )
@@ -735,8 +745,7 @@ impl Worker {
         &self,
         source_id: &str,
         content: String,
-        expected: String,
-        group_revision: Option<String>,
+        condition: Precondition,
         new_provider: Option<String>,
         principal: &str,
     ) -> Result<Prepared, ApiError> {
@@ -768,22 +777,25 @@ impl Worker {
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
             let store = check.store.clone();
-            let pin = store
-                .pin(&target)
-                .map_err(|error| store_write_error(&store, error))?;
-            if pin.sha256() != expected {
-                return Err(stale());
+            let moved = || condition.refused(&store, Some(&target), &service);
+            let refused = |error| match error {
+                WriteError::Conflict => moved(),
+                error => store_write_error(&store, error),
+            };
+            let pin = store.pin(&target).map_err(refused)?;
+            if !condition.holds(&pin.sha256()) {
+                return Err(moved());
             }
-            if let Some(revision) = &group_revision {
-                if service.sources.revision().as_ref() != Some(revision) {
-                    return Err(stale());
+            if let Some(revision) = condition.revision() {
+                if service.sources.revision().as_deref() != Some(revision) {
+                    return Err(moved());
                 }
                 let mut diagnostics = Vec::new();
                 let baseline = store
                     .load(&HashMap::new(), &mut diagnostics)
-                    .map_err(|_| stale())?;
+                    .map_err(|_| moved())?;
                 if !same_source_documents(&accepted.update.sources, &baseline.sources) {
-                    return Err(stale());
+                    return Err(moved());
                 }
             }
             let mut overlay = HashMap::new();
@@ -832,9 +844,9 @@ impl Worker {
                 if let Some(hook) = before_replace {
                     hook();
                 }
-                if group_revision
-                    .as_ref()
-                    .is_some_and(|revision| service.sources.revision().as_ref() != Some(revision))
+                if condition
+                    .revision()
+                    .is_some_and(|revision| service.sources.revision().as_deref() != Some(revision))
                 {
                     return Err(WriteError::Conflict);
                 }
@@ -842,7 +854,7 @@ impl Worker {
             });
             let committed = pin
                 .commit(&content, &validated.sources, &principal, recheck)
-                .map_err(|error| store_write_error(&store, error))?;
+                .map_err(refused)?;
             Ok(prepared(validated, diagnostics, committed))
         })
         .await
@@ -1111,6 +1123,63 @@ fn prepared(
 }
 
 type Prepared = (Config, SourceUpdate, Vec<DetailedDiagnostic>, Committed);
+
+/// What a source replacement is conditional on.
+enum Precondition {
+    /// The client's `If-Match` over the stored content hash of the source.
+    Source(IfMatch),
+    /// The client's `If-Match` over the configuration revision, with the accepted content hash
+    /// and revision the patch was built from.
+    Group {
+        if_match: IfMatch,
+        sha256: String,
+        revision: String,
+    },
+    /// The accepted content hash and revision a management mutation was built from.
+    Internal { sha256: String, revision: String },
+}
+
+impl Precondition {
+    /// Whether the pinned source still has the content this write expects.
+    fn holds(&self, sha256: &str) -> bool {
+        match self {
+            Self::Source(if_match) => if_match.matches(sha256),
+            Self::Group { sha256: pinned, .. } | Self::Internal { sha256: pinned, .. } => {
+                pinned == sha256
+            }
+        }
+    }
+
+    fn revision(&self) -> Option<&str> {
+        match self {
+            Self::Source(_) => None,
+            Self::Group { revision, .. } | Self::Internal { revision, .. } => Some(revision),
+        }
+    }
+
+    /// The refusal once the state this write was validated against moved: the client's
+    /// condition is evaluated again against the current state, and a change it still matches
+    /// is a conflict rather than a failed precondition.
+    fn refused(
+        &self,
+        store: &SourceStore,
+        target: Option<&Path>,
+        service: &ConfigService,
+    ) -> ApiError {
+        let still = match self {
+            Self::Source(if_match) => target
+                .and_then(|target| store.pin(target).ok())
+                .is_some_and(|pin| if_match.matches(&pin.sha256())),
+            Self::Group { if_match, .. } => service
+                .sources
+                .revision()
+                .is_some_and(|revision| if_match.matches(&revision)),
+            // No client condition: any concurrent change is a conflict.
+            Self::Internal { .. } => true,
+        };
+        if still { changed() } else { stale() }
+    }
+}
 
 fn store_write_error(store: &SourceStore, error: WriteError) -> ApiError {
     match store {
