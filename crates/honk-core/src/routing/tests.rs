@@ -787,15 +787,11 @@ fn equal_ip_networks_share_one_matcher_across_routing_and_dns() {
         .union(&DnsRouter::geo_requirements(&config.dns));
     let sources = GeoSourceSet::load(&requirements);
     let mut shared = SharedMatchers::default();
-    let router =
-        Router::from_config_with_geo_sources(&config.routing, &sources, &mut shared).unwrap();
-    let dns = DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut shared).unwrap();
+    let router = Router::from_config_sharing(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_sharing(&config.dns, &sources, &mut shared).unwrap();
     drop(shared);
-    let unshared_router =
-        Router::from_config_with_geo_sources(&config.routing, &sources, &mut Default::default())
-            .unwrap();
-    let unshared_dns =
-        DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut Default::default()).unwrap();
+    let unshared_router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+    let unshared_dns = DnsRouter::new_with_geo_sources(&config.dns, &sources).unwrap();
 
     let routed: Vec<_> = router
         .compiled_routes()
@@ -893,15 +889,11 @@ fn geosite_selectors_share_one_matcher_across_routing_and_dns() {
         .union(&DnsRouter::geo_requirements(&config.dns));
     let sources = GeoSourceSet::load(&requirements);
     let mut shared = SharedMatchers::default();
-    let router =
-        Router::from_config_with_geo_sources(&config.routing, &sources, &mut shared).unwrap();
-    let dns = DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut shared).unwrap();
+    let router = Router::from_config_sharing(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_sharing(&config.dns, &sources, &mut shared).unwrap();
     drop(shared);
-    let unshared_router =
-        Router::from_config_with_geo_sources(&config.routing, &sources, &mut Default::default())
-            .unwrap();
-    let unshared_dns =
-        DnsRouter::new_with_geo_sources(&config.dns, &sources, &mut Default::default()).unwrap();
+    let unshared_router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+    let unshared_dns = DnsRouter::new_with_geo_sources(&config.dns, &sources).unwrap();
 
     let [cn, games_cn, games, private] = router.geosite_matchers()[..] else {
         panic!("expected four routing geosite selectors");

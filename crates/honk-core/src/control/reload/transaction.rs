@@ -409,11 +409,7 @@ impl ControlPlane {
         let new_router = if reuse_routing_state {
             current_router
         } else {
-            match Router::from_config_with_geo_sources(
-                &new_config.routing,
-                geo_sources,
-                &mut shared,
-            ) {
+            match Router::from_config_sharing(&new_config.routing, geo_sources, &mut shared) {
                 Ok(router) => router,
                 Err(error) => {
                     error!(%error, "Failed to build new router");
@@ -463,7 +459,7 @@ impl ControlPlane {
         let dns_router = if reuse_dns_router {
             current_dns_router
         } else {
-            match crate::dns::routing::DnsRouter::new_with_geo_sources(
+            match crate::dns::routing::DnsRouter::new_sharing(
                 &new_config.dns,
                 geo_sources,
                 &mut shared,

@@ -1291,8 +1291,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
     let mut shared = routing::SharedMatchers::default();
-    let router =
-        routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources, &mut shared)?;
+    let router = routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
     ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
@@ -1305,7 +1304,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_cache = std::sync::Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(
         config.dns.cache.max_size,
     )));
-    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_with_geo_sources(
+    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_sharing(
         &config.dns,
         &geo_sources,
         &mut shared,

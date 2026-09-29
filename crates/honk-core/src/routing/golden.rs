@@ -496,7 +496,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
     let mut routing = honk_config::routing::RoutingConfig::default();
     routing.rules = rules;
     (
-        Router::from_config_with_geo_sources(&routing, &sources, &mut Default::default()).unwrap(),
+        Router::from_config_with_geo_sources(&routing, &sources).unwrap(),
         cases,
     )
 }

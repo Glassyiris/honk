@@ -75,15 +75,10 @@ impl Fixture {
                 .map(Arc::from)
             },
         )?;
-        let router = Router::from_config_with_geo_sources(
-            &config.routing,
-            &sources,
-            &mut Default::default(),
-        )?;
+        let router = Router::from_config_with_geo_sources(&config.routing, &sources)?;
         let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_with_geo_sources(
             &config.dns,
             &sources,
-            &mut Default::default(),
         )?);
         let proxy = Arc::new(ProxyRegistry::default_resolver()?);
         let upstream = Arc::new(

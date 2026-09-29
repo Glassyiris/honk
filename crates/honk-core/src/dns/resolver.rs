@@ -95,11 +95,7 @@ fn build_forwarder_from_config(config: &DnsConfig) -> anyhow::Result<Arc<DnsForw
     let dns_cache = Arc::new(Mutex::new(DnsCache::new(config.cache.max_size)));
     let requirements = DnsRouter::geo_requirements(config);
     let geo_sources = crate::routing::GeoSourceSet::load(&requirements);
-    let router = Arc::new(DnsRouter::new_with_geo_sources(
-        config,
-        &geo_sources,
-        &mut Default::default(),
-    )?);
+    let router = Arc::new(DnsRouter::new_with_geo_sources(config, &geo_sources)?);
     let pool = Arc::new(
         UpstreamPool::new(&config.upstream, Arc::clone(&router))?
             .with_client_subnet(config.effective_client_subnet()?),

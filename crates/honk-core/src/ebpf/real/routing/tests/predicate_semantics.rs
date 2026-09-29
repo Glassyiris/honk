@@ -74,9 +74,7 @@ fn assert_predicate(
         "routing {{\n{expression} -> proxy(must)\ndefault: block\n}}"
     ))
     .unwrap();
-    let router =
-        Router::from_config_with_geo_sources(&config.routing, sources, &mut Default::default())
-            .unwrap();
+    let router = Router::from_config_with_geo_sources(&config.routing, sources).unwrap();
     for (index, (connection, hit)) in samples.iter().enumerate() {
         let (action, _) = router.route_action(connection);
         assert_eq!(

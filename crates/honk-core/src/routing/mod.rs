@@ -436,10 +436,18 @@ impl Router {
 
     pub fn from_config(routing: &RoutingConfig) -> anyhow::Result<Self> {
         let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(&routing.rules));
-        Self::from_config_with_geo_sources(routing, &sources, &mut SharedMatchers::default())
+        Self::from_config_with_geo_sources(routing, &sources)
     }
 
     pub(crate) fn from_config_with_geo_sources(
+        routing: &RoutingConfig,
+        geo_sources: &GeoSourceSet,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_sharing(routing, geo_sources, &mut SharedMatchers::default())
+    }
+
+    /// Builds with matchers shared with the other router of the same build.
+    pub(crate) fn from_config_sharing(
         routing: &RoutingConfig,
         geo_sources: &GeoSourceSet,
         shared: &mut SharedMatchers,

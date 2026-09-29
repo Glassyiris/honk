@@ -426,6 +426,14 @@ impl DnsRouter {
     pub(crate) fn new_with_geo_sources(
         dns_config: &DnsConfig,
         geo_sources: &GeoSourceSet,
+    ) -> anyhow::Result<Self> {
+        Self::new_sharing(dns_config, geo_sources, &mut SharedMatchers::default())
+    }
+
+    /// Builds with matchers shared with the traffic router of the same build.
+    pub(crate) fn new_sharing(
+        dns_config: &DnsConfig,
+        geo_sources: &GeoSourceSet,
         shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let request = dns_config.routing.effective_request();

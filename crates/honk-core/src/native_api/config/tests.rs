@@ -196,16 +196,11 @@ impl Fixture {
             |path| std::fs::read(path).map(Arc::from),
         )
         .unwrap();
-        let router =
-            Router::from_config_with_geo_sources(&config.routing, &geo, &mut Default::default())
-                .unwrap();
+        let router = Router::from_config_with_geo_sources(&config.routing, &geo).unwrap();
         let forwarder = Arc::new(DnsForwarder::new(
             Arc::new(NoDns),
             Arc::new(tokio::sync::Mutex::new(DnsCache::new(16))),
-            Arc::new(
-                DnsRouter::new_with_geo_sources(&config.dns, &geo, &mut Default::default())
-                    .unwrap(),
-            ),
+            Arc::new(DnsRouter::new_with_geo_sources(&config.dns, &geo).unwrap()),
         ));
         let resolver = DnsResolver::with_forwarder(&config.dns, Arc::clone(&forwarder)).unwrap();
         let mut control_plane = ControlPlane::new(

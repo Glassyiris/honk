@@ -1281,8 +1281,7 @@ async fn an_update_replaces_the_resolved_copy_of_an_unchanged_loaded_file() {
         })
         .unwrap();
         *state.traffic_router.write().await =
-            Router::from_config_with_geo_sources(&config.routing, &geo, &mut Default::default())
-                .unwrap();
+            Router::from_config_with_geo_sources(&config.routing, &geo).unwrap();
     }
     let geoip_inode = std::fs::metadata(fixture.path("state/geoip.dat"))
         .unwrap()

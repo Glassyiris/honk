@@ -136,7 +136,6 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
     let router = Router::from_config_with_geo_sources(
         &routing,
         &GeoSourceSet::from_bytes(Vec::new(), geoip),
-        &mut Default::default(),
     )
     .unwrap();
     let connection = ConnectionInfo {

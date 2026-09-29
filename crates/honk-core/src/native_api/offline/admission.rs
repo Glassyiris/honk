@@ -42,16 +42,14 @@ impl CapturedConfig {
         let hosts = hosts
             .parse()
             .map_err(|cause| dependency_error(source, "dns", cause))?;
-        let router =
-            Router::from_config_with_geo_sources(&config.routing, &geo, &mut Default::default())
-                .map_err(|_| {
-                    error(
-                        source,
-                        "routing",
-                        "invalid-routing-config",
-                        "routing configuration cannot be compiled",
-                    )
-                })?;
+        let router = Router::from_config_with_geo_sources(&config.routing, &geo).map_err(|_| {
+            error(
+                source,
+                "routing",
+                "invalid-routing-config",
+                "routing configuration cannot be compiled",
+            )
+        })?;
         ControlPlane::compile_routing_plan(&config, &router).map_err(|_| {
             error(
                 source,
@@ -60,16 +58,14 @@ impl CapturedConfig {
                 "routing configuration cannot be compiled",
             )
         })?;
-        DnsRouter::new_with_geo_sources(&config.dns, &geo, &mut Default::default()).map_err(
-            |_| {
-                error(
-                    source,
-                    "dns",
-                    "invalid-dns-config",
-                    "DNS routing configuration cannot be compiled",
-                )
-            },
-        )?;
+        DnsRouter::new_with_geo_sources(&config.dns, &geo).map_err(|_| {
+            error(
+                source,
+                "dns",
+                "invalid-dns-config",
+                "DNS routing configuration cannot be compiled",
+            )
+        })?;
         PolicyId::from_config_with_artifacts(
             &config.dns,
             &hosts.fingerprint(),
