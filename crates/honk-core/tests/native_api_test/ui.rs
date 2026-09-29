@@ -215,6 +215,21 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
             }
         }
     }
+    let webp = std::fs::read_dir(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/doona/assets"),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+    .find(|name| name.ends_with(".webp"))
+    .unwrap();
+    let response = app
+        .client
+        .get(entry_url.join(&format!("./assets/{webp}")).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{webp}");
+    assert_eq!(response.headers()["content-type"], "image/webp", "{webp}");
     for path in [
         "/ui/missing.js",
         "/ui/assets/missing",
