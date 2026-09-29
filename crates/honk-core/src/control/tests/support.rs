@@ -103,7 +103,8 @@ pub(in crate::control) enum UdpTestMode {
 struct UdpTestTransport {
     mode: UdpTestMode,
     relay: SocketAddr,
-    replied: std::sync::atomic::AtomicBool,
+    /// Last DNS query sent in a `DnsResponse` mode, answered once by `recv_packet`.
+    sent: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 #[async_trait::async_trait]
@@ -135,6 +136,10 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 socket.send_to(_data, self.relay).await?;
                 Ok(())
             }
+            UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_) => {
+                *self.sent.lock().expect("sent query") = Some(_data.to_vec());
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -148,18 +153,14 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
         if matches!(
             self.mode,
             UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_)
-        ) && !self
-            .replied
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let response = [0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
-            buf[..response.len()].copy_from_slice(&response);
-            return Ok((response.len(), self.relay));
-        }
-        if matches!(
-            self.mode,
-            UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_)
         ) {
+            // Echo the query as a NOERROR answer (QR set, question intact).
+            let sent = self.sent.lock().expect("sent query").take();
+            if let Some(mut response) = sent {
+                response[2] |= 0x80;
+                buf[..response.len()].copy_from_slice(&response);
+                return Ok((response.len(), self.relay));
+            }
             return std::future::pending().await;
         }
         Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
@@ -314,7 +315,7 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
             _ => Ok(Arc::new(UdpTestTransport {
                 mode: self.mode.clone(),
                 relay: target,
-                replied: std::sync::atomic::AtomicBool::new(false),
+                sent: std::sync::Mutex::new(None),
             })),
         }
     }
@@ -671,7 +672,7 @@ pub(in crate::control) fn score_reload_config(revision: u64) -> Config {
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) struct NativeFlowApi {
-    pub(in crate::control) flows: Arc<crate::native_api::flows::FlowStore>,
+    pub(in crate::control) flows: Arc<crate::observe::flows::FlowStore>,
     addr: SocketAddr,
     client: reqwest::Client,
     server: crate::native_api::NativeServer,
@@ -700,9 +701,9 @@ impl NativeFlowApi {
             .await
             .unwrap(),
         );
-        let native = control.native_observation();
+        let native = Arc::clone(&state.observation);
         native.attach_for_test();
-        let flows = Arc::clone(&native.flows);
+        let flows = Arc::clone(&native.core.flows);
         Self {
             flows,
             addr,

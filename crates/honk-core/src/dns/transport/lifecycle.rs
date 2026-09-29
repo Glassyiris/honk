@@ -288,19 +288,20 @@ impl<T> LifecycleSlot<T> {
 }
 
 pub(super) fn attached() {
-    #[cfg(feature = "native-api")]
     if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
         observer.publish(
             honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
                 server_addr: None,
-                resolution_location: "unknown",
+                resolution_location:
+                    honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
             },
         );
     }
 }
 
+use honk_outbound::runtime::flow_observation::SessionEvent;
+
 pub(super) struct SessionObservation {
-    #[cfg(feature = "native-api")]
     observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
     finished: bool,
 }
@@ -308,57 +309,33 @@ pub(super) struct SessionObservation {
 impl SessionObservation {
     pub(super) fn start() -> Self {
         Self {
-            #[cfg(feature = "native-api")]
             observer: honk_outbound::runtime::flow_observation::current(),
             finished: false,
         }
     }
 
-    pub(super) fn record(&self, _reason: &'static str, _error: Option<&'static str>) {
-        #[cfg(feature = "native-api")]
+    pub(super) fn record(&self, event: SessionEvent) {
         if let Some(observer) = &self.observer {
-            observer.publish(
-                honk_outbound::runtime::flow_observation::FlowEvent::Session {
-                    reason: _reason,
-                    error: _error,
-                },
-            );
+            observer.publish(honk_outbound::runtime::flow_observation::FlowEvent::Session(event));
         }
     }
 
     pub(super) fn finish<T>(
         mut self,
         result: anyhow::Result<T>,
-        _success: &'static str,
+        success: SessionEvent,
     ) -> anyhow::Result<T> {
-        #[cfg(feature = "native-api")]
         if self.observer.is_some() {
-            let cancelled = result.as_ref().err().is_some_and(|error| {
-                error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<honk_outbound::proxy::PacketRejection>(),
-                        Some(honk_outbound::proxy::PacketRejection::Cancelled)
-                    )
-                })
-            });
-            self.record(
-                if result.is_ok() {
-                    _success
-                } else if cancelled {
-                    "dns_session_ready_cancelled"
-                } else {
-                    "dns_session_ready_failed"
-                },
-                result.as_ref().err().map(|error| {
-                    if cancelled {
-                        "cancelled"
-                    } else if honk_outbound::proxy::is_packet_rejection(error) {
-                        "local_refusal"
-                    } else {
-                        "upstream_failed"
+            self.record(match &result {
+                Ok(_) => success,
+                Err(error) => match honk_outbound::proxy::packet_rejection(error) {
+                    Some(honk_outbound::proxy::PacketRejection::Cancelled) => {
+                        SessionEvent::DnsSessionReadyCancelled
                     }
-                }),
-            );
+                    Some(_) => SessionEvent::DnsSessionReadyRefused,
+                    None => SessionEvent::DnsSessionReadyFailed,
+                },
+            });
         }
         self.finished = true;
         result
@@ -368,7 +345,7 @@ impl SessionObservation {
 impl Drop for SessionObservation {
     fn drop(&mut self) {
         if !self.finished {
-            self.record("dns_session_ready_cancelled", Some("cancelled"));
+            self.record(SessionEvent::DnsSessionReadyCancelled);
         }
     }
 }

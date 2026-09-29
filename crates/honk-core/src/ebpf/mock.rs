@@ -56,7 +56,7 @@ pub struct MockEbpfBackend {
     next_domain_map_id: u32,
     next_trace_policy: u32,
     #[cfg(feature = "native-api")]
-    trace_dictionaries: crate::native_api::flows::kernel::KernelTraceDictionaries,
+    trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
     pub route_witnesses: HashMap<u32, KernelRouteWitness>,
     next_trace_id: u32,
     /// TCP connection states (TuplesKey → ConnState)
@@ -992,7 +992,7 @@ impl EbpfBackend for MockEbpfBackend {
     #[cfg(feature = "native-api")]
     fn bind_kernel_trace_dictionary(
         &mut self,
-        dictionary: crate::native_api::flows::kernel::KernelTraceDictionary,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
     ) {
         if let Some(owner) = &self.routing_generation {
             self.trace_dictionaries.bind(
@@ -1007,8 +1007,8 @@ impl EbpfBackend for MockEbpfBackend {
     fn capture_kernel_route(
         &self,
         key: &TuplesKey,
-        reference: crate::native_api::flows::kernel::KernelRouteReference,
-    ) -> Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str> {
+        reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
         if reference.trace_id == 0 {
             return Err("kernel_trace_not_captured");
         }

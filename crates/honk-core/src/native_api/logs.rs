@@ -428,7 +428,7 @@ impl Projection {
             return (WITHHELD, None);
         };
         let allowed = match target {
-            "honk_core::native_api" => message.starts_with("native HTTP "),
+            "honk_core::native_api::server" => message.starts_with("native HTTP "),
             "honk_core::control::runtime" => matches!(
                 message,
                 "Publishing accepted subscription body"

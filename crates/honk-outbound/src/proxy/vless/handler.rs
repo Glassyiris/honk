@@ -237,12 +237,9 @@ impl VLessHandler {
                     vless.wire_flow(),
                 )?;
                 let operation = self.dial_retained_carrier(&runtime, uuid, header, connect_timeout);
-                #[cfg(feature = "native-api")]
                 let stream =
                     crate::runtime::flow_observation::request_write(std::pin::pin!(operation))
                         .await?;
-                #[cfg(not(feature = "native-api"))]
-                let stream = operation.await?;
                 Ok(Arc::new(VlessConnectedTransport::new(stream, target, None)))
             }
             VlessUdpPath::UotV2 => {
@@ -444,10 +441,8 @@ impl VLessHandler {
         for _ in 0..2 {
             match pool.checkout_speculative().await? {
                 SpeculativeCheckout::Shared { session, permit } => {
-                    #[cfg(feature = "native-api")]
                     let observation = crate::session::ObservedSessionOpen::start();
                     let result = open(Arc::clone(&session), permit).await;
-                    #[cfg(feature = "native-api")]
                     observation.finish_open(&result);
                     match result {
                         Ok(transport) => return Ok(PreparedUdpTransport::ready(transport)),
@@ -469,10 +464,8 @@ impl VLessHandler {
                         _ = reservation.cancelled() => anyhow::bail!(retired_error),
                     };
                     let permit = reservation.attach(&session)?;
-                    #[cfg(feature = "native-api")]
                     let observation = crate::session::ObservedSessionOpen::start();
                     let result = open(session, permit).await;
-                    #[cfg(feature = "native-api")]
                     observation.finish_open(&result);
                     let transport = result.map_err(Self::open_error)?;
                     return Ok(PreparedUdpTransport::new(async move {
@@ -817,10 +810,7 @@ impl WarmableOutbound for VLessHandler {
                 }
             }
         };
-        #[cfg(feature = "native-api")]
-        return crate::runtime::flow_observation::without(operation).await;
-        #[cfg(not(feature = "native-api"))]
-        operation.await
+        crate::runtime::flow_observation::without(operation).await
     }
 }
 

@@ -62,30 +62,16 @@ impl ControlPlane {
         let registry = self.runtime_registry.read().clone();
         registry.begin_retirement();
         if let Some(epoch) = epoch.as_mut() {
-            for task in epoch.maintenance.iter().flatten() {
-                task.abort();
-            }
-            for task in &mut epoch.maintenance {
-                retain_error(&mut error, abort_and_join(task).await);
-            }
+            retain_error(&mut error, epoch.maintenance.abort_and_join().await);
         }
         // The tracker covers published UUIDs; the epoch also owns pre-ID TCP work.
-        if let Ok(selected) = self
+        if let Ok(summary) = self
             .connection_tracker
-            .snapshot_close(Some("tcp"), None, usize::MAX)
+            .close_matching(Some("tcp"), None, usize::MAX)
+            .await
+            && summary.failed
         {
-            use futures::StreamExt;
-            let mut closing: futures::stream::FuturesUnordered<_> = selected
-                .into_iter()
-                .map(|selected| self.connection_tracker.start_close(selected).wait())
-                .collect();
-            while let Some(outcome) = closing.next().await {
-                if matches!(outcome, crate::connection_tracker::CloseOutcome::Failed) {
-                    error.get_or_insert_with(|| {
-                        anyhow::anyhow!("TCP retirement could not be confirmed")
-                    });
-                }
-            }
+            error.get_or_insert_with(|| anyhow::anyhow!("TCP retirement could not be confirmed"));
         }
         if let Some(epoch) = epoch.as_mut() {
             epoch.tcp.abort_all();
@@ -110,7 +96,8 @@ impl ControlPlane {
             epoch.health_updates.take();
             #[cfg(feature = "ebpf")]
             if let Some(queue) = epoch.queue.as_mut() {
-                retain_error(&mut error, cleanup_stage(queue.shutdown_service()).await);
+                // Not stage-bounded: see `shutdown_service`.
+                retain_error(&mut error, queue.shutdown_service().await);
                 if let Some(fatal) = queue.take_shutdown_fatal() {
                     error.get_or_insert_with(|| fatal.into());
                 }
@@ -118,6 +105,7 @@ impl ControlPlane {
                     &mut error,
                     cleanup_stage(queue.finish_pending_drain()).await,
                 );
+                queue.abort_tasks().await;
                 self.pending_udp_verdicts = None;
             }
             #[cfg(feature = "ebpf")]
@@ -164,27 +152,63 @@ impl ControlPlane {
         self.network_refresh_retry.take();
         error.map_or(Ok(()), Err)
     }
-    #[cfg(test)]
-    pub(in crate::control) async fn shutdown_datapath(
+
+    // Tests enter without an epoch, like a startup that failed before binding.
+    pub(in crate::control) async fn shutdown_runtime(
         &mut self,
-        drain: &Arc<DrainTracker>,
-        udp_removal_task: &mut tokio::task::JoinHandle<()>,
+        epoch: Option<&mut RuntimeEpoch>,
+        mut fatal: Option<anyhow::Error>,
     ) -> anyhow::Result<()> {
-        let fenced = self.ebpf.write().await.set_datapath_ready(false);
-        drain.start_rejecting();
+        if fatal.is_some() {
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(feature = "native-api")]
+        self.publish_phase(if fatal.is_some() {
+            EnginePhase::Failed
+        } else {
+            EnginePhase::Draining
+        });
+        retain_error(&mut fatal, self.fence_runtime().await);
         #[cfg(feature = "ebpf")]
         if let Some(watcher) = self.iface_watcher.take() {
             watcher.shutdown(STAGE_TIMEOUT).await;
         }
-        let detached = self.ebpf.write().await.detach_hooks();
-        let drained = drain.drain().await;
-        let stopped = self.stop_network_epoch(None).await;
-        let removed = udp_removal_task.await;
-        fenced?;
-        detached?;
-        drained?;
-        stopped?;
-        removed?;
-        Ok(())
+        // No watcher can reattach after this terminal boundary.
+        retain_error(&mut fatal, self.ebpf.write().await.detach_hooks());
+        if self.health_task.is_some() {
+            retain_error(
+                &mut fatal,
+                cleanup_stage(async {
+                    self.alive_set
+                        .shutdown_health_checks()
+                        .await
+                        .map_err(anyhow::Error::from)
+                })
+                .await,
+            );
+        }
+        retain_error(&mut fatal, joined(&mut self.health_task).await);
+        #[cfg(feature = "native-api")]
+        if let Some(owner) = &self.native_owner {
+            retain_error(&mut fatal, cleanup_stage(owner.pause_probes()).await);
+        }
+        #[cfg(feature = "clash-api")]
+        {
+            let mut slot = self.ui_download.lock().await;
+            if let Some(download) = slot.as_mut() {
+                retain_error(&mut fatal, cleanup_stage(download.stop_and_join()).await);
+            }
+            slot.take();
+        }
+        if fatal.is_none() && self.is_datapath_healthy() && epoch.is_some() {
+            retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
+        }
+        retain_error(&mut fatal, self.stop_network_epoch(epoch).await);
+        if let Some(flags) = &self.datapath_flags {
+            retain_error(&mut fatal, flags.disable().await);
+        }
+        retain_error(&mut fatal, self.finalize_shutdown().await);
+        fatal.map_or(Ok(()), Err)
     }
 }

@@ -16,10 +16,9 @@ async fn wait_for_close(close: Option<&CloseCompletion>) {
         None => std::future::pending().await,
     }
 }
-#[cfg(feature = "native-api")]
 use super::observation::ConnectionObservation;
 #[cfg(feature = "native-api")]
-use crate::native_api::catalog::CatalogIdentity;
+use crate::observe::catalog::CatalogIdentity;
 
 mod dial;
 
@@ -149,6 +148,47 @@ async fn wait_for_cold_urltest_release(index: usize) {
     }
 }
 
+/// How an observed TCP connection ended.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy)]
+enum TcpTerminal {
+    DnsInterceptCompleted,
+    NoAvailableNodes,
+    PolicyBlock,
+    DialFailed,
+    IntentionalRetirement,
+    PrefixWriteFailed,
+    RelayClosed,
+    RelayFailed,
+    ConnectionFailed,
+}
+
+#[cfg(feature = "native-api")]
+impl TcpTerminal {
+    fn outcome(self) -> (crate::observe::vocab::ConnectionState, &'static str) {
+        use crate::observe::vocab::ConnectionState::{Blocked, Closed, Failed};
+        match self {
+            Self::DnsInterceptCompleted => (Closed, "dns_intercept_completed"),
+            Self::NoAvailableNodes => (Failed, "no_available_nodes"),
+            Self::PolicyBlock => (Blocked, "policy_block"),
+            Self::DialFailed => (Failed, "dial_failed"),
+            Self::IntentionalRetirement => (Closed, "intentional_retirement"),
+            Self::PrefixWriteFailed => (Failed, "prefix_write_failed"),
+            Self::RelayClosed => (Closed, "relay_closed"),
+            Self::RelayFailed => (Failed, "relay_failed"),
+            Self::ConnectionFailed => (Failed, "connection_failed"),
+        }
+    }
+}
+
+/// Block nodes "dial" by failing and the dial path reports no other signal,
+/// so a failure where every tried node is a block node is the policy's doing.
+pub(super) fn only_block_nodes<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> bool {
+    nodes
+        .into_iter()
+        .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block)
+}
+
 impl ControlPlaneHandle {
     async fn pin_tcp_dns_route(
         &self,
@@ -236,9 +276,12 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-        #[cfg(feature = "native-api")]
-        let mut observation =
-            ConnectionObservation::begin(self.native.as_deref(), "tcp", client_addr, original_dst);
+        let mut observation = ConnectionObservation::begin(
+            self.native.as_deref(),
+            crate::observe::vocab::Network::Tcp,
+            client_addr,
+            original_dst,
+        );
         #[cfg(feature = "native-api")]
         let native_observer = observation.flow().and_then(|flow| {
             flow.observer(self.diagnostics.read().generation, None, "dial_target")
@@ -259,9 +302,7 @@ impl ControlPlaneHandle {
                     6, // TCP
                 );
                 let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
-                #[cfg(feature = "native-api")]
                 observation.handoff(handoff.as_ref(), true);
-                #[cfg(feature = "native-api")]
                 observation.routing_started();
 
                 let pinned_dns_route = if original_dst.port() == 53 {
@@ -278,7 +319,7 @@ impl ControlPlaneHandle {
                             .await?;
                         #[cfg(feature = "native-api")]
                         {
-                            terminal = Some(("closed", "dns_intercept_completed"));
+                            terminal = Some(TcpTerminal::DnsInterceptCompleted);
                         }
                         return Ok(());
                     }
@@ -351,7 +392,6 @@ impl ControlPlaneHandle {
                 if let Some(ref domain) = sniffed_domain {
                     debug!("SNI sniffed domain: {}", domain);
                 }
-                #[cfg(feature = "native-api")]
                 observation.tcp_sniffed(&sniff_result, handoff.as_ref());
                 let (domain, domain_verified, domain_verification) = self
                     .apply_domain_reality_check(
@@ -361,8 +401,6 @@ impl ControlPlaneHandle {
                         client_addr,
                     )
                     .await;
-                #[cfg(not(feature = "native-api"))]
-                let _ = domain_verification;
 
                 if !skip_sniff && let Some(ref ho) = handoff {
                     let cache_key = (original_dst, ho.outbound);
@@ -404,14 +442,12 @@ impl ControlPlaneHandle {
                         None,
                     )
                 };
-                #[cfg(feature = "native-api")]
                 observation.routed(&mut route);
                 let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
                 let matched_rule = route.matched_rule.take();
                 let mode_decision = self.apply_mode_override(&mut route).await;
                 let outbound_name = mode_decision.name;
                 let mode_constraint = mode_decision.constraint;
-                #[cfg(feature = "native-api")]
                 observation.mode_applied(&outbound_name);
 
                 // Seed current predicate facts so later flows need not repeat sniffing.
@@ -466,7 +502,7 @@ impl ControlPlaneHandle {
                     mode_constraint
                 };
                 let outbound_kind =
-                    crate::stats::OutboundKind::routed(&generation_config, &outbound_name);
+                    crate::stats::OutboundKind::routed(&generation_group_manager, &outbound_name);
                 let outbound_guard = self.stats.track_connection(&outbound_name, outbound_kind);
                 #[cfg(feature = "native-api")]
                 let close_catalog = pinned_native
@@ -477,9 +513,9 @@ impl ControlPlaneHandle {
                     observation.pin_selection(*generation, catalog, &generation_config);
                 }
                 #[cfg(feature = "native-api")]
-                let selection_observer = pinned_native
-                    .as_ref()
-                    .and_then(|(generation, _)| observation.observer(*generation, "dial_target"));
+                let selection_observer = pinned_native.as_ref().and_then(|(generation, _)| {
+                    observation.observer(|| *generation, "dial_target")
+                });
                 let (
                     mut candidates,
                     selection_mode,
@@ -520,7 +556,6 @@ impl ControlPlaneHandle {
                 score_feedback.retain(|id, _| candidates.iter().any(|node| node.id == *id));
 
                 if candidates.is_empty() {
-                    #[cfg(feature = "native-api")]
                     observation.tcp_dial_mode(
                         dial_mode,
                         &sniff_result,
@@ -542,7 +577,7 @@ impl ControlPlaneHandle {
                     drop(outbound_guard);
                     #[cfg(feature = "native-api")]
                     {
-                        terminal = Some(("failed", "no_available_nodes"));
+                        terminal = Some(TcpTerminal::NoAvailableNodes);
                     }
                     return Ok(());
                 }
@@ -556,7 +591,6 @@ impl ControlPlaneHandle {
                 } else {
                     domain.clone()
                 };
-                #[cfg(feature = "native-api")]
                 observation.tcp_dial_mode(
                     dial_mode,
                     &sniff_result,
@@ -567,9 +601,13 @@ impl ControlPlaneHandle {
 
                 let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
                 let candidate_refs: Vec<&Node> = candidates.iter().collect();
-                #[cfg(feature = "native-api")]
                 if let Some(flow) = observation.flow() {
-                    flow.transition("dialing", "tcp_dial_started", "unknown", Some(false));
+                    flow.transition(
+                        crate::observe::vocab::ConnectionState::Dialing,
+                        "tcp_dial_started",
+                        crate::observe::vocab::ConnectionMilestone::Unknown,
+                        Some(false),
+                    );
                 }
                 let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
                 let raced = self
@@ -727,12 +765,8 @@ impl ControlPlaneHandle {
                                     }
                                 };
                                 #[cfg(feature = "native-api")]
-                                if retried.is_none()
-                                    && retry_nodes.iter().take(3).all(|node| {
-                                        node.protocol() == honk_config::types::NodeProtocol::Block
-                                    })
-                                {
-                                    terminal = Some(("blocked", "policy_block"));
+                                if retried.is_none() && only_block_nodes(nodes.iter().copied()) {
+                                    terminal = Some(TcpTerminal::PolicyBlock);
                                 }
                                 if retried.is_some() {
                                     selection_chains = retry_chains;
@@ -746,15 +780,11 @@ impl ControlPlaneHandle {
                                 #[cfg(feature = "native-api")]
                                 if terminal.is_none() {
                                     terminal = Some(
-                                        if outbound_name == "block"
-                                            || candidates.iter().all(|node| {
-                                                node.protocol()
-                                                    == honk_config::types::NodeProtocol::Block
-                                            })
+                                        if outbound_name == "block" || only_block_nodes(&candidates)
                                         {
-                                            ("blocked", "policy_block")
+                                            TcpTerminal::PolicyBlock
                                         } else {
-                                            ("failed", "dial_failed")
+                                            TcpTerminal::DialFailed
                                         },
                                     );
                                 }
@@ -850,7 +880,6 @@ impl ControlPlaneHandle {
                             groups,
                         },
                     ) {
-                        #[cfg(feature = "native-api")]
                         if let Some(native) = observation.flow() {
                             native.attach_connection(&conn_id);
                         }
@@ -908,9 +937,9 @@ impl ControlPlaneHandle {
                         #[cfg(feature = "native-api")]
                         {
                             terminal = Some(if intentionally_closed {
-                                ("closed", "intentional_retirement")
+                                TcpTerminal::IntentionalRetirement
                             } else {
-                                ("failed", "prefix_write_failed")
+                                TcpTerminal::PrefixWriteFailed
                             });
                         }
                         if !intentionally_closed {
@@ -941,7 +970,6 @@ impl ControlPlaneHandle {
                     std::sync::Arc::new(move || reporter.first_response())
                         as std::sync::Arc<dyn Fn() + Send + Sync>
                 });
-                #[cfg(feature = "native-api")]
                 let first_response = observation.first_response(first_response);
                 let on_transfer = score_reporter.as_ref().map(|reporter| {
                     let reporter = reporter.clone();
@@ -954,7 +982,6 @@ impl ControlPlaneHandle {
                         }
                     }) as std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
                 });
-                #[cfg(feature = "native-api")]
                 let on_transfer = match observation.flow() {
                     Some(flow) => {
                         let flow = Arc::clone(flow);
@@ -1008,7 +1035,7 @@ impl ControlPlaneHandle {
                     }
                     #[cfg(feature = "native-api")]
                     {
-                        terminal = Some(("closed", "intentional_retirement"));
+                        terminal = Some(TcpTerminal::IntentionalRetirement);
                     }
                     anyhow::ensure!(flow.retire().await, "TCP retirement failed");
                     return Ok(());
@@ -1016,9 +1043,9 @@ impl ControlPlaneHandle {
                 #[cfg(feature = "native-api")]
                 {
                     terminal = Some(if relay_result.is_ok() {
-                        ("closed", "relay_closed")
+                        TcpTerminal::RelayClosed
                     } else {
-                        ("failed", "relay_failed")
+                        TcpTerminal::RelayFailed
                     });
                 }
                 anyhow::ensure!(flow.retire().await, "TCP retirement failed");
@@ -1080,9 +1107,12 @@ impl ControlPlaneHandle {
             close.0.finish(result.is_ok());
         }
         #[cfg(feature = "native-api")]
-        if result.is_err() {
-            observation.finish("failed", "connection_failed");
-        } else if let Some((state, reason)) = terminal {
+        if let Some(terminal) = if result.is_err() {
+            Some(TcpTerminal::ConnectionFailed)
+        } else {
+            terminal
+        } {
+            let (state, reason) = terminal.outcome();
             observation.finish(state, reason);
         }
         result

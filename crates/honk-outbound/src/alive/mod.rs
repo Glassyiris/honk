@@ -13,9 +13,8 @@ mod tests;
 use self::collection::DialerCollection;
 use crate::group::{ScoreFeedback, ScoreSelectionContext};
 pub use observations::{
-    HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth,
-    NativeGroupHealthObservation, NativeGroupProbeContext, NativeHealthObservation,
-    NativeProbeTicket, ProbeMeasurement, UrlProbeMember,
+    GroupHealthObservation, GroupProbeContext, HealthMeasurement, HealthObservation, HealthPurpose,
+    HealthState, HealthTransport, HealthWarmth, ProbeMeasurement, ProbeTicket, UrlProbeMember,
 };
 use parking_lot::{Mutex, RwLock};
 pub use probe::{HealthCheckError, HealthProbePermit, ProbeCancellation};
@@ -118,7 +117,7 @@ pub enum HttpProbeResult {
 #[derive(Debug)]
 pub struct HttpProbeOutcome {
     pub result: HttpProbeResult,
-    pub observation: Option<NativeHealthObservation>,
+    pub observation: Option<HealthObservation>,
 }
 
 impl From<HttpProbeResult> for HttpProbeOutcome {
@@ -171,7 +170,7 @@ pub struct UdpProbeOutcome {
     /// check URL, no Score group, or target policy skips it).
     pub data_path: Option<anyhow::Result<Duration>>,
     /// Qualified DNS and data measurements, captured before legacy family fanout.
-    pub observations: [Option<NativeHealthObservation>; 2],
+    pub observations: [Option<HealthObservation>; 2],
 }
 
 /// Trait for UDP-based health check probing through proxy nodes.
@@ -347,7 +346,7 @@ pub struct AliveDialerSet {
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
     registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
-    native_observations: RwLock<Option<observations::NativeObservations>>,
+    health_observations: RwLock<Option<observations::HealthHistory>>,
     ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
     death_callback: RwLock<Option<Arc<DeathCallback>>>,
     base_cooldown: Duration,
@@ -361,7 +360,7 @@ pub struct AliveDialerSet {
     health_mode: tokio::sync::watch::Sender<probe::HealthMode>,
     health_changed: tokio::sync::Notify,
     external_probes: Mutex<tokio::task::JoinSet<()>>,
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "owned-tasks")]
     health_resolver_tasks: Mutex<Option<Arc<crate::runtime::TaskOwner>>>,
     /// Optional `SO_MARK` value applied to probe sockets so the eBPF datapath
     /// treats them as control-plane traffic and does not re-route them.
@@ -440,7 +439,7 @@ impl AliveDialerSet {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
             registered: RwLock::new(HashMap::new()),
-            native_observations: RwLock::new(None),
+            health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
             resolver: RwLock::new(None),
@@ -453,7 +452,7 @@ impl AliveDialerSet {
             health_mode,
             health_changed: tokio::sync::Notify::new(),
             external_probes: Mutex::new(tokio::task::JoinSet::new()),
-            #[cfg(feature = "native-api")]
+            #[cfg(feature = "owned-tasks")]
             health_resolver_tasks: Mutex::new(None),
             so_mark: None,
             last_emergency_tcp: Mutex::new(HashMap::new()),
@@ -704,7 +703,7 @@ impl AliveDialerSet {
         registered.remove(&node_id);
         self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
-        if let Some(observations) = self.native_observations.write().as_mut() {
+        if let Some(observations) = self.health_observations.write().as_mut() {
             observations.nodes.remove(&node_id);
             observations
                 .groups

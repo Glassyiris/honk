@@ -34,8 +34,8 @@ pub(super) fn parse_group_section(
                 );
                 continue;
             };
-            let ordinal = groups.len() + 1;
-            diagnostics.begin_group_text(group_text, ordinal);
+            let index = groups.len() + 1;
+            diagnostics.begin_group_text(group_text, index);
 
             let mut group = Group {
                 name: group_text.raw().to_owned(),
@@ -50,7 +50,7 @@ pub(super) fn parse_group_section(
                 {
                     return Err(group_scalar_error(
                         header,
-                        ordinal,
+                        index,
                         field,
                         "group scalar does not accept a nested block",
                     )
@@ -117,7 +117,9 @@ pub(super) fn parse_group_section(
             }
             if let Some(value) = fields.get("icon").copied() {
                 if !Group::valid_icon(value.raw()) {
-                    return Err(group_scalar_error(value, ordinal, "icon", "icon must be an absolute http(s) URL or data URI of at most 2048 characters").into());
+                    return Err(
+                        group_scalar_error(value, index, "icon", Group::INVALID_ICON).into(),
+                    );
                 }
                 group.icon = Some(value.raw().to_owned());
             }
@@ -126,7 +128,7 @@ pub(super) fn parse_group_section(
                 group.tolerance = value.raw().parse::<u64>().map_err(|_| {
                     group_scalar_error(
                         value,
-                        ordinal,
+                        index,
                         "tolerance",
                         "tolerance must be a nonnegative integer in milliseconds",
                     )
@@ -136,7 +138,7 @@ pub(super) fn parse_group_section(
                 group.idle_timeout = Some(value.raw().parse::<u64>().map_err(|_| {
                     group_scalar_error(
                         value,
-                        ordinal,
+                        index,
                         "idle_timeout",
                         "idle timeout must be a nonnegative integer in seconds",
                     )
@@ -148,7 +150,7 @@ pub(super) fn parse_group_section(
                     super::scalars::strict_bool(value.raw()).ok_or_else(|| {
                         group_scalar_error(
                             value,
-                            ordinal,
+                            index,
                             "interrupt_connections",
                             "interrupt_connections must be a boolean",
                         )
@@ -164,7 +166,7 @@ pub(super) fn parse_group_section(
 
 fn group_scalar_error(
     value: Text<'_, '_>,
-    ordinal: usize,
+    index: usize,
     field: &'static str,
     message: &'static str,
 ) -> crate::error::DetailedConfigError {
@@ -173,7 +175,7 @@ fn group_scalar_error(
         "invalid-config-value",
         value.source.reference(),
         crate::diagnostic::SettingPath::new("groups")
-            .index(ordinal)
+            .index(index)
             .field(field),
         message,
     );

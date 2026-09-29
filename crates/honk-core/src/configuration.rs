@@ -6,6 +6,7 @@ mod accepted;
 pub(crate) use accepted::*;
 
 use honk_config::{Config, diagnostic::DetailedDiagnostic};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::control::{ControlCommand, ReloadOutcome, ReloadReply};
@@ -17,7 +18,7 @@ pub(crate) struct ActivationRequest {
     #[cfg(feature = "native-api")]
     pub(crate) sources: Option<SourceUpdate>,
     #[cfg(feature = "native-api")]
-    pub(crate) expected_revision: Option<String>,
+    pub(crate) expected_group_revision: Option<String>,
     #[cfg(feature = "native-api")]
     pub(crate) deferred_provider: Option<uuid::Uuid>,
 }
@@ -30,7 +31,6 @@ pub(crate) struct PendingActivation {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ActivationFailure {
-    RequestExhausted,
     EngineUnavailable,
     Unconfirmed,
     Rejected,
@@ -62,10 +62,7 @@ impl Activation {
         &mut self,
         request: ActivationRequest,
     ) -> Result<PendingActivation, ActivationFailure> {
-        self.request_id = self
-            .request_id
-            .checked_add(1)
-            .ok_or(ActivationFailure::RequestExhausted)?;
+        self.request_id += 1;
         let (result, reply) = oneshot::channel();
         self.commands
             .send(ControlCommand::ReloadConfig {
@@ -76,7 +73,7 @@ impl Activation {
                 #[cfg(feature = "native-api")]
                 sources: request.sources.map(std::sync::Arc::new),
                 #[cfg(feature = "native-api")]
-                expected_group_revision: request.expected_revision,
+                expected_group_revision: request.expected_group_revision,
             })
             .await
             .map_err(|_| ActivationFailure::EngineUnavailable)?;
@@ -124,4 +121,18 @@ impl Activation {
         let pending = self.dispatch(request).await?;
         self.complete(pending).await
     }
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    encode_digest(&Sha256::digest(bytes))
+}
+
+pub(crate) fn encode_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    output
 }

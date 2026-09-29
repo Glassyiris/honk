@@ -149,7 +149,7 @@ impl Values {
             .set_engine_level(self.level_overridden.then(|| self.level.as_str()));
         owner.logs.set_limit(self.logs);
         owner.dns.set_log_limit(self.dns);
-        owner.flows.set_limits(self.flows, self.retention);
+        owner.core.flows.set_limits(self.flows, self.retention);
         self.apply_recording(owner);
     }
     fn apply_recording(self, owner: &NativeObservation) {
@@ -157,7 +157,7 @@ impl Values {
         if self.events_active() {
             owner.events.set_recording(true);
         }
-        owner.flows.set_recording(active[0]);
+        owner.core.flows.set_recording(active[0]);
         owner.logs.set_recording(active[1]);
         owner.dns.set_recording(active[2]);
         if !self.events_active() {
@@ -382,13 +382,13 @@ impl Settings {
             }
             unadvertised |= !settings.record_flows;
             if let Some(count) = flows.max_flows {
-                if !(MIN_RECORDS..=super::flows::MAX_RECORDS).contains(&count) {
+                if !(MIN_RECORDS..=crate::observe::flows::MAX_RECORDS).contains(&count) {
                     return Err(invalid(id));
                 }
                 next.flows = count;
             }
             if let Some(seconds) = flows.retention_seconds {
-                if !(1..=super::flows::TERMINAL_TTL.as_secs()).contains(&seconds) {
+                if !(1..=crate::observe::flows::TERMINAL_TTL.as_secs()).contains(&seconds) {
                     return Err(invalid(id));
                 }
                 next.retention = seconds;
@@ -483,7 +483,7 @@ fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value
         let secrets = super::config::ListenerSecrets::from_config(active);
         value["geodata"] = sources.effective().json(
             |url| secrets.mask(url).0,
-            |name| super::geodata::group_id(&state.observation.catalog, name),
+            |name| super::geodata::group_id(&state.observation.core.catalog, name),
         );
     }
     value
@@ -495,35 +495,8 @@ pub(super) async fn patch(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
-    let mut types = request.headers().get_all("content-type").iter();
-    if !types
-        .next()
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
-        })
-        || types.next().is_some()
-    {
-        return Err(super::error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ErrorCode::UnsupportedMediaType,
-            "Expected application/json",
-            id,
-        ));
-    }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| {
-            super::error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::RequestTooLarge,
-                "Request body exceeds its limit",
-                id,
-            )
-        })?;
+    super::config::json_type(&request)?;
+    let bytes = super::body::buffered(request.into_body()).await;
     let mut value = super::body::value(&bytes, || invalid(id))?;
     let geodata = value
         .as_object_mut()
@@ -538,7 +511,7 @@ pub(super) async fn patch(
                 ));
             }
             let mut patch = super::geodata::SourcesPatch::parse(patch, || invalid(id))?;
-            let groups = state.observation.catalog.snapshot();
+            let groups = state.observation.core.catalog.snapshot();
             let current = patch.as_mut().is_none_or(|patch| {
                 patch.resolve_group(|id| {
                     groups
@@ -876,12 +849,16 @@ mod tests {
         assert!(!owner.settings.flow_recording());
         let first = stream(&owner, true);
         let second = stream(&owner, true);
-        let flow = owner.flows.begin(
-            "tcp",
-            "127.0.0.1:31000".parse().unwrap(),
-            "127.0.0.2:443".parse().unwrap(),
-        );
-        assert!(owner.flows.connection_evidence(flow.id()).is_some());
+        let flow = owner
+            .core
+            .flows
+            .begin(
+                crate::observe::vocab::Network::Tcp,
+                "127.0.0.1:31000".parse().unwrap(),
+                "127.0.0.2:443".parse().unwrap(),
+            )
+            .unwrap();
+        assert!(owner.core.flows.connection_evidence(flow.id()).is_some());
         drop(first);
         tokio::time::advance(Duration::from_secs(61)).await;
         owner.settings.maintain(&owner);
@@ -890,11 +867,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(59)).await;
         owner.settings.renew(&owner, false);
         owner.settings.maintain(&owner);
-        assert!(owner.flows.connection_evidence(flow.id()).is_some());
+        assert!(owner.core.flows.connection_evidence(flow.id()).is_some());
         tokio::time::advance(Duration::from_secs(1)).await;
         owner.settings.maintain(&owner);
         assert!(!owner.settings.flow_recording());
-        assert!(owner.flows.connection_evidence(flow.id()).is_none());
+        assert!(owner.core.flows.connection_evidence(flow.id()).is_none());
         let settings = owner.settings.snapshot();
         for recorder in ["logs", "dns_log", "events"] {
             assert_eq!(settings["recording"][recorder]["active"], true);

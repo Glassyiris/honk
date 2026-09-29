@@ -30,7 +30,7 @@ use honk_outbound::group::{
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry};
 use honk_outbound::runtime::SharedRuntimeRegistry;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -66,12 +66,6 @@ struct ExtractLimits {
 /// Redirects followed per proxied fetch (each hop is re-routed: the
 /// Location target is usually a different host).
 const MAX_REDIRECTS: u32 = 5;
-
-/// HTTP/1.1-only ALPN wire: the proxied fetch has no h2 client.
-const HTTP11_ALPN_WIRE: &[u8] = b"\x08http/1.1";
-
-/// Response-header ceiling; GitHub sends a few KB.
-const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// Everything the download needs to route the fetch like user traffic.
 pub struct UiDownloadContext {
@@ -283,7 +277,7 @@ async fn fetch_routed(
     let mut url = url.to_string();
     let mut original_business: Option<ScoreContinuation> = None;
     for _ in 0..=MAX_REDIRECTS {
-        let (host, port, path, is_https) = parse_download_url(&url)?;
+        let (parsed, host, port) = parse_download_url(&url)?;
         let route = tokio::select! {
             biased;
             _ = download_stopped(stop) => return Ok(false),
@@ -303,7 +297,7 @@ async fn fetch_routed(
                 anyhow::bail!("routing sends the external UI download to 'block'");
             }
             UiRoute::Proxy { node, feedback } => {
-                let target = (host.as_str(), port, path.as_str(), is_https);
+                let target = (&parsed, host.as_str(), port);
                 fetch_proxied(ctx, &node, feedback, target, archive, stop).await?
             }
         };
@@ -314,7 +308,7 @@ async fn fetch_routed(
                 if let Some(original) = original_attempt {
                     original_business = Some(original.continuation()?);
                 }
-                url = reqwest::Url::parse(&url)?.join(&location)?.to_string();
+                url = parsed.join(&location)?.to_string();
                 info!(url = %url, "external UI download following redirect");
             }
         }
@@ -338,40 +332,14 @@ async fn fetch_direct(
         biased;
         _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
         result = tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
-        let mut response = crate::marked_http::Client::new()?
+        let response = crate::marked_http::Client::new()?
             .get(
                 &reqwest::Url::parse(url)?,
                 &http::HeaderMap::new(),
                 DOWNLOAD_TIMEOUT,
             )
             .await?;
-        if let Some(reporter) = &reporter {
-            reporter.setup_succeeded();
-            reporter.first_response();
-            reporter.tx(url.len() as u64);
-        }
-        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .ok_or_else(|| anyhow::anyhow!("redirect {} without Location", response.status()))?
-                .to_str()?
-                .to_string();
-            if let Some(reporter) = &reporter {
-                reporter.rx(location.len() as u64);
-            }
-            return Ok(ProxiedFetch::Redirect(location));
-        }
-        if !response.status().is_success() {
-            anyhow::bail!("download external ui failed: {}", response.status());
-        }
-        while let Some(chunk) = response.chunk().await? {
-            if let Some(reporter) = &reporter {
-                reporter.rx(chunk.len() as u64);
-            }
-            archive.append(&chunk).await?;
-        }
-        Ok(ProxiedFetch::Body)
+        receive(response, url, archive, &reporter).await
         }) => result
             .map_err(|_| anyhow::anyhow!("external UI download timed out"))
             .and_then(|result| result),
@@ -393,13 +361,12 @@ enum ProxiedFetch {
     Stopped,
 }
 
-/// One proxied GET through `node`'s tunnel: TLS for https, then a minimal
-/// HTTP/1.1 exchange.
+/// One proxied GET of `url` through `node`'s tunnel to `host:port`.
 async fn fetch_proxied(
     ctx: &UiDownloadContext,
     node: &Node,
     feedback: Option<ScoreAttempt>,
-    (host, port, path, is_https): (&str, u16, &str, bool),
+    (url, host, port): (&reqwest::Url, &str, u16),
     archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
@@ -422,15 +389,12 @@ async fn fetch_proxied(
         match tunnel.dial().await {
         Ok(stream) => match tokio::time::timeout(
             DOWNLOAD_TIMEOUT,
-            proxied_get(stream, (host, path, is_https), archive, &reporter),
+            proxied_get(stream, url, archive, &reporter),
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(anyhow::Error::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "external UI download timed out",
-            ))),
+            Err(_) => Err(timed_out()),
         },
         Err(e) => Err(e.context("external UI download dial failed")),
         } } => result,
@@ -446,134 +410,64 @@ async fn fetch_proxied(
     result
 }
 
-/// TLS-wrap when https, then run the HTTP/1.1 GET.
+/// The GET over the tunnel's stream, answered like the direct one.
 async fn proxied_get(
     stream: Box<dyn AsyncReadWrite>,
-    (host, path, is_https): (&str, &str, bool),
+    url: &reqwest::Url,
     archive: &mut ArchiveFile,
     reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<ProxiedFetch> {
-    if is_https {
-        let connector = honk_outbound::tls::build_dns_connector(false, HTTP11_ALPN_WIRE)?;
-        let mut tls = connector.connect(host, stream).await?;
-        if let Some(reporter) = reporter {
-            reporter.setup_succeeded();
-        }
-        http_get(&mut tls, host, path, archive, reporter).await
-    } else {
-        let mut stream = stream;
-        if let Some(reporter) = reporter {
-            reporter.setup_succeeded();
-        }
-        http_get(&mut stream, host, path, archive, reporter).await
-    }
+    let by = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
+    let response = crate::marked_http::Client::new()?
+        .get_over(stream, url, &http::HeaderMap::new(), by)
+        .await
+        .map_err(|stage| match stage {
+            "download_timeout" => timed_out(),
+            stage => anyhow::anyhow!("external UI download failed: {stage}"),
+        })?;
+    receive(response, url.as_str(), archive, reporter).await
 }
 
-/// Minimal HTTP/1.1 GET: request, header parse, capped body read. Only
-/// identity bodies are supported (Content-Length or read-to-close); GitHub
-/// release assets always carry a length.
-async fn http_get<S>(
-    stream: &mut S,
-    host: &str,
-    path: &str,
+/// Scored as a timeout, not as another failure.
+fn timed_out() -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "external UI download timed out",
+    ))
+}
+
+/// A redirect's Location, a failure, or the body streamed into `archive`.
+async fn receive(
+    mut response: crate::marked_http::Response,
+    url: &str,
     archive: &mut ArchiveFile,
     reporter: &Option<ScoreReporter>,
-) -> anyhow::Result<ProxiedFetch>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-ui-download/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).await?;
+) -> anyhow::Result<ProxiedFetch> {
     if let Some(reporter) = reporter {
-        reporter.tx(request.len() as u64);
+        reporter.setup_succeeded();
+        reporter.first_response();
+        reporter.tx(url.len() as u64);
     }
-
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let head_end = loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            anyhow::bail!("connection closed before response headers");
-        }
+    if crate::marked_http::followed_redirect(response.status()) {
+        let location = response
+            .headers()
+            .get(http::header::LOCATION)
+            .ok_or_else(|| anyhow::anyhow!("redirect {} without Location", response.status()))?
+            .to_str()?
+            .to_string();
         if let Some(reporter) = reporter {
-            reporter.first_response();
-            reporter.rx(n as u64);
+            reporter.rx(location.len() as u64);
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_HEADER_BYTES {
-            anyhow::bail!("response headers exceed {} bytes", MAX_HEADER_BYTES);
-        }
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-
-    let head = String::from_utf8_lossy(&buf[..head_end]);
-    let mut lines = head.lines();
-    let status: u16 = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("malformed HTTP status line"))?;
-    let mut content_length = None;
-    let mut location = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        match name.trim().to_ascii_lowercase().as_str() {
-            "content-length" => content_length = value.trim().parse::<usize>().ok(),
-            "location" => location = Some(value.trim().to_string()),
-            "transfer-encoding" if !value.trim().eq_ignore_ascii_case("identity") => {
-                anyhow::bail!("unsupported transfer-encoding: {}", value.trim());
-            }
-            _ => {}
-        }
-    }
-
-    if matches!(status, 301 | 302 | 303 | 307 | 308) {
-        let location =
-            location.ok_or_else(|| anyhow::anyhow!("redirect {status} without Location"))?;
         return Ok(ProxiedFetch::Redirect(location));
     }
-    if !(200..300).contains(&status) {
-        anyhow::bail!("download external ui failed: {status}");
+    if !response.status().is_success() {
+        anyhow::bail!("download external ui failed: {}", response.status());
     }
-
-    let mut body = &buf[head_end..];
-    match content_length {
-        Some(len) => {
-            if len > MAX_ARCHIVE_BYTES {
-                anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
-            }
-            body = &body[..body.len().min(len)];
-            archive.append(body).await?;
-            while archive.len < len {
-                let n = stream.read(&mut chunk).await?;
-                if let Some(reporter) = reporter {
-                    reporter.rx(n as u64);
-                }
-                if n == 0 {
-                    anyhow::bail!("truncated archive: {} of {} bytes", archive.len, len);
-                }
-                archive.append(&chunk[..n.min(len - archive.len)]).await?;
-            }
+    while let Some(chunk) = response.body_mut().chunk().await? {
+        if let Some(reporter) = reporter {
+            reporter.rx(chunk.len() as u64);
         }
-        None => {
-            archive.append(body).await?;
-            loop {
-                let n = stream.read(&mut chunk).await?;
-                if n == 0 {
-                    break;
-                }
-                if let Some(reporter) = reporter {
-                    reporter.rx(n as u64);
-                }
-                archive.append(&chunk[..n]).await?;
-            }
-        }
+        archive.append(&chunk).await?;
     }
     Ok(ProxiedFetch::Body)
 }
@@ -660,32 +554,25 @@ fn named_then_unlinked(
     Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
-/// Split a download URL into (host, port, path, is_https); the scheme is
-/// required and must be http or https.
-fn parse_download_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> {
+/// Parse a download URL with its host and port; the scheme is required and
+/// must be http or https.
+fn parse_download_url(url: &str) -> anyhow::Result<(reqwest::Url, String, u16)> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid external UI URL '{url}': {e}"))?;
 
-    let is_https = match parsed.scheme() {
-        "https" => true,
-        "http" => false,
-        _ => anyhow::bail!("unsupported scheme in external UI URL '{url}'"),
-    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("unsupported scheme in external UI URL '{url}'");
+    }
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("empty host in external UI URL '{url}'"))?;
+        .ok_or_else(|| anyhow::anyhow!("empty host in external UI URL '{url}'"))?
+        .to_string();
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("missing port in external UI URL '{url}'"))?;
 
-    let mut path = parsed.path().to_string();
-    if let Some(q) = parsed.query() {
-        path.push('?');
-        path.push_str(q);
-    }
-
-    Ok((host.to_string(), port, path, is_https))
+    Ok((parsed, host, port))
 }
 
 /// Extract a zip archive into `output`, stripping the single top-level
@@ -795,6 +682,7 @@ mod tests {
     use honk_outbound::alive::{IpVersion, ProbeDomain};
     use honk_outbound::group::{GroupManager, ScoreSelectionContext, SelectionNetwork};
     use honk_outbound::proxy::{ProtocolEntry, ProxyStream, TcpOutbound};
+    use tokio::io::AsyncReadExt;
 
     /// Build an in-memory zip with the given (path, contents) entries.
     fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -960,7 +848,7 @@ mod tests {
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
             request.push(socket.read_u8().await.unwrap());
-            assert!(request.len() < MAX_HEADER_BYTES);
+            assert!(request.len() < 64 * 1024);
         }
     }
 
@@ -1457,11 +1345,12 @@ mod tests {
             ["ui-parent", "ui-child"]
         );
         let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+        let url = reqwest::Url::parse(&format!("http://{addr}/ui.zip")).unwrap();
         let fetched = fetch_proxied(
             &ctx,
             &node,
             Some(feedback),
-            ("127.0.0.1", addr.port(), "/ui.zip", false),
+            (&url, "127.0.0.1", addr.port()),
             &mut archive,
             &mut None,
         )

@@ -4,7 +4,7 @@
 
 ## 原生 API
 
-本节说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
+本节说明当前已实现的原生观测与控制契约。`native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；两种 allocator 发布产物均包含它，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
 基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的补充。采用该后续 bundle 的自动策略 override（固定成员与 DELETE selection），不采用其 mode 变更：原生 mode 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
@@ -74,7 +74,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 错误的 `details` 只指出被拒绝的对象，不回显提交或配置的值。请求边界错误给出 `header` 或请求部分（`field`：`query`、`body` 或 `target`）及 `kind`。JSON 请求体无法解析或不符合 schema 时，该端点返回 `400 invalid_request`，`details` 为 `{field,kind}`：`field` 是出错成员的点分路径（如 `sources[0].content`）、含未知键的对象或 `body`；`kind` 为 `invalid_json`、`missing`、`wrong_type`、`unknown_field`、`duplicate`、`invalid_value` 或 `too_large`。422 `unsupported_value` 给出被拒绝的 `field` 或 `fields`，并视情况给出受管条目的 `resource` 路径、`allowed` 可选值或路径、未通过的 `check`，或可放行该请求的 `settings`。
 
-原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
+原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。30 秒读空闲期限仅在连接没有进行中请求时生效（自请求 body 结束至响应完成），停滞写入另受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
 密码模式先关闭凭据准入，再执行上述 HTTP grace，随后等待真实的阻塞凭据任务结束。五秒 HTTP 预算不限制最后的 KDF/数据库 join。
 
@@ -116,11 +116,9 @@ Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最�
 
 Setup 占有凭据状态后，discovery 返回 `setup_required:false`，耐久性不确定时也不重新开放。无法确认写入时返回 503 与 `durability_confirmed:false`，不带 `Retry-After`，不声称 `written:true`；须重启才能重新确认数据库中的账户状态。
 
-状态数据库之前的版本把记录保存在 `<data_dir>/native-api/admin.json`。启用 `password_auth` 时，首次启动导入该文件一次（已有的行优先），随后删除文件，`native-api/` 为空时一并删除；旧文件仍须通过与之前相同的所有者与权限检查。未启用 `password_auth` 时不处理该文件。此后再启动旧版本时，它找不到 `admin.json`，会重新开放 setup。
-
 不提供 HTTP 密码重置。恢复访问时，停止 honk，执行 `honk-core admin reset`，重启后重新 setup。把 `<data_dir>/state` 整个移走也能恢复，但会丢弃所有其他持久化状态。
 
-Reset 在检查数据库是否存在前取得状态目录的排他锁，因此不会与首次启动的旧凭据导入竞态。旧凭据文件仍须通过所有者、权限和普通文件检查。
+Reset 在检查数据库是否存在前取得状态目录的排他锁，因此不会与正在创建数据库的首次启动竞态。
 
 ### 用户态记录流
 
@@ -185,7 +183,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，源 `path` 与规则 `file` 保留规范化的入口目录相对名称（例如 `config.d/routing.dae`），源 `absolute_path` 另行提供规范化绝对路径；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。因此 capabilities 中 `config.max_bytes` 为 61440，即 65536 字节正文上限扣除 4096 字节创建信封后单次请求能携带的最大替换或新建内容；`config_validate.max_bytes` 为 8 MiB 预算，因为完整校验还计入从磁盘读取的依赖。`resources.config` 不含 `content` 字段；替换或新建正文超过 `config.max_bytes` 时返回 `413 request_too_large`。
 
-获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的配置数据。`config_content` 与 `writable_includes` 仍可配置，但不产生作用。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能作为可编辑的往返载荷。
+获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的配置数据。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能作为可编辑的往返载荷。
 
 启用 `config_write` 且配置非空 secret 或 `password_auth` 时，已接受的非凭据主文件与所有非凭据 include 均可写。只有已接受的源 ID 授权替换，新建只接受由 include 模式加载的新 `.dae` 路径，调用方提供的路径不能授权任意文件写入；generated/subscription 来源不可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
 
@@ -257,7 +255,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，从不截断；`max_rules` 取 4096 与当前字典行数中的较大值，`dns_rules.max_rules` 同样不小于较长的 DNS 列表。fallback 条目的 `expression` 为其源语句，例如 `fallback: proxy`；未保留源文本时为 `fallback: <outbound>`。路由模拟的求值结果使用 `fallback: <outbound>`。两者在期限内无法固定 router 时返回 `503 snapshot_unavailable` 并带 `Retry-After`。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
-对已接受 `.dae` 配置中的规则，包括含凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序以 dae 写法显示配置值，不加引号：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。监听凭据值仍被遮蔽；普通条件文本无需写权限即可读取，`config_content` 不产生作用。没有已接受来源元数据的规则显示编译后条件值，来源保持 null。编译后展示反映规范化的谓词，不等同于原始编写语法，也不展开 geodata。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 保留各自代次捕获的有界编译后值，包括程序内构造路由器的值。
+对已接受 `.dae` 配置中的规则，包括含凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序以 dae 写法显示配置值，不加引号：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。监听凭据值仍被遮蔽；普通条件文本无需写权限即可读取。没有已接受来源元数据的规则显示编译后条件值，来源保持 null。编译后展示反映规范化的谓词，不等同于原始编写语法，也不展开 geodata。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 保留各自代次捕获的有界编译后值，包括程序内构造路由器的值。
 
 `GET /dns/rules` 以 `{generation_id, request, response}` 返回当前 generation 的 `dns { routing { … } }` 规则。该接口只读，编辑 DNS 规则与 `/rules` 相同，通过来源 PUT 完成。两个列表均按求值顺序排列，并以恰好一条 `kind: "fallback"` 结尾。每条记录包含 `rule_id`、从 0 开始的 `index`、`expression`、`action`、`upstream`、`source` 与 `kind`。请求规则的 action 为 `upstream`、`asis`、`reject`；响应规则的 action 为 `accept`、`reject`、`requery`。action 为 `upstream` 或 `requery` 时，`upstream` 为引擎使用的小写名称，其他 action 为 null。`expression` 为编写时的整条语句，包含 action，去掉行尾注释，例如 `qname(suffix: example.com) -> AliDNS` 或 `fallback: googledns`。配置未写 fallback 时仍列出引擎默认值：请求为 `upstream` `default`，响应为 `accept`；其 expression 为 `fallback: <action>`，`source` 为 null。parser 以警告忽略的规则不列出。
 
@@ -298,7 +296,7 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 ### Geodata 来源与自动更新
 
-有状态库时，`resources.geodata.configurable_sources` 为 true，`runtime_settings.fields` 列出 `geodata`，能力还报告 `max_urls: 4`、`interval_hours: {min: 6, max: 168, default: 24}` 与 `lifecycle: {file_values: start, overrides_persist: true}`：仅在启动时读取配置文件的值，修改在重启后保留。无论有无状态库，`checksum` 均为 `sha256sum`。启用原生 API 时总会打开 `<data_dir>/state/honk.db`；设置存于其中的严格表 `geodata_settings`，重启和激活后保留；schema 版本 2 在打开已有数据库时添加该表。没有状态库时只使用配置文件中的 URL，下列字段均不出现。
+有状态库时，`resources.geodata.configurable_sources` 为 true，`runtime_settings.fields` 列出 `geodata`，能力还报告 `max_urls: 4`、`interval_hours: {min: 6, max: 168, default: 24}` 与 `lifecycle: {file_values: start, overrides_persist: true}`：仅在启动时读取配置文件的值，修改在重启后保留。无论有无状态库，`checksum` 均为 `sha256sum`。启用原生 API 时总会打开 `<data_dir>/state/honk.db`；设置存于其中的严格表 `geodata_settings`，重启和激活后保留。没有状态库时只使用配置文件中的 URL，下列字段均不出现。
 
 此时 `GET /runtime/settings` 包含 `geodata`：`source`、`geosite.urls`、`geoip.urls`、`auto_update`（`enabled`、`interval_hours`）、`download`（`route`、`group_id`）与 `verify_checksum`。只有已存储的设置生效。启动时，配置文件设置了下载 URL 的，honk 将其写入已存储的设置，覆盖通过 API 修改的 URL。配置文件未设置 URL 的资产，若列表由先前的配置文件写入则删除，改用内置 URL；若由 API 修改则保留。修改 `experimental.native_api`（包括这两个 URL）的 reload 会因需要重启而被拒绝，因此其他激活不会改动已存储的设置，通过 API 修改的 URL 保持到下次启动。已存储的列表全部来自配置文件时 `source` 为 `config`，任一列表来自 API 修改时为 `override`；未存储列表时为 `default`，即内置的 MetaCubeX `meta-rules-dat` release 文件，先 raw.githubusercontent.com，后 fastly.jsdelivr.net。自动更新默认开启，间隔默认 24 小时。
 

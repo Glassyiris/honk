@@ -625,7 +625,7 @@ async fn retirement_is_terminal_and_shutdown_remains_idempotent() {
     );
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_terminal_rebuild_is_fresh_and_keeps_process_admission() {
     use futures_util::FutureExt as _;
@@ -687,7 +687,7 @@ async fn native_terminal_rebuild_is_fresh_and_keeps_process_admission() {
     fork.shutdown().await;
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_generation_deposits_stop_without_closing_reused_node_tasks() {
     let node = canonical_node("moved-tasks");
@@ -746,7 +746,7 @@ async fn generation_shutdown_joins_background_jobs_without_native_tracking() {
     assert!(!generation.tasks_failed());
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn ephemeral_close_reports_reaped_panic_but_not_intentional_abort() {
     for panic in [true, false] {
@@ -779,7 +779,7 @@ async fn ephemeral_close_reports_reaped_panic_but_not_intentional_abort() {
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn cancelled_ephemeral_close_retains_owner_until_joined() {
     use futures_util::FutureExt as _;

@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 mod observation;
 mod selector_networks;
 mod udp_selection;

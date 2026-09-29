@@ -386,6 +386,9 @@ pub struct OwnOptions {
 }
 
 impl Group {
+    pub(crate) const INVALID_ICON: &'static str =
+        "icon must be an absolute http(s) URL or data URI of at most 2048 characters";
+
     pub fn valid_icon(value: &str) -> bool {
         if value.chars().count() > 2048
             || value.chars().any(char::is_whitespace)
@@ -437,6 +440,19 @@ pub enum GroupPolicy {
     Fallback,
     /// Reliability-aware automatic selection trained by real connection outcomes.
     Score,
+}
+
+impl GroupPolicy {
+    /// Serde wire name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selector => "selector",
+            Self::URLTest => "urltest",
+            Self::LoadBalance => "loadbalance",
+            Self::Fallback => "fallback",
+            Self::Score => "score",
+        }
+    }
 }
 
 #[cfg(test)]

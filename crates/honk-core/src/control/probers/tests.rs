@@ -690,7 +690,7 @@ async fn native_health_distinguishes_connect_and_http_for_duplicate_names() {
     registry.register(ProtocolEntry::new(node.protocol(), Arc::new(NodeEndpoint)));
     prober.proxy_registry = Arc::new(registry);
     let alive = AliveDialerSet::new();
-    alive.enable_native_observations();
+    alive.enable_health_history();
     alive.register_node(node.id, node.name.clone(), node.address.clone());
     let before = std::time::SystemTime::now();
     assert!(alive.probe_node(node.id, Duration::from_secs(1)).await);
@@ -710,7 +710,7 @@ async fn native_health_distinguishes_connect_and_http_for_duplicate_names() {
         .await;
     assert!(alive.probe_node(node.id, Duration::from_secs(1)).await);
     finish_server(server).await;
-    let samples = alive.native_observations(node.id);
+    let samples = alive.health_observations(node.id);
     assert_eq!(samples.len(), 2);
     for sample in &samples {
         assert_eq!(sample.ip_version, IpVersion::V4);
@@ -728,10 +728,10 @@ async fn native_health_distinguishes_connect_and_http_for_duplicate_names() {
         |sample| sample.measurement == HealthMeasurement::HttpHeaders
             && sample.warmth == HealthWarmth::Unknown
     ));
-    assert_eq!(alive.native_observations(node.id), samples);
+    assert_eq!(alive.health_observations(node.id), samples);
     assert!(!alive.probe_node(node.id, Duration::from_millis(50)).await);
     let failed = alive
-        .native_observations(node.id)
+        .health_observations(node.id)
         .into_iter()
         .find(|sample| sample.measurement == HealthMeasurement::HttpHeaders)
         .unwrap();
@@ -796,7 +796,7 @@ async fn health_shutdown_closes_real_http_probe_without_failure_evidence() {
         let addr = listener.local_addr().unwrap();
         let (prober, node) = test_prober("HEAD");
         let alive = Arc::new(AliveDialerSet::new());
-        alive.enable_native_observations();
+        alive.enable_health_history();
         alive.register_node(node, "probe".into(), addr.to_string());
         alive
             .set_http_probe(Arc::new(prober), format!("http://{addr}/"), "HEAD".into())
@@ -810,7 +810,7 @@ async fn health_shutdown_closes_real_http_probe_without_failure_evidence() {
         alive.shutdown_health_checks().await.unwrap();
         assert!(!request.await.unwrap());
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
-        assert!(alive.native_observations(node).is_empty());
+        assert!(alive.health_observations(node).is_empty());
         assert!(
             alive
                 .get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4)

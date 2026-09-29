@@ -657,7 +657,7 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(feature = "native-api")]
     fn bind_kernel_trace_dictionary(
         &mut self,
-        _dictionary: crate::native_api::flows::kernel::KernelTraceDictionary,
+        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
     ) {
     }
 
@@ -665,8 +665,8 @@ pub trait EbpfBackend: Send + Sync {
     fn capture_kernel_route(
         &self,
         _key: &TuplesKey,
-        _reference: crate::native_api::flows::kernel::KernelRouteReference,
-    ) -> Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str> {
+        _reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
         Err("kernel_trace_unsupported")
     }
 

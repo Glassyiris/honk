@@ -189,8 +189,7 @@ pub(crate) async fn resolve_with_owner(
     if !is_filtered_qtype(qtype, &forwarder.strategy)
         && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
     {
-        #[cfg(feature = "native-api")]
-        crate::native_api::flows::dns::source("hosts", Some("bypass"));
+        crate::observe::flows::dns::source("hosts", Some("bypass"));
         return Ok(outcome);
     }
     let prepared = engine.prepare_parsed(
@@ -200,8 +199,7 @@ pub(crate) async fn resolve_with_owner(
         options.forced_upstream.as_ref(),
         evidence,
     )?;
-    #[cfg(feature = "native-api")]
-    crate::native_api::flows::dns::source("unknown", Some("bypass"));
+    crate::observe::flows::dns::source("unknown", Some("bypass"));
     let reuse_eligible = options.cache != CacheAccess::Bypass
         && prepared.is_cacheable()
         && prepared.is_coalescable();
@@ -273,8 +271,7 @@ pub(crate) async fn resolve_with_owner(
         match flights.acquire(flight_key.clone()) {
             FlightRole::Rejected => return Err(DnsForwardError::Overloaded),
             FlightRole::Waiter(waiter) => {
-                #[cfg(feature = "native-api")]
-                crate::native_api::flows::dns::source("coalesced", None);
+                crate::observe::flows::dns::source("coalesced", None);
                 match waiter.receive().await {
                     Some(result) => {
                         return flight::waiter_outcome(
@@ -284,8 +281,7 @@ pub(crate) async fn resolve_with_owner(
                         .await;
                     }
                     None => {
-                        #[cfg(feature = "native-api")]
-                        crate::native_api::flows::dns::source("unknown", None);
+                        crate::observe::flows::dns::source("unknown", None);
                         continue;
                     }
                 }

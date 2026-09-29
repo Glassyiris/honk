@@ -51,7 +51,7 @@ impl AliveDialerSet {
             for (group, url) in groups {
                 map.insert(group.clone(), url.clone());
             }
-            self.reset_native_group_observations();
+            self.reset_group_health_observations();
         }
         let active_urls: HashSet<String> = self.group_check_urls.read().values().cloned().collect();
         self.url_check_ips

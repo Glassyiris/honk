@@ -20,10 +20,10 @@ use super::{
     ApiError, ErrorCode, NativeState, error, invalid_query, parse_query, timestamp,
     types::{RequestId, TrafficSummary},
 };
+use crate::observe::MAX_SAFE_UINT;
 
 const RETENTION: Duration = Duration::from_secs(600);
 const MAX_POINTS: usize = 600;
-const SAFE_UINT_MAX: u64 = (1 << 53) - 1;
 
 pub(crate) struct Telemetry {
     state: Mutex<Samples>,
@@ -149,7 +149,7 @@ impl Telemetry {
                             connections: traffic
                                 .connections
                                 .total
-                                .filter(|value| *value <= SAFE_UINT_MAX),
+                                .filter(|value| *value <= MAX_SAFE_UINT),
                         },
                     },
                 );
@@ -317,7 +317,7 @@ pub(super) async fn outbounds(
     parse_query(uri, &[], id)?;
     let rows = state.stats.native_snapshot().into_iter().map(|row| {
         // Unlike cumulative UInt64 fields, active connections are a SafeUInt.
-        if row.active_connections > SAFE_UINT_MAX {
+        if row.active_connections > MAX_SAFE_UINT {
             return Err(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::TemporarilyUnavailable, "Outbound active counter is not representable", id));
         }
         Ok(json!({

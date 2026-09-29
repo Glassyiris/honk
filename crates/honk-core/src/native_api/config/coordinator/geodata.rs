@@ -152,18 +152,25 @@ impl Worker {
                 runtime_registry: &plan.runtime_registry,
             },
         };
+        let mut stopping = self.stopping.clone();
         for (asset, urls) in plan.assets.iter().zip(&plan.urls) {
-            let (bytes, origin) = geodata::fetch(
-                asset.kind,
-                urls,
-                &egress,
-                offline::MAX_ASSET_BYTES,
-                &plan.policy,
-                geodata::file_url(&active.experimental.native_api, asset.kind),
-                plan.verify_checksum,
-            )
-            .await
-            .map_err(|error| {
+            // Shutdown must not wait out `DOWNLOAD_LIMIT`; nothing is written yet.
+            let result = tokio::select! {
+                biased;
+                _ = stopping.wait_for(|stopped| *stopped) => {
+                    return Err(failure("coordinator_stopped", &writes));
+                }
+                result = geodata::fetch(
+                    asset.kind,
+                    urls,
+                    &egress,
+                    offline::MAX_ASSET_BYTES,
+                    &plan.policy,
+                    geodata::file_url(&active.experimental.native_api, asset.kind),
+                    plan.verify_checksum,
+                ) => result,
+            };
+            let (bytes, origin) = result.map_err(|error| {
                 if plan.sources.is_some() && error.code.starts_with("checksum_") {
                     tracing::warn!(
                         "geodata checksum check failed; for a mirror that publishes no usable .sha256sum, setting geodata.verify_checksum to false turns the check off"
@@ -184,10 +191,7 @@ impl Worker {
             fetched.push(origin);
         }
         let service = Arc::clone(&self.service);
-        let store = self
-            .store
-            .clone()
-            .ok_or_else(|| failure("source_authority_lost", &writes))?;
+        let store = self.store.clone();
         let revision = plan.revision.clone();
         let data_dir = self.data_dir.clone();
         let deferred = self
@@ -197,7 +201,7 @@ impl Worker {
             .map_err(|_| failure("subscription_owner_unavailable", &writes))?;
         let prepared = tokio::task::spawn_blocking(move || {
             prepare_and_replace(
-                &service, &*store, &active, &accepted, downloads, &revision, &data_dir, &deferred,
+                &service, &store, &active, &accepted, downloads, &revision, &data_dir, &deferred,
             )
         })
         .await
@@ -313,14 +317,11 @@ fn same_settled_dependencies(
     accepted: &[DependencySnapshot],
     captured: &[DependencySnapshot],
 ) -> bool {
-    let settled = |dependencies: &[DependencySnapshot]| {
-        dependencies
-            .iter()
-            .filter(|dependency| !subscription_dependency(dependency))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    same_dependencies(&settled(accepted), &settled(captured))
+    let settled = |dependency: &&DependencySnapshot| !subscription_dependency(dependency);
+    accepted
+        .iter()
+        .filter(settled)
+        .eq(captured.iter().filter(settled))
 }
 
 /// `None` when every download matches its loaded file: nothing is written,
@@ -328,7 +329,7 @@ fn same_settled_dependencies(
 #[allow(clippy::too_many_arguments)]
 fn prepare_and_replace(
     service: &ConfigService,
-    store: &dyn SourceStore,
+    store: &SourceStore,
     active: &Config,
     accepted: &Accepted,
     downloads: Vec<DownloadedAsset>,
@@ -357,7 +358,7 @@ fn prepare_and_replace(
         store.dependency_root(),
         active,
         data_dir,
-        limits(),
+        SourceLimits::DEFAULT,
         &mut diagnostics,
         deferred,
         None,
@@ -434,7 +435,10 @@ fn prepare_and_replace(
         }
         if guards
             .iter()
-            .chain(source_pins.iter().filter_map(Pin::file))
+            .chain(source_pins.iter().filter_map(|pin| match pin {
+                Pin::File(file) => Some(file),
+                Pin::Revision(..) => None,
+            }))
             .chain(kept.iter().map(|asset| &asset.file))
             .any(|other| file.same_target(other))
             || assets.iter().any(|asset| asset.staged.same_target(&file))
@@ -553,7 +557,7 @@ fn prepare_and_replace(
                 return Err(WriteError::Conflict);
             }
             for pin in &source_pins {
-                store.recheck(pin)?;
+                pin.recheck()?;
             }
             for guard in guards.iter().chain(kept.iter().map(|asset| &asset.file)) {
                 guard.recheck()?;
@@ -564,24 +568,14 @@ fn prepare_and_replace(
             for pending in &assets {
                 pending.staged.recheck()?;
             }
-            let mut notices = Vec::new();
-            let loaded = store
-                .load(&HashMap::new(), &mut notices)
-                .map_err(|_| WriteError::Conflict)?;
-            if notices
-                .iter()
-                .any(|notice| notice.severity == Severity::Error)
-                || !same_source_documents(&validated.sources, &loaded.sources)
-            {
-                return Err(WriteError::Conflict);
-            }
-            let dependencies = validated
-                .recapture_dependencies(active, data_dir, limits(), deferred)
-                .map_err(|_| WriteError::Conflict)?;
-            if !same_dependencies(&validated.dependencies, &dependencies) {
-                return Err(WriteError::Conflict);
-            }
-            Ok(())
+            unchanged(
+                store,
+                &HashMap::new(),
+                &validated,
+                active,
+                data_dir,
+                deferred,
+            )
         });
         let completed = match result {
             Ok(completed) => completed,
@@ -613,7 +607,7 @@ fn prepare_and_replace(
     }));
     installed.sort_by_key(|asset| asset.snapshot.kind != "geosite");
     for pin in &source_pins {
-        store.recheck(pin).map_err(|_| {
+        pin.recheck().map_err(|_| {
             failure(
                 "postwrite_conflict",
                 installed.iter().map(|asset| &asset.receipt),
@@ -640,7 +634,7 @@ fn prepare_and_replace(
                 geo_sources: validated.geo_sources,
             }),
             diagnostics,
-            expected_revision: Some(revision.to_owned()),
+            expected_group_revision: Some(revision.to_owned()),
             deferred_provider: None,
         },
         assets: installed,

@@ -42,13 +42,7 @@ pub(in crate::native_api) fn administrative_projection(
     mut value: Value,
 ) -> Result<Value, ApiError> {
     let accepted = state.observation.configuration.sources.accepted.read();
-    let secrets = state
-        .observation
-        .configuration
-        .secrets(accepted.as_ref())
-        .as_ref()
-        .clone()
-        .with_clash(&state.clash_secret);
+    let secrets = state.observation.configuration.secrets(accepted.as_ref());
     secrets.mask_value(&mut value);
     Ok(value)
 }
@@ -138,31 +132,20 @@ pub(in crate::native_api) async fn replace(
     json_type(&request)?;
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
     let path = request.uri().path().to_owned();
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     let replacement: Replacement = body::decode(&bytes, invalid)?;
     if replacement.content.len() > MAX_CONTENT_BYTES {
         return Err(too_large());
     }
-    let reservation = state.observation.configuration.operations.reserve(
-        state.principal(),
-        "PUT",
-        &path,
-        key.as_deref(),
-        &bytes,
-        crate::native_api::operations::OperationKind::Reload,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        state.observation.configuration.enqueue(Work::Replace {
+    admit(state, "PUT", &path, key.as_deref(), &bytes, |reservation| {
+        Work::Replace {
             source_id,
             content: replacement.content,
             if_match: expected,
             reservation,
-        })?;
-    }
-    Ok(admission.await?.into_response())
+        }
+    })
+    .await
 }
 
 pub(in crate::native_api) async fn create(
@@ -183,9 +166,7 @@ pub(in crate::native_api) async fn create(
     }
     json_type(&request)?;
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     let creation: Creation = body::decode(&bytes, invalid)?;
     if creation.content.len() > MAX_CONTENT_BYTES {
         return Err(too_large());
@@ -193,23 +174,19 @@ pub(in crate::native_api) async fn create(
     if !new_source_path(&creation.path) {
         return Err(invalid());
     }
-    let reservation = state.observation.configuration.operations.reserve(
-        state.principal(),
+    admit(
+        state,
         "POST",
         "/api/v1/config/sources",
         key.as_deref(),
         &bytes,
-        crate::native_api::operations::OperationKind::Reload,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        state.observation.configuration.enqueue(Work::Create {
+        |reservation| Work::Create {
             path: creation.path,
             content: creation.content,
             reservation,
-        })?;
-    }
-    Ok(admission.await?.into_response())
+        },
+    )
+    .await
 }
 
 pub(in crate::native_api) async fn reload(
@@ -226,26 +203,17 @@ pub(in crate::native_api) async fn reload(
     if has_body {
         json_type(&request)?;
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     body::no_inputs(&bytes, invalid)?;
-    let reservation = state.observation.configuration.operations.reserve(
-        state.principal(),
+    admit(
+        state,
         "POST",
         "/api/v1/operations/reload",
         key.as_deref(),
         &bytes,
-        crate::native_api::operations::OperationKind::Reload,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        state
-            .observation
-            .configuration
-            .enqueue(Work::Reload { reservation })?;
-    }
-    Ok(admission.await?.into_response())
+        |reservation| Work::Reload { reservation },
+    )
+    .await
 }
 
 pub(in crate::native_api) async fn validate(
@@ -258,9 +226,7 @@ pub(in crate::native_api) async fn validate(
     }
     parse_query(request.uri(), &[], id)?;
     json_type(&request)?;
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     let request: ValidationRequest = body::decode(&bytes, invalid)?;
     if request.sources.is_empty() || request.sources.len() > MAX_SOURCES {
         return Err(if request.sources.is_empty() {

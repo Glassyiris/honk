@@ -222,7 +222,6 @@ struct Hy2TcpStream {
     request: Option<Bytes>,
     response: Vec<u8>,
     body_offset: Option<usize>,
-    #[cfg(feature = "native-api")]
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
@@ -233,7 +232,6 @@ impl Hy2TcpStream {
             request: Some(encode_tcp_request(addr).into()),
             response: Vec::new(),
             body_offset: None,
-            #[cfg(feature = "native-api")]
             observer: crate::runtime::flow_observation::current(),
         }
     }
@@ -327,9 +325,10 @@ impl AsyncRead for Hy2TcpStream {
             }
             if let Some(header_end) = self.parse_response()? {
                 self.body_offset = Some(header_end);
-                #[cfg(feature = "native-api")]
                 if let Some(observer) = self.observer.take() {
-                    observer.milestone_once("target_confirmed");
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                    );
                 }
                 continue;
             }
@@ -379,18 +378,20 @@ impl AsyncWrite for Hy2TcpStream {
                     if !chunks[0].is_empty() {
                         self.request = Some(chunks[0].clone());
                     } else {
-                        #[cfg(feature = "native-api")]
                         if let Some(observer) = &self.observer {
-                            observer.milestone_once("target_request_sent");
+                            observer.milestone_once(
+                                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                            );
                         }
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
                 Poll::Ready(Ok(written)) => {
-                    #[cfg(feature = "native-api")]
                     if let Some(observer) = &self.observer {
-                        observer.milestone_once("target_request_sent");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
                     }
                     Poll::Ready(Ok(written - request_len))
                 }
@@ -413,11 +414,11 @@ impl AsyncWrite for Hy2TcpStream {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                Poll::Ready(Ok(_)) =>
-                {
-                    #[cfg(feature = "native-api")]
+                Poll::Ready(Ok(_)) => {
                     if let Some(observer) = &self.observer {
-                        observer.milestone_once("target_request_sent");
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
                     }
                 }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -676,7 +677,6 @@ impl WarmableOutbound for Hysteria2Handler {
             }
             Ok(())
         };
-        #[cfg(feature = "native-api")]
         let warm = crate::runtime::flow_observation::without(warm);
         warm.await
     }
@@ -746,7 +746,6 @@ impl Hysteria2Handler {
             addr,
             max_datagram,
             target,
-            #[cfg(feature = "native-api")]
             request_observer: parking_lot::Mutex::new(crate::runtime::flow_observation::current()),
         }))
     }
@@ -863,7 +862,6 @@ struct Hy2UdpTransport {
     addr: String,
     max_datagram: usize,
     target: SocketAddr,
-    #[cfg(feature = "native-api")]
     request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
 }
 
@@ -944,9 +942,8 @@ impl PacketTransport for Hy2UdpTransport {
                 .map_err(io::Error::other)
                 .map_err(super::quic_carrier_io_error)?;
         }
-        #[cfg(feature = "native-api")]
         if let Some(observer) = self.request_observer.lock().take() {
-            observer.milestone_once("target_request_sent");
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         Ok(())
     }

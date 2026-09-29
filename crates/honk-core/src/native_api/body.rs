@@ -4,11 +4,20 @@
 //! the HTTP boundary. Submitted values and unknown keys are never echoed: body
 //! types are closed structs, so every key left in a field path is a schema name.
 
+use axum::body::Body;
+use bytes::Bytes;
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::{Value, error::Category, json};
 use serde_path_to_error::{Path, Segment};
 
 use super::ApiError;
+
+/// The HTTP boundary already read the whole body within `MAX_BODY_BYTES`, so this cannot fail.
+pub(super) async fn buffered(body: Body) -> Bytes {
+    axum::body::to_bytes(body, usize::MAX)
+        .await
+        .expect("the HTTP boundary buffers every API body")
+}
 
 /// Decodes a JSON body into `T`, or returns the caller's `invalid` error with details.
 pub(super) fn decode<T: DeserializeOwned>(

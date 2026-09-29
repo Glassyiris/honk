@@ -162,7 +162,7 @@ async fn queued_delete_cannot_change_committed_creation_response() {
                 .service
                 .enqueue(super::super::Work::Manage {
                     mutation,
-                    catalog: Arc::clone(&state.observation.catalog),
+                    catalog: Arc::clone(&state.observation.core.catalog),
                     group_manager: Arc::clone(&state.group_manager),
                     alive_set: Arc::clone(&state.alive_set),
                     response,
@@ -430,7 +430,7 @@ async fn delete_request_errors_and_source_drift_are_not_retryable() {
             let (response, wait) = oneshot::channel();
             let work = super::super::Work::Manage {
                 mutation: crate::native_api::management::Mutation::DeleteNode("unknown".into()),
-                catalog: Arc::clone(&state.observation.catalog),
+                catalog: Arc::clone(&state.observation.core.catalog),
                 group_manager: Arc::clone(&state.group_manager),
                 alive_set: Arc::clone(&state.alive_set),
                 response,
@@ -874,7 +874,9 @@ async fn managed_provider_aliases_cannot_transfer_existing_runtime_identity() {
 #[tokio::test]
 async fn db_store_rejected_management_reports_nothing_written() {
     let fixture = Fixture::new_db(Access::Admin).await;
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let failure = error(
         create_node(&fixture, "not-recorded", LINK)
             .send()
@@ -900,7 +902,9 @@ async fn db_store_rejected_management_reports_nothing_written() {
 #[tokio::test]
 async fn db_store_degraded_management_reports_recorded_write() {
     let fixture = Fixture::new_db(Access::Admin).await;
-    fixture.reject_reloads.store(3, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
     let failure = error(
         create_node(&fixture, "degraded", LINK)
             .send()

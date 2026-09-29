@@ -4,13 +4,12 @@ use std::io;
 use std::os::fd::{AsFd, RawFd};
 use std::sync::Arc;
 
-use aya::maps::{HashMap, Map, MapData};
+use aya::maps::{HashMap, IterableMap, Map, MapData};
 use aya::programs::{FEntry, FExit, fentry::FEntryLink, fexit::FExitLink};
 use aya::{Btf, Ebpf, EbpfLoader};
 use honk_ebpf_common::receive_trace::{
     RECEIVE_TRACE_BATCH_SIZE, RECEIVE_TRACE_VALID, ReceiveTraceBatch, ReceiveTracePacket,
 };
-use parking_lot::Mutex;
 
 use super::btf::Btf as OffsetBtf;
 use super::process_name::{VMLINUX_BTF_ENV, VMLINUX_BTF_PATHS};
@@ -52,9 +51,15 @@ pub(super) fn detect() -> Option<ReceiveTraceOffsets> {
 }
 
 pub struct ReceiveTrace {
-    map: Mutex<HashMap<MapData, u64, ReceiveTraceBatch>>,
+    map: HashMap<MapData, u64, ReceiveTraceBatch>,
     _entries: Vec<FEntryLink>,
     _exits: Vec<FExitLink>,
+}
+
+// Each registration owns its handle so concurrent listeners never serialize map updates.
+fn handle(map: &MapData) -> io::Result<HashMap<MapData, u64, ReceiveTraceBatch>> {
+    let map = MapData::from_fd(map.fd().as_fd().try_clone_to_owned()?).map_err(io::Error::other)?;
+    HashMap::try_from(Map::HashMap(map)).map_err(io::Error::other)
 }
 
 impl ReceiveTrace {
@@ -101,9 +106,8 @@ impl ReceiveTrace {
         let Some(Map::HashMap(map)) = bpf.map("RECEIVE_TRACE") else {
             anyhow::bail!("missing RECEIVE_TRACE hash map");
         };
-        let map = MapData::from_fd(map.fd().as_fd().try_clone_to_owned()?)?;
         Ok(Arc::new(Self {
-            map: Mutex::new(HashMap::try_from(Map::HashMap(map))?),
+            map: handle(map)?,
             _entries: entries,
             _exits: exits,
         }))
@@ -128,38 +132,44 @@ impl ReceiveTrace {
         if size as usize != std::mem::size_of::<u64>() || cookie == 0 {
             return Err(io::Error::other("invalid owned UDP socket cookie"));
         }
-        self.map
-            .lock()
-            .insert(cookie, ReceiveTraceBatch::default(), 1)
+        let mut map = handle(self.map.map())?;
+        map.insert(cookie, ReceiveTraceBatch::default(), 1)
             .map_err(io::Error::other)?;
         Ok(ReceiveRegistration {
-            trace: self.clone(),
+            _trace: self.clone(),
+            map,
             fd,
             cookie,
             epoch: 0,
+            armed: false,
         })
     }
 }
 
 pub(crate) struct ReceiveRegistration {
-    trace: Arc<ReceiveTrace>,
+    _trace: Arc<ReceiveTrace>,
+    map: HashMap<MapData, u64, ReceiveTraceBatch>,
     fd: RawFd,
     cookie: u64,
     epoch: u64,
+    armed: bool,
 }
 
 impl ReceiveRegistration {
+    /// A receive that consumed nothing leaves the armed batch as the hooks
+    /// found it, so the owner may skip `finish` and reuse it without a syscall.
     pub(crate) fn begin(&mut self, fd: RawFd) -> bool {
-        if fd != self.fd {
-            return false;
-        }
+        fd == self.fd && (self.armed || self.arm())
+    }
+
+    fn arm(&mut self) -> bool {
         let Some(epoch) = self.epoch.checked_add(1) else {
+            self.armed = false;
             return false;
         };
         self.epoch = epoch;
-        self.trace
+        self.armed = self
             .map
-            .lock()
             .insert(
                 self.cookie,
                 ReceiveTraceBatch {
@@ -169,22 +179,22 @@ impl ReceiveRegistration {
                 },
                 2,
             )
-            .is_ok()
+            .is_ok();
+        self.armed
     }
 
     pub(crate) fn finish(
-        &self,
+        &mut self,
         count: usize,
     ) -> Option<[ReceiveTracePacket; RECEIVE_TRACE_BATCH_SIZE]> {
-        let mut map = self.trace.map.lock();
-        let batch = map.get(&self.cookie, 0).ok();
-        // Even an errored syscall or failed read must disarm the registration.
-        let disarmed = map
-            .insert(self.cookie, ReceiveTraceBatch::default(), 2)
-            .is_ok();
+        let epoch = self.epoch;
+        let batch = self.map.get(&self.cookie, 0).ok();
+        // Even an errored syscall or failed read must replace the drained batch;
+        // rearming does so and spares the next receive its own update.
+        let rearmed = self.arm();
         let batch = batch?;
-        if !disarmed
-            || batch.epoch != self.epoch
+        if !rearmed
+            || batch.epoch != epoch
             || batch.active != 1
             || batch.count as usize != count
             || batch.depth != 0
@@ -199,7 +209,7 @@ impl ReceiveRegistration {
 
 impl Drop for ReceiveRegistration {
     fn drop(&mut self) {
-        let _ = self.trace.map.lock().remove(&self.cookie);
+        let _ = self.map.remove(&self.cookie);
     }
 }
 
@@ -285,7 +295,7 @@ mod tests {
                 3 => batch.depth = 1,
                 _ => batch.lost = 1,
             }
-            registration.trace.map.lock().insert(cookie, batch, 2)?;
+            registration.map.insert(cookie, batch, 2)?;
             let result = registration.finish(3);
             if loss == 0 {
                 let packets = result.expect("located candidate hole retains other slots");
@@ -299,12 +309,67 @@ mod tests {
             }
         }
 
-        let trace = registration.trace.clone();
+        let trace = registration._trace.clone();
         drop(registration);
-        assert!(trace.map.lock().get(&cookie, 0).is_err());
+        assert!(trace.map.get(&cookie, 0).is_err());
         let mut registration = trace.register(receiver.as_raw_fd())?;
         assert!(registration.begin(receiver.as_raw_fd()));
         assert!(registration.finish(0).is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+    fn receive_trace_stays_armed_between_receives() -> anyhow::Result<()> {
+        let (_bpf, trace) = ReceiveTrace::load_for_test()?;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        receiver.set_nonblocking(true)?;
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut registration = trace.register(receiver.as_raw_fd())?;
+        let cookie = registration.cookie;
+        let mut buffer = [0u8; 8];
+
+        assert!(registration.begin(receiver.as_raw_fd()));
+        let mut marked = trace.map.get(&cookie, 0)?;
+        marked.packets[RECEIVE_TRACE_BATCH_SIZE - 1].priority = 99;
+        registration.map.insert(cookie, marked, 2)?;
+        // Would-block receives skip `finish`; neither they nor `begin` may touch the map.
+        for _ in 0..2 {
+            assert!(registration.begin(receiver.as_raw_fd()));
+            let length = unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert_eq!(length, -1);
+        }
+        let batch = trace.map.get(&cookie, 0)?;
+        assert_eq!(batch.packets[RECEIVE_TRACE_BATCH_SIZE - 1].priority, 99);
+        assert_eq!(
+            (batch.epoch, batch.active, batch.count, batch.lost),
+            (registration.epoch, 1, 0, 0)
+        );
+
+        sender.send_to(b"x", receiver.local_addr()?)?;
+        assert!(registration.begin(receiver.as_raw_fd()));
+        let length = unsafe {
+            libc::recv(
+                receiver.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(length, 1);
+        assert_eq!(registration.finish(1).expect("armed receive")[0].length, 1);
+        let batch = trace.map.get(&cookie, 0)?;
+        assert_eq!(
+            (batch.epoch, batch.active, batch.count),
+            (registration.epoch, 1, 0)
+        );
         Ok(())
     }
 }

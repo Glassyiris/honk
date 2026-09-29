@@ -4,70 +4,11 @@ use axum::http::{HeaderValue, header};
 use honk_config::parser::source_edit::{inline_sources, strip_listener_secrets};
 
 use super::*;
-use crate::native_api::store::db::MAX_REVISIONS;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Import {
     replace: bool,
-}
-
-impl ConfigService {
-    pub(crate) fn store_kind(&self) -> StoreKind {
-        self.store
-            .read()
-            .as_ref()
-            .map_or(StoreKind::File, |store| store.kind())
-    }
-
-    fn database(&self) -> Option<Arc<dyn SourceStore>> {
-        self.store
-            .read()
-            .clone()
-            .filter(|store| store.kind() == StoreKind::Database)
-    }
-
-    /// True when the running configuration may differ from the recorded `head`.
-    pub(crate) fn store_blocked(&self) -> bool {
-        self.store
-            .read()
-            .as_ref()
-            .is_some_and(|store| store.blocked())
-    }
-
-    /// `store` of `GET /config`; reads only cached state.
-    pub(crate) fn store_value(&self) -> Value {
-        let Some(store) = self.database() else {
-            return json!({"kind":"file","revision":null,"parent":null,"recorded":true});
-        };
-        let recording = self.recording.read();
-        let recorded = !store.blocked()
-            && match &*recording {
-                RecordState::Idle => true,
-                RecordState::Pending(previous) => self
-                    .sources
-                    .accepted
-                    .read()
-                    .as_ref()
-                    .is_some_and(|accepted| previous.as_ref() == Some(&accepted.revision)),
-            };
-        let head = store.database().and_then(|database| database.cached_head());
-        json!({"kind":"db","revision":head.map(|(number,_)|number),"parent":head.and_then(|(_,parent)|parent),"recorded":recorded})
-    }
-
-    /// `writable` as advertised: false while a failed record blocks writes.
-    pub(crate) fn editable(&self) -> bool {
-        self.writable() && !self.store_blocked()
-    }
-
-    pub(crate) fn import_capability(&self) -> Value {
-        json!({"available":self.database().is_some() && self.editable(),"replace_required":true})
-    }
-
-    pub(crate) fn revisions_capability(&self) -> Value {
-        // Activating `head` stays possible while blocked: it is the way back in sync.
-        json!({"available":self.database().is_some(),"can_activate":self.database().is_some() && self.writable(),"max_revisions":MAX_REVISIONS})
-    }
 }
 
 pub(in crate::native_api) async fn export(
@@ -86,7 +27,7 @@ pub(in crate::native_api) async fn export(
             id,
         )
     })?;
-    let mut omitted = service.store_kind() == StoreKind::Database
+    let mut omitted = matches!(*service.store.read(), Some(SourceStore::Db(_)))
         && !(config.experimental.native_api.secret.is_empty()
             && config.experimental.clash_api.secret.is_empty());
     let mut sources = accepted.update.sources.clone();
@@ -97,7 +38,7 @@ pub(in crate::native_api) async fn export(
     }
     let inlined = inline_sources(&sources).map_err(|_| unavailable())?;
     let (inlined, _) = ListenerSecrets::from_config(&config)
-        .with_clash(&state.clash_secret)
+        .with_secret(&service.clash_secret)
         .mask(&inlined);
     let body = if omitted {
         format!("# listener secrets omitted\n{inlined}")
@@ -136,14 +77,14 @@ pub(in crate::native_api) async fn revisions(
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
     let service = &state.observation.configuration;
-    let store = service.database().ok_or_else(unsupported)?;
+    let Some(SourceStore::Db(store)) = service.store.read().clone() else {
+        return Err(unsupported());
+    };
     let store_error = || unavailable().with_details(json!({"stage":"store"}));
-    let (active, rows) =
-        tokio::task::spawn_blocking(move || store.database().map(|database| database.revisions()))
-            .await
-            .map_err(|_| store_error())?
-            .ok_or_else(unsupported)?
-            .map_err(|_| store_error())?;
+    let (active, rows) = tokio::task::spawn_blocking(move || store.revisions())
+        .await
+        .map_err(|_| store_error())?
+        .map_err(|_| store_error())?;
     let secrets = service.secrets(service.sources.accepted.read().as_ref());
     let revisions: Vec<Value> = rows
         .into_iter()
@@ -171,21 +112,18 @@ pub(in crate::native_api) async fn import(
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
     let service = &state.observation.configuration;
-    let store = service.database().ok_or_else(unsupported)?;
+    let Some(SourceStore::Db(store)) = service.store.read().clone() else {
+        return Err(unsupported());
+    };
     if !service.writable() {
         return Err(denied());
     }
     json_type(&request)?;
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
     let key = key.ok_or_else(precondition_required)?;
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     let body: Import = body::decode(&bytes, invalid)?;
-    let initialized = store
-        .database()
-        .and_then(|database| database.cached_head())
-        .is_some();
+    let initialized = store.cached_head().is_some();
     if initialized && !body.replace {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -194,19 +132,15 @@ pub(in crate::native_api) async fn import(
             None,
         ));
     }
-    let reservation = service.operations.reserve(
-        state.principal(),
+    admit(
+        state,
         "POST",
         "/api/v1/x-honk/config/import",
         Some(&key),
         &bytes,
-        crate::native_api::operations::OperationKind::Reload,
-    )?;
-    let admission = reservation.admission();
-    if reservation.fresh {
-        service.enqueue(Work::Import { reservation })?;
-    }
-    Ok(admission.await?.into_response())
+        |reservation| Work::Import { reservation },
+    )
+    .await
 }
 
 pub(in crate::native_api) async fn activate(
@@ -216,7 +150,9 @@ pub(in crate::native_api) async fn activate(
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
     let service = &state.observation.configuration;
-    let store = service.database().ok_or_else(unsupported)?;
+    let Some(SourceStore::Db(store)) = service.store.read().clone() else {
+        return Err(unsupported());
+    };
     if !service.writable() {
         return Err(denied());
     }
@@ -230,9 +166,7 @@ pub(in crate::native_api) async fn activate(
     if request.body().size_hint().upper() != Some(0) {
         json_type(&request)?;
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 65536)
-        .await
-        .map_err(|_| too_large())?;
+    let bytes = body::buffered(request.into_body()).await;
     body::no_inputs(&bytes, invalid)?;
     // A replay answers even after retention pruned the revision.
     let reservation = service.operations.reserve(
@@ -245,18 +179,13 @@ pub(in crate::native_api) async fn activate(
     )?;
     let admission = reservation.admission();
     if reservation.fresh {
-        let exists = tokio::task::spawn_blocking(move || {
-            store
-                .database()
-                .map(|database| database.revision_exists(number))
-        })
-        .await
-        .map_err(|_| unavailable())?;
+        let exists = tokio::task::spawn_blocking(move || store.revision_exists(number))
+            .await
+            .map_err(|_| unavailable())?;
         let error = match exists {
-            Some(Ok(true)) => None,
-            Some(Ok(false)) => Some(not_found()),
-            None => Some(unsupported()),
-            Some(Err(_)) => Some(unavailable().with_details(json!({"stage":"store"}))),
+            Ok(true) => None,
+            Ok(false) => Some(not_found()),
+            Err(_) => Some(unavailable().with_details(json!({"stage":"store"}))),
         };
         match error {
             None => service.enqueue(Work::ActivateRevision {

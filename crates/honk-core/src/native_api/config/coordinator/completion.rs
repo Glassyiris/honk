@@ -6,7 +6,6 @@ use crate::native_api::store::Committed;
 impl ActivationFailure {
     fn reason(self) -> (&'static str, &'static str) {
         match self {
-            Self::RequestExhausted => ("request_exhausted", "Reload request sequence exhausted"),
             Self::EngineUnavailable => ("engine_unavailable", "Reload engine is unavailable"),
             Self::Unconfirmed => (
                 "activation_unconfirmed",
@@ -144,17 +143,14 @@ impl Worker {
         if committed.written() {
             return Ok(true);
         }
-        let Some(store) = &self.store else {
-            return Ok(false);
-        };
         let instance = &self.service.instance_id;
         let result = match completion {
             Ok(_) | Err(ActivationFailure::Degraded(_) | ActivationFailure::Reconciliation(_)) => {
-                let writer = Arc::clone(store);
+                let writer = self.store.clone();
                 match tokio::task::spawn_blocking(move || writer.promote(committed)).await {
                     Ok(Ok(())) => Ok(true),
                     _ => {
-                        store.block();
+                        self.store.block();
                         let active = match completion {
                             Ok(outcome) => outcome
                                 .generation()
@@ -166,7 +162,7 @@ impl Worker {
                 }
             }
             Err(ActivationFailure::Unconfirmed) => {
-                store.block();
+                self.store.block();
                 Err(json!({"committed":null,"written":false}))
             }
             Err(_) => Ok(false),

@@ -8,8 +8,8 @@ mod warm;
 pub(in crate::control) use warm::WarmTask;
 
 pub(in crate::control) use fingerprint::{
-    dns_routing_state_reusable, effective_config_unchanged, routing_state_reusable,
-    subscription_nodes_unchanged,
+    declaring_sources_replaced, dns_routing_state_reusable, effective_config_unchanged,
+    routing_state_reusable, subscription_nodes_unchanged,
 };
 pub(crate) use policy::{LogFiles, restart_required_fields};
 #[cfg(test)]
@@ -33,7 +33,6 @@ pub(in crate::control) use connectivity::{
     urltest_group_registrations,
 };
 
-#[cfg(any(feature = "clash-api", feature = "native-api"))]
 pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,

@@ -74,15 +74,7 @@ pub(super) async fn serve(
         },
         full: full_detail(&values, id)?,
     };
-    let limit = values
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=1000).contains(&limit) {
-        return Err(invalid_query(id));
-    }
+    let limit = crate::native_api::pages::limit(&values, id)?;
     let api = &state.observation.dns;
     let mut snapshots = api.snapshots.lock().await;
     snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
@@ -92,7 +84,9 @@ pub(super) async fn serve(
         let position = position.parse::<usize>().map_err(|_| expired())?;
         let snapshot = snapshots
             .iter()
-            .find(|snapshot| snapshot.id == snapshot_id && snapshot.instance == api.instance)
+            .find(|snapshot| {
+                snapshot.id == snapshot_id && snapshot.instance == api.recorder.instance()
+            })
             .ok_or_else(expired)?;
         if position == 0 || position >= snapshot.entries.len() {
             return Err(expired());
@@ -102,7 +96,7 @@ pub(super) async fn serve(
         }
         return page(snapshot, position, limit, id).map(|(response, _)| response);
     }
-    let full = || super::super::catalog::snapshot_unavailable(id).with_retry_after(1);
+    let full = || super::super::catalog::snapshot_unavailable(id);
     if snapshots.len() == 8 {
         return Err(full());
     }
@@ -111,7 +105,7 @@ pub(super) async fn serve(
         .map(|snapshot| snapshot.bytes)
         .sum::<usize>();
     let overhead = std::mem::size_of::<Snapshot>()
-        + api.instance.len()
+        + api.recorder.instance().len()
         + 256
         + filters.name.as_ref().map_or(0, String::capacity)
         + filters.domain.as_ref().map_or(0, String::capacity)
@@ -149,7 +143,7 @@ pub(super) async fn serve(
         + (entries.capacity() - entries.len()) * std::mem::size_of::<ExactCacheEntry>();
     let snapshot = Snapshot {
         id: Uuid::new_v4().to_string(),
-        instance: api.instance.clone(),
+        instance: api.recorder.instance().to_owned(),
         created,
         observed_at: timestamp(wall),
         filters,

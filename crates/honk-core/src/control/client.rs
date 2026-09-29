@@ -6,7 +6,7 @@ use honk_outbound::group::SelectorMember;
 use honk_outbound::group::SelectorNetworks;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-#[cfg(feature = "clash-api")]
+#[cfg(any(feature = "native-api", feature = "clash-api"))]
 use tokio::sync::oneshot;
 
 #[derive(Clone)]
@@ -14,17 +14,10 @@ pub struct ControlClient {
     sender: mpsc::Sender<super::ControlCommand>,
 }
 
-#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[cfg(all(feature = "native-api", feature = "clash-api"))]
 #[derive(Debug)]
 pub(crate) enum ModeRequest {
-    #[cfg(test)]
-    Runtime {
-        mode: &'static str,
-        target: Option<String>,
-    },
-    #[cfg(feature = "clash-api")]
     ClashMode(String),
-    #[cfg(feature = "clash-api")]
     ClashSelection(String),
 }
 
@@ -88,7 +81,7 @@ impl ControlClient {
         Self { sender }
     }
 
-    #[cfg(feature = "clash-api")]
+    #[cfg(any(feature = "native-api", feature = "clash-api"))]
     pub(crate) async fn select(
         &self,
         request: SelectionRequest,
@@ -166,14 +159,14 @@ impl super::ControlPlane {
                 let catalog = self.native_catalog()?;
                 let name = native_group_name(&catalog, &group_id)?;
                 let selected = manager
-                    .native_members(&name)
+                    .group_members(&name)
                     .find_map(|member| match member {
-                        honk_outbound::group::NativeGroupMember::Node(node)
+                        honk_outbound::group::GroupMember::Node(node)
                             if node.id.to_string() == member_id =>
                         {
                             Some(SelectorMember::Node(node.id))
                         }
-                        honk_outbound::group::NativeGroupMember::Group(group)
+                        honk_outbound::group::GroupMember::Group(group)
                             if catalog.groups.get(&group.name) == Some(&member_id) =>
                         {
                             Some(SelectorMember::Group(group.name.clone()))
@@ -215,18 +208,7 @@ impl super::ControlPlane {
                 (honk_outbound::group::SelectionNetwork::Tcp, "tcp"),
                 (honk_outbound::group::SelectionNetwork::Udp, "udp"),
             ] {
-                if matches!(
-                    (networks, network),
-                    (SelectorNetworks::Both, _)
-                        | (
-                            SelectorNetworks::Tcp,
-                            honk_outbound::group::SelectionNetwork::Tcp
-                        )
-                        | (
-                            SelectorNetworks::Udp,
-                            honk_outbound::group::SelectionNetwork::Udp
-                        )
-                ) {
+                if networks.contains(network) {
                     selected.push((
                         network,
                         self.connection_tracker
@@ -246,7 +228,7 @@ impl super::ControlPlane {
         let revision = update.revision;
         #[cfg(feature = "native-api")]
         let selection = match (&member, &self.native) {
-            (None, Some(native)) => Some(crate::native_api::catalog::runtime_selection(
+            (None, Some(native)) => Some(crate::observe::catalog::runtime_selection(
                 &manager,
                 &native.catalog.snapshot(),
                 &name,
@@ -296,7 +278,7 @@ impl super::ControlPlane {
     #[cfg(feature = "native-api")]
     fn native_catalog(
         &self,
-    ) -> Result<Arc<crate::native_api::catalog::CatalogIdentity>, ControlError> {
+    ) -> Result<Arc<crate::observe::catalog::CatalogIdentity>, ControlError> {
         Ok(self
             .native
             .as_ref()
@@ -308,7 +290,7 @@ impl super::ControlPlane {
 
 #[cfg(feature = "native-api")]
 fn native_group_name(
-    catalog: &crate::native_api::catalog::CatalogIdentity,
+    catalog: &crate::observe::catalog::CatalogIdentity,
     group_id: &str,
 ) -> Result<String, ControlError> {
     catalog

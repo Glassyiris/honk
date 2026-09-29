@@ -1,30 +1,10 @@
 use super::*;
-use honk_config::node::Node;
-
-fn fixture() -> Config {
-    let mut config = Config::default();
-    config.nodes = (1..=3)
-        .map(|number| Node {
-            id: Uuid::from_u128(number),
-            name: format!("node-{number}"),
-            ..Default::default()
-        })
-        .collect();
-    config.groups = vec![
-        Group {
-            name: "parent".into(),
-            nodes: vec![config.nodes[0].id],
-            groups: vec!["child".into()],
-            ..Default::default()
-        },
-        Group {
-            name: "child".into(),
-            nodes: vec![config.nodes[1].id, config.nodes[2].id],
-            ..Default::default()
-        },
-    ];
-    config
-}
+use crate::native_api::pages::{MAX_SNAPSHOTS, SNAPSHOT_TTL};
+use crate::observe::catalog::{Catalog, tests::fixture};
+use honk_config::group::GroupPolicy;
+use honk_outbound::alive::IpVersion;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 async fn body(response: Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), MAX_SNAPSHOT_BYTES + 1024)
@@ -46,66 +26,19 @@ fn capture(config: &Config, catalog: &Catalog, filter: Option<&str>) -> NodeSnap
     .unwrap()
 }
 
-#[test]
-fn identities_survive_reordering_but_not_removal_or_restart() {
-    let mut config = fixture();
-    let catalog = Catalog::new(&config);
-    let original = catalog.snapshot();
-    config.groups.reverse();
-    for group in &mut config.groups {
-        group.id = Uuid::new_v4();
-    }
-    config.experimental.native_api.secret = "not part of a group revision".into();
-    catalog.install(&config);
-    assert_eq!(catalog.snapshot().revision, original.revision);
-    assert_eq!(catalog.snapshot().groups, original.groups);
-
-    // Only URLTest reports a tolerance, so it is not part of this group's revision.
-    config.groups[0].tolerance += 1;
-    catalog.install(&config);
-    assert_eq!(catalog.snapshot().revision, original.revision);
-    config.groups[0].own.interrupt_connections = true;
-    catalog.install(&config);
-    assert_ne!(catalog.snapshot().revision, original.revision);
-    assert_eq!(catalog.snapshot().groups, original.groups);
-
-    let removed = config.groups.remove(0);
-    catalog.install(&config);
-    assert!(!catalog.snapshot().groups.contains_key(&removed.name));
-    config.groups.push(removed);
-    catalog.install(&config);
-    assert_ne!(catalog.snapshot().groups["child"], original.groups["child"]);
-    assert_eq!(
-        catalog.snapshot().groups["parent"],
-        original.groups["parent"]
-    );
-    assert_ne!(
-        Catalog::new(&config).snapshot().groups["parent"],
-        original.groups["parent"]
-    );
-}
-
-#[test]
-fn revision_and_members_follow_effective_duplicate_and_cycle_rules() {
-    let mut config = fixture();
-    let mut shadow = config.groups[0].clone();
-    shadow.nodes.clear();
-    config.groups.insert(0, shadow);
-    config.groups[2].groups.push("parent".into());
-    let catalog = Catalog::new(&config);
-    let original = catalog.snapshot();
-    config.groups[0].interrupt_connections ^= true;
-    catalog.install(&config);
-    assert_eq!(catalog.snapshot().revision, original.revision);
-    let manager = GroupManager::new(&config.groups, &config.nodes);
-    let effective = GroupManager::native_effective_groups(&config.groups);
-    for (name, group) in &effective {
-        assert_eq!(manager.native_group(name).unwrap(), group);
-    }
-    let before = catalog.snapshot().revision.clone();
-    config.groups[1].nodes.push(config.nodes[2].id);
-    catalog.install(&config);
-    assert_ne!(catalog.snapshot().revision, before);
+fn resume(
+    pages: &NodePages,
+    cursor: &str,
+    group_id: Option<&str>,
+    limit: usize,
+    request: &RequestId,
+) -> Result<Response, ApiError> {
+    pages.resume(
+        cursor,
+        limit,
+        |snapshot| snapshot.group_id.as_deref() == group_id,
+        request,
+    )
 }
 
 #[tokio::test]
@@ -113,12 +46,13 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     let mut config = fixture();
     config.nodes[1].name = config.nodes[0].name.clone();
     let catalog = Catalog::new(&config);
+    let pages = NodePages::default();
     let identity = catalog.snapshot();
     let request = RequestId("request".into());
     let parent = &identity.groups["parent"];
     let parent_page = body(
-        catalog
-            .page(capture(&config, &catalog, Some(parent)), 100, &request)
+        pages
+            .first(capture(&config, &catalog, Some(parent)), 100, &request)
             .unwrap(),
     )
     .await;
@@ -134,35 +68,30 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
 
     let child = &identity.groups["child"];
     let first = body(
-        catalog
-            .page(capture(&config, &catalog, Some(child)), 1, &request)
+        pages
+            .first(capture(&config, &catalog, Some(child)), 1, &request)
             .unwrap(),
     )
     .await;
     let cursor = first["next_cursor"].as_str().unwrap();
-    assert!(
-        Catalog::new(&config)
-            .resume(cursor, Some(child), 1, &request)
-            .is_err()
-    );
-    assert!(catalog.resume(cursor, Some(parent), 1, &request).is_err());
-    assert!(catalog.resume(cursor, None, 1, &request).is_err());
+    assert!(resume(&NodePages::default(), cursor, Some(child), 1, &request).is_err());
+    assert!(resume(&pages, cursor, Some(parent), 1, &request).is_err());
+    assert!(resume(&pages, cursor, None, 1, &request).is_err());
     config.nodes[2].name = "new-name".into();
     config.groups.clear();
     catalog.install(&config);
     let status = |result: Result<Response, ApiError>| result.unwrap_err().into_response().status();
     assert_eq!(
-        status(catalog.resume(cursor, Some(child), 100, &request)),
+        status(resume(&pages, cursor, Some(child), 100, &request)),
         StatusCode::BAD_REQUEST
     );
-    let second = body(catalog.resume(cursor, Some(child), 1, &request).unwrap()).await;
+    let second = body(resume(&pages, cursor, Some(child), 1, &request).unwrap()).await;
     assert_eq!(second["observed_at"], first["observed_at"]);
     assert_eq!(second["nodes"][0]["name"], "node-3");
     assert_eq!(second["nodes"][0]["group_ids"], json!([child]));
     assert_eq!(second["next_cursor"], Value::Null);
-    catalog.snapshots.lock()[0].created = Instant::now() - SNAPSHOT_TTL;
-    let error = catalog
-        .resume(cursor, Some(child), 1, &request)
+    pages.0.lock()[0].created = Instant::now() - SNAPSHOT_TTL;
+    let error = resume(&pages, cursor, Some(child), 1, &request)
         .unwrap_err()
         .into_response();
     assert_eq!(error.status(), StatusCode::GONE);
@@ -172,38 +101,44 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
 async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_rows() {
     let mut config = fixture();
     let catalog = Catalog::new(&config);
+    let pages = NodePages::default();
     let request = RequestId("request".into());
     let first = body(
-        catalog
-            .page(capture(&config, &catalog, None), 1, &request)
+        pages
+            .first(capture(&config, &catalog, None), 1, &request)
             .unwrap(),
     )
     .await;
     for _ in 0..MAX_SNAPSHOTS {
-        catalog
-            .page(capture(&config, &catalog, None), 1, &request)
+        pages
+            .first(capture(&config, &catalog, None), 1, &request)
             .unwrap();
     }
-    assert_eq!(catalog.snapshots.lock().len(), MAX_SNAPSHOTS);
+    assert_eq!(pages.0.lock().len(), MAX_SNAPSHOTS);
     assert!(
-        catalog
-            .resume(first["next_cursor"].as_str().unwrap(), None, 1, &request)
-            .is_err()
+        resume(
+            &pages,
+            first["next_cursor"].as_str().unwrap(),
+            None,
+            1,
+            &request
+        )
+        .is_err()
     );
 
     config.nodes[0].name = "x".repeat(MAX_SNAPSHOT_BYTES / 2);
     let first_large = body(
-        catalog
-            .page(capture(&config, &catalog, None), 1, &request)
+        pages
+            .first(capture(&config, &catalog, None), 1, &request)
             .unwrap(),
     )
     .await;
-    catalog
-        .page(capture(&config, &catalog, None), 1, &request)
+    pages
+        .first(capture(&config, &catalog, None), 1, &request)
         .unwrap();
     assert!(
-        catalog
-            .snapshots
+        pages
+            .0
             .lock()
             .iter()
             .map(|snapshot| snapshot.bytes)
@@ -211,14 +146,14 @@ async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_row
             <= MAX_SNAPSHOT_BYTES
     );
     assert!(
-        catalog
-            .resume(
-                first_large["next_cursor"].as_str().unwrap(),
-                None,
-                1,
-                &request
-            )
-            .is_err()
+        resume(
+            &pages,
+            first_large["next_cursor"].as_str().unwrap(),
+            None,
+            1,
+            &request
+        )
+        .is_err()
     );
 
     config.nodes[0].name = "x".repeat(MAX_SNAPSHOT_BYTES);
@@ -252,7 +187,7 @@ fn projections_keep_duplicate_names_and_nested_member_identity_separate() {
     let identity = Catalog::new(&config).snapshot();
     let value = group_value(
         &manager,
-        manager.native_group("parent").unwrap(),
+        manager.group("parent").unwrap(),
         &identity,
         &AliveDialerSet::new(),
         true,
@@ -291,7 +226,7 @@ fn projections_keep_duplicate_names_and_nested_member_identity_separate() {
     );
     assert!(
         manager
-            .native_selection("parent", SelectionNetwork::Tcp)
+            .peek_selection("parent", SelectionNetwork::Tcp)
             .is_none()
     );
 }
@@ -306,7 +241,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
     ]
     .into_iter()
     .map(|policy_kind| Group {
-        name: policy(policy_kind).into(),
+        name: policy_kind.as_str().into(),
         policy: policy_kind,
         nodes: config.nodes.iter().map(|node| node.id).collect(),
         ..Default::default()
@@ -335,7 +270,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
     assert!(alive.is_urltest_group_idle("urltest"));
     assert!(
         manager
-            .native_selection("urltest", SelectionNetwork::Tcp)
+            .peek_selection("urltest", SelectionNetwork::Tcp)
             .is_none()
     );
     assert_eq!(manager.score_reason_snapshot(), counters);
@@ -351,100 +286,10 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
 }
 
 #[test]
-fn cold_nested_selection_keeps_member_without_inventing_leaf() {
-    let mut config = fixture();
-    config.groups[0].default = Some("child".into());
-    config.groups[1].policy = GroupPolicy::URLTest;
-    let manager = GroupManager::new(&config.groups, &config.nodes);
-    let identity = Catalog::new(&config).snapshot();
-    let value = selection(
-        &manager,
-        manager.native_group("parent").unwrap(),
-        SelectionNetwork::Tcp,
-        &identity,
-    );
-    assert_eq!(value["member_id"], identity.groups["child"]);
-    assert_eq!(value["resolved_leaf_node_id"], Value::Null);
-}
-
-#[test]
-fn check_urls_remove_userinfo_and_fragments_without_rewriting_request_target() {
-    let group = Group {
-        check_url: Some("https://user:password@example.com:8443/a/../probe?round=1#private".into()),
-        ..Default::default()
-    };
-    assert_eq!(
-        check_url(&group).as_deref(),
-        Some("https://example.com:8443/a/../probe?round=1")
-    );
-    assert_eq!(
-        check_url(&Group {
-            check_url: Some("file:///private/path".into()),
-            ..Default::default()
-        }),
-        None
-    );
-}
-
-#[test]
-fn native_probe_context_keeps_exact_members_without_expanding_probe_set() {
-    let mut config = fixture();
-    config.nodes[0].name = "child".into();
-    config.nodes[1].name = "child".into();
-    config.groups[0].nodes.push(config.nodes[1].id);
-    config.groups[1].default = Some("node-3".into());
-    let manager = GroupManager::new(&config.groups, &config.nodes);
-    let identity = Catalog::new(&config).snapshot();
-    let probes = manager.native_delay_test_members("parent");
-    assert_eq!(
-        probes
-            .iter()
-            .map(|(member, _)| member_id(*member, &identity).unwrap())
-            .collect::<Vec<_>>(),
-        vec![
-            config.nodes[0].id.to_string(),
-            config.nodes[1].id.to_string(),
-            identity.groups["child"].clone()
-        ]
-    );
-    assert_eq!(
-        probes.iter().map(|(_, leaf)| leaf.id).collect::<Vec<_>>(),
-        vec![config.nodes[0].id, config.nodes[1].id, config.nodes[2].id]
-    );
-    assert_eq!(
-        probes.iter().map(|(_, leaf)| leaf.id).collect::<Vec<_>>(),
-        manager
-            .delay_test_members("parent")
-            .iter()
-            .map(|(_, leaf)| leaf.id)
-            .collect::<Vec<_>>()
-    );
-    manager
-        .set_selector_choice(
-            "child",
-            "child",
-            honk_outbound::group::SelectorNetworks::Both,
-        )
-        .unwrap();
-    let probes = manager.native_delay_test_members("parent");
-    assert_eq!(
-        probes
-            .iter()
-            .map(|(member, _)| member_id(*member, &identity).unwrap())
-            .collect::<Vec<_>>(),
-        vec![
-            config.nodes[0].id.to_string(),
-            config.nodes[1].id.to_string()
-        ]
-    );
-    assert_eq!(probes.len(), manager.delay_test_members("parent").len());
-}
-
-#[test]
 fn group_health_falls_back_by_member_and_full_measurement_key() {
     use honk_outbound::alive::{
-        HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth,
-        NativeGroupProbeContext, ProbeDomain,
+        GroupProbeContext, HealthMeasurement, HealthPurpose, HealthState, HealthTransport,
+        HealthWarmth, ProbeDomain,
     };
 
     let mut config = fixture();
@@ -463,58 +308,58 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     let manager = GroupManager::new(&config.groups, &config.nodes);
     let identity = Catalog::new(&config).snapshot();
     let alive = AliveDialerSet::new();
-    alive.enable_native_observations();
+    alive.enable_health_history();
     alive.register_node(node.id, node.name.clone(), "127.0.0.1:1".into());
-    let ticket = alive.native_probe_ticket(node.id);
-    let tcp = NativeHealthObservation::probe(
+    let ticket = alive.probe_ticket(node.id);
+    let tcp = HealthObservation::probe(
         ProbeDomain::Tcp,
         HealthMeasurement::TcpConnect,
         IpVersion::V4,
         Some(Duration::from_millis(12)),
         SystemTime::UNIX_EPOCH + Duration::from_secs(1),
     );
-    let http = NativeHealthObservation {
+    let http = HealthObservation {
         measurement: HealthMeasurement::HttpHeaders,
         ..tcp
     };
-    let dns = NativeHealthObservation {
+    let dns = HealthObservation {
         measurement: HealthMeasurement::DnsRoundTrip,
         purpose: HealthPurpose::Dns,
         ..tcp
     };
-    let udp_dns = NativeHealthObservation {
+    let udp_dns = HealthObservation {
         transport: HealthTransport::Udp,
         ..dns
     };
     let global = [
         tcp,
         http,
-        NativeHealthObservation {
+        HealthObservation {
             warmth: HealthWarmth::Warm,
             ..http
         },
-        NativeHealthObservation {
+        HealthObservation {
             ip_version: IpVersion::V6,
             ..http
         },
         dns,
         udp_dns,
-        NativeHealthObservation {
+        HealthObservation {
             purpose: HealthPurpose::Data,
             ..udp_dns
         },
     ];
     for sample in global {
-        assert!(alive.complete_native_probe(&ticket, None, sample));
+        assert!(alive.complete_probe(&ticket, None, sample));
     }
     for sample in [http, udp_dns] {
-        assert!(alive.complete_native_probe(
+        assert!(alive.complete_probe(
             &ticket,
-            Some(NativeGroupProbeContext {
+            Some(GroupProbeContext {
                 group_id: identity.groups["parent"].parse().unwrap(),
                 member_id: node.id,
             }),
-            NativeHealthObservation {
+            HealthObservation {
                 state: HealthState::Unavailable,
                 latency: None,
                 error: Some("probe_failed"),
@@ -524,7 +369,7 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     }
     let rows = group_health(
         &manager,
-        manager.native_group("parent").unwrap(),
+        manager.group("parent").unwrap(),
         &identity,
         &alive,
     );
@@ -556,12 +401,7 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
                 && row["warmth"] == json!(sample.warmth)
         }));
     }
-    let other = group_health(
-        &manager,
-        manager.native_group("other").unwrap(),
-        &identity,
-        &alive,
-    );
+    let other = group_health(&manager, manager.group("other").unwrap(), &identity, &alive);
     assert_eq!(other.len(), global.len());
     assert!(
         other
@@ -571,26 +411,11 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     assert!(
         group_health(
             &manager,
-            manager.native_group("custom").unwrap(),
+            manager.group("custom").unwrap(),
             &identity,
             &alive
         )
         .is_empty()
     );
-    assert_eq!(alive.native_observations(node.id), global);
-}
-
-#[test]
-fn manual_selector_reports_runtime_selection_source() {
-    let config = fixture();
-    let manager = GroupManager::new(&config.groups, &config.nodes);
-    let identity = Catalog::new(&config).snapshot();
-    let value = selection(
-        &manager,
-        manager.native_group("child").unwrap(),
-        SelectionNetwork::Tcp,
-        &identity,
-    );
-    assert_eq!(value["member_id"], config.nodes[1].id.to_string());
-    assert_eq!(value["source"], "runtime");
+    assert_eq!(alive.health_observations(node.id), global);
 }

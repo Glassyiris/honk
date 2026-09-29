@@ -87,18 +87,17 @@ pub(crate) struct GeoAssetSnapshot {
 enum GeoSource {
     Unused,
     Missing,
+    #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
     Present {
         bytes: Option<Arc<[u8]>>,
         content_digest: [u8; 32],
-        #[cfg(feature = "native-api")]
         path: Option<std::path::PathBuf>,
-        #[cfg(feature = "native-api")]
         modified_at: Option<std::time::SystemTime>,
     },
 }
 
 impl GeoSource {
-    #[cfg(any(not(feature = "native-api"), test))]
+    #[cfg(test)]
     fn present(bytes: Vec<u8>) -> Self {
         Self::captured(bytes.into())
     }
@@ -108,9 +107,7 @@ impl GeoSource {
         Self::Present {
             bytes: Some(bytes),
             content_digest,
-            #[cfg(feature = "native-api")]
             path: None,
-            #[cfg(feature = "native-api")]
             modified_at: None,
         }
     }
@@ -119,9 +116,7 @@ impl GeoSource {
         Self::Present {
             bytes: None,
             content_digest,
-            #[cfg(feature = "native-api")]
             path: None,
-            #[cfg(feature = "native-api")]
             modified_at: None,
         }
     }
@@ -132,7 +127,6 @@ impl GeoSource {
         }
     }
 
-    #[cfg(feature = "native-api")]
     fn with_metadata(
         mut self,
         source_path: Option<std::path::PathBuf>,
@@ -379,11 +373,7 @@ fn capture_source(required: bool, name: &str) -> GeoSource {
         );
         return GeoSource::Missing;
     };
-    #[cfg(not(feature = "native-api"))]
-    let captured = std::fs::read(&path).map(GeoSource::present);
-    #[cfg(feature = "native-api")]
-    let captured = capture_file(&path);
-    match captured {
+    match capture_file(&path) {
         Ok(source) => source,
         Err(error) => {
             tracing::warn!("failed to read {}: {}", path.display(), error);
@@ -392,7 +382,6 @@ fn capture_source(required: bool, name: &str) -> GeoSource {
     }
 }
 
-#[cfg(feature = "native-api")]
 fn capture_file(path: &std::path::Path) -> std::io::Result<GeoSource> {
     use std::os::unix::fs::MetadataExt as _;
     let mut file = std::fs::File::open(path)?;

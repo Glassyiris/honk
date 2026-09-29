@@ -204,7 +204,7 @@ async fn dropping_vmess_stream_closes_physical_transport() {
     .unwrap();
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn runtime_shutdown_joins_vmess_relay_with_live_stream() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -477,7 +477,7 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn deferred_request_observation_follows_relay_write_not_stream_construction() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
@@ -515,7 +515,7 @@ async fn deferred_request_observation_follows_relay_write_not_stream_constructio
     assert!(matches!(
         events.lock().as_slice(),
         [FlowEvent::Milestone {
-            milestone: "target_request_sent"
+            milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
         }]
     ));
     drop(stream);

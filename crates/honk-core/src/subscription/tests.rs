@@ -18,17 +18,6 @@ fn parse_clash_subscription(
     parse_clash_proxies(proxies, subscription_id)
 }
 
-#[tokio::test]
-async fn body_reader_refuses_one_byte_past_the_cap() {
-    let at_cap = http::Response::new(vec![b'a'; MAX_SUBSCRIPTION_BYTES]);
-    assert_eq!(
-        read_capped_body(at_cap.into()).await.unwrap().len(),
-        MAX_SUBSCRIPTION_BYTES
-    );
-    let over_cap = http::Response::new(vec![b'a'; MAX_SUBSCRIPTION_BYTES + 1]);
-    assert!(read_capped_body(over_cap.into()).await.is_err());
-}
-
 #[test]
 fn private_literal_hosts_are_recognized_by_address_not_name() {
     for url in [

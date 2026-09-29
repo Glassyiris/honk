@@ -12,7 +12,7 @@ async fn native_log_records_one_client_completion_not_internal_resolution() {
     ));
     controller
         .dns_service()
-        .attach_observer(Arc::downgrade(&api));
+        .attach_observer(Arc::downgrade(&api.recorder));
     let query = query_with_txid("example.com", 0x1234);
     controller
         .dns_service()
@@ -67,7 +67,7 @@ async fn native_log_keeps_admission_refusal_and_forward_failure() {
     ));
     controller
         .dns_service()
-        .attach_observer(Arc::downgrade(&api));
+        .attach_observer(Arc::downgrade(&api.recorder));
     let held: Vec<_> = (0..2048)
         .map(|_| controller.try_admit_query(false).unwrap())
         .collect();

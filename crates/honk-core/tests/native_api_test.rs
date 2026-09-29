@@ -208,7 +208,12 @@ async fn routing_reads_that_cannot_pin_the_router_are_retryable_snapshot_unavail
 #[tokio::test]
 async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types() {
     let app = TestApp::new(|_| {}).await;
-    for path in ["/api/v1/probes", "/api/v1/routing/trace"] {
+    for (method, path) in [
+        (Method::POST, "/api/v1/probes"),
+        (Method::POST, "/api/v1/routing/trace"),
+        (Method::POST, "/api/v1/dns/cache/flush"),
+        (Method::PATCH, "/api/v1/runtime/settings"),
+    ] {
         for (content_types, status, code, details) in [
             (
                 &["application/json", "application/json"][..],
@@ -231,7 +236,7 @@ async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types()
         ] {
             let mut request = app
                 .client
-                .post(app.url(path))
+                .request(method.clone(), app.url(path))
                 .bearer_auth(SECRET)
                 .body("{}");
             for content_type in content_types {

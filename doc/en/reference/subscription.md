@@ -37,7 +37,7 @@ After a quoted URL, a glued `#` immediately after the closing quote or one balan
 
 This glued-tail compatibility runs after block recognition; it is not a lexical comment. In `sub: 'http://q'(ua)# }`, the separated `}` still closes the subscription block, so subsequent entries can fall outside it. Write `(ua) # }` to make the brace comment data instead.
 
-Quote-error and block rules are listed in the [dialect reference](./dialect.md). The block form's `url`, `ua`, `interval`, and `download_detour` parsing is unchanged.
+Quote-error and block rules are listed in the [dialect reference](./dialect.md). An empty `download_detour` follows routing, in every build.
 
 ## Internal model
 

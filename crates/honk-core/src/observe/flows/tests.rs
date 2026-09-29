@@ -1,16 +1,27 @@
 use super::record::{FlowError, OutboundAttempt, Selection};
 use super::*;
+use crate::native_api::events::EventHub;
 use honk_config::types::DialMode;
 
 fn store() -> Arc<FlowStore> {
-    let instance = Uuid::new_v4().to_string();
-    Arc::new(FlowStore::new(
-        instance.clone(),
-        Arc::new(EventHub::new(instance)),
-    ))
+    store_with_hub().0
 }
 
-fn begin(store: &Arc<FlowStore>, network: &'static str) -> FlowGuard {
+fn store_with_hub() -> (Arc<FlowStore>, Arc<EventHub>) {
+    let instance = Uuid::new_v4().to_string();
+    let hub = Arc::new(EventHub::new(instance.clone()));
+    let store = Arc::new(FlowStore::new(
+        instance,
+        Arc::clone(&hub) as Arc<dyn Events>,
+    ));
+    (store, hub)
+}
+
+fn begin(store: &Arc<FlowStore>, network: Network) -> FlowGuard {
+    try_begin(store, network).expect("recording flow")
+}
+
+fn try_begin(store: &Arc<FlowStore>, network: Network) -> Option<FlowGuard> {
     store.begin(
         network,
         "127.0.0.1:31000".parse().unwrap(),
@@ -18,23 +29,8 @@ fn begin(store: &Arc<FlowStore>, network: &'static str) -> FlowGuard {
     )
 }
 
-fn request_id() -> RequestId {
-    RequestId("flow-test".to_owned())
-}
-
 fn filters(network: &str, state: &str, full: bool, limit: usize) -> Filters {
-    Filters {
-        network: network.to_owned(),
-        state: state.to_owned(),
-        connection_id: None,
-        full,
-        limit,
-    }
-}
-
-fn error_code(error: ApiError, status: StatusCode, code: &str) {
-    assert_eq!(serde_json::to_value(&error).unwrap()["error"]["code"], code);
-    assert_eq!(error.into_response().status(), status);
+    Filters::new(network.to_owned(), state.to_owned(), None, full, limit)
 }
 
 fn dial_mode() -> StepData {
@@ -51,12 +47,15 @@ fn dial_mode() -> StepData {
 #[test]
 fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_population() {
     let store = store();
-    let flow = begin(&store, "tcp");
-    flow.transition("active", "transport_ready", "transport_ready", None);
-    let page = store
-        .page(filters("tcp", "all", true, 100), None, &request_id())
-        .unwrap();
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
+    flow.transition(
+        crate::observe::vocab::ConnectionState::Active,
+        "transport_ready",
+        crate::observe::vocab::ConnectionMilestone::TransportReady,
+        None,
+    );
+    let page = store.page(filters("tcp", "all", true, 100), None).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace_status"], "complete");
     assert_eq!(detail["trace"]["status"], "complete");
     assert_eq!(detail["trace"]["missing"], json!([]));
@@ -64,13 +63,14 @@ fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_popula
     assert_eq!(page["flows"][0]["trace_status"], "complete");
     assert!(detail["ended_at"].is_null());
 
-    flow.mark_gap("not_instrumented");
+    flow.mark_gap(honk_outbound::runtime::flow_observation::GapReason::NotInstrumented);
     flow.step(Some(7), dial_mode());
-    flow.finish("closed", "relay_finished");
-    let changed = store.get(flow.id(), &request_id()).unwrap();
-    let next = store
-        .page(filters("tcp", "all", false, 100), None, &request_id())
-        .unwrap();
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let changed = store.get(flow.id()).unwrap();
+    let next = store.page(filters("tcp", "all", false, 100), None).unwrap();
     assert_eq!(changed["state"], "closed");
     assert_eq!(changed["trace"]["status"], "partial");
     assert_eq!(changed["trace_status"], "partial");
@@ -82,16 +82,19 @@ fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_popula
 #[test]
 fn rejected_source_writes_never_authorize_causal_references() {
     let store = store();
-    let flow = begin(&store, "udp");
+    let flow = begin(&store, crate::observe::vocab::Network::Udp);
     assert!(store.record_step(flow.id(), Some(1), dial_mode()));
     assert!(!store.record_step("foreign-flow", Some(1), dial_mode()));
     for _ in 0..MAX_STEPS {
         flow.step(None, dial_mode());
     }
     assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
-    flow.finish("failed", "capture_lost");
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Failed,
+        "capture_lost",
+    );
     assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert!(
         detail["trace"]["missing"]
             .as_array()
@@ -149,23 +152,25 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
     let observed = router.route_full_observed(&connection, None, MAX_RULE_VALUES);
     assert_eq!(observed.matched.unwrap().action.outbound, "direct");
     let rules =
-        super::super::routing::observed_rule_evaluations("instance", 7, &router, &observed.rules);
+        crate::observe::rules::observed_rule_evaluations("instance", 7, &router, &observed.rules);
     assert_eq!(rules[0].conditions[0].expression, "dip(geoip: test)");
     assert_eq!(rules[0].conditions[0].result, "matched");
     assert_eq!(rules[0].conditions[1].expression, "dport(443)");
 
     let store = store();
-    let flow = store.begin(
-        "tcp",
-        (connection.src_ip, connection.src_port).into(),
-        (connection.dst_ip, connection.dst_port).into(),
-    );
+    let flow = store
+        .begin(
+            crate::observe::vocab::Network::Tcp,
+            (connection.src_ip, connection.src_port).into(),
+            (connection.dst_ip, connection.dst_port).into(),
+        )
+        .unwrap();
     flow.step(
         Some(7),
         StepData::Route {
             evaluation_id: Uuid::new_v4().to_string(),
             chain: "traffic",
-            plane: "userspace",
+            plane: crate::observe::vocab::Plane::Userspace,
             rule_id: Some(rules[0].rule_id.clone()),
             outbound: Some("direct".into()),
             must: Some(false),
@@ -190,7 +195,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
             dns_action: None,
         },
     );
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace_status"], "complete");
     assert_eq!(detail["trace"]["missing"], json!([]));
 }
@@ -198,17 +203,25 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
 #[test]
 fn reply_evidence_survives_later_send_bookkeeping_and_terminal_publication() {
     let store = store();
-    let flow = begin(&store, "udp");
+    let flow = begin(&store, crate::observe::vocab::Network::Udp);
     assert!(flow.first_reply());
-    flow.transition("active", "reply_received", "first_reply", Some(true));
     flow.transition(
-        "active",
+        crate::observe::vocab::ConnectionState::Active,
+        "reply_received",
+        crate::observe::vocab::ConnectionMilestone::FirstReply,
+        Some(true),
+    );
+    flow.transition(
+        crate::observe::vocab::ConnectionState::Active,
         "send_completed",
-        "target_request_sent",
+        crate::observe::vocab::ConnectionMilestone::TargetRequestSent,
         Some(false),
     );
-    flow.finish("closed", "idle_after_reply");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "idle_after_reply",
+    );
+    let detail = store.get(flow.id()).unwrap();
     for step in detail["trace"]["steps"].as_array().unwrap().iter().skip(1) {
         assert_eq!(step["data"]["reply_received"], true);
     }
@@ -218,28 +231,25 @@ fn reply_evidence_survives_later_send_bookkeeping_and_terminal_publication() {
 fn observer_identity_cannot_be_rebound_to_another_retained_flow() {
     use honk_outbound::runtime::flow_observation::FlowEvent;
     let store = store();
-    let first = Arc::new(begin(&store, "tcp"));
-    let second = begin(&store, "tcp");
-    let before_first = store.get(first.id(), &request_id()).unwrap();
-    let before_second = store.get(second.id(), &request_id()).unwrap();
+    let first = Arc::new(begin(&store, crate::observe::vocab::Network::Tcp));
+    let second = begin(&store, crate::observe::vocab::Network::Tcp);
+    let before_first = store.get(first.id()).unwrap();
+    let before_second = store.get(second.id()).unwrap();
     let observer = first.observer(1, None, "dial_target").unwrap();
     let mut context = observer.context();
     context.flow_id = second.id().parse().unwrap();
-    observer
-        .with_context(context)
-        .publish(FlowEvent::Gap("not_instrumented"));
-    assert_eq!(store.get(first.id(), &request_id()).unwrap(), before_first);
-    assert_eq!(
-        store.get(second.id(), &request_id()).unwrap(),
-        before_second
-    );
+    observer.with_context(context).publish(FlowEvent::Gap(
+        honk_outbound::runtime::flow_observation::GapReason::NotInstrumented,
+    ));
+    assert_eq!(store.get(first.id()).unwrap(), before_first);
+    assert_eq!(store.get(second.id()).unwrap(), before_second);
 }
 
 #[test]
 fn physical_dns_attempt_without_its_lookup_cannot_claim_complete_evidence() {
     use honk_outbound::runtime::flow_observation::FlowEvent;
     let store = store();
-    let flow = Arc::new(begin(&store, "tcp"));
+    let flow = Arc::new(begin(&store, crate::observe::vocab::Network::Tcp));
     let observer = flow.observer(1, None, "proxy_server").unwrap();
     let mut context = observer.context();
     context.lookup_id = Some(Uuid::new_v4());
@@ -248,11 +258,12 @@ fn physical_dns_attempt_without_its_lookup_cannot_claim_complete_evidence() {
         .publish(FlowEvent::Transport {
             attempt_id: Uuid::new_v4(),
             server_addr: Some("127.0.0.1:53".parse().unwrap()),
-            status: "started",
-            resolution_location: "unknown",
+            status: honk_outbound::runtime::flow_observation::TransportStatus::Started,
+            resolution_location:
+                honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
             error: None,
         });
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["status"], "partial");
     assert_eq!(detail["trace"]["missing"], json!(["not_instrumented"]));
 }
@@ -260,18 +271,31 @@ fn physical_dns_attempt_without_its_lookup_cannot_claim_complete_evidence() {
 #[test]
 fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     let store = store();
-    let first = begin(&store, "tcp");
+    let first = begin(&store, crate::observe::vocab::Network::Tcp);
     first.attach_connection("connection-old");
-    first.routed("original-group", None, None, "unknown");
+    first.routed(
+        "original-group",
+        None,
+        None,
+        crate::observe::vocab::RoutingSource::Unknown,
+    );
     first.selected(vec![
         "original-group-id".to_owned(),
         "original-node-id".to_owned(),
     ]);
     first.step(Some(7), dial_mode());
-    first.finish("closed", "relay_finished");
-    let second = begin(&store, "tcp");
+    first.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let second = begin(&store, crate::observe::vocab::Network::Tcp);
     second.attach_connection("connection-new");
-    second.routed("replacement-group", None, None, "unknown");
+    second.routed(
+        "replacement-group",
+        None,
+        None,
+        crate::observe::vocab::RoutingSource::Unknown,
+    );
     second.selected(vec![
         "replacement-group-id".to_owned(),
         "replacement-node-id".to_owned(),
@@ -279,7 +303,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     assert_ne!(first.id(), second.id());
     let evidence = store.connection_evidence(first.id()).unwrap();
     assert_eq!(evidence.chain, ["original-group-id", "original-node-id"]);
-    let detail = store.get(first.id(), &request_id()).unwrap();
+    let detail = store.get(first.id()).unwrap();
     assert_eq!(detail["outbound"], "original-group");
     assert_eq!(
         detail["trace"]["steps"]
@@ -292,7 +316,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     );
     let mut query = filters("all", "all", true, 100);
     query.connection_id = Some("connection-old".to_owned());
-    let page = store.page(query, None, &request_id()).unwrap();
+    let page = store.page(query, None).unwrap();
     assert_eq!(page["flows"].as_array().unwrap().len(), 1);
     assert_eq!(page["flows"][0]["id"], first.id());
     assert_eq!(page["flows"][0]["input"]["src"], "127.0.0.1:31000");
@@ -301,31 +325,42 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
 #[test]
 fn guards_finalize_once_and_do_not_fabricate_kernel_connection_close() {
     let store = store();
-    let flow = begin(&store, "udp");
+    let flow = begin(&store, crate::observe::vocab::Network::Udp);
     assert!(flow.first_reply());
     assert!(!flow.first_reply());
-    flow.finish("closed", "idle_after_reply");
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "idle_after_reply",
+    );
     let id = flow.id().to_owned();
-    let terminal = store.get(&id, &request_id()).unwrap();
-    flow.finish("failed", "late_error");
-    flow.routed("late-outbound", None, None, "unknown");
+    let terminal = store.get(&id).unwrap();
+    flow.finish(crate::observe::vocab::ConnectionState::Failed, "late_error");
+    flow.routed(
+        "late-outbound",
+        None,
+        None,
+        crate::observe::vocab::RoutingSource::Unknown,
+    );
     drop(flow);
-    assert_eq!(store.get(&id, &request_id()).unwrap(), terminal);
+    assert_eq!(store.get(&id).unwrap(), terminal);
     assert_eq!(
         terminal["trace"]["steps"][1]["data"]["reply_received"],
         true
     );
 
-    let cancelled = begin(&store, "tcp");
+    let cancelled = begin(&store, crate::observe::vocab::Network::Tcp);
     let id = cancelled.id().to_owned();
     drop(cancelled);
-    let detail = store.get(&id, &request_id()).unwrap();
+    let detail = store.get(&id).unwrap();
     assert_eq!(detail["state"], "failed");
     assert_eq!(detail["trace"]["steps"][1]["data"]["reason"], "cancelled");
 
-    let handoff = begin(&store, "udp");
-    handoff.finish("unknown", "kernel_handoff");
-    let detail = store.get(handoff.id(), &request_id()).unwrap();
+    let handoff = begin(&store, crate::observe::vocab::Network::Udp);
+    handoff.finish(
+        crate::observe::vocab::ConnectionState::Unknown,
+        "kernel_handoff",
+    );
+    let detail = store.get(handoff.id()).unwrap();
     assert_eq!(detail["state"], "unknown");
     assert!(detail["ended_at"].is_string());
 }
@@ -333,22 +368,43 @@ fn guards_finalize_once_and_do_not_fabricate_kernel_connection_close() {
 #[test]
 fn pinned_pages_survive_mutation_and_bind_all_filters() {
     let store = store();
-    let old = begin(&store, "tcp");
-    old.transition("active", "ready", "transport_ready", None);
-    let ignored = begin(&store, "udp");
-    ignored.transition("active", "ready", "transport_ready", None);
-    let recent = begin(&store, "tcp");
-    recent.transition("active", "ready", "transport_ready", None);
+    let old = begin(&store, crate::observe::vocab::Network::Tcp);
+    old.transition(
+        crate::observe::vocab::ConnectionState::Active,
+        "ready",
+        crate::observe::vocab::ConnectionMilestone::TransportReady,
+        None,
+    );
+    let ignored = begin(&store, crate::observe::vocab::Network::Udp);
+    ignored.transition(
+        crate::observe::vocab::ConnectionState::Active,
+        "ready",
+        crate::observe::vocab::ConnectionMilestone::TransportReady,
+        None,
+    );
+    let recent = begin(&store, crate::observe::vocab::Network::Tcp);
+    recent.transition(
+        crate::observe::vocab::ConnectionState::Active,
+        "ready",
+        crate::observe::vocab::ConnectionMilestone::TransportReady,
+        None,
+    );
     let query = filters("tcp", "active", true, 1);
-    let first = store.page(query.clone(), None, &request_id()).unwrap();
+    let first = store.page(query.clone(), None).unwrap();
     assert_eq!(first["flows"][0]["id"], recent.id());
     let cursor = first["next_cursor"].as_str().unwrap();
-    old.finish("closed", "relay_finished");
-    let newcomer = begin(&store, "tcp");
-    newcomer.transition("active", "ready", "transport_ready", None);
-    let second = store
-        .page(query.clone(), Some(cursor), &request_id())
-        .unwrap();
+    old.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let newcomer = begin(&store, crate::observe::vocab::Network::Tcp);
+    newcomer.transition(
+        crate::observe::vocab::ConnectionState::Active,
+        "ready",
+        crate::observe::vocab::ConnectionMilestone::TransportReady,
+        None,
+    );
+    let second = store.page(query.clone(), Some(cursor)).unwrap();
     assert_eq!(second["observed_at"], first["observed_at"]);
     assert_eq!(second["flows"][0]["id"], old.id());
     assert_eq!(second["flows"][0]["state"], "active");
@@ -359,36 +415,22 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
         filters("tcp", "active", false, 1),
         filters("tcp", "active", true, 2),
     ] {
-        error_code(
-            store
-                .page(changed, Some(cursor), &request_id())
-                .unwrap_err(),
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
+        assert_eq!(
+            store.page(changed, Some(cursor)).unwrap_err(),
+            PageRefusal::Mismatch
         );
     }
     let other_instance = super::tests::store();
-    error_code(
+    assert_eq!(
         other_instance
-            .page(query.clone(), Some(cursor), &request_id())
+            .page(query.clone(), Some(cursor))
             .unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+        PageRefusal::Expired
     );
     store.inner.lock().snapshots[0].created = Instant::now() - SNAPSHOT_TTL;
-    error_code(
-        store.page(query, Some(cursor), &request_id()).unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
-    );
-}
-
-#[test]
-fn a_snapshot_over_its_budget_is_snapshot_unavailable() {
-    error_code(
-        super::snapshot_busy(&request_id()),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "snapshot_unavailable",
+    assert_eq!(
+        store.page(query, Some(cursor)).unwrap_err(),
+        PageRefusal::Expired
     );
 }
 
@@ -396,13 +438,13 @@ fn a_snapshot_over_its_budget_is_snapshot_unavailable() {
 fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     let store = store();
     store.set_limits(64, 1);
-    let first = begin(&store, "tcp");
-    let _second = begin(&store, "tcp");
+    let first = begin(&store, crate::observe::vocab::Network::Tcp);
+    let _second = begin(&store, crate::observe::vocab::Network::Tcp);
     let query = filters("all", "all", true, 1);
     let mut cursor = String::new();
     let mut oldest = String::new();
     for round in 0..MAX_SNAPSHOTS {
-        let page = store.page(query.clone(), None, &request_id()).unwrap();
+        let page = store.page(query.clone(), None).unwrap();
         cursor = page["next_cursor"].as_str().unwrap().to_owned();
         if round == 0 {
             oldest = cursor.clone();
@@ -410,32 +452,25 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     }
     // A full table makes room by dropping its oldest snapshot; only that
     // reader starts over, the newest cursors stay valid.
-    let page = store.page(query.clone(), None, &request_id()).unwrap();
+    let page = store.page(query.clone(), None).unwrap();
     assert!(page["next_cursor"].is_string());
     assert_eq!(store.inner.lock().snapshots.len(), MAX_SNAPSHOTS);
-    error_code(
-        store
-            .page(query.clone(), Some(&oldest), &request_id())
-            .unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+    assert_eq!(
+        store.page(query.clone(), Some(&oldest)).unwrap_err(),
+        PageRefusal::Expired
     );
-    store
-        .page(query.clone(), Some(&cursor), &request_id())
-        .unwrap();
+    store.page(query.clone(), Some(&cursor)).unwrap();
     store.set_recording(false);
-    let inert = begin(&store, "tcp");
-    assert!(inert.id().is_empty());
-    assert!(!inert.first_reply());
-    first.finish("closed", "late_finish");
-    error_code(
-        store
-            .page(query.clone(), Some(&cursor), &request_id())
-            .unwrap_err(),
-        StatusCode::GONE,
-        "snapshot_expired",
+    assert!(try_begin(&store, crate::observe::vocab::Network::Tcp).is_none());
+    first.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "late_finish",
     );
-    let page = store.page(query, None, &request_id()).unwrap();
+    assert_eq!(
+        store.page(query.clone(), Some(&cursor)).unwrap_err(),
+        PageRefusal::Expired
+    );
+    let page = store.page(query, None).unwrap();
     assert_eq!(page["flows"], json!([]));
     assert_eq!(page["coverage"]["userspace_tcp"], "none");
     let inner = store.inner.lock();
@@ -447,26 +482,30 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     store.set_recording(true);
     assert_eq!(store.inner.lock().max_records, 64);
     assert_eq!(store.inner.lock().retention, Duration::from_secs(1));
-    first.finish("closed", "late_finish_after_restart");
+    first.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "late_finish_after_restart",
+    );
     assert!(store.inner.lock().records.is_empty());
-    let restarted = begin(&store, "tcp");
+    let restarted = begin(&store, crate::observe::vocab::Network::Tcp);
     assert_ne!(restarted.id(), first.id());
     assert!(!restarted.id().is_empty());
 }
 
 #[test]
 fn aged_out_records_report_one_gap_per_interval_with_the_running_count() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     let gaps = || {
-        store
-            .events
-            .buffered_kinds()
+        hub.buffered_kinds()
             .into_iter()
             .filter(|kind| *kind == "flow.gap")
             .count()
     };
     for _ in 0..5 {
-        begin(&store, "tcp").finish("closed", "relay_finished");
+        begin(&store, crate::observe::vocab::Network::Tcp).finish(
+            crate::observe::vocab::ConnectionState::Closed,
+            "relay_finished",
+        );
     }
     assert_eq!(gaps(), 0);
     let later = Instant::now() + TERMINAL_TTL;
@@ -478,18 +517,22 @@ fn aged_out_records_report_one_gap_per_interval_with_the_running_count() {
     drop(inner);
     // Within the interval a further eviction only advances the count; after
     // it the next eviction is reported again.
-    begin(&store, "tcp").finish("closed", "relay_finished");
+    begin(&store, crate::observe::vocab::Network::Tcp).finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
     store.prune(&mut store.inner.lock(), later + Duration::from_secs(1));
     assert_eq!((gaps(), store.inner.lock().dropped), (1, 6));
-    begin(&store, "tcp").finish("closed", "relay_finished");
+    begin(&store, crate::observe::vocab::Network::Tcp).finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
     store.prune(&mut store.inner.lock(), later + EVICTED_GAP_INTERVAL);
     assert_eq!((gaps(), store.inner.lock().dropped), (2, 7));
 }
 
-fn count(store: &FlowStore, kind: &str) -> usize {
-    store
-        .events
-        .buffered_kinds()
+fn count(hub: &EventHub, kind: &str) -> usize {
+    hub.buffered_kinds()
         .into_iter()
         .filter(|buffered| *buffered == kind)
         .count()
@@ -497,41 +540,44 @@ fn count(store: &FlowStore, kind: &str) -> usize {
 
 #[test]
 fn room_making_eviction_is_reported_once_per_interval() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     // Keep going until twenty records had to make room for newer ones.
     while store.inner.lock().dropped < 20 {
-        begin(&store, "tcp").finish("closed", "relay_finished");
+        begin(&store, crate::observe::vocab::Network::Tcp).finish(
+            crate::observe::vocab::ConnectionState::Closed,
+            "relay_finished",
+        );
     }
-    assert_eq!(count(&store, "flow.gap"), 1);
+    assert_eq!(count(&hub, "flow.gap"), 1);
 }
 
 #[test]
 fn step_overflow_updates_the_record_without_a_gap() {
-    let store = store();
-    let flow = begin(&store, "tcp");
+    let (store, hub) = store_with_hub();
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     while store.inner.lock().records[0].steps.len() < MAX_STEPS {
         flow.step(Some(1), dial_mode());
     }
-    let updates = count(&store, "flow.updated");
+    let updates = count(&hub, "flow.updated");
     let revision = store.inner.lock().records[0].summary.revision;
     flow.step(Some(1), dial_mode());
     let inner = store.inner.lock();
     assert!(inner.records[0].overflow);
     assert_eq!(inner.records[0].summary.revision, revision + 1);
     drop(inner);
-    assert_eq!(count(&store, "flow.updated"), updates + 1);
-    assert_eq!(count(&store, "flow.gap"), 0);
+    assert_eq!(count(&hub, "flow.updated"), updates + 1);
+    assert_eq!(count(&hub, "flow.gap"), 0);
     // Later steps find the record already truncated and publish nothing.
     flow.step(Some(1), dial_mode());
-    assert_eq!(count(&store, "flow.updated"), updates + 1);
-    assert_eq!(count(&store, "flow.gap"), 0);
+    assert_eq!(count(&hub, "flow.updated"), updates + 1);
+    assert_eq!(count(&hub, "flow.gap"), 0);
 }
 
 #[test]
 fn revision_exhaustion_joins_the_interval_notice() {
-    let store = store();
+    let (store, hub) = store_with_hub();
     for _ in 0..2 {
-        let flow = begin(&store, "tcp");
+        let flow = begin(&store, crate::observe::vocab::Network::Tcp);
         store
             .inner
             .lock()
@@ -546,65 +592,58 @@ fn revision_exhaustion_joins_the_interval_notice() {
     assert!(inner.records.is_empty());
     assert_eq!(inner.dropped, 2);
     drop(inner);
-    assert_eq!(count(&store, "flow.gap"), 1);
+    assert_eq!(count(&hub, "flow.gap"), 1);
 }
 
 #[test]
 fn a_userspace_evaluation_is_recomputed_evidence_on_the_wire() {
     let store = store();
-    let flow = begin(&store, "tcp");
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     flow.routed(
         "group",
         Some("gen:0:rule:0"),
         Some("dip(<redacted>)"),
-        "evaluation",
+        crate::observe::vocab::RoutingSource::Evaluation,
     );
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["rule_id"], "gen:0:rule:0");
     assert_eq!(detail["rule_source"], "recomputed");
     // No traffic-route step carries this rule, so its generation is unknown.
     assert_eq!(detail.get("rule_generation_id"), Some(&Value::Null));
-    flow.routed("group", None, None, "forced");
-    assert_eq!(
-        store.get(flow.id(), &request_id()).unwrap()["rule_source"],
-        "unknown"
+    flow.routed(
+        "group",
+        None,
+        None,
+        crate::observe::vocab::RoutingSource::Forced,
     );
+    assert_eq!(store.get(flow.id()).unwrap()["rule_source"], "unknown");
 }
 
 #[test]
 fn retention_distinguishes_expired_unknown_and_active_records() {
     let store = store();
-    let terminal = begin(&store, "tcp");
-    terminal.finish("failed", "dial_failed");
-    let active = begin(&store, "udp");
+    let terminal = begin(&store, crate::observe::vocab::Network::Tcp);
+    terminal.finish(
+        crate::observe::vocab::ConnectionState::Failed,
+        "dial_failed",
+    );
+    let active = begin(&store, crate::observe::vocab::Network::Udp);
     let future = Instant::now() + TERMINAL_TTL;
     store.prune(&mut store.inner.lock(), future);
-    error_code(
-        store.get(terminal.id(), &request_id()).unwrap_err(),
-        StatusCode::GONE,
-        "flow_expired",
-    );
-    error_code(
-        store.get("not-a-recorded-id", &request_id()).unwrap_err(),
-        StatusCode::NOT_FOUND,
-        "resource_not_found",
-    );
+    assert_eq!(store.get(terminal.id()).unwrap_err(), FlowMissing::Expired);
     assert_eq!(
-        store.get(active.id(), &request_id()).unwrap()["state"],
-        "observed"
+        store.get("not-a-recorded-id").unwrap_err(),
+        FlowMissing::NotFound
     );
+    assert_eq!(store.get(active.id()).unwrap()["state"], "observed");
     store.prune(&mut store.inner.lock(), future + TERMINAL_TTL);
-    error_code(
-        store.get(terminal.id(), &request_id()).unwrap_err(),
-        StatusCode::NOT_FOUND,
-        "resource_not_found",
-    );
+    assert_eq!(store.get(terminal.id()).unwrap_err(), FlowMissing::NotFound);
 }
 
 #[test]
 fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
     let store = store();
-    let flow = begin(&store, "tcp");
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     let mut unsafe_data = dial_mode();
     if let StepData::DialMode { domain, .. } = &mut unsafe_data {
         *domain = Some("https://operator:credential@example.test".into());
@@ -613,8 +652,11 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
     for _ in 0..MAX_STEPS + 10 {
         flow.step(Some(1), dial_mode());
     }
-    flow.finish("failed", "dial_failed");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Failed,
+        "dial_failed",
+    );
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["state"], "failed");
     assert!(detail["ended_at"].is_string());
     assert_eq!(
@@ -632,13 +674,13 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
 #[test]
 fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
     let store = store();
-    let flow = begin(&store, "udp");
+    let flow = begin(&store, crate::observe::vocab::Network::Udp);
     flow.step(
         None,
         StepData::Connection {
-            state: "dialing",
+            state: crate::observe::vocab::ConnectionState::Dialing,
             reason: "transport_failed",
-            milestone: "unknown",
+            milestone: crate::observe::vocab::ConnectionMilestone::Unknown,
             attempt_id: Some("https://operator:credential@example.test/private".into()),
             reply_received: None,
             error: Some(FlowError::UdpPrepareFailed),
@@ -647,8 +689,11 @@ fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
             server_addr: None,
         },
     );
-    flow.finish("failed", "transport_failed");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Failed,
+        "transport_failed",
+    );
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
     assert_eq!(detail["state"], "failed");
     assert_eq!(
@@ -662,18 +707,20 @@ fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
 #[test]
 fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
     let store = store();
-    let flow = store.begin(
-        "udp",
-        "[::1]:31000".parse().unwrap(),
-        "[2001:db8::1]:443".parse().unwrap(),
-    );
+    let flow = store
+        .begin(
+            crate::observe::vocab::Network::Udp,
+            "[::1]:31000".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        )
+        .unwrap();
     flow.update_input(None, None, Some("client"), Some(42), None, Some(0), Some(0));
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 1);
     assert_eq!(detail["input"]["pid"], 42);
     flow.update_input(
         Some("secret.example.test"),
-        Some("quic_sni"),
+        Some(crate::observe::vocab::DomainSource::QuicSni),
         Some("client"),
         Some(42),
         None,
@@ -683,9 +730,9 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
     flow.step(
         None,
         StepData::Connection {
-            state: "dialing",
+            state: crate::observe::vocab::ConnectionState::Dialing,
             reason: "transport_failed",
-            milestone: "unknown",
+            milestone: crate::observe::vocab::ConnectionMilestone::Unknown,
             attempt_id: Some("attempt-1".into()),
             reply_received: None,
             error: Some(FlowError::UdpPrepareFailed),
@@ -694,7 +741,7 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
             server_addr: None,
         },
     );
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["input"]["domain"], "secret.example.test");
     assert_eq!(detail["trace"]["steps"][1]["data"]["source"], "sniffer");
     assert_eq!(
@@ -715,8 +762,11 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
 #[test]
 fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() {
     let store = store();
-    let flow = begin(&store, "tcp");
-    for status in ["started", "succeeded"] {
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
+    for status in [
+        honk_outbound::runtime::flow_observation::TransportStatus::Started,
+        honk_outbound::runtime::flow_observation::TransportStatus::Succeeded,
+    ] {
         flow.step(
             Some(1),
             StepData::Outbound {
@@ -728,7 +778,7 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
                     lookup_id: None,
                     kind: "leaf",
                     evaluation_id: Some("evaluation-1".into()),
-                    routing_source: "evaluation",
+                    routing_source: crate::observe::vocab::RoutingSource::Evaluation,
                     routed_outbound: Some("Group/Proxy".into()),
                     effective_outbound: Some("Group/Proxy".into()),
                     mode_override: "none",
@@ -748,12 +798,13 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
                     target_kind: "ip",
                     dial_ip: Some("127.0.0.2".parse().unwrap()),
                     server_addr: None,
-                    resolution_location: "original_ip",
+                    resolution_location:
+                        honk_outbound::runtime::flow_observation::ResolutionLocation::OriginalIp,
                 },
             },
         );
     }
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 3);
     for (index, status) in [(1, "started"), (2, "succeeded")] {
         let data = &detail["trace"]["steps"][index]["data"];
@@ -771,12 +822,15 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
 #[test]
 fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
     let store = store();
-    let original = begin(&store, "tcp");
+    let original = begin(&store, crate::observe::vocab::Network::Tcp);
     let original_id = original.id().to_owned();
     for _ in 0..MAX_RECORDS * 2 {
-        let flow = begin(&store, "tcp");
+        let flow = begin(&store, crate::observe::vocab::Network::Tcp);
         flow.step(Some(1), dial_mode());
-        flow.finish("closed", "relay_finished");
+        flow.finish(
+            crate::observe::vocab::ConnectionState::Closed,
+            "relay_finished",
+        );
     }
     let inner = store.inner.lock();
     assert!(inner.bytes() <= MAX_BYTES);
@@ -787,14 +841,12 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
         inner
             .records
             .iter()
-            .all(|record| record.id() != original_id)
+            .any(|record| record.id() == original_id)
     );
     drop(inner);
     // The ring at its own limit still leaves the listing its reserved share:
     // a walk over every record starts, and the whole store stays in budget.
-    let page = store
-        .page(filters("all", "all", true, 1), None, &request_id())
-        .unwrap();
+    let page = store.page(filters("all", "all", true, 1), None).unwrap();
     assert!(page["next_cursor"].is_string());
     let inner = store.inner.lock();
     assert!(inner.snapshot_bytes > 0);
@@ -803,11 +855,7 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
     // A result that fits in one page keeps nothing.
     let before = store.inner.lock().snapshot_bytes;
     store
-        .page(
-            filters("all", "all", true, MAX_RECORDS),
-            None,
-            &request_id(),
-        )
+        .page(filters("all", "all", true, MAX_RECORDS), None)
         .unwrap();
     assert_eq!(store.inner.lock().snapshot_bytes, before);
 }
@@ -815,7 +863,7 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
 #[test]
 fn step_capacity_not_only_string_length_counts_toward_retention() {
     let store = store();
-    let flow = begin(&store, "tcp");
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     let mut evaluation_id = String::with_capacity(MAX_STEP_BYTES + 1);
     evaluation_id.push_str("evaluation-1");
     flow.step(
@@ -827,8 +875,11 @@ fn step_capacity_not_only_string_length_counts_toward_retention() {
             to_evaluation_id: None,
         },
     );
-    flow.finish("closed", "relay_finished");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
     assert_eq!(detail["trace"]["missing"], json!(["buffer_overflow"]));
     assert_eq!(detail["state"], "closed");
@@ -838,23 +889,60 @@ fn step_capacity_not_only_string_length_counts_toward_retention() {
 fn room_making_prunes_expired_records_before_evicting_live_ones() {
     let store = store();
     store.set_limits(2, 0);
-    let live = begin(&store, "tcp");
-    begin(&store, "tcp").finish("closed", "relay_finished");
-    let newcomer = begin(&store, "tcp");
-    assert!(store.get(live.id(), &request_id()).is_ok());
-    assert!(store.get(newcomer.id(), &request_id()).is_ok());
+    let live = begin(&store, crate::observe::vocab::Network::Tcp);
+    begin(&store, crate::observe::vocab::Network::Tcp).finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let newcomer = begin(&store, crate::observe::vocab::Network::Tcp);
+    assert!(store.get(live.id()).is_ok());
+    assert!(store.get(newcomer.id()).is_ok());
     assert_eq!(store.inner.lock().records.len(), 2);
 }
 
 #[test]
-fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
-    let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
-    assert!(!owner.flows.recording.load(Ordering::Acquire));
-    let inner = owner.flows.inner.lock();
-    let guard = begin(&owner.flows, "tcp");
-    assert!(guard.id().is_empty());
-    assert_eq!(guard.id.capacity(), 0);
-    assert!(guard.store.upgrade().is_none());
+fn a_step_survives_pruning_an_expired_record_behind_it() {
+    let store = store();
+    store.set_limits(64, 0);
+    let live = begin(&store, crate::observe::vocab::Network::Tcp);
+    begin(&store, crate::observe::vocab::Network::Tcp).finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    store.inner.lock().max_records = 1;
+    assert!(store.record_step(live.id(), Some(1), dial_mode()));
+    assert_eq!(store.inner.lock().records.len(), 1);
+}
+
+#[test]
+fn room_making_evicts_ended_records_before_the_oldest_live_one() {
+    let store = store();
+    store.set_limits(3, 3600);
+    let live = begin(&store, crate::observe::vocab::Network::Tcp);
+    let ended: Vec<String> = (0..3)
+        .map(|_| {
+            let flow = begin(&store, crate::observe::vocab::Network::Tcp);
+            flow.finish(
+                crate::observe::vocab::ConnectionState::Closed,
+                "relay_finished",
+            );
+            flow.id().to_owned()
+        })
+        .collect();
+    let newcomer = begin(&store, crate::observe::vocab::Network::Tcp);
+    assert!(store.get(live.id()).is_ok());
+    let inner = store.inner.lock();
+    let retained: Vec<&str> = inner.records.iter().map(|record| record.id()).collect();
+    assert_eq!(retained, [live.id(), ended[2].as_str(), newcomer.id()]);
+}
+
+#[test]
+fn detached_begin_records_nothing_without_locking() {
+    let owner =
+        crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
+    assert!(!owner.core.flows.recording.load(Ordering::Acquire));
+    let inner = owner.core.flows.inner.lock();
+    assert!(try_begin(&owner.core.flows, Network::Tcp).is_none());
     assert!(inner.records.is_empty());
     assert_eq!(inner.records.capacity(), 0);
     assert_eq!(inner.record_bytes, 0);
@@ -862,9 +950,9 @@ fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
 
 #[test]
 fn captured_url_rule_values_survive_summary_updates_and_new_router_generations() {
-    use crate::native_api::routing::{RuleCondition, RuleEvaluation};
+    use crate::observe::rules::{RuleCondition, RuleEvaluation};
     let store = store();
-    let flow = begin(&store, "tcp");
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     let expression = r#"pname("/usr/bin/user@host") && domain(regex: "https://example.test/path")"#;
     let id = "instance:7:rule:0";
     flow.step(
@@ -872,7 +960,7 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
         StepData::Route {
             evaluation_id: "evaluation-7".into(),
             chain: "traffic",
-            plane: "userspace",
+            plane: crate::observe::vocab::Plane::Userspace,
             rule_id: Some(id.into()),
             outbound: Some("group/name@host".into()),
             must: None,
@@ -912,22 +1000,22 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
         "group/name@host",
         Some(id),
         Some("domain(<redacted>)"),
-        "evaluation",
+        crate::observe::vocab::RoutingSource::Evaluation,
     );
-    let before = store.get(flow.id(), &request_id()).unwrap();
+    let before = store.get(flow.id()).unwrap();
     assert_eq!(before["rule_expression"], expression);
     assert_eq!(
         before["rule_generation_id"],
         format!("{}:7", store.instance_id)
     );
-    let later = begin(&store, "tcp");
+    let later = begin(&store, crate::observe::vocab::Network::Tcp);
     later.routed(
         "new",
         Some("instance:8:rule:0"),
         Some("pname(\"new\")"),
-        "evaluation",
+        crate::observe::vocab::RoutingSource::Evaluation,
     );
-    assert_eq!(store.get(flow.id(), &request_id()).unwrap(), before);
+    assert_eq!(store.get(flow.id()).unwrap(), before);
     assert_eq!(
         before["trace"]["steps"][1]["generation_id"],
         format!("{}:7", store.instance_id)
@@ -938,15 +1026,18 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
 #[test]
 fn oversized_utf8_display_is_explicit_capture_loss() {
     let store = store();
-    let flow = begin(&store, "tcp");
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     let oversized = "界".repeat(MAX_TEXT / 3 + 1);
     let mut data = dial_mode();
     if let StepData::DialMode { domain, .. } = &mut data {
         *domain = Some(oversized.clone());
     }
     flow.step(Some(1), data);
-    flow.finish("closed", "relay_finished");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
+    flow.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let detail = store.get(flow.id()).unwrap();
     assert_eq!(detail["trace_status"], "partial");
     assert!(
         detail["trace"]["missing"]
@@ -961,16 +1052,13 @@ fn oversized_utf8_display_is_explicit_capture_loss() {
 #[test]
 fn rendered_rule_text_is_not_interpreted_as_an_internal_placeholder() {
     let store = store();
-    let flow = begin(&store, "tcp");
+    let flow = begin(&store, crate::observe::vocab::Network::Tcp);
     let expression = "pname(unavailable without matcher)";
     flow.routed(
         "direct",
         Some("instance:1:rule:0"),
         Some(expression),
-        "evaluation",
+        crate::observe::vocab::RoutingSource::Evaluation,
     );
-    assert_eq!(
-        store.get(flow.id(), &request_id()).unwrap()["rule_expression"],
-        expression
-    );
+    assert_eq!(store.get(flow.id()).unwrap()["rule_expression"], expression);
 }

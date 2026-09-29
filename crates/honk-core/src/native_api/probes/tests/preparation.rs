@@ -133,7 +133,7 @@ async fn family_preparation(refusal: bool, response_code: u8) {
             .await
             .is_err()
     );
-    let observations = state.alive_set.native_observations(node_id);
+    let observations = state.alive_set.health_observations(node_id);
     if refusal || response_code != 0 {
         assert!(
             observations.is_empty(),

@@ -625,7 +625,7 @@ async fn ephemeral_guard_releases_quic_client_when_probe_is_aborted() {
     .expect("the guard Drop must drive the QUIC close after abort");
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
     use futures_util::FutureExt as _;
@@ -658,7 +658,7 @@ async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
     peer.await.unwrap();
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_close_drains_endpoint_from_cancelled_unpublished_handshake() {
     use futures_util::FutureExt as _;
@@ -690,7 +690,7 @@ async fn native_close_drains_endpoint_from_cancelled_unpublished_handshake() {
     assert!(endpoint.wait_idle().now_or_never().is_some());
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_production_close_drains_cancelled_quic_handshake() {
     use futures_util::FutureExt as _;
@@ -749,7 +749,7 @@ async fn native_production_close_drains_cancelled_quic_handshake() {
     );
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once() {
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
@@ -794,7 +794,7 @@ async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once()
             .filter_map(|(context, event)| match event {
                 FlowEvent::Transport {
                     attempt_id, status, ..
-                } => Some((context, attempt_id, *status)),
+                } => Some((context, attempt_id, status.as_str())),
                 _ => None,
             })
             .collect();
@@ -815,7 +815,8 @@ async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once()
         assert!(!events.iter().any(|(_, event)| matches!(
             event,
             FlowEvent::Milestone {
-                milestone: "target_confirmed" | "target_request_sent"
+                milestone: crate::runtime::flow_observation::Milestone::TargetConfirmed
+                    | crate::runtime::flow_observation::Milestone::TargetRequestSent
             }
         )));
     }
@@ -842,7 +843,7 @@ async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once()
         .filter_map(|(_, event)| match event {
             FlowEvent::Transport {
                 attempt_id, status, ..
-            } => Some((*attempt_id, *status)),
+            } => Some((*attempt_id, status.as_str())),
             _ => None,
         })
         .collect();

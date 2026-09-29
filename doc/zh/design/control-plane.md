@@ -240,17 +240,17 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 ## 原生观测 API
 
-独立且默认编译的 `native-api` feature 提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
+独立且需显式编译的 `native-api` feature（以 `--features native-api` 或 `native-ui` 构建；发布产物包含）提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
-`native_api/server.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；HTTP 关闭共享五秒 grace，随后等待已准入的真实阻塞凭据任务结束。`observation.rs` 拥有进程身份、有界 flow/catalog/event、telemetry、结构化日志、DNS 历史及共用 operation store。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 与 `/logs` 续传均为 ready→replay。
+`native_api/server.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，30 秒读空闲期限仅在该连接没有进行中请求时生效（请求自 body 结束至响应完成视为进行中），停滞写入另有独立 30 秒期限，健康 SSE 与慢 handler 可持续超过 30 秒；accept 错误记录日志后重试，EMFILE/ENFILE/ENOBUFS/ENOMEM 退避 100 ms；连接任务失败只记录日志，不终止 server；HTTP 关闭共享五秒 grace，随后等待已准入的真实阻塞凭据任务结束。`crate::observe`（`observe.rs` 的 `Observation`、flows、rules、catalog 身份、`DnsRecorder`）拥有进程身份与引擎侧有界存储，独立于客户端；`native_api` 只负责 HTTP 投影。未启用 `native-api` 时观测 hook 编译为零开销 inert 替身。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 与 `/logs` 续传均为 ready→replay。
 
-`native_api/handlers.rs` 为每个资源只注册一份方法分派；共用安全边界仍先于方法和资源校验执行。`flows/record.rs` 持有类型化摘要、输入及证据步骤，留存预算计入实际持有的堆容量、snapshot 与有界内核字典预留，JSON 只在 wire 边界投影。核心生命周期与模式命令返回类型化结果，而不是 HTTP 错误或 JSON。
+`native_api/handlers.rs` 为每个资源只注册一份方法分派；共用安全边界仍先于方法和资源校验执行。`observe/flows/record.rs` 持有类型化摘要、输入及证据步骤，留存预算计入实际持有的堆容量、snapshot 与有界内核字典预留，JSON 只在 wire 边界投影。核心生命周期与模式命令返回类型化结果，而不是 HTTP 错误或 JSON。
 
-`flows/producer.rs` 持有 FlowGuard 更新及 TCP/UDP、DNS 共用的组选择证据投影。DNS wire 输入模型归入统一 record；`flows/dns.rs` 保留 lookup/catalog scope 与 DNS 专属捕获。`auth.rs` 持有会话、有界准入和唯一受跟踪的阻塞任务；storage 子模块发布短时持有的凭据状态，不跨 KDF 或 SQL 持有状态锁。
+`observe/flows/producer.rs` 持有 FlowGuard 更新及 TCP/UDP、DNS 共用的组选择证据投影。DNS wire 输入模型归入统一 record；`observe/flows/dns.rs` 保留 lookup/catalog scope 与 DNS 专属捕获。`auth.rs` 持有会话、有界准入和唯一受跟踪的阻塞任务；storage 子模块发布短时持有的凭据状态，不跨 KDF 或 SQL 持有状态锁。
 
 `control/connection/observation.rs` 根据已捕获的 handoff、route、selection 和 transport 事实组装 TCP/UDP 证据。连接编排不构造 wire record，也不使用当前配置重算历史；关闭记录时不分配 capture，精确连接关闭仍独立于记录。
 
-`flows/dns.rs` 与 outbound flow observer 为 scoped/retained 工作绑定实际 lookup、attempt 与 generation 身份。会话 attachment、逻辑 open/readiness 重试与新物理连接、协议确认分开。可选异步 scope 借用调用方 pin 的操作，不复制大型 future 状态；pin 不越过操作的所有权/析构边界。内核证据使用不可变编译字典与报文绑定 witness；UDP receive priority 来自原生辅助元数据，或严格对应 syscall/batch 的 receiver-owned fallback。丢失只改变证据，不改变路由或报文交付。
+`observe/flows/dns.rs` 与 outbound flow observer 为 scoped/retained 工作绑定实际 lookup、attempt 与 generation 身份。会话 attachment、逻辑 open/readiness 重试与新物理连接、协议确认分开。可选异步 scope 借用调用方 pin 的操作，不复制大型 future 状态；pin 不越过操作的所有权/析构边界。内核证据使用不可变编译字典与报文绑定 witness；UDP receive priority 来自原生辅助元数据，或严格对应 syscall/batch 的 receiver-owned fallback。丢失只改变证据，不改变路由或报文交付。
 
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api)。
 
@@ -286,7 +286,7 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 
 网络维护任务属于 `RuntimeEpoch`。延迟缓存 writer 属于进程，仅在终止关闭时 join。
 
-已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。阶段 deadline 超过后仍保有 join，不丢弃线程继续运行。终止关闭先关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间。
+已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。每个关闭阶段受 10 秒 `STAGE_TIMEOUT` 约束：超时后记录日志并返回错误，abort 该阶段 join 的任务，teardown 继续。TCP 连接任务 panic 时记录日志并回收，不会停止引擎。终止关闭先关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间。
 
 健康检查 owner 的五秒 drain deadline 遵循同一规则：终止关闭等待 drain 完成，包括健康检查持有的阻塞解析任务，然后才返回 deadline 错误。若在超时后的清理中发现子任务失败，该失败优先于 deadline 错误返回。
 

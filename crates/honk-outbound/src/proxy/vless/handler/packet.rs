@@ -14,7 +14,6 @@ struct VlessPacketWriter {
     stream: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
     setup: Option<bytes::Bytes>,
     pending: bool,
-    #[cfg(feature = "native-api")]
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
@@ -42,7 +41,6 @@ impl VlessConnectedTransport {
                 stream: writer,
                 setup,
                 pending: false,
-                #[cfg(feature = "native-api")]
                 observer: if native {
                     None
                 } else {
@@ -75,13 +73,11 @@ impl VlessConnectedTransport {
             packet
         };
         writer.pending = true;
-        #[cfg(feature = "native-api")]
         let observer = writer.observer.take();
         let write = async {
             writer.stream.write_all(&frame).await?;
             writer.stream.flush().await
         };
-        #[cfg(feature = "native-api")]
         match observer {
             Some(observer) => {
                 observer
@@ -92,8 +88,6 @@ impl VlessConnectedTransport {
             }
             None => write.await?,
         }
-        #[cfg(not(feature = "native-api"))]
-        write.await?;
         writer.setup = None;
         writer.pending = false;
         Ok(())

@@ -1,21 +1,15 @@
 //! Provider observations and supervisor-owned refresh admission.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    mem::size_of,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, mem::size_of, ops::Range, sync::Arc};
 
 use axum::{
     Json,
-    body::to_bytes,
     extract::Request,
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use honk_config::subscription::Subscription;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -25,18 +19,17 @@ use super::{
     catalog::snapshot_unavailable,
     invalid_query,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
+    pages::{self, MAX_PAGE_SIZE, MAX_SNAPSHOT_BYTES, Pages},
     parse_query, timestamp,
     types::RequestId,
 };
 use crate::{
     control::ReloadOutcome,
-    subscription::{ProviderLoad, SubscriptionMergeReply, SubscriptionSupervisorHandle},
+    subscription::{
+        ProviderLoad, RefreshRefusal, RefreshReport, SubscriptionMergeReply,
+        SubscriptionSupervisorHandle,
+    },
 };
-
-const MAX_PAGE_SIZE: usize = 1000;
-const MAX_SNAPSHOTS: usize = 8;
-const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
-const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize)]
 pub(crate) struct Provider {
@@ -176,31 +169,35 @@ impl Provider {
 }
 
 struct Snapshot {
-    id: Uuid,
     instance: String,
-    limit: usize,
-    created: Instant,
     rows: Vec<Provider>,
     bytes: usize,
 }
 
-impl Snapshot {
-    fn page(&self, offset: usize, limit: usize) -> Response {
-        let end = offset.saturating_add(limit).min(self.rows.len());
-        Json(json!({"providers": &self.rows[offset..end], "next_cursor": (end < self.rows.len()).then(|| format!("{}:{end}", self.id))})).into_response()
+impl pages::Snapshot for Snapshot {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn page(&self, rows: Range<usize>, next_cursor: Option<String>) -> Response {
+        Json(json!({"providers": &self.rows[rows], "next_cursor": next_cursor})).into_response()
     }
 }
 
 pub(crate) struct ProviderApi {
     supervisor: RwLock<Option<SubscriptionSupervisorHandle>>,
-    snapshots: Mutex<VecDeque<Snapshot>>,
+    snapshots: Pages<Snapshot>,
 }
 
 impl ProviderApi {
     pub(crate) fn new() -> Self {
         Self {
             supervisor: RwLock::new(None),
-            snapshots: Mutex::new(VecDeque::new()),
+            snapshots: Pages::default(),
         }
     }
 
@@ -226,50 +223,6 @@ impl ProviderApi {
             .as_ref()
             .is_some_and(SubscriptionSupervisorHandle::caches)
     }
-
-    fn resume(
-        &self,
-        cursor: &str,
-        instance: &str,
-        limit: usize,
-        id: &RequestId,
-    ) -> Result<Response, ApiError> {
-        let expired = || super::catalog::snapshot_expired(id);
-        let (snapshot, offset) = cursor.split_once(':').ok_or_else(expired)?;
-        let snapshot = Uuid::parse_str(snapshot).map_err(|_| expired())?;
-        let offset: usize = offset.parse().map_err(|_| expired())?;
-        let mut snapshots = self.snapshots.lock();
-        snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-        let snapshot = snapshots
-            .iter()
-            .find(|candidate| candidate.id == snapshot && candidate.instance == instance)
-            .ok_or_else(expired)?;
-        if offset == 0 || offset >= snapshot.rows.len() {
-            return Err(expired());
-        }
-        if snapshot.limit != limit {
-            return Err(invalid_query(id));
-        }
-        Ok(snapshot.page(offset, limit))
-    }
-
-    fn page(&self, snapshot: Snapshot, limit: usize, id: &RequestId) -> Result<Response, ApiError> {
-        let response = snapshot.page(0, limit);
-        if snapshot.rows.len() > limit {
-            let mut snapshots = self.snapshots.lock();
-            snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-            while snapshots.len() >= MAX_SNAPSHOTS
-                || snapshots.iter().map(|s| s.bytes).sum::<usize>() + snapshot.bytes
-                    > MAX_SNAPSHOT_BYTES
-            {
-                if snapshots.pop_front().is_none() {
-                    return Err(snapshot_unavailable(id));
-                }
-            }
-            snapshots.push_back(snapshot);
-        }
-        Ok(response)
-    }
 }
 
 pub(super) async fn list(
@@ -278,18 +231,16 @@ pub(super) async fn list(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["limit", "cursor"], id)?;
-    let limit = query
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-        return Err(invalid_query(id));
-    }
+    let limit = pages::limit(&query, id)?;
     let service = &state.observation.providers;
     if let Some(cursor) = query.get("cursor") {
-        return service.resume(cursor, &state.observation.instance_id, limit, id);
+        let instance = &state.observation.core.instance_id;
+        return service.snapshots.resume(
+            cursor,
+            limit,
+            |snapshot| &snapshot.instance == instance,
+            id,
+        );
     }
     let config = state.config.read().await;
     if config
@@ -317,7 +268,7 @@ pub(super) async fn list(
     let supervisor = service.supervisor.read().clone();
     let inline = Provider::inline(inline_count);
     let mut bytes =
-        size_of::<Snapshot>() + state.observation.instance_id.len() + inline.retained_bytes();
+        size_of::<Snapshot>() + state.observation.core.instance_id.len() + inline.retained_bytes();
     let mut rows = Vec::with_capacity(config.subscriptions.len() + 1);
     rows.push(inline);
     for subscription in &config.subscriptions {
@@ -327,7 +278,7 @@ pub(super) async fn list(
             .unwrap_or_default();
         let row = Provider::observed(subscription, load, counts[&subscription.id])
             .routed(subscription, |name| {
-                super::geodata::group_id(&state.observation.catalog, name)
+                super::geodata::group_id(&state.observation.core.catalog, name)
             })
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
@@ -337,12 +288,9 @@ pub(super) async fn list(
         rows.push(row);
     }
     rows[1..].sort_unstable_by(|a, b| a.id.cmp(&b.id));
-    service.page(
+    service.snapshots.first(
         Snapshot {
-            id: Uuid::new_v4(),
-            instance: state.observation.instance_id.clone(),
-            limit,
-            created: Instant::now(),
+            instance: state.observation.core.instance_id.clone(),
             rows,
             bytes,
         },
@@ -374,7 +322,7 @@ pub(super) async fn detail(
         state.observation.providers.supervisor.read().as_ref(),
         provider_id,
         Some(&state.observation.configuration),
-        |name| super::geodata::group_id(&state.observation.catalog, name),
+        |name| super::geodata::group_id(&state.observation.core.catalog, name),
     )
     .map(|value| Json(value).into_response())
     .ok_or_else(not_found)
@@ -414,23 +362,10 @@ pub(super) async fn refresh(
     if provider_id == "inline" {
         return Err(not_refreshable());
     }
-    let mut keys = request.headers().get_all("idempotency-key").iter();
-    let key = keys
-        .next()
-        .map(|value| value.to_str().map(str::to_owned))
-        .transpose()
-        .map_err(|_| invalid_query(id))?;
-    if keys.next().is_some() {
-        return Err(invalid_query(id));
-    }
-    let body = to_bytes(request.into_body(), 65536).await.map_err(|_| {
-        ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::RequestTooLarge,
-            "Refresh request body exceeds its limit.",
-            Some(id.0.clone()),
-        )
-    })?;
+    let key = super::config::request_header(&request, "idempotency-key")
+        .map_err(|_| invalid_query(id))?
+        .map(str::to_owned);
+    let body = super::body::buffered(request.into_body()).await;
     let operations = &state.observation.operations;
     let path = format!("/api/v1/providers/{provider_id}/refresh");
     let reservation = operations.reserve(
@@ -469,7 +404,7 @@ pub(super) async fn refresh(
                 .ok_or_else(not_refreshable)?;
             let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
                 .routed(&subscription, |name| {
-                    super::geodata::group_id(&state.observation.catalog, name)
+                    super::geodata::group_id(&state.observation.core.catalog, name)
                 })
                 .mask_listener_secrets(&config, Some(&state.observation.configuration));
             Ok((subscription, supervisor, display))
@@ -478,14 +413,14 @@ pub(super) async fn refresh(
         match prepared {
             Ok((subscription, supervisor, display)) => supervisor.refresh(
                 subscription,
-                RefreshOperation {
+                Box::new(RefreshOperation {
                     reservation,
                     operations: Arc::clone(operations),
-                    instance: state.observation.instance_id.clone(),
+                    instance: state.observation.core.instance_id.clone(),
                     display_name: display.name,
                     display_url: display.url_redacted.expect("subscription URL is present"),
                     display_download: display.download,
-                },
+                }),
             )?,
             Err(error) => {
                 operations.reject(&reservation.id, error.clone());
@@ -505,19 +440,19 @@ pub(crate) struct RefreshOperation {
     pub(crate) display_download: Option<Value>,
 }
 
-impl RefreshOperation {
-    pub(crate) fn accept(&self) {
+impl RefreshReport for RefreshOperation {
+    fn accept(&self) {
         self.operations.accept(&self.reservation.id);
     }
-    pub(crate) fn running(&self) {
+    fn running(&self) {
         self.operations.running(&self.reservation.id);
     }
-    pub(crate) fn reject(self, error: ApiError) {
-        self.operations.reject(&self.reservation.id, error);
+    fn reject(self: Box<Self>, refusal: RefreshRefusal) {
+        self.operations.reject(&self.reservation.id, refusal.into());
     }
 
-    pub(crate) fn finish(
-        self,
+    fn finish(
+        self: Box<Self>,
         subscription: &Subscription,
         load: ProviderLoad,
         result: Result<SubscriptionMergeReply, &'static str>,
@@ -555,7 +490,17 @@ impl RefreshOperation {
     }
 }
 
-pub(crate) fn unavailable() -> ApiError {
+impl From<RefreshRefusal> for ApiError {
+    fn from(refusal: RefreshRefusal) -> Self {
+        match refusal {
+            RefreshRefusal::NotRefreshable => not_refreshable(),
+            RefreshRefusal::Busy => busy(),
+            RefreshRefusal::Unavailable => unavailable(),
+        }
+    }
+}
+
+fn unavailable() -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::TemporarilyUnavailable,
@@ -564,7 +509,7 @@ pub(crate) fn unavailable() -> ApiError {
     )
     .with_retry_after(1)
 }
-pub(crate) fn busy() -> ApiError {
+fn busy() -> ApiError {
     ApiError::new(
         StatusCode::CONFLICT,
         ErrorCode::StateConflict,
@@ -572,7 +517,7 @@ pub(crate) fn busy() -> ApiError {
         None,
     )
 }
-pub(crate) fn not_refreshable() -> ApiError {
+fn not_refreshable() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         ErrorCode::CapabilityNotSupported,

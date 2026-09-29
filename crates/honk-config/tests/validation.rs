@@ -775,40 +775,6 @@ mod native_api {
     }
 }
 
-#[test]
-fn retired_native_source_settings_are_accepted_and_ignored() {
-    use honk_config::{
-        experimental::NativeApiConfig,
-        parser::{parse_dae_config, parse_dae_config_with_detailed_diagnostics},
-    };
-    let baseline = parse_dae_config("experimental { native_api {} }").unwrap();
-    for value in ["false", "true"] {
-        let mut diagnostics = Vec::new();
-        let parsed = parse_dae_config_with_detailed_diagnostics(&format!(
-            "experimental {{ native_api {{ config_content: {value}\n writable_includes: '/absolute', '../outside', '*.dae', '' }} }}"
-        ), &mut diagnostics).unwrap();
-        assert_eq!(
-            parsed.experimental.native_api,
-            baseline.experimental.native_api
-        );
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|d| d.code == "legacy-native-api")
-                .map(|d| d.setting.to_string())
-                .collect::<Vec<_>>(),
-            [
-                "experimental.native_api.config_content",
-                "experimental.native_api.writable_includes"
-            ]
-        );
-        let serde: NativeApiConfig = serde_json::from_value(serde_json::json!({
-            "config_content":value == "true", "writable_includes":["/absolute", "../outside", "*.dae", ""]
-        })).unwrap();
-        assert_eq!(serde, NativeApiConfig::default());
-    }
-}
-
 mod routing_marks {
     use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
 

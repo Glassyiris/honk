@@ -2,19 +2,17 @@
 
 use axum::{
     Json,
-    body::to_bytes,
     extract::Request,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use futures::{StreamExt, stream::FuturesUnordered};
 use std::net::IpAddr;
 
 use super::{
     NativeState, error, invalid_query, parse_query,
     types::{ApiError, ErrorCode, RequestId},
 };
-use crate::connection_tracker::CloseOutcome;
+use crate::connection_tracker::{CloseOutcome, CloseSummary};
 
 pub(super) const MAX_BULK_CLOSE: usize = 1000;
 
@@ -25,14 +23,8 @@ async fn admit(request: Request, id: &RequestId) -> Result<(), ApiError> {
     {
         return Err(invalid_query(id));
     }
-    let body = to_bytes(request.into_body(), 65_536).await.map_err(|_| {
-        error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::RequestTooLarge,
-            "Request body exceeds its limit",
-            id,
-        )
-    })?;
+    // The security boundary already buffered and capped the body.
+    let body = super::body::buffered(request.into_body()).await;
     if !body.is_empty() {
         return Err(invalid_query(id));
     }
@@ -100,9 +92,10 @@ pub(super) async fn close_bulk(
         return Err(invalid_query(id));
     }
     admit(request, id).await?;
-    let selected = state
+    let summary = state
         .tracker
-        .snapshot_close(network, source, MAX_BULK_CLOSE)
+        .close_matching(network, source, MAX_BULK_CLOSE)
+        .await
         .map_err(|()| {
             error(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -111,29 +104,13 @@ pub(super) async fn close_bulk(
                 id,
             )
         })?;
-    // All claims precede the first wait; HTTP cancellation cannot abandon a suffix.
-    let outcomes: Vec<_> = selected
-        .into_iter()
-        .map(|selected| state.tracker.start_close(selected).wait())
-        .collect::<FuturesUnordered<_>>()
-        .collect()
-        .await;
-    bulk_result(outcomes, id)
+    bulk_result(summary, id)
 }
 
 /// A failed bulk close still reports its counts: those connections stay closed.
-fn bulk_result(outcomes: Vec<CloseOutcome>, id: &RequestId) -> Result<Response, ApiError> {
-    let (mut closed, mut skipped, mut uncertain) = (0usize, 0usize, false);
-    for outcome in outcomes {
-        match outcome {
-            CloseOutcome::Closed => closed += 1,
-            CloseOutcome::NotClosable => skipped += 1,
-            CloseOutcome::Gone => {}
-            CloseOutcome::Failed => uncertain = true,
-        }
-    }
-    let counts = serde_json::json!({"closed":closed,"skipped":skipped});
-    if uncertain {
+fn bulk_result(summary: CloseSummary, id: &RequestId) -> Result<Response, ApiError> {
+    let counts = serde_json::json!({"closed":summary.closed,"skipped":summary.skipped});
+    if summary.failed {
         return Err(failed(id).with_details(counts));
     }
     Ok(Json(counts).into_response())
@@ -147,20 +124,20 @@ mod tests {
     async fn failed_bulk_close_reports_what_it_already_closed() {
         let id = RequestId("request-close".into());
         let response = bulk_result(
-            vec![
-                CloseOutcome::Closed,
-                CloseOutcome::Failed,
-                CloseOutcome::NotClosable,
-                CloseOutcome::Closed,
-                CloseOutcome::Gone,
-            ],
+            CloseSummary {
+                closed: 2,
+                skipped: 1,
+                failed: true,
+            },
             &id,
         )
         .unwrap_err()
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "1");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "temporarily_unavailable");
         assert_eq!(

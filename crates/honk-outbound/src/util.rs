@@ -101,22 +101,22 @@ pub async fn connect_marked_addr(
     mark: Option<u32>,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
-    #[cfg(feature = "native-api")]
-    let mut attempt =
-        crate::runtime::flow_observation::TransportAttempt::start(Some(addr), "unknown");
+    use crate::runtime::flow_observation::{
+        ResolutionLocation, TransportAttempt, TransportError, TransportStatus,
+    };
+    let mut attempt = TransportAttempt::start(Some(addr), ResolutionLocation::Unknown);
     let result = connect_marked_addr_inner(addr, mark, connect_timeout).await;
-    #[cfg(feature = "native-api")]
     if let Some(attempt) = &mut attempt {
         attempt.finish(
             if result.is_ok() {
-                "succeeded"
+                TransportStatus::Succeeded
             } else {
-                "failed"
+                TransportStatus::Failed
             },
             result.as_ref().err().map(|error| match error.kind() {
-                io::ErrorKind::TimedOut => "timeout",
-                io::ErrorKind::ConnectionRefused => "connection_refused",
-                _ => "connect_failed",
+                io::ErrorKind::TimedOut => TransportError::Timeout,
+                io::ErrorKind::ConnectionRefused => TransportError::ConnectionRefused,
+                _ => TransportError::ConnectFailed,
             }),
         );
     }
@@ -170,11 +170,8 @@ pub async fn connect_marked(
     // Boxed: marked hosts/nameserver resolution and its lookup observation are
     // several KiB, and every dial wrapper above this one would embed them.
     let resolution = Box::pin(crate::bootstrap::resolve(host));
-    #[cfg(feature = "native-api")]
     let (resolution, selection) =
         crate::runtime::flow_observation::observe_resolution(resolution).await;
-    #[cfg(not(feature = "native-api"))]
-    let resolution = resolution.await;
     let addrs: Vec<_> = resolution?
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
@@ -182,10 +179,8 @@ pub async fn connect_marked(
     // Address fallback stays inside one authoritative node; policy selection
     // and its dial-admission accounting remain unchanged.
     crate::address_race::race_resolved_addrs(&addrs, |addr| {
-        #[cfg(feature = "native-api")]
         let selection = &selection;
         async move {
-            #[cfg(feature = "native-api")]
             if let Some(selection) = selection {
                 selection.selected_ip(addr.ip());
             }

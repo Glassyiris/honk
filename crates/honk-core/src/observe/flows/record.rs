@@ -11,15 +11,45 @@ use honk_outbound::runtime::flow_observation::DnsLookup;
 use serde::Serialize;
 
 use super::{MAX_RULE_VALUES, MAX_STEPS, display_text, safe_text};
-use crate::native_api::routing::RuleEvaluation;
+use crate::observe::rules::RuleEvaluation;
+use crate::observe::vocab::{
+    ConnectionMilestone, ConnectionState, DomainSource, Network, Plane, RoutingSource, RuleSource,
+};
+use honk_outbound::runtime::flow_observation::{ResolutionLocation, TransportStatus};
+
+/// Wire shape of a DNS lookup step; outbound captures the facts, the
+/// recorder owns how they serialize.
+// Serde only reads the remote type's fields; this mirror is never built.
+#[allow(dead_code)]
+#[derive(Serialize)]
+#[serde(remote = "DnsLookup")]
+struct DnsLookupWire {
+    lookup_id: uuid::Uuid,
+    parent_lookup_id: Option<uuid::Uuid>,
+    attempt_id: Option<uuid::Uuid>,
+    purpose: &'static str,
+    name: String,
+    qtype: String,
+    source: &'static str,
+    upstream_transport: Option<&'static str>,
+    carrier_transport: Option<&'static str>,
+    cache: &'static str,
+    cache_entry_id: Option<String>,
+    upstream: Option<String>,
+    route_evaluation_ids: Vec<String>,
+    status: &'static str,
+    addresses: Vec<IpAddr>,
+    selected_ip: Option<IpAddr>,
+    error: Option<&'static str>,
+}
 
 #[derive(Clone, Serialize)]
 pub(super) struct Summary {
     pub id: String,
     pub instance_id: String,
     pub revision: u64,
-    pub network: &'static str,
-    pub state: &'static str,
+    pub network: Network,
+    pub state: ConnectionState,
     pub pname: Option<String>,
     pub connection_id: Option<String>,
     pub outbound: Option<String>,
@@ -28,9 +58,9 @@ pub(super) struct Summary {
     pub rule_id: Option<String>,
     pub rule_generation_id: Option<String>,
     pub rule_expression: Option<String>,
-    pub rule_source: &'static str,
+    pub rule_source: RuleSource,
     pub ingress: (),
-    pub domain_source: Option<&'static str>,
+    pub domain_source: Option<DomainSource>,
     pub observed_by: &'static str,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -61,7 +91,7 @@ pub(crate) struct Input {
     pub src: SocketAddr,
     pub dst: SocketAddr,
     pub domain: Option<String>,
-    pub domain_source: Option<&'static str>,
+    pub domain_source: Option<DomainSource>,
     pub pid: Option<u32>,
     pub process_path: (),
     pub src_mac: Option<String>,
@@ -116,6 +146,27 @@ impl RouteInput {
                 ids.capacity() * size_of::<String>()
                     + ids.iter().map(String::capacity).sum::<usize>()
             })
+    }
+}
+
+impl From<&crate::routing::ConnectionInfo> for RouteInput {
+    fn from(input: &crate::routing::ConnectionInfo) -> Self {
+        Self {
+            network: input.protocol,
+            src_ip: input.src_ip,
+            src_port: input.src_port,
+            dst_ip: input.dst_ip,
+            dst_port: input.dst_port,
+            domain: input.domain.clone(),
+            pname: input.process_name.clone(),
+            src_mac: input.mac.clone(),
+            dscp: input.dscp,
+            mark: (),
+            ingress: None,
+            domain_rule_ids: None,
+            domain_fact_bitmap: None,
+            domain_fact_state: None,
+        }
     }
 }
 
@@ -234,7 +285,7 @@ pub(crate) struct OutboundAttempt {
     pub parent_attempt_id: Option<String>,
     pub kind: &'static str,
     pub evaluation_id: Option<String>,
-    pub routing_source: &'static str,
+    pub routing_source: RoutingSource,
     pub routed_outbound: Option<String>,
     pub effective_outbound: Option<String>,
     pub mode_override: &'static str,
@@ -245,7 +296,7 @@ pub(crate) struct OutboundAttempt {
     pub target_kind: &'static str,
     pub dial_ip: Option<IpAddr>,
     pub server_addr: Option<SocketAddr>,
-    pub resolution_location: &'static str,
+    pub resolution_location: ResolutionLocation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup_id: Option<String>,
 }
@@ -293,7 +344,7 @@ pub(crate) enum StepData {
     Route {
         evaluation_id: String,
         chain: &'static str,
-        plane: &'static str,
+        plane: Plane,
         rule_id: Option<String>,
         rules: Vec<RuleEvaluation>,
         outbound: Option<String>,
@@ -302,9 +353,9 @@ pub(crate) enum StepData {
         input: Option<EvaluationInput>,
         dns_action: Option<&'static str>,
     },
-    Dns(DnsLookup),
+    Dns(#[serde(with = "DnsLookupWire")] DnsLookup),
     Datapath {
-        plane: &'static str,
+        plane: Plane,
         action: &'static str,
         reason: &'static str,
         error: Option<FlowError>,
@@ -313,7 +364,7 @@ pub(crate) enum StepData {
         configured: DialMode,
         effective_target: &'static str,
         domain: Option<String>,
-        domain_source: Option<&'static str>,
+        domain_source: Option<DomainSource>,
         verification: &'static str,
         reason: &'static str,
     },
@@ -327,13 +378,13 @@ pub(crate) enum StepData {
         attempt_id: String,
         #[serde(flatten)]
         attempt: OutboundAttempt,
-        status: &'static str,
+        status: TransportStatus,
         error: Option<FlowError>,
     },
     Connection {
-        state: &'static str,
+        state: ConnectionState,
         reason: &'static str,
-        milestone: &'static str,
+        milestone: ConnectionMilestone,
         attempt_id: Option<String>,
         reply_received: Option<bool>,
         error: Option<FlowError>,
@@ -440,12 +491,11 @@ impl StepData {
             Self::Input { values, source } => {
                 values.input.redact(redacted, overflow);
                 redact_display(&mut values.pname, redacted, overflow);
-                safe_text(source) && values.input.domain_source.is_none_or(safe_text)
+                safe_text(source)
             }
             Self::Route {
                 evaluation_id,
                 chain,
-                plane,
                 rule_id,
                 outbound,
                 input,
@@ -502,9 +552,7 @@ impl StepData {
                         }
                     }
                 }
-                [evaluation_id.as_str(), *chain, *plane]
-                    .into_iter()
-                    .all(safe_text)
+                [evaluation_id.as_str(), *chain].into_iter().all(safe_text)
                     && rule_id.as_deref().is_none_or(safe_text)
                     && dns_action.is_none_or(|action| {
                         matches!(
@@ -547,15 +595,14 @@ impl StepData {
                     && data.error.is_none_or(safe_text)
             }
             Self::Datapath {
-                plane,
                 action,
                 reason,
                 error,
-            } => [*plane, *action, *reason].into_iter().all(safe_text) && safe_error(error),
+                ..
+            } => [*action, *reason].into_iter().all(safe_text) && safe_error(error),
             Self::DialMode {
                 effective_target,
                 domain,
-                domain_source,
                 verification,
                 reason,
                 ..
@@ -564,7 +611,6 @@ impl StepData {
                 [*effective_target, *verification, *reason]
                     .into_iter()
                     .all(safe_text)
-                    && domain_source.is_none_or(safe_text)
             }
             Self::Reroute {
                 reason,
@@ -579,8 +625,8 @@ impl StepData {
             Self::Outbound {
                 attempt_id,
                 attempt,
-                status,
                 error,
+                ..
             } => {
                 for display in [
                     &mut attempt.routed_outbound,
@@ -594,11 +640,8 @@ impl StepData {
                     && [
                         attempt_id.as_str(),
                         attempt.kind,
-                        attempt.routing_source,
                         attempt.mode_override,
                         attempt.target_kind,
-                        attempt.resolution_location,
-                        *status,
                     ]
                     .into_iter()
                     .all(safe_text)
@@ -609,16 +652,14 @@ impl StepData {
                     && safe_error(error)
             }
             Self::Connection {
-                state,
                 reason,
-                milestone,
                 attempt_id,
                 selections,
                 error,
                 lookup_id,
                 ..
             } => {
-                [*state, *reason, *milestone].into_iter().all(safe_text)
+                safe_text(reason)
                     && attempt_id.as_deref().is_none_or(safe_text)
                     && lookup_id.as_deref().is_none_or(safe_text)
                     && sanitize_selections(selections, redacted, overflow)
@@ -755,5 +796,5 @@ fn redact_display(value: &mut Option<String>, redacted: &mut bool, overflow: &mu
 }
 
 fn rfc3339<S: serde::Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&crate::native_api::timestamp(*time))
+    serializer.serialize_str(&crate::observe::timestamp(*time))
 }

@@ -68,22 +68,29 @@ impl Serialize for ErrorCode {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RetryAfter {
+    /// `1` on a 429 or 503, absent otherwise.
+    Default,
+    Seconds(u32),
+    Never,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
     #[serde(skip)]
-    status: StatusCode,
-    /// `Some(0)` suppresses the default 429/503 `Retry-After`.
+    pub(super) status: StatusCode,
     #[serde(skip)]
-    retry_after: Option<u32>,
-    error: ErrorBody,
+    retry_after: RetryAfter,
+    pub(super) error: ErrorBody,
     request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ErrorBody {
-    code: ErrorCode,
+pub(super) struct ErrorBody {
+    pub(super) code: ErrorCode,
     message: &'static str,
-    details: Option<Value>,
+    pub(super) details: Option<Value>,
 }
 
 impl ApiError {
@@ -95,7 +102,7 @@ impl ApiError {
     ) -> Self {
         Self {
             status,
-            retry_after: None,
+            retry_after: RetryAfter::Default,
             error: ErrorBody {
                 code,
                 message,
@@ -116,13 +123,13 @@ impl ApiError {
     }
 
     pub fn with_retry_after(mut self, seconds: u32) -> Self {
-        self.retry_after = Some(seconds.max(1));
+        self.retry_after = RetryAfter::Seconds(seconds.max(1));
         self
     }
 
     /// For a 503 after a completed write, where repeating the request cannot succeed.
     pub(crate) fn without_retry_after(mut self) -> Self {
-        self.retry_after = Some(0);
+        self.retry_after = RetryAfter::Never;
         self
     }
 
@@ -142,53 +149,20 @@ impl ApiError {
             self.into_details(),
         )
     }
-
-    pub(crate) fn for_management(mut self, deleting: bool) -> Self {
-        let stage = match self.status {
-            StatusCode::PRECONDITION_FAILED => "revision_conflict",
-            StatusCode::UNPROCESSABLE_ENTITY => "validation",
-            StatusCode::CONFLICT => "state_conflict",
-            StatusCode::NOT_FOUND => "capability",
-            _ => "admission",
-        };
-        if !matches!(
-            self.status,
-            StatusCode::NOT_FOUND
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::CONFLICT
-                | StatusCode::PRECONDITION_FAILED
-        ) && (deleting
-            || !matches!(
-                self.status,
-                StatusCode::UNPROCESSABLE_ENTITY
-                    | StatusCode::BAD_REQUEST
-                    | StatusCode::PAYLOAD_TOO_LARGE
-                    | StatusCode::UNSUPPORTED_MEDIA_TYPE
-            ))
-        {
-            self.status = StatusCode::SERVICE_UNAVAILABLE;
-            self.error.code = ErrorCode::TemporarilyUnavailable;
-        }
-        let details = self.error.details.get_or_insert_with(|| json!({}));
-        if let Some(details) = details.as_object_mut() {
-            details.entry("stage").or_insert(json!(stage));
-            details.entry("written").or_insert(json!(false));
-            details.entry("committed").or_insert(json!(false));
-        }
-        self
-    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status;
-        let retry_after = self.retry_after.or_else(|| {
-            matches!(
+        let retry_after = match self.retry_after {
+            RetryAfter::Seconds(seconds) => Some(seconds),
+            RetryAfter::Never => None,
+            RetryAfter::Default => matches!(
                 status,
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
             )
-            .then_some(1)
-        });
+            .then_some(1),
+        };
         let mut response = (
             self.status,
             [
@@ -198,7 +172,7 @@ impl IntoResponse for ApiError {
             Json(self),
         )
             .into_response();
-        if let Some(seconds) = retry_after.filter(|seconds| *seconds > 0) {
+        if let Some(seconds) = retry_after {
             response
                 .headers_mut()
                 .insert("retry-after", axum::http::HeaderValue::from(seconds));
@@ -316,9 +290,9 @@ pub(super) struct Connection {
     pub(super) chain_source: &'static str,
     pub(super) rule_id: Option<String>,
     pub(super) rule_expression: Option<String>,
-    pub(super) rule_source: &'static str,
+    pub(super) rule_source: crate::observe::vocab::RuleSource,
     pub(super) ingress: Option<&'static str>,
-    pub(super) domain_source: Option<&'static str>,
+    pub(super) domain_source: Option<crate::observe::vocab::DomainSource>,
     pub(super) started_at: Option<String>,
     pub(super) observed_by: &'static str,
     pub(super) upload_bytes: Option<String>,
@@ -431,21 +405,21 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     providers["can_manage"] = json!(config.can_manage());
     providers["create_unfetched"] = json!(true);
     let geodata = super::geodata::capability(state).await;
-    let routing_trace = state.observation.trace.capability();
+    let routing_trace = super::routing::trace_capability();
     let rules = super::routing::rules_capability(&*state.traffic_router.read().await);
     let dns_rules = super::dns::rules_capability(&state.config.read().await.dns.routing);
     json!({
         "observed_at": super::timestamp(std::time::SystemTime::now()),
         "profiles": ["base"],
         "limits": {
-            "max_request_target_bytes": 4096,
-            "max_header_bytes": 16384,
+            "max_request_target_bytes": super::security::MAX_TARGET_BYTES,
+            "max_header_bytes": super::security::MAX_HEADER_BYTES,
             "max_json_body_bytes": super::security::MAX_BODY_BYTES,
         },
         "resources": {
-            "config": {"available":config.content_enabled(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::config::MAX_CONTENT_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"x-honk":{"store":config.store_value()["kind"]}},
+            "config": {"available":config.sources.available(),"writable":config.editable(),"create":config.editable(),"max_bytes":super::config::MAX_CONTENT_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"x-honk":{"store":config.store_value()["kind"]}},
             "x-honk": {
-                "config_export": {"available":config.content_enabled()},
+                "config_export": {"available":config.sources.available()},
                 "config_import": config.import_capability(),
                 "config_revisions": config.revisions_capability(),
                 "runtime_mode": {"available":false},
@@ -465,19 +439,19 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "connections": {
                 "available": true,
                 "can_close": true,
-                "max_bulk_close": 1000,
+                "max_bulk_close": super::connections::MAX_BULK_CLOSE,
             },
-            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":super::flows::MAX_RECORDS, "max_steps_per_flow":64, "retention_seconds":super::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":crate::observe::flows::MAX_RECORDS, "max_steps_per_flow":64, "retention_seconds":crate::observe::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": routing_trace,
             "rules": rules,
-            "events": {"available":true,"kinds":kinds,"retention_seconds":60,"max_buffered_events":512,"max_clients":16,"heartbeat_seconds":15},
+            "events": {"available":true,"kinds":kinds,"retention_seconds":super::events::RETENTION.as_secs(),"max_buffered_events":super::events::MAX_EVENTS,"max_clients":super::events::MAX_CLIENTS,"heartbeat_seconds":super::events::HEARTBEAT.as_secs()},
             "logs": state.observation.logs.capability(),
             "dns_query": state.observation.dns.query_capability(),
             "dns_cache": state.observation.dns.cache_capability(),
             "dns_log": state.observation.dns.log_capability(),
             "dns_rules": dns_rules,
             "runtime_settings": super::settings::capability(&state.settings, state.geodata.as_ref().is_some()),
-            "operations": {"available":true,"retention_seconds":300,"max_replay_keys":super::operations::MAX_TOMBSTONES},
+            "operations": {"available":true,"retention_seconds":super::operations::RETENTION.as_secs(),"max_replay_keys":super::operations::MAX_TOMBSTONES},
             "reload": {"available":config.running()},
             "suspend": {"available":false},
             "resume": {"available":false},

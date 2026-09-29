@@ -1,5 +1,5 @@
 mod http2;
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 mod native;
 mod score;
 

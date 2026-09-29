@@ -33,6 +33,33 @@ pub(crate) struct ProviderLoad {
     pub(crate) rejection: Option<&'static str>,
 }
 
+/// Why the supervisor refused an explicit provider refresh.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RefreshRefusal {
+    /// No supervised worker owns the provider.
+    NotRefreshable,
+    /// A refresh is in flight or the provider's worker spec is changing.
+    Busy,
+    /// The refresh queue is full or the supervisor has stopped.
+    Unavailable,
+}
+
+/// Receives the lifecycle of one explicit provider refresh, so the supervisor
+/// reports progress without depending on the API that asked for it.
+#[cfg(feature = "native-api")]
+pub(crate) trait RefreshReport: Send + Sync {
+    fn accept(&self);
+    fn running(&self);
+    fn reject(self: Box<Self>, refusal: RefreshRefusal);
+    fn finish(
+        self: Box<Self>,
+        subscription: &Subscription,
+        load: ProviderLoad,
+        result: Result<SubscriptionMergeReply, &'static str>,
+    );
+}
+
 struct ObservedProvider {
     subscription: Subscription,
     load: ProviderLoad,
@@ -198,7 +225,7 @@ async fn fetch_once(
 struct Flight {
     authorized: AuthorizedSubscription,
     #[cfg(feature = "native-api")]
-    operation: Option<crate::native_api::providers::RefreshOperation>,
+    operation: Option<Box<dyn RefreshReport>>,
 }
 
 enum ProviderSchedule {
@@ -477,26 +504,22 @@ impl SupervisorState {
     }
 
     #[cfg(feature = "native-api")]
-    fn refresh(
-        &mut self,
-        subscription: Subscription,
-        operation: crate::native_api::providers::RefreshOperation,
-    ) {
+    fn refresh(&mut self, subscription: Subscription, operation: Box<dyn RefreshReport>) {
         let id = subscription.id;
         let Some(provider) = self.providers.get_mut(&id) else {
-            operation.reject(crate::native_api::providers::not_refreshable());
+            operation.reject(RefreshRefusal::NotRefreshable);
             return;
         };
         if !same_worker_spec(&provider.authorized.subscription, &subscription) {
-            operation.reject(crate::native_api::providers::busy());
+            operation.reject(RefreshRefusal::Busy);
             return;
         }
         if self.flights.contains_key(&id) {
-            operation.reject(crate::native_api::providers::busy());
+            operation.reject(RefreshRefusal::Busy);
             return;
         }
         if self.pending.len() >= MAX_REFRESH_QUEUE {
-            operation.reject(crate::native_api::providers::unavailable());
+            operation.reject(RefreshRefusal::Unavailable);
             return;
         }
         operation.accept();
@@ -702,7 +725,7 @@ enum SupervisorCommand {
     #[cfg(feature = "native-api")]
     Refresh {
         subscription: Subscription,
-        operation: crate::native_api::providers::RefreshOperation,
+        operation: Box<dyn RefreshReport>,
     },
     Shutdown {
         done: oneshot::Sender<anyhow::Result<usize>>,
@@ -744,16 +767,16 @@ impl SubscriptionSupervisorHandle {
     pub(crate) fn refresh(
         &self,
         subscription: Subscription,
-        operation: crate::native_api::providers::RefreshOperation,
-    ) -> Result<(), crate::native_api::ApiError> {
+        operation: Box<dyn RefreshReport>,
+    ) -> Result<(), RefreshRefusal> {
         if let Err(error) = self.command_tx.try_send(SupervisorCommand::Refresh {
             subscription,
             operation,
         }) {
             if let SupervisorCommand::Refresh { operation, .. } = error.into_inner() {
-                operation.reject(crate::native_api::providers::unavailable());
+                operation.reject(RefreshRefusal::Unavailable);
             }
-            return Err(crate::native_api::providers::unavailable());
+            return Err(RefreshRefusal::Unavailable);
         }
         Ok(())
     }
@@ -845,7 +868,6 @@ impl SubscriptionSupervisor {
         })
     }
     /// Routed fetches wait for this, so it hands over routing before `start`.
-    #[cfg(feature = "native-api")]
     pub(crate) fn route_through(&self, routing: crate::download_route::SharedOutbounds) {
         self.prepared
             .as_ref()

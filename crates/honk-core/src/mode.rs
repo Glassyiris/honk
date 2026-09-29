@@ -12,51 +12,33 @@ type SharedEbpfBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBacken
 pub struct ModeState {
     /// Canonical clash mode: `"Rule"` | `"Global"` | `"Direct"`.
     pub mode: String,
-    /// Clash GLOBAL display projection; native routing uses `target`, never this name.
-    pub global_selection: String,
-    #[cfg(feature = "native-api")]
-    pub(crate) native_enabled: bool,
-    #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
-    pub(crate) target: Option<ModeTarget>,
+    pub(crate) selection: Selection,
     #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
     pub(crate) source: ModeSource,
+}
+
+/// The GLOBAL selection: a persisted name for legacy Clash-only processes, a
+/// transient identity when native is enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Selection {
+    Name(String),
+    #[cfg(feature = "native-api")]
+    Target(Option<ModeTarget>),
 }
 
 /// Shared routing snapshot, published only through [`DatapathFlagsHandle`].
 pub type SharedModeState = Arc<parking_lot::RwLock<ModeState>>;
 
-#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[cfg(feature = "native-api")]
+#[cfg_attr(not(any(feature = "clash-api", test)), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModeTarget {
     Node { id: uuid::Uuid, name: String },
     Group { id: String, name: String },
 }
 
-#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[cfg(feature = "native-api")]
 impl ModeTarget {
-    #[cfg(test)]
-    pub(crate) fn from_id(
-        id: &str,
-        config: &honk_config::Config,
-        groups: &std::collections::HashMap<String, String>,
-    ) -> Option<Self> {
-        if let Ok(node_id) = uuid::Uuid::parse_str(id)
-            && let Some(node) = config.nodes.iter().find(|node| node.id == node_id)
-        {
-            return Some(Self::Node {
-                id: node.id,
-                name: node.name.clone(),
-            });
-        }
-        groups
-            .iter()
-            .find(|(_, current)| current.as_str() == id)
-            .map(|(name, id)| Self::Group {
-                id: id.clone(),
-                name: name.clone(),
-            })
-    }
-
     #[cfg(any(feature = "clash-api", test))]
     pub(crate) fn from_name(
         name: &str,
@@ -82,13 +64,13 @@ impl ModeTarget {
         }
     }
 
-    #[cfg(any(feature = "clash-api", test))]
     fn name(&self) -> &str {
         match self {
             Self::Node { name, .. } | Self::Group { name, .. } => name,
         }
     }
 
+    #[cfg(any(feature = "clash-api", test))]
     fn present(
         &self,
         config: &honk_config::Config,
@@ -123,11 +105,7 @@ impl ModeState {
     pub fn new(mode: &str, global_selection: impl Into<String>) -> Self {
         Self {
             mode: Self::normalize(mode).unwrap_or_else(|| "Rule".to_string()),
-            global_selection: global_selection.into(),
-            #[cfg(feature = "native-api")]
-            native_enabled: false,
-            #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
-            target: None,
+            selection: Selection::Name(global_selection.into()),
             #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
             source: ModeSource::Config,
         }
@@ -136,8 +114,22 @@ impl ModeState {
     #[cfg(feature = "native-api")]
     pub(crate) fn native() -> Self {
         Self {
-            native_enabled: true,
+            selection: Selection::Target(None),
             ..Self::new("Rule", "")
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(self.selection, Selection::Target(_))
+    }
+
+    /// Clash GLOBAL display name; native routing uses the target, never this name.
+    pub fn global_selection(&self) -> &str {
+        match &self.selection {
+            Selection::Name(name) => name,
+            #[cfg(feature = "native-api")]
+            Selection::Target(target) => target.as_ref().map_or("", ModeTarget::name),
         }
     }
 
@@ -151,14 +143,16 @@ impl ModeState {
         config: &honk_config::Config,
         groups: &std::collections::HashMap<String, String>,
     ) -> ModeOverride {
-        if !self.native_enabled || must || outbound == "block" || self.is_rule() {
+        let Selection::Target(target) = &self.selection else {
+            return ModeOverride::Unchanged;
+        };
+        if must || outbound == "block" || self.is_rule() {
             return ModeOverride::Unchanged;
         }
         if self.is_direct() {
             return ModeOverride::Direct;
         }
-        match self
-            .target
+        match target
             .as_ref()
             .filter(|target| target.present(config, groups))
         {
@@ -201,16 +195,21 @@ impl ModeState {
 
     /// The mode-dependent part of the eBPF datapath policy.
     pub fn direct_offload_mode_bits(&self) -> u32 {
-        #[cfg(feature = "native-api")]
-        if self.native_enabled && self.is_global() {
-            #[cfg(any(feature = "clash-api", test))]
-            if matches!(&self.target, Some(ModeTarget::Node { id, .. }) if *id == honk_config::config::DIRECT_NODE_ID)
-            {
-                return honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL;
-            }
-            return 0;
+        if self.is_global() {
+            let direct = match &self.selection {
+                Selection::Name(name) => name == "direct",
+                #[cfg(feature = "native-api")]
+                Selection::Target(target) => {
+                    matches!(target, Some(ModeTarget::Node { id, .. }) if *id == honk_config::config::DIRECT_NODE_ID)
+                }
+            };
+            return if direct {
+                honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL
+            } else {
+                0
+            };
         }
-        if self.is_direct() || (self.is_global() && self.global_selection == "direct") {
+        if self.is_direct() {
             honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL
         } else if self.is_rule() {
             honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT
@@ -232,23 +231,26 @@ impl ModeState {
         if must || outbound_name == "block" {
             return outbound_name.to_string();
         }
-        // Native callers must carry the identity, not downgrade to a display name.
-        #[cfg(feature = "native-api")]
-        if self.native_enabled && self.is_global() {
-            return "block".to_owned();
-        }
         if self.is_direct() {
             return "direct".to_string();
         }
-        if self.is_global() && !self.global_selection.is_empty() && selection_resolvable {
-            return self.global_selection.clone();
+        if self.is_global() {
+            match &self.selection {
+                Selection::Name(name) if !name.is_empty() && selection_resolvable => {
+                    return name.clone();
+                }
+                Selection::Name(_) => {}
+                // Native callers must carry the identity, not downgrade to a display name.
+                #[cfg(feature = "native-api")]
+                Selection::Target(_) => return "block".to_owned(),
+            }
         }
         outbound_name.to_string()
     }
 }
 
 /// Apply a request under the command owner's reload lock and config read barrier.
-#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[cfg(all(feature = "native-api", feature = "clash-api"))]
 pub(crate) async fn apply_mode_request(
     config: &honk_config::Config,
     groups: &std::collections::HashMap<String, String>,
@@ -258,27 +260,14 @@ pub(crate) async fn apply_mode_request(
     use crate::control::client::{ControlError, ModeRequest};
 
     match request {
-        #[cfg(test)]
-        ModeRequest::Runtime { mode, target } => {
-            if !flags.snapshot().native_enabled {
-                return Err(ControlError::Unsupported);
-            }
-            let target = target
-                .as_deref()
-                .map(|id| ModeTarget::from_id(id, config, groups).ok_or(ControlError::NotFound))
-                .transpose()?;
-            flags.set_native_mode(mode, target, config, groups).await
-        }
-        #[cfg(feature = "clash-api")]
         ModeRequest::ClashMode(mode) => {
             if ModeState::normalize(&mode).is_none() {
                 return Err(ControlError::Unsupported);
             }
             flags.set_clash_mode(&mode, config, groups).await
         }
-        #[cfg(feature = "clash-api")]
         ModeRequest::ClashSelection(selection) => {
-            if flags.snapshot().native_enabled
+            if flags.snapshot().is_native()
                 && ModeTarget::from_name(&selection, config, groups).is_none()
             {
                 return Err(ControlError::Unsupported);
@@ -360,43 +349,6 @@ impl DatapathFlagsHandle {
         self.mode_state.read().clone()
     }
 
-    /// The control owner retains the config read barrier through this transition.
-    #[cfg(all(test, feature = "native-api"))]
-    pub(crate) async fn set_native_mode(
-        &self,
-        mode: &str,
-        target: Option<ModeTarget>,
-        config: &honk_config::Config,
-        groups: &std::collections::HashMap<String, String>,
-    ) -> anyhow::Result<ModeState> {
-        let mode = ModeState::normalize(mode).context("invalid mode")?;
-        anyhow::ensure!(
-            (mode == "Global") == target.is_some(),
-            "global mode requires exactly one target"
-        );
-        anyhow::ensure!(
-            target
-                .as_ref()
-                .is_none_or(|target| target.present(config, groups)),
-            "mode target is unavailable"
-        );
-        self.update(false, move |state, current| {
-            anyhow::ensure!(
-                state.initialized && current.native_enabled,
-                "native mode is unavailable"
-            );
-            current.mode = mode;
-            current.global_selection = target
-                .as_ref()
-                .map(|target| target.name().to_owned())
-                .unwrap_or_default();
-            current.target = target;
-            current.source = ModeSource::Runtime;
-            Ok(Persistence::None)
-        })
-        .await
-    }
-
     /// Clash participates in the same transient identity owner when native is enabled.
     #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
     pub(crate) async fn set_clash_mode(
@@ -408,11 +360,11 @@ impl DatapathFlagsHandle {
         let mode = ModeState::normalize(mode).context("invalid clash mode")?;
         self.update(false, move |state, current| {
             anyhow::ensure!(state.initialized, "datapath flags are not initialized");
-            if current.native_enabled {
+            if let Selection::Target(target) = &mut current.selection {
                 if mode == "Global" {
                     // Never replace a stale pinned identity by today's same-name object.
-                    if current.target.is_none() {
-                        current.target = config
+                    if target.is_none() {
+                        *target = config
                             .groups
                             .iter()
                             .find_map(|group| {
@@ -429,18 +381,11 @@ impl DatapathFlagsHandle {
                             });
                     }
                     anyhow::ensure!(
-                        current
-                            .target
+                        target
                             .as_ref()
                             .is_some_and(|target| target.present(config, groups)),
                         "mode target is unavailable"
                     );
-                    current.global_selection = current
-                        .target
-                        .as_ref()
-                        .expect("validated target")
-                        .name()
-                        .to_owned();
                 }
                 current.source = ModeSource::Runtime;
             }
@@ -459,14 +404,15 @@ impl DatapathFlagsHandle {
     ) -> anyhow::Result<ModeState> {
         self.update(false, move |state, current| {
             anyhow::ensure!(state.initialized, "datapath flags are not initialized");
-            if current.native_enabled {
-                current.target = Some(
+            current.selection = if current.is_native() {
+                current.source = ModeSource::Runtime;
+                Selection::Target(Some(
                     ModeTarget::from_name(&selection, config, groups)
                         .context("unknown or ambiguous GLOBAL selection")?,
-                );
-                current.source = ModeSource::Runtime;
-            }
-            current.global_selection = selection;
+                ))
+            } else {
+                Selection::Name(selection)
+            };
             Ok(Persistence::Global)
         })
         .await
@@ -511,7 +457,7 @@ impl DatapathFlagsHandle {
         // The flags write already fenced READY even if staged-state cleanup failed.
         quiescence?;
         #[cfg(feature = "native-api")]
-        let persist = !mode.native_enabled;
+        let persist = !mode.is_native();
         #[cfg(not(feature = "native-api"))]
         let persist = true;
         if let Some(db) = &inner.cache_db
@@ -520,7 +466,7 @@ impl DatapathFlagsHandle {
             match persistence {
                 Persistence::None => {}
                 Persistence::Mode => db.save_clash_mode(&mode.mode),
-                Persistence::Global => db.save_clash_global(&mode.global_selection),
+                Persistence::Global => db.save_clash_global(mode.global_selection()),
             }
         }
         Ok(mode)
@@ -549,7 +495,7 @@ impl DatapathFlagsHandle {
             anyhow::ensure!(state.initialized, "datapath flags are not initialized");
             #[cfg(feature = "native-api")]
             anyhow::ensure!(
-                !current.native_enabled,
+                !current.is_native(),
                 "native mode requires identity-aware control"
             );
             current.mode = mode;
@@ -564,10 +510,10 @@ impl DatapathFlagsHandle {
             anyhow::ensure!(state.initialized, "datapath flags are not initialized");
             #[cfg(feature = "native-api")]
             anyhow::ensure!(
-                !mode.native_enabled,
+                !mode.is_native(),
                 "native selection requires identity-aware control"
             );
-            mode.global_selection = selection;
+            mode.selection = Selection::Name(selection);
             Ok(Persistence::Global)
         })
         .await
@@ -625,7 +571,7 @@ impl DatapathFlagsPublication<'_> {
         &mut self,
         backend: &mut dyn crate::ebpf::EbpfBackend,
     ) -> anyhow::Result<()> {
-        if !self.inner.mode_state.read().native_enabled {
+        if !self.inner.mode_state.read().is_native() {
             return Ok(());
         }
         anyhow::ensure!(
@@ -684,7 +630,7 @@ mod tests {
     fn test_new_fallback() {
         let s = ModeState::new("bogus", "proxy");
         assert_eq!(s.mode, "Rule");
-        assert_eq!(s.global_selection, "proxy");
+        assert_eq!(s.global_selection(), "proxy");
         assert!(!s.is_direct());
         assert!(!s.is_global());
     }
@@ -766,7 +712,7 @@ mod tests {
         mode_result.unwrap();
         selection_result.unwrap();
         assert_eq!(state.read().mode, "Global");
-        assert_eq!(state.read().global_selection, "direct");
+        assert_eq!(state.read().global_selection(), "direct");
         assert!(
             writes.lock()[fenced_at..]
                 .iter()

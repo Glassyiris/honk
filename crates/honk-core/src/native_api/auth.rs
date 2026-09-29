@@ -4,7 +4,6 @@
 //! PBKDF2-HMAC-SHA256 hash of the password. Sessions are opaque random tokens kept in memory as
 //! SHA-256 digests; a restart forgets them all.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -282,13 +281,15 @@ pub(crate) struct Auth {
 #[derive(Default)]
 struct Work {
     closed: bool,
+    /// Cleared before the reply is sent: a finished job can still be unreaped.
+    busy: bool,
     jobs: JoinSet<()>,
 }
 
 impl Auth {
-    pub(crate) fn open(db: Arc<StateDb>, data_dir: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open(db: Arc<StateDb>) -> Result<Self, StoreError> {
         Ok(Self {
-            store: CredentialStore::open(db, data_dir)?,
+            store: CredentialStore::open(db)?,
             sessions: Sessions::default(),
             rate: AuthRate::default(),
             work: Mutex::new(Work::default()),
@@ -312,7 +313,7 @@ impl Auth {
                 return Err(unavailable(id));
             }
             // ponytail: one administrator needs one worker; no credential queue to outlive requests.
-            if !worker.jobs.is_empty() {
+            if worker.busy {
                 return Err(rate_limited(id, 1));
             }
             if let Some(after) = self.rate.admit(peer.0) {
@@ -321,8 +322,11 @@ impl Auth {
             let (send, receive) = oneshot::channel();
             let auth = Arc::clone(self);
             let id = id.clone();
+            worker.busy = true;
             worker.jobs.spawn_blocking(move || {
-                let _ = send.send(work(&auth, &id));
+                let response = work(&auth, &id);
+                auth.work.lock().busy = false;
+                let _ = send.send(response);
             });
             receive
         };

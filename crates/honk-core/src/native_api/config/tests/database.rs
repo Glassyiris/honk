@@ -65,7 +65,9 @@ async fn main_source_write_records_a_revision_after_the_tree_is_deleted() {
 async fn rejected_reload_leaves_the_db_head_alone() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());
-    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     assert_eq!(main["writable"], true);
@@ -650,7 +652,9 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
 async fn unconfirmed_activation_blocks_writes() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());
-    fixture.reject_reloads.store(2, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Drop as u8, Ordering::SeqCst);
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     let operation = accepted(
@@ -673,7 +677,9 @@ async fn unconfirmed_activation_blocks_writes() {
         fixture.get(CONFIG).await["x-honk"]["store"]["recorded"],
         false
     );
-    fixture.reject_reloads.store(0, Ordering::SeqCst);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Apply as u8, Ordering::SeqCst);
     fixture.shutdown().await;
 }
 

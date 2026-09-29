@@ -138,7 +138,14 @@ impl ControlPlane {
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
         drop(current_guard);
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
-        let declared = new_config.subscriptions.clone();
+        let declared = new_config
+            .subscriptions
+            .iter()
+            .filter(|subscription| retained_providers.contains(&subscription.id))
+            .filter_map(|subscription| {
+                Some((subscription.id, subscription.source.as_ref()?.0.clone()))
+            })
+            .collect();
         self.apply_resolved_runtime_config_locked(
             new_config,
             drain,
@@ -195,7 +202,7 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         let _reloading = native
             .as_deref()
-            .map(crate::native_api::observation::NativeObservation::begin_reload);
+            .map(crate::observe::Observation::begin_reload);
         #[cfg(feature = "native-api")]
         let replaces_sources = matches!(
             &diagnostic_update,
@@ -325,14 +332,14 @@ impl ControlPlane {
                     }
                 }
                 #[cfg(feature = "native-api")]
-                if let Some(native) = &self.native
+                if let Some(owner) = &self.native_owner
                     && replaces_sources
                 {
-                    native.settings.activate(native, &new_config);
+                    owner.activate(&new_config);
                 }
-                // Equal configurations may still come from a fresh source table;
-                // later refresh diagnostics name their declaring file through it.
-                *config = Arc::new(new_config);
+                if declaring_sources_replaced(current_config.as_ref(), &new_config) {
+                    *config = Arc::new(new_config);
+                }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(ReloadOutcome::Noop { generation });
             }
@@ -516,7 +523,7 @@ impl ControlPlane {
         );
         #[cfg(feature = "native-api")]
         let prepared_dictionary = self.native.as_ref().and_then(|native| {
-            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+            crate::observe::flows::kernel::KernelTraceDictionary::prepare(
                 &native.instance_id,
                 generation.get(),
                 &new_router,
@@ -762,9 +769,9 @@ impl ControlPlane {
                     active_diagnostics.buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
-                        self.alive_set.invalidate_native_group_observations();
-                        if replaces_sources {
-                            native.settings.activate(native, &config_guard);
+                        self.alive_set.invalidate_group_health_observations();
+                        if replaces_sources && let Some(owner) = &self.native_owner {
+                            owner.activate(&config_guard);
                         }
                         native.committed(
                             prepared_catalog.expect("native candidate catalog"),

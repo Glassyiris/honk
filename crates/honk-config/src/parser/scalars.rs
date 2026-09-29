@@ -174,37 +174,48 @@ pub(super) fn bool_value(
     parsed
 }
 
-fn list_value(
-    value: Text<'_, '_>,
-    aggregate_compat: bool,
-    legacy_unquote_items: bool,
-    filter_empty: bool,
-    diagnostics: &mut ParserDiagnostics<'_>,
-) -> Vec<String> {
-    list_value_inner(
-        value,
-        aggregate_compat,
-        legacy_unquote_items,
-        filter_empty,
-        true,
-        diagnostics,
-    )
-}
-
-/// A list for a setting that never existed before the item-wise parser: there is no legacy
-/// reading to compare against, so quoting differences are not migration notices.
-fn new_list_value(value: Text<'_, '_>, diagnostics: &mut ParserDiagnostics<'_>) -> Vec<String> {
-    list_value_inner(value, false, false, false, false, diagnostics)
-}
-
-fn list_value_inner(
-    value: Text<'_, '_>,
+#[derive(Clone, Copy)]
+struct ListOptions {
     aggregate_compat: bool,
     legacy_unquote_items: bool,
     filter_empty: bool,
     legacy_notice: bool,
+}
+
+impl ListOptions {
+    const INTERFACES: Self = Self {
+        aggregate_compat: false,
+        legacy_unquote_items: false,
+        filter_empty: true,
+        legacy_notice: true,
+    };
+    const CHECK_TARGETS: Self = Self {
+        aggregate_compat: true,
+        legacy_unquote_items: true,
+        filter_empty: false,
+        legacy_notice: true,
+    };
+    /// A setting that never existed before the item-wise parser: there is no legacy
+    /// reading to compare against, so quoting differences are not migration notices.
+    const NEW: Self = Self {
+        aggregate_compat: false,
+        legacy_unquote_items: false,
+        filter_empty: false,
+        legacy_notice: false,
+    };
+}
+
+fn list_value(
+    value: Text<'_, '_>,
+    options: ListOptions,
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Vec<String> {
+    let ListOptions {
+        aggregate_compat,
+        legacy_unquote_items,
+        filter_empty,
+        legacy_notice,
+    } = options;
     let trimmed = value.trim();
     let whole_quoted = trimmed
         .quoted_prefix()
@@ -323,10 +334,10 @@ pub(super) fn parse_global_section(
         );
     }
     if let Some(value) = settings.get("lan_interface") {
-        cfg.lan_interface = list_value(*value, false, false, true, diagnostics);
+        cfg.lan_interface = list_value(*value, ListOptions::INTERFACES, diagnostics);
     }
     if let Some(value) = settings.get("wan_interface") {
-        cfg.wan_interface = list_value(*value, false, false, true, diagnostics);
+        cfg.wan_interface = list_value(*value, ListOptions::INTERFACES, diagnostics);
     }
     if settings.contains_key("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = bool_value(
@@ -348,7 +359,7 @@ pub(super) fn parse_global_section(
         );
     }
     if let Some(value) = settings.get("tcp_check_url") {
-        cfg.tcp_check_url = list_value(*value, true, true, false, diagnostics);
+        cfg.tcp_check_url = list_value(*value, ListOptions::CHECK_TARGETS, diagnostics);
     }
     if let Some(value) = settings
         .get("tcp_check_http_method")
@@ -357,7 +368,7 @@ pub(super) fn parse_global_section(
         cfg.tcp_check_http_method = value.to_owned();
     }
     if let Some(value) = settings.get("udp_check_dns") {
-        cfg.udp_check_dns = list_value(*value, true, true, false, diagnostics);
+        cfg.udp_check_dns = list_value(*value, ListOptions::CHECK_TARGETS, diagnostics);
     }
     if let Some(text) = settings.get("check_interval") {
         let value = text.unquote().raw();
@@ -582,8 +593,6 @@ const NATIVE_API_KEYS: &[&str] = &[
     "probe_allowed_cidrs",
     "probe_allowed_ports",
     "config_write",
-    "config_content",
-    "writable_includes",
     "geosite_download_url",
     "geoip_download_url",
     "geodata_download_detour",
@@ -873,16 +882,6 @@ pub(super) fn parse_experimental_section(
                             })?;
                         }
                     }
-                    if let Some(text) = values.get("config_content") {
-                        strict_bool(text.unquote().raw()).ok_or_else(|| {
-                            scalar_error(
-                                *text,
-                                "invalid-config-value",
-                                "experimental.native_api.config_content",
-                                "expected true/false, yes/no, 1/0 or on/off",
-                            )
-                        })?;
-                    }
                     for (key, target) in [
                         ("listen", &mut config.native_api.listen),
                         ("secret", &mut config.native_api.secret),
@@ -905,7 +904,8 @@ pub(super) fn parse_experimental_section(
                         }
                     }
                     if let Some(text) = values.get("probe_allowed_cidrs") {
-                        config.native_api.probe_allowed_cidrs = new_list_value(*text, diagnostics);
+                        config.native_api.probe_allowed_cidrs =
+                            list_value(*text, ListOptions::NEW, diagnostics);
                         if config
                             .native_api
                             .probe_allowed_cidrs
@@ -922,36 +922,11 @@ pub(super) fn parse_experimental_section(
                         }
                     }
                     if let Some(text) = values.get("probe_allowed_ports") {
-                        let entries = new_list_value(*text, diagnostics);
+                        let entries = list_value(*text, ListOptions::NEW, diagnostics);
                         config.native_api.probe_allowed_ports = entries.iter().map(|value| {
                             value.parse::<u16>().ok().filter(|port| *port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
                                 .ok_or_else(|| scalar_error(*text, "invalid-config-value", "experimental.native_api.probe_allowed_ports", "probe port allowlist requires ports from 1 through 65535"))
                         }).collect::<Result<Vec<_>,_>>()?;
-                    }
-                    if let Some(text) = values.get("writable_includes") {
-                        let _ = new_list_value(*text, diagnostics);
-                    }
-                    for (key, message) in [
-                        (
-                            "config_content",
-                            "experimental.native_api.config_content no longer has an effect",
-                        ),
-                        (
-                            "writable_includes",
-                            "experimental.native_api.writable_includes no longer has an effect",
-                        ),
-                    ] {
-                        if values.contains_key(key) {
-                            diagnostics.emit(crate::diagnostic::DetailedDiagnostic::warning(
-                                "legacy-native-api",
-                                diagnostics.source(),
-                                SettingPath::new("experimental")
-                                    .field("native_api")
-                                    .field(key),
-                                crate::diagnostic::SafeValue::Redacted,
-                                message,
-                            ));
-                        }
                     }
                     for (key, setting, target) in [
                         (
@@ -966,7 +941,7 @@ pub(super) fn parse_experimental_section(
                         ),
                     ] {
                         if let Some(text) = values.get(key) {
-                            let items = new_list_value(*text, diagnostics);
+                            let items = list_value(*text, ListOptions::NEW, diagnostics);
                             let invalid = items.iter().any(|value| {
                                 if key == "allowed_hosts" {
                                     crate::experimental::parse_native_authority(value, 80).is_none()

@@ -47,7 +47,7 @@ fn assert_handshake(
             FlowEvent::Transport {
                 attempt_id: started_id,
                 server_addr: started_address,
-                status: "started",
+                status: honk_outbound::runtime::flow_observation::TransportStatus::Started,
                 error: None,
                 ..
             },
@@ -72,9 +72,9 @@ fn assert_handshake(
     assert_ne!(Some(*started_id), context.attempt_id);
     assert_eq!(*started_address, Some(address));
     assert_eq!(*finished_address, Some(address));
-    assert_eq!(*status, expected_status);
+    assert_eq!(status.as_str(), expected_status);
     assert_eq!(
-        *error,
+        error.map(|error| error.as_str()),
         match expected_status {
             "succeeded" => None,
             "cancelled" => Some("cancelled"),

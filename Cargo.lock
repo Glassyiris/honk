@@ -1532,7 +1532,6 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
- "rustix",
  "rustls-pemfile",
  "rustls-platform-verifier",
  "serde",

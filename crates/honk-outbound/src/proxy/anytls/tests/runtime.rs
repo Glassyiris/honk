@@ -70,7 +70,7 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
     .expect("the connection must close on abort");
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() {
     use futures_util::FutureExt as _;
@@ -97,7 +97,7 @@ async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() 
     ));
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_ephemeral_close_joins_cancelled_pool_factory_before_releasing_capacity() {
     use futures_util::FutureExt as _;
@@ -121,7 +121,7 @@ async fn native_ephemeral_close_joins_cancelled_pool_factory_before_releasing_ca
     assert!(!anytls.pool.has_usable_session());
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_production_factory_and_drivers_travel_with_reused_runtime() {
     use futures_util::FutureExt as _;
@@ -170,7 +170,7 @@ async fn native_production_factory_and_drivers_travel_with_reused_runtime() {
     ));
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_production_close_joins_factory_cancelled_before_first_poll() {
     use futures_util::FutureExt as _;

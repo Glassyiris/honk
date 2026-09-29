@@ -380,7 +380,7 @@ fn parsed_equivalent_vless_udp_fallbacks_reuse_runtime() {
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn native_production_cool_factory_joins_carrier_io_before_shutdown_returns() {
     use crate::session::ManagedSession as _;

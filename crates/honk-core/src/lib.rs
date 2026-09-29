@@ -17,15 +17,17 @@ pub mod connection_tracker;
 pub mod control;
 pub(crate) mod degradations;
 pub mod dns;
-#[cfg(any(feature = "clash-api", feature = "native-api"))]
 pub(crate) mod download_route;
 pub mod ebpf;
+mod logging;
 mod marked_http;
 pub mod mode;
 #[cfg(feature = "native-api")]
 pub mod native_api;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;
+#[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
+pub(crate) mod observe;
 pub mod pool;
 pub mod relay;
 pub mod routing;
@@ -51,6 +53,11 @@ use honk_config::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SettingPath, finish_attempt, report_detailed_diagnostics,
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
+use logging::{
+    LOG_FILE_LIMIT, LocalTime, QUIET_LOG_TARGETS, RotatingLogFile, console_ansi, console_log_layer,
+    resolved_log_file_path,
+};
+use state::startup::{claim_state, open_state_db};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -456,157 +463,6 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
     Ok(pid)
 }
 
-/// Opens the state db in file mode; db mode opened it with its revisions.
-/// Returns `(db, reset)`: `reset` asks for a corrupt, non-strict db to be
-/// moved aside once the instance lock is held.
-///
-/// Unless the db is strict, a db that is unavailable, unsafe or locked by
-/// `admin reset` leaves honk running without persistence; a newer schema or a
-/// foreign file still refuses startup, because only that binary can use it.
-fn open_state_db(
-    cli: &Cli,
-    config: &Config,
-    data_dir: &std::path::Path,
-    degradations: &degradations::Degradations,
-) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
-    let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
-    if cli.store == ConfigStore::Db
-        || !(config.experimental.cache_file.stores_selections()
-            || config.global.store_subscribe
-            || config.experimental.native_api.enabled
-            || config.experimental.native_api.password_auth)
-    {
-        return Ok((None, false));
-    }
-    match state::StateDb::open(data_dir) {
-        Ok(db) => Ok((Some(Arc::new(db)), false)),
-        Err(state::StateError::Corrupt) if !strict => {
-            warn!("state database is corrupt; it is moved aside once the instance lock is held");
-            Ok((None, true))
-        }
-        Err(
-            error @ (state::StateError::Unavailable
-            | state::StateError::Unsafe(_)
-            | state::StateError::Locked),
-        ) if !strict => {
-            warn!(%error, "continuing without persistence");
-            persistence_lost(data_dir, degradations, error);
-            Ok((None, false))
-        }
-        Err(error) => Err(anyhow::anyhow!("state database: {error}")),
-    }
-}
-
-/// Moves a corrupt, non-strict state db aside; any failure, including another
-/// process still holding the db, leaves honk running without persistence.
-fn reset_non_strict(
-    data_dir: &std::path::Path,
-    degradations: &degradations::Degradations,
-) -> Option<Arc<state::StateDb>> {
-    // `Ok(None)`: an earlier corrupt copy blocks the move, so the db stays corrupt.
-    let error = match state::reset_corrupt(data_dir) {
-        Ok(Some(db)) => return Some(Arc::new(db)),
-        Ok(None) => state::StateError::Corrupt,
-        Err(error) => {
-            warn!(%error, "state database could not be reset; continuing without persistence");
-            error
-        }
-    };
-    persistence_lost(data_dir, degradations, error);
-    None
-}
-
-fn persistence_lost(
-    data_dir: &std::path::Path,
-    degradations: &degradations::Degradations,
-    error: state::StateError,
-) {
-    let rule = match error {
-        state::StateError::Unsafe(refusal) => {
-            let path = data_dir.join(refusal.target.relative_path());
-            warn!(
-                path = %path.display(),
-                rule = refusal.rule.as_str(),
-                fix = %refusal.fix(&path),
-                "state database path is unsafe"
-            );
-            Some(refusal.rule.as_str())
-        }
-        _ => None,
-    };
-    degradations.set_with_rule(
-        degradations::Component::Persistence,
-        degradations::Issue {
-            code: "persistence_unavailable",
-            message: "The state database is unavailable; runtime state is not kept across restarts.",
-            reason: error.reason(),
-        },
-        rule,
-    );
-}
-
-/// The state db and subscription store for this run.
-struct ClaimedState {
-    state_db: Option<Arc<state::StateDb>>,
-    subscriptions: Option<subscription::SubscriptionStore>,
-}
-
-/// Startup changes to the state db, made with the instance lock held: the
-/// reset of a corrupt non-strict db, clearing disabled owners' tables, and the
-/// legacy `.sub` import and removal. The previous instance has exited, so a
-/// legacy body it wrote last is copied before its store is removed.
-fn claim_state(
-    state_db: Option<Arc<state::StateDb>>,
-    reset: bool,
-    config: &Config,
-    data_dir: &std::path::Path,
-    legacy_roots: impl IntoIterator<Item = PathBuf>,
-    degradations: &degradations::Degradations,
-) -> ClaimedState {
-    let state_db = if reset {
-        reset_non_strict(data_dir, degradations)
-    } else {
-        state_db
-    };
-    if let Some(state) = state_db.as_ref() {
-        let experimental = &config.experimental;
-        let owners = state::ActiveOwners {
-            cache: experimental.cache_file.stores_selections(),
-            dns: experimental.cache_file.stores_dns(),
-            clash: experimental.cache_file.stores_mode()
-                && cfg!(feature = "clash-api")
-                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
-                && !experimental.clash_api.external_controller.is_empty(),
-            subscriptions: config.global.store_subscribe,
-        };
-        if let Err(error) = state::clear_inactive(state, owners) {
-            warn!(%error, "state database: clearing tables of disabled owners failed");
-        }
-    }
-    let subscriptions = match state_db.as_ref().filter(|_| config.global.store_subscribe) {
-        Some(state) => {
-            if let Some(legacy) = subscription::LegacySubscriptionStore::import(
-                state,
-                legacy_roots,
-                &config.subscriptions,
-            ) {
-                legacy.remove();
-            }
-            Some(subscription::SubscriptionStore::new(Arc::clone(state)))
-        }
-        None => {
-            if config.global.store_subscribe {
-                warn!("Subscription store unavailable; continuing without persistence");
-            }
-            None
-        }
-    };
-    ClaimedState {
-        state_db,
-        subscriptions,
-    }
-}
-
 /// Take the process-wide instance lock: the datapath uses fixed names
 /// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
 /// them, so a second instance must never start while the first is still
@@ -769,22 +625,6 @@ fn prepare_runtime_data_dir(
     prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
 }
 
-/// Log timestamps in the machine's local time zone with its UTC offset,
-/// e.g. `2026-09-12T02:30:15.123456+10:00`. The default timer prints UTC,
-/// which does not line up with a router's syslog or an operator's clock.
-/// chrono reads the zone itself, so this stays sound after threads exist.
-struct LocalTime;
-
-impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(
-            w,
-            "{}",
-            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
-        )
-    }
-}
-
 /// A valid cached Clash mode, else `default_mode`, else `Rule`.
 #[cfg(feature = "clash-api")]
 fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &str) -> String {
@@ -793,172 +633,6 @@ fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &st
         .and_then(|mode| mode::ModeState::normalize(&mode))
         .or_else(|| mode::ModeState::normalize(default_mode))
         .unwrap_or_else(|| "Rule".to_owned())
-}
-
-/// quinn logs every endpoint-driver death at ERROR; probe/warm endpoints over
-/// retiring AnyTLS sessions die as a matter of course (the SYNACK watchdog
-/// kills them on purpose), so that target is silenced unless `RUST_LOG` says
-/// otherwise.
-const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off";
-
-/// Colour belongs on a terminal only: a service manager (procd, syslog) stores
-/// the escape codes verbatim. A non-empty `NO_COLOR` turns it off everywhere.
-fn console_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
-    is_terminal && no_color.is_none_or(|value| value.is_empty())
-}
-
-/// The console layer, with or without the local timestamp. The file layer
-/// always stamps: a file has no journal in front of it.
-fn console_log_layer<S, W, F>(
-    disable_timestamp: bool,
-    ansi: bool,
-    writer: W,
-    filter: F,
-) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
-    F: tracing_subscriber::layer::Filter<S> + Send + Sync + 'static,
-{
-    use tracing_subscriber::Layer as _;
-    if disable_timestamp {
-        Box::new(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_ansi(ansi)
-                .with_writer(writer)
-                .with_filter(filter),
-        )
-    } else {
-        Box::new(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_ansi(ansi)
-                .with_writer(writer)
-                .with_filter(filter),
-        )
-    }
-}
-
-fn resolved_log_file_path(
-    config: &Config,
-    cli_override: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    cli_override
-        .map(honk_config::paths::resolve_artifact_path)
-        .or_else(|| match config.global.log_file.trim() {
-            "" => None,
-            path => Some(honk_config::paths::resolve_artifact_path(path)),
-        })
-}
-
-fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            anyhow::anyhow!("create log directory {}: {error}", parent.display())
-        })?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "log destination is not a regular file: {}",
-        path.display()
-    );
-    Ok(file)
-}
-
-/// The log file rotates at this size: it becomes `<name>.1`, replacing an
-/// older copy, so the file and its copy together stay under twice the limit.
-const LOG_FILE_LIMIT: u64 = 10 * 1024 * 1024;
-
-/// The tracing writer for `global.log_file`, rotating at `limit`.
-struct RotatingLogFile {
-    path: std::path::PathBuf,
-    file: std::fs::File,
-    size: u64,
-    limit: u64,
-    /// Set when a rotation failed: no further attempts, and the current file
-    /// takes lines only up to twice the limit.
-    stuck: bool,
-    /// Whether the one warning about dropped lines was printed.
-    dropping: bool,
-    #[cfg(test)]
-    fail_reopen: bool,
-}
-
-impl RotatingLogFile {
-    fn open(path: &std::path::Path, limit: u64) -> anyhow::Result<Self> {
-        let file = open_log_file(path)?;
-        let size = file.metadata()?.len();
-        Ok(Self {
-            path: path.to_path_buf(),
-            file,
-            size,
-            limit,
-            stuck: false,
-            dropping: false,
-            #[cfg(test)]
-            fail_reopen: false,
-        })
-    }
-
-    fn rotate(&mut self) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        // Another honk sharing the file during a restart handoff may have
-        // rotated it already; renaming then would overwrite its copy.
-        let ours = self.file.metadata()?;
-        let current = std::fs::symlink_metadata(&self.path).ok();
-        if current.is_some_and(|current| (current.dev(), current.ino()) == (ours.dev(), ours.ino()))
-        {
-            let mut rotated = self.path.clone().into_os_string();
-            rotated.push(".1");
-            std::fs::rename(&self.path, rotated)?;
-        }
-        #[cfg(test)]
-        if self.fail_reopen {
-            return Err(std::io::Error::other("injected reopen failure"));
-        }
-        // Opened with the same checks as the first file.
-        self.file = open_log_file(&self.path).map_err(std::io::Error::other)?;
-        self.size = self.file.metadata()?.len();
-        Ok(())
-    }
-}
-
-impl std::io::Write for RotatingLogFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let after = self.size.saturating_add(buf.len() as u64);
-        if !self.stuck && self.size > 0 && after > self.limit && self.rotate().is_err() {
-            self.stuck = true;
-        }
-        if self.stuck && after > self.limit.saturating_mul(2) {
-            if !self.dropping {
-                self.dropping = true;
-                // Not through tracing: this is the tracing writer.
-                eprintln!(
-                    "honk-core: log file {} could not be rotated; dropping log lines until restart",
-                    self.path.display()
-                );
-            }
-            return Ok(buf.len());
-        }
-        let written = self.file.write(buf)?;
-        self.size = self.size.saturating_add(written as u64);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
-    }
 }
 
 fn load_operator_config(
@@ -1685,6 +1359,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     info!("DNS forwarder ready");
 
+    #[cfg(feature = "native-api")]
+    let native_enabled = config.experimental.native_api.enabled;
     let mut control_plane = control::ControlPlane::new_with_upstream_pool_and_budget(
         config,
         ebpf_backend,
@@ -1695,6 +1371,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
         Arc::clone(&degradations),
     )?;
+    #[cfg(feature = "native-api")]
+    let native_observation = if native_enabled {
+        Some(native_api::observation::NativeObservation::attach(&mut control_plane).await)
+    } else {
+        None
+    };
     control_plane
         .install_startup_diagnostics(startup_diagnostics)
         .await;
@@ -1734,7 +1416,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .experimental
         .clash_api
         .clone();
-    let mode_db = control_plane.mode_db();
     let native_mode = cfg!(feature = "native-api")
         && control_plane
             .config_handle()
@@ -1743,44 +1424,39 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .experimental
             .native_api
             .enabled;
-    #[cfg(feature = "clash-api")]
-    let mode = if native_mode {
-        "Rule".to_owned()
-    } else {
-        startup_clash_mode(mode_db.as_deref(), &clash_cfg.default_mode)
-    };
-    #[cfg(not(feature = "clash-api"))]
-    let mode = "Rule".to_owned();
-    let (default_selection, valid_global_selections) = {
-        let config = control_plane.config_handle();
-        let config = config.read().await;
-        let selections = config
-            .groups
-            .iter()
-            .map(|group| group.name.clone())
-            .chain(config.nodes.iter().map(|node| node.name.clone()))
-            .collect::<Vec<_>>();
-        (selections.first().cloned().unwrap_or_default(), selections)
-    };
-    let global_selection = if native_mode {
-        String::new()
-    } else {
-        mode_db
-            .as_ref()
-            .and_then(|db| db.load_clash_global())
-            .filter(|selection| {
-                valid_global_selections
+    let mode_value = match native_mode {
+        #[cfg(feature = "native-api")]
+        true => mode::ModeState::native(),
+        #[cfg(not(feature = "native-api"))]
+        true => unreachable!("native mode needs the native-api feature"),
+        false => {
+            let mode_db = control_plane.mode_db();
+            #[cfg(feature = "clash-api")]
+            let mode = startup_clash_mode(mode_db.as_deref(), &clash_cfg.default_mode);
+            #[cfg(not(feature = "clash-api"))]
+            let mode = "Rule".to_owned();
+            let (default_selection, valid_global_selections) = {
+                let config = control_plane.config_handle();
+                let config = config.read().await;
+                let selections = config
+                    .groups
                     .iter()
-                    .any(|valid| valid == selection)
-            })
-            .unwrap_or(default_selection)
-    };
-    let mode_value = mode::ModeState::new(&mode, global_selection);
-    #[cfg(feature = "native-api")]
-    let mode_value = if native_mode {
-        mode::ModeState::native()
-    } else {
-        mode_value
+                    .map(|group| group.name.clone())
+                    .chain(config.nodes.iter().map(|node| node.name.clone()))
+                    .collect::<Vec<_>>();
+                (selections.first().cloned().unwrap_or_default(), selections)
+            };
+            let global_selection = mode_db
+                .as_ref()
+                .and_then(|db| db.load_clash_global())
+                .filter(|selection| {
+                    valid_global_selections
+                        .iter()
+                        .any(|valid| valid == selection)
+                })
+                .unwrap_or(default_selection);
+            mode::ModeState::new(&mode, global_selection)
+        }
     };
     let mode_state: mode::SharedModeState =
         std::sync::Arc::new(parking_lot::RwLock::new(mode_value));
@@ -1788,31 +1464,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     control_plane.start_datapath_flags_coordinator()?;
 
     #[cfg(feature = "native-api")]
-    let native_server = {
-        let settings = control_plane
-            .config_handle()
-            .read()
-            .await
-            .experimental
-            .native_api
-            .clone();
-        if settings.enabled {
-            let listener = tokio::net::TcpListener::bind(&settings.listen)
-                .await
-                .map_err(|_| anyhow::anyhow!("native API listener bind failed"))?;
-            let listen = listener.local_addr()?;
-            let state =
-                native_api::NativeState::new(&mut control_plane, listen, started_at, started)
-                    .await?;
-            let logs = &control_plane.native_observation().logs;
-            logs.attach_engine_level(engine_level);
-            native_log_binding.bind(std::sync::Arc::downgrade(logs));
-            let server = native_api::NativeServer::start(listener, std::sync::Arc::new(state));
-            info!(%listen, message = "native API listener ready");
-            Some(server)
-        } else {
-            None
-        }
+    let mut native = match native_observation {
+        Some(observation) => Some(
+            native_api::NativeRuntime::start(
+                &mut control_plane,
+                observation,
+                started_at,
+                started,
+                engine_level,
+                &native_log_binding,
+            )
+            .await?,
+        ),
+        None => None,
     };
 
     // Starts only when external_controller is configured; bind/parse
@@ -1875,7 +1539,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
-    #[cfg(feature = "native-api")]
     subscription_supervisor.route_through(download_route::SharedOutbounds {
         router: control_plane.traffic_router(),
         config: control_plane.config_handle(),
@@ -1886,57 +1549,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     subscription_supervisor.start(cmd_tx.clone());
     #[cfg(feature = "native-api")]
     control_plane.attach_subscriptions(subscription_supervisor.handle());
-    #[cfg(feature = "native-api")]
-    if control_plane
-        .config_handle()
-        .read()
-        .await
-        .experimental
-        .native_api
-        .enabled
-    {
-        control_plane
-            .native_observation()
-            .providers
-            .attach(subscription_supervisor.handle());
-    }
     let reload_subscription_supervisor = subscription_supervisor.handle();
     #[cfg(feature = "native-api")]
-    let (config_coordinator, native_configuration) = {
-        let enabled = control_plane
-            .config_handle()
-            .read()
-            .await
-            .experimental
-            .native_api
-            .enabled;
-        if enabled {
-            let service = control_plane.native_observation().configuration.clone();
-            let store: std::sync::Arc<dyn native_api::store::SourceStore> = match database.take() {
-                Some(database) => database.store,
-                None => std::sync::Arc::new(native_api::store::FileStore::new(
-                    native_sources
-                        .as_ref()
-                        .and_then(|sources| sources.sources.first())
-                        .map_or_else(|| cli.config.clone(), |source| source.path.clone()),
-                )),
-            };
-            let owner = service
-                .start(
-                    Some(store),
+    let native_configuration = match native.as_mut() {
+        Some(native) => Some(
+            native
+                .start_configuration(
+                    &mut control_plane,
+                    database.take(),
                     native_sources,
-                    honk_config::paths::data_dir().to_path_buf(),
-                    control_plane.config_handle(),
-                    control_plane.log_files(),
-                    control_plane.diagnostics_handle(),
+                    &cli.config,
                     cmd_tx.clone(),
                     reload_subscription_supervisor.clone(),
                 )
-                .await;
-            (Some(owner), Some(service))
-        } else {
-            (None, None)
-        }
+                .await,
+        ),
+        None => None,
     };
 
     // SIGHUP handler: reload configuration from disk and push it to the
@@ -1982,7 +1610,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             #[cfg(feature = "native-api")]
                             sources: None,
                             #[cfg(feature = "native-api")]
-                            expected_revision: None,
+                            expected_group_revision: None,
                             #[cfg(feature = "native-api")]
                             deferred_provider: None,
                         })
@@ -2010,7 +1638,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
-    #[cfg(feature = "native-api")]
     let shutdown_intent = control_plane.shutdown_intent();
     let sig_handle = tokio::spawn(async move {
         // The shell may start us with SIGINT/SIGTERM ignored (e.g. background
@@ -2034,7 +1661,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
-        #[cfg(feature = "native-api")]
         shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
@@ -2049,18 +1675,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let control_result = control_plane.run().await;
     #[cfg(feature = "native-api")]
-    if let Some(coordinator) = config_coordinator {
-        coordinator.shutdown().await;
-    }
-    #[cfg(feature = "native-api")]
-    {
-        if control_result.is_err() {
-            control_plane.publish_phase(control::EnginePhase::Failed);
-        }
-        if let Some(server) = native_server {
-            server.shutdown().await;
-        }
-    }
+    native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -2682,98 +2297,13 @@ fn is_mountpoint(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod local_time_tests {
-    use tracing_subscriber::fmt::time::FormatTime;
-
-    #[test]
-    fn test_log_timestamp_carries_the_local_utc_offset() {
-        let mut out = String::new();
-        super::LocalTime
-            .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut out))
-            .unwrap();
-        // 2026-09-12T02:30:15.123456+10:00 — date, time with microseconds, signed offset.
-        let (stamp, offset) = out.split_at(out.len() - 6);
-        assert_eq!(stamp.len(), 26, "{out}");
-        assert_eq!(&stamp[10..11], "T", "{out}");
-        assert!(offset.starts_with('+') || offset.starts_with('-'), "{out}");
-        assert_eq!(&offset[3..4], ":", "{out}");
-        let expected = chrono::Local::now().format("%:z").to_string();
-        assert_eq!(offset, expected, "{out}");
-    }
-
-    /// `--disable-timestamp` drops the stamp from the console line only.
-    #[test]
-    fn test_disable_timestamp_omits_the_console_stamp() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::prelude::*;
-
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let render = |disable_timestamp: bool| {
-            let sink = Sink::default();
-            let writer = sink.clone();
-            let layer = super::console_log_layer(
-                disable_timestamp,
-                true,
-                move || writer.clone(),
-                tracing_subscriber::EnvFilter::new("info"),
-            );
-            let subscriber = tracing_subscriber::registry().with(layer);
-            tracing::subscriber::with_default(subscriber, || {
-                tracing::info!("stamp probe");
-            });
-            let bytes = sink.0.lock().unwrap().clone();
-            let text = String::from_utf8(bytes).unwrap();
-            // The console layer keeps its colours; strip the SGR sequences.
-            let mut plain = String::new();
-            let mut rest = text.as_str();
-            while let Some(start) = rest.find("\u{1b}[") {
-                plain.push_str(&rest[..start]);
-                let after = &rest[start + 2..];
-                rest = after.find('m').map_or("", |end| &after[end + 1..]);
-            }
-            plain.push_str(rest);
-            plain
-        };
-
-        let stamped = render(false);
-        assert!(stamped.starts_with("20"), "{stamped:?}");
-        assert!(stamped.contains(" INFO "), "{stamped:?}");
-        let bare = render(true);
-        assert!(bare.trim_start().starts_with("INFO "), "{bare:?}");
-        assert!(bare.contains("stamp probe"), "{bare:?}");
-    }
-
-    /// Colour only on a terminal, and never when `NO_COLOR` is set non-empty.
-    #[test]
-    fn test_console_colour_needs_a_terminal_and_no_no_color() {
-        use std::ffi::OsStr;
-
-        assert!(super::console_ansi(true, None));
-        assert!(super::console_ansi(true, Some(OsStr::new(""))));
-        assert!(!super::console_ansi(true, Some(OsStr::new("1"))));
-        assert!(!super::console_ansi(false, None));
-        assert!(!super::console_ansi(false, Some(OsStr::new("1"))));
-    }
-}
-
-#[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, RotatingLogFile, load_operator_config, open_log_file,
-        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
-        publish_instance_pid, running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, load_operator_config, prepare_nfqueue_startup,
+        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
+        running_instance_pid,
     };
+    use crate::logging::open_log_file;
     use clap::Parser;
 
     #[test]
@@ -2782,7 +2312,7 @@ mod startup_lifecycle_tests {
         drop(crate::state::StateDb::open(directory.path()).unwrap());
         let held = crate::state::StateDb::open(directory.path()).unwrap();
         let degradations = crate::degradations::Degradations::default();
-        assert!(super::reset_non_strict(directory.path(), &degradations).is_none());
+        assert!(crate::state::startup::reset_non_strict(directory.path(), &degradations).is_none());
         let issue = degradations
             .get(crate::degradations::Component::Persistence)
             .expect("the failed reset is reported");
@@ -3109,144 +2639,5 @@ mod startup_lifecycle_tests {
         let rendered = error.to_string();
         assert!(rendered.contains("node ID duplicates another node"));
         assert!(!rendered.contains("configuration validation failed"));
-    }
-}
-
-#[cfg(test)]
-mod state_claim_tests {
-    use std::path::PathBuf;
-
-    use clap::Parser as _;
-
-    fn legacy_store(
-        root: &std::path::Path,
-        subscriptions: &[&honk_config::subscription::Subscription],
-    ) {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        if !root.exists() {
-            std::fs::create_dir(root).unwrap();
-            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        for sub in subscriptions {
-            let path = root.join(crate::subscription::SubscriptionStore::key(sub));
-            std::fs::write(&path, format!("socks5://127.0.0.1:1080#{}", sub.url)).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-    }
-
-    fn subscription(name: &str) -> honk_config::subscription::Subscription {
-        honk_config::subscription::Subscription {
-            url: format!("https://example.invalid/{name}"),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_successor_without_the_instance_lock_leaves_the_state_alone() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let directory = tempfile::tempdir().unwrap();
-        let lock_path = directory.path().join("honk-core.lock");
-        let _held = nix::fcntl::Flock::lock(
-            std::fs::File::create(&lock_path).unwrap(),
-            nix::fcntl::FlockArg::LockExclusiveNonblock,
-        )
-        .unwrap();
-        super::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = Some(lock_path.clone()));
-
-        // One data directory without a db, and one whose db and legacy store
-        // belong to the running instance.
-        let empty = directory.path().join("empty");
-        let running = directory.path().join("running");
-        for data_dir in [&empty, &running] {
-            std::fs::create_dir(data_dir).unwrap();
-            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let sub = subscription("kept");
-        legacy_store(&running.join(".sub"), &[&sub]);
-        drop(crate::state::StateDb::open(&running).unwrap());
-        let snapshot = |data_dir: &std::path::Path| {
-            let mut entries: Vec<_> = walk(data_dir);
-            entries.sort();
-            entries
-        };
-        let before = snapshot(&running);
-
-        for data_dir in [&empty, &running] {
-            let config = directory.path().join(format!(
-                "{}.dae",
-                data_dir.file_name().unwrap().to_string_lossy()
-            ));
-            std::fs::write(
-                &config,
-                format!(
-                    "global {{\n data_dir: '{}'\n store_subscribe: true\n}}\nsubscription {{\n '{}'\n}}\n",
-                    data_dir.display(),
-                    sub.url
-                ),
-            )
-            .unwrap();
-            let cli = super::Cli::parse_from([
-                "honk-core",
-                "--mock-ebpf",
-                "-c",
-                config.to_str().unwrap(),
-            ]);
-            let error = super::run(cli).await.unwrap_err();
-            assert!(error.to_string().contains("refusing to start"), "{error:#}");
-        }
-        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
-        assert_eq!(snapshot(&running), before);
-        super::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = None);
-    }
-
-    fn walk(root: &std::path::Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(root).unwrap() {
-            let entry = entry.unwrap();
-            let metadata = entry.metadata().unwrap();
-            if metadata.is_dir() {
-                entries.extend(walk(&entry.path()));
-            }
-            entries.push((entry.path(), metadata.len(), metadata.modified().unwrap()));
-        }
-        entries
-    }
-
-    #[test]
-    fn a_reset_state_db_backs_the_subscription_store() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let directory = tempfile::tempdir().unwrap();
-        let state_dir = directory.path().join(crate::state::STATE_DIR);
-        std::fs::create_dir(&state_dir).unwrap();
-        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let file = state_dir.join(crate::state::DB_FILE);
-        std::fs::write(&file, vec![0x5a; 8192]).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let cli = super::Cli::parse_from(["honk-core"]);
-        let mut config = honk_config::Config::default();
-        config.global.store_subscribe = true;
-
-        let degradations = crate::degradations::Degradations::default();
-        let (db, reset) =
-            super::open_state_db(&cli, &config, directory.path(), &degradations).unwrap();
-        assert!(db.is_none() && reset);
-        let claimed = super::claim_state(
-            db,
-            reset,
-            &config,
-            directory.path(),
-            [directory.path().join(".sub")],
-            &degradations,
-        );
-        assert!(claimed.state_db.is_some());
-        assert!(
-            degradations.snapshot().is_empty(),
-            "a successful reset degrades nothing"
-        );
-        assert!(claimed.subscriptions.is_some());
-        assert!(state_dir.join("honk.db.corrupt").exists());
     }
 }

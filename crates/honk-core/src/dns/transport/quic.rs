@@ -156,9 +156,10 @@ async fn quic_connect(
         direct = direct_endpoint.get(addr.is_ipv6()).await?;
         &direct
     };
-    #[cfg(feature = "native-api")]
-    let mut observation =
-        honk_outbound::runtime::flow_observation::TransportAttempt::start(Some(addr), "unknown");
+    let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
+        Some(addr),
+        honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
+    );
     let handshake = async {
         let connecting = endpoint
             .connect_with(config.clone(), addr, sni)
@@ -175,15 +176,16 @@ async fn quic_connect(
             })
     }
     .await;
-    #[cfg(feature = "native-api")]
     if let Some(observation) = &mut observation {
         observation.finish(
             if handshake.is_ok() {
-                "succeeded"
+                honk_outbound::runtime::flow_observation::TransportStatus::Succeeded
             } else {
-                "failed"
+                honk_outbound::runtime::flow_observation::TransportStatus::Failed
             },
-            handshake.as_ref().err().map(|_| "quic_connect_failed"),
+            handshake.as_ref().err().map(|_| {
+                honk_outbound::runtime::flow_observation::TransportError::QuicConnectFailed
+            }),
         );
     }
     let connection = handshake?;

@@ -264,9 +264,9 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                 )
                 .delete(
                     |State(state): App, Extension(id): Id, request: Request| async move {
-                        let action = management::Action::DeleteNode(
+                        let action = management::Action::Delete(management::Mutation::DeleteNode(
                             path_id(request.uri().path()).to_owned(),
-                        );
+                        ));
                         respond(management::mutate(&state, action, request, &id).await, id)
                     },
                 ),
@@ -311,9 +311,10 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                 )
                 .delete(
                     |State(state): App, Extension(id): Id, request: Request| async move {
-                        let action = management::Action::DeleteProvider(
-                            path_id(request.uri().path()).to_owned(),
-                        );
+                        let action =
+                            management::Action::Delete(management::Mutation::DeleteProvider(
+                                path_id(request.uri().path()).to_owned(),
+                            ));
                         respond(management::mutate(&state, action, request, &id).await, id)
                     },
                 ),

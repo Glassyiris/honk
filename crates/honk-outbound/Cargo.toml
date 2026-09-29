@@ -65,7 +65,8 @@ tokio-rustls.workspace = true
 # descriptor facts stay unconditional; normal feature-off builds have neither
 # handlers nor VLESS runtime pools/carrier semaphores. Unit backend tests remain.
 rprx = []
-native-api = []
+flow-observation = []
+owned-tasks = []
 
 [[bench]]
 name = "ss_aead"

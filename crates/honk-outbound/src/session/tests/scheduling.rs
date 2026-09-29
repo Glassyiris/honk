@@ -360,9 +360,9 @@ async fn stream_capacity_race_is_a_health_neutral_refusal() {
         || async { unreachable!("the offered session has capacity") },
         |_session, _permit| async { Ok::<_, OpenError>(()) },
     );
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let (observer, events) = observation::capture();
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let open = observer.scope(open);
     let error = open
         .await
@@ -376,7 +376,7 @@ async fn stream_capacity_race_is_a_health_neutral_refusal() {
         crate::group::ScoreOutcome::Rejected
     );
     assert_eq!(session.state(), SessionState::Active);
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     assert_eq!(
         observation::outcomes(&events.lock()),
         [
@@ -424,7 +424,7 @@ async fn offer_registers_before_checking_capacity() {
     assert_eq!(session.active_streams(), 0);
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 mod observation {
     use super::*;
     use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
@@ -449,7 +449,7 @@ mod observation {
         events
             .iter()
             .filter_map(|event| match event {
-                FlowEvent::Session { reason, error } => Some((*reason, *error)),
+                FlowEvent::Session(event) => Some((event.reason(), event.error())),
                 _ => None,
             })
             .collect()

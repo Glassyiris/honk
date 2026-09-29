@@ -318,7 +318,7 @@ async fn cancelling_stalled_h2_probe_drops_its_driver_stream() {
     let _ = server.await;
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn native_h2_cold_and_warm_exchange_configured_request() {
     for cold in [true, false] {
@@ -378,7 +378,7 @@ async fn native_h2_cold_and_warm_exchange_configured_request() {
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn native_h2_rejects_bad_status_and_duplicate_status_without_warm_fallback() {
     for cold in [true, false] {
@@ -428,7 +428,7 @@ async fn native_h2_rejects_bad_status_and_duplicate_status_without_warm_fallback
     }
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn native_h2_cancellation_drops_stalled_driver_inline() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -148,11 +148,11 @@ pub(super) async fn deliver_source_reply(
             if !pool.source_flow_reply_admitted(owner, key, generation, token, &endpoint) {
                 return SourceReplyDisposition::Drop;
             }
-            #[cfg(feature = "native-api")]
-            endpoint.native_reply_received();
+            endpoint.native.reply_received();
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
-                #[cfg(feature = "native-api")]
-                endpoint.native_drop("reply_family_mismatch", Some("reply_family_mismatch"));
+                endpoint
+                    .native
+                    .dropped("reply_family_mismatch", Some("reply_family_mismatch"));
                 return SourceReplyDisposition::Drop;
             }
             #[cfg(test)]
@@ -173,8 +173,9 @@ pub(super) async fn deliver_source_reply(
                 .await,
                 Ok(Ok(_))
             ) {
-                #[cfg(feature = "native-api")]
-                endpoint.native_drop("client_delivery_failed", Some("client_send_failed"));
+                endpoint
+                    .native
+                    .dropped("client_delivery_failed", Some("client_send_failed"));
                 debug!("VLESS UDP source reply delivery failed");
                 return SourceReplyDisposition::Observed;
             }

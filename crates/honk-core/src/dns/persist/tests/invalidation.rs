@@ -23,10 +23,7 @@ async fn targeted_deletion_orders_queued_puts_preserves_unrelated_rows_and_rejec
         .invalidate(CacheInvalidation::Id(first_id))
         .await
         .unwrap();
-    assert_eq!(
-        (result.matched, result.deleted, result.persistent),
-        (1, 1, true)
-    );
+    assert_eq!((result.deleted, result.persistent), (1, true));
     assert!(service.entry_id(&first).is_none());
     assert!(service.entry_id(&second).is_some());
     persister.counters.queued.fetch_add(1, Ordering::Relaxed);

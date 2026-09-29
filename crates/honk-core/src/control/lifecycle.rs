@@ -4,14 +4,17 @@ use super::runtime::{
 use super::udp_ingress::{UdpLoopState, udp_listener_loop};
 use super::*;
 use std::collections::HashSet;
-#[cfg(feature = "native-api")]
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 mod teardown;
 
-const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for shutdown stages that have no natural deadline (watcher join,
+/// runtime-generation retirement, DNS controller/persistence close). The
+/// datapath hooks are already detached by then, so a hung stage must time
+/// out and log rather than leave the process half-torn-down forever.
+pub(super) const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BoundListeners {
     tcp4: tokio::io::unix::AsyncFd<std::net::TcpListener>,
@@ -22,12 +25,12 @@ struct BoundListeners {
     nfqueue_enabled: bool,
 }
 
-struct RuntimeEpoch {
+pub(super) struct RuntimeEpoch {
     listeners: BoundListeners,
     stop: watch::Sender<bool>,
     ingress: JoinSet<()>,
     tcp: JoinSet<()>,
-    maintenance: [Option<tokio::task::JoinHandle<()>>; 7],
+    maintenance: OwnedTasks,
     dns: Option<dns_listener::DnsListener>,
     janitor: Option<tokio::task::JoinHandle<()>>,
     removals: Option<tokio::task::JoinHandle<()>>,
@@ -36,14 +39,6 @@ struct RuntimeEpoch {
     health_updates: Option<HealthUpdates>,
     #[cfg(feature = "ebpf")]
     queue: Option<NfqueueRuntime>,
-}
-
-impl Drop for RuntimeEpoch {
-    fn drop(&mut self) {
-        for task in self.maintenance.iter().flatten() {
-            task.abort();
-        }
-    }
 }
 
 type HealthUpdateKey = (uuid::Uuid, u32, u32);
@@ -209,9 +204,6 @@ impl ControlPlane {
                 }
             };
 
-        #[cfg(all(test, feature = "native-api"))]
-        tests::enable_udp_provenance(&udp4_sockets, &udp6_sockets)?;
-
         Ok(BoundListeners {
             tcp4: tcp4_listener,
             tcp6: tcp6_listener,
@@ -347,7 +339,7 @@ impl ControlPlane {
             stop,
             ingress: JoinSet::new(),
             tcp: JoinSet::new(),
-            maintenance: std::array::from_fn(|_| None),
+            maintenance: OwnedTasks::default(),
             janitor: None,
             removals: None,
             removal_errors,
@@ -363,9 +355,7 @@ impl ControlPlane {
                     self.concurrency_limit.clone(),
                     self.stats.clone(),
                     self.drain_tracker.clone(),
-                    #[cfg(feature = "native-api")]
                     self.native.clone(),
-                    #[cfg(feature = "native-api")]
                     self.diagnostics.clone(),
                 )?);
             }
@@ -473,7 +463,9 @@ impl ControlPlane {
             // Preparation has not opened admission. Cleanup must not borrow the
             // terminal process shutdown path or discard retained API owners.
             if let Err(cleanup) = self.stop_network_epoch(Some(&mut epoch)).await {
-                return Err(anyhow::Error::new(EpochCleanupFailure(cleanup)).context(error));
+                return Err(cleanup
+                    .context("runtime candidate cleanup failed")
+                    .context(error));
             }
             return Err(error);
         }
@@ -505,48 +497,44 @@ impl ControlPlane {
         let registry = self.runtime_registry.clone();
         let dns = self.dns_controller.runtime_provider();
         let groups = self.group_manager.clone();
-        epoch.maintenance = [
-            self.udp_pool.spawn_janitor(),
-            self.sniffer_pool.spawn_janitor(),
-            super::tcp_sniff::spawn_sniff_neg_cache_janitor(self.tcp_sniff_neg_cache.clone()),
-            self.connection_pool.spawn_janitor(),
-            tokio::spawn(run_tcp_admission_scaler(
-                self.concurrency_limit.clone(),
-                self.resource_budget,
-                self.stats.clone(),
-                self.tcp_admission_target.clone(),
-            )),
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+        let tasks = &mut epoch.maintenance.0;
+        tasks.push(self.udp_pool.spawn_janitor());
+        tasks.push(self.sniffer_pool.spawn_janitor());
+        tasks.push(super::tcp_sniff::spawn_sniff_neg_cache_janitor(
+            self.tcp_sniff_neg_cache.clone(),
+        ));
+        tasks.push(self.connection_pool.spawn_janitor());
+        tasks.push(tokio::spawn(run_tcp_admission_scaler(
+            self.concurrency_limit.clone(),
+            self.resource_budget,
+            self.stats.clone(),
+            self.tcp_admission_target.clone(),
+        )));
+        tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+            tick.tick().await;
+            loop {
                 tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    let now = std::time::Instant::now();
-                    registry.read().reap_idle_resources(now);
-                    dns.current().reap_idle_resources(now);
-                }
-            }),
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(5));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    let manager = groups.read().clone();
-                    manager.observe_transport_quality();
-                }
-            }),
-        ]
-        .map(Some);
+                let now = std::time::Instant::now();
+                registry.read().reap_idle_resources(now);
+                dns.current().reap_idle_resources(now);
+            }
+        }));
+        tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let manager = groups.read().clone();
+                manager.observe_transport_quality();
+            }
+        }));
         self.start_preconnect().await;
         let generation = self.runtime_registry.read().clone();
         self.start_udp_warm_coordinator(generation.clone()).await;
         self.start_selector_warm_coordinator(generation).await;
     }
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("runtime candidate cleanup failed: {0}")]
-struct EpochCleanupFailure(#[source] anyhow::Error);
 
 /// Whether `socket` records kernel UDP receive traces: `SO_RCVPRIORITY` where
 /// the kernel has it, otherwise the eBPF receive trace.
@@ -582,29 +570,19 @@ fn record_udp_trace(degradations: &crate::degradations::Degradations, unavailabl
 }
 
 async fn cleanup_stage<T>(future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    tokio::pin!(future);
-    match tokio::time::timeout(STAGE_TIMEOUT, &mut future).await {
-        Ok(result) => result,
-        Err(_) => {
-            // Retain the same future: its blocking tasks and transport joins
-            // remain owned even when the transition can no longer succeed.
-            let _ = future.await?;
-            anyhow::bail!("runtime cleanup exceeded its stop deadline")
-        }
-    }
+    tokio::time::timeout(STAGE_TIMEOUT, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("runtime cleanup exceeded its stop deadline"))?
 }
 
 async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
     let Some(handle) = task.as_mut() else {
         return Ok(());
     };
-    let result = tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await;
-    let result = match result {
+    let result = match tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await {
         Ok(result) => result.map_err(anyhow::Error::from),
         Err(_) => {
-            // A timeout is a failed transition, not permission to detach a
-            // blocking child. The epoch keeps ownership until its join settles.
-            let _ = handle.await;
+            handle.abort();
             Err(anyhow::anyhow!(
                 "owned runtime task exceeded its stop deadline"
             ))
@@ -614,9 +592,7 @@ async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Resul
     result
 }
 
-pub(super) async fn abort_and_join(
-    task: &mut Option<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<()> {
+async fn abort_and_join(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
     if let Some(handle) = task.as_ref() {
         handle.abort();
     }
@@ -629,6 +605,32 @@ pub(super) async fn abort_and_join(
             Ok(())
         }
         result => result,
+    }
+}
+
+/// Background tasks that are aborted when dropped.
+#[derive(Default)]
+pub(super) struct OwnedTasks(pub(super) Vec<tokio::task::JoinHandle<()>>);
+
+impl OwnedTasks {
+    /// Aborts every task, then joins each; cancellation is the expected exit.
+    pub(super) async fn abort_and_join(&mut self) -> anyhow::Result<()> {
+        for task in &self.0 {
+            task.abort();
+        }
+        let mut error = None;
+        for task in self.0.drain(..) {
+            retain_error(&mut error, abort_and_join(&mut Some(task)).await);
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for OwnedTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -674,13 +676,21 @@ impl RuntimeEpoch {
                 { std::future::pending::<EpochEvent>().await }
             } => event,
             command = commands.recv() => EpochEvent::Command(command),
-            result = self.tcp.join_next(), if !self.tcp.is_empty() => match result {
-                Some(Err(error)) if !error.is_cancelled() => EpochEvent::Fatal(error.into()),
-                _ => EpochEvent::Reaped,
-            },
+            result = self.tcp.join_next(), if !self.tcp.is_empty() => reap_tcp(result),
             result = accept_tcp_with_admission(&self.listeners.tcp4, self.listeners.tcp6.as_ref(), plane.concurrency_limit.clone(), plane.stats.clone()), if !plane.drain_tracker.should_reject() => EpochEvent::Accepted(result),
         }
     }
+}
+
+/// A connection task owns one flow; its panic must end that flow only,
+/// never the runtime epoch.
+fn reap_tcp(result: Option<Result<(), tokio::task::JoinError>>) -> EpochEvent {
+    if let Some(Err(error)) = result
+        && !error.is_cancelled()
+    {
+        error!(%error, "TCP connection task panicked");
+    }
+    EpochEvent::Reaped
 }
 
 impl ControlPlane {
@@ -697,18 +707,7 @@ impl ControlPlane {
         error.map_or(Ok(()), Err)
     }
 
-    fn shutdown_pending(&self) -> bool {
-        #[cfg(feature = "native-api")]
-        {
-            self.shutdown_requested.load(Ordering::Acquire)
-        }
-        #[cfg(not(feature = "native-api"))]
-        {
-            false
-        }
-    }
-
-    pub(super) async fn run_lifecycle(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut commands = self
             .command_rx
             .take()
@@ -728,8 +727,8 @@ impl ControlPlane {
         .await;
         let mut fatal = startup.err();
         if fatal.is_none() {
-            self.start_epoch_maintenance(epoch.as_mut().expect("startup epoch"))
-                .await;
+            let active = epoch.as_mut().expect("startup epoch");
+            self.start_epoch_maintenance(active).await;
             #[cfg(feature = "native-api")]
             self.publish_phase(EnginePhase::Running);
             #[cfg(target_os = "linux")]
@@ -738,121 +737,79 @@ impl ControlPlane {
             {
                 warn!(%error, "sd_notify readiness failed");
             }
-        }
-        while fatal.is_none() && !self.shutdown_pending() {
-            let event = match epoch.as_mut() {
-                Some(active) => active.next(self, &mut commands).await,
-                None => EpochEvent::Command(commands.recv().await),
-            };
-            match event {
-                EpochEvent::Command(command) => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    let drain = self.drain_tracker.clone();
-                    if !self
-                        .dispatch_control_command(command, &drain, &mut authorizations)
-                        .await
-                    {
-                        break;
+            while fatal.is_none() && !self.shutdown_requested.load(Ordering::Acquire) {
+                match active.next(self, &mut commands).await {
+                    EpochEvent::Command(command) => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        let drain = self.drain_tracker.clone();
+                        if !self
+                            .dispatch_control_command(command, &drain, &mut authorizations)
+                            .await
+                        {
+                            break;
+                        }
                     }
-                }
-                EpochEvent::Fatal(error) => fatal = Some(error),
-                #[cfg(feature = "ebpf")]
-                EpochEvent::TokenExhausted => {
-                    if let Some(queue) = epoch.as_mut().and_then(|epoch| epoch.queue.as_mut())
-                        && let Err(error) = self.recover_nfqueue_token_exhaustion(queue).await
-                    {
-                        fatal = Some(error);
+                    EpochEvent::Fatal(error) => fatal = Some(error),
+                    #[cfg(feature = "ebpf")]
+                    EpochEvent::TokenExhausted => {
+                        if let Some(queue) = active.queue.as_mut()
+                            && let Err(error) = self.recover_nfqueue_token_exhaustion(queue).await
+                        {
+                            fatal = Some(error);
+                        }
                     }
-                }
-                EpochEvent::Reaped => {}
-                EpochEvent::Accepted(Ok((stream, address, family, permit))) => {
-                    if self.drain_tracker.should_reject() {
-                        continue;
-                    }
-                    if let Err(error) = set_so_mark_zero(&stream) {
-                        warn!(%error, "failed to clear accepted socket bypass mark");
-                    }
-                    let handle = self.spawn_handle();
-                    let guard = ConnectionGuard::new(self.drain_tracker.clone());
-                    let flow = self.stats.track_tcp_flow();
-                    epoch
-                        .as_mut()
-                        .expect("accepted epoch")
-                        .tcp
-                        .spawn(async move {
+                    EpochEvent::Reaped => {}
+                    EpochEvent::Accepted(Ok((stream, address, family, permit))) => {
+                        if self.drain_tracker.should_reject() {
+                            continue;
+                        }
+                        if let Err(error) = set_so_mark_zero(&stream) {
+                            warn!(%error, "failed to clear accepted socket bypass mark");
+                        }
+                        let handle = self.spawn_handle();
+                        let guard = ConnectionGuard::new(self.drain_tracker.clone());
+                        let flow = self.stats.track_tcp_flow();
+                        active.tcp.spawn(async move {
                             let (_permit, _guard, _flow) = (permit, guard, flow);
                             if let Err(error) = handle.serve_connection(stream, address).await {
                                 debug!(%error, family, "TCP connection ended");
                             }
                         });
-                }
-                EpochEvent::Accepted(Err(error)) => {
-                    error!(%error, "TPROXY TCP accept failed");
-                    if error.raw_os_error() == Some(libc::EMFILE) {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    EpochEvent::Accepted(Err(error)) => {
+                        error!(%error, "TPROXY TCP accept failed");
+                        if error.raw_os_error() == Some(libc::EMFILE) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
             }
         }
-        if fatal.is_some() {
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-        #[cfg(feature = "native-api")]
-        self.publish_phase(if fatal.is_some() {
-            EnginePhase::Failed
-        } else {
-            EnginePhase::Draining
-        });
-        retain_error(&mut fatal, self.fence_runtime().await);
-        #[cfg(feature = "ebpf")]
-        if let Some(watcher) = self.iface_watcher.take() {
-            watcher.shutdown(STAGE_TIMEOUT).await;
-        }
-        // No watcher can reattach after this terminal boundary.
-        retain_error(&mut fatal, self.ebpf.write().await.detach_hooks());
-        if self.health_task.is_some() {
-            retain_error(
-                &mut fatal,
-                cleanup_stage(async {
-                    self.alive_set
-                        .shutdown_health_checks()
-                        .await
-                        .map_err(anyhow::Error::from)
-                })
-                .await,
-            );
-        }
-        retain_error(&mut fatal, joined(&mut self.health_task).await);
-        #[cfg(feature = "native-api")]
-        if let Some(native) = &self.native {
-            retain_error(
-                &mut fatal,
-                cleanup_stage(async { native.probes.pause().await.map_err(anyhow::Error::from) })
-                    .await,
-            );
-        }
-        #[cfg(feature = "clash-api")]
-        {
-            let mut slot = self.ui_download.lock().await;
-            if let Some(download) = slot.as_mut() {
-                retain_error(&mut fatal, cleanup_stage(download.stop_and_join()).await);
-            }
-            slot.take();
-        }
-        if fatal.is_none() && self.is_datapath_healthy() && epoch.is_some() {
-            retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
-        }
-        retain_error(&mut fatal, self.stop_network_epoch(epoch.as_mut()).await);
-        if let Some(flags) = &self.datapath_flags {
-            retain_error(&mut fatal, flags.disable().await);
-        }
-        retain_error(&mut fatal, self.finalize_shutdown().await);
-        fatal.map_or(Ok(()), Err)
+        self.shutdown_runtime(epoch.as_mut(), fatal).await
     }
 }
 
 #[cfg(all(test, feature = "native-api"))]
 mod tests;
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_panicked_or_cancelled_connection_task_is_reaped_not_fatal() {
+        let mut tasks = JoinSet::<()>::new();
+        tasks.spawn(async { panic!("connection bug") });
+        let panicked = tasks.join_next().await;
+        assert!(matches!(&panicked, Some(Err(error)) if error.is_panic()));
+        assert!(matches!(reap_tcp(panicked), EpochEvent::Reaped));
+
+        tasks.spawn(std::future::pending::<()>());
+        tasks.abort_all();
+        let cancelled = tasks.join_next().await;
+        assert!(matches!(&cancelled, Some(Err(error)) if error.is_cancelled()));
+        assert!(matches!(reap_tcp(cancelled), EpochEvent::Reaped));
+    }
+}

@@ -113,7 +113,7 @@ async fn raw_probe_keeps_family_and_typed_health_out_of_http_ranking() {
     assert_eq!(result["result"]["results"][0]["warmth"], "cold");
     assert_eq!(result["result"]["results"][1]["state"], "unknown");
     assert_eq!(result["result"]["results"][1]["health_updated"], false);
-    let samples = state.alive_set.native_observations(id);
+    let samples = state.alive_set.health_observations(id);
     assert!(
         samples
             .iter()
@@ -209,7 +209,7 @@ async fn duplicate_group_members_share_execution_but_keep_both_associations() {
         .groups
         .push(serde_json::from_value(json!({"name":"root","groups":["left","right"]})).unwrap());
     let state = state(config).await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let input = request(
         json!({"type":"group","group_id":identity.groups["root"]}),
         "tcp_connect",
@@ -271,7 +271,7 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
             .unwrap(),
         );
         let state = state(config).await;
-        let identity = state.observation.catalog.snapshot();
+        let identity = state.observation.core.catalog.snapshot();
         let peer = tokio::spawn(async move {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -531,7 +531,7 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
     assert!(
         state
             .alive_set
-            .native_observations(honk_config::config::DIRECT_NODE_ID)
+            .health_observations(honk_config::config::DIRECT_NODE_ID)
             .is_empty()
     );
 }
@@ -547,7 +547,7 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
         config.groups.push(serde_json::from_value(json!({"name":format!("group-{index}"),"nodes":[honk_config::config::DIRECT_NODE_ID]})).unwrap());
     }
     let state = state(config).await;
-    let identity = state.observation.catalog.snapshot();
+    let identity = state.observation.core.catalog.snapshot();
     let (stop, receiver) = watch::channel(false);
     let worker = state.observation.probes.start(Arc::clone(&state), receiver);
     let mut held = Vec::new();
@@ -686,7 +686,7 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
     );
     let samples = state
         .alive_set
-        .native_observations(honk_config::config::DIRECT_NODE_ID);
+        .health_observations(honk_config::config::DIRECT_NODE_ID);
     for transport in [HealthTransport::Tcp, HealthTransport::Udp] {
         assert!(samples.iter().any(|sample| sample.transport == transport
             && sample.purpose == HealthPurpose::Dns
@@ -785,8 +785,8 @@ fn restricted_addresses_require_cidr_even_with_allowed_ports() {
     let policy = Policy::new(&config);
     assert!(!policy.address("::ffff:127.0.0.1".parse().unwrap()));
     assert!(!policy.address("169.254.169.254".parse().unwrap()));
-    assert!(policy.port(Kind::Http, 8080, false));
-    assert!(!policy.port(Kind::Dns, 443, false));
+    assert!(policy.port(8080, Kind::Http.default_port(false)));
+    assert!(!policy.port(443, Kind::Dns.default_port(false)));
     config.probe_allowed_cidrs = vec!["127.0.0.0/8".into()];
     assert!(Policy::new(&config).address("::ffff:127.0.0.1".parse().unwrap()));
 }
@@ -1025,7 +1025,7 @@ async fn ipv6_raw_probe_dials_the_requested_family_without_ipv4_fallback() {
     assert!(
         state
             .alive_set
-            .native_observations(id)
+            .health_observations(id)
             .iter()
             .all(|sample| sample.ip_version == IpVersion::V6)
     );

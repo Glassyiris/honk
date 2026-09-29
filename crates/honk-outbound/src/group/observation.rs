@@ -1,6 +1,6 @@
 //! Source-time policy facts; no target keys, scorer cells, or later state reads.
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ pub struct ObservedCandidate {
 pub(super) fn capture<'a>(
     build: impl FnOnce() -> ScoreSelectionPlan<'a>,
 ) -> ScoreSelectionPlan<'a> {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     if crate::runtime::flow_observation::current().is_some()
         && captured::CAPTURE.try_with(|_| ()).is_err()
     {
@@ -75,7 +75,7 @@ pub(super) fn decision<T>(
     effects: SelectionEffects,
     build: impl FnOnce() -> T,
 ) -> T {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     if let Ok(index) = captured::CAPTURE.try_with(|state| {
         let mut state = state.borrow_mut();
         if state.decisions.len() == 64 || !captured::safe_name(&group.name) {
@@ -112,16 +112,16 @@ pub(super) fn decision<T>(
 }
 
 pub(super) fn active() -> bool {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     return captured::DECISION
         .try_with(|index| index.is_some())
         .unwrap_or(false);
-    #[cfg(not(feature = "native-api"))]
+    #[cfg(not(feature = "flow-observation"))]
     false
 }
 
 pub(super) fn gap() {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     let _ = captured::CAPTURE.try_with(|state| state.borrow_mut().truncated = true);
 }
 
@@ -140,7 +140,7 @@ pub(super) fn member(
     eligible: Option<bool>,
     reason: &'static str,
 ) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         if state.rows == 256 {
             state.truncated = true;
@@ -170,7 +170,7 @@ pub(super) fn selected(candidate: Option<&Candidate<'_>>, reason: &'static str) 
 }
 
 pub(super) fn chosen(candidate: Option<&Candidate<'_>>) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         let member = candidate.and_then(|candidate| state.member(candidate.member()));
         let decision = &mut state.decisions[index];
@@ -186,13 +186,13 @@ pub(super) fn chosen(candidate: Option<&Candidate<'_>>) {
 }
 
 pub(super) fn reason(reason: &'static str) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| state.decisions[index].reason = reason);
     let _ = reason;
 }
 
 pub(super) fn previous(member: GroupMember<'_>) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         let member = state.member(member);
         state.decisions[index].previous_member = member;
@@ -214,7 +214,7 @@ pub(super) fn previous_tag(manager: &super::GroupManager, group: &Group, tag: &s
 }
 
 pub(super) fn previous_node(id: Uuid) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         let decision = &mut state.decisions[index];
         // Score retains a leaf, not the historical subgroup path that selected it.
@@ -225,7 +225,7 @@ pub(super) fn previous_node(id: Uuid) {
 }
 
 pub(super) fn metric(metric: &'static str, tolerance_ms: Option<f64>) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         state.decisions[index].metric = Some(metric);
         state.decisions[index].tolerance_ms = tolerance_ms.filter(|value| value.is_finite());
@@ -234,7 +234,7 @@ pub(super) fn metric(metric: &'static str, tolerance_ms: Option<f64>) {
 }
 
 pub(super) fn latency(id: Uuid, tag: &str, latency: std::time::Duration) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         let latency =
             (latency != std::time::Duration::MAX).then_some(latency.as_secs_f64() * 1000.0);
@@ -252,7 +252,7 @@ pub(super) fn latency(id: Uuid, tag: &str, latency: std::time::Duration) {
 }
 
 pub(super) fn latency_tier(candidate: &Candidate<'_>, demoted: bool) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         for row in &mut state.decisions[index].candidates {
             if row.leaf_node_id == Some(candidate.node.id)
@@ -270,7 +270,7 @@ pub(super) fn latency_tier(candidate: &Candidate<'_>, demoted: bool) {
 }
 
 pub(super) fn score(id: Uuid, score: f64) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         for row in &mut state.decisions[index].candidates {
             if row.leaf_node_id == Some(id) && row.eligible == Some(true) {
@@ -282,7 +282,7 @@ pub(super) fn score(id: Uuid, score: f64) {
 }
 
 pub(super) fn score_eligible(id: Uuid, eligible: bool) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         for row in &mut state.decisions[index].candidates {
             if row.leaf_node_id == Some(id) && row.eligible == Some(true) {
@@ -298,7 +298,7 @@ pub(super) fn score_eligible(id: Uuid, eligible: bool) {
 }
 
 pub(super) fn ordered(candidates: &[Candidate<'_>]) {
-    #[cfg(feature = "native-api")]
+    #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
         state.decisions[index].candidates.sort_by_key(|row| {
             candidates
@@ -313,7 +313,7 @@ pub(super) fn ordered(candidates: &[Candidate<'_>]) {
     let _ = candidates;
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(feature = "flow-observation")]
 mod captured {
     use super::*;
     use std::cell::RefCell;
