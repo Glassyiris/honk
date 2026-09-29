@@ -115,10 +115,21 @@ pub(crate) fn parse_name(
     start: usize,
     state: &mut NameParseState,
 ) -> Result<(DnsName, usize), QueryError> {
+    let mut wire = [0; 255];
+    let (length, end) = parse_name_into(raw, start, state, &mut wire)?;
+    Ok((DnsName(wire[..length].into()), end))
+}
+
+pub(crate) fn parse_name_into(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+    wire: &mut [u8; 255],
+) -> Result<(usize, usize), QueryError> {
     state.begin_name();
     let mut cursor = start;
     let mut end = None;
-    let mut wire = Vec::new();
+    let mut length = 0;
     loop {
         let octet = *raw.get(cursor).ok_or(QueryError::MalformedName)?;
         if octet & 0xc0 == 0xc0 {
@@ -134,25 +145,21 @@ pub(crate) fn parse_name(
         if octet & 0xc0 != 0 || octet > 63 {
             return Err(QueryError::MalformedName);
         }
-        wire.push(octet);
-        if wire.len() > 255 {
-            return Err(QueryError::MalformedName);
-        }
+        *wire.get_mut(length).ok_or(QueryError::MalformedName)? = octet;
+        length += 1;
         cursor += 1;
         if octet == 0 {
-            return Ok((DnsName(wire.into_boxed_slice()), end.unwrap_or(cursor)));
+            return Ok((length, end.unwrap_or(cursor)));
         }
-        let label_end = cursor
-            .checked_add(usize::from(octet))
-            .filter(|label_end| *label_end <= raw.len())
-            .ok_or(QueryError::MalformedName)?;
-        wire.extend_from_slice(
-            raw.get(cursor..label_end)
-                .ok_or(QueryError::MalformedName)?,
-        );
-        if wire.len() > 255 {
-            return Err(QueryError::MalformedName);
-        }
+        let label_end = cursor + usize::from(octet);
+        let output_end = length + usize::from(octet);
+        wire.get_mut(length..output_end)
+            .ok_or(QueryError::MalformedName)?
+            .copy_from_slice(
+                raw.get(cursor..label_end)
+                    .ok_or(QueryError::MalformedName)?,
+            );
+        length = output_end;
         cursor = label_end;
     }
 }

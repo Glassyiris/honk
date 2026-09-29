@@ -1582,7 +1582,7 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input '->'"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input '{'"
 
 [[case]]
 id = "honk-doc-en-configuration-04"
@@ -1710,13 +1710,24 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
-source = { file = "doc/en/reference/experimental.md", lines = "69-85" }
+source = { file = "doc/en/reference/experimental.md", lines = "146-157" }
 wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
 honk_diagnostics = []
 compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-experimental-02"
+source = { file = "doc/en/reference/experimental.md", lines = "161-166" }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+differences = [{ path = "sections[0]", dae = { absent = true }, honk = { items = [], name = "assets" }, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }, { path = "unknown_sections", dae = 1, honk = 0, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }]
 unknown_sections = 0
 
 [[case]]
@@ -1853,7 +1864,7 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub'compatible:'https://example.net/sub'('"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub''https://example.com/no_tag_link'detailed:'https://example.org/sub'{'"
 
 [[case]]
 id = "honk-doc-zh-configuration-01"
@@ -1888,7 +1899,7 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input '->'"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input '{'"
 
 [[case]]
 id = "honk-doc-zh-configuration-04"
@@ -2016,13 +2027,24 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
-source = { file = "doc/zh/reference/experimental.md", lines = "69-85" }
+source = { file = "doc/zh/reference/experimental.md", lines = "149-160" }
 wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
 honk_diagnostics = []
 compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-experimental-02"
+source = { file = "doc/zh/reference/experimental.md", lines = "164-169" }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+differences = [{ path = "sections[0]", dae = { absent = true }, honk = { items = [], name = "assets" }, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }, { path = "unknown_sections", dae = 1, honk = 0, reason = "assets is a honk root block; the pinned dae parser keeps it as an unknown section." }]
 unknown_sections = 0
 
 [[case]]
@@ -2159,7 +2181,7 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
-reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub'compatible:'https://example.net/sub'('"
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub''https://example.com/no_tag_link'detailed:'https://example.org/sub'{'"
 
 [[case]]
 id = "dae-docs-en-README-194-195"

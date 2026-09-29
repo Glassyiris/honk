@@ -11,6 +11,7 @@ use crate::proxy::{AsyncReadWrite, transport::maybe_tls_wrap};
 use crate::runtime::NodeRuntime;
 use crate::session::{OpenError, SessionPermit, SessionPool, SessionPoolConfig};
 use bytes::Bytes;
+use futures_util::FutureExt;
 use honk_config::node::Node;
 use parking_lot::Mutex;
 use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
@@ -183,11 +184,15 @@ impl XhttpRuntime {
             .xhttp
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no XHTTP runtime"))?;
-        let runtime = runtime.clone();
+        let dial_runtime = runtime.clone();
         anyhow::ensure!(!transport.is_retired(), "XHTTP runtime retired");
-        transport
-            .pool
-            .offer(move || Self::dial(runtime, Arc::new(Mutex::new(None)), timeout))
+        runtime
+            .scope_tasks(
+                transport
+                    .pool
+                    .offer(move || Self::dial(dial_runtime, Arc::new(Mutex::new(None)), timeout))
+                    .boxed(),
+            )
             .await?;
         Ok(())
     }
@@ -231,10 +236,17 @@ impl XhttpRuntime {
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, XhttpPreparation)> {
         let state = PreparationState::new(self.clone());
         let preparation = XhttpPreparation::new(state.clone());
-        let stream = tokio::select! {
-            result = self.open_inner(runtime, tcp, timeout, state) => result?,
-            _ = self.retired() => anyhow::bail!("XHTTP runtime retired"),
-        };
+        let stream = runtime
+            .scope_tasks(
+                async {
+                    tokio::select! {
+                        result = self.open_inner(runtime, tcp, timeout, state) => result,
+                        _ = self.retired() => anyhow::bail!("XHTTP runtime retired"),
+                    }
+                }
+                .boxed(),
+            )
+            .await?;
         Ok((stream, preparation))
     }
 
@@ -311,7 +323,7 @@ impl XhttpRuntime {
         // Unpublished runtimes have no pool-bound owner to supply replacement admission.
         let admission = crate::runtime::capture_dial_admission();
         let download_session = download.session.clone();
-        let driver = tokio::spawn(admission.scope(async move {
+        let driver = crate::runtime::spawn_owned(admission.scope(async move {
             let upload = async {
                 match upload {
                     Upload::Streaming(upload) => {
@@ -338,13 +350,14 @@ impl XhttpRuntime {
             if let Err(error) = result {
                 driver_flow.fail(error);
             }
-        }));
+        }))
+        .ok_or(crate::proxy::PacketRejection::Cancelled)?;
         Ok(Box::new(XhttpStream {
             download,
             flow,
             packet_flush_barriers: (template.mode == ResolvedMode::PacketUp)
                 .then(|| packet_flush_barriers(&runtime.node)),
-            driver: driver.abort_handle(),
+            driver,
             _runtime: runtime.clone(),
             _flow_permit: flow_permit,
             read_result: None,
