@@ -316,7 +316,7 @@ async fn shared_geoip_matchers_follow_reload_ownership() {
     use crate::configuration::SourceUpdate;
     use crate::dns::routing::{DnsResponseDecision, DnsRouter};
     use crate::routing::{
-        CompiledPredicate, GeoAssetSnapshot, GeoRequirements, GeoSourceSet, IpMatcher,
+        BinaryLpmTrie, CompiledPredicate, GeoAssetSnapshot, GeoRequirements, GeoSourceSet,
     };
 
     let mut cp = crate::control::tests::support::control_plane(Config::default());
@@ -380,7 +380,9 @@ async fn shared_geoip_matchers_follow_reload_ownership() {
         let CompiledPredicate::DestinationIp(routed) = routed else {
             panic!("expected a destination IP condition");
         };
-        let answered = Arc::clone(dns.answer_ip_matchers()[0]);
+        // Each matcher owns one trie, so trie identity is matcher identity.
+        let routed = Arc::clone(routed.trie());
+        let answered = Arc::clone(dns.answer_ip_tries()[0]);
         (router, dns, routed, answered)
     };
     let blocks = |router: &Router, ip: &str| {
@@ -400,7 +402,7 @@ async fn shared_geoip_matchers_follow_reload_ownership() {
         dns.select_response("lab.test", 1, &[ip.parse().unwrap()], "")
             == DnsResponseDecision::Reject
     };
-    let shared = |a: &Arc<IpMatcher>, b: &Arc<IpMatcher>| Arc::ptr_eq(a, b);
+    let shared = |a: &Arc<BinaryLpmTrie>, b: &Arc<BinaryLpmTrie>| Arc::ptr_eq(a, b);
 
     assert!(matches!(
         apply(&config, &initial).await,

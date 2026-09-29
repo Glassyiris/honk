@@ -806,12 +806,12 @@ fn equal_ip_networks_share_one_matcher_across_routing_and_dns() {
             _ => None,
         })
         .collect();
-    let answered = dns.answer_ip_matchers();
+    let answered = dns.answer_ip_tries();
     let [geo, geo_again, literal, negated] = routed[..] else {
         panic!("expected four destination IP conditions");
     };
     assert!(Arc::ptr_eq(geo, geo_again) && Arc::ptr_eq(geo, negated));
-    assert!(Arc::ptr_eq(geo, answered[0]) && Arc::ptr_eq(literal, answered[1]));
+    assert!(Arc::ptr_eq(geo.trie(), answered[0]) && Arc::ptr_eq(literal.trie(), answered[1]));
     assert!(!Arc::ptr_eq(geo, literal));
     assert_eq!(
         router.policy_fingerprint(),
@@ -835,10 +835,15 @@ fn equal_ip_networks_share_one_matcher_across_routing_and_dns() {
         assert_eq!(response(&dns), response(&unshared_dns), "{ip}");
     }
 
-    let old = Arc::downgrade(geo);
-    drop((router, dns));
+    let (matcher, trie) = (Arc::downgrade(geo), Arc::downgrade(geo.trie()));
+    drop(router);
     assert!(
-        old.upgrade().is_none(),
+        matcher.upgrade().is_none(),
+        "DNS must keep only the trie, not the network list"
+    );
+    drop(dns);
+    assert!(
+        trie.upgrade().is_none(),
         "the build must not outlive its routers"
     );
 }

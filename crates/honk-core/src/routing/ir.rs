@@ -31,12 +31,12 @@ pub enum CompiledPredicate {
 #[derive(Debug, Clone)]
 pub struct IpMatcher {
     nets: Vec<IpNet>,
-    trie: BinaryLpmTrie,
+    trie: Arc<BinaryLpmTrie>,
 }
 
 impl IpMatcher {
     pub(crate) fn new(nets: Vec<IpNet>) -> Self {
-        let trie = BinaryLpmTrie::from_nets(&nets);
+        let trie = Arc::new(BinaryLpmTrie::from_nets(&nets));
         Self { nets, trie }
     }
 
@@ -46,6 +46,10 @@ impl IpMatcher {
 
     pub fn matches(&self, ip: &IpAddr) -> bool {
         self.trie.matches(ip)
+    }
+
+    pub(crate) fn trie(&self) -> &Arc<BinaryLpmTrie> {
+        &self.trie
     }
 }
 
@@ -73,6 +77,11 @@ impl SharedMatchers {
     pub(crate) fn geosite(&mut self, code: &str, domains: &[GeositeDomain]) -> Arc<GeositeMatcher> {
         let matcher = self.geosite.entry(code.trim().to_lowercase());
         Arc::clone(matcher.or_insert_with(|| Arc::new(GeositeMatcher::build(domains))))
+    }
+
+    /// DNS answer matching needs only the trie; the nets stay in this build-local registry.
+    pub(crate) fn trie(&mut self, nets: Vec<IpNet>) -> Arc<BinaryLpmTrie> {
+        Arc::clone(self.ip(nets).trie())
     }
 
     /// Offers live matchers so a rebuild keeps them for unchanged network lists.

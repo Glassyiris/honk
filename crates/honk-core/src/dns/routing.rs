@@ -156,7 +156,7 @@ mod compiler {
                     nets.extend(assets.geoip_nets(geoip));
                     Ok(CompiledCond::Ip {
                         not: *not,
-                        matcher: shared.ip(nets),
+                        trie: shared.trie(nets),
                     })
                 }
             })
@@ -208,7 +208,7 @@ mod matcher {
     use std::net::IpAddr;
     use std::sync::Arc;
 
-    use crate::routing::{GeositeMatcher, IpMatcher};
+    use crate::routing::{BinaryLpmTrie, GeositeMatcher};
 
     #[derive(Clone)]
     pub(super) enum CompiledDomainMatcher {
@@ -259,7 +259,7 @@ mod matcher {
         },
         Ip {
             not: bool,
-            matcher: Arc<IpMatcher>,
+            trie: Arc<BinaryLpmTrie>,
         },
     }
 
@@ -324,8 +324,8 @@ mod matcher {
                 CompiledCond::Upstream { not, names } => {
                     (names.iter().any(|name| name == value.from_upstream), *not)
                 }
-                CompiledCond::Ip { not, matcher } => {
-                    (value.answer_ips.iter().any(|ip| matcher.matches(ip)), *not)
+                CompiledCond::Ip { not, trie } => {
+                    (value.answer_ips.iter().any(|ip| trie.matches(ip)), *not)
                 }
             };
             let result = matched != negated;
@@ -662,12 +662,13 @@ impl DnsRouter {
             .collect()
     }
 
-    pub(crate) fn answer_ip_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::IpMatcher>> {
+    #[cfg(test)]
+    pub(crate) fn answer_ip_tries(&self) -> Vec<&std::sync::Arc<crate::routing::BinaryLpmTrie>> {
         self.response_rules
             .iter()
             .flat_map(|rule| &rule.conditions)
             .filter_map(|condition| match condition {
-                matcher::CompiledCond::Ip { matcher, .. } => Some(matcher),
+                matcher::CompiledCond::Ip { trie, .. } => Some(trie),
                 _ => None,
             })
             .collect()
