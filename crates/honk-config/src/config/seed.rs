@@ -166,6 +166,7 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
             groups,
             subscriptions,
             experimental,
+            assets: Default::default(),
         })
     }
 }

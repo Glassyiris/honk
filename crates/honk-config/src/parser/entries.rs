@@ -3,6 +3,7 @@ use super::diagnostics::ParserDiagnostics;
 use super::lexer::Span;
 use super::read::Text;
 use crate::ConfigDiagnostic;
+use crate::assets::AssetsConfig;
 use crate::diagnostic::Severity;
 use crate::node::Node;
 use crate::subscription::{DeclaringSource, Subscription};
@@ -191,15 +192,17 @@ fn warn_glued_comment(tail: Text<'_, '_>, diagnostics: &mut ParserDiagnostics<'_
 
 pub(super) fn parse_subscription_section(
     section: &[Segment<'_, '_>],
+    assets: &AssetsConfig,
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<Vec<Subscription>, super::ParseFailure> {
-    parse_subscription_section_indexed(section, diagnostics, |_, _| {})
+    parse_subscription_section_indexed(section, assets, diagnostics, |_, _| {})
 }
 
 /// A legacy wrapper header may itself emit a subscription while owning other
 /// entries. Its absent span forbids deleting that header along with its children.
 pub(super) fn parse_subscription_section_indexed(
     section: &[Segment<'_, '_>],
+    assets: &AssetsConfig,
     diagnostics: &mut ParserDiagnostics<'_>,
     mut on_entry: impl FnMut(&Subscription, Option<Span>),
 ) -> Result<Vec<Subscription>, super::ParseFailure> {
@@ -212,6 +215,7 @@ pub(super) fn parse_subscription_section_indexed(
         for child in body {
             visit_subscription_segment(
                 &child,
+                assets,
                 diagnostics,
                 &mut subscriptions,
                 &mut entry_index,
@@ -224,6 +228,7 @@ pub(super) fn parse_subscription_section_indexed(
 
 fn visit_subscription_segment<'d, 'a>(
     segment: &Segment<'d, 'a>,
+    assets: &AssetsConfig,
     diagnostics: &mut ParserDiagnostics<'_>,
     subscriptions: &mut Vec<Subscription>,
     entry_index: &mut usize,
@@ -236,7 +241,8 @@ fn visit_subscription_segment<'d, 'a>(
     if let Some((tag, url)) = block {
         *entry_index += 1;
         diagnostics.subscription_text(Text::segment(segment).trim(), *entry_index);
-        let subscription = parse_subscription_block(segment, tag, url, *entry_index, diagnostics)?;
+        let subscription =
+            parse_subscription_block(segment, tag, url, *entry_index, assets, diagnostics)?;
         on_entry(&subscription, Some(segment.span()));
         subscriptions.push(subscription);
         return Ok(());
@@ -255,7 +261,7 @@ fn visit_subscription_segment<'d, 'a>(
         }
         *entry_index += 1;
         diagnostics.entry_text(entry, *entry_index);
-        if let Some((subscription, _)) = parse_subscription_entry(entry, diagnostics) {
+        if let Some((subscription, _)) = parse_subscription_entry(entry, assets, diagnostics) {
             on_entry(&subscription, None);
             subscriptions.push(subscription);
         }
@@ -263,6 +269,7 @@ fn visit_subscription_segment<'d, 'a>(
             for child in body {
                 visit_subscription_segment(
                     &child,
+                    assets,
                     diagnostics,
                     subscriptions,
                     entry_index,
@@ -279,7 +286,7 @@ fn visit_subscription_segment<'d, 'a>(
     }
     *entry_index += 1;
     diagnostics.entry_text(text, *entry_index);
-    if let Some((subscription, span)) = parse_subscription_entry(text, diagnostics) {
+    if let Some((subscription, span)) = parse_subscription_entry(text, assets, diagnostics) {
         on_entry(&subscription, Some(span));
         subscriptions.push(subscription);
     }
@@ -371,12 +378,13 @@ fn parse_subscription_block<'d, 'a>(
     tag: Text<'d, 'a>,
     url: Option<Text<'d, 'a>>,
     index: usize,
+    assets: &AssetsConfig,
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<Subscription, super::ParseFailure> {
     let mut subscription = Subscription {
         name: canonical_tag(tag),
         source: Some(DeclaringSource(Text::segment(segment).source.reference())),
-        ..Default::default()
+        ..assets.subscription_base()
     };
     let mut fields = SubscriptionFields {
         url,
@@ -441,6 +449,7 @@ fn parse_subscription_block<'d, 'a>(
 
 fn parse_subscription_entry(
     text: Text<'_, '_>,
+    assets: &AssetsConfig,
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Option<(Subscription, Span)> {
     if text.has_error() {
@@ -466,13 +475,14 @@ fn parse_subscription_entry(
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_default()
     };
+    let base = assets.subscription_base();
     Some((
         Subscription {
             name,
             url,
-            user_agent,
+            user_agent: user_agent.or(base.user_agent.clone()),
             source: Some(DeclaringSource(text.source.reference())),
-            ..Default::default()
+            ..base
         },
         text.source.span(text.span.start, end),
     ))

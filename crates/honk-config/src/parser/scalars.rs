@@ -753,6 +753,15 @@ pub(super) fn parse_experimental_section(
                 value.warn_glued_hash(diagnostics);
                 values.insert(key.raw(), value);
             }
+            for (block, key, _) in crate::diagnostic::LEGACY_ASSETS_KEYS {
+                if block == name && values.contains_key(key) {
+                    diagnostics.emit(crate::diagnostic::legacy_assets_warning(
+                        diagnostics.source(),
+                        block,
+                        key,
+                    ));
+                }
+            }
             match name {
                 "clash_api" => {
                     if let Some(value) = values

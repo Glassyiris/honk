@@ -292,12 +292,26 @@ pub fn append_subscription_source(
     let mut notices = Vec::new();
     let mut diagnostics =
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
-    let subscriptions = super::entries::parse_subscription_section(&sections, &mut diagnostics)
-        .map_err(|_| SourceEditError)?;
+    let assets = document_assets(&document, &mut diagnostics);
+    let subscriptions =
+        super::entries::parse_subscription_section(&sections, &assets, &mut diagnostics)
+            .map_err(|_| SourceEditError)?;
     if subscriptions.iter().any(|existing| existing.name == name) {
         return Err(SourceEditError);
     }
     Ok(append_entry(&document, "subscription", &entry))
+}
+
+/// Entries inherit the file's `assets` defaults, as they do when it loads.
+fn document_assets(
+    document: &super::cursor::Document<'_>,
+    diagnostics: &mut super::diagnostics::ParserDiagnostics<'_>,
+) -> crate::assets::AssetsConfig {
+    let sections = document
+        .sections()
+        .filter(|root| root.header() == "assets")
+        .collect::<Vec<_>>();
+    super::assets::parse_section(&sections, diagnostics).config
 }
 
 /// Match by name and fetch identity (URL, configured UA, headers), never the
@@ -317,8 +331,10 @@ pub fn remove_subscription_source(
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
     let mut target = None;
     let mut ambiguous = false;
+    let assets = document_assets(&document, &mut diagnostics);
     super::entries::parse_subscription_section_indexed(
         &sections,
+        &assets,
         &mut diagnostics,
         |existing, span| {
             if existing.name == subscription.name
