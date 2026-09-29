@@ -81,6 +81,24 @@ struct Record {
     bytes: usize,
 }
 
+/// The `trace.missing` reasons kept as bits of `Record::missing`, in wire order.
+#[derive(Clone, Copy)]
+enum Missing {
+    NotInstrumented = 1,
+    StartedLate = 2,
+}
+
+impl Missing {
+    const ALL: [Self; 2] = [Self::NotInstrumented, Self::StartedLate];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotInstrumented => "not_instrumented",
+            Self::StartedLate => "started_late",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Filters {
     network: String,
@@ -668,20 +686,17 @@ impl Record {
     }
 
     fn mark_gap(&mut self, reason: GapReason) -> bool {
-        match reason {
-            GapReason::BufferOverflow => !std::mem::replace(&mut self.overflow, true),
-            GapReason::Redacted => !std::mem::replace(&mut self.redacted, true),
-            reason => {
-                let flag = if reason == GapReason::StartedLate {
-                    2
-                } else {
-                    1
-                };
-                let changed = self.missing & flag == 0;
-                self.missing |= flag;
-                changed
-            }
-        }
+        let flag = match reason {
+            GapReason::BufferOverflow => return !std::mem::replace(&mut self.overflow, true),
+            GapReason::Redacted => return !std::mem::replace(&mut self.redacted, true),
+            GapReason::StartedLate => Missing::StartedLate,
+            GapReason::NotInstrumented
+            | GapReason::SharedDialContinuesAfterWaiter
+            | GapReason::RetirementOwnerLost => Missing::NotInstrumented,
+        } as u8;
+        let changed = self.missing & flag == 0;
+        self.missing |= flag;
+        changed
     }
 
     fn trace_status(&self) -> &'static str {
@@ -766,12 +781,11 @@ impl Record {
     fn project(&self) -> Value {
         let mut row = json!(self.summary);
         row["input"] = json!(self.input);
-        let mut missing = Vec::new();
-        for (flag, reason) in [(1, "not_instrumented"), (2, "started_late")] {
-            if self.missing & flag != 0 {
-                missing.push(reason);
-            }
-        }
+        let mut missing: Vec<_> = Missing::ALL
+            .into_iter()
+            .filter(|flag| self.missing & *flag as u8 != 0)
+            .map(Missing::as_str)
+            .collect();
         if self.overflow {
             missing.push("buffer_overflow");
         }
