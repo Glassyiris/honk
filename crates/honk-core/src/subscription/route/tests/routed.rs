@@ -250,7 +250,7 @@ async fn a_route_with_no_usable_node_fails_specifically_and_never_goes_direct() 
         let message = error.to_string();
         assert!(message.contains("'own-provider'"), "{message}");
         assert!(message.contains("'own'"), "{message}");
-        assert!(message.contains("download_detour: direct"), "{message}");
+        assert!(message.contains("route: direct"), "{message}");
         assert_eq!(dials.load(Ordering::SeqCst), 0);
     }
     assert!(requests.lock().is_empty(), "nothing reached the host");
