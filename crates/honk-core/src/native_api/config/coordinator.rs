@@ -533,14 +533,7 @@ impl Worker {
         // Capture under the publication barrier before the queue can delete this resource.
         let active = self.active.read().await;
         let value = if collection == "nodes" {
-            let secrets = {
-                let accepted = self.service.sources.accepted.read();
-                self.service
-                    .secrets(accepted.as_ref())
-                    .as_ref()
-                    .clone()
-                    .with_secret(&active.experimental.clash_api.secret)
-            };
+            let secrets = self.service.secrets_with(&active);
             super::super::catalog::node_value(
                 &active,
                 &catalog.snapshot(),
