@@ -132,6 +132,7 @@ impl NativeObservation {
 impl Owner for NativeObservation {
     fn activate(&self, config: &Config) {
         self.settings.activate(self, config);
+        self.configuration.warn_secret_collisions();
     }
 
     fn pause_probes(&self) -> BoxFuture<'_, anyhow::Result<()>> {
