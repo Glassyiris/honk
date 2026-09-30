@@ -177,6 +177,40 @@ async fn listener_settings_data_dir_and_secrets_stay_read_only() {
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn import_from_another_entry_than_the_recorded_tree_is_refused() {
+    let fixture = Fixture::new_db_custom(Access::Admin, |root, files| {
+        let old = root.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        for (name, text) in files.iter() {
+            let path = old.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let entry = old.join("main.dae").canonicalize().unwrap();
+        DatabaseStartup::open(&entry, &state, &mut Vec::new())
+            .unwrap()
+            .record()
+            .unwrap();
+    })
+    .await;
+    let response = fixture
+        .request(Method::POST, "/api/v1/x-honk/config/import")
+        .header("idempotency-key", "moved")
+        .json(&json!({"replace":true}))
+        .send()
+        .await
+        .unwrap();
+    let refused = error(response, StatusCode::FORBIDDEN, "permission_denied").await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"import_entry_changed"})
+    );
+    fixture.shutdown().await;
+}
+
 async fn operation(fixture: &Fixture, path: &str, key: &str, body: Value) -> Value {
     let response = fixture
         .request(Method::POST, path)

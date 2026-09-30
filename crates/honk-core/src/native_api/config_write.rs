@@ -24,6 +24,10 @@ pub(crate) enum WriteError {
     TooLarge,
     #[error("configuration source path is unsafe")]
     UnsafePath,
+    #[error("configuration source declares a listener secret")]
+    SecretSource,
+    #[error("configuration source contains a listener secret")]
+    SecretContent,
     #[error("configuration source is not UTF-8")]
     InvalidUtf8,
     #[error("configuration source changed but durability is unconfirmed")]

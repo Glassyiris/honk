@@ -210,9 +210,7 @@ pub(super) async fn mutate(
     request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    if !state.observation.configuration.can_manage() {
-        return Err(unsupported());
-    }
+    state.observation.configuration.manage_admission()?;
     let deleting = matches!(action, Action::Delete(_));
     parse_query(request.uri(), &[], id)?;
     if !deleting {

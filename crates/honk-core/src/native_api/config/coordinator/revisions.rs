@@ -14,7 +14,7 @@ impl Worker {
             move |database, diagnostics| {
                 let entry = database.import_entry();
                 if entry != database.entry() {
-                    return Err(denied());
+                    return Err(denied().with_reason(WriteRefusal::ImportEntryChanged));
                 }
                 let originals = Config::from_dae_file_with_sources(
                     entry,
