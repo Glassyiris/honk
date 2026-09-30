@@ -50,7 +50,7 @@ fn pragmas_read_back_on_a_fresh_and_a_reopened_file() {
         ("page_size", "Integer(4096)"),
         ("auto_vacuum", "Integer(2)"),
         ("application_id", "Integer(1752133227)"),
-        ("user_version", "Integer(1)"),
+        ("user_version", "Integer(2)"),
     ]
     .into_iter()
     .map(|(name, value)| (name, value.to_owned()))
@@ -561,4 +561,37 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
     )
     .unwrap();
     assert_eq!(tables.map(count), [1, 1, 0, 1, 0, 1]);
+}
+
+// Builds before the schema was folded into one statement wrote version 1
+// without `geodata_settings`; later builds wrote version 1 with it. Both
+// upgrade to the current version and keep their rows.
+#[test]
+fn both_forms_of_a_version_1_database_upgrade() {
+    for downgrade in [
+        "DROP TABLE geodata_settings; PRAGMA user_version = 1;",
+        "INSERT INTO geodata_settings (id, record) VALUES (1, '{}'); PRAGMA user_version = 1;",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        drop(StateDb::open(directory.path()).unwrap());
+        let connection = Connection::open(db_path(directory.path())).unwrap();
+        connection.execute_batch(downgrade).unwrap();
+        drop(connection);
+        let state = StateDb::open(directory.path()).unwrap();
+        assert_eq!(pragma(&state.strict(), "user_version"), Ok(SCHEMA_VERSION));
+        state
+            .strict()
+            .execute(
+                "INSERT OR REPLACE INTO geodata_settings (id, record) VALUES (1, '{\"a\":1}')",
+                [],
+            )
+            .unwrap();
+        drop(state);
+        let state = StateDb::open(directory.path()).unwrap();
+        let record: String = state
+            .strict()
+            .query_row("SELECT record FROM geodata_settings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(record, "{\"a\":1}");
+    }
 }

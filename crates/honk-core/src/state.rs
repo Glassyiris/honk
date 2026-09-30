@@ -23,7 +23,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavio
 pub(crate) const STATE_DIR: &str = "state";
 pub(crate) const DB_FILE: &str = "honk.db";
 pub(crate) const APPLICATION_ID: i64 = 0x686f_6e6b;
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 /// 112 MiB of 4 KiB pages.
 const MAX_PAGE_COUNT: i64 = 28672;
@@ -68,6 +68,13 @@ CREATE INDEX dns_answer_expiry ON dns_answer(expire_at);
 CREATE TABLE clash_state (key TEXT PRIMARY KEY CHECK (key IN ('mode','global')), value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE geodata_settings (id INTEGER PRIMARY KEY CHECK (id=1), record TEXT NOT NULL CHECK (length(record) <= 65536));
 ";
+
+/// Upgrades from older versions, in order: entry `n` takes version `n + 1` to
+/// `n + 2`. Version 1 files exist both with and without `geodata_settings`,
+/// so its upgrade only creates the table when it is missing.
+const MIGRATIONS: [&str; 1] = [
+    "CREATE TABLE IF NOT EXISTS geodata_settings (id INTEGER PRIMARY KEY CHECK (id=1), record TEXT NOT NULL CHECK (length(record) <= 65536));",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StateError {
@@ -653,7 +660,8 @@ fn create_schema(connection: &mut Connection) -> Result<(), StateError> {
     let application_id = pragma(&transaction, "application_id")?;
     let schema = match (application_id, current) {
         (APPLICATION_ID, SCHEMA_VERSION) => return Ok(()),
-        (0, 0) => SCHEMA,
+        (0, 0) => SCHEMA.to_owned(),
+        (APPLICATION_ID, 1..SCHEMA_VERSION) => MIGRATIONS[current as usize - 1..].concat(),
         _ => return Err(StateError::Unsupported),
     };
     transaction
