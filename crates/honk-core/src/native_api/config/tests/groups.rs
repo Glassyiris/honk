@@ -352,7 +352,7 @@ async fn group_patch_evaluates_a_malformed_or_wildcard_if_match() {
 #[tokio::test]
 async fn group_patch_without_writable_source_is_unsupported() {
     let fixture = Fixture::new(Access::Metadata, false).await;
-    error(
+    let refused = error(
         patch(
             &fixture,
             &json!({"id":"any-group"}),
@@ -366,6 +366,10 @@ async fn group_patch_without_writable_source_is_unsupported() {
         "capability_not_supported",
     )
     .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"writes_disabled"})
+    );
     fixture.shutdown().await;
 }
 
@@ -383,7 +387,7 @@ async fn group_patch_in_credential_source_is_unsupported() {
         .get(&format!("/api/v1/groups/{}", group["id"].as_str().unwrap()))
         .await;
     assert_eq!(detail["capabilities"]["mutable_config"], json!([]));
-    error(
+    let refused = error(
         patch(
             &fixture,
             group,
@@ -397,6 +401,10 @@ async fn group_patch_in_credential_source_is_unsupported() {
         "capability_not_supported",
     )
     .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"listener_secret_source"})
+    );
     fixture.shutdown().await;
 }
 
