@@ -176,13 +176,8 @@ fn route(settings: &NativeApiConfig, sources: Option<&Sources>) -> Route {
 
 /// A URL as `source_redacted` and `fetched_url_redacted` show it, listener
 /// secrets masked; None when it cannot be shown safely.
-pub(crate) fn redact(
-    url: &str,
-    secrets: &config::ListenerSecrets,
-    service: &config::ConfigService,
-) -> Option<String> {
-    let secret = |text: &str| secrets.contains(text) || service.mask_text(text).1;
-    display_url(url, secret).map(|url| service.mask_text(&secrets.mask(&url).0).0)
+pub(crate) fn redact(url: &str, secrets: &config::ListenerSecrets) -> Option<String> {
+    display_url(url, |text| secrets.contains(text)).map(|url| secrets.mask(&url).0)
 }
 
 /// The URL without query and fragment, and with every path segment that may
@@ -263,7 +258,7 @@ pub(crate) fn project(
     sources: &config::ConfigService,
     group_id: impl Fn(&str) -> Option<String>,
 ) -> GeoData {
-    let secrets = config::ListenerSecrets::from_config(active);
+    let secrets = sources.secrets_with(active);
     let status = geodata.map(|geodata| {
         let requirements = GeoRequirements::for_traffic(&active.routing.rules).union(
             &crate::dns::routing::DnsRouter::geo_requirements(&active.dns),
@@ -283,7 +278,7 @@ pub(crate) fn project(
             .map(|asset| {
                 let source_redacted = urls(&active.experimental.native_api, geodata, asset.kind)
                     .first()
-                    .and_then(|url| redact(url, &secrets, sources));
+                    .and_then(|url| redact(url, &secrets));
                 let origin = geodata.map(|geodata| {
                     let fetched = geodata.fetched(asset.kind, &asset.sha256);
                     Origin {
@@ -294,7 +289,7 @@ pub(crate) fn project(
                             route
                         }),
                         fetched_url_redacted: fetched
-                            .and_then(|fetched| redact(&fetched.url, &secrets, sources)),
+                            .and_then(|fetched| redact(&fetched.url, &secrets)),
                     }
                 });
                 GeoAsset {
