@@ -297,6 +297,8 @@ pub(crate) struct ConfigService {
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
     /// The secret set for the accepted sources, keyed by the `SourceUpdate` it was built from.
     secrets: Mutex<Option<(Arc<SourceUpdate>, Arc<ListenerSecrets>)>>,
+    /// The accepted snapshot `warn_secret_collisions` last reported, by `SourceUpdate` and generation.
+    warned: Mutex<Option<(Arc<SourceUpdate>, u64)>>,
     store: RwLock<Option<SourceStore>>,
     recording: RwLock<RecordState>,
     #[cfg(test)]
@@ -370,6 +372,7 @@ impl ConfigService {
             last_reload: RwLock::new(None),
             phase: RwLock::new(None),
             secrets: Mutex::new(None),
+            warned: Mutex::new(None),
             store: RwLock::new(None),
             recording: RwLock::new(RecordState::Idle),
             #[cfg(test)]
@@ -588,6 +591,36 @@ impl ConfigService {
             refusal @ Some(WriteRefusal::WritesDisabled) => refusal,
             _ if self.store_blocked() => Some(WriteRefusal::StoreBlocked),
             refusal => refusal,
+        }
+    }
+
+    /// Warns once per accepted snapshot about each source that a listener secret value in its text
+    /// makes read-only; the fix is a secret no source contains.
+    pub(crate) fn warn_secret_collisions(&self) {
+        let guard = self.sources.accepted.read();
+        let Some(accepted) = guard.as_ref() else {
+            return;
+        };
+        {
+            let mut warned = self.warned.lock();
+            if warned.as_ref().is_some_and(|(update, generation)| {
+                Arc::ptr_eq(update, &accepted.update) && *generation == accepted.generation
+            }) {
+                return;
+            }
+            *warned = Some((Arc::clone(&accepted.update), accepted.generation));
+        }
+        let secrets = self.secrets(Some(accepted));
+        for (index, source) in accepted.update.sources.iter().enumerate() {
+            if self.source_refusal_with_secrets(accepted, index, &secrets)
+                == Some(WriteRefusal::ListenerSecretInContent)
+            {
+                tracing::warn!(
+                    source_id = %accepted.ids[&source.path],
+                    path = %secrets.mask(&source_path(accepted, index).to_string_lossy()).0,
+                    "configuration source is read-only because its text contains a listener secret value"
+                );
+            }
         }
     }
 
