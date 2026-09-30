@@ -924,9 +924,11 @@ impl Worker {
     }
 
     async fn candidate_check(&self) -> Result<CandidateCheck, ApiError> {
+        let active = self.active.read().await.clone();
         Ok(CandidateCheck {
             store: self.store.clone(),
-            active: self.active.read().await.clone(),
+            secrets: self.service.secrets_with(&active),
+            active,
             log_files: self.log_files.clone(),
             data_dir: self.data_dir.clone(),
             deferred: self
@@ -941,6 +943,8 @@ impl Worker {
 /// What a candidate validates against, captured before blocking work.
 struct CandidateCheck {
     store: SourceStore,
+    /// The set the source listing's `writable` uses, so a write it offers is not refused here.
+    secrets: ListenerSecrets,
     active: Arc<Config>,
     log_files: LogFiles,
     data_dir: PathBuf,
@@ -1012,12 +1016,7 @@ impl CandidateCheck {
                     .sources
                     .iter()
                     .any(|source| source.path == target && source.contains_api_secret)
-                || [
-                    &active.experimental.native_api.secret,
-                    &active.experimental.clash_api.secret,
-                ]
-                .iter()
-                .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
+                || self.secrets.contains(content)
             {
                 return Err(denied());
             }
