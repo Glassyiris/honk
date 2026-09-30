@@ -51,8 +51,9 @@ CONFIG_NET_NS=y
 ```text
 CONFIG_NF_TABLES=y|m
 CONFIG_NF_TABLES_INET=y|m
+CONFIG_NFT_CT=y|m
+CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
-CONFIG_NFNETLINK_QUEUE=y|m
 ```
 
 `pname(...)` 路由需要 cgroup v2。缺少 cgroup v2 时，其余功能仍可启动，但进程名路由会被禁用。

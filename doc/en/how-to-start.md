@@ -51,8 +51,9 @@ Held-first-packet UDP, which is enabled by default, additionally requires:
 ```text
 CONFIG_NF_TABLES=y|m
 CONFIG_NF_TABLES_INET=y|m
+CONFIG_NFT_CT=y|m
+CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
-CONFIG_NFNETLINK_QUEUE=y|m
 ```
 
 `pname(...)` routing requires cgroup v2. Without cgroup v2, the remaining features can still start, but process-name routing is disabled.
