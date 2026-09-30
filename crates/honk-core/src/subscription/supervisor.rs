@@ -253,7 +253,9 @@ impl Provider {
         match &mut self.schedule {
             ProviderSchedule::RefreshEligible(next) => {
                 let interval = self.authorized.subscription.update_interval;
-                *next = (interval > 0).then(|| now + Duration::from_secs(interval));
+                *next = (interval > 0)
+                    .then(|| now.checked_add(Duration::from_secs(interval)))
+                    .flatten();
             }
             #[cfg(feature = "native-api")]
             ProviderSchedule::Deferred => {}
