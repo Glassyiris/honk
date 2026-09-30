@@ -590,8 +590,6 @@ const NATIVE_API_KEYS: &[&str] = &[
     "record_memory",
     "record_logs",
     "record_dns_log",
-    "probe_allowed_cidrs",
-    "probe_allowed_ports",
     "config_write",
     "geosite_download_url",
     "geoip_download_url",
@@ -734,6 +732,21 @@ pub(super) fn parse_experimental_section(
                     );
                     continue;
                 };
+                if name == "native_api"
+                    && matches!(key.raw(), "probe_allowed_cidrs" | "probe_allowed_ports")
+                {
+                    scalar_warning(
+                        key,
+                        diagnostics,
+                        if key.raw() == "probe_allowed_cidrs" {
+                            "experimental.native_api.probe_allowed_cidrs"
+                        } else {
+                            "experimental.native_api.probe_allowed_ports"
+                        },
+                        "setting was removed and can be deleted; its value is ignored",
+                    );
+                    continue;
+                }
                 if !known_keys.contains(&key.raw()) {
                     if strict_section {
                         return Err(strict_error(line, key.raw()).into());
@@ -913,31 +926,6 @@ pub(super) fn parse_experimental_section(
                         if let Some(text) = values.get(key) {
                             *target = text.unquote().raw().to_owned();
                         }
-                    }
-                    if let Some(text) = values.get("probe_allowed_cidrs") {
-                        config.native_api.probe_allowed_cidrs =
-                            list_value(*text, ListOptions::NEW, diagnostics);
-                        if config
-                            .native_api
-                            .probe_allowed_cidrs
-                            .iter()
-                            .any(|value| value.parse::<ipnet::IpNet>().is_err())
-                        {
-                            return Err(scalar_error(
-                                *text,
-                                "invalid-config-value",
-                                "experimental.native_api.probe_allowed_cidrs",
-                                "probe destination allowlist requires explicit IP CIDRs",
-                            )
-                            .into());
-                        }
-                    }
-                    if let Some(text) = values.get("probe_allowed_ports") {
-                        let entries = list_value(*text, ListOptions::NEW, diagnostics);
-                        config.native_api.probe_allowed_ports = entries.iter().map(|value| {
-                            value.parse::<u16>().ok().filter(|port| *port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
-                                .ok_or_else(|| scalar_error(*text, "invalid-config-value", "experimental.native_api.probe_allowed_ports", "probe port allowlist requires ports from 1 through 65535"))
-                        }).collect::<Result<Vec<_>,_>>()?;
                     }
                     for (key, setting, target) in [
                         (
