@@ -324,6 +324,7 @@ impl Worker {
             }
             Work::Sighup => match self.load().await {
                 Ok((candidate, sources, diagnostics)) => {
+                    honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
                     let completion = self
                         .activation
                         .activate(ActivationRequest {
