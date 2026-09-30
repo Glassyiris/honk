@@ -187,8 +187,10 @@ VMess JSON `net` and Shadowrocket transport parameters select only the stream tr
 
 VLESS supports TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Unencrypted Vision's direct-copy path is raw TCP with TLS 1.3 or REALITY, not WS/gRPC; encrypted Vision follows the composition rules below.
 
-Vision currently implements downstream unpadding and Direct handling only;
-uploads are not Vision-padded and do not switch to raw TCP. See the
+Vision adds uplink padding and removes downstream padding. Uplink Direct needs
+an eligible TLS 1.3 ServerHello before the first complete application-data record;
+early data or an undecided inspection-budget expiry ends padding with End on the outer transport.
+Each direction switches independently. See the
 [Vision support boundary](../design/outbound.md#vision-and-vless-encryption).
 
 ### Shadowrocket VLESS
