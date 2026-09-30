@@ -743,7 +743,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     .await;
     assert_eq!(
         refused["error"]["details"],
-        json!({"reason":"listener_settings_changed"})
+        json!({"reason":"credential_sources_changed"})
     );
     error(
         fixture
