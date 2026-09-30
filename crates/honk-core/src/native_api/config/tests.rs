@@ -787,6 +787,22 @@ async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
     ] {
         assert!(!encoded.contains(secret), "listener value leaked");
     }
+    let export = fixture
+        .request(Method::GET, "/api/v1/x-honk/config/export")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    let export = export.text().await.unwrap();
+    assert!(export.contains("# <redacted> copied across sources"));
+    for secret in [
+        SECRET,
+        "overridden-listener-token",
+        "old-clash-token",
+        "clash-listener-token",
+    ] {
+        assert!(!export.contains(secret), "listener value exported");
+    }
     let path_only = source(&config, &fixture.originals["clash-listener-token.dae"]);
     assert_eq!(path_only["content"], "# Ordinary included content.\n");
     assert_eq!(path_only["path"], "<redacted>.dae");

@@ -37,8 +37,11 @@ pub(in crate::native_api) async fn export(
         source.content = Arc::from(stripped);
     }
     let inlined = inline_sources(&sources).map_err(|_| unavailable())?;
-    let (inlined, _) = ListenerSecrets::from_config(&config)
-        .with_secret(&service.clash_secret)
+    let (inlined, _) = service
+        .secrets(Some(&accepted))
+        .as_ref()
+        .clone()
+        .with_config(&config)
         .mask(&inlined);
     let body = if omitted {
         format!("# listener secrets omitted\n{inlined}")
@@ -85,7 +88,7 @@ pub(in crate::native_api) async fn revisions(
         .await
         .map_err(|_| store_error())?
         .map_err(|_| store_error())?;
-    let secrets = service.secrets(service.sources.accepted.read().as_ref());
+    let secrets = service.current_secrets();
     let revisions: Vec<Value> = rows
         .into_iter()
         .map(|row| {

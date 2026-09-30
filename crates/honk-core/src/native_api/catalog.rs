@@ -360,8 +360,7 @@ pub(super) async fn node(
 }
 
 fn listener_secrets(state: &NativeState) -> Arc<ListenerSecrets> {
-    let accepted = state.observation.configuration.sources.accepted.read();
-    state.observation.configuration.secrets(accepted.as_ref())
+    state.observation.configuration.current_secrets()
 }
 
 fn group_health(

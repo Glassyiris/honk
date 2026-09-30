@@ -1091,6 +1091,28 @@ async fn anonymous_callers_cannot_change_sources_and_read_urls_as_written() {
 }
 
 #[tokio::test]
+async fn settings_mask_an_overridden_listener_secret_in_urls() {
+    const OVERRIDDEN: &str = "overridden-listener-token";
+    let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
+        setup_rules(root, files);
+        let auth = files.get_mut("auth.dae").unwrap();
+        *auth = auth.replace(
+            &format!("secret: '{SECRET}'"),
+            &format!("secret: '{OVERRIDDEN}'\n secret: '{SECRET}'\n geosite_download_url: 'https://mirror.example/{OVERRIDDEN}/geosite.dat'"),
+        );
+    })
+    .await;
+    let settings = fixture.get(SETTINGS).await;
+    assert_eq!(
+        settings["geodata"]["geosite"]["urls"],
+        json!(["https://mirror.example/<redacted>/geosite.dat"])
+    );
+    assert!(!settings.to_string().contains(OVERRIDDEN));
+    assert!(!fixture.get(GEO).await.to_string().contains(OVERRIDDEN));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn null_returns_to_the_built_in_sources() {
     let fixture = Fixture::new_with_state(Access::Admin, setup_rules).await;
     let defaults = fixture.get(SETTINGS).await["geodata"].clone();
