@@ -45,6 +45,10 @@ pub(crate) enum StoreError {
     NotEmpty,
     #[error("configuration revision is invalid")]
     Invalid,
+    #[error("configuration revision declares a listener secret")]
+    SecretSource,
+    #[error("configuration revision contains a listener secret")]
+    SecretContent,
     #[error("configuration revision exceeds 16 MiB of stored JSON")]
     TooLarge,
     #[error("state database is locked by `honk-core admin reset`")]
@@ -565,6 +569,8 @@ impl DbStore {
         self.stored(candidate, &forbidden)
             .map_err(|error| match error {
                 StoreError::Invalid => WriteError::UnsafePath,
+                StoreError::SecretSource => WriteError::SecretSource,
+                StoreError::SecretContent => WriteError::SecretContent,
                 StoreError::TooLarge => WriteError::TooLarge,
                 _ => WriteError::Unavailable,
             })
@@ -587,11 +593,13 @@ impl DbStore {
         let stored = sources
             .iter()
             .map(|source| {
-                if source.contains_api_secret
-                    || forbidden.contains(&source.content)
+                if source.contains_api_secret {
+                    return Err(StoreError::SecretSource);
+                }
+                if forbidden.contains(&source.content)
                     || forbidden.contains(&source.path.to_string_lossy())
                 {
-                    return Err(StoreError::Invalid);
+                    return Err(StoreError::SecretContent);
                 }
                 let name = source
                     .path

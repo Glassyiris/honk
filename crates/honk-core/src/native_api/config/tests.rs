@@ -633,7 +633,7 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         let main = source(&config, &fixture.originals["main.dae"]);
         assert_eq!(fixture.get(&source_path(main)).await, source_content(main));
         let before = disk(fixture.directory.path());
-        error(
+        let refused = error(
             fixture
                 .replace(main, "routing { fallback: block }")
                 .send()
@@ -643,6 +643,10 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
             "permission_denied",
         )
         .await;
+        assert_eq!(
+            refused["error"]["details"],
+            json!({"reason":"writes_disabled"})
+        );
         assert_eq!(disk(fixture.directory.path()), before);
         assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
         fixture.shutdown().await;
@@ -699,7 +703,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     }
     assert!(!config.to_string().contains(SECRET));
     let before = disk(fixture.directory.path());
-    error(
+    let refused = error(
         fixture
             .replace(
                 source(&config, &fixture.originals["auth.dae"]),
@@ -712,8 +716,12 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         "permission_denied",
     )
     .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"listener_secret_source"})
+    );
     let without_auth = fixture.originals["main.dae"].replace(" 'auth.dae'\n", "");
-    error(
+    let refused = error(
         fixture
             .replace(
                 source(&config, &fixture.originals["main.dae"]),
@@ -726,6 +734,10 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         "permission_denied",
     )
     .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"listener_settings_changed"})
+    );
     error(
         fixture
             .request(Method::GET, "/api/v1/config/sources/unknown")
@@ -765,6 +777,74 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         source_content(source(&config, &fixture.originals["editable.dae"]))
     );
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_source_writes_name_the_listener_secret_reason() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
+        files
+            .get_mut("locked.dae")
+            .unwrap()
+            .push_str(&format!("# {SECRET}\n"));
+    })
+    .await;
+    let config = fixture.get(CONFIG).await;
+    let row = |name: &str| {
+        config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (locked, editable) = (row("locked.dae"), row("editable.dae"));
+    let before = disk(fixture.directory.path());
+    let reason = |response: Response| async move {
+        error(response, StatusCode::FORBIDDEN, "permission_denied").await["error"]["details"]
+            ["reason"]
+            .clone()
+    };
+    let refused = fixture
+        .replace(&locked, "# replaced\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reason(refused).await, "listener_secret_in_content");
+    let copied = format!("# {SECRET}\n");
+    let refused = fixture.replace(&editable, &copied).send().await.unwrap();
+    assert_eq!(reason(refused).await, "listener_secret_in_content");
+    // The same declaration again changes no listener setting, and it still carries the secret.
+    let declared = &fixture.originals["auth.dae"];
+    let refused = fixture.replace(&editable, declared).send().await.unwrap();
+    assert_eq!(reason(refused).await, "listener_secret_source");
+    assert_eq!(disk(fixture.directory.path()), before);
+    let mut auth = fixture.originals["auth.dae"].clone();
+    auth.push_str("# Edited on disk since the last reload.\n");
+    std::fs::write(fixture.path("auth.dae"), auth).unwrap();
+    let refused = fixture.replace(&editable, "# edit\n").send().await.unwrap();
+    assert_eq!(reason(refused).await, "credential_sources_changed");
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn writes_after_the_coordinator_stopped_are_unavailable() {
+    let mut fixture = Fixture::new(Access::Admin, false).await;
+    let config = fixture.get(CONFIG).await;
+    let editable = source(&config, &fixture.originals["editable.dae"]).clone();
+    fixture.coordinator.take().unwrap().shutdown().await;
+    let refused = error(
+        fixture.replace(&editable, "# edit\n").send().await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"configuration_unavailable"})
+    );
     fixture.shutdown().await;
 }
 
