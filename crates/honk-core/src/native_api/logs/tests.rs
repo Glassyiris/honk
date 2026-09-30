@@ -462,6 +462,33 @@ fn native_server_failures_are_admitted_at_their_emitting_module() {
 }
 
 #[test]
+fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
+    const TARGET: &str = "honk_core::native_api::security";
+    let line = |reason: Option<WriteRefusal>| Projection {
+        message: audited_message("native HTTP request"),
+        status: Some(403),
+        reason,
+        withheld: true,
+        ..Projection::default()
+    };
+    let (message, fields) = line(Some(WriteRefusal::WritesDisabled)).finish(TARGET);
+    assert_eq!(message, "native HTTP request");
+    assert_eq!(
+        fields,
+        json!({"reason":"writes_disabled","status":403,"native_withheld_fields":true})
+            .as_object()
+            .cloned()
+    );
+    assert_eq!(line(None).finish(TARGET).0, WITHHELD);
+    assert_eq!(
+        line(Some(WriteRefusal::WritesDisabled))
+            .finish("honk_core::native_api::server")
+            .0,
+        WITHHELD
+    );
+}
+
+#[test]
 fn listener_ready_is_admitted_only_at_its_pinned_target() {
     // startup.rs pins `target: "honk_core"`; its module path is not audited.
     let project = || Projection {
