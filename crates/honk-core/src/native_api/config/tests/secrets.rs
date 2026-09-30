@@ -152,3 +152,28 @@ async fn every_masked_listener_secret_is_refused_in_written_content() {
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
+
+/// In db mode the stored secret survives only in the db, not in any accepted source text.
+#[tokio::test]
+async fn stored_listener_secret_is_refused_in_written_content_in_db_mode() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let config = fixture.get(CONFIG).await;
+    let editable = source(&config, &fixture.originals["editable.dae"]);
+    let refused = error(
+        fixture
+            .replace(editable, &format!("# {SECRET}\n"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"listener_secret_in_content"})
+    );
+    assert_eq!(store.head(), Ok(Some(1)));
+    fixture.shutdown().await;
+}
