@@ -58,9 +58,9 @@ build-all: build-core
 check:
     cargo check
 
-# Clippy lint all
+# Clippy lint all (fetches the pinned doona for native-ui unless HONK_DOONA_DIR is set)
 lint:
-    cargo clippy --all --all-targets --features honk-core/native-ui -- -D warnings
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo clippy --all --all-targets --features honk-core/native-ui -- -D warnings
 
 # Format all
 fmt:
@@ -79,7 +79,7 @@ test:
 # Workspace CI gate (requires cargo-nextest).
 test-ci:
     # Without nextest: cargo test --workspace --features honk-core/native-ui --no-fail-fast
-    cargo nextest run --workspace --features honk-core/native-ui --profile ci
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo nextest run --workspace --features honk-core/native-ui --profile ci
 
 # Run core + outbound tests
 test-core:
