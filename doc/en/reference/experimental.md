@@ -71,7 +71,7 @@ With `config_write: true`, all accepted noncredential includes are writable; ord
 
 Probe targets come only from accepted configuration. Resolution, IPv4-mapped IPv6 normalization and selected-IP pinning still apply; callers cannot supply URLs and probes do not follow redirects. Probes, geodata and shared downloads use configured targets without an address or port allowlist. Whoever can write the configuration or control subscription content decides those targets; provider content is trusted configuration.
 
-The removed `probe_allowed_cidrs` and `probe_allowed_ports` keys are accepted in dae configuration with one warning per key; their values are ignored and the keys can be deleted. Neither key is serialized.
+The removed `probe_allowed_cidrs` and `probe_allowed_ports` keys are accepted in dae configuration and compatibility structured loaders with one warning per key; their values are ignored and the keys can be deleted. Neither key is serialized.
 
 ## `clash_api`
 
