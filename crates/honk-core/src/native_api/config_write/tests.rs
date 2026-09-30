@@ -410,3 +410,36 @@ fn create_new_never_replaces_and_refuses_a_swapped_directory() {
         .collect();
     assert_eq!(names, [OsString::from("new.dae")]);
 }
+
+#[test]
+fn stale_temporaries_are_removed_and_other_files_kept() {
+    let (directory, _) = fixture();
+    let stale = directory
+        .path()
+        .join(format!(".honk-config-{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&stale, "partial").unwrap();
+    let foreign = [
+        ".honk-config-backup.tmp",
+        ".honk-config-00000000-0000-0000-0000-00000000000G.tmp",
+        ".honk-config-00000000000000000000000000000000.tmp",
+        "honk-config-00000000-0000-0000-0000-000000000000.tmp",
+    ];
+    for name in foreign {
+        fs::write(directory.path().join(name), "keep").unwrap();
+    }
+    let linked = directory
+        .path()
+        .join(format!(".honk-config-{}.tmp", uuid::Uuid::new_v4()));
+    symlink("config.dae", &linked).unwrap();
+
+    assert_eq!(
+        remove_stale_temporaries(directory.path()),
+        std::slice::from_ref(&stale)
+    );
+    assert!(!stale.exists());
+    for name in foreign {
+        assert!(directory.path().join(name).exists(), "{name}");
+    }
+    assert!(linked.symlink_metadata().is_ok());
+    assert!(remove_stale_temporaries(directory.path()).is_empty());
+}
