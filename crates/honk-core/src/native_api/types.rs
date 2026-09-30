@@ -70,6 +70,34 @@ impl Serialize for ErrorCode {
     }
 }
 
+/// Why a configuration write was refused, sent as `details.reason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteRefusal {
+    WritesDisabled,
+    ConfigurationUnavailable,
+    ListenerSecretSource,
+    ListenerSecretInContent,
+    ListenerSettingsChanged,
+    CredentialSourcesChanged,
+    ImportEntryChanged,
+    UnsafePath,
+}
+
+impl WriteRefusal {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WritesDisabled => "writes_disabled",
+            Self::ConfigurationUnavailable => "configuration_unavailable",
+            Self::ListenerSecretSource => "listener_secret_source",
+            Self::ListenerSecretInContent => "listener_secret_in_content",
+            Self::ListenerSettingsChanged => "listener_settings_changed",
+            Self::CredentialSourcesChanged => "credential_sources_changed",
+            Self::ImportEntryChanged => "import_entry_changed",
+            Self::UnsafePath => "unsafe_path",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RetryAfter {
     /// `1` on a 429 or 503, absent otherwise.
@@ -116,6 +144,15 @@ impl ApiError {
 
     pub fn with_details(mut self, details: Value) -> Self {
         self.error.details = Some(details);
+        self
+    }
+
+    /// Adds `reason` to the details, keeping what they already hold.
+    pub(crate) fn with_reason(mut self, reason: WriteRefusal) -> Self {
+        let details = self.error.details.get_or_insert_with(|| json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert("reason".into(), json!(reason.as_str()));
+        }
         self
     }
 
