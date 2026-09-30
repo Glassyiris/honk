@@ -33,7 +33,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::operations::{OperationStore, Reservation};
 use super::store::{SourceStore, db::MAX_REVISIONS};
 use super::{
-    ApiError, ErrorCode, NativeState, body, error, parse_query, timestamp, types::RequestId,
+    ApiError, ErrorCode, NativeState, body, error, parse_query, timestamp,
+    types::{RequestId, WriteRefusal},
 };
 use crate::configuration::{
     Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate,
@@ -386,10 +387,18 @@ impl ConfigService {
     }
 
     pub(crate) fn writable(&self) -> bool {
-        self.sources.available()
-            && self.settings.config_write
-            && self.settings.credentialed()
-            && self.sender.lock().is_some()
+        self.write_refusal().is_none()
+    }
+
+    /// Why no configuration write is admitted now; `None` when writes are.
+    pub(crate) fn write_refusal(&self) -> Option<WriteRefusal> {
+        if !self.settings.config_write || !self.settings.credentialed() {
+            Some(WriteRefusal::WritesDisabled)
+        } else if !self.sources.available() || self.sender.lock().is_none() {
+            Some(WriteRefusal::ConfigurationUnavailable)
+        } else {
+            None
+        }
     }
 
     /// True when the running configuration may differ from the recorded `head`.
@@ -434,17 +443,28 @@ impl ConfigService {
     }
 
     pub(crate) fn can_manage(&self) -> bool {
-        self.sender
+        self.manage_admission().is_ok()
+    }
+
+    /// The refusal `/nodes` and `/providers` writes get while the main source cannot take them.
+    pub(super) fn manage_admission(&self) -> Result<(), ApiError> {
+        let accepted = self.sources.accepted.read().clone();
+        let running = self
+            .sender
             .lock()
             .as_ref()
-            .is_some_and(|sender| !sender.is_closed())
-            && self
-                .sources
-                .accepted
-                .read()
-                .as_ref()
-                .is_some_and(|accepted| self.source_writable(accepted, 0))
-            && !self.store_blocked()
+            .is_some_and(|sender| !sender.is_closed());
+        let Some(accepted) = accepted.filter(|_| running) else {
+            return Err(super::management::unsupported()
+                .with_reason(WriteRefusal::ConfigurationUnavailable));
+        };
+        if let Some(reason) = self.source_refusal(&accepted, 0) {
+            return Err(super::management::unsupported().with_reason(reason));
+        }
+        if self.store_blocked() {
+            return Err(super::management::unsupported());
+        }
+        Ok(())
     }
 
     pub(super) async fn manage(
@@ -529,21 +549,31 @@ impl ConfigService {
     }
 
     fn source_writable(&self, accepted: &Accepted, index: usize) -> bool {
-        let secrets = self.secrets(Some(accepted));
-        self.source_writable_with_secrets(accepted, index, &secrets)
+        self.source_refusal(accepted, index).is_none()
     }
 
-    fn source_writable_with_secrets(
+    /// Why the accepted source at `index` takes no write; `None` when it does.
+    fn source_refusal(&self, accepted: &Accepted, index: usize) -> Option<WriteRefusal> {
+        let secrets = self.secrets(Some(accepted));
+        self.source_refusal_with_secrets(accepted, index, &secrets)
+    }
+
+    fn source_refusal_with_secrets(
         &self,
         accepted: &Accepted,
         index: usize,
         secrets: &ListenerSecrets,
-    ) -> bool {
+    ) -> Option<WriteRefusal> {
         let source = &accepted.update.sources[index];
-        self.settings.config_write
-            && self.settings.credentialed()
-            && !source.contains_api_secret
-            && !secrets.contains(&source.content)
+        if !self.settings.config_write || !self.settings.credentialed() {
+            Some(WriteRefusal::WritesDisabled)
+        } else if source.contains_api_secret {
+            Some(WriteRefusal::ListenerSecretSource)
+        } else if secrets.contains(&source.content) {
+            Some(WriteRefusal::ListenerSecretInContent)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn group_writable(&self, name: &str) -> bool {
@@ -633,7 +663,7 @@ impl ConfigService {
             "id":accepted.ids[&source.path], "path":path,
             "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
-            "writable":self.source_writable_with_secrets(accepted,index,secrets) && !self.store_blocked(), "loaded_at":timestamp(accepted.accepted_at),
+            "writable":self.source_refusal_with_secrets(accepted,index,secrets).is_none() && !self.store_blocked(), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(), "content":content,
         });
         // Database source paths are labels, not files an operator could open.
