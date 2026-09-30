@@ -558,7 +558,9 @@ impl AliveDialerSet {
     pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let permit = self.acquire_health_probe()?;
         let cancel = permit.cancellation();
-        let operation = self.resolve_host_inner(host, port);
+        // Boxed: unboxed, this future is large enough in debug builds to overflow
+        // the worker stack when the check URL resolves through a proxied upstream.
+        let operation = Box::pin(self.resolve_host_inner(host, port));
         cancel
             .run(cancel.scope_resolution(operation))
             .await
