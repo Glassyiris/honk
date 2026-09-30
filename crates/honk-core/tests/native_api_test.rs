@@ -57,7 +57,7 @@ fn control_plane(config: Config) -> ControlPlane {
 
 struct TestApp {
     addr: SocketAddr,
-    client: Client,
+    client: contract::ContractClient,
     control: ControlPlane,
     state: Weak<NativeState>,
     server: NativeServer,
@@ -89,12 +89,14 @@ impl TestApp {
         let server = NativeServer::start(listener, state);
         Self {
             addr,
-            client: Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(IO_TIMEOUT)
-                .build()
-                .unwrap(),
+            client: contract::ContractClient(
+                Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(IO_TIMEOUT)
+                    .build()
+                    .unwrap(),
+            ),
             control,
             state: weak,
             server,
@@ -111,7 +113,7 @@ impl TestApp {
         format!("http://{addr}{path}")
     }
 
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+    fn get(&self, path: &str) -> contract::ContractRequest {
         self.client.get(self.url(path)).bearer_auth(SECRET)
     }
 
@@ -1130,6 +1132,8 @@ async fn shutdown_reclaims_an_authenticated_incomplete_body_and_state() {
     tokio::task::yield_now().await;
 }
 
+#[path = "native_api_test/contract.rs"]
+mod contract;
 #[path = "native_api_test/observations.rs"]
 mod observations;
 #[path = "native_api_test/ui.rs"]
