@@ -257,6 +257,8 @@ pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> Detailed
         SettingPath::new("groups").field("policy")
     } else if d.setting.starts_with("group.") && d.setting.ends_with(".filter") {
         SettingPath::new("groups").field("filter")
+    } else if d.setting.starts_with("subscription.") && d.setting.ends_with(".cache") {
+        SettingPath::new("subscriptions").field("cache")
     } else if d.setting.starts_with("subscription.") {
         SettingPath::new("subscriptions").field("interval")
     } else if d.setting.starts_with("dns.fixed_domain_ttl.") {
@@ -293,6 +295,7 @@ pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> Detailed
         "duration is not milliseconds, `ms` or `s`; keeping the default (100ms)",
         "duration is not milliseconds, `ms` or `s`; keeping the default (30ms)",
         "value is not a boolean spelling honk recognises; using fallback false",
+        "value is not a boolean; using fallback true",
         "honk could not parse this port as a decimal in 0-65535; using fallback 12345",
         "honk could not parse this port as a decimal in 0-65535; using fallback 0",
         "honk could not parse this mark as a u32; using fallback 0",
