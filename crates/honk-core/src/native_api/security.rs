@@ -390,19 +390,38 @@ pub(super) async fn boundary(
     // and a refused configuration write a WARN line naming why.
     let status = response.status().as_u16();
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    if let Some(reason) = response.extensions().get::<WriteRefusal>() {
+    log_request(
+        logged_method,
+        template,
+        status,
+        elapsed_ms,
+        &request_id,
+        response.extensions().get::<WriteRefusal>().copied(),
+    );
+    response
+}
+
+pub(super) fn log_request(
+    method: &str,
+    template: &str,
+    status: u16,
+    elapsed_ms: f64,
+    request_id: &str,
+    reason: Option<WriteRefusal>,
+) {
+    if let Some(reason) = reason {
         tracing::warn!(
-            method = logged_method,
+            method,
             route = template,
             status,
             elapsed_ms,
             request_id = %request_id,
             reason = reason.as_str(),
-            "native HTTP request"
+            message = "native HTTP request"
         );
     } else if status >= 400 {
         tracing::info!(
-            method = logged_method,
+            method,
             route = template,
             status,
             elapsed_ms,
@@ -411,7 +430,7 @@ pub(super) async fn boundary(
         );
     } else {
         tracing::debug!(
-            method = logged_method,
+            method,
             route = template,
             status,
             elapsed_ms,
@@ -419,7 +438,6 @@ pub(super) async fn boundary(
             "native HTTP request"
         );
     }
-    response
 }
 
 fn is_event_stream(response: &Response) -> bool {
