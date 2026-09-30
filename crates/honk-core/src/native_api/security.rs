@@ -138,11 +138,16 @@ impl Security {
         self.hosts.contains(authority) || self.listener_itself(&authority.0, authority.1)
     }
 
-    // The plain-HTTP origin of the listener itself is as trustworthy as its Host; an extra
-    // `allowed_hosts` entry still says nothing about the scheme and needs `allow_origins`.
-    fn origin_allowed(&self, origin: &(String, String, u16)) -> bool {
+    // The plain-HTTP origin of the listener itself is as trustworthy as its Host, so on a
+    // wildcard bind it must name that Host: another IP literal at the same port is another
+    // site. An extra `allowed_hosts` entry says nothing about the scheme and needs
+    // `allow_origins`.
+    fn origin_allowed(&self, origin: &(String, String, u16), authority: &(String, u16)) -> bool {
         let (scheme, host, port) = origin;
-        self.origins.contains(origin) || (scheme == "http" && self.listener_itself(host, *port))
+        self.origins.contains(origin)
+            || (scheme == "http"
+                && (host, *port) == (&authority.0, authority.1)
+                && self.listener_itself(host, *port))
     }
 
     fn check_origin(
@@ -150,7 +155,7 @@ impl Security {
         headers: &HeaderMap,
         request_id: &str,
     ) -> Result<Option<HeaderValue>, ApiError> {
-        single_header(headers, "host")
+        let authority = single_header(headers, "host")
             .ok()
             .flatten()
             .and_then(|value| value.to_str().ok())
@@ -163,7 +168,7 @@ impl Security {
                 .to_str()
                 .ok()
                 .and_then(parse_native_origin)
-                .is_some_and(|origin| self.origin_allowed(&origin));
+                .is_some_and(|origin| self.origin_allowed(&origin, &authority));
             if !allowed {
                 return Err(forbidden(request_id));
             }
