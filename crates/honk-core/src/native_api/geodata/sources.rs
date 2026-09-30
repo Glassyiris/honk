@@ -489,12 +489,14 @@ impl Sources {
     /// Before this process has checked, the wait counts from `now`, so a
     /// startup never downloads at once, whatever the loaded files' age.
     fn reschedule(&self, now: SystemTime) {
-        let auto = self.effective().auto_update;
+        let stored = self.stored.lock();
+        let auto = effective(&stored).auto_update;
         let mut status = self.status.lock();
         status.next_check_at = auto.enabled.then(|| {
             status.last_checked_at.unwrap_or(now) + wait(auto, status.failures) + jitter()
         });
         drop(status);
+        drop(stored);
         self.changed.notify_one();
     }
 
