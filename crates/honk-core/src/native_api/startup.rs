@@ -1,6 +1,7 @@
 //! Bring-up and teardown of the native API for one `run`.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -9,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use super::config::ConfigService;
+use super::config_write;
 use super::logs::{EngineLevel, LogBinding};
 use super::observation::NativeObservation;
 use super::store::{DatabaseStartup, SourceStore};
@@ -80,6 +82,7 @@ impl NativeRuntime {
         let observation = &self.observation;
         observation.providers.attach(subscriptions.clone());
         let service = observation.configuration.clone();
+        remove_stale_temporaries(sources.as_ref(), config_path);
         let store = match database {
             Some(database) => SourceStore::Db(database.store),
             None => SourceStore::File(
@@ -120,6 +123,33 @@ impl NativeRuntime {
         }
         if let Some(server) = server {
             server.shutdown().await;
+        }
+    }
+}
+
+/// Sweeps every directory a configuration or geodata write stages into; runs before the
+/// coordinator exists, so no temporary file of this process can be caught.
+fn remove_stale_temporaries(sources: Option<&SourceUpdate>, config_path: &Path) {
+    let files = sources.into_iter().flat_map(|sources| {
+        let dependencies = sources
+            .dependencies
+            .iter()
+            .map(|dependency| &dependency.path);
+        sources
+            .sources
+            .iter()
+            .map(|source| &source.path)
+            .chain(dependencies)
+    });
+    let directories: BTreeSet<_> = files
+        .map(PathBuf::as_path)
+        .chain([config_path])
+        .filter_map(Path::parent)
+        .chain([honk_config::paths::data_dir()])
+        .collect();
+    for directory in directories {
+        for path in config_write::remove_stale_temporaries(directory) {
+            info!(target: "honk_core", path = %path.display(), message = "removed stale configuration write temporary file");
         }
     }
 }
