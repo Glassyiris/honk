@@ -20,6 +20,17 @@ fn state() -> SupervisorState {
     SupervisorState::new(Arc::new(SubscriptionManager::new().unwrap()), None)
 }
 
+#[test]
+fn an_interval_past_the_clock_range_is_never_due() {
+    let mut subscription = authorized(uuid::Uuid::new_v4(), 1, "http://provider".into());
+    subscription.subscription.update_interval = u64::MAX;
+    let provider = Provider::new(subscription);
+    assert!(matches!(
+        provider.schedule,
+        ProviderSchedule::RefreshEligible(None)
+    ));
+}
+
 #[tokio::test]
 async fn shutdown_joins_pending_fetch_socket_instead_of_detaching_it() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
