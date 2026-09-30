@@ -31,8 +31,7 @@ pub(in crate::native_api) fn administrative_projection(
     state: &NativeState,
     mut value: Value,
 ) -> Result<Value, ApiError> {
-    let accepted = state.observation.configuration.sources.accepted.read();
-    let secrets = state.observation.configuration.secrets(accepted.as_ref());
+    let secrets = state.observation.configuration.current_secrets();
     secrets.mask_value(&mut value);
     Ok(value)
 }

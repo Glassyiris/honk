@@ -123,7 +123,12 @@ impl ListenerSecrets {
     }
 
     pub(crate) fn from_config(config: &Config) -> Self {
-        Self::new(&[], &config.experimental.native_api.secret)
+        Self::empty().with_config(config)
+    }
+
+    /// Adds the effective secrets of `config`.
+    pub(crate) fn with_config(self, config: &Config) -> Self {
+        self.with_secret(&config.experimental.native_api.secret)
             .with_secret(&config.experimental.clash_api.secret)
     }
 
@@ -512,9 +517,15 @@ impl ConfigService {
         secrets
     }
 
-    pub(crate) fn mask_text(&self, text: &str) -> (String, bool) {
-        let guard = self.sources.accepted.read();
-        self.secrets(guard.as_ref()).mask(text)
+    /// The secret set for the sources accepted now.
+    pub(crate) fn current_secrets(&self) -> Arc<ListenerSecrets> {
+        self.secrets(self.sources.accepted.read().as_ref())
+    }
+
+    /// Every listener secret a response about `active` must not carry: each accepted declaration
+    /// and stored value, and the effective secrets `active` runs with.
+    pub(crate) fn secrets_with(&self, active: &Config) -> ListenerSecrets {
+        self.current_secrets().as_ref().clone().with_config(active)
     }
 
     fn source_writable(&self, accepted: &Accepted, index: usize) -> bool {
