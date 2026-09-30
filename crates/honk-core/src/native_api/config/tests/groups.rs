@@ -646,3 +646,20 @@ async fn group_config_reports_unset_options_as_null_and_null_clears_them() {
         source_text
     );
 }
+
+#[tokio::test]
+async fn groups_list_in_declaration_order() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let source_text = "group {\n zeta { policy: fallback }\n alpha { policy: fallback }\n mid { policy: fallback }\n alpha { policy: fallback }\n}\n";
+    std::fs::write(fixture.path("editable.dae"), source_text).unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let groups = fixture.get("/api/v1/groups").await;
+    let names: Vec<_> = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["zeta", "mid", "alpha"]);
+}
