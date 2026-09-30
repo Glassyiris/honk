@@ -576,6 +576,21 @@ impl ConfigService {
         }
     }
 
+    /// Why the listed source at `index` is read-only in the accepted snapshot; `None` when it is
+    /// writable.
+    fn read_only_reason(
+        &self,
+        accepted: &Accepted,
+        index: usize,
+        secrets: &ListenerSecrets,
+    ) -> Option<WriteRefusal> {
+        match self.source_refusal_with_secrets(accepted, index, secrets) {
+            refusal @ Some(WriteRefusal::WritesDisabled) => refusal,
+            _ if self.store_blocked() => Some(WriteRefusal::StoreBlocked),
+            refusal => refusal,
+        }
+    }
+
     pub(crate) fn group_writable(&self, name: &str) -> bool {
         self.editable()
             && self
@@ -659,13 +674,17 @@ impl ConfigService {
         let source = &accepted.update.sources[index];
         let (content, mut redacted) = secrets.mask(&source.content);
         let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
+        let read_only_reason = self.read_only_reason(accepted, index, secrets);
         let mut value = json!({
             "id":accepted.ids[&source.path], "path":path,
             "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
-            "writable":self.source_refusal_with_secrets(accepted,index,secrets).is_none() && !self.store_blocked(), "loaded_at":timestamp(accepted.accepted_at),
+            "writable":read_only_reason.is_none(), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(), "content":content,
         });
+        if let Some(reason) = read_only_reason {
+            value["read_only_reason"] = json!(reason.as_str());
+        }
         // Database source paths are labels, not files an operator could open.
         if !matches!(*self.store.read(), Some(SourceStore::Db(_))) {
             let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
