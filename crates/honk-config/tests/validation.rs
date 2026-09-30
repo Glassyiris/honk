@@ -255,6 +255,25 @@ mod check_targets {
     }
 
     #[test]
+    fn http_targets_reject_explicit_zero_ports() {
+        use honk_config::check::{decode_health_http_target, decode_http_check_target};
+        for input in [
+            "http://127.0.0.1:0/check",
+            "https://[::1]:0/",
+            "host:0/check",
+        ] {
+            assert!(decode_http_check_target(input, false).is_err(), "{input}");
+            assert!(decode_health_http_target(input).is_err(), "{input}");
+        }
+        assert_eq!(
+            decode_http_check_target("http://host:8080/", false)
+                .unwrap()
+                .port(),
+            8080
+        );
+    }
+
+    #[test]
     fn http_targets_reject_ambiguous_authorities_before_exposing_userinfo() {
         use honk_config::check::decode_http_check_target;
         for input in [
