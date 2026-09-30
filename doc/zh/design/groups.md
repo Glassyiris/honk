@@ -281,7 +281,7 @@ VLESS pool/source key 与 QUIC 状态；配置变化时得到 fresh runtime。�
 maintenance pass 与其他 idle resource 一起回收未受 retention 的 idle VLESS
 carrier，不创建新的 protocol timer。
 
-原生探测固定成员到叶节点的关联和代次所有者，不推进策略状态。实际 TCP-connect、HTTP 和 TCP/UDP DNS 测量保留传输协议、用途、地址族及冷热状态；过期或取消的结果不发布新的健康状态。探测仅使用已接受的配置目标，不检查地址或端口策略，仍固定解析出的 IP。参见[有界探测](../reference/api.md#有界探测dns-与路由诊断)。
+原生探测固定成员到叶节点的关联和代次所有者，不推进策略状态。实际 TCP-connect、HTTP 和 TCP/UDP DNS 测量保留传输协议、用途、地址族及冷热状态；过期或取消的结果不发布新的健康状态。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。探测仍固定解析出的 IP。参见[有界探测](../reference/api.md#有界探测dns-与路由诊断)。
 
 ## 拨号准入预算
 
