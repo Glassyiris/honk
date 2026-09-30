@@ -31,7 +31,7 @@ pub(crate) trait Events: Send + Sync {
 
 /// The observation surface that owns the recorders' runtime settings.
 pub(crate) trait Owner: Send + Sync {
-    /// Applies `config`'s recorder settings.
+    /// Applies `config`'s recorder settings after a reload that replaced the accepted sources.
     fn activate(&self, config: &Config);
     /// Pauses background probes; an absent or stopped probe worker is success.
     fn pause_probes(&self) -> BoxFuture<'_, anyhow::Result<()>>;

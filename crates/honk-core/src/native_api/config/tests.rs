@@ -857,13 +857,19 @@ async fn writes_after_the_coordinator_stopped_are_unavailable() {
     fixture.shutdown().await;
 }
 
-type RequestLine = (tracing::Level, HashMap<String, String>);
+type LogLine = (tracing::Level, HashMap<String, String>);
 
-/// Request log lines as level and field text, from the test thread's own dispatcher.
-#[derive(Clone, Default)]
-struct RequestLines(Arc<parking_lot::Mutex<Vec<RequestLine>>>);
+/// Log lines with one message, as level and field text, from the test thread's own dispatcher.
+#[derive(Clone)]
+struct LogLines(&'static str, Arc<parking_lot::Mutex<Vec<LogLine>>>);
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLines {
+impl LogLines {
+    fn new(message: &'static str) -> Self {
+        Self(message, Arc::default())
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLines {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         struct Fields(HashMap<String, String>);
         impl tracing::field::Visit for Fields {
@@ -876,8 +882,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLines {
         }
         let mut fields = Fields(HashMap::new());
         event.record(&mut fields);
-        if fields.0.get("message").map(String::as_str) == Some("native HTTP request") {
-            self.0.lock().push((*event.metadata().level(), fields.0));
+        if fields.0.get("message").map(String::as_str) == Some(self.0) {
+            self.1.lock().push((*event.metadata().level(), fields.0));
         }
     }
 }
@@ -891,7 +897,7 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
     ) {
         return;
     }
-    let lines = RequestLines::default();
+    let lines = LogLines::new("native HTTP request");
     let _dispatch =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
     let fixture = Fixture::new(Access::Metadata, false).await;
@@ -914,7 +920,7 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
     )
     .await;
     fixture.shutdown().await;
-    let lines = lines.0.lock();
+    let lines = lines.1.lock();
     let refused: Vec<_> = lines
         .iter()
         .filter(|(_, fields)| fields["method"] == "PUT")
@@ -931,6 +937,83 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
         .unwrap();
     assert_eq!(*level, tracing::Level::INFO);
     assert!(!fields.contains_key("reason"));
+}
+
+#[tokio::test]
+async fn a_listener_secret_in_source_text_warns_once_per_accepted_reload() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::a_listener_secret_in_source_text_warns_once_per_accepted_reload",
+    ) {
+        return;
+    }
+    let lines = LogLines::new(
+        "configuration source is read-only because its text contains a listener secret value",
+    );
+    let _dispatch =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
+    // A glob loads the file so that only its own text and path hold the Clash secret.
+    let fixture = Fixture::new_custom(Access::Admin, false, |directory, files| {
+        std::fs::create_dir(directory.join("extra")).unwrap();
+        files
+            .get_mut("auth.dae")
+            .unwrap()
+            .push_str("experimental { clash_api { secret: 'clash-listener-token' } }\n");
+        files
+            .get_mut("main.dae")
+            .unwrap()
+            .push_str("include { 'extra/*.dae' }\n");
+        files.insert(
+            "extra/clash-listener-token.dae",
+            "# clash-listener-token copied here\n".into(),
+        );
+    })
+    .await;
+    let config = fixture.get(CONFIG).await;
+    let collided = source(
+        &config,
+        &fixture.originals["extra/clash-listener-token.dae"],
+    );
+    assert_eq!(collided["read_only_reason"], "listener_secret_in_content");
+    let expected = (
+        collided["id"].as_str().unwrap().to_owned(),
+        "extra/<redacted>.dae".to_owned(),
+    );
+    let warnings = || {
+        lines
+            .1
+            .lock()
+            .iter()
+            .map(|(level, fields)| {
+                assert_eq!(*level, tracing::Level::WARN);
+                (fields["source_id"].clone(), fields["path"].clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(warnings(), [expected.clone()]);
+    // A reload whose sources lost the acceptance race reports the snapshot already reported.
+    fixture.service.warn_secret_collisions();
+    assert_eq!(warnings().len(), 1);
+    let reload = || async {
+        let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+        fixture.terminal(&operation).await
+    };
+    // An unchanged configuration is accepted again as a no-op.
+    assert_eq!(reload().await["status"], "succeeded");
+    assert_eq!(warnings().len(), 2);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
+    assert_eq!(reload().await["error"]["code"], "reload_rejected");
+    assert_eq!(warnings().len(), 2);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
+    let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    std::fs::write(fixture.path("main.dae"), edited).unwrap();
+    assert_eq!(reload().await["error"]["code"], "reload_degraded");
+    assert_eq!(warnings(), vec![expected; 3]);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
