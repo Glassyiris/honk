@@ -31,8 +31,8 @@ Requires the opt-in `native-api` Cargo feature (build with `--features native-ap
 | `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
 | `record_logs` | `true` | Permit up to 512 structured logs for 60 seconds under the API client-attachment rule or an explicit runtime pin. `false` prohibits capture; configuration changes require restart. Console/Clash logging remains independent. |
 | `record_dns_log` | `true` | Permit completed client DNS history under the API client-attachment rule or an explicit runtime pin, bounded to 512 records and 8 MiB. `false` prohibits history; configuration changes require restart. |
-| `probe_allowed_cidrs` | empty list | Explicit IP CIDRs authorizing otherwise restricted resolved probe targets and proxy-server addresses. Empty denies restricted addresses, including loopback/private/link-local ranges. |
-| `probe_allowed_ports` | empty list | Additional ports 1–65535 for configured HTTP/DNS probe targets. Defaults permit HTTP 80, HTTPS 443 and DNS 53; raw TCP probes use only the node's configured server port. CIDR authorization remains independently required. |
+| `probe_allowed_cidrs` | empty list | IP CIDRs authorizing restricted geodata URL destinations only, including loopback/private/link-local ranges. Empty denies those ranges for nonexempt geodata URLs; probes do not use this setting. The existing name is retained for configuration compatibility. |
+| `probe_allowed_ports` | empty list | Additional ports 1–65535 for geodata URLs only, beyond HTTP 80 and HTTPS 443. CIDR authorization remains independently required. Probes use configured ports without this setting; its existing name is retained for configuration compatibility. |
 | `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, and creation of new include-loaded `.dae` files, excluding listener-credential-bearing sources. Requires a nonempty `secret` or `password_auth`. |
 
 Geodata download URLs and routes now belong to [`assets.geodata`](./assets.md). Their former `native_api` keys remain accepted with warnings; see the replacement table in the assets reference.
@@ -71,7 +71,7 @@ Configuration metadata, validation and reload operations require a genuine `.dae
 
 With `config_write: true`, all accepted noncredential includes are writable; ordinary `include` glob and no-match semantics remain unchanged. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations).
 
-Probe requests cannot supply URLs or allowlist exceptions. For an intentionally local test target, an administrator might set `probe_allowed_cidrs: '127.0.0.1/32'` and `probe_allowed_ports: '18080'`; authorize only the necessary destinations/ports. Resolution checks and address pinning still apply. Native source writes cannot change these allowlists.
+Probe targets come only from accepted configuration and have no address or port policy checks. Resolution, IPv4-mapped IPv6 normalization and selected-IP pinning still apply; callers cannot supply URLs and probes do not follow redirects. `probe_allowed_cidrs` and `probe_allowed_ports` govern geodata URLs only, except URLs named by the active configuration file. Native source writes cannot change these allowlists.
 
 ## `clash_api`
 
