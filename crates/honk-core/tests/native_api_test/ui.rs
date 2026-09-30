@@ -165,19 +165,18 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
     assert_eq!(response.headers()["content-type"], "text/html");
     let entry_url = response.url().clone();
     let index = response.text().await.unwrap();
-    assert_eq!(index, include_str!("../../assets/doona/index.html"));
+    assert_eq!(
+        index,
+        include_str!(concat!(env!("HONK_DOONA_DIR"), "/index.html"))
+    );
     let references = regex::Regex::new(r#"(?:src|href)="(\./[^"]+)""#).unwrap();
     let paths = references
         .captures_iter(&index)
         .map(|value| value[1].to_owned());
     for path in paths.chain(["./index.html".into(), "./sw.js".into()]) {
         let url = entry_url.join(&path).unwrap();
-        let expected = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/doona")
-                .join(&path),
-        )
-        .unwrap();
+        let expected =
+            std::fs::read(std::path::Path::new(env!("HONK_DOONA_DIR")).join(&path)).unwrap();
         for method in [Method::GET, Method::HEAD] {
             let response = app
                 .client
@@ -215,13 +214,11 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
             }
         }
     }
-    let webp = std::fs::read_dir(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/doona/assets"),
-    )
-    .unwrap()
-    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-    .find(|name| name.ends_with(".webp"))
-    .unwrap();
+    let webp = std::fs::read_dir(std::path::Path::new(env!("HONK_DOONA_DIR")).join("assets"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.ends_with(".webp"))
+        .unwrap();
     let response = app
         .client
         .get(entry_url.join(&format!("./assets/{webp}")).unwrap())
