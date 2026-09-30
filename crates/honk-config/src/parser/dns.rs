@@ -344,7 +344,7 @@ fn parse_dns_upstreams(
         let (address, explicit_sni) = extract_tls_server_name(address);
         let tls_server_name = explicit_sni.or_else(|| sni_from_upstream_address(&address));
         upstreams.push(crate::dns::DnsUpstream {
-            name: name.raw().to_owned(),
+            name: name.unquote().raw().to_owned(),
             address,
             protocol,
             tls_server_name,
@@ -576,9 +576,11 @@ fn parse_dns_routing(
             if target.raw().is_empty() {
                 invalid_dns_rule(diagnostics, kind, ordinal, "incomplete-dns-rule");
             } else if is_response {
-                routing.response.fallback = crate::dns::DnsResponseAction::parse(target.raw());
+                routing.response.fallback =
+                    crate::dns::DnsResponseAction::parse(target.unquote().raw());
             } else {
-                routing.request.fallback = crate::dns::DnsRequestAction::parse(target.raw());
+                routing.request.fallback =
+                    crate::dns::DnsRequestAction::parse(target.unquote().raw());
                 if let crate::dns::DnsRequestAction::Upstream(name) = &routing.request.fallback {
                     routing.fallback = name.clone();
                 }
@@ -610,12 +612,12 @@ fn parse_dns_routing(
         if is_response {
             routing.response.rules.push(crate::dns::DnsResponseRule {
                 conditions,
-                action: crate::dns::DnsResponseAction::parse(right.raw()),
+                action: crate::dns::DnsResponseAction::parse(right.unquote().raw()),
             });
         } else {
             routing.request.rules.push(crate::dns::DnsRequestRule {
                 conditions,
-                action: crate::dns::DnsRequestAction::parse(right.raw()),
+                action: crate::dns::DnsRequestAction::parse(right.unquote().raw()),
             });
         }
     }
