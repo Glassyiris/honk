@@ -615,9 +615,7 @@ impl ConfigService {
         }
         let secrets = self.secrets(Some(accepted));
         for (index, source) in accepted.update.sources.iter().enumerate() {
-            if self.source_refusal_with_secrets(accepted, index, &secrets)
-                == Some(WriteRefusal::ListenerSecretInContent)
-            {
+            if secrets.contains(&source.content) {
                 tracing::warn!(
                     source_id = %accepted.ids[&source.path],
                     path = %secrets.mask(&source_path(accepted, index).to_string_lossy()).0,
