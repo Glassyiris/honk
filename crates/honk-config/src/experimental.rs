@@ -118,8 +118,6 @@ pub struct NativeApiConfig {
     pub record_memory: bool,
     pub record_logs: bool,
     pub record_dns_log: bool,
-    pub probe_allowed_cidrs: Vec<String>,
-    pub probe_allowed_ports: Vec<u16>,
     pub config_write: bool,
     pub geosite_download_url: String,
     pub geoip_download_url: String,
@@ -145,8 +143,6 @@ impl Default for NativeApiConfig {
             record_memory: true,
             record_logs: true,
             record_dns_log: true,
-            probe_allowed_cidrs: Vec::new(),
-            probe_allowed_ports: Vec::new(),
             config_write: false,
             geosite_download_url: String::new(),
             geoip_download_url: String::new(),
@@ -216,22 +212,6 @@ impl NativeApiConfig {
                     "geodata source URL must not exceed 4096 bytes",
                 ));
             }
-        }
-        if self
-            .probe_allowed_cidrs
-            .iter()
-            .any(|value| value.parse::<ipnet::IpNet>().is_err())
-        {
-            return Err(invalid(
-                "probe_allowed_cidrs",
-                "probe destination allowlist requires explicit IP CIDRs",
-            ));
-        }
-        if self.probe_allowed_ports.contains(&0) {
-            return Err(invalid(
-                "probe_allowed_ports",
-                "probe port allowlist requires ports from 1 through 65535",
-            ));
         }
         if self.enabled {
             let listen = self
