@@ -285,7 +285,7 @@ gets a fresh runtime. The existing outbound maintenance pass reaps unretained
 idle VLESS carriers together with its other idle resources; no new protocol
 timer is created.
 
-Native probes capture member-to-leaf associations and generation owners without advancing policy state. Real raw-TCP, HTTP and TCP/UDP DNS measurements retain transport/purpose/family/warmth; obsolete or cancelled results do not publish fresh health. Restricted destination/port admission and pinned resolution apply even to configured endpoints. See [bounded probes](../reference/api.md#bounded-probes).
+Native probes capture member-to-leaf associations and generation owners without advancing policy state. Real raw-TCP, HTTP and TCP/UDP DNS measurements retain transport/purpose/family/warmth; obsolete or cancelled results do not publish fresh health. Probes use accepted configuration targets without address or port policy checks; resolution remains pinned. See [bounded probes](../reference/api.md#bounded-probes).
 
 ## Dial admission budget
 
