@@ -22,7 +22,7 @@ use subtle::ConstantTimeEq;
 
 use super::NativeState;
 use super::auth::SessionLease;
-use super::types::{Admitted, ApiError, ErrorCode, RequestId};
+use super::types::{Admitted, ApiError, ErrorCode, RequestId, WriteRefusal};
 
 pub(super) const MAX_TARGET_BYTES: usize = 4096;
 pub(super) const MAX_HEADER_BYTES: usize = 16384;
@@ -386,10 +386,21 @@ pub(super) async fn boundary(
         | Method::PATCH => method.as_str(),
         _ => "OTHER",
     };
-    // A dashboard polls every few seconds; only rejected or failed requests earn an INFO line.
+    // A dashboard polls every few seconds; only rejected or failed requests earn an INFO line,
+    // and a refused configuration write a WARN line naming why.
     let status = response.status().as_u16();
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    if status >= 400 {
+    if let Some(reason) = response.extensions().get::<WriteRefusal>() {
+        tracing::warn!(
+            method = logged_method,
+            route = template,
+            status,
+            elapsed_ms,
+            request_id = %request_id,
+            reason = reason.as_str(),
+            "native HTTP request"
+        );
+    } else if status >= 400 {
         tracing::info!(
             method = logged_method,
             route = template,
