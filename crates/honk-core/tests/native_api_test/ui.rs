@@ -366,7 +366,7 @@ async fn slow_public_file_readers_release_capacity_at_the_connection_deadline() 
     tokio::time::advance(Duration::from_secs(31)).await;
     tokio::task::yield_now().await;
     tokio::time::resume();
-    let response = read_raw_response(&mut waiting).await;
+    let response = read_raw_response(&mut waiting, "/api").await;
     assert_eq!(response.status, 200);
     let mut first = peers.remove(0);
     socket2::SockRef::from(&first)

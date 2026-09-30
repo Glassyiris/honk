@@ -215,10 +215,7 @@ async fn login_issues_a_session_and_logout_ends_only_that_one() {
 /// Opens an authenticated stream and consumes its first frame.
 async fn open_stream(app: &TestApp, path: &str, token: &str) -> Response {
     // The shared client's whole-request timeout would end any stream on its own.
-    let mut response = Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
+    let mut response = contract::ContractClient(Client::builder().no_proxy().build().unwrap())
         .get(app.url(path))
         .bearer_auth(token)
         .header("accept", "text/event-stream")
@@ -226,15 +223,11 @@ async fn open_stream(app: &TestApp, path: &str, token: &str) -> Response {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let first = timeout(IO_TIMEOUT, response.chunk())
-        .await
-        .unwrap()
-        .unwrap()
-        .expect("stream opens with a frame");
-    assert!(
-        std::str::from_utf8(&first)
-            .unwrap()
-            .contains("stream.ready")
+    assert_eq!(
+        observations::next_event(&mut response, &mut String::new())
+            .await
+            .0,
+        "stream.ready"
     );
     response
 }
