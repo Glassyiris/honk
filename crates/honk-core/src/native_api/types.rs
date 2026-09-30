@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorCode {
@@ -169,15 +169,21 @@ impl ApiError {
 
     pub fn with_details(mut self, details: Value) -> Self {
         self.error.details = Some(details);
+        if let Some(reason) = self.reason {
+            self = self.with_reason(reason);
+        }
         self
     }
 
-    /// Adds `reason` to the details, keeping what they already hold.
+    /// Adds `reason`, preserving object fields or wrapping other details in `value`.
     pub(crate) fn with_reason(mut self, reason: WriteRefusal) -> Self {
-        let details = self.error.details.get_or_insert_with(|| json!({}));
-        if let Some(details) = details.as_object_mut() {
-            details.insert("reason".into(), json!(reason.as_str()));
-        }
+        let mut details = match self.error.details.take() {
+            Some(Value::Object(details)) => details,
+            Some(value) => Map::from_iter([("value".into(), value)]),
+            None => Map::new(),
+        };
+        details.insert("reason".into(), json!(reason.as_str()));
+        self.error.details = Some(Value::Object(details));
         self.reason = Some(reason);
         self
     }
@@ -530,3 +536,6 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
         },
     })
 }
+
+#[cfg(test)]
+mod tests;
