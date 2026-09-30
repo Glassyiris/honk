@@ -192,6 +192,48 @@ fn url(address: SocketAddr) -> String {
 }
 
 #[tokio::test]
+async fn stored_url_still_requires_address_and_port_authorization() {
+    let (address, requests) = server(b"restricted").await;
+    let world = world(Vec::new());
+    let egress = Egress {
+        bootstrap: "udp://127.0.0.1:9",
+        route: &Route::Direct,
+        outbounds: Outbounds {
+            router: &world.router,
+            config: &world.config,
+            group_manager: &world.group_manager,
+            proxy_registry: &world.proxy_registry,
+            runtime_registry: &world.runtime_registry,
+        },
+    };
+    for settings in [
+        NativeApiConfig {
+            probe_allowed_ports: vec![address.port()],
+            ..Default::default()
+        },
+        NativeApiConfig {
+            probe_allowed_cidrs: vec!["127.0.0.0/8".into()],
+            ..Default::default()
+        },
+    ] {
+        let policy = Policy::new(&settings);
+        let error = fetch(
+            "geosite",
+            &[url(address)],
+            &egress,
+            1024,
+            &policy,
+            "",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "destination_rejected");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn a_group_route_downloads_through_the_group() {
     let (address, requests) = server(b"through the group").await;
     let world = world(Vec::new());
