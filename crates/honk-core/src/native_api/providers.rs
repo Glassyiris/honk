@@ -149,12 +149,12 @@ impl Provider {
         config: &honk_config::Config,
         sources: Option<&super::config::ConfigService>,
     ) -> Self {
-        let secrets = super::config::ListenerSecrets::from_config(config);
+        let secrets = match sources {
+            Some(sources) => sources.secrets_with(config),
+            None => super::config::ListenerSecrets::from_config(config),
+        };
         for value in std::iter::once(&mut self.name).chain(self.url_redacted.iter_mut()) {
             *value = secrets.mask(value).0;
-            if let Some(sources) = sources {
-                *value = sources.mask_text(value).0;
-            }
         }
         self
     }
