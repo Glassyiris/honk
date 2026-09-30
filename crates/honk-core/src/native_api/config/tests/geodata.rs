@@ -504,7 +504,7 @@ async fn download_bounds_actual_chunked_bytes_and_joins_timed_out_connection() {
             let read = timeout(WAIT, stream.read_to_end(&mut remaining)).await.unwrap();
             assert!(read.is_ok() || read.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
         });
-        let result = download_direct(&url, "", (tokio::time::Instant::now() + Duration::from_millis(100)).into(), 4, None).await;
+        let result = download_direct(&url, "", (tokio::time::Instant::now() + Duration::from_millis(100)).into(), 4).await;
         assert_eq!(result.unwrap_err().code, expected);
         tasks.join_next().await.unwrap().unwrap();
     }
@@ -728,19 +728,6 @@ impl Mirror {
     }
 }
 
-/// Stored URLs follow the administrator's destination policy, so the loopback
-/// mirror has to be allowed like any private address.
-fn allow(files: &mut HashMap<&'static str, String>, address: SocketAddr) {
-    let auth = files.get_mut("auth.dae").unwrap();
-    *auth = auth.replace(
-        " enabled: true",
-        &format!(
-            " probe_allowed_cidrs: '127.0.0.0/8'\n probe_allowed_ports: {}\n enabled: true",
-            address.port()
-        ),
-    );
-}
-
 fn checksum(bytes: &[u8]) -> Vec<u8> {
     format!("{}  file.dat\n", crate::configuration::digest(bytes)).into_bytes()
 }
@@ -755,7 +742,7 @@ async fn patch_settings(fixture: &Fixture, body: Value) -> Response {
 }
 
 #[tokio::test]
-async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
+async fn custom_port_override_verifies_and_activates_after_failed_mirrors() {
     let site = geosite("new.example");
     let ip = geoip(203);
     const OK: &str = "200 OK";
@@ -775,7 +762,6 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     .await;
     let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
         setup_rules(root, files);
-        allow(files, mirror.address);
     })
     .await;
     let geosite_urls = [
@@ -863,7 +849,6 @@ async fn a_failed_download_names_its_asset_and_the_rejected_status() {
     .await;
     let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
         setup_rules(root, files);
-        allow(files, mirror.address);
     })
     .await;
     ok(patch_settings(
@@ -890,7 +875,6 @@ async fn a_missing_file_keeps_its_404_in_the_failure() {
     let mirror = Mirror::new(vec![("/geosite.dat", "200 OK", geosite("new.example"))]).await;
     let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
         setup_rules(root, files);
-        allow(files, mirror.address);
     })
     .await;
     ok(patch_settings(

@@ -73,7 +73,6 @@ impl Hop<'_> {
                     deadline: deadline.into(),
                     max_bytes,
                     bootstrap: None,
-                    admits: &|_| true,
                 };
                 let fetched = routing
                     .outbounds()

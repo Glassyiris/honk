@@ -623,7 +623,17 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
 
 #[tokio::test]
 async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for (bind, host, family) in [
+        ("127.0.0.1:0", "127.0.0.1", "ipv4"),
+        ("[::1]:0", "[::1]", "ipv6"),
+        ("127.0.0.1:0", "[::ffff:127.0.0.1]", "ipv4"),
+    ] {
+        measure_dns_exchange(bind, host, family).await;
+    }
+}
+
+async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
     let address = listener.local_addr().unwrap();
     let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
     let tcp_peer = tokio::spawn(async move {
@@ -642,13 +652,13 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
         udp.send_to(&query[..length], peer).await.unwrap();
     });
     let mut config = Config::default();
-    config.global.udp_check_dns = vec![address.to_string()];
+    config.global.udp_check_dns = vec![format!("{host}:{}", address.port())];
     let state = state(config).await;
     let input = request(
         json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
         "dns",
         json!(["tcp", "udp"]),
-        "ipv4",
+        family,
     );
     let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
@@ -663,11 +673,12 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
     )
     .await
     .unwrap();
+    assert_eq!(plan.result.results.len(), 2);
     assert!(
         plan.result
             .results
             .iter()
-            .all(|row| row.state == "healthy" && row.health_updated)
+            .all(|row| row.state == "healthy" && row.health_updated && row.latency_ms.is_some())
     );
     let samples = state
         .alive_set
@@ -687,7 +698,7 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
 }
 
 #[tokio::test]
-async fn group_probe_reaches_loopback_server_with_default_destination_policy() {
+async fn group_http_probe_measures_loopback_node_and_custom_check_port() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node = Node::from_share_link(&format!(
         "socks5://relay.example:{}",
@@ -712,7 +723,7 @@ async fn group_probe_reaches_loopback_server_with_default_destination_policy() {
         );
         let mut destination = [0; 6];
         socket.read_exact(&mut destination).await.unwrap();
-        assert_eq!(destination, [1, 1, 1, 1, 0, 80]);
+        assert_eq!(destination, [1, 1, 1, 1, 0x20, 0xfb]);
         socket
             .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
             .await
@@ -725,7 +736,7 @@ async fn group_probe_reaches_loopback_server_with_default_destination_policy() {
             String::from_utf8(request)
                 .unwrap()
                 .to_ascii_lowercase()
-                .contains("host: authority.example\r\n")
+                .contains("host: authority.example:8443\r\n")
         );
         socket
             .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
@@ -744,7 +755,7 @@ async fn group_probe_reaches_loopback_server_with_default_destination_policy() {
     config
         .groups
         .push(serde_json::from_value(json!({"name":"lan-relay","nodes":[id]})).unwrap());
-    config.global.tcp_check_url = vec!["http://authority.example/check".into()];
+    config.global.tcp_check_url = vec!["http://authority.example:8443/check".into()];
     let state = state(config).await;
     let identity = state.observation.core.catalog.snapshot();
     let input = request(
@@ -772,6 +783,11 @@ async fn group_probe_reaches_loopback_server_with_default_destination_policy() {
         id.to_string()
     );
     assert_eq!(result["result"]["results"][0]["state"], "healthy");
+    assert!(
+        result["result"]["results"][0]["latency_ms"]
+            .as_f64()
+            .is_some()
+    );
     peer.await.unwrap();
     stop.send(true).unwrap();
     worker.await.unwrap();

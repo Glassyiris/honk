@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -11,7 +10,6 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::destination::Policy;
 use super::operations::{OperationKind, Reservation};
 use super::{ApiError, ErrorCode, NativeState, config, parse_query, timestamp, types::RequestId};
 use crate::download_route::{self, Detour, Failed, Outbounds};
@@ -89,7 +87,6 @@ pub(crate) struct GeoUpdatePlan {
     pub(crate) proxy_registry: Arc<crate::proxy::ProxyRegistry>,
     pub(crate) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     pub(crate) catalog: Arc<crate::observe::catalog::Catalog>,
-    pub(crate) policy: Arc<Policy>,
     pub(crate) sources: Option<Arc<Sources>>,
 }
 
@@ -423,7 +420,6 @@ async fn queue(state: &Arc<NativeState>, reservation: Reservation) -> bool {
             catalog: Arc::clone(&state.observation.core.catalog),
             assets,
             revision,
-            policy: Arc::new(Policy::new(&state.settings)),
             sources,
         })
     }
@@ -518,27 +514,23 @@ impl From<&'static str> for Failure {
 /// checksum has a separate `CHECKSUM_TIMEOUT` that starts after the file
 /// arrives. Every request takes the route in
 /// `egress`; one it cannot carry fails like a connection and never goes
-/// direct instead. `policy` applies to every URL but `exempt`, the one the
-/// administrator wrote in the configuration file. Without `verify_checksum`
+/// direct instead. Without `verify_checksum`
 /// no checksum is requested and every downloaded file is accepted unverified.
 pub(crate) async fn fetch(
     kind: &'static str,
     urls: &[String],
     egress: &Egress<'_>,
     max_bytes: usize,
-    policy: &Policy,
-    exempt: &str,
     verify_checksum: bool,
 ) -> Result<(Arc<[u8]>, Fetched), Failure> {
     let mut last = Failure::from("invalid_source");
     for url in urls {
-        let policy = (url != exempt).then_some(policy);
         let started = Instant::now();
         let deadline = Deadline {
             headers: started + IDLE_TIMEOUT,
             idle: Some((IDLE_TIMEOUT, started + DOWNLOAD_LIMIT)),
         };
-        let (bytes, group) = match download(url, egress, deadline, max_bytes, policy).await {
+        let (bytes, group) = match download(url, egress, deadline, max_bytes).await {
             Ok(downloaded) => downloaded,
             Err(error) => {
                 last = error;
@@ -557,7 +549,6 @@ pub(crate) async fn fetch(
                 egress,
                 (Instant::now() + CHECKSUM_TIMEOUT).into(),
                 MAX_CHECKSUM_BYTES,
-                policy,
             )
             .await;
             match published {
@@ -611,14 +602,13 @@ async fn download(
     egress: &Egress<'_>,
     deadline: Deadline,
     max_bytes: usize,
-    policy: Option<&Policy>,
 ) -> Result<(Arc<[u8]>, Option<String>), Failure> {
     let routed = match egress.route {
         Route::Direct => None,
         Route::Routing => Some((egress.outbounds, Detour::Routing)),
         Route::Group(group) => Some((egress.outbounds, Detour::Group(group))),
     };
-    exchange(url, egress.bootstrap, routed, deadline, max_bytes, policy).await
+    exchange(url, egress.bootstrap, routed, deadline, max_bytes).await
 }
 
 /// Fetches `url` straight from its host, resolved with the bootstrap
@@ -629,30 +619,22 @@ pub(crate) async fn download_direct(
     bootstrap: &str,
     deadline: Deadline,
     max_bytes: usize,
-    policy: Option<&Policy>,
 ) -> Result<Arc<[u8]>, Failure> {
-    exchange(url, bootstrap, None, deadline, max_bytes, policy)
+    exchange(url, bootstrap, None, deadline, max_bytes)
         .await
         .map(|(bytes, _)| bytes)
 }
 
 /// One GET that only a 200 answers, through `routed` or straight to the
-/// host; another status is kept for the failure. `policy` limits the port
-/// and the addresses the request may reach.
+/// host; another status is kept for the failure.
 async fn exchange(
     url: &str,
     bootstrap: &str,
     routed: Option<(Outbounds<'_>, Detour<'_>)>,
     deadline: Deadline,
     max_bytes: usize,
-    policy: Option<&Policy>,
 ) -> Result<(Arc<[u8]>, Option<String>), Failure> {
     let url = parse_geodata_url(url).ok_or("invalid_source")?;
-    let port = url.port_or_known_default().ok_or("invalid_source")?;
-    if policy.is_some_and(|policy| !policy.http_port(port, url.scheme() == "https")) {
-        return Err("destination_rejected".into());
-    }
-    let admits = |ip: IpAddr| policy.is_none_or(|policy| policy.address(ip));
     let headers = http::HeaderMap::new();
     let request = download_route::Request {
         url: &url,
@@ -661,7 +643,6 @@ async fn exchange(
         deadline,
         max_bytes,
         bootstrap: Some(bootstrap),
-        admits: &admits,
     };
     let (reply, group) = match routed {
         None => (download_route::fetch_direct(&request).await?, None),
