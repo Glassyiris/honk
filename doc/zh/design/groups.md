@@ -276,6 +276,8 @@ VLESS pool/source key 与 QUIC state；配置变化时得到 fresh runtime。现
 maintenance pass 与其他 idle resource 一起回收未受 retention 的 idle VLESS
 carrier，不创建新的 protocol timer。
 
+原生探测固定成员到叶节点的关联和代次所有者，不推进策略状态。实际 TCP-connect、HTTP 和 TCP/UDP DNS 测量保留传输协议、用途、地址族及冷热状态；过期或取消的结果不发布新的健康状态。探测仅使用已接受的配置目标，不检查地址或端口策略，仍固定解析出的 IP。参见[有界探测](../reference/api.md#有界探测dns-与路由诊断)。
+
 ## 拨号准入预算
 
 `max_concurrent_dials` 默认为 64，并为物理代理连接和协议握手创建 generation-local semaphore。配置值会被启动时计算出的不可变进程级描述符 gate 限制。重载可以改变替代 generation 的本地上限，但重叠的新旧 generation 仍共享同一个进程 gate。
