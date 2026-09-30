@@ -397,7 +397,13 @@ impl ConfigService {
     pub(crate) fn write_refusal(&self) -> Option<WriteRefusal> {
         if !self.settings.config_write || !self.settings.credentialed() {
             Some(WriteRefusal::WritesDisabled)
-        } else if !self.sources.available() || self.sender.lock().is_none() {
+        } else if !self.sources.available()
+            || self
+                .sender
+                .lock()
+                .as_ref()
+                .is_none_or(mpsc::Sender::is_closed)
+        {
             Some(WriteRefusal::ConfigurationUnavailable)
         } else {
             None
@@ -452,15 +458,12 @@ impl ConfigService {
     /// The refusal `/nodes` and `/providers` writes get while the main source cannot take them.
     pub(super) fn manage_admission(&self) -> Result<(), ApiError> {
         let accepted = self.sources.accepted.read().clone();
-        let running = self
-            .sender
-            .lock()
-            .as_ref()
-            .is_some_and(|sender| !sender.is_closed());
-        let Some(accepted) = accepted.filter(|_| running) else {
-            return Err(super::management::unsupported()
-                .with_reason(WriteRefusal::ConfigurationUnavailable));
-        };
+        if let Some(reason) = self.write_refusal() {
+            return Err(super::management::unsupported().with_reason(reason));
+        }
+        let accepted = accepted.ok_or_else(|| {
+            super::management::unsupported().with_reason(WriteRefusal::ConfigurationUnavailable)
+        })?;
         if let Some(reason) = self.source_refusal(&accepted, 0) {
             return Err(super::management::unsupported().with_reason(reason));
         }

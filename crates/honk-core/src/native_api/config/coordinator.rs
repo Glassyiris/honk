@@ -993,16 +993,8 @@ impl CandidateCheck {
                 ids,
             ));
         }
-        if validated.config.experimental.native_api != active.experimental.native_api
-            || validated.config.experimental.clash_api.secret
-                != active.experimental.clash_api.secret
-            || (matches!(self.store, SourceStore::Db(_))
-                && validated.config.global.data_dir != active.global.data_dir)
-        {
-            return Err(denied().with_reason(WriteRefusal::ListenerSettingsChanged));
-        }
         let mut written = &validated.sources[0];
-        if let Some((accepted, target, content)) = write {
+        let refusal = if let Some((accepted, target, content)) = write {
             let old_credentials: Vec<_> = accepted
                 .update
                 .sources
@@ -1030,9 +1022,6 @@ impl CandidateCheck {
             } else {
                 None
             };
-            if let Some(reason) = refusal {
-                return Err(denied().with_reason(reason));
-            }
             if let Some(source) = validated
                 .sources
                 .iter()
@@ -1040,6 +1029,20 @@ impl CandidateCheck {
             {
                 written = source;
             }
+            refusal
+        } else {
+            None
+        };
+        let refusal = refusal.or_else(|| {
+            (validated.config.experimental.native_api != active.experimental.native_api
+                || validated.config.experimental.clash_api.secret
+                    != active.experimental.clash_api.secret
+                || (matches!(self.store, SourceStore::Db(_))
+                    && validated.config.global.data_dir != active.global.data_dir))
+                .then_some(WriteRefusal::ListenerSettingsChanged)
+        });
+        if let Some(reason) = refusal {
+            return Err(denied().with_reason(reason));
         }
         // The reload would reject these, and a rejected reload leaves the written file
         // ahead of the accepted hash; refuse before writing.
