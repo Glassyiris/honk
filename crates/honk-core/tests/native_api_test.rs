@@ -299,7 +299,8 @@ struct RawResponse {
     body: Vec<u8>,
 }
 
-async fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
+/// Reads the answer to a GET for `target` and checks it against the contract.
+async fn read_raw_response(stream: &mut TcpStream, target: &str) -> RawResponse {
     let mut bytes = Vec::new();
     timeout(IO_TIMEOUT, stream.read_to_end(&mut bytes))
         .await
@@ -309,9 +310,9 @@ async fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
         .windows(4)
         .position(|part| part == b"\r\n\r\n")
         .unwrap();
-    let headers = std::str::from_utf8(&bytes[..boundary])
-        .unwrap()
-        .to_ascii_lowercase();
+    let head = std::str::from_utf8(&bytes[..boundary]).unwrap();
+    contract::check_raw(Method::GET, target, head, &bytes[boundary + 4..]);
+    let headers = head.to_ascii_lowercase();
     let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
     RawResponse {
         status,
@@ -328,7 +329,7 @@ async fn raw_request(app: &TestApp, target: &str, headers: &str, body: &[u8]) ->
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     stream.write_all(body).await.unwrap();
-    read_raw_response(&mut stream).await
+    read_raw_response(&mut stream, target).await
 }
 
 fn raw_error(response: RawResponse, status: u16, code: &str) {
