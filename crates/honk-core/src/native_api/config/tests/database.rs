@@ -651,6 +651,13 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     );
     let running = source(&config, &candidate);
     assert_eq!(running["writable"], false);
+    assert!(
+        config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["read_only_reason"] == "store_blocked")
+    );
     let again = candidate.replace("fallback: block", "fallback: direct");
     let response = fixture.replace(running, &again).send().await.unwrap();
     let body = error(
@@ -676,6 +683,13 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
     assert_eq!(revisions(&fixture).len(), 1);
     let config = fixture.get(CONFIG).await;
     assert_eq!(config["x-honk"]["store"]["recorded"], true);
+    assert!(
+        config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("read_only_reason").is_none())
+    );
     source(&config, &fixture.originals["main.dae"]);
     let capabilities = fixture.get("/api/v1/capabilities").await;
     assert_eq!(capabilities["resources"]["config"]["writable"], true);

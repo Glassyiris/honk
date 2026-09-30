@@ -70,11 +70,14 @@ impl Serialize for ErrorCode {
     }
 }
 
-/// Why a configuration write was refused, sent as `details.reason`.
+/// Why a configuration write was refused, sent as `details.reason`, or why a listed source is
+/// read-only, sent as its `read_only_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteRefusal {
     WritesDisabled,
     ConfigurationUnavailable,
+    /// Only a source listing names it: a failed record blocks writes until the head is activated.
+    StoreBlocked,
     ListenerSecretSource,
     ListenerSecretInContent,
     ListenerSettingsChanged,
@@ -84,9 +87,10 @@ pub(crate) enum WriteRefusal {
 }
 
 impl WriteRefusal {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::WritesDisabled,
         Self::ConfigurationUnavailable,
+        Self::StoreBlocked,
         Self::ListenerSecretSource,
         Self::ListenerSecretInContent,
         Self::ListenerSettingsChanged,
@@ -104,6 +108,7 @@ impl WriteRefusal {
         match self {
             Self::WritesDisabled => "writes_disabled",
             Self::ConfigurationUnavailable => "configuration_unavailable",
+            Self::StoreBlocked => "store_blocked",
             Self::ListenerSecretSource => "listener_secret_source",
             Self::ListenerSecretInContent => "listener_secret_in_content",
             Self::ListenerSettingsChanged => "listener_settings_changed",
