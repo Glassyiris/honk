@@ -163,3 +163,39 @@ fn candidate_secret_refusals_precede_listener_settings_changes() {
         assert_eq!(error.into_details(), Some(json!({"reason":reason})));
     }
 }
+
+#[test]
+fn db_import_secret_copy_keeps_its_status_details_and_reason() {
+    let (directory, entry, _) = source_tree();
+    let state = directory.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let main = std::fs::read_to_string(&entry).unwrap();
+    std::fs::write(
+        &entry,
+        format!("{main}global {{ data_dir: '{}' }}\n", state.display()),
+    )
+    .unwrap();
+    let mut startup =
+        super::super::super::store::DatabaseStartup::open(&entry, &state, &mut Vec::new()).unwrap();
+    startup.record().unwrap();
+    std::fs::write(
+        &entry,
+        format!(
+            "{}# listener-token\n",
+            std::fs::read_to_string(&entry).unwrap()
+        ),
+    )
+    .unwrap();
+    let error = revisions::read_import(&startup.store, &mut Vec::new())
+        .err()
+        .unwrap();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.error.code.as_str(), "unsupported_value");
+    assert_eq!(
+        error.into_details(),
+        Some(
+            json!({"resource":"/x-honk/config/import", "check":"secret_copy", "reason":"listener_secret_in_content"})
+        )
+    );
+    assert_eq!(startup.store.head(), Ok(Some(1)));
+}
