@@ -975,10 +975,17 @@ async fn a_listener_secret_in_source_text_warns_once_per_accepted_reload() {
         &fixture.originals["extra/clash-listener-token.dae"],
     );
     assert_eq!(collided["read_only_reason"], "listener_secret_in_content");
-    let expected = (
-        collided["id"].as_str().unwrap().to_owned(),
-        "extra/<redacted>.dae".to_owned(),
-    );
+    let auth = source(&config, &fixture.originals["auth.dae"]);
+    let expected = vec![
+        (
+            auth["id"].as_str().unwrap().to_owned(),
+            "auth.dae".to_owned(),
+        ),
+        (
+            collided["id"].as_str().unwrap().to_owned(),
+            "extra/<redacted>.dae".to_owned(),
+        ),
+    ];
     let warnings = || {
         lines
             .1
@@ -990,29 +997,29 @@ async fn a_listener_secret_in_source_text_warns_once_per_accepted_reload() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(warnings(), [expected.clone()]);
+    assert_eq!(warnings(), expected);
     // A reload whose sources lost the acceptance race reports the snapshot already reported.
     fixture.service.warn_secret_collisions();
-    assert_eq!(warnings().len(), 1);
+    assert_eq!(warnings().len(), 2);
     let reload = || async {
         let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
         fixture.terminal(&operation).await
     };
     // An unchanged configuration is accepted again as a no-op.
     assert_eq!(reload().await["status"], "succeeded");
-    assert_eq!(warnings().len(), 2);
+    assert_eq!(warnings().len(), 4);
     fixture
         .reject_reloads
         .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
     assert_eq!(reload().await["error"]["code"], "reload_rejected");
-    assert_eq!(warnings().len(), 2);
+    assert_eq!(warnings().len(), 4);
     fixture
         .reject_reloads
         .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
     let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
     std::fs::write(fixture.path("main.dae"), edited).unwrap();
     assert_eq!(reload().await["error"]["code"], "reload_degraded");
-    assert_eq!(warnings(), vec![expected; 3]);
+    assert_eq!(warnings(), vec![expected; 3].concat());
     fixture.shutdown().await;
 }
 
@@ -1244,4 +1251,77 @@ fn malformed_credential_source_is_withheld_without_panicking() {
         secrets.mask("ordinary content"),
         ("ordinary content".into(), false)
     );
+}
+
+#[test]
+fn every_secret_bearing_accepted_source_warns_even_when_writes_are_disabled() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::every_secret_bearing_accepted_source_warns_even_when_writes_are_disabled",
+    ) {
+        return;
+    }
+    let lines = LogLines::new(
+        "configuration source is read-only because its text contains a listener secret value",
+    );
+    let _dispatch =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("extra")).unwrap();
+    let entry = directory.path().join("main.dae");
+    std::fs::write(&entry, "include { 'auth.dae'\n 'extra/*.dae' }\n").unwrap();
+    std::fs::write(
+        directory.path().join("auth.dae"),
+        format!("experimental {{ native_api {{ secret: '{SECRET}' }} }}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join(format!("extra/{SECRET}.dae")),
+        format!("# {SECRET}\n"),
+    )
+    .unwrap();
+    let loaded = Config::from_dae_file_with_sources(
+        &entry,
+        &HashMap::new(),
+        SourceLimits::DEFAULT,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let owner = crate::native_api::observation::NativeObservation::new(&loaded.config);
+    let service = &owner.configuration;
+    let update = SourceUpdate {
+        sources: loaded.sources,
+        dependencies: vec![],
+        geo_sources: None,
+    };
+    service
+        .sources
+        .accept(service.sources.prepare_accept(&update), 1);
+    service.warn_secret_collisions();
+    service.warn_secret_collisions();
+    let accepted = service.sources.accepted.read().clone().unwrap();
+    let expected = [
+        (
+            accepted.ids[&directory.path().join("auth.dae")].clone(),
+            "auth.dae",
+        ),
+        (
+            accepted.ids[&directory.path().join(format!("extra/{SECRET}.dae"))].clone(),
+            "extra/<redacted>.dae",
+        ),
+    ];
+    {
+        let captured = lines.1.lock();
+        assert_eq!(captured.len(), 2);
+        for ((level, fields), (id, path)) in captured.iter().zip(&expected) {
+            assert_eq!(*level, tracing::Level::WARN);
+            assert_eq!(&fields["source_id"], id);
+            assert_eq!(&fields["path"], path);
+            assert!(!fields.values().any(|value| value.contains(SECRET)));
+        }
+    }
+    service.sources.generation_committed("next-generation", 2);
+    service.warn_secret_collisions();
+    service.warn_secret_collisions();
+    assert_eq!(lines.1.lock().len(), 4);
 }
