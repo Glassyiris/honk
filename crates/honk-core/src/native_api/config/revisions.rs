@@ -118,8 +118,8 @@ pub(in crate::native_api) async fn import(
     let Some(SourceStore::Db(store)) = service.store.read().clone() else {
         return Err(unsupported());
     };
-    if !service.writable() {
-        return Err(denied());
+    if let Some(reason) = service.write_refusal() {
+        return Err(denied().with_reason(reason));
     }
     json_type(&request)?;
     let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
@@ -156,8 +156,8 @@ pub(in crate::native_api) async fn activate(
     let Some(SourceStore::Db(store)) = service.store.read().clone() else {
         return Err(unsupported());
     };
-    if !service.writable() {
-        return Err(denied());
+    if let Some(reason) = service.write_refusal() {
+        return Err(denied().with_reason(reason));
     }
     let path = request.uri().path().to_owned();
     let number = path

@@ -123,8 +123,8 @@ pub(in crate::native_api) async fn replace(
     if !state.observation.configuration.sources.available() {
         return Err(unsupported());
     }
-    if !state.observation.configuration.writable() {
-        return Err(denied());
+    if let Some(reason) = state.observation.configuration.write_refusal() {
+        return Err(denied().with_reason(reason));
     }
     let expected = if_match(&request)?;
     json_type(&request)?;
@@ -155,8 +155,8 @@ pub(in crate::native_api) async fn create(
     if !state.observation.configuration.sources.available() {
         return Err(unsupported());
     }
-    if !state.observation.configuration.writable() {
-        return Err(denied());
+    if let Some(reason) = state.observation.configuration.write_refusal() {
+        return Err(denied().with_reason(reason));
     }
     // A blocked store advertises `create: false`.
     if !state.observation.configuration.editable() {

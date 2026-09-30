@@ -378,8 +378,8 @@ pub(super) async fn patch(
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
     let service = &state.observation.configuration;
-    if !service.writable() {
-        return Err(read_only());
+    if let Some(reason) = service.write_refusal() {
+        return Err(read_only().with_reason(reason));
     }
     if config::request_header(&request, "content-type")?
         .and_then(|value| value.split(';').next())

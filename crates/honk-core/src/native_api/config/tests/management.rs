@@ -362,12 +362,26 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
         fixture.get("/api/v1/capabilities").await["resources"]["nodes"]["can_manage"],
         false
     );
-    error(
+    let refused = error(
         create_node(&fixture, "denied", LINK).send().await.unwrap(),
         StatusCode::NOT_FOUND,
         "capability_not_supported",
     )
     .await;
+    assert_eq!(refused["error"]["details"]["reason"], "writes_disabled");
+    fixture.shutdown().await;
+    let mut fixture = Fixture::new(Access::Admin, false).await;
+    fixture.coordinator.take().unwrap().shutdown().await;
+    let refused = error(
+        create_node(&fixture, "stopped", LINK).send().await.unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["details"]["reason"],
+        "configuration_unavailable"
+    );
     fixture.shutdown().await;
 }
 
@@ -589,6 +603,8 @@ async fn management_write_and_phase_failures_do_not_mutate_sources() {
     )
     .await;
     assert_eq!(failure["error"]["details"]["written"], false);
+    assert_eq!(failure["error"]["details"]["stage"], "write");
+    assert_eq!(failure["error"]["details"]["reason"], "unsafe_path");
     std::fs::remove_file(fixture.path("main.dae")).unwrap();
     std::fs::rename(saved, fixture.path("main.dae")).unwrap();
     let (_phase, receiver) = tokio::sync::watch::channel(crate::control::EnginePhase::Draining);

@@ -136,15 +136,18 @@ fn promote_on_a_moved_head_conflicts() {
 fn candidates_with_listener_secrets_are_not_recorded() {
     let fixture = fixture();
     let store = initialized(&fixture);
-    let pin = store.pin(store.entry()).unwrap();
-    let content = "experimental { native_api { secret: 'leaked' } }\n";
-    let candidate = sources(store.entry(), content);
-    assert_eq!(
+    let refused = |content: &str| {
+        let pin = store.pin(store.entry()).unwrap();
+        let candidate = sources(store.entry(), content);
         store
             .commit(pin, content, &candidate, "control", Box::new(|| Ok(())))
-            .err(),
-        Some(WriteError::UnsafePath)
+            .err()
+    };
+    assert_eq!(
+        refused("experimental { native_api { secret: 'leaked' } }\n"),
+        Some(WriteError::SecretSource)
     );
+    assert_eq!(refused("# native-token\n"), Some(WriteError::SecretContent));
 }
 
 #[test]

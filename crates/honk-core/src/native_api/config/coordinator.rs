@@ -357,9 +357,7 @@ impl Worker {
         group_manager: &honk_outbound::group::SharedGroupManager,
         alive_set: &honk_outbound::alive::AliveDialerSet,
     ) -> Result<Completion, ApiError> {
-        if !self.service.can_manage() {
-            return Err(management::unsupported());
-        }
+        self.service.manage_admission()?;
         let active = self.active.read().await.clone();
         let accepted = self
             .service
@@ -368,8 +366,8 @@ impl Worker {
             .read()
             .clone()
             .ok_or_else(management::unsupported)?;
-        if !self.service.source_writable(&accepted, 0) {
-            return Err(management::unsupported());
+        if let Some(reason) = self.service.source_refusal(&accepted, 0) {
+            return Err(management::unsupported().with_reason(reason));
         }
         let main = &accepted.update.sources[0];
         use honk_config::parser::source_edit::{
@@ -681,8 +679,8 @@ impl Worker {
             .group_sources
             .get(&patch.name)
             .ok_or_else(not_found)?;
-        if !self.service.source_writable(&accepted, index) {
-            return Err(super::super::groups::read_only());
+        if let Some(reason) = self.service.source_refusal(&accepted, index) {
+            return Err(super::super::groups::read_only().with_reason(reason));
         }
         let changes = patch.changes()?;
         let content = honk_config::parser::source_edit::edit_group_source(
@@ -752,8 +750,8 @@ impl Worker {
             .iter()
             .position(|source| accepted.ids[&source.path] == source_id)
             .ok_or_else(not_found)?;
-        if !self.service.source_writable(&accepted, index) {
-            return Err(denied());
+        if let Some(reason) = self.service.source_refusal(&accepted, index) {
+            return Err(denied().with_reason(reason));
         }
         let target = accepted.update.sources[index].path.clone();
         let mut check = self.candidate_check().await?;
@@ -914,7 +912,13 @@ impl Worker {
                 .map_err(|error| match error {
                     WriteError::Conflict => changed(),
                     // The parent became a symlink after resolution: still a path outside the root.
-                    WriteError::UnsafePath => invalid(),
+                    WriteError::UnsafePath => invalid().with_reason(WriteRefusal::UnsafePath),
+                    WriteError::SecretSource => {
+                        invalid().with_reason(WriteRefusal::ListenerSecretSource)
+                    }
+                    WriteError::SecretContent => {
+                        invalid().with_reason(WriteRefusal::ListenerSecretInContent)
+                    }
                     error => store_write_error(store, error),
                 })?;
             Ok(prepared(validated, diagnostics, committed))
@@ -994,7 +998,7 @@ impl CandidateCheck {
             || (matches!(self.store, SourceStore::Db(_))
                 && validated.config.global.data_dir != active.global.data_dir)
         {
-            return Err(denied());
+            return Err(denied().with_reason(WriteRefusal::ListenerSettingsChanged));
         }
         let mut written = &validated.sources[0];
         if let Some((accepted, target, content)) = write {
@@ -1011,14 +1015,22 @@ impl CandidateCheck {
                 .filter(|source| source.contains_api_secret)
                 .map(|source| (&source.path, &source.content))
                 .collect();
-            if old_credentials != new_credentials
-                || validated
-                    .sources
-                    .iter()
-                    .any(|source| source.path == target && source.contains_api_secret)
-                || self.secrets.contains(content)
+            // The target's own declaration implies a changed credential set, so it goes first.
+            let refusal = if validated
+                .sources
+                .iter()
+                .any(|source| source.path == target && source.contains_api_secret)
             {
-                return Err(denied());
+                Some(WriteRefusal::ListenerSecretSource)
+            } else if self.secrets.contains(content) {
+                Some(WriteRefusal::ListenerSecretInContent)
+            } else if old_credentials != new_credentials {
+                Some(WriteRefusal::CredentialSourcesChanged)
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                return Err(denied().with_reason(reason));
             }
             if let Some(source) = validated
                 .sources
@@ -1181,12 +1193,20 @@ fn db_write_error(error: WriteError) -> ApiError {
     }
 }
 
+fn refused_write(reason: WriteRefusal) -> ApiError {
+    denied()
+        .with_details(json!({"stage":"write"}))
+        .with_reason(reason)
+}
+
 fn write_error(error: WriteError) -> ApiError {
     match error {
         WriteError::Conflict => stale(),
         WriteError::Exists => exists(),
         WriteError::TooLarge => too_large(),
-        WriteError::UnsafePath => denied().with_details(json!({"stage":"write"})),
+        WriteError::UnsafePath => refused_write(WriteRefusal::UnsafePath),
+        WriteError::SecretSource => refused_write(WriteRefusal::ListenerSecretSource),
+        WriteError::SecretContent => refused_write(WriteRefusal::ListenerSecretInContent),
         WriteError::InvalidUtf8 => invalid(),
         WriteError::Unavailable => unavailable().with_details(json!({"stage":"write"})),
         WriteError::ChangedButNotDurable => {
