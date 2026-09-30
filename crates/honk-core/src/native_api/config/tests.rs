@@ -452,6 +452,7 @@ fn source_content(row: &Value) -> Value {
     let mut row = row.clone();
     let object = row.as_object_mut().unwrap();
     assert!(object.remove("writable").is_some() && object.remove("loaded_at").is_some());
+    object.remove("read_only_reason");
     row
 }
 fn source<'a>(config: &'a Value, content: &str) -> &'a Value {
@@ -627,7 +628,9 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|row| row["content"].is_string() && row["writable"] == false)
+                .all(|row| row["content"].is_string()
+                    && row["writable"] == false
+                    && row["read_only_reason"] == "writes_disabled")
         );
         assert!(!config.to_string().contains(SECRET));
         let main = source(&config, &fixture.originals["main.dae"]);
@@ -675,6 +678,10 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         let id = row["id"].as_str().unwrap();
         assert!(!id.is_empty() && !id.contains(name));
         assert_eq!(row["writable"], *name != "auth.dae");
+        assert_eq!(
+            row.get("read_only_reason").cloned(),
+            (*name == "auth.dae").then(|| json!("listener_secret_source"))
+        );
         assert_eq!(row["absolute_path"], fixture.path(name).to_str().unwrap());
         if *name == "auth.dae" {
             assert!(row["content"].as_str().unwrap().contains("enabled: true"));
@@ -800,6 +807,8 @@ async fn refused_source_writes_name_the_listener_secret_reason() {
             .clone()
     };
     let (locked, editable) = (row("locked.dae"), row("editable.dae"));
+    assert_eq!(locked["read_only_reason"], "listener_secret_in_content");
+    assert!(editable.get("read_only_reason").is_none());
     let before = disk(fixture.directory.path());
     let reason = |response: Response| async move {
         error(response, StatusCode::FORBIDDEN, "permission_denied").await["error"]["details"]
