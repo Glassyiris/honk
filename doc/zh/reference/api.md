@@ -83,7 +83,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
 
-配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建（发布产物已启用）并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。静态响应保留 `no-cache`、`nosniff`、`X-Frame-Options: DENY`；公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求 bearer；不向 UI 注入凭据。
+配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建（发布产物已启用）并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。静态响应带 `no-cache` 与 `nosniff`，不带 framing header，以便 LuCI 等面板嵌入 UI；需要防御 clickjacking 的部署应在反向代理添加 `X-Frame-Options` 或 `Content-Security-Policy: frame-ancestors`。公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求 bearer；不向 UI 注入凭据。
 
 ### 认证发现与密码会话
 
