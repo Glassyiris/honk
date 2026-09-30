@@ -239,9 +239,11 @@ impl<'a> ParserDiagnostics<'a> {
                 }
             }
         } else if let Some(index) = self.subscription {
-            diagnostic.setting = SettingPath::new("subscriptions")
-                .index(index)
-                .field("interval");
+            if let Some(crate::diagnostic::SettingSegment::Field(field)) =
+                diagnostic.setting.0.last().cloned()
+            {
+                diagnostic.setting = SettingPath::new("subscriptions").index(index).field(field);
+            }
             diagnostic.entry_index = Some(index);
         } else if ttl && let Some(index) = self.entry {
             diagnostic.setting = SettingPath::new("dns")
