@@ -467,6 +467,34 @@ fn recheck_error(error: Errno) -> WriteError {
     }
 }
 
+const TEMPORARY_PREFIX: &str = ".honk-config-";
+const TEMPORARY_SUFFIX: &str = ".tmp";
+
+/// Removes temporary files a killed process left in `directory` and returns their paths.
+/// Only call this before any write of this process can have staged one.
+pub(crate) fn remove_stale_temporaries(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let is_temporary = entry.file_name().to_str().is_some_and(|name| {
+            name.strip_prefix(TEMPORARY_PREFIX)
+                .and_then(|name| name.strip_suffix(TEMPORARY_SUFFIX))
+                .is_some_and(|id| {
+                    uuid::Uuid::try_parse(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+                })
+        });
+        if is_temporary
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed.push(entry.path());
+        }
+    }
+    removed
+}
+
 struct TemporaryFile {
     directory: File,
     name: String,
@@ -477,7 +505,10 @@ struct TemporaryFile {
 impl TemporaryFile {
     fn create(directory: &File) -> Result<Self, WriteError> {
         let directory = directory.try_clone().map_err(|_| WriteError::Unavailable)?;
-        let name = format!(".honk-config-{}.tmp", uuid::Uuid::new_v4());
+        let name = format!(
+            "{TEMPORARY_PREFIX}{}{TEMPORARY_SUFFIX}",
+            uuid::Uuid::new_v4()
+        );
         let descriptor = openat(
             &directory,
             name.as_str(),
