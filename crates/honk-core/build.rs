@@ -94,11 +94,23 @@ fn embed_native_ui() -> anyhow::Result<()> {
         Ok(())
     }
 
-    println!("cargo:rerun-if-changed=assets/doona");
-    let root = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("assets/doona");
+    println!("cargo:rerun-if-env-changed=HONK_DOONA_DIR");
+    let root = std::path::PathBuf::from(std::env::var_os("HONK_DOONA_DIR").context(
+        "the native-ui feature embeds a doona build from HONK_DOONA_DIR; \
+         fetch the pinned release with `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`",
+    )?);
     ensure!(
-        fs::symlink_metadata(&root)?.is_dir(),
-        "native UI assets must be a directory"
+        root.is_absolute(),
+        "HONK_DOONA_DIR must be an absolute path: {}",
+        root.display()
+    );
+    println!("cargo:rerun-if-changed={}", root.display());
+    ensure!(
+        fs::symlink_metadata(&root)
+            .with_context(|| format!("failed to inspect HONK_DOONA_DIR {}", root.display()))?
+            .is_dir(),
+        "HONK_DOONA_DIR must be a directory: {}",
+        root.display()
     );
     let mut files = Vec::new();
     collect(&root, &root, &mut files)?;
@@ -111,10 +123,11 @@ fn embed_native_ui() -> anyhow::Result<()> {
     );
     let mut generated = String::from("&[\n");
     for path in files {
-        writeln!(
-            generated,
-            "    ({path:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/assets/doona/\", {path:?}))),"
-        )?;
+        let file = root.join(&path);
+        let file = file
+            .to_str()
+            .context("HONK_DOONA_DIR paths must be UTF-8")?;
+        writeln!(generated, "    ({path:?}, include_bytes!({file:?})),")?;
     }
     generated.push_str("]\n");
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
