@@ -327,7 +327,7 @@ impl Tunnel {
     }
 }
 
-/// One GET a download makes, and the addresses it may reach.
+/// One GET a download makes.
 pub(crate) struct Request<'a> {
     pub(crate) url: &'a reqwest::Url,
     pub(crate) headers: &'a http::HeaderMap,
@@ -338,9 +338,6 @@ pub(crate) struct Request<'a> {
     /// The only resolver a direct host name is resolved with; `None` uses the
     /// process bootstrap resolver and its system fallback.
     pub(crate) bootstrap: Option<&'a str>,
-    /// Whether an address may be reached: every direct one, and a proxied
-    /// host written as an address. The node's egress resolves a proxied domain.
-    pub(crate) admits: &'a (dyn Fn(IpAddr) -> bool + Sync),
 }
 
 /// Why a routed download failed.
@@ -392,9 +389,6 @@ impl Outbounds<'_> {
             Route::Block => return Err("route_blocked".into()),
             Route::Direct { .. } => fetch_direct(request).await?,
             Route::Proxy { node, .. } => {
-                if parse_host_ip(host).is_some_and(|ip| !(request.admits)(ip)) {
-                    return Err("destination_rejected".into());
-                }
                 let tunnel = match timeout_at(by, self.tunnel(&node, (host, port))).await {
                     Err(_) => return Err("download_timeout".into()),
                     Ok(Err(error)) => {
@@ -422,7 +416,7 @@ impl Outbounds<'_> {
 }
 
 /// Makes `request` straight to its host over the bypass mark, on the first
-/// admitted address that accepts the connection.
+/// resolved address that accepts the connection.
 pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'static str> {
     let by = request.deadline.headers;
     let host = request
@@ -450,12 +444,7 @@ pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'stati
                 .map_err(|_| "resolution_failed")?
         }
     };
-    let mut rejected = false;
     for ip in addresses {
-        if !(request.admits)(ip) {
-            rejected = true;
-            continue;
-        }
         let connected = timeout_at(
             by,
             honk_outbound::util::connect_marked_addr(
@@ -470,11 +459,7 @@ pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'stati
             return get(Box::new(stream), request).await;
         }
     }
-    Err(if rejected {
-        "destination_rejected"
-    } else {
-        "connection_failed"
-    })
+    Err("connection_failed")
 }
 
 async fn get(
