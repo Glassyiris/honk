@@ -6,6 +6,7 @@ mod dns_rules;
 mod geodata;
 mod groups;
 mod management;
+mod secrets;
 mod transactions;
 mod validation;
 
@@ -67,6 +68,8 @@ struct Fixture {
     addr: SocketAddr,
     client: Client,
     authenticated: bool,
+    /// The bearer token; a test that declares another native secret sets it.
+    bearer: &'static str,
     state: Weak<NativeState>,
     service: Arc<ConfigService>,
     server: Option<NativeServer>,
@@ -276,6 +279,7 @@ impl Fixture {
             addr,
             client: Client::builder().no_proxy().timeout(WAIT).build().unwrap(),
             authenticated: !matches!(access, Access::Anonymous),
+            bearer: SECRET,
             state: weak,
             service,
             server: Some(server),
@@ -299,7 +303,7 @@ impl Fixture {
             .client
             .request(method, format!("http://{}{path}", self.addr));
         if self.authenticated {
-            request.bearer_auth(SECRET)
+            request.bearer_auth(self.bearer)
         } else {
             request
         }
