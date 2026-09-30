@@ -492,7 +492,7 @@ pub(super) async fn get(
 /// Adds the geodata sources, URLs as written apart from listener secrets.
 fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value {
     if let Some(sources) = state.geodata.as_ref() {
-        let secrets = super::config::ListenerSecrets::from_config(active);
+        let secrets = state.observation.configuration.secrets_with(active);
         value["geodata"] = sources.effective().json(
             |url| secrets.mask(url).0,
             |name| super::geodata::group_id(&state.observation.core.catalog, name),
