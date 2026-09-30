@@ -209,3 +209,70 @@ fn test_validate_typed_api_legacy_rules_precede_new_request_fallback() {
         &config.dns.routing.convert_legacy_rules(),
     );
 }
+
+fn quoted_upstream_config(declared: &str, target: &str) -> Config {
+    let source = format!(
+        "dns {{
+    upstream {{
+        {declared}: 'udp://192.0.2.1:53'
+    }}
+    routing {{
+        request {{
+            qname(full: quoted.example) -> {target}
+            fallback: {target}
+        }}
+        response {{
+            upstream({target}) && ip(192.0.2.0/24) -> {target}
+            fallback: {target}
+        }}
+    }}
+}}
+"
+    );
+    honk_config::parser::parse_dae_config(&source).unwrap()
+}
+
+#[test]
+fn test_validate_resolves_dns_upstream_names_across_quote_styles() {
+    use honk_config::dns::{DnsCond, DnsRequestAction, DnsResponseAction};
+    for (declared, target, name) in [
+        ("'my dns'", "'my dns'", "my dns"),
+        ("\"my dns\"", "\"my dns\"", "my dns"),
+        ("'my dns'", "\"my dns\"", "my dns"),
+        ("\"my dns\"", "'my dns'", "my dns"),
+        ("alidns", "'alidns'", "alidns"),
+        ("'alidns'", "alidns", "alidns"),
+    ] {
+        let config = quoted_upstream_config(declared, target);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{declared} -> {target}: {error:?}"));
+        let dns = &config.dns;
+        assert_eq!(dns.upstream[0].name, name);
+        let upstream = DnsRequestAction::Upstream(name.into());
+        assert_eq!(dns.routing.request.rules[0].action, upstream);
+        assert_eq!(dns.routing.request.fallback, upstream);
+        assert_eq!(dns.routing.fallback, name);
+        let requery = DnsResponseAction::Upstream(name.into());
+        assert_eq!(dns.routing.response.rules[0].action, requery);
+        assert_eq!(dns.routing.response.fallback, requery);
+        assert_eq!(
+            dns.routing.response.rules[0].conditions[0],
+            DnsCond::Upstream {
+                not: false,
+                names: vec![name.into()],
+            },
+        );
+    }
+}
+
+#[test]
+fn test_validate_rejects_unknown_quoted_dns_upstream_name() {
+    let mut config = quoted_upstream_config("'my dns'", "'my dns'");
+    config.dns.routing.request.rules[0].action =
+        honk_config::dns::DnsRequestAction::Upstream("'my dns'".into());
+    assert_missing_dns_upstream(&config, "dns.routing.request.rules[1].action", "'my dns'");
+
+    let config = quoted_upstream_config("'my dns'", "\"other dns\"");
+    assert_missing_dns_upstream(&config, "dns.routing.request.rules[1].action", "other dns");
+}

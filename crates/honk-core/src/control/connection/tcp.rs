@@ -960,11 +960,6 @@ impl ControlPlaneHandle {
                     }
                 };
 
-                // Zero-copy fast path: a direct dial yields plain `TcpStream`s on
-                // both ends, so relay through `splice(2)` (with automatic lossless
-                // fallback to the copy relay when the kernel rejects it). TLS- or
-                // protocol-wrapped proxy streams keep the userspace copy relay.
-                // Both paths update the connection's live byte counters as data flows.
                 let first_response = score_reporter.as_ref().map(|reporter| {
                     let reporter = reporter.clone();
                     std::sync::Arc::new(move || reporter.first_response())
@@ -1010,14 +1005,9 @@ impl ControlPlaneHandle {
                         tokio::select! {
                             biased;
                             _ = wait_for_close(close.as_ref()) => None,
-                            result = async { match proxy_stream.into_tcp_stream() {
-                                Ok(upstream) => relay::splice::relay_splice(
-                                    flow.stream_mut(), upstream, client_addr, original_dst, Some(conn_progress.clone()),
-                                ).await,
-                                Err(proxy_stream) => relay::splice::relay_auto(
-                                    flow.stream_mut(), proxy_stream.stream, client_addr, original_dst, Some(conn_progress),
-                                ).await,
-                            }} => Some(result),
+                            result = relay::relay_proxy(
+                                flow.stream_mut(), proxy_stream, client_addr, original_dst, conn_progress,
+                            ) => Some(result),
                         }
                     };
                     #[cfg(feature = "native-api")]
