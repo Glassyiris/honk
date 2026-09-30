@@ -461,31 +461,55 @@ fn native_server_failures_are_admitted_at_their_emitting_module() {
     }
 }
 
-#[test]
-fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
-    const TARGET: &str = "honk_core::native_api::security";
-    let line = |reason: Option<WriteRefusal>| Projection {
-        message: audited_message("native HTTP request"),
-        status: Some(403),
-        reason,
-        withheld: true,
-        ..Projection::default()
-    };
-    let (message, fields) = line(Some(WriteRefusal::WritesDisabled)).finish(TARGET);
-    assert_eq!(message, "native HTTP request");
+#[tokio::test]
+async fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
+    if run_isolated(
+        "native_api::logs::tests::only_a_request_line_with_a_known_refusal_reason_is_admitted",
+    ) {
+        return;
+    }
+    let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
+    owner.settings.renew(&owner, false);
+    let store = Arc::clone(&owner.logs);
+    let dispatch = capture(&store);
+    let query = "?level=info&target=honk_core::native_api";
+    let mut stream = response(&store, query, None).into_body().into_data_stream();
+    let baseline = next(&mut stream).await;
+    drop(stream);
+    tracing::dispatcher::with_default(&dispatch, || {
+        super::super::security::log_request(
+            "PUT",
+            "/api/v1/config/sources/{source_id}",
+            403,
+            1.5,
+            "request-1",
+            Some(WriteRefusal::WritesDisabled),
+        );
+        tracing::warn!(target: "honk_core::native_api::security", status = 403u16,
+            reason = "not_a_refusal_reason", message = "native HTTP request");
+        super::super::security::log_request("GET", "/api/v1/config", 404, 1.5, "request-2", None);
+        tracing::warn!(target: "honk_core::native_api::server", status = 403u16,
+            reason = "writes_disabled", message = "native HTTP request");
+    });
+    let mut resumed = response(&store, query, Some(cursor(&baseline)))
+        .into_body()
+        .into_data_stream();
+    assert!(
+        next(&mut resumed)
+            .await
+            .starts_with("event: stream.ready\n")
+    );
+    let known = data(&next(&mut resumed).await);
+    assert_eq!(known["message"], "native HTTP request");
     assert_eq!(
-        fields,
+        known["fields"],
         json!({"reason":"writes_disabled","status":403,"native_withheld_fields":true})
-            .as_object()
-            .cloned()
     );
-    assert_eq!(line(None).finish(TARGET).0, WITHHELD);
-    assert_eq!(
-        line(Some(WriteRefusal::WritesDisabled))
-            .finish("honk_core::native_api::server")
-            .0,
-        WITHHELD
-    );
+    for _ in 0..3 {
+        let withheld = data(&next(&mut resumed).await);
+        assert_eq!(withheld["message"], WITHHELD);
+        assert!(withheld["fields"].is_null(), "{withheld}");
+    }
 }
 
 #[test]
