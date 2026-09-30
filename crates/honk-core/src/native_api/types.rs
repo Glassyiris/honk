@@ -84,6 +84,22 @@ pub(crate) enum WriteRefusal {
 }
 
 impl WriteRefusal {
+    const ALL: [Self; 8] = [
+        Self::WritesDisabled,
+        Self::ConfigurationUnavailable,
+        Self::ListenerSecretSource,
+        Self::ListenerSecretInContent,
+        Self::ListenerSettingsChanged,
+        Self::CredentialSourcesChanged,
+        Self::ImportEntryChanged,
+        Self::UnsafePath,
+    ];
+
+    /// The code spelled `text`, if it is one.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == text)
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::WritesDisabled => "writes_disabled",
@@ -112,6 +128,9 @@ pub struct ApiError {
     pub(super) status: StatusCode,
     #[serde(skip)]
     retry_after: RetryAfter,
+    /// Travels to the request log as a response extension; the body carries it in `details`.
+    #[serde(skip)]
+    reason: Option<WriteRefusal>,
     pub(super) error: ErrorBody,
     request_id: Option<String>,
 }
@@ -133,6 +152,7 @@ impl ApiError {
         Self {
             status,
             retry_after: RetryAfter::Default,
+            reason: None,
             error: ErrorBody {
                 code,
                 message,
@@ -153,6 +173,7 @@ impl ApiError {
         if let Some(details) = details.as_object_mut() {
             details.insert("reason".into(), json!(reason.as_str()));
         }
+        self.reason = Some(reason);
         self
     }
 
@@ -202,6 +223,7 @@ impl IntoResponse for ApiError {
             )
             .then_some(1),
         };
+        let reason = self.reason;
         let mut response = (
             self.status,
             [
@@ -211,6 +233,9 @@ impl IntoResponse for ApiError {
             Json(self),
         )
             .into_response();
+        if let Some(reason) = reason {
+            response.extensions_mut().insert(reason);
+        }
         if let Some(seconds) = retry_after {
             response
                 .headers_mut()
