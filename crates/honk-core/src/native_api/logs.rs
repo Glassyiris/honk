@@ -29,7 +29,7 @@ use super::{
     ApiError, ErrorCode, NativeState, error,
     events::{self, EventHub},
     parse_query, timestamp,
-    types::RequestId,
+    types::{RequestId, WriteRefusal},
 };
 
 const MAX_RECORDS: usize = 512;
@@ -366,6 +366,8 @@ struct Projection {
     nodes: Option<u64>,
     tcp: Option<bool>,
     udp: Option<bool>,
+    status: Option<u64>,
+    reason: Option<WriteRefusal>,
     withheld: bool,
 }
 
@@ -377,16 +379,19 @@ impl Visit for Projection {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = audited_message(value);
-        } else {
-            self.withheld = true;
+        match field.name() {
+            "message" => self.message = audited_message(value),
+            "reason" if WriteRefusal::parse(value).is_some() => {
+                self.reason = WriteRefusal::parse(value);
+            }
+            _ => self.withheld = true,
         }
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "nodes" => self.nodes = Some(value),
+            "status" => self.status = Some(value),
             _ => self.withheld = true,
         }
     }
@@ -418,6 +423,7 @@ fn audited_message(message: &str) -> Option<&'static str> {
         }
         "Standalone DNS listener started" => Some("Standalone DNS listener started"),
         "native API listener ready" => Some("native API listener ready"),
+        "native HTTP request" => Some("native HTTP request"),
         _ => None,
     }
 }
@@ -428,7 +434,9 @@ impl Projection {
             return (WITHHELD, None);
         };
         let allowed = match target {
-            "honk_core::native_api::server" => message.starts_with("native HTTP "),
+            "honk_core::native_api::server" => {
+                message.starts_with("native HTTP ") && message != "native HTTP request"
+            }
             "honk_core::control::runtime" => matches!(
                 message,
                 "Publishing accepted subscription body"
@@ -437,6 +445,10 @@ impl Projection {
                     | "Standalone DNS listener started"
             ),
             "honk_core" => message == "native API listener ready",
+            // Only the refused-write line: other request lines stay withheld.
+            "honk_core::native_api::security" => {
+                message == "native HTTP request" && self.reason.is_some()
+            }
             _ => false,
         };
         if !allowed {
@@ -456,7 +468,16 @@ impl Projection {
                 fields.insert("udp".into(), json!(udp));
             }
         }
+        if message == "native HTTP request" {
+            if let Some(reason) = self.reason {
+                fields.insert("reason".into(), json!(reason.as_str()));
+            }
+            if let Some(status) = self.status {
+                fields.insert("status".into(), json!(status));
+            }
+        }
         if self.withheld
+            || (self.status.is_some() && message != "native HTTP request")
             || (self.nodes.is_some() && message != "Publishing accepted subscription body")
             || ((self.tcp.is_some() || self.udp.is_some())
                 && message != "Standalone DNS listener started")
