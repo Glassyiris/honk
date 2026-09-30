@@ -60,6 +60,7 @@ impl ConfigService {
                 .generation_committed(&crate::observe::catalog::revision_for(&config), generation);
         }
         *self.store.write() = Some(store.clone());
+        self.warn_secret_collisions();
         let (sender, mut receiver) = mpsc::channel(16);
         *self.sender.lock() = Some(sender);
         let (stop, mut stopping) = watch::channel(false);
