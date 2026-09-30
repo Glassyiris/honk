@@ -115,7 +115,11 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
     app.shutdown().await;
 }
 
-async fn next_event(response: &mut Response, pending: &mut String) -> (String, String, Value) {
+/// Reads the next named event and checks its data against the contract.
+pub(super) async fn next_event(
+    response: &mut Response,
+    pending: &mut String,
+) -> (String, String, Value) {
     loop {
         if let Some(end) = pending.find("\n\n") {
             let frame = pending[..end].to_owned();
@@ -132,11 +136,9 @@ async fn next_event(response: &mut Response, pending: &mut String) -> (String, S
             if kind.is_empty() {
                 continue;
             }
-            return (
-                kind,
-                field("id:"),
-                serde_json::from_str(&field("data:")).unwrap(),
-            );
+            let data = serde_json::from_str(&field("data:")).unwrap();
+            contract::check_event(response.url(), &kind, &data);
+            return (kind, field("id:"), data);
         }
         let chunk = timeout(IO_TIMEOUT, response.chunk())
             .await
@@ -519,7 +521,7 @@ async fn native_head_disposes_event_stream_without_consuming_client_capacity() {
 #[tokio::test]
 async fn native_sse_heartbeat_survives_connection_lifetime_and_shutdown_releases_state() {
     let app = TestApp::new(|_| {}).await;
-    let client = Client::builder().no_proxy().build().unwrap();
+    let client = contract::ContractClient(Client::builder().no_proxy().build().unwrap());
     let mut response = client
         .get(app.url("/api/v1/events?kinds=generation.changed"))
         .bearer_auth(SECRET)

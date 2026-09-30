@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use jsonschema::{Draft, Registry, Validator};
-use reqwest::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING};
 use reqwest::{Client, IntoUrl, Method, RequestBuilder, Response, Url};
 use serde_json::Value;
 
@@ -17,6 +17,24 @@ const CONTRACT_URL: &str = "https://contract.honk.invalid/openapi.json";
 /// Responses honk sends that the contract does not describe yet, awaiting an
 /// owner decision: (method, path template or raw path, status, reason).
 const KNOWN_DRIFT: &[(&str, &str, u16, &str)] = &[];
+
+/// Values the contract rejects inside otherwise conforming responses, awaiting
+/// an owner decision: (label, instance path, reason).
+const KNOWN_VALUE_DRIFT: &[(&str, &str, &str)] = &[
+    (
+        "GET /api/v1/groups/{group_id} 200",
+        "/config/check_url",
+        MASKED_URL,
+    ),
+    (
+        "GET /api/v1/groups/{group_id}/config 200",
+        "/config/check_url",
+        MASKED_URL,
+    ),
+];
+
+const MASKED_URL: &str = "a masked listener secret leaves `<redacted>` in the URL, which \
+    SafeHttpUrl's `format: uri` rejects; the contract does not say how a masked URL is spelled";
 
 static DOCUMENT: LazyLock<Value> = LazyLock::new(|| serde_yaml::from_str(CONTRACT).unwrap());
 
@@ -94,14 +112,95 @@ impl ContractRequest {
 }
 
 async fn check(method: &Method, url: &Url, response: Response) -> Response {
+    let status = response.status();
+    let Some((label, schema)) = inspect(method, url.path(), status.as_u16(), response.headers())
+    else {
+        return response;
+    };
+    let version = response.version();
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await.unwrap();
+    check_json(&label, &schema, &bytes);
+    let mut rebuilt = http::Response::builder().status(status).version(version);
+    *rebuilt.headers_mut().unwrap() = headers;
+    Response::from(rebuilt.body(bytes).unwrap())
+}
+
+/// Checks a response read off a raw socket: `target` is the request target as
+/// sent and `head` the status line and headers as received.
+pub(super) fn check_raw(method: Method, target: &str, head: &str, body: &[u8]) {
+    let target = match target.strip_prefix("http://") {
+        Some(rest) => rest.find('/').map_or("/", |start| &rest[start..]),
+        None => target,
+    };
+    let path = target.split('?').next().unwrap();
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap().split_whitespace().nth(1).unwrap();
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').unwrap();
+        headers.append(
+            HeaderName::try_from(name.trim()).unwrap(),
+            HeaderValue::try_from(value.trim()).unwrap(),
+        );
+    }
+    let Some((label, schema)) = inspect(&method, path, status.parse().unwrap(), &headers) else {
+        return;
+    };
+    let chunked = headers
+        .get(TRANSFER_ENCODING)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"chunked"));
+    if chunked {
+        check_json(&label, &schema, &dechunk(body));
+    } else {
+        check_json(&label, &schema, body);
+    }
+}
+
+fn dechunk(mut body: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    loop {
+        let end = body.windows(2).position(|part| part == b"\r\n").unwrap();
+        let size = std::str::from_utf8(&body[..end]).unwrap();
+        let size = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16).unwrap();
+        body = &body[end + 2..];
+        if size == 0 {
+            return decoded;
+        }
+        decoded.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+}
+
+/// Checks one server-sent event's data against the schema its event name selects.
+pub(super) fn check_event(url: &Url, kind: &str, data: &Value) {
     let path = url.path();
+    let template = template_for(path).unwrap_or(path);
+    let label = format!("GET {template} event {kind}");
+    let schema = DOCUMENT
+        .pointer(&format!(
+            "/paths/{}/get/responses/200/content/text~1event-stream/x-event-data-schemas/{}",
+            escape(template),
+            escape(kind)
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("contract: {label}: event is not documented"));
+    check_value(&label, schema.strip_prefix('#').unwrap(), data);
+}
+
+/// Checks the status and headers, returning the label and the schema pointer
+/// the JSON body still has to match, if any.
+fn inspect(
+    method: &Method,
+    path: &str,
+    status: u16,
+    headers: &HeaderMap,
+) -> Option<(String, String)> {
     // CORS preflight is transport negotiation, not a contract operation.
     if (path != "/api" && !path.starts_with("/api/")) || method == Method::OPTIONS {
-        return response;
+        return None;
     }
-    let status = response.status().as_u16();
-    let media_type = response
-        .headers()
+    let media_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap().trim().to_ascii_lowercase());
@@ -117,7 +216,7 @@ async fn check(method: &Method, url: &Url, response: Response) -> Response {
         .iter()
         .any(|&(m, t, s, _)| m == method.as_str() && t == template.unwrap_or(path) && s == status)
     {
-        return response;
+        return None;
     }
     let operation = template
         .map(|template| format!("/paths/{}/{lookup}", escape(template)))
@@ -128,10 +227,8 @@ async fn check(method: &Method, url: &Url, response: Response) -> Response {
             status >= 400 && media_type.as_deref() == Some("application/json"),
             "contract: {label}: operation is not in the contract"
         );
-        if method == Method::HEAD {
-            return response;
-        }
-        return validate(&label, "/components/schemas/ErrorResponse", response).await;
+        return (method != Method::HEAD)
+            .then(|| (label, "/components/schemas/ErrorResponse".to_owned()));
     };
     let responses = DOCUMENT.pointer(&format!("{operation}/responses")).unwrap();
     let key = [
@@ -144,15 +241,34 @@ async fn check(method: &Method, url: &Url, response: Response) -> Response {
     .unwrap_or_else(|| panic!("contract: {label}: status is not documented"));
     let pointer = resolve(format!("{operation}/responses/{key}"));
     let declared = DOCUMENT.pointer(&pointer).unwrap();
-    for (name, header) in declared["headers"].as_object().into_iter().flatten() {
-        let header = match header["$ref"].as_str() {
-            Some(target) => DOCUMENT.pointer(&resolve(target[1..].to_owned())).unwrap(),
-            None => header,
-        };
+    for name in declared["headers"]
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+    {
+        let header = resolve(format!("{pointer}/headers/{}", escape(name)));
+        let values = headers.get_all(name);
         assert!(
-            header["required"] != Value::Bool(true) || response.headers().contains_key(name),
+            DOCUMENT.pointer(&header).unwrap()["required"] != Value::Bool(true)
+                || values.iter().next().is_some(),
             "contract: {label}: required header {name} is missing"
         );
+        let schema = resolve(format!("{header}/schema"));
+        // Header values are text; a numeric schema describes the parsed value.
+        let numeric = matches!(
+            DOCUMENT.pointer(&schema).unwrap()["type"].as_str(),
+            Some("integer" | "number")
+        );
+        for value in values {
+            let text = value
+                .to_str()
+                .unwrap_or_else(|_| panic!("contract: {label}: header {name} is not text"));
+            let instance = numeric
+                .then(|| serde_json::from_str(text).ok())
+                .flatten()
+                .unwrap_or_else(|| Value::from(text));
+            check_value(&format!("{label}: header {name}"), &schema, &instance);
+        }
     }
     let content = declared["content"].as_object();
     let Some(media_type) = media_type else {
@@ -160,17 +276,18 @@ async fn check(method: &Method, url: &Url, response: Response) -> Response {
             content.is_none_or(|content| content.is_empty()) || method == Method::HEAD,
             "contract: {label}: response has no body but the contract declares one"
         );
-        return response;
+        return None;
     };
     assert!(
         content.is_some_and(|content| content.contains_key(&media_type)),
         "contract: {label}: media type {media_type} is not documented"
     );
+    // Event streams are checked frame by frame, through `check_event`.
     if media_type != "application/json" || method == Method::HEAD {
-        return response;
+        return None;
     }
     let schema = format!("{pointer}/content/{}/schema", escape(&media_type));
-    validate(&label, &schema, response).await
+    Some((label, schema))
 }
 
 /// Picks the template whose literal segments match the most of `path`, so
@@ -212,13 +329,13 @@ fn escape(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 
-async fn validate(label: &str, pointer: &str, response: Response) -> Response {
-    let status = response.status();
-    let version = response.version();
-    let headers = response.headers().clone();
-    let bytes = response.bytes().await.unwrap();
-    let body: Value = serde_json::from_slice(&bytes)
+fn check_json(label: &str, pointer: &str, bytes: &[u8]) {
+    let body: Value = serde_json::from_slice(bytes)
         .unwrap_or_else(|error| panic!("contract: {label}: body is not JSON: {error}"));
+    check_value(label, pointer, &body);
+}
+
+fn check_value(label: &str, pointer: &str, instance: &Value) {
     let validator = VALIDATORS
         .lock()
         .unwrap()
@@ -229,6 +346,8 @@ async fn validate(label: &str, pointer: &str, response: Response) -> Response {
             let schema = serde_json::json!({ "$ref": format!("{CONTRACT_URL}#{fragment}") });
             let validator = jsonschema::options()
                 .with_draft(Draft::Draft202012)
+                // 2020-12 treats `format` as an annotation unless asked.
+                .should_validate_formats(true)
                 .with_registry(&REGISTRY)
                 .build(&schema)
                 .unwrap_or_else(|error| panic!("contract: {label}: {error}"));
@@ -236,17 +355,20 @@ async fn validate(label: &str, pointer: &str, response: Response) -> Response {
         })
         .clone();
     let errors: Vec<_> = validator
-        .iter_errors(&body)
+        .iter_errors(instance)
+        .filter(|error| {
+            let path = error.instance_path().to_string();
+            !KNOWN_VALUE_DRIFT
+                .iter()
+                .any(|&(known, at, _)| known == label && at == path)
+        })
         .map(|error| format!("{} at {}", error, error.instance_path()))
         .collect();
     assert!(
         errors.is_empty(),
-        "contract: {label}: {}\nbody: {body}",
+        "contract: {label}: {}\nvalue: {instance}",
         errors.join("; ")
     );
-    let mut rebuilt = http::Response::builder().status(status).version(version);
-    *rebuilt.headers_mut().unwrap() = headers;
-    Response::from(rebuilt.body(bytes).unwrap())
 }
 
 /// Reads the suite's scenario tests never reach still have to match the contract.
