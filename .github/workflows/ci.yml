@@ -290,6 +290,11 @@ jobs:
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
+      - name: Fetch doona for the native-ui feature
+        run: |
+          set -euo pipefail
+          dir=$(ci/fetch-doona.sh)
+          echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all --all-targets --features honk-core/native-ui -- -D warnings
       - name: Write lint CI report
@@ -391,6 +396,11 @@ jobs:
           echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
           sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - name: Fetch doona for the native-ui feature
+        run: |
+          set -euo pipefail
+          dir=$(ci/fetch-doona.sh)
+          echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
       - name: List workspace tests
         run: |
           set -euo pipefail
@@ -1339,6 +1349,11 @@ jobs:
       - run: cargo check -p honk-core --no-default-features --features clash-api
       - run: cargo check -p honk-core --no-default-features --features native-api
       - run: cargo check -p honk-core --no-default-features --features native-api,clash-api
+      - name: Fetch doona for the native-ui feature
+        run: |
+          set -euo pipefail
+          dir=$(ci/fetch-doona.sh)
+          echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
       - run: cargo check -p honk-core --no-default-features --features native-ui
       - name: Test independent native API
         run: |
