@@ -70,6 +70,50 @@ impl Serialize for ErrorCode {
     }
 }
 
+/// Why a configuration write was refused, sent as `details.reason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteRefusal {
+    WritesDisabled,
+    ConfigurationUnavailable,
+    ListenerSecretSource,
+    ListenerSecretInContent,
+    ListenerSettingsChanged,
+    CredentialSourcesChanged,
+    ImportEntryChanged,
+    UnsafePath,
+}
+
+impl WriteRefusal {
+    const ALL: [Self; 8] = [
+        Self::WritesDisabled,
+        Self::ConfigurationUnavailable,
+        Self::ListenerSecretSource,
+        Self::ListenerSecretInContent,
+        Self::ListenerSettingsChanged,
+        Self::CredentialSourcesChanged,
+        Self::ImportEntryChanged,
+        Self::UnsafePath,
+    ];
+
+    /// The code spelled `text`, if it is one.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == text)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WritesDisabled => "writes_disabled",
+            Self::ConfigurationUnavailable => "configuration_unavailable",
+            Self::ListenerSecretSource => "listener_secret_source",
+            Self::ListenerSecretInContent => "listener_secret_in_content",
+            Self::ListenerSettingsChanged => "listener_settings_changed",
+            Self::CredentialSourcesChanged => "credential_sources_changed",
+            Self::ImportEntryChanged => "import_entry_changed",
+            Self::UnsafePath => "unsafe_path",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RetryAfter {
     /// `1` on a 429 or 503, absent otherwise.
@@ -84,6 +128,9 @@ pub struct ApiError {
     pub(super) status: StatusCode,
     #[serde(skip)]
     retry_after: RetryAfter,
+    /// Travels to the request log as a response extension; the body carries it in `details`.
+    #[serde(skip)]
+    reason: Option<WriteRefusal>,
     pub(super) error: ErrorBody,
     request_id: Option<String>,
 }
@@ -105,6 +152,7 @@ impl ApiError {
         Self {
             status,
             retry_after: RetryAfter::Default,
+            reason: None,
             error: ErrorBody {
                 code,
                 message,
@@ -116,6 +164,16 @@ impl ApiError {
 
     pub fn with_details(mut self, details: Value) -> Self {
         self.error.details = Some(details);
+        self
+    }
+
+    /// Adds `reason` to the details, keeping what they already hold.
+    pub(crate) fn with_reason(mut self, reason: WriteRefusal) -> Self {
+        let details = self.error.details.get_or_insert_with(|| json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert("reason".into(), json!(reason.as_str()));
+        }
+        self.reason = Some(reason);
         self
     }
 
@@ -165,6 +223,7 @@ impl IntoResponse for ApiError {
             )
             .then_some(1),
         };
+        let reason = self.reason;
         let mut response = (
             self.status,
             [
@@ -174,6 +233,9 @@ impl IntoResponse for ApiError {
             Json(self),
         )
             .into_response();
+        if let Some(reason) = reason {
+            response.extensions_mut().insert(reason);
+        }
         if let Some(seconds) = retry_after {
             response
                 .headers_mut()

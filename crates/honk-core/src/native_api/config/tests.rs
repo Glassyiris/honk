@@ -633,7 +633,7 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         let main = source(&config, &fixture.originals["main.dae"]);
         assert_eq!(fixture.get(&source_path(main)).await, source_content(main));
         let before = disk(fixture.directory.path());
-        error(
+        let refused = error(
             fixture
                 .replace(main, "routing { fallback: block }")
                 .send()
@@ -643,6 +643,10 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
             "permission_denied",
         )
         .await;
+        assert_eq!(
+            refused["error"]["details"],
+            json!({"reason":"writes_disabled"})
+        );
         assert_eq!(disk(fixture.directory.path()), before);
         assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
         fixture.shutdown().await;
@@ -699,7 +703,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     }
     assert!(!config.to_string().contains(SECRET));
     let before = disk(fixture.directory.path());
-    error(
+    let refused = error(
         fixture
             .replace(
                 source(&config, &fixture.originals["auth.dae"]),
@@ -712,8 +716,12 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         "permission_denied",
     )
     .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"listener_secret_source"})
+    );
     let without_auth = fixture.originals["main.dae"].replace(" 'auth.dae'\n", "");
-    error(
+    let refused = error(
         fixture
             .replace(
                 source(&config, &fixture.originals["main.dae"]),
@@ -726,6 +734,10 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         "permission_denied",
     )
     .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"listener_settings_changed"})
+    );
     error(
         fixture
             .request(Method::GET, "/api/v1/config/sources/unknown")
@@ -766,6 +778,150 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     );
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_source_writes_name_the_listener_secret_reason() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
+        files
+            .get_mut("locked.dae")
+            .unwrap()
+            .push_str(&format!("# {SECRET}\n"));
+    })
+    .await;
+    let config = fixture.get(CONFIG).await;
+    let row = |name: &str| {
+        config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (locked, editable) = (row("locked.dae"), row("editable.dae"));
+    let before = disk(fixture.directory.path());
+    let reason = |response: Response| async move {
+        error(response, StatusCode::FORBIDDEN, "permission_denied").await["error"]["details"]
+            ["reason"]
+            .clone()
+    };
+    let refused = fixture
+        .replace(&locked, "# replaced\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reason(refused).await, "listener_secret_in_content");
+    let copied = format!("# {SECRET}\n");
+    let refused = fixture.replace(&editable, &copied).send().await.unwrap();
+    assert_eq!(reason(refused).await, "listener_secret_in_content");
+    // The same declaration again changes no listener setting, and it still carries the secret.
+    let declared = &fixture.originals["auth.dae"];
+    let refused = fixture.replace(&editable, declared).send().await.unwrap();
+    assert_eq!(reason(refused).await, "listener_secret_source");
+    assert_eq!(disk(fixture.directory.path()), before);
+    let mut auth = fixture.originals["auth.dae"].clone();
+    auth.push_str("# Edited on disk since the last reload.\n");
+    std::fs::write(fixture.path("auth.dae"), auth).unwrap();
+    let refused = fixture.replace(&editable, "# edit\n").send().await.unwrap();
+    assert_eq!(reason(refused).await, "credential_sources_changed");
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn writes_after_the_coordinator_stopped_are_unavailable() {
+    let mut fixture = Fixture::new(Access::Admin, false).await;
+    let config = fixture.get(CONFIG).await;
+    let editable = source(&config, &fixture.originals["editable.dae"]).clone();
+    fixture.coordinator.take().unwrap().shutdown().await;
+    let refused = error(
+        fixture.replace(&editable, "# edit\n").send().await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["details"],
+        json!({"reason":"configuration_unavailable"})
+    );
+    fixture.shutdown().await;
+}
+
+type RequestLine = (tracing::Level, HashMap<String, String>);
+
+/// Request log lines as level and field text, from the test thread's own dispatcher.
+#[derive(Clone, Default)]
+struct RequestLines(Arc<parking_lot::Mutex<Vec<RequestLine>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLines {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields(HashMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+        }
+        let mut fields = Fields(HashMap::new());
+        event.record(&mut fields);
+        if fields.0.get("message").map(String::as_str) == Some("native HTTP request") {
+            self.0.lock().push((*event.metadata().level(), fields.0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_write_logs_its_reason_on_the_request_line() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    // Callsite interest is process-wide; other tests' dispatchers would race this one.
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::a_refused_write_logs_its_reason_on_the_request_line",
+    ) {
+        return;
+    }
+    let lines = RequestLines::default();
+    let _dispatch =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
+    let fixture = Fixture::new(Access::Metadata, false).await;
+    let config = fixture.get(CONFIG).await;
+    let main = source(&config, &fixture.originals["main.dae"]);
+    error(
+        fixture.replace(main, "# edit\n").send().await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    )
+    .await;
+    error(
+        fixture
+            .request(Method::GET, "/api/v1/config/sources/unknown")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    )
+    .await;
+    fixture.shutdown().await;
+    let lines = lines.0.lock();
+    let refused: Vec<_> = lines
+        .iter()
+        .filter(|(_, fields)| fields["method"] == "PUT")
+        .collect();
+    assert_eq!(refused.len(), 1, "{lines:?}");
+    let (level, fields) = refused[0];
+    assert_eq!(*level, tracing::Level::WARN);
+    assert_eq!(fields["reason"], "writes_disabled");
+    assert_eq!(fields["status"], "403");
+    assert!(!fields.values().any(|value| value.contains("main.dae")));
+    let (level, fields) = lines
+        .iter()
+        .find(|(_, fields)| fields["status"] == "404")
+        .unwrap();
+    assert_eq!(*level, tracing::Level::INFO);
+    assert!(!fields.contains_key("reason"));
 }
 
 #[tokio::test]
