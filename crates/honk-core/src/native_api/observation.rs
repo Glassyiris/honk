@@ -74,10 +74,7 @@ impl NativeObservation {
             config.experimental.native_api.record_dns_log,
             Arc::downgrade(&flows),
         ));
-        let probes = Arc::new(super::probes::ProbeService::new(
-            &config.experimental.native_api,
-            Arc::clone(&operations),
-        ));
+        let probes = Arc::new(super::probes::ProbeService::new(Arc::clone(&operations)));
         let level = super::settings::Level::configured(&config.global.log_level);
         let logs = Arc::new(super::logs::LogStore::new(
             instance_id.clone(),

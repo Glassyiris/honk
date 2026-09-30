@@ -1,4 +1,4 @@
-//! The administrator's outbound destination policy for probes and geodata downloads.
+//! The administrator's outbound destination policy for geodata downloads.
 
 use std::{net::IpAddr, sync::LazyLock};
 
@@ -62,12 +62,27 @@ impl Policy {
         !restricted || self.allowed.iter().any(|net| net.contains(&ip))
     }
 
-    /// `default` is the protocol's own port; `None` admits any nonzero port.
-    pub(crate) fn port(&self, port: u16, default: Option<u16>) -> bool {
-        port != 0 && default.is_none_or(|default| port == default || self.ports.contains(&port))
-    }
-
     pub(crate) fn http_port(&self, port: u16, https: bool) -> bool {
-        self.port(port, Some(if https { 443 } else { 80 }))
+        port != 0 && (port == if https { 443 } else { 80 } || self.ports.contains(&port))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restricted_addresses_require_cidr_even_with_allowed_ports() {
+        let mut config = NativeApiConfig {
+            probe_allowed_ports: vec![8080],
+            ..Default::default()
+        };
+        let policy = Policy::new(&config);
+        assert!(!policy.address("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!policy.address("169.254.169.254".parse().unwrap()));
+        assert!(policy.http_port(8080, false));
+        assert!(!policy.http_port(443, false));
+        config.probe_allowed_cidrs = vec!["127.0.0.0/8".into()];
+        assert!(Policy::new(&config).address("::ffff:127.0.0.1".parse().unwrap()));
     }
 }

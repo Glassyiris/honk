@@ -385,13 +385,6 @@ fn configured(message: &'static str, settings: &[&str]) -> ApiError {
     unsupported(message, json!({"field":"kind","settings":settings}))
 }
 
-fn address() -> ApiError {
-    unsupported(
-        "The probe destination address is not permitted",
-        json!({"check":"address","settings":["probe_allowed_cidrs"]}),
-    )
-}
-
 pub(super) fn selections(
     manager: &GroupManager,
     identity: &CatalogIdentity,
@@ -408,16 +401,12 @@ pub(super) fn selections(
     }
 }
 
-pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan, ApiError> {
+pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
     let Plan {
         context,
         result,
         candidates,
     } = plan;
-    let https = context
-        .http
-        .as_ref()
-        .is_some_and(|request| request.uri().scheme_str() == Some("https"));
     let mut resolved = HashMap::new();
     let mut attempts = Vec::with_capacity(candidates.len());
     let mut skipped = Vec::new();
@@ -427,12 +416,6 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
             .as_ref()
             .map(|(host, port)| (host.as_str(), *port))
             .unwrap_or((candidate.node.host(), candidate.node.port));
-        if !policy.port(port, context.spec.kind.default_port(https)) {
-            return Err(unsupported(
-                "The probe destination port is not permitted",
-                json!({"check":"port","settings":["probe_allowed_ports"]}),
-            ));
-        }
         let ips = resolve(
             &context.dns,
             &mut resolved,
@@ -440,9 +423,6 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
             "Resolving the probe destination was refused locally",
         )
         .await?;
-        if ips.iter().any(|&ip| !policy.address(ip)) {
-            return Err(address());
-        }
         let addr = ips
             .iter()
             .copied()
@@ -458,9 +438,6 @@ pub(super) async fn prepare(policy: &Policy, plan: Plan) -> Result<PreparedPlan,
                 "Resolving the probed node's server was refused locally",
             )
             .await?;
-            if ips.iter().any(|&ip| !policy.address(ip)) {
-                return Err(address());
-            }
             ips.first().copied()
         } else {
             None
