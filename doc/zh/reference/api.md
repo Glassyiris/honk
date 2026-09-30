@@ -24,7 +24,7 @@
 | POST | `/api/v1/nodes` | 用 `{name,link}` 创建主文件节点；真实激活后才返回 201。 |
 | GET | `/api/v1/nodes/{id}` | 单个节点，字段与列表相同；未知 ID 返回 404。 |
 | DELETE | `/api/v1/nodes/{id}` | 删除主文件 inline 节点；激活后返回 `{deleted:0\|1}`。 |
-| GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision 与捕获的健康数据。 |
+| GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision 与捕获的健康数据；列表按配置中的声明顺序排列。 |
 | GET | `/api/v1/groups/{groupId}/config` | 组的 `policy` 与 `config`，以配置 revision 作为 `ETag`。 |
 | PUT | `/api/v1/groups/{groupId}/selection` | 按直接成员 ID 设置 Selector 的 `tcp`、`udp` 或 `both` 选择。 |
 | DELETE | `/api/v1/groups/{groupId}/selection` | 清除自动策略组在 `tcp`、`udp` 或 `both` 上的固定成员。 |
