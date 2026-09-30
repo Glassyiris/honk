@@ -4,7 +4,7 @@
 
 ## 原生 API
 
-本节说明当前已实现的原生观测与控制契约。`native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；两种 allocator 发布产物均包含它，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
+本节说明当前已实现的原生观测与控制契约。`native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；两种 allocator 发布产物均包含它及内嵌 UI（`native-ui`），但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
 基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的补充。采用该后续 bundle 的自动策略 override（固定成员与 DELETE selection），不采用其 mode 变更：原生 mode 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
@@ -83,7 +83,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
 
-配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。静态响应保留 `no-cache`、`nosniff`、`X-Frame-Options: DENY`；公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求 bearer；不向 UI 注入凭据。
+配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建（发布产物已启用）并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。静态响应保留 `no-cache`、`nosniff`、`X-Frame-Options: DENY`；公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求 bearer；不向 UI 注入凭据。
 
 ### 认证发现与密码会话
 
@@ -317,9 +317,9 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 ### 内嵌 doona 来源
 
-默认关闭的 `native-ui` 隐含 `native-api`，内嵌 doona `0.1.0-beta.10`、提交 `d3211e15f562ebf8be2dc4dd458a4bcb0237bb9c` 的构建产物与 notices，不含 Noto Sans TC 与 SC 字体。doona 的 CSS 以 `font-display: optional` 声明这些字体，因此字体请求返回 404 时浏览器使用系统字体。需要 Noto Sans 时，将 [doona 发布页](https://github.com/Zakkaus/doona/releases)的 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz` 解压到同一目录并让 `ui` 指向该目录，或安装 `doona` 与 `doona-fonts` 软件包并设置 `ui: /usr/share/doona`。`crates/honk-core/assets/doona-provenance.json` 记录源码/程序/字体包 SHA-256、构建身份及逐文件摘要。对应的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-beta.10`](https://github.com/Zakkaus/doona/tree/v0.1.0-beta.10)；在 doona 克隆中执行 `git archive --format=tar --prefix=doona/ v0.1.0-beta.10 | gzip -n`（GNU gzip）可复现 `source_sha256` 记录的源码包。honk 的发布流程不发布 `native-ui` 二进制；分发此类二进制时须按 GPL-3.0 第 6 条一并提供该源码包与 notices。
+默认关闭的 `native-ui` 隐含 `native-api`，编译时从 `HONK_DOONA_DIR` 指定的绝对路径目录读取 doona 构建产物并内嵌；未设置该变量时构建失败。`ci/fetch-doona.sh` 下载 `.github/ci/pins.env` 固定的发布包（当前为 doona `0.1.0-beta.10`、提交 `d3211e15f562ebf8be2dc4dd458a4bcb0237bb9c`），校验 SHA-256，确认包内含 `THIRD-PARTY-NOTICES.txt` 及 `NOTICE` 引用的全部 `LICENSES/` 文件，删除字体并输出目录：`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。未设置该变量时，`just lint` 与 `just test-ci` 自动执行该脚本。发布产物包含内嵌 UI；二进制内嵌 doona 程序包自带的 notices，每个发布 tarball 也在 `doona/` 目录附带这些文件。内嵌产物不含 Noto Sans TC 与 SC 字体。doona 的 CSS 以 `font-display: optional` 声明这些字体，因此字体请求返回 404 时浏览器使用系统字体。需要 Noto Sans 时，将 [doona 发布页](https://github.com/Zakkaus/doona/releases)的 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz` 解压到同一目录并让 `ui` 指向该目录，或安装 `doona` 与 `doona-fonts` 软件包并设置 `ui: /usr/share/doona`。对应的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-beta.10`](https://github.com/Zakkaus/doona/tree/v0.1.0-beta.10)。发布流程将 `doona-source-0.1.0-beta.10.tar.gz` 附加到正式标签发布与滚动 Debug 发布；该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-beta.10 | gzip -n`（GNU gzip）。再分发 `native-ui` 二进制时，须按 GPL-3.0 第 6 条一并提供该源码包与 notices。
 
-复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 运行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1790423166 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。普通 Cargo 构建只使用已检入资产，不调用前端 build/下载。真实 checker 在该源码的 `tools/conformance.mjs`；live walk 只读，主动跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器动作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
+复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 运行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1790716798 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。Cargo 构建只内嵌 `HONK_DOONA_DIR` 中的文件，不构建也不下载前端。真实 checker 在该源码的 `tools/conformance.mjs`；live walk 只读，主动跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器动作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
 
 ### 共用模式与数据面生命周期
 
