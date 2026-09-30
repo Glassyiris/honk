@@ -667,17 +667,33 @@ async fn wildcard_bind_accepts_its_own_ip_literal_authorities_but_no_names() {
         .await;
     }
     // Only plain HTTP is the listener's own scheme; a TLS proxy still declares its origin.
-    error_response(
-        app.get("/api")
-            .header("host", format!("192.0.2.7:{port}"))
-            .header("origin", format!("https://192.0.2.7:{port}"))
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::FORBIDDEN,
-        "permission_denied",
-    )
-    .await;
+    // A page on another address at the same port is another site, not the listener.
+    for (host, origin) in [
+        (
+            format!("192.0.2.7:{port}"),
+            format!("https://192.0.2.7:{port}"),
+        ),
+        (
+            format!("192.0.2.7:{port}"),
+            format!("http://198.51.100.10:{port}"),
+        ),
+        (
+            format!("127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+        ),
+    ] {
+        error_response(
+            app.get("/api")
+                .header("host", host)
+                .header("origin", origin)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+        )
+        .await;
+    }
     app.shutdown().await;
 }
 
