@@ -31,8 +31,8 @@
 | `record_memory` | `true` | 无客户端也记录 RSS/cgroup history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时内存观测。 |
 | `record_logs` | `true` | 允许按 API 客户端连接规则或显式运行时设置捕获结构化日志，最多保留 512 条、60 秒。`false` 禁止捕获；修改配置需重启。控制台和 Clash 日志保持独立。 |
 | `record_dns_log` | `true` | 允许按 API 客户端连接规则或显式运行时设置记录客户端 DNS 完成历史，最多保留 512 条、8 MiB。`false` 禁止记录；修改配置需重启。 |
-| `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
-| `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
+| `probe_allowed_cidrs` | 空列表 | 仅用于放行 geodata URL 的受限 IP CIDR，包括私网、loopback、link-local；空列表拒绝非豁免 URL 的这些地址。探测不使用此设置；保留现有名称以兼容配置。 |
+| `probe_allowed_ports` | 空列表 | 仅扩展 geodata URL 的默认 HTTP 80、HTTPS 443 端口；每项须为 1–65535，受限地址仍需独立 CIDR 许可。探测直接使用配置的端口；保留现有名称以兼容配置。 |
 | `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，以及新建由 include 模式加载的 `.dae` 文件，含监听凭据的源除外；要求非空 `secret` 或启用 `password_auth`。 |
 
 Geodata 下载 URL 与出口现由 [`assets.geodata`](./assets.md) 配置。旧版 `native_api` 字段仍可读取并产生警告；替代关系见 Assets 参考中的表格。
@@ -57,7 +57,7 @@ experimental {
 
 默认 Host 只接受具体监听 authority；loopback 另接受同端口的 `localhost`、`127.0.0.1` 与 `[::1]`。通配监听接受同端口的任意 IP 字面量 Host 与 `localhost`，因为这些就是请求到达的那个监听器本身；DNS 名称仍不授权，因为只有名称能被重绑定。只有真实直连对应的明文 HTTP Origin 自动允许；通配监听时该 Origin 必须与请求自身的 Host 相同，同端口其他地址上的页面需列入 `allow_origins`。TLS 反代若保留 `Host: panel.example`，需配置 `allowed_hosts: 'panel.example'` 与 `allow_origins: 'https://panel.example'`；若保留 `Host: panel.example:443`，则使用 `allowed_hosts: 'panel.example', 'panel.example:443'`。Forwarded headers 不授予权限。
 
-列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`、`probe_allowed_cidrs: '127.0.0.0/8', '::1/128'`、`probe_allowed_ports: 8080, 8443`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。Probe 会校验并固定解析出的地址，IPv4-mapped IPv6 先规范化为 IPv4；开放端口不自动授权受限 CIDR，也不允许调用方指定任意 URL 或跟随 HTTP 重定向。
+列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`、`probe_allowed_cidrs: '127.0.0.0/8', '::1/128'`、`probe_allowed_ports: 8080, 8443`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。探测目标仅来自已接受的配置，不检查地址或端口策略；仍解析并固定选中的 IP，将 IPv4-mapped IPv6 规范化为 IPv4，且不接受调用方 URL、不跟随 HTTP 重定向。`probe_allowed_cidrs` 与 `probe_allowed_ports` 仅用于 geodata URL；与当前配置文件所设 URL 相同的 URL 豁免。开放端口不自动授权受限 CIDR，原生源写入不能修改这两个列表。
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api)。
 

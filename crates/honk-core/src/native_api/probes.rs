@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use honk_config::{Config, experimental::NativeApiConfig, node::Node};
+use honk_config::{Config, node::Node};
 use honk_outbound::{
     alive::{
         GroupProbeContext, HealthMeasurement, HealthObservation, HealthPurpose, HealthState,
@@ -32,7 +32,6 @@ use uuid::Uuid;
 
 use super::{
     ApiError, ErrorCode, NativeState, config,
-    destination::Policy,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
     parse_query,
     security::{REQUESTS_PER_MINUTE, RequestRate},
@@ -75,15 +74,6 @@ enum Kind {
     Dns,
 }
 impl Kind {
-    /// The port the destination policy admits without `probe_allowed_ports`;
-    /// a TCP connect probe measures whatever port the node dials.
-    fn default_port(self, https: bool) -> Option<u16> {
-        match self {
-            Self::TcpConnect => None,
-            Self::Dns => Some(53),
-            Self::Http => Some(if https { 443 } else { 80 }),
-        }
-    }
     /// The health purpose the kind measures; a request cannot choose it.
     fn purpose(self) -> Purpose {
         match self {
@@ -270,7 +260,6 @@ impl Drop for RequestGuard<'_> {
 
 pub(crate) struct ProbeService {
     operations: Arc<OperationStore>,
-    policy: Policy,
     rate: RequestRate,
     sender: mpsc::Sender<Job>,
     receiver: Mutex<Option<(mpsc::Receiver<Job>, mpsc::Receiver<Command>)>>,
@@ -281,13 +270,12 @@ pub(crate) struct ProbeService {
 }
 
 impl ProbeService {
-    pub(crate) fn new(config: &NativeApiConfig, operations: Arc<OperationStore>) -> Self {
+    pub(crate) fn new(operations: Arc<OperationStore>) -> Self {
         let (sender, receiver) = mpsc::channel(MAX_QUEUED);
         let (commands, command_receiver) = mpsc::channel(1);
         let (cancel, _) = watch::channel(false);
         Self {
             operations,
-            policy: Policy::new(config),
             rate: RequestRate::new(),
             sender,
             receiver: Mutex::new(Some((receiver, command_receiver))),
@@ -487,7 +475,7 @@ impl ProbeService {
                 .require_running()
                 .map_err(|_| (ENGINE_UNAVAILABLE, None))?;
             // Preparation refuses only with unsupported_value; keep its safe message and details.
-            prepare(&self.policy, job.plan)
+            prepare(job.plan)
                 .await
                 .map_err(|error| (("unsupported_value", error.message()), error.into_details()))
         })
