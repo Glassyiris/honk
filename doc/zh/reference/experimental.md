@@ -57,7 +57,7 @@ experimental {
 
 列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。探测目标仅来自已接受的配置，仍解析并固定选中的 IP，将 IPv4-mapped IPv6 规范化为 IPv4，且不接受调用方 URL、不跟随 HTTP 重定向。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。
 
-已移除的 `probe_allowed_cidrs` 与 `probe_allowed_ports` 键仍可在 dae 配置中出现，每个键产生一条警告；其值被忽略，可以删除这两个键。配置序列化不输出这两个键。
+已移除的 `probe_allowed_cidrs` 与 `probe_allowed_ports` 键仍可在 dae 配置及兼容的结构化加载器中出现，每个键产生一条警告；其值被忽略，可以删除这两个键。配置序列化不输出这两个键。
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api)。
 

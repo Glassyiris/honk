@@ -22,12 +22,34 @@ fn tree(data_dir: &Path) -> (tempfile::TempDir, PathBuf) {
     (directory, root.join("config.dae"))
 }
 
+fn assert_removed_warnings(diagnostics: &[DetailedDiagnostic]) {
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    for (notice, key) in diagnostics
+        .iter()
+        .zip(["probe_allowed_cidrs", "probe_allowed_ports"])
+    {
+        assert_eq!(
+            notice.setting.to_string(),
+            format!("experimental.native_api.{key}")
+        );
+        assert_eq!(notice.code, "legacy-config-warning");
+        assert_eq!(notice.severity, honk_config::diagnostic::Severity::Warning);
+    }
+}
+
 #[test]
 fn import_strips_secrets_and_a_later_start_reads_only_the_head() {
     let state = tempfile::tempdir().unwrap();
     let data_dir = state.path().canonicalize().unwrap();
     let (directory, entry) = tree(&data_dir);
-    let mut startup = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+    let removed = "experimental { native_api {\n probe_allowed_cidrs: PRIVATE\n probe_allowed_ports: 0, 65536, invalid\n } }\n";
+    let mut content = fs::read_to_string(&entry).unwrap();
+    content.push_str(removed);
+    fs::write(&entry, content).unwrap();
+    let mut diagnostics = Vec::new();
+    let mut startup = DatabaseStartup::open(&entry, &data_dir, &mut diagnostics).unwrap();
+    assert_removed_warnings(&diagnostics);
+    assert!(startup.sources.sources[0].content.ends_with(removed));
     assert!(
         startup
             .sources
@@ -44,7 +66,10 @@ fn import_strips_secrets_and_a_later_start_reads_only_the_head() {
     drop(startup);
     drop(directory);
 
-    let reopened = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+    diagnostics.clear();
+    let reopened = DatabaseStartup::open(&entry, &data_dir, &mut diagnostics).unwrap();
+    assert_removed_warnings(&diagnostics);
+    assert!(reopened.sources.sources[0].content.ends_with(removed));
     assert_eq!(reopened.config, imported);
     assert_eq!(reopened.store.head(), Ok(Some(1)));
 }
