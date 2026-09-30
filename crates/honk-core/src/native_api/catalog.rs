@@ -480,11 +480,19 @@ pub(super) async fn groups(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    let _config = state.config.read().await;
+    let config = state.config.read().await;
     let identity = state.observation.core.catalog.snapshot();
     let manager = state.group_manager.read().clone();
-    let mut names: Vec<_> = identity.groups.keys().collect();
-    names.sort_unstable();
+    // Declaration order; a redefined group sits where its winning last definition is.
+    let mut seen = HashSet::new();
+    let mut names: Vec<_> = config
+        .groups
+        .iter()
+        .rev()
+        .map(|group| &group.name)
+        .filter(|name| identity.groups.contains_key(*name) && seen.insert(*name))
+        .collect();
+    names.reverse();
     let revision = state
         .observation
         .configuration
