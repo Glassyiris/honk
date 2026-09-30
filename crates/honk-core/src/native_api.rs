@@ -7,7 +7,6 @@ pub(crate) mod config;
 mod config_write;
 mod connections;
 mod datapath;
-mod destination;
 pub(crate) mod dns;
 pub(crate) mod events;
 pub(crate) mod flows;

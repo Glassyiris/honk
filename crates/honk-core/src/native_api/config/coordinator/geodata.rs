@@ -166,8 +166,6 @@ impl Worker {
                     urls,
                     &egress,
                     offline::MAX_ASSET_BYTES,
-                    &plan.policy,
-                    geodata::file_url(&active.experimental.native_api, asset.kind),
                     plan.verify_checksum,
                 ) => result,
             };
