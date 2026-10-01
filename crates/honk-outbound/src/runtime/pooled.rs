@@ -18,9 +18,6 @@ impl PooledLifecycle for AnyTlsRuntime {
         if retention == 0 || was_unretained {
             self.pool.set_warm_retained(retention != 0);
         }
-        if retention == 0 {
-            self.tls.evict();
-        }
     }
     fn retire(&self) {
         self.pool.retire();

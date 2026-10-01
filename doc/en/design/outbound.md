@@ -843,7 +843,7 @@ throughput-neutral on a 75ms/15%-loss link. Overrides:
 ## AnyTLS session engine
 
 `src/proxy/anytls/mod.rs` implements sing-anytls multiplexing with stateless handlers. Each generation's `NodeRuntime::AnyTls` owns one
-`SessionPool<AnyTlsSession>` and lazily materialized BoringSSL connector.
+`SessionPool<AnyTlsSession>` and a BoringSSL connector built on the first dial; the connector is never idle-reaped because TLS contexts are shared per shape.
 Generation-free calls use a guarded ephemeral equivalent.
 
 ### Pool and session lifecycle

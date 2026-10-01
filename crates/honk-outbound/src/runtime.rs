@@ -39,12 +39,8 @@ use std::sync::Arc;
 #[cfg(any(feature = "rprx", test))]
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-const TLS_ACTIVE_RATIO_NUMERATOR: usize = 1;
-const TLS_ACTIVE_RATIO_DENOMINATOR: usize = 10;
-const TLS_ACTIVE_MIN: usize = 8;
-pub const TLS_IDLE_RETENTION: Duration = Duration::from_secs(10 * 60);
-pub const TLS_REAP_INTERVAL: Duration = Duration::from_secs(60);
+use std::time::Duration;
+pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(any(feature = "rprx", test))]
@@ -252,8 +248,8 @@ impl QuicRuntime {
     }
 }
 
-/// Lazily built TLS state. An in-flight handshake owns an `Arc`, so evicting
-/// the cached reference never invalidates active work.
+/// Lazily built, generation-local TLS state. Contexts are shared per shape in
+/// `tls`, so holding the connector costs a few KiB and needs no idle reaping.
 #[derive(Debug, Default)]
 struct TlsConnectorSlot {
     state: parking_lot::Mutex<TlsConnectorSlotState>,
@@ -261,8 +257,7 @@ struct TlsConnectorSlot {
 
 #[derive(Debug, Default)]
 struct TlsConnectorSlotState {
-    cached: Option<(Arc<crate::tls::TlsConnector>, Instant)>,
-    revision: u64,
+    cached: Option<Arc<crate::tls::TlsConnector>>,
     closed: bool,
 }
 
@@ -270,44 +265,12 @@ impl TlsConnectorSlot {
     fn get_or_build(&self, node: &Node) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let mut state = self.state.lock();
         anyhow::ensure!(!state.closed, "TLS runtime is closed");
-        state.revision = state.revision.wrapping_add(1);
-        if let Some((connector, used_at)) = state.cached.as_mut() {
-            *used_at = Instant::now();
+        if let Some(connector) = &state.cached {
             return Ok(Arc::clone(connector));
         }
         let connector = Arc::new(crate::tls::build_connector(node)?);
-        state.cached = Some((Arc::clone(&connector), Instant::now()));
+        state.cached = Some(Arc::clone(&connector));
         Ok(connector)
-    }
-
-    fn sample(&self) -> Option<(Instant, u64)> {
-        let state = self.state.lock();
-        state
-            .cached
-            .as_ref()
-            .map(|(_, used_at)| (*used_at, state.revision))
-    }
-
-    fn evict_if_sample(&self, sample: (Instant, u64)) -> bool {
-        let mut state = self.state.lock();
-        let unchanged = state.revision == sample.1
-            && state
-                .cached
-                .as_ref()
-                .is_some_and(|(_, used_at)| *used_at == sample.0);
-        if !unchanged {
-            return false;
-        }
-        state.cached.take();
-        state.revision = state.revision.wrapping_add(1);
-        true
-    }
-
-    fn evict(&self) {
-        let mut state = self.state.lock();
-        if state.cached.take().is_some() {
-            state.revision = state.revision.wrapping_add(1);
-        }
     }
 
     // Pool shutdown signals detached factories; it does not join them.
@@ -323,8 +286,8 @@ impl TlsConnectorSlot {
     }
 }
 
-/// AnyTLS session runtime: the pool stays generation-owned, while expensive
-/// BoringSSL state is materialized only for nodes entering the active set.
+/// AnyTLS session runtime: the pool stays generation-owned, while the TLS
+/// connector is materialized on the first dial.
 #[derive(Debug)]
 pub struct AnyTlsRuntime {
     pub(crate) pool: Arc<crate::proxy::anytls::AnyTlsPool>,
@@ -655,24 +618,6 @@ impl NodeRuntime {
                 ProtocolRuntime::Quic(runtime) => runtime.client_count(),
                 _ => Some(0),
             },
-        }
-    }
-
-    fn tls_connector_sample(&self) -> Option<(Instant, u64)> {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.sample(),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(_) => None,
-        }
-    }
-
-    fn evict_tls_connector_if_sample(&self, sample: (Instant, u64)) -> bool {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.evict_if_sample(sample),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
-            #[cfg(any(feature = "rprx", test))]
-            ProtocolRuntime::Vless(_) => false,
         }
     }
 
@@ -1067,10 +1012,9 @@ impl OutboundRuntimeRegistry {
         self.nodes.is_empty()
     }
 
-    /// Reap idle runtime resources while retaining each protocol's hot floor.
-    /// AnyTLS keeps its recent connector working set; VLESS closes only idle
-    /// carriers above explicit or runtime warm retention.
-    pub fn reap_idle_resources(&self, now: Instant) -> usize {
+    /// Reap finished tasks and idle VLESS/XHTTP carriers above explicit or runtime
+    /// warm retention.
+    pub fn reap_idle_resources(&self) -> usize {
         if let Some(owner) = std::sync::LazyLock::get(&self.background_tasks) {
             owner.reap();
         }
@@ -1082,36 +1026,7 @@ impl OutboundRuntimeRegistry {
                 }
             }
         }
-        let mut reaped = self.reap_session_pools();
-        let anytls_count = self
-            .nodes
-            .values()
-            .filter(|runtime| matches!(runtime.runtime, ProtocolRuntime::AnyTls(_)))
-            .count();
-        let target = anytls_count
-            .saturating_mul(TLS_ACTIVE_RATIO_NUMERATOR)
-            .div_ceil(TLS_ACTIVE_RATIO_DENOMINATOR)
-            .max(TLS_ACTIVE_MIN)
-            .min(anytls_count);
-        let mut loaded: Vec<_> = self
-            .nodes
-            .values()
-            .filter_map(|runtime| {
-                runtime
-                    .tls_connector_sample()
-                    .map(|sample| (sample, runtime))
-            })
-            .collect();
-        loaded.sort_unstable_by_key(|((used_at, _), _)| std::cmp::Reverse(*used_at));
-
-        for (index, (sample, runtime)) in loaded.into_iter().enumerate() {
-            if (index >= target || now.saturating_duration_since(sample.0) >= TLS_IDLE_RETENTION)
-                && runtime.evict_tls_connector_if_sample(sample)
-            {
-                reaped += 1;
-            }
-        }
-        reaped
+        self.reap_session_pools()
     }
 
     /// Whether this generation has become terminal. Warm-up work must reject

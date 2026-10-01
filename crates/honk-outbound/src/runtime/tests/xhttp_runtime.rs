@@ -129,7 +129,7 @@ async fn xhttp_physical_warm_retention_maintenance_and_shutdown() {
         assert_eq!(runtime.warm_counts().sessions, 1);
         assert_eq!(runtime.vless_carriers.available_permits(), carriers - 1);
         assert!(runtime.is_warm_or_stateless_for(WarmRequirement::Session));
-        assert_eq!(registry.reap_idle_resources(Instant::now()), 0);
+        assert_eq!(registry.reap_idle_resources(), 0);
     }
     runtime.release_warm(WarmRetention::Selector).await;
     assert_eq!(runtime.warm_counts().sessions, 0);
@@ -138,7 +138,7 @@ async fn xhttp_physical_warm_retention_maintenance_and_shutdown() {
     crate::proxy::transport::xhttp::XhttpRuntime::warm(&runtime, Duration::from_secs(2))
         .await
         .unwrap();
-    assert_eq!(registry.reap_idle_resources(Instant::now()), 1);
+    assert_eq!(registry.reap_idle_resources(), 1);
     assert_eq!(runtime.warm_counts().sessions, 0);
     runtime.retain_warm(WarmRetention::Udp).await.commit();
     crate::proxy::transport::xhttp::XhttpRuntime::warm(&runtime, Duration::from_secs(2))

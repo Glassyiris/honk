@@ -470,7 +470,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
     pools[1].set_warm_retained(true);
     let active_child = sessions[2].try_reserve().unwrap();
 
-    assert_eq!(registry.reap_idle_resources(std::time::Instant::now()), 1);
+    assert_eq!(registry.reap_idle_resources(), 1);
     assert!(sessions[0].is_closed());
     assert!(!sessions[1].is_closed());
     assert!(!sessions[2].is_closed());
