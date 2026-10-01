@@ -205,8 +205,7 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 未启用 Encryption 的 Vision TLS/REALITY carrier 先走 copy loop；两个方向都进入 Direct 且连接已转发 256 KiB 后，relay 在两个方向都不持有未写出字节的位置交接：一个方向处于读边界，另一个方向挂起在读取上。此时 relay 把 carrier 的 TCP socket 借给同一个双向 splice 引擎，Vision/TLS 栈仍归 relay 所有，carrier pressure 采样在借出的 socket 上继续。probe 不支持或 pipe 创建失败时，任何字节尚未移动，relay 恢复同一个 Vision 流的 copy loop；每条连接只尝试一次交接。两个阶段共用连接计数器，统计覆盖整条连接，first-response 回调只触发一次。
 
 copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的字节；输入暂时
-空闲时也会 flush 待发字节。每个方向使用 65,535 字节缓冲区，使满载 read
-恰好容纳一个最大 AnyTLS frame，不拆成 8 KiB write，也不留下单字节尾帧。
+空闲时也会 flush 待发字节。每个方向先使用 8 KiB 缓冲区；第一次读满即判定为大流量，该方向随后改用 65,535 字节缓冲区，使满载 read 恰好容纳一个最大 AnyTLS frame，不拆成 8 KiB write，也不留下单字节尾帧（仅首帧较小）。空闲和小流量连接不会扩容，因此一条空闲连接的 copy 缓冲区是 16 KiB，而不是 128 KiB。
 应用不需要再发一个请求或关闭连接才能送出当前请求。
 
 首次 EOF 后，两条中继路径只限制空闲排空时间：`DRAIN_DEADLINE` 是没有任何字节进展的 30 秒。活跃 survivor 可以运行超过 30 秒；静默 survivor 不能无限持有 accepted socket。

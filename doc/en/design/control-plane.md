@@ -218,8 +218,7 @@ Unencrypted Vision TLS/REALITY carriers start in the copy loop. Once both direct
 
 The copy pumps flush bytes buffered by sniffing or protocol setup before reading
 new input, and flush pending writes whenever input becomes idle. Each direction
-uses a 65,535-byte buffer, so saturated reads fit one maximum AnyTLS frame rather
-than fragmenting into 8 KiB writes or leaving a one-byte tail. Buffering never
+starts with an 8 KiB buffer; the first read that fills it marks a bulk flow, and that direction then uses a 65,535-byte buffer, so saturated reads fit one maximum AnyTLS frame rather than fragmenting into 8 KiB writes or leaving a one-byte tail (only the first frame is small). Idle and chatty flows never grow, so a held connection costs 16 KiB of copy buffers instead of 128 KiB. Buffering never
 requires the application to send another request or close before its current request leaves.
 
 After the first EOF, both relay paths bound only idle drain time: `DRAIN_DEADLINE` is 30 seconds without a byte of progress. An active survivor may run longer than 30 seconds; a silent survivor cannot pin accepted sockets indefinitely.
