@@ -70,7 +70,7 @@ async fn ready_precedes_replay_and_live_on_fresh_and_resumed_streams() {
     assert!(resumed_ready.starts_with("event: stream.ready\n"));
     assert_eq!(cursor(&resumed_ready), cursor(&ready));
     let replay_one = next(&mut resumed).await;
-    assert_eq!(cursor(&replay_one), cursor(&original));
+    assert_eq!(replay_one, original);
     assert_eq!(data(&replay_one)["revision"], 1);
     assert_eq!(data(&next(&mut resumed).await)["revision"], 2);
     assert_eq!(data(&next(&mut resumed).await)["revision"], 3);
@@ -162,15 +162,37 @@ async fn cursors_reject_changed_filters_instance_and_forgery() {
     let hub = hub();
     let mut stream = subscribe(&hub, all(), None);
     let ready = next(&mut stream).await;
-    let saved = cursor(&ready);
+    let mut same = subscribe(&hub, all(), None);
+    let same_ready = next(&mut same).await;
+    assert_ne!(cursor(&ready), cursor(&same_ready));
+    let other_filter = Filter::new(1 << 2, Some("flow-a".into()));
+    let mut other = subscribe(&hub, other_filter.clone(), None);
+    let other_ready = next(&mut other).await;
+    publish_flow(&hub, "flow-a", 1);
+    let original = next(&mut stream).await;
+    assert_eq!(next(&mut same).await, original);
+    let different = next(&mut other).await;
+    assert_eq!(data(&different), data(&original));
+    assert_ne!(cursor(&different), cursor(&original));
+    let saved = cursor(&original);
     assert_expired(&hub, Filter::new(1 << 2, None), saved);
     assert_expired(&hub, Filter::new(63, Some("flow-a".into())), saved);
+    assert_expired(&hub, other_filter.clone(), saved);
+    assert_expired(&hub, all(), cursor(&different));
     assert_expired(&Arc::new(EventHub::new("instance-b".into())), all(), saved);
     assert_expired(&Arc::new(EventHub::new("instance-a".into())), all(), saved);
     assert_expired(&hub, all(), "unknown");
     let mut tampered = URL_SAFE_NO_PAD.decode(saved).unwrap();
     tampered[0] ^= 0x80;
     assert_expired(&hub, all(), &URL_SAFE_NO_PAD.encode(tampered));
+    let mut replay = subscribe(&hub, all(), Some(cursor(&ready)));
+    next(&mut replay).await;
+    assert_eq!(next(&mut replay).await, original);
+    let mut different_replay = subscribe(&hub, other_filter, Some(cursor(&other_ready)));
+    next(&mut different_replay).await;
+    assert_eq!(next(&mut different_replay).await, different);
+    publish_flow(&hub, "flow-a", 2);
+    assert_eq!(data(&next(&mut different_replay).await)["revision"], 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -538,6 +560,15 @@ async fn log_stream_binding_and_rejected_payload_invalidate_cursors() {
     let ready = next(&mut stream).await;
     assert_expired(&events, all(), cursor(&ready));
     assert_expired(&logs, all(), cursor(&ready));
+    let mut queued = subscribe(&logs, filter.clone(), None);
+    next(&mut queued).await;
+    logs.publish_log(
+        3,
+        "honk_core",
+        Bytes::from_static(b"{\"fields\":{\"nodes\":1}}"),
+        logs.capture_epoch(),
+    );
+    let recorded = next(&mut stream).await;
     logs.publish_log(
         3,
         "honk_core",
@@ -545,7 +576,65 @@ async fn log_stream_binding_and_rejected_payload_invalidate_cursors() {
         logs.capture_epoch(),
     );
     assert!(stream.next().await.unwrap().is_err());
-    assert_expired(&logs, filter, cursor(&ready));
+    assert!(queued.next().await.unwrap().is_err());
+    assert_expired(&logs, filter.clone(), cursor(&ready));
+    assert_expired(&logs, filter.clone(), cursor(&recorded));
+    let mut fresh = subscribe(&logs, filter.clone(), None);
+    next(&mut fresh).await;
+    logs.publish_log(
+        3,
+        "honk_core",
+        Bytes::from_static(b"{\"fields\":{\"nodes\":2}}"),
+        logs.capture_epoch(),
+    );
+    let new_record = next(&mut fresh).await;
+    assert_eq!(data(&new_record)["fields"]["nodes"], 2);
+    let mut resumed = subscribe(&logs, filter, Some(cursor(&new_record)));
+    assert_eq!(cursor(&next(&mut resumed).await), cursor(&new_record));
+}
+
+#[tokio::test]
+async fn log_byte_pressure_closes_queued_consumers_and_expires_replay() {
+    let hub = Arc::new(EventHub::logs("instance-a".into()));
+    let filter = Filter::logs(5, None);
+    let mut live = subscribe(&hub, filter.clone(), None);
+    let baseline = next(&mut live).await;
+    let mut different = subscribe(&hub, Filter::logs(4, None), None);
+    next(&mut different).await;
+    let mut slow = subscribe(&hub, Filter::logs(5, Some("honk_old".into())), None);
+    next(&mut slow).await;
+    let publish = |target, nodes| {
+        let mut payload = serde_json::to_vec(&json!({"fields": {"nodes": nodes}})).unwrap();
+        payload.resize(MAX_PAYLOAD_BYTES, b' ');
+        hub.publish_log(3, target, Bytes::from(payload), hub.capture_epoch());
+    };
+    publish("honk_old", 0);
+    let oldest = next(&mut live).await;
+    assert_eq!(data(&next(&mut different).await), data(&oldest));
+    let mut penultimate = oldest.clone();
+    let mut latest = oldest.clone();
+    for nodes in 1..=MAX_EVENTS / 2 + 1 {
+        publish("honk_new", nodes);
+        penultimate = latest;
+        latest = next(&mut live).await;
+        let other = next(&mut different).await;
+        assert_eq!(data(&latest)["fields"]["nodes"], nodes);
+        assert_eq!(data(&other), data(&latest));
+        assert_ne!(cursor(&other), cursor(&latest));
+    }
+    assert_expired(&hub, filter.clone(), cursor(&baseline));
+    assert_expired(&hub, filter.clone(), cursor(&oldest));
+    assert_eq!(
+        slow.next().await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert!(slow.next().await.is_none());
+    hub.set_limit(1);
+    assert_expired(&hub, filter.clone(), cursor(&penultimate));
+    let mut resumed = subscribe(&hub, filter, Some(cursor(&latest)));
+    assert_eq!(cursor(&next(&mut resumed).await), cursor(&latest));
+    publish("honk_new", 999);
+    assert_eq!(data(&next(&mut resumed).await)["fields"]["nodes"], 999);
 }
 
 #[tokio::test]
@@ -553,10 +642,16 @@ async fn idle_admission_and_old_capture_epochs_preserve_boundaries() {
     let hub = hub();
     let mut old = subscribe(&hub, all(), None);
     let ready = next(&mut old).await;
+    let mut consumer = subscribe(&hub, all(), None);
+    next(&mut consumer).await;
+    hub.publish("runtime.updated", json!({}), None);
+    let recorded = next(&mut consumer).await;
     let epoch = hub.capture_epoch();
     hub.set_recording(false);
     assert!(old.next().await.unwrap().is_err());
+    assert!(consumer.next().await.unwrap().is_err());
     assert_expired(&hub, all(), cursor(&ready));
+    assert_expired(&hub, all(), cursor(&recorded));
     let _idle = subscribe(&hub, all(), None);
     hub.publish("runtime.updated", json!({}), None);
     assert!(hub.buffered_kinds().is_empty());
@@ -566,6 +661,13 @@ async fn idle_admission_and_old_capture_epochs_preserve_boundaries() {
     assert!(hub.buffered_kinds().is_empty());
     hub.publish("runtime.updated", json!({}), None);
     assert_eq!(hub.buffered_kinds(), vec!["runtime.updated"]);
+    let mut fresh = subscribe(&hub, all(), None);
+    next(&mut fresh).await;
+    hub.publish("runtime.updated", json!({}), None);
+    let new_record = next(&mut fresh).await;
+    assert_ne!(cursor(&new_record), cursor(&recorded));
+    let mut resumed = subscribe(&hub, all(), Some(cursor(&new_record)));
+    assert_eq!(cursor(&next(&mut resumed).await), cursor(&new_record));
 }
 
 #[tokio::test]
