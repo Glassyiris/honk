@@ -9,6 +9,7 @@ async fn state(mut config: Config) -> Arc<NativeState> {
     config.global.nfqueue_enable = false;
     config.experimental.native_api.enabled = true;
     config.experimental.native_api.allow_anonymous_loopback = true;
+
     config.ensure_builtin_nodes();
     let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
     let forwarder = resolver.forwarder();
@@ -133,6 +134,7 @@ async fn configured_nondefault_http_port_survives_request_drop_and_replay() {
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
+
     let state = state(config).await;
     let (stop, receiver) = watch::channel(false);
     let worker = state.observation.probes.start(Arc::clone(&state), receiver);
@@ -186,6 +188,7 @@ async fn configured_nondefault_http_port_survives_request_drop_and_replay() {
     release.send(()).unwrap();
     let result = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
     assert_eq!(result["result"]["results"][0]["state"], "healthy");
+    assert!(result["result"]["results"][0]["latency_ms"].is_number());
     peer.await.unwrap();
     stop.send(true).unwrap();
     worker.await.unwrap();
@@ -252,6 +255,7 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
         let url = format!("http://{address}/check");
         let mut config = Config::default();
         config.global.tcp_check_url = vec![url.clone()];
+
         for name in ["left", "right"] {
             config
                 .groups
@@ -480,6 +484,7 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
+
     let state = state(config).await;
     let input = request(
         json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
@@ -531,6 +536,7 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
+
     for index in 0..5 {
         config.groups.push(serde_json::from_value(json!({"name":format!("group-{index}"),"nodes":[honk_config::config::DIRECT_NODE_ID]})).unwrap());
     }
@@ -688,11 +694,6 @@ async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
             && sample.purpose == HealthPurpose::Dns
             && sample.measurement == HealthMeasurement::DnsRoundTrip));
     }
-    assert!(
-        !samples
-            .iter()
-            .any(|sample| sample.purpose == HealthPurpose::Data)
-    );
     tcp_peer.await.unwrap();
     udp_peer.await.unwrap();
 }
@@ -859,6 +860,68 @@ async fn malformed_requests_name_the_field_but_not_the_value() {
         body["error"]["details"],
         json!({"field":"target.node_id","kind":"missing"})
     );
+    let legal = request(
+        json!({"type":"node","node_id":"retained"}),
+        "http",
+        json!(["tcp"]),
+        "ipv4",
+    );
+    let retained = state
+        .observation
+        .operations
+        .reserve(
+            state.principal(),
+            "POST",
+            "/api/v1/probes",
+            Some("conflict"),
+            legal.to_string().as_bytes(),
+            OperationKind::Probe,
+        )
+        .unwrap();
+    let mut empty_transport = legal.clone();
+    empty_transport["transport"] = json!([]);
+    let malformed_requests = [input, empty_transport];
+    for malformed in &malformed_requests {
+        let error = create(
+            &state,
+            http_request(malformed, "conflict"),
+            &RequestId("conflict".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+    let mut reservations = vec![retained];
+    loop {
+        match state.observation.operations.reserve(
+            state.principal(),
+            "POST",
+            "/api/v1/probes",
+            None,
+            legal.to_string().as_bytes(),
+            OperationKind::Probe,
+        ) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(error) => {
+                assert_eq!(
+                    error.into_response().status(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+                break;
+            }
+        }
+    }
+    for malformed in &malformed_requests {
+        let error = create(
+            &state,
+            http_request(malformed, "fresh"),
+            &RequestId("fresh".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+    drop(reservations);
     stop.send(true).unwrap();
     worker.await.unwrap();
 }

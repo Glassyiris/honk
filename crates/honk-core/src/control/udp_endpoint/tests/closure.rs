@@ -36,7 +36,9 @@ pub(in crate::control::udp_endpoint) fn tracked_entry(
 #[tokio::test]
 async fn udp_close_waits_for_driver_and_exact_backend_ack() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        for mismatch in [false, true] {
+        for (mismatch, already_retiring) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let pool = Arc::new(UdpEndpointPool::new());
             let stats = Arc::new(StatsManager::new());
             let tracker = Arc::new(ConnectionTracker::new());
@@ -147,8 +149,14 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     )
                     .unwrap();
             }
+            if already_retiring {
+                pool.remove(source, destination);
+            }
             let pending = tracker.start_close(selected);
-            assert_eq!(tracker.close_id(&id).await, CloseOutcome::Gone);
+            let mut duplicate = Box::pin(tracker.close_id(&id));
+            assert!(futures::poll!(&mut duplicate).is_pending());
+            let mut bulk = Box::pin(tracker.close_matching(Some("udp"), None, 1000));
+            assert!(futures::poll!(&mut bulk).is_pending());
             while weak.upgrade().is_some() {
                 tokio::task::yield_now().await;
             }
@@ -160,6 +168,9 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             drop(locked);
             if mismatch {
                 assert_eq!(pending.await, CloseOutcome::Failed);
+                assert_eq!(duplicate.await, CloseOutcome::Failed);
+                assert!(bulk.await.unwrap().failed);
+                assert_eq!(tracker.close_id(&id).await, CloseOutcome::Failed);
                 assert!(failures.recv().await.is_some());
                 assert!(matches!(
                     pool.endpoints
@@ -180,6 +191,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 );
             } else {
                 assert_eq!(pending.await, CloseOutcome::Closed);
+                assert_eq!(duplicate.await, CloseOutcome::Closed);
+                assert_eq!(bulk.await.unwrap().closed, 1);
                 assert!(tracker.snapshot().is_empty());
                 assert!(
                     backend
@@ -210,6 +223,180 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             pool.remove_sink.lock().take();
             worker.await.unwrap();
         }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn udp_close_without_exact_pool_owner_completes_all_claims() {
+    use crate::connection_tracker::{CloseAction, CloseSignal, ConnectionOwner};
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for lost_pool in [false, true] {
+            let pool = Arc::new(UdpEndpointPool::new());
+            let weak_pool = Arc::downgrade(&pool);
+            let retained_pool = (!lost_pool).then_some(pool);
+            let tracker = ConnectionTracker::new();
+            let signal = CloseSignal::new();
+            let source = "127.0.0.1:10001".parse().unwrap();
+            let destination = "127.0.0.1:10002".parse().unwrap();
+            tracker.register_owned(
+                tracked_entry("missing-owner", source, destination),
+                ConnectionOwner {
+                    signal: Arc::clone(&signal),
+                    action: CloseAction::Udp {
+                        pool: weak_pool,
+                        client: source,
+                        destination,
+                        token: 101,
+                        generation: 1,
+                    },
+                    groups: Vec::new(),
+                },
+            );
+            let stale = tracker
+                .snapshot_close(None, None, 1000)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let first = tracker.start_close(
+                tracker
+                    .snapshot_close(None, None, 1000)
+                    .unwrap()
+                    .pop()
+                    .unwrap(),
+            );
+            assert_eq!(first.wait().await, CloseOutcome::Failed);
+            assert_eq!(
+                tracker.close_id("missing-owner").await,
+                CloseOutcome::Failed
+            );
+            assert!(
+                tracker
+                    .close_matching(None, None, 1000)
+                    .await
+                    .unwrap()
+                    .failed
+            );
+            signal.finish(true);
+            assert_eq!(
+                tracker.close_id("missing-owner").await,
+                CloseOutcome::Failed
+            );
+            let replacement = CloseSignal::new();
+            tracker.register_owned(
+                tracked_entry("missing-owner", source, destination),
+                ConnectionOwner {
+                    signal: Arc::clone(&replacement),
+                    action: CloseAction::Tcp,
+                    groups: Vec::new(),
+                },
+            );
+            assert_eq!(tracker.close_selected(stale).await, CloseOutcome::Gone);
+            let mut cancelled = Box::pin(replacement.cancelled());
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            tracker.remove("missing-owner");
+            assert_eq!(tracker.close_id("missing-owner").await, CloseOutcome::Gone);
+            tracker.register(tracked_entry("unowned", source, destination));
+            assert_eq!(tracker.close_id("unowned").await, CloseOutcome::NotClosable);
+            drop(retained_pool);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let (removals, mut removed) = mpsc::channel(1);
+        pool.set_remove_sink(removals);
+        let stats = StatsManager::new();
+        let tracker = ConnectionTracker::new();
+        tracker.enable();
+        let source = "127.0.0.1:10001".parse().unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket.connect(destination).await.unwrap();
+        let local_transport = socket.local_addr().unwrap();
+        let endpoint = Arc::new(UdpEndpoint::new(
+            transport(socket, destination),
+            destination,
+            uuid::Uuid::new_v4(),
+        ));
+        let mut lease = match pool.reserve_owned_or_enqueue(
+            source,
+            destination,
+            Bytes::from_static(b"live"),
+            101,
+            None,
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("fresh owned endpoint"),
+        };
+        let generation = lease.generation();
+        assert!(lease.commit_ready(Arc::clone(&endpoint)));
+        pool.register_ready_tracker(
+            source,
+            destination,
+            101,
+            generation,
+            &endpoint,
+            &tracker,
+            Vec::new(),
+            || tracked_entry("acknowledged", source, destination),
+        )
+        .unwrap();
+        let selected = tracker
+            .snapshot_close(None, None, 1000)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let signal = Arc::clone(&endpoint.retirement.0.close);
+        let key = crate::control::connection::build_tuples_key(
+            destination.ip(),
+            destination.port(),
+            source.ip(),
+            source.port(),
+            17,
+        );
+        let mut backend = MockEbpfBackend::new();
+        backend
+            .udp_conn_state_store(
+                &key,
+                &ConnState {
+                    decision_token: 101,
+                    state: UdpDecisionState::Proxy as u8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(lease);
+        let pending = tracker.start_close(selected);
+        drop(endpoint);
+        let removal = removed.recv().await.unwrap();
+        assert!(pool.wait_removal_io(&removal).await);
+        drop(UdpSocket::bind(local_transport).await.unwrap());
+        assert_eq!(
+            backend.remove_udp_flow(&key, 101).unwrap(),
+            crate::ebpf::UdpDecisionCommitResult::Applied
+        );
+        tracker.remove("acknowledged");
+        assert!(pool.complete_removal(source, destination, 101, generation));
+        assert!(!pool.close_exact(source, destination, 101, generation));
+        assert_eq!(pending.wait().await, CloseOutcome::Closed);
+        signal.finish(false);
+        assert_eq!(
+            crate::connection_tracker::CloseRequest::Pending(signal)
+                .wait()
+                .await,
+            CloseOutcome::Closed
+        );
+        assert_eq!(tracker.close_id("acknowledged").await, CloseOutcome::Gone);
     })
     .await
     .unwrap();

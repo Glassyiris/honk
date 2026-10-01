@@ -27,18 +27,12 @@ pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Res
     )?;
     let network = query.get("network").map(String::as_str).unwrap_or("all");
     let state_filter = query.get("state").map(String::as_str).unwrap_or("all");
-    let limit = query
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
+    let limit = super::pages::limit(&query, id)?;
     if !matches!(network, "tcp" | "udp" | "all")
         || !(state_filter == "all"
             || crate::observe::vocab::ConnectionState::ALL
                 .iter()
                 .any(|state| state.as_str() == state_filter))
-        || !(1..=1000).contains(&limit)
         || query
             .get("connection_id")
             .is_some_and(|value| value.is_empty())
@@ -62,15 +56,7 @@ pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Res
         Ok(page) => {
             Ok(Json(super::config::administrative_projection(state, page)?).into_response())
         }
-        Err(refusal) => {
-            let mut response = page_error(refusal, id).into_response();
-            if response.status() == StatusCode::SERVICE_UNAVAILABLE {
-                response
-                    .headers_mut()
-                    .insert("retry-after", axum::http::HeaderValue::from_static("1"));
-            }
-            Ok(response)
-        }
+        Err(refusal) => Ok(page_error(refusal, id).into_response()),
     }
 }
 

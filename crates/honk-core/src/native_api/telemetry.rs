@@ -22,8 +22,8 @@ use super::{
 };
 use crate::observe::MAX_SAFE_UINT;
 
-const RETENTION: Duration = Duration::from_secs(600);
-const MAX_POINTS: usize = 600;
+pub(super) const RETENTION: Duration = Duration::from_secs(600);
+pub(super) const MAX_POINTS: usize = 600;
 
 pub(crate) struct Telemetry {
     state: Mutex<Samples>,
@@ -223,20 +223,23 @@ fn history<T: Clone>(
 
 fn history_query(uri: &Uri, id: &RequestId) -> Result<(u64, usize), ApiError> {
     let values = parse_query(uri, &["window_seconds", "max_points"], id)?;
-    let number = |name: &str| -> Result<usize, ApiError> {
+    let number = |name: &str, max: usize| -> Result<usize, ApiError> {
         let Some(value) = values.get(name) else {
-            return Ok(MAX_POINTS);
+            return Ok(max);
         };
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(invalid_query(id));
         }
         let value = value.parse::<usize>().map_err(|_| invalid_query(id))?;
-        if !(1..=MAX_POINTS).contains(&value) {
+        if !(1..=max).contains(&value) {
             return Err(invalid_query(id));
         }
         Ok(value)
     };
-    Ok((number("window_seconds")? as u64, number("max_points")?))
+    Ok((
+        number("window_seconds", RETENTION.as_secs() as usize)? as u64,
+        number("max_points", MAX_POINTS)?,
+    ))
 }
 
 fn disabled(id: &RequestId) -> ApiError {

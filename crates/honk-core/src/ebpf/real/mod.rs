@@ -1306,6 +1306,7 @@ impl EbpfBackend for RealEbpfBackend {
             h.abort();
             let _ = h.await;
         }
+        drop(self.receive_trace.take());
 
         // Drop object map fds before unlinking generation-owned pins; both
         // persistent sequence pins survive ordinary shutdown.

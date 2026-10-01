@@ -37,7 +37,7 @@
 
 以 `--features native-api` 构建（release 构建已包含）并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立观测用户态连接/记录流、节点/组健康、出站计数、RSS/cgroup、历史、事件、结构化安全日志、DNS 与 provider 状态；支持有界 probe、路由模拟、精确连接关闭/缓存失效、provider refresh、分网络 Selector 与临时 settings。除显式匿名 loopback 外均要求 bearer secret 或密码登录；可托管可信目录，或以 `--features native-ui` 和 `ui: embedded` 使用固定真实 doona，运行时不下载 UI。
 
-`.dae` 仍是唯一配置权威：启动捕获的源支持元数据、离线校验、授权源 PUT 和受限组 PATCH；另有真实激活后才成功的主文件节点/provider 创建与删除，以及已验证 geodata 更新 operation。编辑已有条目继续使用源 PUT；`--store db` 改为将已接受的源记录为状态数据库中的 revision。凭据源省略正文且只读。Native 启用时与 Clash 共用非持久化模式，成功显式激活（含 no-op）重置 Rule/settings，provider/network refresh 保留。原生 runtime_mode 与完整内核透明观测仍未开放。详见[原生设置](doc/zh/reference/experimental.md#native_api)与 [API 契约](doc/zh/reference/api.md#原生-api)。
+`.dae` 仍是唯一配置权威：启动捕获的源支持元数据、离线校验、授权源 PUT 和受限组 PATCH；另有真实激活后才成功的主文件节点/provider 创建与删除，以及已验证 geodata 更新 operation。编辑已有条目继续使用源 PUT；`--store db` 改为将已接受的源记录为状态数据库中的 revision。凭据源只读，返回正文时遮蔽 listener secret 值。Native 启用时与 Clash 共用非持久化模式，成功显式激活（含 no-op）重置 Rule/settings，provider/network refresh 保留。原生 runtime mode、暂停/恢复与完整内核 flow 仍关闭。详见[原生 API 参考](doc/zh/reference/api.md#原生-api)。
 
 ## 开发
 

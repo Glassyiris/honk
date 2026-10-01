@@ -277,7 +277,10 @@ pub(crate) async fn apply_mode_request(
                 .await
         }
     }
-    .map_err(|_| ControlError::Unavailable)
+    .map_err(|error| {
+        tracing::warn!(%error, "mode publication failed");
+        ControlError::Unavailable
+    })
 }
 
 #[cfg(all(test, feature = "native-api"))]

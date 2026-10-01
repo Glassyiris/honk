@@ -302,9 +302,9 @@ async fn native_catalog_masks_listener_secrets_without_changing_membership_or_cu
     })
     .await;
     let stats = app.control.stats_handle();
-    stats.record_connection(&nodes[0].name, OutboundKind::Node);
+    let _named = stats.track_connection(&nodes[0].name, OutboundKind::Node);
     stats.record_bytes(&nodes[0].name, OutboundKind::Node, 17, 29);
-    stats.record_connection("ordinary-node", OutboundKind::Node);
+    let _ordinary = stats.track_connection("ordinary-node", OutboundKind::Node);
     let clean = |value: &Value| {
         let body = value.to_string();
         assert!(!body.contains(SECRET), "{body}");
@@ -642,6 +642,12 @@ async fn native_only_successful_observation_gets_attach() {
             (Method::HEAD, "/api/v1/dns/log", StatusCode::OK),
             (Method::HEAD, "/api/v1/logs", StatusCode::OK),
             (
+                Method::HEAD,
+                "/api/v1/events?kinds=flow.updated",
+                StatusCode::OK,
+            ),
+            (Method::GET, "/api/v1/runtime", StatusCode::OK),
+            (
                 Method::GET,
                 "/api/v1/flows?limit=0",
                 StatusCode::BAD_REQUEST,
@@ -700,7 +706,9 @@ async fn native_only_successful_observation_gets_attach() {
         for recorder in ["flows", "logs", "dns_log", "events"] {
             assert_eq!(
                 settings["recording"][recorder]["active"],
-                recorder != "flows" || poll == "/api/v1/flows",
+                recorder == "events"
+                    || (recorder == "flows" && poll == "/api/v1/flows")
+                    || (recorder == "dns_log" && poll == "/api/v1/dns/log"),
                 "{poll}: {recorder}"
             );
         }
@@ -715,7 +723,7 @@ async fn native_only_successful_observation_gets_attach() {
 }
 
 #[tokio::test]
-async fn native_sse_flow_demand_requires_explicit_diagnostics() {
+async fn native_sse_recorders_require_their_own_diagnostics() {
     for (path, flow_demand) in [
         ("/api/v1/events", false),
         (
@@ -750,9 +758,13 @@ async fn native_sse_flow_demand_requires_explicit_diagnostics() {
             settings["recording"]["flows"]["active"], flow_demand,
             "{path}"
         );
-        for recorder in ["logs", "dns_log", "events"] {
-            assert_eq!(settings["recording"][recorder]["active"], true, "{path}");
-        }
+        assert_eq!(
+            settings["recording"]["logs"]["active"],
+            path == "/api/v1/logs",
+            "{path}"
+        );
+        assert_eq!(settings["recording"]["dns_log"]["active"], false, "{path}");
+        assert_eq!(settings["recording"]["events"]["active"], true, "{path}");
         // The response precedes this GET's renewal, so it observes the SSE demand.
         let flows = response_json(app.get("/api/v1/flows").send().await.unwrap()).await;
         assert_eq!(
@@ -762,6 +774,14 @@ async fn native_sse_flow_demand_requires_explicit_diagnostics() {
         );
         let enabled = response_json(app.get("/api/v1/flows").send().await.unwrap()).await;
         assert_eq!(enabled["coverage"]["userspace_tcp"], "partial");
+        let settings =
+            response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+        assert_eq!(
+            settings["recording"]["logs"]["active"],
+            path == "/api/v1/logs",
+            "{path}"
+        );
+        assert_eq!(settings["recording"]["dns_log"]["active"], false, "{path}");
         drop(stream);
         app.shutdown().await;
     }
