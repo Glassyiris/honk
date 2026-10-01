@@ -67,28 +67,6 @@ impl DnsResolver {
     ) -> anyhow::Result<ResolvedAddr> {
         self.service.resolve_name_for_source(domain, source).await
     }
-
-    pub async fn resolve_first_ipv4(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let (result, witness) =
-            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve(domain))
-                .await;
-        let selected = result?.ipv4.first().copied();
-        if let (Some(witness), Some(ip)) = (witness, selected) {
-            witness.selected_ip(ip);
-        }
-        Ok(selected)
-    }
-
-    pub async fn resolve_first_ipv6(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let (result, witness) =
-            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve(domain))
-                .await;
-        let selected = result?.ipv6.first().copied();
-        if let (Some(witness), Some(ip)) = (witness, selected) {
-            witness.selected_ip(ip);
-        }
-        Ok(selected)
-    }
 }
 
 fn build_forwarder_from_config(config: &DnsConfig) -> anyhow::Result<Arc<DnsForwarder>> {

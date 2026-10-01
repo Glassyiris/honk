@@ -637,9 +637,12 @@ async fn put_proxy(
                 .await
             {
                 Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::control::client::ControlError::Unsupported) => {
+                    error_response(StatusCode::BAD_REQUEST, "unknown proxy name")
+                }
                 Err(_) => error_response(
-                    StatusCode::BAD_REQUEST,
-                    "GLOBAL selection transition failed",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "GLOBAL selection transition could not be confirmed",
                 ),
             };
         }

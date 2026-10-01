@@ -68,7 +68,7 @@ flowchart LR
 
 `src/share_link.rs` 是唯一 `Node::from_share_link` parser；`src/share_link/options.rs` 把 URI packet encoding 与独立 mux controls 归入规范协议模型，再进行 normalization、validation 与 identity derivation。`src/node/wire.rs` 是唯一 flat serde adapter；VLESS 输入即使以 `null` 出现已移除的旧字段也会拒绝，而同一字段在非 VLESS 输入上仅为兼容 artifact。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 
-`src/experimental.rs` 的 `ExperimentalConfig` 持有 `clash_api`、`native_api` 与 `cache_file`。原生设置严格校验、独立启用且均需重启。需显式编译的 `native-api`（以 `--features native-api` 或 `native-ui` 构建；发布产物包含）提供用户态观测、有界历史、来源所有的组 PATCH/主文件条目管理，以及已验证 geodata 激活，listener 仍默认关闭。`.dae` 仍是唯一配置权威；原文披露/写许可独立，凭据源只读且省略正文，自动 override、原生 mode 与完整内核透明仍关闭。默认关闭的 `native-ui` 内嵌有许可与版本记录的真实 doona，不在运行时获取资产。弃用 `udp_nfqueue` 块仅将 `enabled` 迁移到 `GlobalConfig::nfqueue_enable` 并告警。
+`src/experimental.rs` 的 `ExperimentalConfig` 持有 `clash_api`、`native_api` 与 `cache_file`。原生设置严格校验、独立启用且均需重启。需显式编译的 `native-api`（以 `--features native-api` 或 `native-ui` 构建；发布产物包含）提供用户态观测、有界历史、来源所有的组 PATCH/主文件条目管理，以及已验证 geodata 激活，listener 仍默认关闭。`.dae` 仍是唯一配置权威；原文披露/写许可独立。凭据源只读，返回正文时遮蔽 listener secret 值，而不是省略正文。自动策略的分网络 pin/clear 已开放，pin 属于当前 GroupManager，激活后消失；原生 mode 与完整内核透明仍关闭。默认关闭的 `native-ui` 在打包时通过 `ci/fetch-doona.sh` 与 `.github/ci/pins.env` 获取有许可及版本记录的真实 doona，`build.rs` 读取绝对路径 `HONK_DOONA_DIR`，不在运行时获取资产或构建前端。弃用 `udp_nfqueue` 块仅将 `enabled` 迁移到 `GlobalConfig::nfqueue_enable` 并告警。
 
 ## 高层数据路径
 
@@ -137,6 +137,8 @@ flowchart TB
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
 `mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。若请求 `global.nfqueue_enable = true`，启动会记录 warning，仅在本进程关闭 NFQUEUE 暂存，配置文件保持不变。
+
+嵌入 eBPF 时，`build.rs` 使用内核 crate 固定的编译器及独立 release 策略重建，不继承 host 的 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS` 或 `CARGO_PROFILE_*` 性能分析覆盖。编译器 sidecar 还必须不早于嵌入构建脚本，因此修改嵌入策略会使既有对象失效。显式 `--bpf-object` 资产及手动内核构建仍由调用方负责。
 
 ## 作者与分工说明
 

@@ -94,19 +94,33 @@ fn assert_expired(store: &Arc<LogStore>, query: &str, cursor: &str) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tracing_retains_during_grace_and_resume_ready_cannot_skip_replay() {
     if run_isolated(
         "native_api::logs::tests::tracing_retains_during_grace_and_resume_ready_cannot_skip_replay",
     ) {
         return;
     }
-    let mut config = honk_config::Config::default();
-    config.global.log_level = "trace".into();
+    let config = honk_config::Config::default();
     let owner = super::super::observation::NativeObservation::new(&config);
-    owner.settings.renew(&owner, false);
     let store = Arc::clone(&owner.logs);
     let dispatch = capture(&store);
+    let _capture = tracing::dispatcher::set_default(&dispatch);
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::NONE);
+    emit_nodes(&dispatch, 39);
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::DNS_LOG);
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::FLOWS);
+    emit_nodes(&dispatch, 40);
+    assert_eq!(store.hub.buffered_kinds(), Vec::<&str>::new());
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::LOGS);
     let mut stream = response(&store, "?level=info&target=honk_core::control", None)
         .into_body()
         .into_data_stream();
@@ -167,6 +181,25 @@ async fn tracing_retains_during_grace_and_resume_ready_cannot_skip_replay() {
         cursor(&ready),
     );
     assert_expired(&store, "", "forged");
+    drop(again);
+    tokio::time::advance(Duration::from_secs(59)).await;
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::FLOWS);
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::DNS_LOG);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    owner.settings.maintain(&owner);
+    emit_nodes(&dispatch, 44);
+    assert_eq!(store.hub.buffered_kinds(), Vec::<&str>::new());
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::LOGS);
+    let mut fresh = response(&store, "", None).into_body().into_data_stream();
+    next(&mut fresh).await;
+    emit_nodes(&dispatch, 45);
+    assert_eq!(data(&next(&mut fresh).await)["fields"]["nodes"], 45);
 }
 
 struct Unformattable;
@@ -469,7 +502,9 @@ async fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
         return;
     }
     let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
-    owner.settings.renew(&owner, false);
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::LOGS);
     let store = Arc::clone(&owner.logs);
     let dispatch = capture(&store);
     let query = "?level=info&target=honk_core::native_api";

@@ -235,12 +235,15 @@ async fn capped(response: &'static [u8]) -> Result<std::sync::Arc<[u8]>, &'stati
     });
     let url = reqwest::Url::parse("http://capped.example/file").unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let response = super::Client::new()
+    let prepared = super::Client::new()
         .unwrap()
-        .get_over(Box::new(client), &url, &http::HeaderMap::new(), deadline)
-        .await?;
+        .prepare_over(Box::new(client), &url, &http::HeaderMap::new(), deadline)
+        .await
+        .map_err(|error| error.stage)?;
+    let response = super::send(prepared).await.map_err(|error| error.stage)?;
     Ok(super::read(response, |_, _| true, deadline.into(), 4)
-        .await?
+        .await
+        .map_err(|error| error.stage)?
         .body)
 }
 

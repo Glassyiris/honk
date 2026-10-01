@@ -332,16 +332,20 @@ async fn fetch_direct(
         biased;
         _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
         result = tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
-        let response = crate::marked_http::Client::new()?
-            .get(
+        let prepared = crate::marked_http::Client::new()?
+            .prepare(
                 &reqwest::Url::parse(url)?,
                 &http::HeaderMap::new(),
                 DOWNLOAD_TIMEOUT,
             )
             .await?;
+        if let Some(reporter) = &reporter {
+            reporter.setup_succeeded();
+        }
+        let response = crate::marked_http::send(prepared).await?;
         receive(response, url, archive, &reporter).await
         }) => result
-            .map_err(|_| anyhow::anyhow!("external UI download timed out"))
+            .map_err(|_| timed_out())
             .and_then(|result| result),
     };
     if let Some(reporter) = &reporter {
@@ -389,7 +393,10 @@ async fn fetch_proxied(
         match tunnel.dial().await {
         Ok(stream) => match tokio::time::timeout(
             DOWNLOAD_TIMEOUT,
-            proxied_get(stream, url, archive, &reporter),
+            async {
+                let by = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
+                proxied_get(&crate::marked_http::Client::new()?, stream, url, archive, &reporter, by).await
+            },
         )
         .await
         {
@@ -412,19 +419,20 @@ async fn fetch_proxied(
 
 /// The GET over the tunnel's stream, answered like the direct one.
 async fn proxied_get(
+    client: &crate::marked_http::Client,
     stream: Box<dyn AsyncReadWrite>,
     url: &reqwest::Url,
     archive: &mut ArchiveFile,
     reporter: &Option<ScoreReporter>,
+    by: tokio::time::Instant,
 ) -> anyhow::Result<ProxiedFetch> {
-    let by = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
-    let response = crate::marked_http::Client::new()?
-        .get_over(stream, url, &http::HeaderMap::new(), by)
-        .await
-        .map_err(|stage| match stage {
-            "download_timeout" => timed_out(),
-            stage => anyhow::anyhow!("external UI download failed: {stage}"),
-        })?;
+    let prepared = client
+        .prepare_over(stream, url, &http::HeaderMap::new(), by)
+        .await?;
+    if let Some(reporter) = reporter {
+        reporter.setup_succeeded();
+    }
+    let response = crate::marked_http::send(prepared).await?;
     receive(response, url.as_str(), archive, reporter).await
 }
 
@@ -444,7 +452,6 @@ async fn receive(
     reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<ProxiedFetch> {
     if let Some(reporter) = reporter {
-        reporter.setup_succeeded();
         reporter.first_response();
         reporter.tx(url.len() as u64);
     }
@@ -683,6 +690,8 @@ mod tests {
     use honk_outbound::group::{GroupManager, ScoreSelectionContext, SelectionNetwork};
     use honk_outbound::proxy::{ProtocolEntry, ProxyStream, TcpOutbound};
     use tokio::io::AsyncReadExt;
+
+    mod attribution;
 
     /// Build an in-memory zip with the given (path, contents) entries.
     fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {

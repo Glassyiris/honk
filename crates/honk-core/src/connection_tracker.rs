@@ -60,10 +60,16 @@ impl CloseSignal {
     }
 
     pub(crate) fn finish(&self, success: bool) {
-        self.0.send_replace(if success {
-            ClosePhase::Closed
-        } else {
-            ClosePhase::Failed
+        self.0.send_if_modified(|phase| {
+            if matches!(*phase, ClosePhase::Closed | ClosePhase::Failed) {
+                return false;
+            }
+            *phase = if success {
+                ClosePhase::Closed
+            } else {
+                ClosePhase::Failed
+            };
+            true
         });
     }
 
@@ -84,13 +90,7 @@ pub(crate) struct CloseCompletion(pub(crate) Arc<CloseSignal>);
 
 impl Drop for CloseCompletion {
     fn drop(&mut self) {
-        self.0.0.send_if_modified(|phase| {
-            if matches!(*phase, ClosePhase::Closed | ClosePhase::Failed) {
-                return false;
-            }
-            *phase = ClosePhase::Failed;
-            true
-        });
+        self.0.finish(false);
     }
 }
 
@@ -455,7 +455,10 @@ impl ConnectionTracker {
             match (&tracked.owner, &selected.owner) {
                 (None, None) => return CloseRequest::Immediate(CloseOutcome::NotClosable),
                 (Some(current), Some(selected)) if Arc::ptr_eq(current, selected) => {
-                    current.signal.claim()
+                    if !current.signal.claim() {
+                        return CloseRequest::Pending(Arc::clone(&current.signal));
+                    }
+                    true
                 }
                 _ => false,
             }
@@ -473,10 +476,11 @@ impl ConnectionTracker {
         } = &owner.action
         {
             let Some(pool) = pool.upgrade() else {
-                return CloseRequest::Immediate(CloseOutcome::Failed);
+                owner.signal.finish(false);
+                return CloseRequest::Pending(Arc::clone(&owner.signal));
             };
             if !pool.close_exact(*client, *destination, *token, *generation) {
-                return CloseRequest::Immediate(CloseOutcome::Gone);
+                owner.signal.finish(false);
             }
         }
         CloseRequest::Pending(Arc::clone(&owner.signal))

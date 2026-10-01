@@ -149,6 +149,8 @@ struct Writer {
     budget_pages: i64,
     /// Batches skipped for the page budget; the first one is logged.
     skipped: u64,
+    // The directory lock must outlive the writer connection.
+    _state: Arc<StateDb>,
 }
 
 impl Writer {
@@ -403,7 +405,6 @@ impl FlushSignal {
 }
 
 pub struct CacheDb {
-    _state: Arc<StateDb>,
     /// Reader connection; writes go through `writer`.
     conn: Mutex<Connection>,
     pending: Arc<Mutex<HashMap<Key, PendingWrite>>>,
@@ -412,6 +413,7 @@ pub struct CacheDb {
     flush: Arc<FlushSignal>,
     #[cfg(test)]
     write_attempted: std::sync::atomic::AtomicBool,
+    _state: Arc<StateDb>,
 }
 
 impl Drop for CacheDb {
@@ -432,6 +434,7 @@ impl CacheDb {
             latest: HashMap::new(),
             budget_pages: state.cache_budget_pages(),
             skipped: 0,
+            _state: Arc::clone(&state),
         };
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (writer, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);

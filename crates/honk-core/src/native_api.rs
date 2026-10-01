@@ -76,6 +76,7 @@ pub struct NativeState {
     dns: crate::dns::DnsService,
     traffic_router: Arc<RwLock<crate::routing::Router>>,
     backend: Arc<RwLock<Box<dyn crate::ebpf::EbpfBackend>>>,
+    datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
     control_tx: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     proxy_registry: Arc<crate::proxy::ProxyRegistry>,
@@ -179,6 +180,7 @@ impl NativeState {
             dns: control.dns_service(),
             traffic_router: control.traffic_router(),
             backend: control.ebpf_handle(),
+            datapath_flags: control.datapath_flags_handle(),
             control_tx: control.command_sender(),
             runtime_registry: control.runtime_registry(),
             proxy_registry: control.proxy_registry(),
@@ -288,17 +290,21 @@ async fn observation_request(
 ) -> Response {
     let get = request.method() == axum::http::Method::GET;
     let path = request.uri().path();
-    let flow_demand = matches!(path, "/api/v1/flows")
+    let demand = if matches!(path, "/api/v1/flows")
         || path
             .strip_prefix("/api/v1/flows/")
-            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
-    let poll = get && (flow_demand || path == "/api/v1/dns/log");
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        settings::Demand::FLOWS
+    } else if path == "/api/v1/dns/log" {
+        settings::Demand::DNS_LOG
+    } else {
+        settings::Demand::NONE
+    };
+    let poll = get && demand != settings::Demand::NONE;
     let response = next.run(request).await;
     if poll && response.status().is_success() {
-        state
-            .observation
-            .settings
-            .renew(&state.observation, flow_demand);
+        state.observation.settings.renew(&state.observation, demand);
     }
     response
 }
@@ -557,15 +563,7 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
         .map(|value| value.parse::<IpAddr>().map(|ip| ip.to_canonical()))
         .transpose()
         .map_err(|_| invalid_query(id))?;
-    let limit = query
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=1000).contains(&limit) {
-        return Err(invalid_query(id));
-    }
+    let limit = pages::limit(&query, id)?;
     let mut total_tcp = 0;
     let mut total_udp = 0;
     let mut selected: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit);

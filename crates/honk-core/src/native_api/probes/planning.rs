@@ -48,7 +48,7 @@ pub(super) struct PreparedPlan {
     pub(super) skipped: Vec<AddressUnavailable>,
 }
 
-fn validate(request: &ProbeRequest) -> Result<(), ApiError> {
+pub(super) fn validate(request: &ProbeRequest) -> Result<(), ApiError> {
     if match &request.target {
         Target::Node { node_id } => node_id.is_empty(),
         Target::Group { group_id } => group_id.is_empty(),
@@ -83,7 +83,6 @@ fn validate(request: &ProbeRequest) -> Result<(), ApiError> {
 }
 
 pub(super) async fn capture(state: &NativeState, request: ProbeRequest) -> Result<Plan, ApiError> {
-    validate(&request)?;
     // Publication holds router before config; all later owner snapshots are synchronous.
     let router = state.traffic_router.read().await;
     let config_guard = state.config.read().await;
@@ -416,6 +415,12 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
             .as_ref()
             .map(|(host, port)| (host.as_str(), *port))
             .unwrap_or((candidate.node.host(), candidate.node.port));
+        if port == 0 {
+            return Err(unsupported(
+                "The probe destination requires a nonzero port",
+                json!({"check":"port"}),
+            ));
+        }
         let ips = resolve(
             &context.dns,
             &mut resolved,

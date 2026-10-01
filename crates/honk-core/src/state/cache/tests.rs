@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 fn member(name: &str) -> SelectorMember {
     SelectorMember::Group(name.to_owned())
@@ -28,6 +29,51 @@ fn selector_and_clash_state_round_trip() {
     }
     assert_eq!(db.load_clash_mode().as_deref(), Some("Global"));
     assert_eq!(db.load_clash_global().as_deref(), Some("proxy"));
+}
+
+#[test]
+fn writer_keeps_the_directory_locked_after_the_cache_reader_closes() {
+    use nix::fcntl::{Flock, FlockArg};
+
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateDb::open(directory.path()).unwrap());
+    let db = CacheDb::open(Arc::clone(&state)).unwrap();
+    let writer = db.writer.clone();
+    drop(state);
+    drop(db);
+
+    let lock = || {
+        Flock::lock(
+            std::fs::File::open(directory.path().join(super::super::STATE_DIR)).unwrap(),
+            FlockArg::LockExclusiveNonblock,
+        )
+    };
+    assert!(matches!(lock(), Err((_, nix::errno::Errno::EWOULDBLOCK))));
+    let (ack, result) = mpsc::channel();
+    writer.send(Write::Barrier(ack)).unwrap();
+    result
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match lock() {
+            Ok(guard) => {
+                drop(guard);
+                break;
+            }
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer did not release its database lock"
+                );
+                std::thread::yield_now();
+            }
+            Err((_, error)) => panic!("exclusive state lock failed: {error}"),
+        }
+    }
 }
 
 #[test]

@@ -719,8 +719,8 @@ mod native_api {
             ["http://localhost:3000", "https://panel.example"]
         );
         assert!(
-            serde_json::from_str::<Config>(
-                r#"{"experimental":{"native_api":{"secrett":"PRIVATE"}}}"#
+            serde_json::from_value::<Config>(
+                serde_json::json!({"experimental":{"native_api":{"secrett":"PRIVATE"}}})
             )
             .is_err()
         );

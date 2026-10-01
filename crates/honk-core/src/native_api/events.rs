@@ -5,7 +5,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -63,6 +63,10 @@ const KINDS: [Kind; 6] = [
     Kind::OperationUpdated,
     Kind::GenerationChanged,
 ];
+
+pub(super) fn kind_names() -> [&'static str; KINDS.len()] {
+    KINDS.map(Kind::name)
+}
 
 impl Kind {
     const fn name(self) -> &'static str {
@@ -157,6 +161,18 @@ struct Record {
     flow_id: Option<String>,
     logs: Option<(u8, &'static str)>,
     payload: Bytes,
+    frame: OnceLock<([u8; 32], Bytes)>,
+}
+
+impl Record {
+    fn retained_bytes(&self) -> usize {
+        // Reserve the one possible frame before any subscriber initializes it.
+        self.payload.len() * 2
+            + self.kind.name().len()
+            + 128
+            + 22
+            + size_of::<OnceLock<([u8; 32], Bytes)>>()
+    }
 }
 
 struct Subscriber {
@@ -202,7 +218,7 @@ impl State {
     fn evict(&mut self) {
         if let Some(record) = self.records.pop_front() {
             self.evicted_through = record.seq;
-            self.retained_bytes -= record.payload.len();
+            self.retained_bytes -= record.retained_bytes();
             if record.logs.is_some() {
                 for subscriber in self.subscribers.iter_mut().flatten() {
                     if subscriber
@@ -368,13 +384,15 @@ impl EventHub {
             flow_id: flow_id.map(str::to_owned),
             payload,
             logs,
+            frame: OnceLock::new(),
         });
+        let retained_bytes = record.retained_bytes();
         while state.records.len() >= state.limit
-            || state.retained_bytes + record.payload.len() > MAX_RETAINED_BYTES
+            || state.retained_bytes + retained_bytes > MAX_RETAINED_BYTES
         {
             state.evict();
         }
-        state.retained_bytes += record.payload.len();
+        state.retained_bytes += retained_bytes;
         state.records.push_back(Arc::clone(&record));
         for subscriber in state.subscribers.iter_mut().flatten() {
             if subscriber.closed || !subscriber.filter.matches(&record) {
@@ -748,14 +766,22 @@ fn encode_cursor(
 }
 
 fn record_frame(signer: &Hkdf<Sha256>, record: &Record, filter: &Filter) -> Bytes {
-    let cursor = encode_cursor(
-        signer,
-        record.seq,
-        record.stamp,
-        &record.nonce,
-        &filter.binding,
-    );
-    frame(record.kind.name(), &cursor, &record.payload)
+    let encode = || {
+        let cursor = encode_cursor(
+            signer,
+            record.seq,
+            record.stamp,
+            &record.nonce,
+            &filter.binding,
+        );
+        frame(record.kind.name(), &cursor, &record.payload)
+    };
+    let (binding, bytes) = record.frame.get_or_init(|| (filter.binding, encode()));
+    if *binding == filter.binding {
+        bytes.clone()
+    } else {
+        encode()
+    }
 }
 
 fn frame(kind: &str, cursor: &str, payload: &[u8]) -> Bytes {
@@ -811,7 +837,7 @@ fn invalid(id: &RequestId) -> ApiError {
 fn request_options(
     request: &Request,
     id: &RequestId,
-) -> Result<(Filter, Option<String>, bool), ApiError> {
+) -> Result<(Filter, Option<String>, super::settings::Demand), ApiError> {
     let values = parse_query(request.uri(), &["kinds", "flow_id"], id)?;
     let kinds = if let Some(kinds) = values.get("kinds") {
         let mut mask = 0;
@@ -839,7 +865,11 @@ fn request_options(
     Ok((
         Filter::new(kinds, flow_id),
         request_cursor(request, id)?,
-        flow_demand,
+        if flow_demand {
+            super::settings::Demand::FLOWS
+        } else {
+            super::settings::Demand::NONE
+        },
     ))
 }
 
@@ -961,7 +991,7 @@ pub(super) async fn serve(
     request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    let (filter, cursor, flow_demand) = request_options(&request, id)?;
+    let (filter, cursor, demand) = request_options(&request, id)?;
     let admit = || {
         state
             .observation
@@ -972,7 +1002,7 @@ pub(super) async fn serve(
         state
             .observation
             .settings
-            .subscribe(&state.observation, flow_demand, admit)?
+            .subscribe(&state.observation, demand, admit)?
     } else {
         admit()?
     };

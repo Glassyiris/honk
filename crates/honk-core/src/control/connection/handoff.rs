@@ -1,3 +1,5 @@
+#[cfg(feature = "native-api")]
+use super::observation::ConnectionObservation;
 use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::{HashMap, HashSet};
@@ -88,8 +90,13 @@ impl HandoffResult {
         key: &TuplesKey,
         entry: RoutingHandoffEntry,
         atomic: bool,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> Self {
         let handoff = Self::from(entry);
+        #[cfg(feature = "native-api")]
+        if !observation.is_recording() {
+            return handoff;
+        }
         #[cfg(feature = "native-api")]
         let handoff = {
             let mut handoff = handoff;
@@ -164,16 +171,19 @@ impl HandoffResult {
 
     /// Convert the eBPF MAC address to canonical lower-case colon form.
     pub(super) fn mac_address(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
         if self.mac == [0u8; 6] {
             return None;
         }
-        Some(
-            self.mac
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(":"),
+        let mut mac = String::with_capacity(17);
+        write!(
+            mac,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
         )
+        .expect("writing to a String cannot fail");
+        Some(mac)
     }
 }
 
@@ -404,13 +414,26 @@ impl ControlPlaneHandle {
     /// backend state is touched.  The lock's sole role here is to keep the
     /// backend (and its map fds) alive against `cleanup()`, which takes the
     /// write lock.
-    pub(super) async fn lookup_handoff(&self, tuples: &TuplesKey) -> Option<HandoffResult> {
+    pub(super) async fn lookup_handoff(
+        &self,
+        tuples: &TuplesKey,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+    ) -> Option<HandoffResult> {
         let backend = self.ebpf.read().await;
         backend
             .routing_handoff_take_observed(tuples)
             .ok()
             .flatten()
-            .map(|(entry, atomic)| HandoffResult::captured(backend.as_ref(), tuples, entry, atomic))
+            .map(|(entry, atomic)| {
+                HandoffResult::captured(
+                    backend.as_ref(),
+                    tuples,
+                    entry,
+                    atomic,
+                    #[cfg(feature = "native-api")]
+                    observation,
+                )
+            })
     }
 
     /// Staged UDP transitions consume their handoff atomically at commit, so
@@ -420,9 +443,16 @@ impl ControlPlaneHandle {
         &self,
         tuples: &TuplesKey,
         decision_token: u32,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<Option<HandoffResult>> {
         if decision_token == 0 {
-            let handoff = self.lookup_handoff(tuples).await;
+            let handoff = self
+                .lookup_handoff(
+                    tuples,
+                    #[cfg(feature = "native-api")]
+                    observation,
+                )
+                .await;
             return Ok(if tuples.dst_port == 53 {
                 handoff.filter(|handoff| {
                     handoff.outbound == OutboundIndex::ControlPlaneRouting as u8
@@ -448,6 +478,8 @@ impl ControlPlaneHandle {
             tuples,
             entry,
             true,
+            #[cfg(feature = "native-api")]
+            observation,
         )))
     }
 
@@ -455,6 +487,7 @@ impl ControlPlaneHandle {
         &self,
         stream: TcpStream,
         tuples: TuplesKey,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
         let backend = self.ebpf.read().await;
         match backend.tcp_conn_state_lookup(&tuples) {
@@ -479,7 +512,14 @@ impl ControlPlaneHandle {
             .ok()
             .flatten()
             .map(|(entry, atomic)| {
-                HandoffResult::captured(backend.as_ref(), &tuples, entry, atomic)
+                HandoffResult::captured(
+                    backend.as_ref(),
+                    &tuples,
+                    entry,
+                    atomic,
+                    #[cfg(feature = "native-api")]
+                    observation,
+                )
             });
         Ok((flow, handoff))
     }
@@ -610,7 +650,7 @@ mod tcp_flow_lifecycle_tests;
 
 #[cfg(all(test, feature = "native-api"))]
 #[test]
-fn nonatomic_take_downgrades_evidence_without_changing_handoff_authority() {
+fn handoff_capture_follows_admission_without_changing_authority() {
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
     let entry = RoutingHandoffEntry {
         result: honk_ebpf_common::RoutingResult {
@@ -622,15 +662,35 @@ fn nonatomic_take_downgrades_evidence_without_changing_handoff_authority() {
         routing_generation: 9,
         ..Default::default()
     };
-    let result = HandoffResult::captured(&backend, &TuplesKey::default(), entry, false);
-    assert_eq!(result.capture_gap, Some("kernel_handoff_nonatomic_take"));
-    assert_eq!(
-        (
-            result.outbound,
-            result.mark,
-            result.must,
-            result.routing_generation
-        ),
-        (2, 0x42, 1, 9)
-    );
+    for admitted in [false, true] {
+        let native =
+            crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
+        native.core.flows.set_recording(admitted);
+        let observation = ConnectionObservation::begin(
+            Some(&native.core),
+            crate::observe::vocab::Network::Tcp,
+            "127.0.0.1:31000".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        );
+        native.core.flows.set_recording(!admitted);
+        let result =
+            HandoffResult::captured(&backend, &TuplesKey::default(), entry, false, &observation);
+        assert_eq!(
+            result.capture_gap,
+            Some(if admitted {
+                "kernel_handoff_nonatomic_take"
+            } else {
+                "kernel_trace_not_captured"
+            })
+        );
+        assert_eq!(
+            (
+                result.outbound,
+                result.mark,
+                result.must,
+                result.routing_generation
+            ),
+            (2, 0x42, 1, 9)
+        );
+    }
 }

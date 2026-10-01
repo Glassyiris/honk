@@ -27,7 +27,7 @@ use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
 use super::vocab::{ConnectionState, DomainSource, Network, Plane, RuleSource};
 
 pub(crate) const MAX_RECORDS: usize = 1024;
-const MAX_STEPS: usize = 64;
+pub(crate) const MAX_STEPS: usize = 64;
 pub(crate) const MAX_RULE_VALUES: usize = 256;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Listings keep this much of the budget for their snapshots, so a ring that
@@ -35,7 +35,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 pub(crate) const TERMINAL_TTL: Duration = Duration::from_secs(300);
-const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+pub(crate) const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 /// Records leave the ring one at a time as flows end, newer ones need the room
 /// or a revision runs out, so a `flow.gap` per departure would shadow every
 /// flow under load. Departures are reported at most once per interval, with
@@ -339,8 +339,11 @@ impl FlowStore {
         let new_bytes = record.bytes;
         self.updated(record);
         store.record_bytes = store.record_bytes - old_bytes + new_bytes;
-        self.enforce_limit(&mut store, now);
-        store.records.iter().any(|record| record.id() == id)
+        if self.enforce_limit(&mut store, now) {
+            store.records.iter().any(|record| record.id() == id)
+        } else {
+            true
+        }
     }
 
     pub(crate) fn record_step(&self, id: &str, generation: Option<u64>, data: StepData) -> bool {
@@ -428,14 +431,16 @@ impl FlowStore {
 
     /// Expired records give way first, then ended ones, before a live one is
     /// evicted for room.
-    fn enforce_limit(&self, store: &mut Store, now: Instant) {
+    /// Returns whether pruning or eviction may have changed record membership.
+    fn enforce_limit(&self, store: &mut Store, now: Instant) -> bool {
         let over = |store: &Store| {
             store.records.len() > store.max_records
                 || OWNER_BYTES + store.retained_record_bytes() > MAX_BYTES - SNAPSHOT_BYTES
         };
-        if over(store) {
-            self.prune(store, now);
+        if !over(store) {
+            return false;
         }
+        self.prune(store, now);
         while over(store) {
             if store.records.is_empty() {
                 break;
@@ -447,6 +452,7 @@ impl FlowStore {
                 .unwrap_or(0);
             self.evict(store, index, now, "buffer_overflow");
         }
+        true
     }
 
     fn prune(&self, store: &mut Store, now: Instant) {

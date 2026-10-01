@@ -28,6 +28,8 @@
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
+UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。`cleanup()` 先卸载 ingress hook、join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活也会释放，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
+
 ## 透明代理入口
 
 真实 TCP 和 UDP listener 在 `daens` 内创建，并设置透明 socket 选项和有效的 `global.so_mark_from_dae`（零值选择 `0x100`）。该 mark 使数据路径把它们识别为 honk 自己的 listener，而不是普通本地服务。已接受 TCP socket 会继承 mark，因此每个 accept loop 在处理流前将其清零。Mock listener 是宿主命名空间内不带特权透明选项的普通 socket。
@@ -186,6 +188,8 @@ copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的
 
 Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时才会被接管。`TcpFlowPins` 为每个 accepted owner 引用计数该方向 tuple。BPF janitor 跳过已 pin 的 conn-state 和匹配的 redirect 元数据。最后一个 owner 退役时读取当前条目，并且只在 state 与 timestamp 仍匹配已观察 incarnation 时条件删除；旧 relay 不能删除复用的 tuple。
 
+真实 relay 完成后，TCP owner 先按实际结果恰一次结算 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。
+
 ## Reload 与运行时 generation
 
 SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与否，警告都只报告一次；被拒绝的尝试另报告一次脱敏后的原因，不进入运行时发布流程。报告本次诊断不会替换当前运行时状态，也不会新增最近失败尝试的缓存。
@@ -195,8 +199,10 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 1. Fence NFQUEUE readiness，并等待内核 reader-epoch 宽限期。
 2. 拒绝新的透明代理准入。
 3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 变空，并排空精确 endpoint retirement。
-4. 构建 generation 私有事实、加载生成函数并附着全部 inactive slot，最后切换 `ROUTING_POLICY_ROOT`，再于同一串行边界内发布出站 registry、DNS runtime pointer、Router、配置、组和 projection snapshot。
+4. 在下述发布 guard 内，只有 compiled plan、learned facts 变化或数据路径健康需要恢复时才调用 `EbpfBackend::publish_routing_plan`。后端暂存 inactive slot 的 generation 私有事实与生成函数，最后切换 `ROUTING_POLICY_ROOT`。原生显式激活随后使用已经持有的 backend 重置 mode，再发布替代 registry、DNS pointer、Router、配置、组与 projection；root 已提交后 mode reset 失败会提交新代为 degraded，并保持准入 fence。
 5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
+
+`control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`；provider 的 DNS publication guard 在这些 guard 内准备。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
 
 提交前失败保留活动代码与事实，不再重放旧路由计划。Fence 后发布被拒绝时，控制器恢复组连通性并重开旧 generation；连通性恢复失败则继续拒绝准入。Root 切换成功后新 generation 已提交，之后若 NFQUEUE 重开失败，保留已发布的新 generation 并继续 fence 准入，直到后续成功 reload 修复。
 
@@ -227,7 +233,7 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 ## 订阅编排
 
-启动时先解析已存正文，再开始网络刷新。有效且非空的恢复结果立即提供节点，并从五秒首次拉取等待中移除该订阅；缺失、无效或空正文只会在共享 grace 期间等待。之后所有订阅仍在后台刷新。
+启动时先解析已存正文，再开始网络刷新。有效且非空的恢复结果立即提供节点，并从五秒首次拉取等待中移除该订阅。只有未有效恢复的 direct 订阅进入共享 grace；经路由的拉取等待路由就绪，不阻塞启动。之后仍在后台联网刷新。
 
 `ControlPlane::run` 首次被 poll 时便取得控制命令接收端的所有权，早于所有启动阶段的 await。这个已开始运行的 future 返回或被丢弃时，即使监听器启动失败也会关闭通道，使阻塞在满队列上的订阅投递解除等待，随后调用方才能等待 supervisor 关闭。
 
@@ -235,9 +241,9 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 正文通过校验与运行时发布分别报告。节点集合准入失败时，只输出一次脱敏诊断，并保留活动配置；已经保存的正文不会回滚。
 
-当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
+当 `global.store_subscribe` 启用时，通过校验的原始响应存放在固定状态数据库 `<data_dir>/state/honk.db` 的 `subscription_body` 表，key 由请求 URL、配置的 user-agent 覆盖值与有序 headers 决定。完整正文在一个 SQLite 事务中替换，单份最多 8 MiB、总量最多 32 MiB。启动从 `<data_dir>`、`/var/share/honk`、CWD 下找到的第一个私有旧 `.sub` 目录一次导入已启用订阅正文；已有行优先，已复制文件与临时文件被删除，未导入正文保留供后续符合条件的启动处理。迁移与失败细节见[订阅参考](../reference/subscription.md#拉取持久化与恢复)。
 
-- `src/subscription.rs` 负责拉取、解析与 FD 相对的正文持久化。`subscription/supervisor.rs` 将当前授权及 deferred/可刷新调度状态放在同一 provider record；`supervisor/startup.rs` 恢复缓存正文并执行共用五秒启动宽限。启动与稳态使用同一 supervisor state；在途工作独立保留捕获的 revision 与发布确认，关闭等待其结束，reconcile 不丢弃可能已提交的确认。
+- `src/subscription.rs` 负责拉取与解析；`subscription/store.rs` 持有 SQLite 正文存储与 FD 相对的旧存储导入。`subscription/supervisor.rs` 将当前授权及 deferred/可刷新调度状态放在同一 provider record；`supervisor/startup.rs` 恢复缓存正文并执行仅限 direct 的共用五秒启动宽限。启动与稳态使用同一 supervisor state；在途工作独立保留捕获的 revision 与发布确认，关闭等待其结束，reconcile 不丢弃可能已提交的确认。
 - 守护进程的拉取/恢复路径与 `honk-tool sub` 的本地文件共用正文格式检测。`Simple`/`Custom` 接受 BOM、可换行的标准/URL-safe Base64、原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及 Surge/Surfboard/Loon/Quantumult X 记录。`src/subscription/json.rs` 与 `records.rs` 规范化外部记录，`clash.rs` 构造并校验类型化节点。
   只导入节点，不导入完整配置中的路由、DNS 或组。原生 JSON 保留以 Unicode 代理项对编码的名称。跳过不支持的节点，身份重复时保留首个可用节点，空结果不替换活动订阅。导入的 Trojan/AnyTLS/QUIC 节点必须使用 TLS，不会静默降级为明文。
   Clash 与 sing-box 的 TCP ALPN 归入共享 TLS 模型，而不是 TUIC 的 QUIC 字段。共享构造器的跳过告警只包含从 1 开始的代理序号和静态拒绝原因，不包含原始节点记录或凭据。
@@ -246,7 +252,7 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 独立且需显式编译的 `native-api` feature（以 `--features native-api` 或 `native-ui` 构建；发布产物包含）提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
-`native_api/server.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，30 秒读空闲期限仅在该连接没有进行中请求时生效（请求自 body 结束至响应完成视为进行中），停滞写入另有独立 30 秒期限，健康 SSE 与慢 handler 可持续超过 30 秒；accept 错误记录日志后重试，EMFILE/ENFILE/ENOBUFS/ENOMEM 退避 100 ms；连接任务失败只记录日志，不终止 server；HTTP 关闭共享五秒 grace，随后等待已准入的真实阻塞凭据任务结束。`crate::observe`（`observe.rs` 的 `Observation`、flows、rules、catalog 身份、`DnsRecorder`）拥有进程身份与引擎侧有界存储，独立于客户端；`native_api` 只负责 HTTP 投影。未启用 `native-api` 时观测 hook 编译为零开销 inert 替身。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 与 `/logs` 续传均为 ready→replay。
+`native_api/server.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，30 秒读空闲期限仅在该连接没有进行中请求时生效（请求自 body 结束至响应完成视为进行中），停滞写入另有独立 30 秒期限，健康 SSE 与慢 handler 可持续超过 30 秒；accept 错误记录日志后重试，EMFILE/ENFILE/ENOBUFS/ENOMEM 退避 100 ms；连接任务失败只记录日志，不终止 server；HTTP 关闭共享五秒 grace，随后等待已准入的真实阻塞凭据任务结束。`crate::observe`（`observe.rs` 的 `Observation`、flows、rules、catalog 身份、`DnsRecorder`）拥有进程身份与引擎侧有界存储，独立于客户端；`native_api` 只负责 HTTP 投影。未启用 `native-api` 时观测 hook 编译为零开销 inert 替身。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 与 `/logs` 续传均为 ready → replay → live。
 
 `native_api/handlers.rs` 为每个资源只注册一份方法分派；共用安全边界仍先于方法和资源校验执行。`observe/flows/record.rs` 持有类型化摘要、输入及证据步骤，留存预算计入实际持有的堆容量、snapshot 与有界内核字典预留，JSON 只在 wire 边界投影。核心生命周期与模式命令返回类型化结果，而不是 HTTP 错误或 JSON。
 
@@ -256,6 +262,8 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 `observe/flows/dns.rs` 与 outbound flow observer 为 scoped/retained 工作绑定实际 lookup、attempt 与 generation 身份。会话 attachment、逻辑 open/readiness 重试与新物理连接、协议确认分开。可选异步 scope 借用调用方 pin 的操作，不复制大型 future 状态；pin 不越过操作的所有权/析构边界。内核证据使用不可变编译字典与报文绑定 witness；UDP receive priority 来自原生辅助元数据，或严格对应 syscall/batch 的 receiver-owned fallback。丢失只改变证据，不改变路由或报文交付。
 
+既有原生 sampler 通过 `DatapathFlagsHandle` 同步实际 flow 需求，保留模式/NFQUEUE 位，仅在后端写入成功后提交追踪准入。等待后端所有权后重新读取需求，sampler 停止并 join 后再同步一次；不新增 writer、timer 或路由重编译。内核对每次调用复用同一 flags 快照来控制可选 witness 生产，已保留的捕获与真实路由判定不受后续需求变化重解释。
+
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api)。
 
 出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
@@ -264,9 +272,9 @@ TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics�
 
 `native_api/config/http.rs` 持有源 HTTP adapter。数据库记录通过 awaited blocking promotion 由协调器持续持有，包括 HTTP 取消与关闭；待记录的新 accepted 源不会被错误标成旧的耐久 revision。
 
-Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，不改变 router→config→eBPF 的发布锁序或订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。
+Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，遵循上述包含 datapath flags publication 的锁序及订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。
 
-Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，不用 tracker 删除充数。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span、原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash/依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分；自动 override 仍关闭。
+Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，不用 tracker 删除充数；同一 owner 的重复 close 共用完成结果与失败，不存在或 replacement 才是 Gone。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span、原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash/依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分；自动策略的分网络 pin/clear 已开放，pin 只属于当前 GroupManager。
 
 主文件创建/删除复用相同协调器、parser span、revision fence 与 reload reply，但等真实激活后才返回 201/200。订阅 supervisor 持有绑定身份的初次拉取延迟，所有离线准入都携带这些排除项和有效运行时数据目录。Geodata 先暂存并验证所有资产，再经 FD 相对替换；临时不可变 `SourceUpdate.geo_sources` 同时进入 reload 的两条路径，发布后不再由 accepted 源元数据保留。Router/DnsRouter 保留实际加载字节的元数据，观测按 router-before-config 锁序且不重读磁盘；部分文件替换与提交后降级如实报告，不承诺回滚。
 
@@ -275,6 +283,8 @@ Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存�
 激活执行只产生一份类型化完成结果，分别投影到 operation、管理响应和 SIGHUP 日志。创建响应在协调器接受下一项修改前保留已提交的资源表示。源元数据在取得 config 写锁前准备，发布时复核捕获的 revision/generation。Rename 前的依赖复查将逻辑读取方绑定到规范化目标及字节：有序 hosts/ECH 引用、订阅声明位置与 geodata 类型。它重新发现 source/glob 和依赖选择，但不重复编译未变化的已准入候选；交换两个读取方的文件目标仍会冲突。
 
 Probe worker 拥有有界准备/排队/执行/清理，DNS 诊断使用真实 generation 与精确缓存 owner，provider refresh 由 SubscriptionSupervisor 拉取并等待 revision-fenced publication；GET 不伪造这些 producer。Routing trace 只模拟当前 compiled predicate，不 DNS/探测/选组；当前规则字典只在 parser 来源可用时提供脱敏 source location。Runtime settings 由一个 owner 先校验全量 merge 再发布，native+Clash mode 共用 `DatapathFlagsHandle`。Native 启用时模式不恢复/持久化；显式接受配置激活（含 no-op）重置 Rule 与 settings，provider/network refresh 不重置。
+
+自动诊断采集由 `native_api/settings.rs` 持有相互独立的需求：成功的 flow GET 或显式 flow-event kind/`flow_id` 开启 flows，logs stream 开启 logs，成功的 DNS-log GET 开启 DNS log。普通 events 只维持自己的 attachment，不开启这三个 recorder。准入失败及普通 API/validation 请求不增加诊断需求。每个 stream lease 只释放其实际取得的集合；每类 recorder 独立保有最后需求释放后的六十秒 grace，不由其他读取/stream 续期。配置许可与显式 runtime On/Off 仍有优先权；显式激活重置 override，provider/network refresh 保留。
 
 Probe 准备阶段将捕获的计划消费为具体地址的可执行尝试或明确的家族地址不可用结果。DNS-owned resolver 保留代次及 canonical accepted-positive 应答资格；即使另一家族有地址，终止性 packet refusal 也拒绝整个准备。健康 ticket 与探测配置在同一发布屏障内捕获。
 
@@ -290,13 +300,13 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 
 网络维护任务属于 `RuntimeEpoch`。延迟缓存 writer 属于进程，仅在终止关闭时 join。
 
-已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。每个关闭阶段受 10 秒 `STAGE_TIMEOUT` 约束：超时后记录日志并返回错误，abort 该阶段 join 的任务，teardown 继续。TCP 连接任务 panic 时记录日志并回收，不会停止引擎。终止关闭先关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间。
+已开始的 blocking 工作无法靠取消 async waiter 停止，持有它的 owner 必须等待实际 join。通用 cleanup/join 阶段使用十秒 `STAGE_TIMEOUT`，超时的已 join async task 会被 abort，teardown 报告失败。`control/cache.rs::StateTick` 是例外：十秒后告警并继续 join 真实维护任务及在途 blocking SQLite 写入，不 abort；取消这次等待时 handle 仍留在 owner，可再次等待；owner 被 Drop 时只发出停止信号，外层 task 继续持有 blocking 写入。因此总关闭时间没有严格十秒上限。TCP 连接任务 panic 时记录日志并回收，不停止引擎。正常退出保留既有 accepted-flow 五秒 drain grace，故障退出可跳过；原生 HTTP 另有五秒 graceful drain。
 
-健康检查 owner 的五秒 drain deadline 遵循同一规则：终止关闭等待 drain 完成，包括健康检查持有的阻塞解析任务，然后才返回 deadline 错误。若在超时后的清理中发现子任务失败，该失败优先于 deadline 错误返回。
+健康检查 owner 也会在五秒 drain deadline 后继续等待实际 drain（包括其阻塞解析任务），再返回 deadline 错误。若后续清理发现子任务失败，该失败优先于 deadline 错误。
 
 ## Clash API 与 cache DB
 
-可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当任一 API 成功绑定，或任一配置组使用 `interrupt_connections` 时启用连接元数据；真实 transport 关闭不等于移除记录。可选 SQLite `cachedb` 在数据路径准入前打开，持久化分网络 Selector 选择与可选 DNS 应答；Clash mode/GLOBAL 仅在 native 未启用时恢复与保存。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和原始配置目录中的已有数据库；缺失数据库在 `global.data_dir` 下创建。配置和持久化语义见 [Experimental 参考](../reference/experimental.md)。
+可选 Clash-compatible axum server 是共享引擎 handle 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。任一 API 成功绑定，或任一配置组使用 `interrupt_connections` 时启用连接元数据；真实 transport 关闭不等于移除记录。Selector 写入与 accepted-manager 替换串行化，Clash 写 both、读 TCP。运行时缓存表位于固定状态数据库 `<data_dir>/state/honk.db`；旧 `cache_file.path` 与 `cache_id` 仅用于一次导入旧 `cache.db`，不决定活动数据库位置。升级后不设 `cache_file.enabled` 即默认保存 Selector 选择与延迟样本；`true` 额外启用 mode/GLOBAL 以及配合 `store_dns` 的 DNS 应答，`false` 禁用这类缓存持久化。Mode 仅在 native 未启用时持久化。目录锁覆盖全部已持有 SQLite connection 的存活期，包括 cache writer connection 到线程退出。见 [Experimental 参考](../reference/experimental.md)。
 
 ## 相关文档
 

@@ -26,12 +26,14 @@ Requires the opt-in `native-api` Cargo feature (build with `--features native-ap
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
 | `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` with the default-off `native-ui` feature. No startup download, extraction or frontend build. |
-| `record_flows` | `true` | Permit bounded userspace flow recording under the API client-attachment rule or an explicit runtime pin. `false` prohibits recording, including runtime pins; configuration changes require restart. |
+| `record_flows` | `true` | Permit bounded userspace flow recording under flow diagnostic demand or an explicit runtime pin. `false` prohibits recording, including runtime pins; configuration changes require restart. |
 | `record_traffic` | `true` | Keep up to 600 traffic samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current counters remain available. |
 | `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
-| `record_logs` | `true` | Permit up to 512 structured logs for 60 seconds under the API client-attachment rule or an explicit runtime pin. `false` prohibits capture; configuration changes require restart. Console/Clash logging remains independent. |
-| `record_dns_log` | `true` | Permit completed client DNS history under the API client-attachment rule or an explicit runtime pin, bounded to 512 records and 8 MiB. `false` prohibits history; configuration changes require restart. |
+| `record_logs` | `true` | Permit up to 512 structured logs for 60 seconds under an admitted `/logs` SSE demand or an explicit runtime pin. `false` prohibits capture; configuration changes require restart. Console/Clash logging remains independent. |
+| `record_dns_log` | `true` | Permit completed client DNS history under successful `/dns/log` GET demand or an explicit runtime pin, bounded to 512 records and 8 MiB. `false` prohibits history; configuration changes require restart. |
 | `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, and creation of new include-loaded `.dae` files, excluding listener-credential-bearing sources. Requires a nonempty `secret` or `password_auth`. |
+
+Auto flow, log and DNS-log demand each have an independent 60-second grace. Ordinary events attach only for event capture; successful flow reads or explicit flow-event filters demand flows, `/logs` SSE demands logs, and successful `/dns/log` GET demands DNS logs. Other API requests, validation, failed GETs and HEAD do not request diagnostic capture. Runtime On/Off, configuration prohibitions and activation reset behavior remain as described in the [API reference](./api.md#recorded-userspace-flows).
 
 Geodata download URLs and routes now belong to [`assets.geodata`](./assets.md). Their former `native_api` keys remain accepted with warnings; see the replacement table in the assets reference.
 
@@ -67,7 +69,7 @@ Traffic and memory histories share the existing one-second sampler; missing samp
 
 Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup; programmatic configs and compatibility serde loaders do not supply one. Configuration reads expose accepted content, masking only declared listener-secret values, including duplicate/overridden values and their other occurrences. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. Credential-bearing sources stay read-only and retain original-byte hashes. Source `path` stays entry-directory-relative; `absolute_path` exposes the canonical absolute path. Move credentials to a dedicated read-only include locally if the main source must be editable. The API cannot change/move API credentials or alter native settings; those require a local edit and restart.
 
-With `config_write: true`, all accepted noncredential includes are writable; ordinary `include` glob and no-match semantics remain unchanged. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations).
+With `config_write: true`, all accepted noncredential includes are writable; ordinary `include` glob and no-match semantics remain unchanged. Save by opaque source ID with RFC 9110 `If-Match` over disk-content SHA-256 (strong tags, lists/multiple field lines or `*`; weak tags never match), then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations).
 
 Probe targets come only from accepted configuration. Resolution, IPv4-mapped IPv6 normalization and selected-IP pinning still apply; callers cannot supply URLs and probes do not follow redirects. Probes, geodata and shared downloads use configured targets without an address or port allowlist. Whoever can write the configuration or control subscription content decides those targets; provider content is trusted configuration.
 
@@ -112,6 +114,8 @@ With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; wit
 | `store_dns` | `false` | With `enabled: true`, also persist and restore DNS cache answers. |
 
 Both fields are startup-owned; SIGHUP rejects a candidate configuration that changes either.
+
+Upgrade note: omitting `cache_file.enabled` now keeps Selector choices and delay samples by default; opt in with `true` for mode/GLOBAL and, separately, `store_dns: true` for DNS answers. Explicit `false` disables these runtime-cache stores, not unrelated configuration, credential or subscription storage.
 
 `path`, `cache_id` and `store_fakeip` are no longer settings. They still parse, emit a `legacy-cache-file` warning and have no effect, and SIGHUP accepts edits to them. `path` and `cache_id` are read once, to import a legacy `cache.db` (below).
 
