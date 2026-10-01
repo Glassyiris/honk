@@ -109,6 +109,16 @@ pub(super) fn invalid() -> ApiError {
     )
 }
 
+fn invalid_value(message: &'static str, details: serde_json::Value) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidRequest,
+        message,
+        None,
+    )
+    .with_details(details)
+}
+
 /// Details name the resource path and the rejected fields; submitted names,
 /// links and URLs can hold secrets and are never echoed.
 pub(super) fn unsupported_value(message: &'static str, details: serde_json::Value) -> ApiError {
@@ -226,13 +236,13 @@ pub(super) async fn mutate(
             Action::CreateNode => {
                 let input: NodeCreate = super::body::decode(&body, invalid)?;
                 if !(1..=64).contains(&input.name.chars().count()) {
-                    return Err(unsupported_value(
+                    return Err(invalid_value(
                         "Node name must be 1 to 64 characters",
                         json!({"resource":"/nodes","field":"name"}),
                     ));
                 }
                 if !(1..=8192).contains(&input.link.chars().count()) {
-                    return Err(unsupported_value(
+                    return Err(invalid_value(
                         "Node share link must be 1 to 8192 characters",
                         json!({"resource":"/nodes","field":"link"}),
                     ));
@@ -242,13 +252,13 @@ pub(super) async fn mutate(
             Action::CreateProvider => {
                 let input: ProviderCreate = super::body::decode(&body, invalid)?;
                 let rejected = |message, field: &str| {
-                    Err(unsupported_value(
+                    Err(invalid_value(
                         message,
                         json!({"resource":"/providers","field":field}),
                     ))
                 };
                 if input.kind != "subscription" {
-                    return Err(unsupported_value(
+                    return Err(invalid_value(
                         "Provider kind must be subscription",
                         json!({"resource":"/providers","field":"kind","allowed":["subscription"]}),
                     ));
@@ -264,16 +274,18 @@ pub(super) async fn mutate(
                         "name",
                     );
                 }
-                if !(1..=4096).contains(&input.url.chars().count())
-                    || !(input.url.starts_with("http://") || input.url.starts_with("https://"))
+                if !(1..=4096).contains(&input.url.chars().count()) {
+                    return rejected("Provider URL must be 1 to 4096 characters", "url");
+                }
+                if !(input.url.starts_with("http://") || input.url.starts_with("https://"))
                     || reqwest::Url::parse(&input.url)
                         .ok()
                         .is_none_or(|url| url.host_str().is_none())
                 {
-                    return rejected(
-                        "Provider URL must be an HTTP(S) URL with a host, at most 4096 characters",
-                        "url",
-                    );
+                    return Err(unsupported_value(
+                        "Provider URL must be an HTTP(S) URL with a host",
+                        json!({"resource":"/providers","field":"url"}),
+                    ));
                 }
                 if input
                     .update_interval
@@ -294,7 +306,10 @@ pub(super) async fn mutate(
                     );
                 }
                 if input.cache.is_some() && !state.observation.providers.caches() {
-                    return rejected("Provider cache requires global.store_subscribe", "cache");
+                    return Err(unsupported_value(
+                        "Provider cache requires global.store_subscribe",
+                        json!({"resource":"/providers","field":"cache"}),
+                    ));
                 }
                 Mutation::CreateProvider(input)
             }

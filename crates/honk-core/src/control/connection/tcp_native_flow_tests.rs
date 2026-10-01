@@ -719,7 +719,7 @@ async fn native_tcp_delete_closes_both_peers_without_recording() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn tcp_close_claim_waits_for_guard_and_duplicate_claim_is_gone() -> anyhow::Result<()> {
+async fn tcp_close_claims_share_guard_retirement() -> anyhow::Result<()> {
     use crate::connection_tracker::CloseOutcome;
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut fixture = Fixture::with_recording("direct", "ip", false).await?;
@@ -741,13 +741,15 @@ async fn tcp_close_claim_waits_for_guard_and_duplicate_claim_is_gone() -> anyhow
             .pop()
             .unwrap();
         let completion = tracker.start_close(selected);
-        assert_eq!(tracker.close_id(&connection.id).await, CloseOutcome::Gone);
+        let mut duplicate = Box::pin(tracker.close_id(&connection.id));
+        assert!(futures::poll!(&mut duplicate).is_pending());
         assert_eq!(upstream.read(&mut byte).await?, 0);
         let mut completion = Box::pin(completion.wait());
         assert!(futures::poll!(&mut completion).is_pending());
         assert_eq!(tracker.snapshot().len(), 1);
         drop(backend);
         assert_eq!(completion.await, CloseOutcome::Closed);
+        assert_eq!(duplicate.await, CloseOutcome::Closed);
         assert_eq!(fixture.client.read(&mut byte).await?, 0);
         (&mut fixture.task).await??;
         assert_eq!(
@@ -850,6 +852,16 @@ async fn aborted_tcp_close_does_not_acknowledge_guard_retirement() -> anyhow::Re
             .pop()
             .unwrap();
         let completion = tracker.start_close(selected);
+        let mut duplicate = Box::pin(
+            tracker.close_selected(
+                tracker
+                    .snapshot_close(Some("tcp"), None, 1000)
+                    .unwrap()
+                    .pop()
+                    .unwrap(),
+            ),
+        );
+        assert!(futures::poll!(&mut duplicate).is_pending());
         assert_eq!(upstream.read(&mut byte).await?, 0);
         let retiring = fixture.flow("active").await?;
         assert!(retiring["ended_at"].is_null());
@@ -861,6 +873,7 @@ async fn aborted_tcp_close_does_not_acknowledge_guard_retirement() -> anyhow::Re
         fixture.task.abort();
         assert!((&mut fixture.task).await.unwrap_err().is_cancelled());
         assert_eq!(completion.wait().await, CloseOutcome::Failed);
+        assert_eq!(duplicate.await, CloseOutcome::Failed);
         assert_eq!(fixture.client.read(&mut byte).await?, 0);
         drop(backend);
         let cancelled = fixture.flow("failed").await?;

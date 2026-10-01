@@ -468,14 +468,7 @@ pub(super) fn version() -> Value {
 pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let config = &state.observation.configuration;
     let telemetry = &state.observation.telemetry;
-    let kinds = vec![
-        "stream.ready",
-        "runtime.updated",
-        "flow.updated",
-        "flow.gap",
-        "generation.changed",
-        "operation.updated",
-    ];
+    let kinds = super::events::kind_names();
     let mut providers = state
         .observation
         .providers
@@ -506,20 +499,20 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "runtime": {"available": true},
             "runtime_memory": {"available":true,"metrics":telemetry.metrics()},
             "runtime_outbounds": {"available":true},
-            "traffic_history": {"available":telemetry.record_traffic(),"max_window_seconds":600,"max_points":600},
-            "memory_history": {"available":telemetry.record_memory(),"max_window_seconds":600,"max_points":600},
+            "traffic_history": {"available":telemetry.record_traffic(),"max_window_seconds":super::telemetry::RETENTION.as_secs(),"max_points":super::telemetry::MAX_POINTS},
+            "memory_history": {"available":telemetry.record_memory(),"max_window_seconds":super::telemetry::RETENTION.as_secs(),"max_points":super::telemetry::MAX_POINTS},
             "datapath": super::datapath::capability(),
             "nodes": {"available": true, "can_manage":config.can_manage()},
             "providers": providers,
             "geodata": geodata,
-            "groups": {"available": true, "config_patch":config.editable(), "selection": true, "max_patch_operations":32},
+            "groups": {"available": true, "config_patch":config.editable(), "selection": true, "max_patch_operations":super::groups::MAX_PATCH_OPERATIONS},
             "probes": state.observation.probes.capability(),
             "connections": {
                 "available": true,
                 "can_close": true,
                 "max_bulk_close": super::connections::MAX_BULK_CLOSE,
             },
-            "flows": {"available": true, "recording": state.observation.settings.flow_recording_policy(), "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":crate::observe::flows::MAX_RECORDS, "max_steps_per_flow":64, "retention_seconds":crate::observe::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": state.observation.settings.flow_recording_policy(), "scopes":["userspace_tcp","userspace_udp","dns_intercept"], "min_flows":super::settings::MIN_RECORDS, "max_flows":crate::observe::flows::MAX_RECORDS, "max_steps_per_flow":crate::observe::flows::MAX_STEPS, "retention_seconds":crate::observe::flows::TERMINAL_TTL.as_secs(), "snapshot_ttl_seconds":crate::observe::flows::SNAPSHOT_TTL.as_secs(), "max_page_size":super::pages::MAX_PAGE_SIZE},
             "routing_trace": routing_trace,
             "rules": rules,
             "events": {"available":true,"kinds":kinds,"retention_seconds":super::events::RETENTION.as_secs(),"max_buffered_events":super::events::MAX_EVENTS,"max_clients":super::events::MAX_CLIENTS,"heartbeat_seconds":super::events::HEARTBEAT.as_secs()},

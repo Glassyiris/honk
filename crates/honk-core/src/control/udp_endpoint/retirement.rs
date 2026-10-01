@@ -143,7 +143,12 @@ impl UdpEndpointPool {
         token: u32,
         generation: u64,
     ) -> bool {
-        self.retire_if_same(EndpointKey::new(client, dst), token, generation)
+        let key = EndpointKey::new(client, dst);
+        self.retire_if_same(key, token, generation)
+            || self.endpoints.get(&key).is_some_and(|entry| {
+                matches!(entry.value(), EndpointEntry::Retiring { generation: found, token: observed, .. }
+                    if *found == generation && *observed == token)
+            })
     }
 
     pub(in crate::control) async fn wait_removal_io(&self, removal: &EndpointRemoval) -> bool {
@@ -366,6 +371,10 @@ impl UdpEndpointPool {
                 } = occupied.get()
                 {
                     terminal.cleaned(true);
+                }
+                // A late close must observe completion before the tombstone disappears.
+                if let EndpointEntry::Retiring { io: Some(io), .. } = occupied.get() {
+                    io.close.finish(true);
                 }
                 occupied.remove();
                 true

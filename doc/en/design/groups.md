@@ -14,6 +14,8 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager.
 
+The shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` by the same name, independent of insertion, deletion or reordering. A rename is a new group, not a transfer of the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
+
 The `src/group/` facade and its internals are split by responsibility:
 
 | Module | Responsibility |
@@ -43,6 +45,8 @@ UDP selection first excludes forwarding leaves whose canonical protocol/configur
 | Score | With `policy: score`, chooses one health-eligible leaf using observed reliability, fresh target-aware quality and bounded validation. Historical sample volume is not a performance bonus. Selector remains the default. |
 
 Selector validation/publication is one shared transition; callbacks run after synchronous guards are released. `interrupt_connections` captures the pre-transition transport owners by their actual selected group path and network, then closes them outside manager/entry locks. The response reports interruption only after confirmed completion. TCP closes its exact UUID owner; UDP retires its token/generation-bound view and waits for backend/driver/reply fences. Shared XUDP siblings and the carrier remain alive. This path is independent of optional native flow recording, not a deletion of tracking metadata.
+
+Concurrent closes of the same captured owner share its real completion and inherit a failed retirement; they do not report `Gone` merely because it is already Closing or Failed. A missing or replaced owner remains `Gone`. Automatic interrupt callbacks only start retirement; callers that require confirmation wait on that owner's completion.
 
 Native group observations are non-mutating, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload—not a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. An automatic-policy pin lives only in the running GroupManager, so an activation drops it; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups).
 

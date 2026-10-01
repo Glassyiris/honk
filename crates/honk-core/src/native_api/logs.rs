@@ -32,7 +32,7 @@ use super::{
     types::{RequestId, WriteRefusal},
 };
 
-const MAX_RECORDS: usize = 512;
+pub(super) const MAX_RECORDS: usize = 512;
 const WITHHELD: &str = "[message withheld: not audited for native disclosure]";
 const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 
@@ -503,13 +503,11 @@ pub(super) async fn serve(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     if request.method() == axum::http::Method::GET {
-        let subscription =
-            state
-                .observation
-                .settings
-                .subscribe(&state.observation, false, || {
-                    state.observation.logs.subscribe(&request, id)
-                })?;
+        let subscription = state.observation.settings.subscribe(
+            &state.observation,
+            super::settings::Demand::LOGS,
+            || state.observation.logs.subscribe(&request, id),
+        )?;
         Ok(events::stream_response(subscription))
     } else {
         state.observation.logs.response(&request, id)

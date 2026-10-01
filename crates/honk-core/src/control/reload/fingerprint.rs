@@ -5,7 +5,25 @@ fn normalize_reload_metadata(current: &Config, candidate: &mut Config) {
         node.created_at = current.created_at;
         node.updated_at = current.updated_at;
     }
-    for (group, current) in candidate.groups.iter_mut().zip(&current.groups) {
+    // ponytail: quadratic matching is bounded by MAX_USER_GROUPS; index only if reload profiles justify it.
+    for index in (0..candidate.groups.len()).rev() {
+        let occurrence = candidate.groups[index + 1..]
+            .iter()
+            .filter(|later| later.name == candidate.groups[index].name)
+            .count();
+        let group = &mut candidate.groups[index];
+        let Some(current) = current
+            .groups
+            .iter()
+            .rev()
+            .filter(|current| current.name == group.name)
+            .nth(occurrence)
+        else {
+            if current.groups.iter().any(|current| current.id == group.id) {
+                group.id = uuid::Uuid::new_v4();
+            }
+            continue;
+        };
         group.id = current.id;
         group.created_at = current.created_at;
     }
@@ -140,6 +158,11 @@ mod tests {
         let mut current = Config::default();
         current.nodes.push(honk_config::node::Node::default());
         current.groups.push(honk_config::node::Group::default());
+        current.groups[0].name = "repeated".into();
+        let mut effective = current.groups[0].clone();
+        effective.id = uuid::Uuid::new_v4();
+        effective.created_at += chrono::Duration::seconds(2);
+        current.groups.push(effective);
         current
             .subscriptions
             .push(honk_config::subscription::Subscription::default());

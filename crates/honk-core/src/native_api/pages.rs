@@ -80,8 +80,8 @@ impl<T: Snapshot> Pages<T> {
         Ok(response)
     }
 
-    /// An unknown, expired or exhausted cursor is `410 snapshot_expired`; one
-    /// resumed with another `limit`, or refused by `accept` as taken under
+    /// An unknown, expired, exhausted or noncanonical cursor is `410 snapshot_expired`;
+    /// one resumed with another `limit`, or refused by `accept` as taken under
     /// other request parameters, is `400 invalid_request`.
     pub(super) fn resume(
         &self,
@@ -91,9 +91,9 @@ impl<T: Snapshot> Pages<T> {
         id: &RequestId,
     ) -> Result<Response, ApiError> {
         let expired = || snapshot_expired(id);
-        let (key, offset) = cursor.split_once(':').ok_or_else(expired)?;
-        let key = Uuid::parse_str(key).map_err(|_| expired())?;
-        let offset: usize = offset.parse().map_err(|_| expired())?;
+        let (raw_key, raw_offset) = cursor.split_once(':').ok_or_else(expired)?;
+        let key = Uuid::parse_str(raw_key).map_err(|_| expired())?;
+        let offset: usize = raw_offset.parse().map_err(|_| expired())?;
         let mut held = self.0.lock();
         held.retain(|held| held.created.elapsed() < SNAPSHOT_TTL);
         let held = held
@@ -105,6 +105,12 @@ impl<T: Snapshot> Pages<T> {
         }
         if held.limit != limit || !accept(&held.snapshot) {
             return Err(invalid_query(id));
+        }
+        if !offset.is_multiple_of(held.limit)
+            || raw_key != &*key.hyphenated().encode_lower(&mut [0; 36])
+            || raw_offset.starts_with(['0', '+'])
+        {
+            return Err(expired());
         }
         Ok(page(&held.snapshot, key, offset, limit))
     }

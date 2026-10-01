@@ -373,8 +373,28 @@ pub(super) async fn refresh(
         .map_err(|_| invalid_query(id))?
         .map(str::to_owned);
     let body = super::body::buffered(request.into_body()).await;
+    if !body.is_empty() || key.as_deref() == Some("") {
+        return Err(invalid_query(id));
+    }
+    let uuid = Uuid::parse_str(provider_id).map_err(|_| not_found())?;
+    let subscription = state
+        .config
+        .read()
+        .await
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.id == uuid)
+        .cloned();
     let operations = &state.observation.operations;
     let path = format!("/api/v1/providers/{provider_id}/refresh");
+    let Some(subscription) = subscription else {
+        if let Some(replay) =
+            operations.replay(state.principal(), "POST", &path, key.as_deref(), &body)?
+        {
+            return Ok(replay.admission().await?.into_response());
+        }
+        return Err(not_found());
+    };
     let reservation = operations.reserve(
         state.principal(),
         "POST",
@@ -386,19 +406,9 @@ pub(super) async fn refresh(
     let admission = reservation.admission();
     if reservation.fresh {
         let prepared = async {
-            if !body.is_empty() {
-                return Err(invalid_query(id));
-            }
             state.require_running()?;
-            let provider_id = Uuid::parse_str(provider_id).map_err(|_| not_found())?;
             let config = state.config.read().await;
             state.require_running()?;
-            let subscription = config
-                .subscriptions
-                .iter()
-                .find(|s| s.id == provider_id)
-                .ok_or_else(not_found)?
-                .clone();
             if !subscription.enabled {
                 return Err(not_refreshable());
             }
@@ -477,7 +487,7 @@ impl RefreshReport for RefreshOperation {
                             .succeed(id, OperationResult::ProviderRefresh(provider));
                     }
                     ReloadOutcome::CommittedDegraded { generation } => {
-                        self.operations.fail(id, "publication_degraded", "Provider nodes were committed but the runtime is degraded.", Some(json!({"committed": true, "active_generation_id": format!("{}:{generation}", self.instance), "datapath_generation_id": generation.to_string()})));
+                        self.operations.fail(id, "publication_degraded", "Provider nodes were committed but the runtime is degraded.", Some(json!({"committed": true, "active_generation_id": format!("{}:{generation}", self.instance), "datapath_generation_id": null})));
                     }
                     ReloadOutcome::Rejected => {
                         self.operations.fail(id, "publication_rejected", "Provider runtime publication was rejected; active nodes were retained.", rejection_details(reply.rejection));

@@ -257,6 +257,9 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
 #[tokio::test]
 #[ignore = "requires root; run via just test-netns"]
 async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
+    use std::os::fd::AsRawFd;
+
+    let links_before = held_bpf_link_count();
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-pin-ownership-test-{}", std::process::id()));
     std::fs::create_dir_all(&pin_root).expect("pin root");
@@ -280,7 +283,40 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
     .await
     .expect("backend load");
     backend.detach_hooks().expect("detach hooks");
+    let trace = backend
+        .receive_trace()
+        .expect("attach real receive fallback");
+    let trace_owner = std::sync::Arc::downgrade(&trace);
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut registration = trace.register(receiver.as_raw_fd()).unwrap();
+    assert!(registration.begin(receiver.as_raw_fd()));
+    sender
+        .send_to(b"trace", receiver.local_addr().unwrap())
+        .unwrap();
+    let mut bytes = [0u8; 8];
+    assert_eq!(receiver.recv(&mut bytes).unwrap(), 5);
+    let packets = registration.finish(1).expect("fallback receive evidence");
+    assert_eq!(
+        packets[0].valid,
+        honk_ebpf_common::receive_trace::RECEIVE_TRACE_VALID
+    );
+    assert_eq!(packets[0].length, 5);
+    drop(registration);
+    drop(trace);
     backend.cleanup().await.expect("cleanup");
+    assert!(
+        trace_owner.upgrade().is_none(),
+        "cleanup retained receive trace while backend lives"
+    );
+    assert_eq!(
+        held_bpf_link_count(),
+        links_before,
+        "cleanup retained BPF links"
+    );
 
     assert_eq!(
         aya::maps::MapInfo::from_pin(&foreign)
