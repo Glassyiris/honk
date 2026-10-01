@@ -65,6 +65,7 @@ async fn private_child_panic_fails_operation_and_pause_without_negating_measurem
         });
         let mut config = Config::default();
         config.global.tcp_check_url = vec![format!("http://{address}/check")];
+
         let mut state = state(config).await;
         let mut registry = honk_outbound::proxy::ProxyRegistry::new();
         registry.register(honk_outbound::proxy::ProtocolEntry::new(
@@ -136,6 +137,7 @@ async fn pause_drains_started_and_disconnected_queued_jobs() {
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
+
     for index in 0..=MAX_ACTIVE {
         config.groups.push(serde_json::from_value(json!({"name":format!("pause-{index}"),"nodes":[honk_config::config::DIRECT_NODE_ID]})).unwrap());
     }

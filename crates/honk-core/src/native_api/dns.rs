@@ -30,7 +30,7 @@ use crate::dns::{
 use crate::observe::{DnsRecorder, flows::FlowStore};
 
 mod cache;
-mod log;
+pub(super) mod log;
 mod records;
 pub(super) mod rules;
 #[cfg(test)]
@@ -39,6 +39,8 @@ mod tests;
 pub(crate) use rules::capability as rules_capability;
 
 pub(super) const MAX_RESPONSE_BYTES: usize = 262_144;
+const MAX_QUERY_TYPES: usize = 8;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 
 pub(crate) struct DnsApi {
@@ -67,7 +69,7 @@ impl DnsApi {
     }
     pub(crate) fn query_capability(&self) -> Value {
         json!({"available":true,"record_types":TYPES.iter().map(|&value| records::record_type(value)).collect::<Vec<_>>(),
-            "limits":{"max_types_per_request":8,"query_timeout_ms":10000,"max_response_bytes":MAX_RESPONSE_BYTES,
+            "limits":{"max_types_per_request":MAX_QUERY_TYPES,"query_timeout_ms":QUERY_TIMEOUT.as_millis(),"max_response_bytes":MAX_RESPONSE_BYTES,
             "per_principal_requests_per_minute":super::security::REQUESTS_PER_MINUTE,"global_requests_per_minute":super::security::REQUESTS_PER_MINUTE}})
     }
     pub(crate) fn cache_capability(&self) -> Value {
@@ -186,7 +188,7 @@ pub(super) async fn query(
     if types.is_empty() {
         return Err(invalid());
     }
-    if types.len() > 8 {
+    if types.len() > MAX_QUERY_TYPES {
         return Err(error(
             StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::RequestTooLarge,
@@ -225,7 +227,7 @@ pub(super) async fn query(
             &domain,
             &types,
             &options,
-            tokio::time::Instant::now() + Duration::from_secs(10),
+            tokio::time::Instant::now() + QUERY_TIMEOUT,
         )
         .await
         .map_err(|error| match error {

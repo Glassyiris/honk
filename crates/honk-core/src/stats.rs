@@ -600,19 +600,6 @@ impl StatsManager {
         snap
     }
 
-    /// Record a new connection on an outbound.
-    pub fn record_connection(&self, outbound: &str, kind: OutboundKind) {
-        let trackers = &self.trackers[kind as usize];
-        if let Some(tracker) = trackers.get(outbound) {
-            tracker.increment_connections();
-            return;
-        }
-        trackers
-            .entry(outbound.to_owned())
-            .or_default()
-            .increment_connections();
-    }
-
     /// Track one connection with an exactly-once active counter balance.
     pub fn track_connection(
         self: &Arc<Self>,
@@ -945,13 +932,6 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a closed connection on an outbound.
-    pub fn record_close(&self, outbound: &str, kind: OutboundKind) {
-        if let Some(tracker) = self.trackers[kind as usize].get(outbound) {
-            tracker.decrement_connections();
-        }
-    }
-
     /// Record bytes transferred through an outbound.
     pub fn record_bytes(&self, outbound: &str, kind: OutboundKind, tx: u64, rx: u64) {
         let trackers = &self.trackers[kind as usize];
@@ -1103,11 +1083,11 @@ mod tests {
 
     #[test]
     fn test_stats_manager() {
-        let mgr = StatsManager::new();
+        let mgr = Arc::new(StatsManager::new());
 
-        mgr.record_connection("proxy1", crate::stats::OutboundKind::Node);
-        mgr.record_connection("proxy1", crate::stats::OutboundKind::Node);
-        mgr.record_connection("proxy2", crate::stats::OutboundKind::Node);
+        let _first = mgr.track_connection("proxy1", crate::stats::OutboundKind::Node);
+        let _second = mgr.track_connection("proxy1", crate::stats::OutboundKind::Node);
+        let _third = mgr.track_connection("proxy2", crate::stats::OutboundKind::Node);
         mgr.record_bytes("proxy1", crate::stats::OutboundKind::Node, 1000, 2000);
         mgr.record_error("proxy2", crate::stats::OutboundKind::Node);
 
@@ -1121,7 +1101,7 @@ mod tests {
     #[test]
     fn warmed_stats_methods_reuse_one_tracker() {
         let manager = Arc::new(StatsManager::new());
-        manager.record_connection("proxy", crate::stats::OutboundKind::Node);
+        let first = manager.track_connection("proxy", crate::stats::OutboundKind::Node);
         let guard = manager.track_connection("proxy", crate::stats::OutboundKind::Node);
         manager.record_bytes("proxy", crate::stats::OutboundKind::Node, 100, 200);
         manager.record_error("proxy", crate::stats::OutboundKind::Node);
@@ -1135,7 +1115,7 @@ mod tests {
         assert_eq!(tracker.errors, 1);
 
         drop(guard);
-        manager.record_close("proxy", crate::stats::OutboundKind::Node);
+        drop(first);
         assert_eq!(manager.snapshot()["proxy"].active_conns, 0);
     }
 

@@ -27,7 +27,7 @@ use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
 use super::vocab::{ConnectionState, DomainSource, Network, Plane, RuleSource};
 
 pub(crate) const MAX_RECORDS: usize = 1024;
-const MAX_STEPS: usize = 64;
+pub(crate) const MAX_STEPS: usize = 64;
 pub(crate) const MAX_RULE_VALUES: usize = 256;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Listings keep this much of the budget for their snapshots, so a ring that
@@ -35,7 +35,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 pub(crate) const TERMINAL_TTL: Duration = Duration::from_secs(300);
-const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+pub(crate) const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 /// Records leave the ring one at a time as flows end, newer ones need the room
 /// or a revision runs out, so a `flow.gap` per departure would shadow every
 /// flow under load. Departures are reported at most once per interval, with

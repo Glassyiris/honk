@@ -297,7 +297,7 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程等待后台工作任务结束并关闭 DNS transport；只有这些 transport 排空后，才关闭它们的私有 outbound runtime fork，再退役捕获的普通流量 registry 中未转移的可复用状态。
 
-30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全兜底，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。Forwarding 返回后的 bootstrap fallback 不在该取消范围内。最多保留四个已退役代；超过上限与 provider 关闭会触发相同的强制取消。某代完成退役且 lease 排空后即释放其 runtime，只保留 outbound registry 供上述强制关闭使用。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。
+30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全兜底，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。应用解析的 bootstrap fallback 仍在原查询 lease 内执行，drain 会等待它，强制 shutdown 也会取消它。最多保留四个已退役代；超过上限与 provider 关闭会触发相同的强制取消。某代完成退役且 lease 排空后即释放其 runtime，只保留 outbound registry 供上述强制关闭使用。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。
 
 `DnsServiceProvider` 持有、回收全部退役与强制关闭 supervisor，并在关闭时等待它们结束。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 

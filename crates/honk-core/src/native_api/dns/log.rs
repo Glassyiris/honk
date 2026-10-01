@@ -560,7 +560,21 @@ mod tests {
             crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
         let store = owner.dns.log_for_test();
         capture(store, "disabled.example", None);
-        owner.settings.renew(&owner, false);
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::NONE);
+        capture(store, "ordinary-events.example", None);
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::FLOWS);
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::LOGS);
+        capture(store, "other-diagnostics.example", None);
+        assert_eq!(value(store.page_for_test()).await["total"], 0);
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::DNS_LOG);
         let query = crate::dns::forwarder::build_dns_query("diagnostic.example", 1);
         let response = crate::dns::response::build_dns_refused(&query);
         let mapped: SocketAddr = "[::ffff:192.0.2.1]:53000".parse().unwrap();
@@ -602,12 +616,30 @@ mod tests {
         assert_eq!(page["total"], 1);
         assert_eq!(page["records"][0]["src"], mapped.to_string());
         assert_eq!(page["records"][0]["status"], "REFUSED");
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_secs(59)).await;
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::FLOWS);
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::LOGS);
+        tokio::time::advance(Duration::from_secs(1)).await;
         owner.settings.maintain(&owner);
         assert!(!store.recording());
-        owner.settings.renew(&owner, false);
+        capture(store, "expired.example", None);
+        assert_eq!(value(store.page_for_test()).await["total"], 0);
+        owner
+            .settings
+            .renew(&owner, crate::native_api::settings::Demand::DNS_LOG);
         assert!(store.recording());
         assert_eq!(value(store.page_for_test()).await["total"], 0);
+        capture(store, "renewed.example", None);
+        let renewed = value(store.page_for_test()).await;
+        assert_eq!(
+            renewed["records"][0]["question"]["name"],
+            "renewed.example."
+        );
+        assert_eq!(renewed["records"][0]["status"], "REFUSED");
     }
 
     #[tokio::test]

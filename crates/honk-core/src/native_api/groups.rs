@@ -14,6 +14,8 @@ use super::{
     types::RequestId,
 };
 
+pub(super) const MAX_PATCH_OPERATIONS: usize = 32;
+
 /// Patchable settings: wire field name, JSON pointer and source edit, indexed by the constants below.
 pub(super) const FIELDS: [(&str, &str, GroupField); 7] = [
     ("policy", "/policy", GroupField::Policy),
@@ -195,7 +197,7 @@ fn operation_list(value: &Value) -> Result<&Vec<Value>, ApiError> {
         .as_array()
         .filter(|operations| !operations.is_empty())
         .ok_or_else(invalid)?;
-    if operations.len() > 32 {
+    if operations.len() > MAX_PATCH_OPERATIONS {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::RequestTooLarge,
