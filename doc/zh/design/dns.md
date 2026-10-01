@@ -279,7 +279,7 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、routing/group snapshot、transport manager、路由投影、捕获的 bootstrap resolver 及代内 query/UDP admission。每个新 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于该代。每个 DNS pool 持有新的 outbound runtime fork，不复用 traffic session 或旧 DNS 代 session。fork 与来源配置代共享 dial semaphore、进程 physical-dial ceiling 和进程 VLESS-carrier gate，但不共享 retirement state 或 protocol pool。
 
-现有 TLS 维护任务也会回收当前 DNS registry 的空闲 connector。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
+现有维护任务也会回收当前 DNS registry 已结束的任务与空闲 VLESS carrier。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
 
 发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程 join 后台 worker、关闭 DNS transport 及其私有代理 session，再退役捕获的普通流量 registry 中未转移的可复用状态。
 

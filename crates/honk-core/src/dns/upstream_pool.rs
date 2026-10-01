@@ -363,10 +363,10 @@ impl UpstreamPool {
             .map_err(|_| anyhow::anyhow!("DNS upstream runtime generation is already set"))
     }
 
-    pub(crate) fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
+    pub(crate) fn reap_idle_resources(&self) -> usize {
         self.runtime_generation
             .get()
-            .map_or(0, |generation| generation.reap_idle_resources(now))
+            .map_or(0, |generation| generation.reap_idle_resources())
     }
 
     pub(crate) fn tasks_failed(&self) -> bool {
