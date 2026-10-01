@@ -29,15 +29,23 @@ build-core-ebpf:
 # triple spelling, so the wrappers strip them and re-anchor on the zig triple.
 # link-self-contained=no lets zig supply the CRT (Rust's self-contained
 # rcrt1.o + zig's crt1.o both define _start). Requires zig (0.14+) in PATH.
-build-musl:
+build-musl features="ebpf,native-api":
     ZIGCC_TARGET=x86_64-linux-musl \
     CC_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcc \
     CXX_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcxx \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER={{justfile_directory()}}/ci/zigcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
     BINDGEN_EXTRA_CLANG_ARGS="$({{justfile_directory()}}/ci/zig-bindgen-env x86_64-linux-musl)" \
-    cargo build --release -p honk-core --features "ebpf" --target x86_64-unknown-linux-musl
+    cargo build --release -p honk-core --features "{{features}}" --target x86_64-unknown-linux-musl
     @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
+
+# build-musl with the pinned doona UI embedded (native-ui implies native-api);
+# fetches it unless HONK_DOONA_DIR is set
+build-musl-embedded-ui:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    doona="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}"
+    HONK_DOONA_DIR="$doona" {{just_executable()}} build-musl "ebpf,native-ui"
 
 # Build eBPF object standalone (optional; honk-core build.rs auto-builds it)
 # NOTE: an environment RUSTFLAGS overrides crates/honk-ebpf/.cargo/config.toml
