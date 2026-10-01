@@ -29,6 +29,7 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
             _ = stop.changed() => break,
             _ = interval.tick() => {
                 state.observation.settings.maintain(&state.observation);
+                reconcile_kernel_trace(&state).await;
                 state.observation.core.flows.maintain();
                 let now = Instant::now();
                 let totals = state.stats.traffic_totals();
@@ -58,6 +59,18 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
                 state.observation.events.publish("runtime.updated", serde_json::json!({}), None);
             }
         }
+    }
+}
+
+/// Settings owns demand; the existing sampler publishes it on its next tick.
+/// Scheduling and publication/telemetry contention can delay that tick.
+async fn reconcile_kernel_trace(state: &NativeState) {
+    if let Some(flags) = &state.datapath_flags
+        && let Err(error) = flags
+            .reconcile_kernel_trace(|| state.observation.settings.flow_recording())
+            .await
+    {
+        tracing::warn!(%error, "kernel trace admission retains its previous state");
     }
 }
 
@@ -405,6 +418,7 @@ async fn supervise(
     if sampler_running {
         let _ = sampler.await;
     }
+    reconcile_kernel_trace(&state).await;
     let _ = schedule_stop.send(true);
     if schedule_running {
         let _ = schedule.await;

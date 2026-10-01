@@ -1,4 +1,5 @@
 use super::*;
+use honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED;
 
 fn witness(backend: &RealEbpfBackend, id: u32) -> KernelRouteWitness {
     let map = backend.bpf().unwrap().map("ROUTE_TRACE_MAP").unwrap();
@@ -22,7 +23,83 @@ fn capturing(must: bool) -> (RealEbpfBackend, RoutingPushPlan, TproxyListeners) 
     let (mut backend, mut plan, listeners) = publish(&rules);
     plan.enable_trace(true);
     backend.publish_routing_plan(&plan, &[]).unwrap();
+    backend
+        .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
+        .unwrap();
     (backend, plan, listeners)
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
+    isolated(|| {
+        let (mut backend, _, _listeners) = capturing(true);
+        let src = "192.0.2.26".parse().unwrap();
+        let dst = "198.51.100.36".parse().unwrap();
+        for side in ["lan_ingress_l2", "wan_egress_l2"] {
+            for protocol in [IPPROTO_TCP, IPPROTO_UDP] {
+                let port =
+                    43100 + if side == "wan_egress_l2" { 10 } else { 0 } + u16::from(protocol);
+                let bytes = packet(src, dst, protocol, port, 443, 5, 2);
+                let key = tuple(src, dst, port, 443, protocol);
+                backend.set_datapath_flags(0).unwrap();
+                let count = hash_count::<u32, KernelRouteWitness>(&backend, "ROUTE_TRACE_MAP");
+                let sequence = backend
+                    .array_get::<[u32; 2]>("ROUTE_TRACE_SEQUENCE", 0)
+                    .unwrap();
+                let off = run(&backend, side, &bytes, SkbInput::default());
+                assert_eq!(off.verdict, TC_ACT_REDIRECT);
+                let unrecorded = handoff(&backend, &key);
+                assert_eq!(unrecorded.trace_id, 0);
+                assert_eq!(off.cb[3], 0);
+                assert_eq!(
+                    hash_count::<u32, KernelRouteWitness>(&backend, "ROUTE_TRACE_MAP"),
+                    count
+                );
+                assert_eq!(
+                    backend
+                        .array_get::<[u32; 2]>("ROUTE_TRACE_SEQUENCE", 0)
+                        .unwrap(),
+                    sequence
+                );
+
+                backend
+                    .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
+                    .unwrap();
+                let bytes = packet(src, dst, protocol, port + 1, 443, 5, 2);
+                let key = tuple(src, dst, port + 1, 443, protocol);
+                let on = run(&backend, side, &bytes, SkbInput::default());
+                let recorded = handoff(&backend, &key);
+                assert_eq!((on.verdict, on.mark), (off.verdict, off.mark));
+                let authority = |entry: RoutingHandoffEntry| {
+                    let result = entry.result;
+                    (
+                        result.outbound,
+                        result.mark,
+                        result.must,
+                        result.decision_token,
+                        result.mac,
+                        result.pname,
+                        result.pid,
+                        result.dscp,
+                        entry.routing_generation,
+                    )
+                };
+                assert_eq!(authority(recorded), authority(unrecorded));
+                assert_ne!(recorded.trace_id, 0);
+                assert_ne!(recorded.trace_id, ROUTE_TRACE_LOST);
+                let retained = witness(&backend, recorded.trace_id);
+                backend.set_datapath_flags(0).unwrap();
+                assert_eq!(witness(&backend, recorded.trace_id).output, retained.output);
+                if protocol == IPPROTO_UDP {
+                    backend.routing_handoff_take(&key).unwrap().unwrap();
+                    let cached = run(&backend, side, &bytes, SkbInput::default());
+                    assert_eq!(cached.cb[3], recorded.trace_id);
+                    assert_eq!(handoff(&backend, &key).trace_id, recorded.trace_id);
+                }
+            }
+        }
+    });
 }
 
 #[test]
@@ -46,6 +123,7 @@ fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_cha
             let before = witness(&backend, original.trace_id);
             assert_eq!(before.output.input.dscp, 5);
             assert_eq!(before.output.generation, original.routing_generation);
+            backend.set_datapath_flags(0).unwrap();
             backend.publish_routing_plan(&plan, &[]).unwrap();
             let changed = packet(src, dst, IPPROTO_UDP, port, 443, 19, 0);
             let changed_run = run(&backend, side, &changed, SkbInput::default());
@@ -55,6 +133,9 @@ fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_cha
             assert_eq!(restored.trace_id, original.trace_id);
             assert_eq!(restored.routing_generation, original.routing_generation);
             assert_eq!(witness(&backend, restored.trace_id).output, before.output);
+            backend
+                .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
+                .unwrap();
         }
     });
 }
@@ -63,40 +144,58 @@ fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_cha
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn staged_udp_witness_uses_exact_token_and_generation() {
     isolated(|| {
-        let (mut backend, _, _listeners) = capturing(false);
-        backend
-            .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-            .unwrap();
-        // A direct fallback is unresolved in the absence of mode-owned offload.
-        let src = "192.0.2.20".parse().unwrap();
-        let dst = "198.51.100.30".parse().unwrap();
-        let key = tuple(src, dst, 43001, 444, IPPROTO_UDP);
-        let bytes = packet(src, dst, IPPROTO_UDP, 43001, 444, 0, 0);
-        let result = run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
-        assert_eq!(result.verdict, TC_ACT_OK);
-        let entry = handoff(&backend, &key);
-        assert_ne!(entry.result.decision_token, 0);
-        assert_eq!(
-            result.mark & NFQUEUE_TOKEN_MASK,
-            entry.result.decision_token
-        );
-        assert_eq!(
-            entry.routing_generation,
-            backend.routing_policy_generation()
-        );
-        let trace = witness(&backend, entry.trace_id);
-        assert_eq!(trace.decision_token, entry.result.decision_token);
-        assert_eq!(trace.output.generation, entry.routing_generation);
-        assert_eq!(
+        for capture in [false, true] {
+            let (mut backend, _, _listeners) = capturing(false);
             backend
-                .udp_conn_state_lookup(&key)
-                .unwrap()
-                .unwrap()
-                .trace_id,
-            entry.trace_id
-        );
-        run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
-        assert_eq!(handoff(&backend, &key).trace_id, entry.trace_id);
+                .set_datapath_flags(
+                    DATAPATH_FLAG_NFQ_ENABLED
+                        | DATAPATH_FLAG_NFQ_READY
+                        | if capture {
+                            DATAPATH_FLAG_TRACE_ENABLED
+                        } else {
+                            0
+                        },
+                )
+                .unwrap();
+            // A direct fallback is unresolved in the absence of mode-owned offload.
+            let src = "192.0.2.20".parse().unwrap();
+            let dst = "198.51.100.30".parse().unwrap();
+            let key = tuple(src, dst, 43001, 444, IPPROTO_UDP);
+            let bytes = packet(src, dst, IPPROTO_UDP, 43001, 444, 0, 0);
+            let result = run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
+            assert_eq!(result.verdict, TC_ACT_OK);
+            let entry = handoff(&backend, &key);
+            assert_ne!(entry.result.decision_token, 0);
+            assert_eq!(
+                result.mark & NFQUEUE_TOKEN_MASK,
+                entry.result.decision_token
+            );
+            assert_eq!(
+                entry.routing_generation,
+                backend.routing_policy_generation()
+            );
+            if capture {
+                let trace = witness(&backend, entry.trace_id);
+                assert_eq!(trace.decision_token, entry.result.decision_token);
+                assert_eq!(trace.output.generation, entry.routing_generation);
+            } else {
+                assert_eq!(entry.trace_id, 0);
+                assert_eq!(
+                    hash_count::<u32, KernelRouteWitness>(&backend, "ROUTE_TRACE_MAP"),
+                    0
+                );
+            }
+            assert_eq!(
+                backend
+                    .udp_conn_state_lookup(&key)
+                    .unwrap()
+                    .unwrap()
+                    .trace_id,
+                entry.trace_id
+            );
+            run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
+            assert_eq!(handoff(&backend, &key).trace_id, entry.trace_id);
+        }
     });
 }
 
@@ -293,6 +392,9 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
         let (mut backend, mut plan, _listeners) = publish(&rules);
         plan.enable_trace(true);
         backend.publish_routing_plan(&plan, &[]).unwrap();
+        backend
+            .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
+            .unwrap();
         for slot in 0..6 {
             set_array(&mut backend, "OUTBOUND_CONNECTIVITY_MAP", slot, 1u64);
         }

@@ -268,7 +268,6 @@ impl Settings {
         next.apply(owner);
         *current = next;
     }
-    #[cfg(test)]
     pub(crate) fn flow_recording(&self) -> bool {
         self.values.lock().active()[0]
     }
