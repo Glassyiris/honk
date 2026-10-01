@@ -711,7 +711,7 @@ Salamander obfuscation 在每个 wire datagram 前加 8 字节随机 salt，并�
 ## AnyTLS session 引擎
 
 AnyTLS handler 无状态。每个 generation 的 `NodeRuntime::AnyTls` 拥有一个
-`SessionPool<AnyTlsSession>` 与 lazy materialize 的 BoringSSL connector。
+`SessionPool<AnyTlsSession>` 与首次拨号时构建的 BoringSSL connector；TLS context 按 shape 共享，因此 connector 不做空闲回收。
 无 generation 调用使用带 guard 的 ephemeral 等价物。
 
 ### Pool 与 session 生命周期

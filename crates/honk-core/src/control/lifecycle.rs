@@ -511,13 +511,12 @@ impl ControlPlane {
             self.tcp_admission_target.clone(),
         )));
         tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+            let mut tick = tokio::time::interval(honk_outbound::runtime::REAP_INTERVAL);
             tick.tick().await;
             loop {
                 tick.tick().await;
-                let now = std::time::Instant::now();
-                registry.read().reap_idle_resources(now);
-                dns.current().reap_idle_resources(now);
+                registry.read().reap_idle_resources();
+                dns.current().reap_idle_resources();
             }
         }));
         tasks.push(tokio::spawn(async move {
