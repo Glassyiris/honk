@@ -381,6 +381,8 @@ A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机�
 
 `src/tls.rs` 提供 BoringSSL TLS client；进程级 `set_tls_mode` 选择 TLS profile。`build_reality_connector(chrome)` 使用 `reality.rs` 的握手后 ed25519 认证替代 PKI，只允许 TLS 1.3 且不提供 REALITY resumption。显式结构化 TCP ALPN 在 tls/utls 模式下都传入 `build_connector`；空列表保留 profile 默认值，Chrome ALPS 取决于列表是否精确包含 `h2`。Registry 发布与直接 connector 构造都会校验非空 override；共享 stream dispatch 在选择 plaintext 或 REALITY 前校验，直接 QUIC 配置会拒绝 TCP ALPN，而不会忽略它。
 
+`build_connector` 与 `build_reality_connector` 返回共享的 BoringSSL context：每种（REALITY、是否验证、pin、ALPN 覆盖、Chrome 模式）组合一个，保存在进程级缓存中，达到 128 种组合时清空重建。每个 context 持有进程级 webpki 信任库，而不是 `SslConnector::builder` 默认解析的系统 CA 证书包，因此拨号不再解析证书，存活连接也不会各自占用一份 CA 副本。
+
 ### 进程级 TLS profile
 
 `tls_implementation = "utls"` 在进程范围启用唯一实现的 Chrome-oriented
