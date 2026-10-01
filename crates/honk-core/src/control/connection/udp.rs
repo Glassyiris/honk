@@ -238,8 +238,13 @@ impl ControlPlaneHandle {
                 client_addr.port(),
                 17, // UDP
             );
-            self.lookup_udp_handoff(&tuples, lease.decision_token())
-                .await?
+            self.lookup_udp_handoff(
+                &tuples,
+                lease.decision_token(),
+                #[cfg(feature = "native-api")]
+                observation,
+            )
+            .await?
         };
         #[cfg(feature = "native-api")]
         let handoff = handoff.map(|mut handoff| {
