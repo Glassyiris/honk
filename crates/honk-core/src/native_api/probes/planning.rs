@@ -120,19 +120,19 @@ fn plan(
                 .ok_or_else(not_found)?,
         ),
     };
-    if group
-        .as_ref()
-        .is_some_and(|name| !manager.probe_plan_within_limit(name, MAX_RESULTS))
-    {
-        return Err(too_large());
-    }
     let members: Vec<_> = if let Some(group) = &group {
         match request.members.as_ref() {
-            Some(Members::Scope(MemberScope::Leaves)) => manager
-                .probe_leaves(group, MAX_MEMBERS + 1)
-                .into_iter()
-                .map(GroupMember::Node)
-                .collect(),
+            Some(Members::Scope(MemberScope::Leaves)) => {
+                // Only this scope expands descendants; a child group otherwise probes its one selected leaf.
+                if !manager.probe_plan_within_limit(group, MAX_RESULTS) {
+                    return Err(too_large());
+                }
+                manager
+                    .probe_leaves(group, MAX_MEMBERS + 1)
+                    .into_iter()
+                    .map(GroupMember::Node)
+                    .collect()
+            }
             _ => {
                 let mut members = Vec::new();
                 for member in manager.group_members(group) {
