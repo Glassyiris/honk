@@ -247,6 +247,60 @@ async fn duplicate_group_members_share_execution_but_keep_both_associations() {
 }
 
 #[tokio::test]
+async fn a_large_group_is_probed_by_member_subset_and_a_child_group_by_its_selected_leaf() {
+    let nodes: Vec<Node> = (1..=300u16)
+        .map(|port| node(SocketAddr::from(([127, 0, 0, 1], port))))
+        .collect();
+    let ids: Vec<_> = nodes.iter().map(|node| node.id.to_string()).collect();
+    let mut config = Config::default();
+    config.nodes.extend(nodes);
+    for group in [
+        json!({"name":"big","nodes":ids}),
+        json!({"name":"c1","nodes":&ids[..100]}),
+        json!({"name":"c2","nodes":&ids[100..200]}),
+        json!({"name":"c3","nodes":&ids[200..]}),
+        json!({"name":"parent","groups":["c1","c2","c3"]}),
+    ] {
+        config.groups.push(serde_json::from_value(group).unwrap());
+    }
+    let state = state(config).await;
+    let plan = |group: &str, members: Value| {
+        let group_id = state.observation.core.catalog.snapshot().groups[group].clone();
+        let mut input = request(
+            json!({"type":"group","group_id":group_id}),
+            "tcp_connect",
+            json!(["tcp"]),
+            "ipv4",
+        );
+        input["members"] = members;
+        capture(&state, serde_json::from_value(input).unwrap())
+    };
+
+    let subset = plan("big", json!(&ids[..3])).await.unwrap();
+    assert_eq!(subset.result.results.len(), 3);
+    let parent = plan("parent", json!("direct")).await.unwrap();
+    let leaves: Vec<_> = parent
+        .result
+        .results
+        .iter()
+        .map(|row| row.resolved_leaf_node_id.as_deref())
+        .collect();
+    assert_eq!(
+        leaves,
+        [&ids[0], &ids[100], &ids[200]].map(|id| Some(id.as_str()))
+    );
+    for (group, members) in [
+        ("big", json!("direct")),
+        ("big", json!("leaves")),
+        ("big", json!(&ids[..65])),
+        ("parent", json!("leaves")),
+    ] {
+        let error = plan(group, members).await.err().unwrap();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[tokio::test]
 async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
     let leaf = honk_config::config::DIRECT_NODE_ID;
     for custom_url in [false, true] {
