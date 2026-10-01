@@ -301,7 +301,14 @@ impl ControlPlaneHandle {
                     client_addr.port(),
                     6, // TCP
                 );
-                let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
+                let (mut flow, handoff) = self
+                    .adopt_tcp_flow(
+                        stream,
+                        tuples,
+                        #[cfg(feature = "native-api")]
+                        &observation,
+                    )
+                    .await?;
                 observation.handoff(handoff.as_ref(), true);
                 observation.routing_started();
 
