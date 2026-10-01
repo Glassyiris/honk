@@ -186,6 +186,8 @@ copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的
 
 首次 EOF 后，两条中继路径只限制空闲排空时间：`DRAIN_DEADLINE` 是没有任何字节进展的 30 秒。活跃 survivor 可以运行超过 30 秒；静默 survivor 不能无限持有 accepted socket。
 
+客户端不发 FIN 或 RST 就消失的情况单独限制：TPROXY TCP listener 启用 TCP keepalive（空闲 3600 秒、间隔 15 秒、4 次探测），accepted socket 继承该设置。静默的客户端约一小时后结束其 relay；仍在线的空闲客户端会应答探测，因此长时间空闲的连接保持打开。该错误是客户端侧的 `TimedOut`，按取消结算 Score。
+
 Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时才会被接管。`TcpFlowPins` 为每个 accepted owner 引用计数该方向 tuple。BPF janitor 跳过已 pin 的 conn-state 和匹配的 redirect 元数据。最后一个 owner 退役时读取当前条目，并且只在 state 与 timestamp 仍匹配已观察 incarnation 时条件删除；旧 relay 不能删除复用的 tuple。
 
 真实 relay 完成后，TCP owner 先按实际结果恰一次结算 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。

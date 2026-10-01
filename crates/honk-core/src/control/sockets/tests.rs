@@ -819,3 +819,22 @@ fn reply_send_errors_about_the_destination_keep_the_socket() {
         "no os code"
     )));
 }
+
+/// A client that vanishes without FIN/RST must not pin its relay forever:
+/// accepted sockets are probed and a silent peer is cut within hours.
+#[cfg(target_os = "linux")]
+#[test]
+fn accepted_client_sockets_detect_a_vanished_peer() {
+    let listener = sockets::bind_tproxy_tcp(SocketAddr::from(([127, 0, 0, 1], 0)), 0).unwrap();
+    let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+
+    let socket = socket2::SockRef::from(&accepted);
+    assert!(socket.keepalive().unwrap(), "probes must be enabled");
+    let silence = socket.tcp_keepalive_time().unwrap()
+        + socket.tcp_keepalive_interval().unwrap() * socket.tcp_keepalive_retries().unwrap();
+    assert!(
+        silence <= std::time::Duration::from_secs(2 * 3600),
+        "a dead peer must be detected within 2 hours, got {silence:?}"
+    );
+}

@@ -74,6 +74,7 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     socket.set_nonblocking(true)?;
     socket.set_cloexec(true)?;
     socket.set_reuse_address(true)?;
+    set_client_keepalive(&socket)?;
     if domain == Domain::IPV6 {
         // Keep the v6 listener v6-only so it does not conflict with the v4 listener.
         socket.set_only_v6(true)?;
@@ -92,6 +93,25 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     socket.listen(128)?;
 
     Ok(socket.into())
+}
+
+// A dead client is reaped after IDLE + INTERVAL * RETRIES = about an hour of silence.
+const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(3600);
+#[cfg(target_os = "linux")]
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(target_os = "linux")]
+const CLIENT_KEEPALIVE_RETRIES: u32 = 4;
+
+/// Accepted sockets inherit these. A client that vanishes without FIN/RST
+/// otherwise pins its relay and both sockets until the upstream closes; a
+/// live idle client answers the probes, so long connections are untouched.
+fn set_client_keepalive(socket: &Socket) -> io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new().with_time(CLIENT_KEEPALIVE_IDLE);
+    #[cfg(target_os = "linux")]
+    let keepalive = keepalive
+        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
+        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+    socket.set_tcp_keepalive(&keepalive)
 }
 
 /// Clear the inherited bypass mark on an accepted transparent socket.

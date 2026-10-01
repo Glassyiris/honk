@@ -224,6 +224,8 @@ requires the application to send another request or close before its current req
 
 After the first EOF, both relay paths bound only idle drain time: `DRAIN_DEADLINE` is 30 seconds without a byte of progress. An active survivor may run longer than 30 seconds; a silent survivor cannot pin accepted sockets indefinitely.
 
+A client that disappears without FIN or RST is bounded separately: the TPROXY TCP listeners enable TCP keepalive (3600 s idle, 15 s interval, 4 probes) and accepted sockets inherit it. A silent client ends its relay after about an hour; a live idle client answers the probes, so long idle connections stay open. Its error is a client-side `TimedOut`, which settles Score as cancellation.
+
 An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP` entry still exists. `TcpFlowPins` reference-counts that directional tuple for every accepted owner. The BPF janitor skips pinned conn-state and matching redirect metadata. When the final owner retires, it reads the current entry and conditionally removes it only if the state and timestamp still match the observed incarnation; an older relay cannot delete a reused tuple.
 
 After a real relay completes, the TCP owner settles its actual Score outcome and relay-error statistics once before propagating any retirement failure. Successful relay evidence is not changed to cancellation by failed retirement. TCP pool replenishment still requires both relay success and confirmed retirement; intentional cancellation retains its separate neutral path.
