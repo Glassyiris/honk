@@ -871,8 +871,11 @@ only its own SID; an unrelated acknowledgement never clears another stream's
 deadline, and local stream teardown cancels it. An open still pending
 three seconds after its SYN was written is reset at stream level when the
 session kept receiving frames during the window (the server was alive but
-never acknowledged that open). A fully silent window retires the physical
-session so the pool redials instead of reusing a dead carrier.
+never acknowledged that open). A fully silent window is not proof of a dead
+carrier, because a loss burst silences every stream at once and TCP delivers
+afterwards: it resets only that open and takes the session out of rotation, and
+the session is retired with its streams only if it stays silent for another ten
+seconds, so the pool still redials instead of reusing a dead carrier.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor (`anytls_min_idle_session`) and `anytls_idle_session_timeout` feed one node-local janitor.
