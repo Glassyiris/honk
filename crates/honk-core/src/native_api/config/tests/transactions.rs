@@ -880,3 +880,42 @@ async fn suspend_and_resume_are_not_offered() {
     }
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn removed_destination_settings_survive_export_reload_and_sighup() {
+    const REMOVED: &str = "experimental { native_api {\n probe_allowed_cidrs: PRIVATE\n probe_allowed_ports: 0, 65536, invalid\n } }\n";
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, originals| {
+        originals.get_mut("editable.dae").unwrap().push_str(REMOVED);
+    })
+    .await;
+    let assert_warnings = |config: &Value| {
+        let rows = config["diagnostics"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{config}");
+        assert!(
+            rows.iter()
+                .all(|row| row["code"] == "legacy-config-warning" && row["level"] == "warning")
+        );
+        assert!(!serde_json::to_string(rows).unwrap().contains("PRIVATE"));
+    };
+    assert_warnings(&fixture.get(CONFIG).await);
+    let export = fixture
+        .request(Method::GET, "/api/v1/x-honk/config/export")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    let export = export.text().await.unwrap();
+    assert!(export.contains(REMOVED), "{export}");
+    let mut diagnostics = Vec::new();
+    honk_config::parser::parse_dae_config_with_detailed_diagnostics(&export, &mut diagnostics)
+        .unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+    assert_warnings(&fixture.get(CONFIG).await);
+    fixture.service.request_sighup().unwrap();
+    fixture.barrier().await;
+    assert_warnings(&fixture.get(CONFIG).await);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
+    fixture.shutdown().await;
+}

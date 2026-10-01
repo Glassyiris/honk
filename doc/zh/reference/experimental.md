@@ -31,8 +31,6 @@
 | `record_memory` | `true` | 无客户端也记录 RSS/cgroup history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时内存观测。 |
 | `record_logs` | `true` | 允许按 API 客户端连接规则或显式运行时设置捕获结构化日志，最多保留 512 条、60 秒。`false` 禁止捕获；修改配置需重启。控制台和 Clash 日志保持独立。 |
 | `record_dns_log` | `true` | 允许按 API 客户端连接规则或显式运行时设置记录客户端 DNS 完成历史，最多保留 512 条、8 MiB。`false` 禁止记录；修改配置需重启。 |
-| `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
-| `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
 | `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，以及新建由 include 模式加载的 `.dae` 文件，含监听凭据的源除外；要求非空 `secret` 或启用 `password_auth`。 |
 
 Geodata 下载 URL 与出口现由 [`assets.geodata`](./assets.md) 配置。旧版 `native_api` 字段仍可读取并产生警告；替代关系见 Assets 参考中的表格。
@@ -57,13 +55,15 @@ experimental {
 
 默认 Host 只接受具体监听 authority；loopback 另接受同端口的 `localhost`、`127.0.0.1` 与 `[::1]`。通配监听接受同端口的任意 IP 字面量 Host 与 `localhost`，因为这些就是请求到达的那个监听器本身；DNS 名称仍不授权，因为只有名称能被重绑定。只有真实直连对应的明文 HTTP Origin 自动允许；通配监听时该 Origin 必须与请求自身的 Host 相同，同端口其他地址上的页面需列入 `allow_origins`。TLS 反代若保留 `Host: panel.example`，需配置 `allowed_hosts: 'panel.example'` 与 `allow_origins: 'https://panel.example'`；若保留 `Host: panel.example:443`，则使用 `allowed_hosts: 'panel.example', 'panel.example:443'`。Forwarded headers 不授予权限。
 
-列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`、`probe_allowed_cidrs: '127.0.0.0/8', '::1/128'`、`probe_allowed_ports: 8080, 8443`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。Probe 会校验并固定解析出的地址，IPv4-mapped IPv6 先规范化为 IPv4；开放端口不自动授权受限 CIDR，也不允许调用方指定任意 URL 或跟随 HTTP 重定向。
+列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。探测目标仅来自已接受的配置，仍解析并固定选中的 IP，将 IPv4-mapped IPv6 规范化为 IPv4，且不接受调用方 URL、不跟随 HTTP 重定向。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。
+
+已移除的 `probe_allowed_cidrs` 与 `probe_allowed_ports` 键仍可在 dae 配置及兼容的结构化加载器中出现，每个键产生一条警告；其值被忽略，可以删除这两个键。配置序列化不输出这两个键。
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api)。
 
 单文件部署可使用发布产物，或执行 `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`，并设置 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。静态资源不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
 
-Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。直连的域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS。`assets.geodata.route` 或已存储的路由可改为遵循路由规则或经过组下载；路由无法承载请求时不会回退到直连。所有已加载资产都要有配置来源才能更新。[主文件条目与 geodata 契约](./api.md#主文件条目与-geodata-管理)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
+配置文件中的 geodata 来源由管理员配置、需重启，不能通过源写入修改。启用状态数据库时，下载还可使用已认证的 URL 覆盖或内置来源；拒绝 userinfo、fragment、redirect 与 content encoding。直连的域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS。`assets.geodata.route` 或已存储的路由可改为遵循路由规则或经过组下载；路由无法承载请求时不会回退到直连。更新使用适用的配置文件、已存储或内置来源。[主文件条目与 geodata 契约](./api.md#主文件条目与-geodata-管理)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
 
 ### 共用采样与可选历史
 

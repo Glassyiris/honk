@@ -162,16 +162,6 @@ impl World {
         urls: &[String],
         verify_checksum: bool,
     ) -> Result<(Arc<[u8]>, Fetched), Failure> {
-        // Loopback servers are private destinations, so the policy has to allow them.
-        let ports: Vec<u16> = urls
-            .iter()
-            .filter_map(|url| parse_geodata_url(url)?.port())
-            .collect();
-        let policy = Policy::new(&NativeApiConfig {
-            probe_allowed_cidrs: vec!["127.0.0.0/8".into()],
-            probe_allowed_ports: ports,
-            ..Default::default()
-        });
         let egress = Egress {
             bootstrap: "udp://127.0.0.1:9",
             route: &route,
@@ -183,7 +173,7 @@ impl World {
                 runtime_registry: &self.runtime_registry,
             },
         };
-        fetch("geosite", urls, &egress, 1024, &policy, "", verify_checksum).await
+        fetch("geosite", urls, &egress, 1024, verify_checksum).await
     }
 }
 

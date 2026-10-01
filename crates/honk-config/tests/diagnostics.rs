@@ -374,6 +374,62 @@ mod config_loaders {
     }
 
     #[test]
+    fn structured_loaders_ignore_removed_native_destination_keys_with_warnings() {
+        let root = serde_json::json!({"experimental": {"native_api": {
+            "record_flows": false,
+            "probe_allowed_cidrs": {"PRIVATE": false},
+            "probe_allowed_ports": [0, 65536, "PRIVATE"]
+        }}});
+        for (extension, text) in [
+            ("json", serde_json::to_string(&root).unwrap()),
+            ("yaml", serde_yaml::to_string(&root).unwrap()),
+            ("toml", toml::to_string(&root).unwrap()),
+            ("dae", serde_json::to_string(&root).unwrap()),
+        ] {
+            let file = tempfile::Builder::new()
+                .suffix(&format!(".{extension}"))
+                .tempfile()
+                .unwrap();
+            std::fs::write(file.path(), text).unwrap();
+            let mut diagnostics = Vec::new();
+            let config = Config::from_file_with_detailed_diagnostics(
+                file.path().to_str().unwrap(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(!config.experimental.native_api.record_flows);
+            assert_eq!(diagnostics.len(), 2, "{extension}: {diagnostics:?}");
+            for key in ["probe_allowed_cidrs", "probe_allowed_ports"] {
+                let notice = diagnostics
+                    .iter()
+                    .find(|notice| {
+                        notice.setting.to_string() == format!("experimental.native_api.{key}")
+                    })
+                    .unwrap();
+                assert_eq!(notice.code, "legacy-config-warning");
+                assert_eq!(notice.severity, honk_config::diagnostic::Severity::Warning);
+                assert!(
+                    notice.message.contains("removed") && notice.message.contains("can be deleted")
+                );
+                assert!(!serde_json::to_string(&config).unwrap().contains(key));
+            }
+            assert!(!format!("{diagnostics:?}").contains("PRIVATE"));
+        }
+        let invalid = r#"{"experimental":{"native_api":{"record_flows":"PRIVATE"}}}"#;
+        let error =
+            Config::from_json_str_with_detailed_diagnostics(invalid, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.diagnostic.setting.to_string(), "experimental");
+        let input = r#"{"experimental":{"native_api":{"probe_allowed_cidrs":null,"probe_allowed_ports":null}}}"#;
+        let mut diagnostics = Vec::new();
+        Config::from_json_str_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            Config::from_json_str(r#"{"experimental":{"native_api":{"probe_allowed_port":[]}}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn legacy_cache_file_keys_warn_in_dae_and_structured_input() {
         let dae = "experimental { cache_file { enabled: true\n path: 'cache.db' }\n cache_file { cache_id: 'gw' } }\n";
         let mut diagnostics = Vec::new();

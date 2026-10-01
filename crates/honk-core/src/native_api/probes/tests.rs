@@ -9,8 +9,6 @@ async fn state(mut config: Config) -> Arc<NativeState> {
     config.global.nfqueue_enable = false;
     config.experimental.native_api.enabled = true;
     config.experimental.native_api.allow_anonymous_loopback = true;
-    config.experimental.native_api.probe_allowed_cidrs =
-        vec!["127.0.0.0/8".into(), "::1/128".into()];
     config.ensure_builtin_nodes();
     let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
     let forwarder = resolver.forwarder();
@@ -130,12 +128,11 @@ async fn raw_probe_keeps_family_and_typed_health_out_of_http_ranking() {
 }
 
 #[tokio::test]
-async fn admitted_probe_survives_request_drop_and_replay_precedes_catalog_lookup() {
+async fn configured_nondefault_http_port_survives_request_drop_and_replay() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
-    config.experimental.native_api.probe_allowed_ports = vec![address.port()];
     let state = state(config).await;
     let (stop, receiver) = watch::channel(false);
     let worker = state.observation.probes.start(Arc::clone(&state), receiver);
@@ -219,9 +216,7 @@ async fn duplicate_group_members_share_execution_but_keep_both_associations() {
     let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    let mut plan = prepare(&state.observation.probes.policy, plan)
-        .await
-        .unwrap();
+    let mut plan = prepare(plan).await.unwrap();
     let (_stop, receiver) = watch::channel(false);
     execute(
         &state,
@@ -257,7 +252,6 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
         let url = format!("http://{address}/check");
         let mut config = Config::default();
         config.global.tcp_check_url = vec![url.clone()];
-        config.experimental.native_api.probe_allowed_ports = vec![address.port()];
         for name in ["left", "right"] {
             config
                 .groups
@@ -296,9 +290,7 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
             let plan = capture(&state, serde_json::from_value(input).unwrap())
                 .await
                 .unwrap();
-            let mut plan = prepare(&state.observation.probes.policy, plan)
-                .await
-                .unwrap();
+            let mut plan = prepare(plan).await.unwrap();
             let (_stop, receiver) = watch::channel(false);
             execute(
                 &state,
@@ -488,7 +480,6 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
-    config.experimental.native_api.probe_allowed_ports = vec![address.port()];
     let state = state(config).await;
     let input = request(
         json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
@@ -499,9 +490,7 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
     let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    let mut plan = prepare(&state.observation.probes.policy, plan)
-        .await
-        .unwrap();
+    let mut plan = prepare(plan).await.unwrap();
     let peer = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut bytes = Vec::new();
@@ -542,7 +531,6 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
     config.global.tcp_check_url = vec![format!("http://{address}/check")];
-    config.experimental.native_api.probe_allowed_ports = vec![address.port()];
     for index in 0..5 {
         config.groups.push(serde_json::from_value(json!({"name":format!("group-{index}"),"nodes":[honk_config::config::DIRECT_NODE_ID]})).unwrap());
     }
@@ -635,7 +623,17 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
 
 #[tokio::test]
 async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for (bind, host, family) in [
+        ("127.0.0.1:0", "127.0.0.1", "ipv4"),
+        ("[::1]:0", "[::1]", "ipv6"),
+        ("127.0.0.1:0", "[::ffff:127.0.0.1]", "ipv4"),
+    ] {
+        measure_dns_exchange(bind, host, family).await;
+    }
+}
+
+async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
     let address = listener.local_addr().unwrap();
     let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
     let tcp_peer = tokio::spawn(async move {
@@ -654,21 +652,18 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
         udp.send_to(&query[..length], peer).await.unwrap();
     });
     let mut config = Config::default();
-    config.global.udp_check_dns = vec![address.to_string()];
-    config.experimental.native_api.probe_allowed_ports = vec![address.port()];
+    config.global.udp_check_dns = vec![format!("{host}:{}", address.port())];
     let state = state(config).await;
     let input = request(
         json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
         "dns",
         json!(["tcp", "udp"]),
-        "ipv4",
+        family,
     );
     let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    let mut plan = prepare(&state.observation.probes.policy, plan)
-        .await
-        .unwrap();
+    let mut plan = prepare(plan).await.unwrap();
     let (_stop, receiver) = watch::channel(false);
     execute(
         &state,
@@ -678,11 +673,12 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
     )
     .await
     .unwrap();
+    assert_eq!(plan.result.results.len(), 2);
     assert!(
         plan.result
             .results
             .iter()
-            .all(|row| row.state == "healthy" && row.health_updated)
+            .all(|row| row.state == "healthy" && row.health_updated && row.latency_ms.is_some())
     );
     let samples = state
         .alive_set
@@ -702,9 +698,13 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
 }
 
 #[tokio::test]
-async fn production_socks_probe_sends_numeric_destination_and_preserves_http_authority() {
+async fn group_http_probe_measures_loopback_node_and_custom_check_port() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let node = node(listener.local_addr().unwrap());
+    let node = Node::from_share_link(&format!(
+        "socks5://relay.example:{}",
+        listener.local_addr().unwrap().port()
+    ))
+    .unwrap();
     let id = node.id;
     let peer = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
@@ -723,7 +723,7 @@ async fn production_socks_probe_sends_numeric_destination_and_preserves_http_aut
         );
         let mut destination = [0; 6];
         socket.read_exact(&mut destination).await.unwrap();
-        assert_eq!(destination, [127, 0, 0, 1, 0, 80]);
+        assert_eq!(destination, [1, 1, 1, 1, 0x20, 0xfb]);
         socket
             .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
             .await
@@ -736,7 +736,7 @@ async fn production_socks_probe_sends_numeric_destination_and_preserves_http_aut
             String::from_utf8(request)
                 .unwrap()
                 .to_ascii_lowercase()
-                .contains("host: authority.example\r\n")
+                .contains("host: authority.example:8443\r\n")
         );
         socket
             .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
@@ -744,61 +744,61 @@ async fn production_socks_probe_sends_numeric_destination_and_preserves_http_aut
             .unwrap();
     });
     let mut config = Config::default();
+    let hosts = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        hosts.path(),
+        "relay.example 127.0.0.1\nauthority.example 1.1.1.1\n",
+    )
+    .unwrap();
+    config.dns.hosts = vec![hosts.path().to_string_lossy().into_owned()];
     config.nodes.push(node);
-    config.global.tcp_check_url = vec!["http://127.0.0.1/check".into()];
+    config
+        .groups
+        .push(serde_json::from_value(json!({"name":"lan-relay","nodes":[id]})).unwrap());
+    config.global.tcp_check_url = vec!["http://authority.example:8443/check".into()];
     let state = state(config).await;
+    let identity = state.observation.core.catalog.snapshot();
     let input = request(
-        json!({"type":"node","node_id":id.to_string()}),
+        json!({"type":"group","group_id":identity.groups["lan-relay"]}),
         "http",
         json!(["tcp"]),
         "ipv4",
     );
-    let plan = capture(&state, serde_json::from_value(input).unwrap())
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let accepted = body(
+        create(
+            &state,
+            http_request(&input, "lan"),
+            &RequestId("lan".into()),
+        )
         .await
-        .unwrap();
-    let mut plan = prepare(&state.observation.probes.policy, plan)
-        .await
-        .unwrap();
-    plan.context.http = Some(
-        honk_outbound::urltest::health_http_probe_request("http://authority.example/check", "HEAD")
-            .unwrap(),
-    );
-    let (_stop, receiver) = watch::channel(false);
-    execute(
-        &state,
-        &mut plan,
-        Instant::now() + Duration::from_secs(2),
-        receiver,
+        .unwrap(),
     )
-    .await
-    .unwrap();
-    assert_eq!(plan.result.results[0].state, "healthy");
+    .await;
+    let result = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(
+        result["result"]["results"][0]["resolved_leaf_node_id"],
+        id.to_string()
+    );
+    assert_eq!(result["result"]["results"][0]["state"], "healthy");
+    assert!(
+        result["result"]["results"][0]["latency_ms"]
+            .as_f64()
+            .is_some()
+    );
     peer.await.unwrap();
-}
-
-#[test]
-fn restricted_addresses_require_cidr_even_with_allowed_ports() {
-    let mut config = NativeApiConfig {
-        probe_allowed_ports: vec![8080],
-        ..Default::default()
-    };
-    let policy = Policy::new(&config);
-    assert!(!policy.address("::ffff:127.0.0.1".parse().unwrap()));
-    assert!(!policy.address("169.254.169.254".parse().unwrap()));
-    assert!(policy.port(8080, Kind::Http.default_port(false)));
-    assert!(!policy.port(443, Kind::Dns.default_port(false)));
-    config.probe_allowed_cidrs = vec!["127.0.0.0/8".into()];
-    assert!(Policy::new(&config).address("::ffff:127.0.0.1".parse().unwrap()));
+    stop.send(true).unwrap();
+    worker.await.unwrap();
 }
 
 #[tokio::test]
 async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
     let proxy = Node::from_share_link("socks5://127.0.0.1:1080").unwrap();
-    let restricted = Node::from_share_link("socks5://10.9.8.7:1080").unwrap();
-    let (proxy, restricted_id) = (proxy.clone(), restricted.id.to_string());
     let proxy_id = proxy.id.to_string();
     let mut config = Config::default();
-    config.nodes.extend([proxy, restricted]);
+    config.nodes.push(proxy);
     config.global.tcp_check_url = vec!["http://127.0.0.1:8080/PRIVATE".into()];
     config.global.udp_check_dns = Vec::new();
     let state = state(config).await;
@@ -820,16 +820,6 @@ async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
             request(node(&direct), "tcp_connect", json!(["tcp"]), "ipv4"),
             "TCP connect probes do not apply to direct or block nodes",
             json!({"field":"kind","allowed":["http","dns"]}),
-        ),
-        (
-            request(node(&restricted_id), "tcp_connect", json!(["tcp"]), "ipv4"),
-            "The probe destination address is not permitted",
-            json!({"check":"address","settings":["probe_allowed_cidrs"]}),
-        ),
-        (
-            request(node(&proxy_id), "http", json!(["tcp"]), "ipv4"),
-            "The probe destination port is not permitted",
-            json!({"check":"port","settings":["probe_allowed_ports"]}),
         ),
         (
             request(node(&proxy_id), "dns", json!(["tcp"]), "ipv4"),
@@ -1026,9 +1016,7 @@ async fn ipv6_raw_probe_dials_the_requested_family_without_ipv4_fallback() {
     let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    let mut plan = prepare(&state.observation.probes.policy, plan)
-        .await
-        .unwrap();
+    let mut plan = prepare(plan).await.unwrap();
     let (_stop, receiver) = watch::channel(false);
     execute(
         &state,
