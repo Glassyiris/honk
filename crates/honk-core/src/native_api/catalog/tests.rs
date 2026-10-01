@@ -386,6 +386,9 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
             row["latency_ms"],
             if scoped { Value::Null } else { json!(12.0) }
         );
+        for field in ["moving_avg_ms", "avg10_ms"] {
+            assert_eq!(row[field], row["latency_ms"], "{field}");
+        }
     }
     for sample in global {
         assert!(rows.iter().any(|row| {
