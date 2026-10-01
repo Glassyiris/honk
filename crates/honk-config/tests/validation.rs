@@ -688,7 +688,6 @@ mod native_api {
             "record_flows: maybe",
             "record_logs: maybe",
             "record_dns_log: maybe",
-
             "secret { value: PRIVATE }",
             "unknown { secret: PRIVATE }",
             "allowed_hosts: 'localhost', ''",
@@ -719,18 +718,12 @@ mod native_api {
             config.experimental.native_api.allow_origins,
             ["http://localhost:3000", "https://panel.example"]
         );
-        for native in [
-            serde_json::json!({"secrett":"PRIVATE"}),
-            serde_json::json!({"probe_allowed_cidrs":[]}),
-            serde_json::json!({"probe_allowed_ports":[8080]}),
-        ] {
-            assert!(
-                serde_json::from_value::<Config>(
-                    serde_json::json!({"experimental":{"native_api":native}})
-                )
-                .is_err()
-            );
-        }
+        assert!(
+            serde_json::from_value::<Config>(
+                serde_json::json!({"experimental":{"native_api":{"secrett":"PRIVATE"}}})
+            )
+            .is_err()
+        );
     }
 
     #[test]

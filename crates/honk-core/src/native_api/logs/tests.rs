@@ -502,7 +502,9 @@ async fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
         return;
     }
     let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
-    owner.settings.renew(&owner, false);
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::LOGS);
     let store = Arc::clone(&owner.logs);
     let dispatch = capture(&store);
     let query = "?level=info&target=honk_core::native_api";
