@@ -339,6 +339,8 @@ A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机�
 `webpki-root-certs` 构建。显式 no-verify connector 用于配置的不安全模式
 和 REALITY；后者以自己的握手后检查替代 PKI。
 
+`build_connector` 与 `build_reality_connector` 返回共享的 BoringSSL context：每种（REALITY、是否验证、pin、ALPN 覆盖、Chrome 模式）组合一个，保存在进程级缓存中，达到 128 种组合时清空重建。每个 context 持有进程级 webpki 信任库，而不是 `SslConnector::builder` 默认解析的系统 CA 证书包，因此拨号不再解析证书，存活连接也不会各自占用一份 CA 副本。
+
 ### 进程级 TLS profile
 
 `tls_implementation = "utls"` 在进程范围启用唯一实现的 Chrome-oriented
