@@ -415,15 +415,19 @@ fn do_tproxy_wan_egress_tcp(
             ip_version,
             true,
         );
-        let (mut decision, generation) =
-            match crate::route::route(&mut pkt.routing_input, pname, &mut pkt.route_witness.output)
-            {
-                Ok(result) => result,
-                Err(_) => return Err(TC_ACT_SHOT),
-            };
+        let flags = crate::maps::datapath_flags();
+        let (mut decision, generation) = match crate::route::route(
+            &mut pkt.routing_input,
+            pname,
+            flags,
+            &mut pkt.route_witness.output,
+        ) {
+            Ok(result) => result,
+            Err(_) => return Err(TC_ACT_SHOT),
+        };
         routing_generation = generation;
 
-        decision.apply_mode_flags(crate::maps::datapath_flags(), tuples.five.dst_port);
+        decision.apply_mode_flags(flags, tuples.five.dst_port);
         outbound = decision.handoff_outbound();
         mark = decision.mark;
         must = decision.must != 0;
@@ -791,14 +795,19 @@ fn do_tproxy_wan_egress_udp(
         ip_version,
         true,
     );
-    let (mut decision, generation) =
-        match crate::route::route(&mut pkt.routing_input, pname, &mut pkt.route_witness.output) {
-            Ok(result) => result,
-            Err(_) => return Err(TC_ACT_SHOT),
-        };
+    let flags = crate::maps::datapath_flags();
+    let (mut decision, generation) = match crate::route::route(
+        &mut pkt.routing_input,
+        pname,
+        flags,
+        &mut pkt.route_witness.output,
+    ) {
+        Ok(result) => result,
+        Err(_) => return Err(TC_ACT_SHOT),
+    };
     let routing_generation = generation;
 
-    decision.apply_mode_flags(crate::maps::datapath_flags(), tuples.five.dst_port);
+    decision.apply_mode_flags(flags, tuples.five.dst_port);
     outbound = decision.handoff_outbound();
     mark = decision.mark;
     must = decision.must != 0;

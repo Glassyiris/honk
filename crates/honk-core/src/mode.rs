@@ -296,6 +296,7 @@ pub struct DatapathFlagsHandle {
 struct DatapathFlagsState {
     nfqueue_enabled: bool,
     nfqueue_ready: bool,
+    trace_enabled: bool,
     initialized: bool,
     quiescence_failed: bool,
 }
@@ -308,6 +309,9 @@ impl DatapathFlagsState {
             if self.nfqueue_ready {
                 flags |= honk_ebpf_common::DATAPATH_FLAG_NFQ_READY;
             }
+        }
+        if self.trace_enabled {
+            flags |= honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED;
         }
         flags
     }
@@ -341,6 +345,7 @@ impl DatapathFlagsHandle {
                 state: DatapathFlagsState {
                     nfqueue_enabled: false,
                     nfqueue_ready: false,
+                    trace_enabled: false,
                     initialized: false,
                     quiescence_failed: false,
                 },
@@ -492,6 +497,37 @@ impl DatapathFlagsHandle {
         .map(|_| ())
     }
 
+    /// Optional observation only: retain the applied state on write failure and
+    /// retry on the next maintenance pass without fencing business traffic.
+    /// `recording` must be a side-effect-free effective Settings snapshot.
+    #[cfg(feature = "native-api")]
+    pub(crate) async fn reconcile_kernel_trace(
+        &self,
+        recording: impl Fn() -> bool,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
+        if !inner.state.initialized || inner.state.trace_enabled == recording() {
+            return Ok(());
+        }
+        let backend = Arc::clone(&inner.backend);
+        let mut backend = backend.write().await;
+        // Demand may have changed while waiting for either publication lock.
+        // The callback takes only a synchronous Settings snapshot, never a guard
+        // across await; terminal disable cannot be undone by this publisher.
+        let enabled = recording();
+        if inner.state.trace_enabled == enabled {
+            return Ok(());
+        }
+        let mut next = inner.state.clone();
+        next.trace_enabled = enabled;
+        let flags = next.compose(&inner.mode_state.read());
+        backend
+            .set_datapath_flags(flags)
+            .context("failed to publish kernel trace admission")?;
+        inner.state = next;
+        Ok(())
+    }
+
     pub async fn set_mode(&self, mode: &str) -> anyhow::Result<()> {
         let mode = ModeState::normalize(mode).context("invalid clash mode")?;
         self.update(false, move |state, current| {
@@ -552,6 +588,7 @@ impl DatapathFlagsHandle {
             anyhow::ensure!(state.initialized, "datapath flags are not initialized");
             state.nfqueue_enabled = false;
             state.nfqueue_ready = false;
+            state.trace_enabled = false;
             state.initialized = false;
             Ok(Persistence::None)
         })
@@ -782,5 +819,113 @@ mod tests {
             writes.lock().as_slice(),
             [RULE | ENABLED | READY, ALL | ENABLED | READY]
         );
+    }
+
+    #[cfg(feature = "native-api")]
+    #[tokio::test]
+    async fn trace_publication_retries_failure_without_changing_mode_or_nfqueue() {
+        use honk_ebpf_common::{
+            DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_NFQ_READY as READY,
+            DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_TRACE_ENABLED as TRACE,
+        };
+        let (handle, _, writes, backend) = flags_fixture();
+        handle.initialize(true, true).await.unwrap();
+        for (previous, desired) in [(false, true), (true, false)] {
+            backend
+                .write()
+                .await
+                .arm_datapath_flags_write_fault(1)
+                .unwrap();
+            assert!(handle.reconcile_kernel_trace(|| desired).await.is_err());
+            assert_eq!(handle.inner.lock().await.state.trace_enabled, previous);
+            handle.set_mode("Direct").await.unwrap();
+            assert_eq!(
+                writes.lock().last().copied(),
+                Some(ALL | ENABLED | READY | if previous { TRACE } else { 0 })
+            );
+            handle.reconcile_kernel_trace(|| desired).await.unwrap();
+            assert_eq!(
+                writes.lock().last().copied(),
+                Some(ALL | ENABLED | READY | if desired { TRACE } else { 0 })
+            );
+            let count = writes.lock().len();
+            handle.reconcile_kernel_trace(|| desired).await.unwrap();
+            assert_eq!(
+                writes.lock().len(),
+                count,
+                "unchanged demand must not write"
+            );
+        }
+        handle.reconcile_kernel_trace(|| true).await.unwrap();
+        let (fenced, mode) = tokio::join!(handle.fence_nfqueue(), handle.set_mode("Global"));
+        fenced.unwrap();
+        mode.unwrap();
+        handle.set_global_selection("direct".into()).await.unwrap();
+        assert_eq!(writes.lock().last().copied(), Some(ALL | ENABLED | TRACE));
+        handle.reopen_nfqueue().await.unwrap();
+        assert_eq!(
+            writes.lock().last().copied(),
+            Some(ALL | ENABLED | READY | TRACE)
+        );
+        handle.disable().await.unwrap();
+        assert_eq!(writes.lock().last().copied(), Some(ALL));
+        let count = writes.lock().len();
+        handle.reconcile_kernel_trace(|| true).await.unwrap();
+        assert_eq!(
+            writes.lock().len(),
+            count,
+            "terminal disable cannot be reopened"
+        );
+    }
+
+    #[cfg(feature = "native-api")]
+    #[tokio::test]
+    async fn trace_publication_rechecks_demand_after_backend_wait() {
+        use honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED as TRACE;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (handle, _, writes, backend) = flags_fixture();
+        handle.initialize(true, true).await.unwrap();
+        let recording = AtomicBool::new(true);
+        let held = backend.write().await;
+        let pending = handle.reconcile_kernel_trace(|| recording.load(Ordering::Acquire));
+        tokio::pin!(pending);
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        recording.store(false, Ordering::Release);
+        drop(held);
+        pending.await.unwrap();
+        assert_eq!(
+            writes.lock().len(),
+            1,
+            "a withdrawn enable must not publish"
+        );
+        handle.reconcile_kernel_trace(|| true).await.unwrap();
+        assert_ne!(writes.lock().last().unwrap() & TRACE, 0);
+        let held = backend.write().await;
+        let pending = handle.reconcile_kernel_trace(|| recording.load(Ordering::Acquire));
+        tokio::pin!(pending);
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        recording.store(true, Ordering::Release);
+        drop(held);
+        pending.await.unwrap();
+        assert_eq!(
+            writes.lock().len(),
+            2,
+            "a withdrawn disable must not publish"
+        );
+        recording.store(false, Ordering::Release);
+        let held = backend.write().await;
+        let pending = handle.reconcile_kernel_trace(|| recording.load(Ordering::Acquire));
+        tokio::pin!(pending);
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        let disabled = handle.disable();
+        tokio::pin!(disabled);
+        assert!(futures::poll!(disabled.as_mut()).is_pending());
+        drop(held);
+        pending.await.unwrap();
+        disabled.await.unwrap();
+        assert_eq!(writes.lock().last().unwrap() & TRACE, 0);
+        let count = writes.lock().len();
+        handle.reconcile_kernel_trace(|| true).await.unwrap();
+        assert_eq!(writes.lock().len(), count);
     }
 }

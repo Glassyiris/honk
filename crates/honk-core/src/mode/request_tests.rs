@@ -236,10 +236,12 @@ async fn refresh_retains_identity_and_missing_or_recreated_targets_fail_closed()
 async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
     use honk_ebpf_common::{
         DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+        DATAPATH_FLAG_TRACE_ENABLED as TRACE,
     };
     let config = config();
     let catalog = Catalog::new(&config);
     let (flags, backend) = owner(ModeState::native(), None).await;
+    flags.reconcile_kernel_trace(|| true).await.unwrap();
     flags
         .set_clash_mode("Direct", &config, &catalog.snapshot().groups)
         .await
@@ -258,7 +260,7 @@ async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
         assert_eq!(flags.snapshot().selection, Selection::Target(None));
         assert_eq!(
             backend.datapath_flags_write_log().last().copied(),
-            Some(RULE | ENABLED)
+            Some(RULE | ENABLED | TRACE)
         );
     }
     // A no-op explicit activation has the same reset semantics; ordinary reads do not.

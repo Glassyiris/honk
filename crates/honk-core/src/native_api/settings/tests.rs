@@ -425,3 +425,90 @@ async fn recorder_modes_and_activation_preserve_separate_demand() {
         drop(admitted);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn kernel_trace_admission_follows_only_effective_flow_recording() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE, DATAPATH_FLAG_TRACE_ENABLED as TRACE,
+    };
+    let config = Config::default();
+    let owner = NativeObservation::new(&config);
+    let mock = crate::ebpf::mock::MockEbpfBackend::new();
+    let writes = Arc::clone(&mock.datapath_flags_writes);
+    let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>> =
+        Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
+    let flags = crate::mode::DatapathFlagsHandle::new(
+        backend,
+        Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
+            "Rule", "Proxy",
+        ))),
+        None,
+    );
+    flags.initialize(false, false).await.unwrap();
+    let check = async |expected| {
+        owner.settings.maintain(&owner);
+        flags
+            .reconcile_kernel_trace(|| owner.settings.flow_recording())
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.lock().last().copied(),
+            Some(RULE | if expected { TRACE } else { 0 })
+        );
+    };
+    let patch = |mode| {
+        owner
+            .settings
+            .patch(
+                &owner,
+                &config.experimental.native_api,
+                serde_json::from_value(json!({"record_flows": mode})).unwrap(),
+                &RequestId("trace-demand".into()),
+            )
+            .unwrap();
+    };
+    check(false).await;
+    let unrelated = stream(
+        &owner,
+        Demand {
+            logs: true,
+            dns_log: true,
+            ..Demand::NONE
+        },
+    );
+    check(false).await;
+    let flow = stream(&owner, Demand::FLOWS);
+    check(true).await;
+    patch("off");
+    check(false).await;
+    owner.settings.activate(&owner, &config);
+    check(true).await;
+    drop(flow);
+    tokio::time::advance(Duration::from_secs(59)).await;
+    check(true).await;
+    owner.settings.renew(&owner, Demand::DNS_LOG);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    check(false).await;
+    patch("on");
+    check(true).await;
+    owner.settings.activate(&owner, &config);
+    check(false).await;
+    patch("on");
+    check(true).await;
+    owner.settings.shutdown(&owner);
+    check(false).await;
+    owner.settings.activate(&owner, &config);
+    owner.settings.renew(&owner, Demand::FLOWS);
+    check(false).await;
+    drop(unrelated);
+
+    let mut forbidden = config;
+    forbidden.experimental.native_api.record_flows = false;
+    let owner = NativeObservation::new(&forbidden);
+    let _flow = stream(&owner, Demand::FLOWS);
+    flags
+        .reconcile_kernel_trace(|| owner.settings.flow_recording())
+        .await
+        .unwrap();
+    assert_eq!(writes.lock().last().copied(), Some(RULE));
+}
