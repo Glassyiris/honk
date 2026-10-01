@@ -13,8 +13,9 @@ mod tests;
 use self::collection::DialerCollection;
 use crate::group::{ScoreFeedback, ScoreSelectionContext};
 pub use observations::{
-    GroupHealthObservation, GroupProbeContext, HealthMeasurement, HealthObservation, HealthPurpose,
-    HealthState, HealthTransport, HealthWarmth, ProbeMeasurement, ProbeTicket, UrlProbeMember,
+    GroupHealthObservation, GroupProbeContext, HealthAverages, HealthMeasurement,
+    HealthObservation, HealthPurpose, HealthState, HealthTransport, HealthWarmth, ProbeMeasurement,
+    ProbeTicket, UrlProbeMember,
 };
 use parking_lot::{Mutex, RwLock};
 pub use probe::{HealthCheckError, HealthProbePermit, ProbeCancellation};
