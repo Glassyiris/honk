@@ -299,6 +299,8 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 `observe/flows/dns.rs` 与 outbound flow observer 为 scoped/retained 工作绑定实际 lookup、attempt 与 generation 身份。会话 attachment、逻辑 open/readiness 重试与新物理连接、协议确认分开。可选异步 scope 借用调用方 pin 的操作，不复制大型 future 状态；pin 不越过操作的所有权/析构边界。内核证据使用不可变编译字典与报文绑定 witness；UDP receive priority 来自原生辅助元数据，或严格对应 syscall/batch 的 receiver-owned fallback。丢失只改变证据，不改变路由或报文交付。
 
+既有原生 sampler 通过 `DatapathFlagsHandle` 同步实际 flow 需求，保留模式/NFQUEUE 位，仅在后端写入成功后提交追踪准入。等待后端所有权后重新读取需求，sampler 停止并 join 后再同步一次；不新增 writer、timer 或路由重编译。内核对每次调用复用同一 flags 快照来控制可选 witness 生产，已保留的捕获与真实路由判定不受后续需求变化重解释。
+
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api)。
 
 出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
