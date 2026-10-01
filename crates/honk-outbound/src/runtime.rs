@@ -551,17 +551,17 @@ impl NodeRuntime {
 
     /// Scope protocol jobs to this runtime, never to a caller's probe owner.
     /// Callers retain and drain their own dialing future before final shutdown.
-    pub async fn scope_tasks<T, F>(&self, future: F) -> anyhow::Result<T>
+    pub fn scope_tasks<T, F>(&self, future: F) -> impl Future<Output = anyhow::Result<T>>
     where
         F: Future<Output = anyhow::Result<T>>,
     {
         #[cfg(feature = "owned-tasks")]
         match &self.task_owner {
-            Some(owner) => owner.scope(future).await,
-            None => tasks::scope_owner(None, future).await,
+            Some(owner) => futures_util::future::Either::Left(owner.scope(future)),
+            None => futures_util::future::Either::Right(tasks::scope_owner(None, future)),
         }
         #[cfg(not(feature = "owned-tasks"))]
-        future.await
+        future
     }
 
     pub(crate) fn task_scope(&self) -> TaskScope {
