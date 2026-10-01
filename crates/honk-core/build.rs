@@ -227,6 +227,10 @@ fn embed_ebpf_object() {
                 && std::fs::read_to_string(p.with_extension("toolchain"))
                     .is_ok_and(|built_channel| built_channel == channel)
                 && !object_stale(
+                    &p.with_extension("toolchain"),
+                    &[manifest_dir.join("build.rs").as_path()],
+                )
+                && !object_stale(
                     &p,
                     &src_dirs.iter().map(|d| d.as_path()).collect::<Vec<_>>(),
                 ) =>
@@ -247,30 +251,38 @@ fn embed_ebpf_object() {
             // Missing, or stale without .BTF (e.g. built while an environment
             // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
             println!("cargo:warning=Building eBPF object with {channel}...");
-            let status = Command::new("cargo")
-                .arg(format!("+{channel}"))
-                .args([
-                    "build",
-                    "--release",
-                    "-Zbuild-std=core",
-                    "--target",
-                    "bpfel-unknown-none",
-                ])
-                // Cargo exports its absolute host rustc path to build scripts.
-                // Let the selected nightly resolve its own compiler and sysroot.
-                .env_remove("RUSTC")
-                // An inherited RUSTFLAGS would override the crate's
-                // .cargo/config.toml rustflags (--btf, debuginfo) and silently
-                // produce a BTF-less object again.
-                .env_remove("RUSTFLAGS")
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                // Parent workspace analysis must not turn this separate build into clippy.
-                .env_remove("RUSTC_WORKSPACE_WRAPPER")
-                .env_remove("CLIPPY_ARGS")
-                .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
-                .current_dir(&ebpf_crate)
-                .status()
-                .expect("failed to build eBPF object");
+            let status = {
+                let mut command = Command::new("cargo");
+                for (key, _) in std::env::vars_os() {
+                    if key.as_encoded_bytes().starts_with(b"CARGO_PROFILE_") {
+                        command.env_remove(key);
+                    }
+                }
+                command
+            }
+            .arg(format!("+{channel}"))
+            .args([
+                "build",
+                "--release",
+                "-Zbuild-std=core",
+                "--target",
+                "bpfel-unknown-none",
+            ])
+            // Cargo exports its absolute host rustc path to build scripts.
+            // Let the selected nightly resolve its own compiler and sysroot.
+            .env_remove("RUSTC")
+            // An inherited RUSTFLAGS would override the crate's
+            // .cargo/config.toml rustflags (--btf, debuginfo) and silently
+            // produce a BTF-less object again.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            // Parent workspace analysis must not turn this separate build into clippy.
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CLIPPY_ARGS")
+            .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
+            .current_dir(&ebpf_crate)
+            .status()
+            .expect("failed to build eBPF object");
 
             if !status.success() {
                 panic!(
