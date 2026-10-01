@@ -95,8 +95,8 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     Ok(socket.into())
 }
 
-// A dead client is reaped after IDLE + INTERVAL * RETRIES = 2 minutes of silence.
-const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+// A dead client is reaped after IDLE + INTERVAL * RETRIES = about an hour of silence.
+const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(3600);
 #[cfg(target_os = "linux")]
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(target_os = "linux")]
