@@ -139,6 +139,8 @@ Flow 事件需求指显式 `kinds` 包含 `flow.updated` 或 `flow.gap`，或非
 
 `record_flows` 默认为 true，允许在 flow 诊断需求有效时记录。显式运行时设置 `record_flows: "on"` 可在无客户端时持续记录；运行时 `"off"` 强制关闭，配置中的 `record_flows: false` 禁止记录，修改后需重启。实际记录停止时释放 flow 记录和快照。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
 
+内核 witness 生产通过既有组合 datapath flags 跟随实际 flow 记录状态。既有 sampler 在后续 tick 同步变化；调度、telemetry 与发布锁竞争可能延迟收敛，不承诺固定一秒内完成。启用发布前已路由的流量可以明确报告内核证据缺失。关闭需求不丢弃已保留的 witness/字典，不改变路由或 NFQUEUE 权威，也不撤销操作已经取得的捕获资格。未录制的操作跳过 witness 解码。
+
 Flow ID 表示 incarnation，不是五元组。TCP/UDP 捕获真实执行的路由谓词与短路、嗅探/校验、群组选择、DNS 子查询、物理尝试、会话复用/重试及终态边界；拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次来自实际使用它们的操作，不按当前配置或路由模拟重建。DNS lookup/parent ID 与 outbound attempt/parent ID 保留因果关系；复用 carrier 记录为 attachment，不伪造新物理拨号。协议请求/确认 milestone 必须有真实协议证据，DNS 子步骤就绪不能成为业务目标确认。TCP/UDP 终态跟随所属清理边界；内核 offload 以 unknown 结束观察，不伪造 closed。
 
 只有该 flow 范围内截至当前进度已执行的决策均被捕获，`trace_status` 与 `trace.status` 才是 `complete`。Active、failed、closed 均可完整；这不代表成功或全局覆盖。来源缺失/歧义、监听凭据值遮蔽及捕获预算耗尽，会保持 `partial` 并列出 `missing` 原因；达到 trace 上限不停止转发。用户态 TCP/UDP 和截获 DNS 的总体覆盖仍为 `partial`，仅内核处理的 direct/block/bypass 仍为 `none`，不开放 `full_transparency`。
@@ -171,6 +173,8 @@ Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，
 ### 原生事件
 
 使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。16 个名额已满时新连接返回 `503 temporarily_unavailable` 并带 `Retry-After`。每 15 秒 heartbeat。每个连接都先发送 ready；有效续传的顺序为 ready→replay→live，ready 保留请求 cursor，之后由 replay 推进，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
+
+每条事件/日志记录最多为其首个精确过滤绑定缓存一份完整 frame；其他绑定仍独立签名。既有 2 MiB 留存 ring 预算在发布前预留 payload、一份可能的缓存 frame 及 cache cell，因此接近单条上限的 payload 可能在达到笔数上限前过期。该 ring 预算不是所有排队或 HTTP 持有引用的进程级内存上限。
 
 新连接的 ready 游标是不透明检查点，不是保留的事件记录。旧历史已经过期时，新签发的检查点仍可立即续传；它不会恢复已淘汰的记录游标，也不能跨过更新事件的丢失。时间、过滤器、instance 与记录重置检查保持有效。顺序指投递/重放位置，不是游标字节的排序。
 
