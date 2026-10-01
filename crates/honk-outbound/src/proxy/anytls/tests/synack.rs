@@ -86,11 +86,23 @@ async fn reused_v2_session_requires_synack_within_deadline() {
     tokio::task::yield_now().await;
 
     assert!(
-        session.is_closed(),
-        "a missing SYNACK retires the reused session"
+        !session.is_closed(),
+        "one silent window must not kill the carrier's other streams"
+    );
+    assert_eq!(
+        crate::session::ManagedSession::state(&*session),
+        crate::session::SessionState::Draining,
+        "a silent carrier takes no new streams"
     );
     let error = third.read_u8().await.unwrap_err();
     assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+
+    tokio::time::advance(SILENT_SESSION_GRACE).await;
+    tokio::task::yield_now().await;
+    assert!(
+        session.is_closed(),
+        "a carrier that stays silent through the grace period is retired"
+    );
     drop((first, second));
 }
 
@@ -300,6 +312,76 @@ async fn synack_timeout_on_active_session_resets_only_the_stream() {
         (cmd, sid, payload.as_slice()),
         (CMD_PSH, first.sid, b"still live".as_slice())
     );
+    session.close();
+}
+
+/// A loss burst silences every stream at once. Only the unanswered open may
+/// fail; the siblings must survive and the carrier must live on once frames
+/// flow again (it used to be retired, resetting every stream on it).
+#[tokio::test(start_paused = true)]
+async fn silent_window_resets_only_the_open_and_a_recovering_carrier_survives() {
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let mut first = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = session
+        .open_stream_direct(
+            vec![0x01, 2, 2, 2, 2, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        read_frame(&mut server).await.unwrap();
+    }
+    write_frame(&mut server, CMD_SYNACK, second.sid, &[])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    let mut third = session
+        .open_stream_direct(
+            vec![0x01, 3, 3, 3, 3, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        read_frame(&mut server).await.unwrap();
+    }
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(SYNACK_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let error = third.read_u8().await.unwrap_err();
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+    assert!(!session.is_closed());
+    assert!(session.streams.lock().unwrap().contains_key(&first.sid));
+    assert!(session.streams.lock().unwrap().contains_key(&second.sid));
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    write_frame(&mut server, CMD_PSH, first.sid, b"late")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(SILENT_SESSION_GRACE).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !session.is_closed(),
+        "frames arrived after the silent window, so the carrier is alive"
+    );
+    let mut buf = [0u8; 4];
+    first.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"late");
     session.close();
 }
 
