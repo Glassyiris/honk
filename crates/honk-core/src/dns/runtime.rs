@@ -39,7 +39,7 @@ mod resources {
         fn tasks_failed(&self) -> bool {
             false
         }
-        fn reap_idle_resources(&self, _now: std::time::Instant) -> usize {
+        fn reap_idle_resources(&self) -> usize {
             0
         }
     }
@@ -54,8 +54,8 @@ mod resources {
             UpstreamPool::tasks_failed(self)
         }
 
-        fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
-            UpstreamPool::reap_idle_resources(self, now)
+        fn reap_idle_resources(&self) -> usize {
+            UpstreamPool::reap_idle_resources(self)
         }
     }
 }
@@ -194,8 +194,8 @@ impl DnsRuntime {
         &self.parts.routing_projection
     }
 
-    pub(crate) fn reap_idle_resources(&self, now: std::time::Instant) -> usize {
-        self.parts.transport.reap_idle_resources(now)
+    pub(crate) fn reap_idle_resources(&self) -> usize {
+        self.parts.transport.reap_idle_resources()
     }
 
     pub(crate) fn cache(&self) -> Arc<tokio::sync::Mutex<super::cache::DnsCache>> {
