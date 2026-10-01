@@ -5,9 +5,9 @@ use crate::ebpf::real::RealEbpfBackend;
 use crate::routing::{Router, golden};
 use honk_config::types::DialMode;
 use honk_ebpf_common::{
-    DaeParam, DomainRouting, KernelRouteOutput, ROUTE_FACT_DOMAIN, ROUTE_FACT_PRESENT_SHIFT,
-    ROUTE_FACT_SOURCE, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_ENABLED, ROUTE_TRACE_OVERFLOW,
-    ROUTE_TRACE_VALUES, ROUTE_TRACE_VERSION, ROUTING_POLICY_ROOT_NAME,
+    DATAPATH_FLAG_TRACE_ENABLED, DaeParam, DomainRouting, KernelRouteOutput, ROUTE_FACT_DOMAIN,
+    ROUTE_FACT_PRESENT_SHIFT, ROUTE_FACT_SOURCE, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_ENABLED,
+    ROUTE_TRACE_OVERFLOW, ROUTE_TRACE_VALUES, ROUTE_TRACE_VERSION,
 };
 
 fn compile(source: &str) -> (Router, RoutingPushPlan) {
@@ -68,9 +68,16 @@ fn branch_witness_keeps_port_order_missing_negation_and_consumed_domain_facts() 
     let miss = [2, 2, 0, 2, 1, 2, 2, 1, 2, 0, 1, 1, 1, 1, 0];
     let hit = [2, 2, 0, 2, 1, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0];
     let mut retained = None;
-    for capture in [true, false, true] {
-        plan.enable_trace(capture);
+    for (compiled, capture) in [(true, false), (true, true), (false, true), (true, true)] {
+        plan.enable_trace(compiled);
         backend.publish_routing_plan(&plan, &[]).unwrap();
+        backend
+            .set_datapath_flags(if capture {
+                DATAPATH_FLAG_TRACE_ENABLED
+            } else {
+                0
+            })
+            .unwrap();
         for state in 0..4 {
             let bitmap = match state {
                 0 | 3 => {
@@ -100,7 +107,7 @@ fn branch_witness_keeps_port_order_missing_negation_and_consumed_domain_facts() 
             let actual = backend.run_routing_test(&packet).unwrap();
             assert_eq!(actual.status, 0);
             assert_eq!(actual.decision, expected);
-            if capture {
+            if compiled && capture {
                 assert_eq!(actual.trace.decision, expected);
                 assert_eq!(actual.trace.input, packet);
                 assert_eq!(actual.trace.domain_bitmap, bitmap);
@@ -170,6 +177,9 @@ fn folded_and_unreachable_conditions_have_no_invented_runtime_outcomes() {
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
+    backend
+        .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
+        .unwrap();
     let mut connection = golden::connection();
     connection.dst_port = 80;
     let actual = backend.run_routing_test(&input(&connection)).unwrap();
@@ -194,18 +204,6 @@ fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
-    let mut descriptor = {
-        let root = backend
-            .bpf()
-            .unwrap()
-            .map(ROUTING_POLICY_ROOT_NAME)
-            .unwrap();
-        let root =
-            aya::maps::ArrayOfMaps::<_, super::super::RoutingDescriptor>::try_from(root).unwrap();
-        root.get(&0, 0).unwrap()
-    };
-    let admitted = descriptor.get(&0, 0).unwrap();
-    assert_ne!(admitted.trace_policy, 0);
     #[cfg(feature = "native-api")]
     let dictionaries = {
         use crate::observe::flows::kernel::{KernelTraceDictionaries, KernelTraceDictionary};
@@ -219,15 +217,12 @@ fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
         KernelTraceDictionaries::default()
     };
     for capture in [true, false, true] {
-        descriptor
-            .set(
-                0,
-                honk_ebpf_common::RoutingPolicyDescriptor {
-                    trace_policy: if capture { admitted.trace_policy } else { 0 },
-                    ..admitted
-                },
-                0,
-            )
+        backend
+            .set_datapath_flags(if capture {
+                DATAPATH_FLAG_TRACE_ENABLED
+            } else {
+                0
+            })
             .unwrap();
         for (port, rule_id, overflow) in [
             (1000, 0, false),
@@ -330,9 +325,16 @@ fn capture_preserves_every_golden_decision_before_and_after_dns_override() {
         DialMode::DomainPlusPlus,
     ] {
         let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), mode).unwrap();
-        for capture in [false, true] {
-            plan.enable_trace(capture);
+        for (compiled, capture) in [(false, false), (false, true), (true, false), (true, true)] {
+            plan.enable_trace(compiled);
             backend.publish_routing_plan(&plan, &[]).unwrap();
+            backend
+                .set_datapath_flags(if capture {
+                    DATAPATH_FLAG_TRACE_ENABLED
+                } else {
+                    0
+                })
+                .unwrap();
             for case in &cases {
                 let packet = input(&case.connection);
                 let key = crate::ebpf::maps::ip_addr_to_lpm_key(case.connection.dst_ip);
@@ -362,7 +364,7 @@ fn capture_preserves_every_golden_decision_before_and_after_dns_override() {
                 let actual = backend.run_routing_test(&packet).unwrap();
                 assert_eq!(actual.status, 0, "{mode:?}/{}", case.label);
                 assert_eq!(actual.decision, final_decision, "{mode:?}/{}", case.label);
-                if capture {
+                if compiled && capture {
                     assert_eq!(actual.trace.decision, generated, "{mode:?}/{}", case.label);
                     assert_eq!(
                         actual.trace.flags & (ROUTE_TRACE_ENABLED | ROUTE_TRACE_COMPLETE),

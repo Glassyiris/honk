@@ -8,12 +8,12 @@
 use aya_ebpf::bindings::__sk_buff;
 
 use aya_ebpf_cty::c_long;
-use honk_ebpf_common::{KernelRouteOutput, KernelRouteWitness};
 use honk_ebpf_common::{
-    L4ProtoType, ROUTE_TRACE_AMBIGUOUS, ROUTE_TRACE_DNS_OVERRIDE, ROUTE_TRACE_ENABLED,
-    ROUTE_TRACE_LOST, ROUTE_TRACE_VERSION, ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN,
-    RoutingDecision, RoutingInput,
+    DATAPATH_FLAG_TRACE_ENABLED, L4ProtoType, ROUTE_TRACE_AMBIGUOUS, ROUTE_TRACE_DNS_OVERRIDE,
+    ROUTE_TRACE_ENABLED, ROUTE_TRACE_LOST, ROUTE_TRACE_VERSION, ROUTING_FEATURE_PROCESS,
+    ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
 };
+use honk_ebpf_common::{KernelRouteOutput, KernelRouteWitness};
 
 use crate::{
     errno::{EFAULT, EINVAL, ENOEXEC},
@@ -141,6 +141,7 @@ fn evaluate_policy(
     input: &mut RoutingInput,
     pname: Option<&[u8; 16]>,
     input_is_canonical: bool,
+    flags: u32,
     output: &mut KernelRouteOutput,
 ) -> (i32, RoutingDecision, u64) {
     let zero = 0u32;
@@ -150,6 +151,7 @@ fn evaluate_policy(
     };
     let generation = descriptor.generation;
     let policy_id = descriptor.trace_policy;
+    let trace_enabled = policy_id != 0 && flags & DATAPATH_FLAG_TRACE_ENABLED != 0;
     if !input_is_canonical {
         if input.is_wan != 0
             && descriptor.features & ROUTING_FEATURE_PROCESS != 0
@@ -161,7 +163,7 @@ fn evaluate_policy(
             input.pname_len = 0;
         }
     }
-    if policy_id != 0 {
+    if trace_enabled {
         output.flags = ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED;
     }
     let status = match descriptor.slot {
@@ -175,14 +177,14 @@ fn evaluate_policy(
             let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
-        if policy_id != 0 {
+        if trace_enabled {
             for word in DECISION_WORDS..OUTPUT_WORDS {
                 let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }
         }
     }
-    if policy_id != 0 {
+    if trace_enabled {
         output.generation = generation;
         output.policy_id = policy_id;
     }
@@ -193,7 +195,7 @@ fn evaluate_policy(
         && decision.must == 0
     {
         decision.outbound = OUTBOUND_CONTROL_PLANE_ROUTING as u32;
-        if policy_id != 0 {
+        if trace_enabled {
             output.flags |= ROUTE_TRACE_DNS_OVERRIDE;
         }
     }
@@ -205,9 +207,10 @@ fn evaluate_policy(
 pub fn route(
     input: &mut RoutingInput,
     pname: Option<&[u8; 16]>,
+    flags: u32,
     output: &mut KernelRouteOutput,
 ) -> Result<(RoutingDecision, u64), c_long> {
-    let (status, decision, generation) = evaluate_policy(input, pname, false, output);
+    let (status, decision, generation) = evaluate_policy(input, pname, false, flags, output);
     if status == 0 {
         Ok((decision, generation))
     } else if status < 0 {
@@ -230,8 +233,13 @@ pub fn routing_test(_ctx: *mut __sk_buff) -> c_long {
         result.status = -EFAULT;
         return crate::action::TC_ACT_OK;
     };
-    let (status, decision, _) =
-        evaluate_policy(unsafe { &mut *input }, None, true, &mut result.trace);
+    let (status, decision, _) = evaluate_policy(
+        unsafe { &mut *input },
+        None,
+        true,
+        crate::maps::datapath_flags(),
+        &mut result.trace,
+    );
     result.status = status;
     result.decision = decision;
     crate::action::TC_ACT_OK
