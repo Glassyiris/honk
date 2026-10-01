@@ -68,6 +68,9 @@ const DEFAULT_PADDING_SCHEME: &[u8] = b"stop=8\n\
 7=500-1000";
 /// Reused v2 sessions must prove that a newly opened target is still live.
 const SYNACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// A session that stays fully silent this long after a missed SYNACK is
+/// retired together with its streams.
+const SILENT_SESSION_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct PaddingScheme {
@@ -536,9 +539,27 @@ impl AnyTlsSession {
                     .dispatch_error(sid, crate::SharedError::new(error))
                     .await;
             } else {
-                session.fail(anyhow::anyhow!(
-                    "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
-                ));
+                // Loss bursts silence every stream at once and TCP delivers
+                // afterwards, so one missed open must not reset its siblings:
+                // stop offering the carrier, fail only this open, and retire the
+                // carrier if it stays silent through the grace period.
+                crate::session::ManagedSession::begin_drain(&*session);
+                let silent_marker = session.rx_frame_seq.load(Ordering::Relaxed);
+                let error = anyhow::anyhow!("stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}");
+                session
+                    .dispatch_error(
+                        sid,
+                        crate::SharedError::new(anyhow::Error::new(crate::proxy::NodeFailure(error))),
+                    )
+                    .await;
+                tokio::time::sleep(SILENT_SESSION_GRACE).await;
+                if !session.is_closed()
+                    && session.rx_frame_seq.load(Ordering::Relaxed) == silent_marker
+                {
+                    session.fail(anyhow::anyhow!(
+                        "session silent for {SILENT_SESSION_GRACE:?} after stream {sid} SYNACK timeout"
+                    ));
+                }
             }
         });
     }
