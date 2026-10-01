@@ -323,7 +323,7 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
     assert!(relay.await.unwrap_err().is_cancelled());
 }
 
-#[cfg(feature = "flow-observation")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn runtime_shutdown_joins_vmess_relay_with_live_stream() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

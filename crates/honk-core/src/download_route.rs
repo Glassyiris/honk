@@ -481,14 +481,19 @@ async fn get(
         plain = marked_http::Client::plain();
         &plain
     };
-    let response = client
-        .get_over(
+    let prepared = client
+        .prepare_over(
             stream,
             request.url,
             request.headers,
             request.deadline.headers,
         )
-        .await?;
+        .await
+        .map_err(|error| error.stage)?;
+    let response = timeout_at(request.deadline.headers, marked_http::send(prepared))
+        .await
+        .map_err(|_| "download_timeout")?
+        .map_err(|error| error.stage)?;
     marked_http::read(
         response,
         request.wants_body,
@@ -496,4 +501,5 @@ async fn get(
         request.max_bytes,
     )
     .await
+    .map_err(|error| error.stage)
 }

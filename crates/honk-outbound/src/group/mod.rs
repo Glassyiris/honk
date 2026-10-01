@@ -45,9 +45,11 @@ pub use score::{
     ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
     ScoreVerificationState, ScoreWaitReason,
 };
+#[cfg(test)]
+pub use state::SelectorChoices;
 pub use state::{
-    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorChoices, SelectorError,
-    SelectorMember, SelectorNetworks, SelectorUpdate,
+    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorError, SelectorMember,
+    SelectorNetworks, SelectorUpdate,
 };
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-

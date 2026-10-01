@@ -250,17 +250,15 @@ protocol = "udp"
 
 #[test]
 fn test_stats_manager_full_workflow() {
-    let mgr = StatsManager::new();
+    let mgr = std::sync::Arc::new(StatsManager::new());
 
-    for _ in 0..10 {
-        mgr.record_connection("proxy-us", honk_core::stats::OutboundKind::Node);
-    }
-    for _ in 0..5 {
-        mgr.record_connection("proxy-jp", honk_core::stats::OutboundKind::Node);
-    }
-
-    mgr.record_close("proxy-us", honk_core::stats::OutboundKind::Node);
-    mgr.record_close("proxy-us", honk_core::stats::OutboundKind::Node);
+    let mut us: Vec<_> = (0..10)
+        .map(|_| mgr.track_connection("proxy-us", honk_core::stats::OutboundKind::Node))
+        .collect();
+    let _jp: Vec<_> = (0..5)
+        .map(|_| mgr.track_connection("proxy-jp", honk_core::stats::OutboundKind::Node))
+        .collect();
+    us.truncate(8);
 
     mgr.record_bytes(
         "proxy-us",

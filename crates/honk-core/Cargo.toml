@@ -81,7 +81,7 @@ quinn.workspace = true
 h3 = { workspace = true, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn.workspace = true
 
-# Persistence (cache_file / cachedb)
+# Persistence (state database)
 rusqlite.workspace = true
 
 # Misc
@@ -118,7 +118,7 @@ ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
 native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
-# Embed the vendored doona distribution for experimental.native_api.ui: embedded.
+# Embed the pinned doona distribution from HONK_DOONA_DIR at build time.
 native-ui = ["native-api"]
 # Route the shipped binary's allocations through mimalloc (see main.rs)
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]

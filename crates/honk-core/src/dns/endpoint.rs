@@ -92,22 +92,6 @@ impl DnsEndpoint {
         self
     }
 
-    /// Resolve host to the first address allowed by the configured strategy.
-    pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
-        let resolve =
-            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve_addrs());
-        crate::observe::scope_pin!(resolve);
-        let (addresses, witness) =
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
-        let selected = addresses?.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
-        })?;
-        if let Some(witness) = witness {
-            witness.selected_ip(selected.ip());
-        }
-        Ok(selected)
-    }
-
     /// Resolve host to every allowed candidate, preferred family first.
     ///
     /// Dialers iterate this list so failure in the preferred family can fall

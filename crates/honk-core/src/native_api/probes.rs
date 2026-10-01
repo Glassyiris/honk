@@ -529,6 +529,8 @@ pub(super) async fn create(
     let service = &state.observation.probes;
     let guard = service.request();
     let bytes = super::body::buffered(request.into_body()).await;
+    let request: ProbeRequest = super::body::decode(&bytes, invalid)?;
+    planning::validate(&request)?;
     let reservation = service.operations.reserve(
         state.principal(),
         "POST",
@@ -545,7 +547,6 @@ pub(super) async fn create(
             if guard.cancel.as_ref().is_none_or(|cancel| *cancel.borrow()) {
                 return Err(unavailable());
             }
-            let request: ProbeRequest = super::body::decode(&bytes, invalid)?;
             let plan = capture(state, request).await?;
             state.require_running()?;
             service.rate.admit(id)?;

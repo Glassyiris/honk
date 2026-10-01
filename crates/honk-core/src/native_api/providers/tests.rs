@@ -25,242 +25,8 @@ const WAIT: Duration = Duration::from_secs(5);
 const OLD: &str = "socks5://127.0.0.1:11080#old";
 const NEW: &str = "socks5://127.0.0.1:11081#new";
 
-struct Origin {
-    address: SocketAddr,
-    requests: mpsc::UnboundedReceiver<TcpStream>,
-    count: Arc<AtomicUsize>,
-    task: JoinHandle<()>,
-}
-
-impl Origin {
-    async fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (sender, requests) = mpsc::unbounded_channel();
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&count);
-        let task = tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut header = Vec::new();
-                while !header.ends_with(b"\r\n\r\n") {
-                    header.push(socket.read_u8().await.unwrap());
-                }
-                observed.fetch_add(1, Ordering::SeqCst);
-                if sender.send(socket).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            address,
-            requests,
-            count,
-            task,
-        }
-    }
-
-    fn subscription(&self) -> Subscription {
-        Subscription {
-            name: "private-provider-tag".into(),
-            url: format!(
-                "http://{}/credential-path?token=private-query#private-fragment",
-                self.address
-            ),
-            update_interval: 0,
-            download_detour: "direct".into(),
-            headers: vec![honk_config::subscription::SubscriptionHeader {
-                key: "Authorization".into(),
-                value: "Bearer private-origin-token".into(),
-            }],
-            ..Default::default()
-        }
-    }
-
-    async fn next(&mut self) -> TcpStream {
-        timeout(WAIT, self.requests.recv()).await.unwrap().unwrap()
-    }
-    async fn stop(self) {
-        self.task.abort();
-        let _ = self.task.await;
-    }
-}
-
-async fn respond(mut socket: TcpStream, body: &str) {
-    socket
-        .write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-}
-
-struct Fixture {
-    address: SocketAddr,
-    client: reqwest::Client,
-    state: Arc<NativeState>,
-    server: NativeServer,
-    subscriptions: SubscriptionSupervisor,
-    commands: mpsc::Sender<ControlCommand>,
-    merges: mpsc::Receiver<ControlCommand>,
-    control: JoinHandle<anyhow::Result<()>>,
-}
-
-impl Fixture {
-    async fn start(
-        mut config: Config,
-        store: Option<SubscriptionStore>,
-        initial_body: Option<&str>,
-        origin: &mut Origin,
-    ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        config.global.nfqueue_enable = false;
-        config.global.store_subscribe = false;
-        config.experimental.native_api.enabled = true;
-        config.experimental.native_api.secret = "provider-admin-token".into();
-        config.experimental.native_api.listen = address.to_string();
-        config.ensure_builtin_nodes();
-        let preparation = tokio::spawn(async move {
-            let owner = SubscriptionSupervisor::prepare(&mut config, store, Vec::new())
-                .await
-                .unwrap();
-            (config, owner)
-        });
-        if let Some(body) = initial_body {
-            respond(origin.next().await, body).await;
-        }
-        let (config, mut subscriptions) = timeout(WAIT, preparation).await.unwrap().unwrap();
-        let resolver = DnsResolver::new(&config.dns).unwrap();
-        let forwarder = resolver.forwarder();
-        let mut control = ControlPlane::new(
-            config,
-            Box::new(MockEbpfBackend::new()),
-            Router::new(&[], "direct").unwrap(),
-            Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
-            resolver,
-            forwarder,
-        )
-        .unwrap();
-        control.set_mode_state(Arc::new(RwLock::new(crate::mode::ModeState::new(
-            "Rule", "",
-        ))));
-        control.start_datapath_flags_coordinator().unwrap();
-        control
-            .install_startup_diagnostics(subscriptions.take_startup_diagnostics())
-            .await;
-        let state = Arc::new(
-            NativeState::new(&mut control, address, SystemTime::now(), Instant::now())
-                .await
-                .unwrap(),
-        );
-        let commands = control.command_sender();
-        let (merge_tx, merges) = mpsc::channel(16);
-        subscriptions.start(merge_tx);
-        state.observation.providers.attach(subscriptions.handle());
-        let control = tokio::spawn(async move {
-            control
-                .run_native_config_test_commands(
-                    Arc::new(AtomicUsize::new(0)),
-                    None,
-                    Arc::default(),
-                )
-                .await
-        });
-        let server = NativeServer::start(listener, Arc::clone(&state));
-        Self {
-            address,
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .default_headers(reqwest::header::HeaderMap::from_iter([(
-                    reqwest::header::AUTHORIZATION,
-                    reqwest::header::HeaderValue::from_static("Bearer provider-admin-token"),
-                )]))
-                .timeout(WAIT)
-                .build()
-                .unwrap(),
-            state,
-            server,
-            subscriptions,
-            commands,
-            merges,
-            control,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.address)
-    }
-    async fn get(&self, path: &str) -> Value {
-        let response = self.client.get(self.url(path)).send().await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        response.json().await.unwrap()
-    }
-    async fn refresh(&self, provider: Uuid, key: &str) -> reqwest::Response {
-        self.client
-            .post(self.url(&format!("/api/v1/providers/{provider}/refresh")))
-            .header("idempotency-key", key)
-            .send()
-            .await
-            .unwrap()
-    }
-    async fn publish(&mut self) {
-        let command = timeout(WAIT, self.merges.recv()).await.unwrap().unwrap();
-        self.commands.send(command).await.unwrap();
-    }
-    async fn terminal(&self, accepted: &Value) -> Value {
-        timeout(WAIT, async {
-            loop {
-                let operation = self.get(accepted["href"].as_str().unwrap()).await;
-                if matches!(operation["status"].as_str(), Some("succeeded" | "failed")) {
-                    break operation;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap()
-    }
-    async fn reload(&self, config: Config) {
-        let (result, wait) = oneshot::channel();
-        self.commands
-            .send(ControlCommand::ReloadConfig {
-                request_id: 1,
-                config: Box::new(config),
-                diagnostics: Vec::new(),
-                sources: None,
-                expected_group_revision: None,
-                result,
-            })
-            .await
-            .unwrap();
-        let reply = timeout(WAIT, wait).await.unwrap().unwrap();
-        assert!(reply.outcome.accepted());
-        self.subscriptions
-            .handle()
-            .reconcile(reply.authorized)
-            .await
-            .unwrap();
-    }
-    async fn stop(self) {
-        self.server.shutdown().await;
-        // The test bridge is the owner of intentionally gated, not-yet-admitted merges.
-        drop(self.merges);
-        assert_eq!(
-            timeout(WAIT, self.subscriptions.shutdown())
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
-        self.commands.send(ControlCommand::Shutdown).await.unwrap();
-        timeout(WAIT, self.control).await.unwrap().unwrap().unwrap();
-    }
-}
+mod support;
+use support::{Fixture, Origin, respond};
 
 #[tokio::test]
 async fn provider_get_is_safe_pure_and_counts_accepted_provenance_not_display_names() {
@@ -321,6 +87,19 @@ async fn refresh_replays_before_busy_and_success_waits_for_real_runtime_publicat
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
     let accepted: Value = accepted.json().await.unwrap();
     let socket = origin.next().await;
+    let invalid = fixture
+        .client
+        .post(fixture.url(&format!("/api/v1/providers/{}/refresh", subscription.id)))
+        .header("idempotency-key", "same")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_request"
+    );
     let replay: Value = fixture
         .refresh(subscription.id, "same")
         .await
@@ -332,6 +111,64 @@ async fn refresh_replays_before_busy_and_success_waits_for_real_runtime_publicat
         fixture.refresh(subscription.id, "different").await.status(),
         StatusCode::CONFLICT
     );
+    // Keep all 32 operation slots occupied; malformed or missing resources still win.
+    let operations = &fixture.state.observation.operations;
+    let held: Vec<_> = (0..31)
+        .map(|index| {
+            operations
+                .reserve(
+                    fixture.state.principal(),
+                    "POST",
+                    &format!("/capacity/{index}"),
+                    None,
+                    b"",
+                    OperationKind::ProviderRefresh,
+                )
+                .unwrap()
+        })
+        .collect();
+    for provider in ["not-a-uuid".to_owned(), Uuid::new_v4().to_string()] {
+        let response = fixture
+            .client
+            .post(fixture.url(&format!("/api/v1/providers/{provider}/refresh")))
+            .header("idempotency-key", "missing")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "resource_not_found"
+        );
+    }
+    assert_eq!(
+        fixture
+            .refresh(subscription.id, "new-at-capacity")
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let invalid = fixture
+        .client
+        .post(fixture.url(&format!("/api/v1/providers/{}/refresh", subscription.id)))
+        .header("idempotency-key", "invalid-at-capacity")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_request"
+    );
+    let replay: Value = fixture
+        .refresh(subscription.id, "same")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay["operation_id"], accepted["operation_id"]);
+    drop(held);
     respond(socket, NEW).await;
     let command = timeout(WAIT, fixture.merges.recv()).await.unwrap().unwrap();
     assert_eq!(
@@ -648,6 +485,43 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_expired() {
     let first = fixture.get("/api/v1/providers?limit=1").await;
     assert_eq!(first["providers"][0]["id"], "inline");
     let cursor = first["next_cursor"].as_str().unwrap();
+    let wider = fixture.get("/api/v1/providers?limit=2").await;
+    let all = fixture.get("/api/v1/providers").await;
+    let wider_cursor = wider["next_cursor"].as_str().unwrap();
+    let (snapshot, _) = wider_cursor.split_once(':').unwrap();
+    for (cursor, limit, status) in [
+        (format!("{snapshot}:1"), 2, StatusCode::GONE),
+        (format!("{snapshot}:02"), 2, StatusCode::GONE),
+        (format!("{snapshot}:+2"), 2, StatusCode::GONE),
+        (
+            format!("{}:2", snapshot.replace('-', "")),
+            2,
+            StatusCode::GONE,
+        ),
+        (format!("{snapshot}:1"), 1, StatusCode::BAD_REQUEST),
+        (format!("{snapshot}:4"), 1, StatusCode::GONE),
+    ] {
+        let mut url = reqwest::Url::parse(&fixture.url("/api/v1/providers")).unwrap();
+        url.query_pairs_mut()
+            .extend_pairs([("limit", limit.to_string()), ("cursor", cursor)]);
+        let response = fixture.client.get(url).send().await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            if status == StatusCode::GONE {
+                "snapshot_expired"
+            } else {
+                "invalid_request"
+            }
+        );
+    }
+    let resumed = fixture
+        .get(&format!("/api/v1/providers?limit=2&cursor={wider_cursor}"))
+        .await;
+    assert_eq!(
+        resumed["providers"],
+        json!(&all["providers"].as_array().unwrap()[2..])
+    );
     let mut changed = fixture.state.config.read().await.as_ref().clone();
     changed.subscriptions.clear();
     *fixture.state.config.write().await = Arc::new(changed);
@@ -844,4 +718,59 @@ async fn refresh_without_subscription_owner_is_unsupported_not_retryable() {
     .into_response();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(response.headers().get("retry-after").is_none());
+}
+
+#[tokio::test]
+async fn degraded_refresh_reports_userspace_commit_without_a_kernel_generation() {
+    let state = crate::native_api::tests::state().await;
+    let operations = Arc::clone(&state.observation.operations);
+    let subscription = Subscription::default();
+    let reservation = operations
+        .reserve(
+            state.principal(),
+            "POST",
+            "/api/v1/providers/test/refresh",
+            None,
+            b"",
+            OperationKind::ProviderRefresh,
+        )
+        .unwrap();
+    let id = reservation.id.clone();
+    let operation = Box::new(RefreshOperation {
+        reservation,
+        operations: Arc::clone(&operations),
+        instance: state.instance_id.clone(),
+        display_name: "provider".into(),
+        display_url: "https://example.test/sub".into(),
+        display_download: None,
+    });
+    operation.accept();
+    operation.running();
+    operation.finish(
+        &subscription,
+        ProviderLoad::default(),
+        Ok(SubscriptionMergeReply {
+            outcome: ReloadOutcome::CommittedDegraded { generation: 7 },
+            node_count: 1,
+            authorized: Vec::new(),
+            rejection: None,
+        }),
+    );
+    let response = operations.get(&id).unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["error"]["code"], "publication_degraded");
+    assert_eq!(
+        body["error"]["details"],
+        json!({
+            "committed": true,
+            "active_generation_id": format!("{}:7", state.instance_id),
+            "datapath_generation_id": null,
+        })
+    );
 }

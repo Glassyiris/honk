@@ -671,3 +671,61 @@ async fn lock_wait_past_deadline_is_retryable_unavailable() {
     assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error.headers()["retry-after"], "1");
 }
+
+#[tokio::test]
+async fn rejected_traces_preserve_the_full_admitted_rate_budget() {
+    let state = crate::native_api::tests::state().await;
+    let id = RequestId("test".into());
+    let valid = json!({"input":{"network":"tcp","dst_ip":"198.51.100.20","dst_port":443}});
+    let cases = [
+        (None, valid.to_string(), StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        (Some("application/json"), "{".into(), StatusCode::BAD_REQUEST),
+        (Some("application/json"), json!({"input":{"network":"tcp","domain":"example.test","dst_port":0}}).to_string(), StatusCode::BAD_REQUEST),
+        (Some("application/json"), json!({"input":{"network":"tcp","dst_ip":"198.51.100.20","dst_port":443},"resolve":"unknown"}).to_string(), StatusCode::BAD_REQUEST),
+        (Some("application/json"), json!({"input":{"network":"tcp","dst_ip":"198.51.100.20","dst_port":443},"resolve":"live"}).to_string(), StatusCode::BAD_REQUEST),
+        (Some("application/json"), json!({"input":{"network":"tcp","domain":"example.test","dst_ip":"198.51.100.20","dst_port":443},"resolve":"live"}).to_string(), StatusCode::BAD_REQUEST),
+        (Some("application/json"), json!({"input":{"network":"tcp","domain":"example.test","dst_port":443},"resolve":"live"}).to_string(), StatusCode::UNPROCESSABLE_ENTITY),
+    ];
+    for _ in 0..=super::super::security::REQUESTS_PER_MINUTE {
+        for (content_type, body, status) in &cases {
+            let mut request = Request::post("/api/v1/routing/trace");
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", *content_type);
+            }
+            let error = super::trace(
+                &state,
+                request.body(axum::body::Body::from(body.clone())).unwrap(),
+                &id,
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(error.status(), *status, "{body}");
+        }
+    }
+    for _ in 0..super::super::security::REQUESTS_PER_MINUTE {
+        let response = super::trace(
+            &state,
+            Request::post("/api/v1/routing/trace")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(valid.to_string()))
+                .unwrap(),
+            &id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = super::trace(
+        &state,
+        Request::post("/api/v1/routing/trace")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(valid.to_string()))
+            .unwrap(),
+        &id,
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}

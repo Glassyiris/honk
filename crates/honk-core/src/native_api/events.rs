@@ -64,6 +64,10 @@ const KINDS: [Kind; 6] = [
     Kind::GenerationChanged,
 ];
 
+pub(super) fn kind_names() -> [&'static str; KINDS.len()] {
+    KINDS.map(Kind::name)
+}
+
 impl Kind {
     const fn name(self) -> &'static str {
         match self {
@@ -811,7 +815,7 @@ fn invalid(id: &RequestId) -> ApiError {
 fn request_options(
     request: &Request,
     id: &RequestId,
-) -> Result<(Filter, Option<String>, bool), ApiError> {
+) -> Result<(Filter, Option<String>, super::settings::Demand), ApiError> {
     let values = parse_query(request.uri(), &["kinds", "flow_id"], id)?;
     let kinds = if let Some(kinds) = values.get("kinds") {
         let mut mask = 0;
@@ -839,7 +843,11 @@ fn request_options(
     Ok((
         Filter::new(kinds, flow_id),
         request_cursor(request, id)?,
-        flow_demand,
+        if flow_demand {
+            super::settings::Demand::FLOWS
+        } else {
+            super::settings::Demand::NONE
+        },
     ))
 }
 
@@ -961,7 +969,7 @@ pub(super) async fn serve(
     request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    let (filter, cursor, flow_demand) = request_options(&request, id)?;
+    let (filter, cursor, demand) = request_options(&request, id)?;
     let admit = || {
         state
             .observation
@@ -972,7 +980,7 @@ pub(super) async fn serve(
         state
             .observation
             .settings
-            .subscribe(&state.observation, flow_demand, admit)?
+            .subscribe(&state.observation, demand, admit)?
     } else {
         admit()?
     };

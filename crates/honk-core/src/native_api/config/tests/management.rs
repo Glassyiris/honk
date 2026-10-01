@@ -284,6 +284,24 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
     )
     .await;
     for body in [
+        json!({"name":"","link":LINK}),
+        json!({"name":"n".repeat(65),"link":LINK}),
+        json!({"name":"bounded","link":""}),
+        json!({"name":"bounded","link":"x".repeat(8193)}),
+    ] {
+        error(
+            fixture
+                .request(Method::POST, NODES)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        )
+        .await;
+    }
+    for body in [
         json!({"name":"unsafe\nnode { injected: x }","link":LINK}),
         json!({"name":"unsupported","link":"private-unknown://secret-password@host"}),
         json!({"name":"managed","link":LINK,"unknown":true}),
@@ -950,6 +968,12 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
         json!({"update_interval": 86400, "user_agent": format!("honk/{}", env!("CARGO_PKG_VERSION"))})
     );
     for invalid in [
+        json!({"kind":"other"}),
+        json!({"name":""}),
+        json!({"name":"n".repeat(65)}),
+        json!({"name":"invalid tag"}),
+        json!({"url":""}),
+        json!({"url":format!("https://example.test/{}", "x".repeat(4096))}),
         json!({"update_interval": 31_536_001}),
         json!({"update_interval": -1}),
         json!({"user_agent": ""}),
@@ -970,13 +994,12 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
             .send()
             .await
             .unwrap();
-        assert!(
-            matches!(
-                response.status(),
-                StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST
-            ),
-            "{invalid} was accepted"
-        );
+        let (status, code) = if invalid.get("cache").is_some() {
+            (StatusCode::UNPROCESSABLE_ENTITY, "unsupported_value")
+        } else {
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        };
+        error(response, status, code).await;
     }
     // Printable ASCII passes validation, but no dae quote can hold both quote characters.
     let unquotable = fixture

@@ -61,7 +61,9 @@ impl Hop<'_> {
                 match tokio::time::timeout_at(deadline, client.get(url, headers, remaining)).await {
                     Err(_) => Err("download_timeout"),
                     Ok(response) => {
-                        marked_http::read(response?, wants_body, deadline.into(), max_bytes).await
+                        marked_http::read(response?, wants_body, deadline.into(), max_bytes)
+                            .await
+                            .map_err(|error| error.stage)
                     }
                 }
             }
