@@ -199,7 +199,6 @@ pub(crate) enum Class {
 /// The open state database. It holds a shared `flock` on `state/` for its
 /// lifetime, so an exclusive lock there means no daemon has the file open.
 pub struct StateDb {
-    _lock: Flock<File>,
     /// `/proc/self/fd`-resolved path of `honk.db`; every open compares its
     /// inode with `identity`.
     path: PathBuf,
@@ -209,6 +208,7 @@ pub struct StateDb {
     /// `subscription_body` keys of the enabled subscriptions in the published
     /// configuration; `None` until the first publication.
     enabled_subscriptions: Mutex<Option<std::collections::HashSet<String>>>,
+    _lock: Flock<File>,
 }
 
 impl StateDb {

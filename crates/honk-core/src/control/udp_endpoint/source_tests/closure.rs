@@ -96,7 +96,8 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             .unwrap();
         let close = tracker.start_close(selected);
         drop(endpoint_a);
-        assert_eq!(tracker.close_id(&id).await, CloseOutcome::Gone);
+        let mut duplicate = Box::pin(tracker.close_id(&id));
+        assert!(futures::poll!(&mut duplicate).is_pending());
         admitted_send.await.unwrap();
         let frame = next_data_frame(&mut events, &mut replies).await;
         assert_eq!(frame.connection, first.connection);
@@ -109,6 +110,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             (b"admitted-reply".to_vec(), target_a)
         );
         assert_eq!(close.await, CloseOutcome::Closed);
+        assert_eq!(duplicate.await, CloseOutcome::Closed);
         assert!(matches!(
             pool.classify_source_reply(&owner, target_a),
             SourceReplyTarget::Drop

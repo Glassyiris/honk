@@ -103,6 +103,30 @@ struct Replay {
     body: [u8; 32],
 }
 
+impl Replay {
+    fn new(
+        instance: &str,
+        principal: &str,
+        method: &str,
+        path: &str,
+        key: &str,
+        body: &[u8],
+    ) -> Self {
+        let principal = digest(&[instance.as_bytes(), principal.as_bytes()]);
+        let scope = digest(&[
+            instance.as_bytes(),
+            &principal,
+            method.as_bytes(),
+            path.as_bytes(),
+            key.as_bytes(),
+        ]);
+        Self {
+            body: digest(&[&scope, body]),
+            scope,
+        }
+    }
+}
+
 struct Operation {
     status: Status,
     created_at: SystemTime,
@@ -203,6 +227,24 @@ impl OperationStore {
         }
     }
 
+    /// Finds a retained admission without allocating or evicting an operation slot.
+    pub(crate) fn replay(
+        &self,
+        principal: &str,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        body: &[u8],
+    ) -> Result<Option<Reservation>, ApiError> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let replay = Replay::new(&self.instance_id, principal, method, path, key, body);
+        let mut state = self.state.lock();
+        state.prune();
+        state.reservation(principal, &replay)
+    }
+
     pub(crate) fn reserve(
         self: &Arc<Self>,
         principal: &str,
@@ -212,7 +254,6 @@ impl OperationStore {
         body: &[u8],
         kind: OperationKind,
     ) -> Result<Reservation, ApiError> {
-        let requester = principal.to_owned();
         if key == Some("") {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -221,40 +262,14 @@ impl OperationStore {
                 None,
             ));
         }
-        let principal = digest(&[self.instance_id.as_bytes(), principal.as_bytes()]);
-        let replay = key.map(|key| {
-            let scope = digest(&[
-                self.instance_id.as_bytes(),
-                &principal,
-                method.as_bytes(),
-                path.as_bytes(),
-                key.as_bytes(),
-            ]);
-            Replay {
-                body: digest(&[&scope, body]),
-                scope,
-            }
-        });
+        let replay =
+            key.map(|key| Replay::new(&self.instance_id, principal, method, path, key, body));
         let mut state = self.state.lock();
         state.prune();
         if let Some(replay) = &replay
-            && let Some((id, body, admission)) = state.replay(&replay.scope)
+            && let Some(reservation) = state.reservation(principal, replay)?
         {
-            if body != replay.body {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    ErrorCode::IdempotencyConflict,
-                    "Idempotency-Key was already used with a different request body.",
-                    None,
-                ));
-            }
-            return Ok(Reservation {
-                id: id.to_owned(),
-                fresh: false,
-                principal: requester,
-                admission,
-                owner: None,
-            });
+            return Ok(reservation);
         }
         if kind == OperationKind::GeodataUpdate
             && state
@@ -285,7 +300,7 @@ impl OperationStore {
         Ok(Reservation {
             id,
             fresh: true,
-            principal: requester,
+            principal: principal.to_owned(),
             admission: receiver,
             owner: Some(Arc::downgrade(self)),
         })
@@ -488,6 +503,31 @@ impl OperationStore {
 }
 
 impl State {
+    fn reservation(
+        &self,
+        principal: &str,
+        replay: &Replay,
+    ) -> Result<Option<Reservation>, ApiError> {
+        let Some((id, body, admission)) = self.replay(&replay.scope) else {
+            return Ok(None);
+        };
+        if body != replay.body {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::IdempotencyConflict,
+                "Idempotency-Key was already used with a different request body.",
+                None,
+            ));
+        }
+        Ok(Some(Reservation {
+            id: id.to_owned(),
+            fresh: false,
+            principal: principal.to_owned(),
+            admission,
+            owner: None,
+        }))
+    }
+
     fn prune(&mut self) {
         let now = Instant::now();
         let retained = |terminal: Instant| now.duration_since(terminal) < RETENTION;

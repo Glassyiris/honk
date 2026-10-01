@@ -204,7 +204,7 @@ async fn dropping_vmess_stream_closes_physical_transport() {
     .unwrap();
 }
 
-#[cfg(feature = "flow-observation")]
+#[cfg(feature = "owned-tasks")]
 #[tokio::test]
 async fn runtime_shutdown_joins_vmess_relay_with_live_stream() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

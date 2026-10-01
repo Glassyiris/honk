@@ -2069,6 +2069,215 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
     assert!(!drain.should_reject());
 }
 
+#[tokio::test]
+async fn reload_preserves_group_identity_by_name_not_position() {
+    let cp = test_cp().await;
+    let mut config = cp.config.read().await.as_ref().clone();
+    config.ensure_builtin_nodes();
+    config.groups = ["alpha", "beta"]
+        .into_iter()
+        .map(|name| Group {
+            name: name.into(),
+            nodes: vec![honk_config::config::DIRECT_NODE_ID],
+            ..Default::default()
+        })
+        .collect();
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    let original = cp.config.read().await.as_ref().clone();
+    let captured = crate::connection_tracker::captured_groups(
+        &["alpha".into(), "beta".into(), "direct".into()],
+        "direct",
+        &original,
+        None,
+    );
+    assert_eq!(
+        captured,
+        original
+            .groups
+            .iter()
+            .map(|group| group.id.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    for change in 0..4 {
+        let before = cp.config.read().await.as_ref().clone();
+        let mut candidate = before.clone();
+        for group in &mut candidate.groups {
+            group.id = uuid::Uuid::new_v4();
+            group.created_at += chrono::Duration::seconds(1);
+        }
+        match change {
+            0 => candidate.groups.swap(0, 1),
+            1 => candidate.groups.insert(
+                0,
+                Group {
+                    name: "inserted".into(),
+                    nodes: vec![honk_config::config::DIRECT_NODE_ID],
+                    ..Default::default()
+                },
+            ),
+            2 => candidate.groups.retain(|group| group.name != "beta"),
+            3 => {
+                let group = candidate
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.name == "alpha")
+                    .unwrap();
+                group.id = original.groups[0].id;
+                group.name = "renamed".into();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            cp.apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+                .await
+                .accepted()
+        );
+        let accepted = cp.config.read().await.as_ref().clone();
+        for group in &accepted.groups {
+            if let Some(previous) = before
+                .groups
+                .iter()
+                .find(|previous| previous.name == group.name)
+            {
+                assert_eq!(group.id, previous.id);
+                assert_eq!(group.created_at, previous.created_at);
+            } else {
+                assert!(before.groups.iter().all(|previous| previous.id != group.id));
+                assert!(!captured.contains(&group.id.to_string()));
+            }
+        }
+        for name in ["alpha", "beta"] {
+            let current = crate::connection_tracker::captured_groups(
+                &[name.into(), "direct".into()],
+                "direct",
+                &accepted,
+                None,
+            );
+            let expected = original
+                .groups
+                .iter()
+                .find(|group| group.name == name)
+                .unwrap()
+                .id
+                .to_string();
+            if accepted.groups.iter().any(|group| group.name == name) {
+                assert_eq!(current, vec![expected]);
+            } else {
+                assert!(current.is_empty());
+                assert!(
+                    accepted
+                        .groups
+                        .iter()
+                        .all(|group| group.id.to_string() != expected)
+                );
+            }
+        }
+        let generation = cp
+            .dns_controller
+            .runtime_provider()
+            .current_generation()
+            .get();
+        let mut reparsed = accepted.clone();
+        for group in &mut reparsed.groups {
+            group.id = uuid::Uuid::new_v4();
+            group.created_at += chrono::Duration::seconds(1);
+        }
+        assert_eq!(
+            cp.apply_runtime_config(reparsed, Default::default(), &DrainTracker::new())
+                .await,
+            ReloadOutcome::Noop { generation }
+        );
+        assert_eq!(cp.config.read().await.groups, accepted.groups);
+    }
+}
+
+#[tokio::test]
+async fn reordered_groups_interrupt_only_their_captured_tcp_owner_without_native()
+-> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let cp = test_cp().await;
+        let mut config = cp.config.read().await.as_ref().clone();
+        config.ensure_builtin_nodes();
+        config.global.dial_mode = "ip".into();
+        config.routing.default_outbound = "alpha".into();
+        config.groups = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| Group {
+                name: name.into(),
+                nodes: vec![
+                    honk_config::config::DIRECT_NODE_ID,
+                    honk_config::config::BLOCK_NODE_ID,
+                ],
+                default: Some("direct".into()),
+                interrupt_connections: true,
+                ..Default::default()
+            })
+            .collect();
+        assert!(
+            cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
+                .await
+                .accepted()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let destination = listener.local_addr()?;
+        let mut client = TcpStream::connect(destination).await?;
+        let (accepted, source) = listener.accept().await?;
+        let handle = cp.spawn_handle();
+        crate::control::tests::store_active_tcp_flow(&handle, destination, source).await?;
+        let worker = handle.clone();
+        let task = tokio::spawn(async move { worker.serve_connection(accepted, source).await });
+        let (mut upstream, _) = listener.accept().await?;
+        client.write_all(b"live").await?;
+        let mut bytes = [0; 4];
+        upstream.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"live");
+        let alpha = cp.config.read().await.groups[0].id.to_string();
+        assert_eq!(
+            handle
+                .connection_tracker
+                .snapshot_group(&alpha, Some("tcp"))
+                .len(),
+            1
+        );
+        config.groups.swap(0, 1);
+        assert!(
+            cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+                .await
+                .accepted()
+        );
+        let manager = cp.group_manager.read().clone();
+        manager
+            .set_selector_choice(
+                "beta",
+                "block",
+                honk_outbound::group::SelectorNetworks::Both,
+            )
+            .unwrap();
+        client.write_all(b"kept").await?;
+        upstream.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"kept");
+        manager
+            .set_selector_choice(
+                "alpha",
+                "block",
+                honk_outbound::group::SelectorNetworks::Both,
+            )
+            .unwrap();
+        assert_eq!(client.read(&mut bytes).await?, 0);
+        assert_eq!(upstream.read(&mut bytes).await?, 0);
+        task.await??;
+        assert!(handle.connection_tracker.snapshot().is_empty());
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
 #[cfg(feature = "native-api")]
 #[tokio::test(start_paused = true)]
 async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejection() {

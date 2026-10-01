@@ -233,11 +233,15 @@ pub(super) async fn trace(
 ) -> Result<Response, ApiError> {
     let deadline = Instant::now() + TIMEOUT;
     parse_query(request.uri(), &[], id)?;
-    state.observation.trace_rate.admit(id)?;
     super::config::json_type(&request)?;
     let bytes = super::body::buffered(request.into_body()).await;
     let request: TraceRequest = super::body::decode(&bytes, || invalid(id))?;
     request.input.validate(id)?;
+    if matches!(request.resolve, Resolve::Live)
+        && (request.input.domain.is_none() || request.input.dst_ip.is_some())
+    {
+        return Err(invalid(id));
+    }
     if !matches!(request.resolve, Resolve::None) {
         return Err(error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -246,6 +250,7 @@ pub(super) async fn trace(
             id,
         ));
     }
+    state.observation.trace_rate.admit(id)?;
     let (evaluation, generation) = evaluate_current(state, &request.input, deadline, id).await?;
     let response = RoutingTraceResponse {
         mode: "simulation",

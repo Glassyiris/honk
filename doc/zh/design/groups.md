@@ -14,6 +14,8 @@
 
 普通重载构建完整的替代 `GroupManager`，通过 `migrate_selector_choices_from` 分别迁移 TCP/UDP Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。两种 API 的选择写入与 accepted-manager 替换通过同一 control/reload owner 串行化，不能确认对旧管理器的写入。因此读取方只会看到完整旧图或新图。
 
+共用的 `control/reload/fingerprint.rs` 重载规范化按同名保留配置组 UUID 与 `created_at`，不受插入、删除或重排影响。改名视为新组，不继承旧身份；程序化改名若仍携带旧 UUID，也会重新生成 UUID。SIGHUP、显式激活及 provider/runtime reload（含 no-op 比较）都遵循此规则，不依赖原生观测是否存在。
+
 `src/group/` 对外接口与内部实现按职责拆分：
 
 | 模块 | 职责 |
@@ -43,6 +45,8 @@ UDP 选择首先排除规范协议／配置不支持 UDP 的转发叶节点，�
 | Score | 以 `policy: score` 显式选择后，根据实际可靠性、新鲜目标质量和有界验证选择一个健康合格叶节点；历史样本数量不是性能加分。省略策略仍默认 Selector。 |
 
 组中断根据连接建立时捕获的胜出组身份/路径和网络选择精确 TCP/UDP owner，不从今天的组成员或叶名称重建匹配；不依赖 flow recorder 是否启用。显式选择在发布前捕获旧集合，回调在同步 guard 外运行，再等待发生变化网络的关闭确认；相同选择不重拨。TCP 绑定 UUID/cancel/completion，UDP 绑定 token/generation/source view 并确认 backend 与 driver 退役；共享 XUDP 不杀其他 view 的 carrier，也不重放数据。选择已发布但关闭确认失败可返回错误，不声称回滚。
+
+同一已捕获 owner 的并发 close 共用实际完成结果，退役失败也由所有等待者继承；不会仅因已处于 Closing 或 Failed 而报告 `Gone`。不存在或已被替换的 owner 仍是 `Gone`。自动中断回调只发起退役，需要确认的调用者等待该 owner 的 completion。
 
 组配置与运行时选择分离：受限原生 JSON Patch 由 parser span 和既有协调器持久化为 `.dae`，全量验证后真实 reload；accepted revision 与文件 hash 是不同 fence。配置 icon 原样展示经过校验的 HTTP(S)/data URI，不派生或抓取。自动策略的固定成员只存在于当前 GroupManager，配置激活后即失效；节点/provider 创建删除另经主文件源事务，修改已有条目仍用源 PUT，见[API 参考](../reference/api.md#主文件条目与-geodata-管理)。
 

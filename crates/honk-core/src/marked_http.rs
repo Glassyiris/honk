@@ -21,6 +21,48 @@ type Stream = Box<dyn AsyncReadWrite>;
 /// An answer whose body owns the connection it arrives on.
 pub(crate) type Response = http::Response<ResponseBody>;
 
+/// A download failure, with its stable output stage and original cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{stage}")]
+pub(crate) struct Error {
+    pub(crate) stage: &'static str,
+    #[source]
+    source: Option<anyhow::Error>,
+}
+
+impl Error {
+    fn caused(stage: &'static str, source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            stage,
+            source: Some(source.into()),
+        }
+    }
+
+    fn timeout() -> Self {
+        Self::caused(
+            "download_timeout",
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP download timed out"),
+        )
+    }
+}
+
+impl From<&'static str> for Error {
+    fn from(stage: &'static str) -> Self {
+        Self {
+            stage,
+            source: None,
+        }
+    }
+}
+
+/// The existing GET inputs after its connection and any TLS are ready.
+pub(crate) struct Prepared<'a> {
+    stream: Stream,
+    url: std::borrow::Cow<'a, reqwest::Url>,
+    target: http::Uri,
+    headers: http::HeaderMap,
+}
+
 struct Driver(tokio::task::JoinHandle<()>);
 
 impl Driver {
@@ -86,6 +128,13 @@ impl Client {
         Self { tls: None }
     }
 
+    #[cfg(all(test, feature = "clash-api"))]
+    pub(crate) fn with_tls(config: rustls::ClientConfig) -> Self {
+        Self {
+            tls: Some(TlsConnector::from(Arc::new(config))),
+        }
+    }
+
     async fn connect(&self, uri: &http::Uri, timeout: Duration) -> anyhow::Result<Stream> {
         let host = uri
             .host()
@@ -129,6 +178,18 @@ impl Client {
         headers: &http::HeaderMap,
         timeout: Duration,
     ) -> anyhow::Result<Response> {
+        send(self.prepare(url, headers, timeout).await?)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Prepare the direct GET, including environment proxy CONNECT and TLS.
+    pub(crate) async fn prepare(
+        &self,
+        url: &reqwest::Url,
+        headers: &http::HeaderMap,
+        timeout: Duration,
+    ) -> anyhow::Result<Prepared<'static>> {
         let mut url = url.clone();
         let mut headers = headers.clone();
         normalize_url(&mut url, &mut headers)?;
@@ -183,44 +244,57 @@ impl Client {
                 .map_or("/", |path| path.as_str())
                 .parse()?
         };
-        send(stream, &url, target, headers).await
+        Ok(Prepared {
+            stream,
+            url: std::borrow::Cow::Owned(url),
+            target,
+            headers,
+        })
     }
 
-    /// One GET of `url` over a stream the caller dialed, with the TLS and
-    /// HTTP/1.1 of [`Self::get`]. The answer's headers have to arrive by `by`.
-    /// Errors name the stage that failed.
-    pub(crate) async fn get_over(
+    /// Prepare a GET over the caller's stream, with TLS complete by `by`.
+    pub(crate) async fn prepare_over<'a>(
         &self,
         stream: Stream,
-        url: &reqwest::Url,
+        url: &'a reqwest::Url,
         headers: &http::HeaderMap,
         by: Instant,
-    ) -> Result<Response, &'static str> {
+    ) -> Result<Prepared<'a>, Error> {
         if !matches!(url.scheme(), "http" | "https") {
-            return Err("invalid_source");
+            return Err("invalid_source".into());
         }
-        let uri: http::Uri = url.as_str().parse().map_err(|_| "invalid_source")?;
+        let uri: http::Uri = url
+            .as_str()
+            .parse()
+            .map_err(|error| Error::caused("invalid_source", error))?;
         let target = http::Uri::from(uri.path_and_query().ok_or("invalid_source")?.clone());
         let stream = timeout_at(by, self.tls(stream, &uri))
             .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "tls_failed")?;
-        timeout_at(by, send(stream, url, target, headers.clone()))
-            .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "http_failed")
+            .map_err(|_| Error::timeout())?
+            .map_err(|error| Error::caused("tls_failed", error))?;
+        Ok(Prepared {
+            stream,
+            url: std::borrow::Cow::Borrowed(url),
+            target,
+            headers: headers.clone(),
+        })
     }
 }
 
-/// One GET of `target` over `stream`, already TLS where `url` asks for it.
-/// Host names `url`'s host and port, never its userinfo; the answer has to
-/// come in identity encoding.
-async fn send(
-    stream: Stream,
-    url: &reqwest::Url,
-    target: http::Uri,
-    mut headers: http::HeaderMap,
-) -> anyhow::Result<Response> {
+/// Send the prepared GET; only the actual response completes this future.
+pub(crate) async fn send(prepared: Prepared<'_>) -> Result<Response, Error> {
+    send_inner(prepared)
+        .await
+        .map_err(|error| Error::caused("http_failed", error))
+}
+
+async fn send_inner(prepared: Prepared<'_>) -> anyhow::Result<Response> {
+    let Prepared {
+        stream,
+        url,
+        target,
+        mut headers,
+    } = prepared;
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("HTTP URL has no host"))?;
@@ -288,7 +362,7 @@ pub(crate) async fn read(
     wants_body: fn(http::StatusCode, &http::HeaderMap) -> bool,
     deadline: Deadline,
     max_bytes: usize,
-) -> Result<Reply, &'static str> {
+) -> Result<Reply, Error> {
     let (parts, mut body) = response.into_parts();
     let result = async {
         let status = parts.status;
@@ -306,11 +380,11 @@ pub(crate) async fn read(
                 .to_str()
                 .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity"))
         }) {
-            return Err("content_encoding_rejected");
+            return Err("content_encoding_rejected".into());
         }
         let size = body.body.size_hint();
         if size.upper().is_some_and(|size| size > max_bytes as u64) {
-            return Err("asset_too_large");
+            return Err("asset_too_large".into());
         }
         // A declared length fills one buffer of that size, so a large body is
         // neither grown in steps nor copied once more into an `Arc`.
@@ -326,11 +400,11 @@ pub(crate) async fn read(
         };
         while let Some(data) = timeout_at(next_bytes(), body.chunk())
             .await
-            .map_err(|_| "download_timeout")?
-            .map_err(|_| "http_failed")?
+            .map_err(|_| Error::timeout())?
+            .map_err(|error| Error::caused("http_failed", error))?
         {
             if data.len() > max_bytes.saturating_sub(received) {
-                return Err("asset_too_large");
+                return Err("asset_too_large".into());
             }
             match sized.as_mut() {
                 Some(buffer) => Arc::get_mut(buffer)
@@ -348,7 +422,7 @@ pub(crate) async fn read(
                 location,
                 body: buffer,
             }),
-            Some(_) => Err("http_failed"),
+            Some(_) => Err("http_failed".into()),
             None => Ok(Reply {
                 status,
                 location,

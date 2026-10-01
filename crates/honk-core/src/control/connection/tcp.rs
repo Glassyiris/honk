@@ -1038,24 +1038,11 @@ impl ControlPlaneHandle {
                         TcpTerminal::RelayFailed
                     });
                 }
-                anyhow::ensure!(flow.retire().await, "TCP retirement failed");
-
+                let relay_succeeded = relay_result.is_ok();
                 match relay_result {
                     Ok(_) => {
                         if let Some(reporter) = &score_reporter {
                             reporter.finish(crate::group::ScoreOutcome::Success);
-                        }
-                        drop(outbound_guard);
-
-                        if outbound_name != "direct" && outbound_name != "block" {
-                            self.replenish_tcp_pool(
-                                node,
-                                (original_dst, target_domain),
-                                &runtime_generation,
-                                connect_timeout,
-                                score_reporter,
-                                health_ipver,
-                            );
                         }
                     }
                     Err(e) => {
@@ -1073,11 +1060,23 @@ impl ControlPlaneHandle {
                             warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                         }
                         self.stats.record_error(&outbound_name, outbound_kind);
-                        drop(outbound_guard);
                         if let Some(reporter) = &score_reporter {
                             reporter.finish(tcp_relay_score_outcome(&e));
                         }
                     }
+                }
+                anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                drop(outbound_guard);
+
+                if relay_succeeded && outbound_name != "direct" && outbound_name != "block" {
+                    self.replenish_tcp_pool(
+                        node,
+                        (original_dst, target_domain),
+                        &runtime_generation,
+                        connect_timeout,
+                        score_reporter,
+                        health_ipver,
+                    );
                 }
 
                 Ok(())
@@ -1112,6 +1111,145 @@ impl ControlPlaneHandle {
 #[cfg(test)]
 mod score_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_outcome_is_settled_once_even_when_retirement_fails() -> anyhow::Result<()> {
+        use crate::control::tests::support::{canonical_socks5, test_dns_forwarder};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for relay_fails in [false, true] {
+                for retirement_fails in [false, true] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                    let destination = listener.local_addr()?;
+                    let proxies = [
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+                    ];
+                    let nodes = [
+                        canonical_socks5(
+                            "seed",
+                            "127.0.0.1",
+                            proxies[0].local_addr()?.port(),
+                            None,
+                        ),
+                        canonical_socks5(
+                            "relay",
+                            "127.0.0.1",
+                            proxies[1].local_addr()?.port(),
+                            None,
+                        ),
+                    ];
+                    let mut config = Config::default();
+                    config.ensure_builtin_nodes();
+                    config.nodes.extend(nodes.iter().cloned());
+                    config.groups = vec![Group {
+                        name: "score".into(),
+                        policy: GroupPolicy::Score,
+                        nodes: nodes.iter().map(|node| node.id).collect(),
+                        ..Default::default()
+                    }];
+                    config.routing.default_outbound = "score".into();
+                    config.global.dial_mode = "ip".into();
+                    let router = Router::from_config(&config.routing)?;
+                    let plane = ControlPlane::new(
+                        config,
+                        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+                        router,
+                        Arc::new(ProxyRegistry::default_resolver()?),
+                        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+                        test_dns_forwarder(),
+                    )?;
+                    let handle = plane.spawn_handle();
+                    let manager = handle.group_manager.read().clone();
+                    let seed = manager
+                        .feedback_for_node(
+                            nodes[0].id,
+                            crate::group::ScoreSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                IpVersion::V4,
+                            ),
+                        )
+                        .unwrap()
+                        .start();
+                    seed.setup_succeeded();
+                    seed.tx(1);
+                    seed.rx(1);
+                    seed.finish(crate::group::ScoreOutcome::Success);
+                    let mut client = TcpStream::connect(destination).await?;
+                    let (accepted, source) = listener.accept().await?;
+                    crate::control::tests::store_active_tcp_flow(&handle, destination, source)
+                        .await?;
+                    let worker = handle.clone();
+                    let serving =
+                        tokio::spawn(
+                            async move { worker.serve_connection(accepted, source).await },
+                        );
+                    let (mut upstream, _) = tokio::select! {
+                        accepted = proxies[0].accept() => accepted?,
+                        accepted = proxies[1].accept() => accepted?,
+                    };
+                    let mut greeting = [0; 3];
+                    upstream.read_exact(&mut greeting).await?;
+                    upstream.write_all(&[5, 0]).await?;
+                    let mut request = [0; 10];
+                    upstream.read_exact(&mut request).await?;
+                    upstream
+                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                        .await?;
+                    client.write_all(b"q").await?;
+                    assert_eq!(upstream.read_u8().await?, b'q');
+                    upstream.write_all(b"r").await?;
+                    assert_eq!(client.read_u8().await?, b'r');
+                    if retirement_fails {
+                        let key = handle.tcp_flow_pins.snapshot().into_iter().next().unwrap();
+                        assert_eq!(handle.tcp_flow_pins.release_for_test(key), Some(true));
+                    }
+                    if relay_fails {
+                        socket2::SockRef::from(&upstream).set_linger(Some(Duration::ZERO))?;
+                        drop(upstream);
+                    } else {
+                        upstream.shutdown().await?;
+                        client.shutdown().await?;
+                    }
+                    let result = serving.await?;
+                    assert_eq!(result.is_err(), retirement_fails);
+                    let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+                    assert_eq!(counters.spent, 1, "fixture must execute a scored trial");
+                    assert_eq!(
+                        (
+                            counters.trial_success,
+                            counters.trial_failure,
+                            counters.trial_cancelled
+                        ),
+                        (u64::from(!relay_fails), u64::from(relay_fails), 0),
+                    );
+                    assert_eq!(
+                        handle.stats.snapshot()["score"].errors,
+                        u32::from(relay_fails)
+                    );
+                    if retirement_fails {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), async {
+                                tokio::select! {
+                                    accepted = proxies[0].accept() => accepted,
+                                    accepted = proxies[1].accept() => accepted,
+                                }
+                            })
+                            .await
+                            .is_err(),
+                            "failed retirement must not replenish the pool"
+                        );
+                    }
+                    let runtime = handle.runtime_registry.read().clone();
+                    runtime.shutdown().await;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
 
     #[test]
     fn pending_warm_refill_refunds_trial_without_starting_business() {

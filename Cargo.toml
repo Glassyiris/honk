@@ -114,7 +114,7 @@ url = "2"
 percent-encoding = "2"
 aho-corasick = "1"
 
-# Persistence (cache_file / cachedb)
+# Persistence (state database)
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 
 # Misc

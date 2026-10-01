@@ -288,17 +288,21 @@ async fn observation_request(
 ) -> Response {
     let get = request.method() == axum::http::Method::GET;
     let path = request.uri().path();
-    let flow_demand = matches!(path, "/api/v1/flows")
+    let demand = if matches!(path, "/api/v1/flows")
         || path
             .strip_prefix("/api/v1/flows/")
-            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
-    let poll = get && (flow_demand || path == "/api/v1/dns/log");
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        settings::Demand::FLOWS
+    } else if path == "/api/v1/dns/log" {
+        settings::Demand::DNS_LOG
+    } else {
+        settings::Demand::NONE
+    };
+    let poll = get && demand != settings::Demand::NONE;
     let response = next.run(request).await;
     if poll && response.status().is_success() {
-        state
-            .observation
-            .settings
-            .renew(&state.observation, flow_demand);
+        state.observation.settings.renew(&state.observation, demand);
     }
     response
 }
@@ -557,15 +561,7 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
         .map(|value| value.parse::<IpAddr>().map(|ip| ip.to_canonical()))
         .transpose()
         .map_err(|_| invalid_query(id))?;
-    let limit = query
-        .get("limit")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid_query(id))?
-        .unwrap_or(100);
-    if !(1..=1000).contains(&limit) {
-        return Err(invalid_query(id));
-    }
+    let limit = pages::limit(&query, id)?;
     let mut total_tcp = 0;
     let mut total_udp = 0;
     let mut selected: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit);

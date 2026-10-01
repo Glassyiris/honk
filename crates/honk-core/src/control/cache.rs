@@ -1,4 +1,5 @@
 use super::*;
+use crate::dns::persist::unix_now;
 use crate::state::StateDb;
 use crate::state::cache::{
     CacheDb, DELAY_SAMPLE_MAX_AGE_SECS, Live, Maintenance, Missing, TickOwners, maintenance_tick,
@@ -15,15 +16,26 @@ impl StateTick {
     /// Stops at the next wait; a maintenance write in flight finishes first.
     pub(super) async fn stop_and_join(&mut self) -> anyhow::Result<()> {
         self.stop.take();
-        super::lifecycle::joined(&mut self.task).await
+        let Some(handle) = self.task.as_mut() else {
+            return Ok(());
+        };
+        let result = match tokio::time::timeout(super::lifecycle::STAGE_TIMEOUT, &mut *handle).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("state maintenance exceeded its stop deadline; waiting for blocking work");
+                handle.await
+            }
+        };
+        self.task.take();
+        result.map_err(anyhow::Error::from)
     }
 }
 
 impl Drop for StateTick {
     fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        // The outer task retains its blocking write until it finishes.
+        self.stop.take();
     }
 }
 
@@ -266,18 +278,57 @@ impl ControlPlane {
     }
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::tests::support::{canonical_socks5, control_plane};
     use honk_outbound::alive::{IpVersion, ProbeDomain};
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_tick_survives_cancelled_join_and_owner_drop() {
+        for drop_owner in [false, true] {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (finished, completion) = tokio::sync::oneshot::channel();
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                })
+                .await
+                .unwrap();
+                let _ = (&mut stopped).await;
+                finished.send(()).unwrap();
+            });
+            let mut tick = StateTick {
+                stop: Some(stop),
+                task: Some(task),
+            };
+            started.await.unwrap();
+            {
+                let waiting = tick.stop_and_join();
+                tokio::pin!(waiting);
+                assert!(futures::poll!(&mut waiting).is_pending());
+                tokio::time::advance(Duration::from_secs(11)).await;
+                assert!(futures::poll!(&mut waiting).is_pending());
+            }
+            assert!(tick.task.is_some());
+            if drop_owner {
+                drop(tick);
+            } else {
+                let waiting = tick.stop_and_join();
+                tokio::pin!(waiting);
+                assert!(futures::poll!(&mut waiting).is_pending());
+                release.send(()).unwrap();
+                waiting.await.unwrap();
+                completion.await.unwrap();
+                continue;
+            }
+            release.send(()).unwrap();
+            completion.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn a_default_config_keeps_the_selection_across_a_restart() {
@@ -398,19 +449,15 @@ mod tests {
         // Let the first tick reach its maintenance write, which waits on `connection`.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let stop = plane.state_tick.stop_and_join();
-        tokio::pin!(stop);
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut stop)
+            tokio::time::timeout(Duration::from_secs(11), plane.state_tick.stop_and_join(),)
                 .await
                 .is_err(),
             "shutdown finished while a maintenance write was in flight"
         );
+        assert!(plane.state_tick.task.is_some());
         drop(connection);
-        tokio::time::timeout(Duration::from_secs(5), stop)
-            .await
-            .unwrap()
-            .unwrap();
+        plane.state_tick.stop_and_join().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

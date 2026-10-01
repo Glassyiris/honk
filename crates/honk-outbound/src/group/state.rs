@@ -70,6 +70,7 @@ impl From<SelectionNetwork> for SelectorNetworks {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectorChoices {
     pub tcp: Option<SelectorMember>,
@@ -347,6 +348,7 @@ impl GroupManager {
         })
     }
 
+    #[cfg(test)]
     /// Both effective identities and their revision from one publication read.
     pub fn selector_choices(&self, group_name: &str) -> Option<SelectorChoices> {
         let group = self.selector_group(group_name).ok()?;
@@ -362,10 +364,7 @@ impl GroupManager {
         })
     }
 
-    pub fn selector_revision(&self) -> u64 {
-        self.selector_choice.read().revision
-    }
-
+    #[cfg(test)]
     pub fn selector_member_choice(
         &self,
         group_name: &str,
