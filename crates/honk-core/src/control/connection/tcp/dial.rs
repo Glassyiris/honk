@@ -125,11 +125,9 @@ impl ControlPlaneHandle {
                             &scope,
                         );
                         #[cfg(feature = "native-api")]
-                        let dial = async {
-                            match &native_observer {
-                                Some(observer) => observer.scope(dial).await,
-                                None => dial.await,
-                            }
+                        let dial = match &native_observer {
+                            Some(observer) => futures::future::Either::Left(observer.scope(dial)),
+                            None => futures::future::Either::Right(dial),
                         };
                         let mut dial = std::pin::pin!(dial);
                         // Poll the dial before the timer, and keep its pending
@@ -476,7 +474,6 @@ impl ControlPlaneHandle {
         health_ipver: IpVersion,
     ) {
         let (original_dst, target_domain) = target;
-        let node_addr = format!("{}:{}", node.host(), node.port);
         let pool = self.connection_pool.clone();
         let registry = self.proxy_registry.clone();
         let generation = Arc::clone(runtime_generation);
@@ -540,8 +537,11 @@ impl ControlPlaneHandle {
                             reporter.setup_failed(score_runtime_outcome(&generation, &e));
                         }
                         debug!(
-                            "Pool deposit: ready dial to {} via {} failed: {}",
-                            original_dst, node_addr, e
+                            "Pool deposit: ready dial to {} via {}:{} failed: {}",
+                            original_dst,
+                            node.host(),
+                            node.port,
+                            e
                         );
                     }
                 }
@@ -552,6 +552,7 @@ impl ControlPlaneHandle {
                 // instead; a bare TCP is useless to them.
                 return;
             }
+            let node_addr = format!("{}:{}", node.host(), node.port);
             let pool_reporter = pool_feedback.map(|reporter| {
                 reporter.start_warmup(crate::group::ScoreSelectionContext::aggregate(
                     SelectionNetwork::Tcp,
