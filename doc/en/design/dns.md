@@ -300,7 +300,7 @@ Incremental acknowledgement compares the successful write with the current desir
 
 One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of traffic session reuse and predecessor DNS sessions. The fork shares its source configuration generation's dial semaphore, the process physical-dial ceiling, and the process VLESS-carrier gate, but not retirement state or protocol pools.
 
-The existing TLS maintenance pass also reaps the active DNS registry's idle connectors. Terminal registry shutdown releases its cached connectors even while a retired runtime remains retained.
+The existing maintenance pass also reaps the active DNS registry's finished tasks and idle VLESS carriers. Terminal registry shutdown releases its cached connectors even while a retired runtime remains retained.
 
 Publication makes the replacement immediately available with independent execution resources: even a saturated predecessor cannot consume its query/UDP quota or make it join an old flight. The completed-answer cache, publication/flush fence, and persistence remain shared; they do not own in-flight work. Old query leases drain naturally through reply I/O, then retirement joins background workers, closes DNS transports, closes their private outbound runtime fork only after those transports drain, and retires the captured traffic registry's non-transferred reusable state.
 

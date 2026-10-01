@@ -249,66 +249,6 @@ async fn warm_retention_releases_only_after_last_owner() {
     }
 }
 
-#[test]
-fn refreshed_connector_rejects_stale_reaper_sample() {
-    let node = node("anytls", NodeProtocol::AnyTLS);
-    let slot = TlsConnectorSlot::default();
-    let first = slot.get_or_build(&node).unwrap();
-    let stale_sample = slot.sample().unwrap();
-
-    let refreshed = slot.get_or_build(&node).unwrap();
-    assert!(Arc::ptr_eq(&first, &refreshed));
-    assert!(!slot.evict_if_sample(stale_sample));
-    assert!(slot.is_loaded());
-
-    assert!(slot.evict_if_sample(slot.sample().unwrap()));
-    assert!(!slot.is_loaded());
-}
-
-#[test]
-fn reap_keeps_recent_active_ratio_and_rebuilds_evicted_connectors() {
-    let nodes: Vec<_> = (0..20)
-        .map(|index| node(&format!("anytls-{index}"), NodeProtocol::AnyTLS))
-        .collect();
-    let registry = OutboundRuntimeRegistry::build(&nodes).unwrap();
-    let loaded: Vec<_> = nodes
-        .iter()
-        .map(|node| {
-            let runtime = registry.get(&node.id).unwrap();
-            let connector = runtime.anytls_tls_connector().unwrap();
-            (runtime, connector)
-        })
-        .collect();
-
-    assert_eq!(registry.reap_idle_resources(Instant::now()), 12);
-    assert_eq!(
-        loaded
-            .iter()
-            .filter(|(runtime, _)| runtime.tls_connector_loaded())
-            .count(),
-        8
-    );
-    let evicted = loaded
-        .iter()
-        .find(|(runtime, _)| !runtime.tls_connector_loaded())
-        .unwrap();
-    let rebuilt = evicted.0.anytls_tls_connector().unwrap();
-    assert!(!Arc::ptr_eq(&evicted.1, &rebuilt));
-}
-
-#[test]
-fn reap_drops_idle_connector_even_inside_hot_ratio() {
-    let node = node("anytls", NodeProtocol::AnyTLS);
-    let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-    let runtime = registry.get(&node.id).unwrap();
-    runtime.anytls_tls_connector().unwrap();
-    assert_eq!(
-        registry.reap_idle_resources(Instant::now() + TLS_IDLE_RETENTION),
-        1
-    );
-    assert!(!runtime.tls_connector_loaded());
-}
-
 #[tokio::test]
 async fn warm_resources_report_session_state_only() {
     let anytls = node("anytls", NodeProtocol::AnyTLS);

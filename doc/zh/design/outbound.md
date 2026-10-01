@@ -707,7 +707,7 @@ quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。c
 ## AnyTLS session 引擎
 
 `src/proxy/anytls/mod.rs` 实现 sing-anytls 多路复用，handler 无状态。每个 generation 的 `NodeRuntime::AnyTls` 拥有一个
-`SessionPool<AnyTlsSession>` 与 lazy materialize 的 BoringSSL connector。
+`SessionPool<AnyTlsSession>` 与首次拨号时构建的 BoringSSL connector；TLS context 按 shape 共享，因此 connector 不做空闲回收。
 无 generation 调用使用带 guard 的 ephemeral 等价物。
 
 ### Pool 与 session 生命周期
