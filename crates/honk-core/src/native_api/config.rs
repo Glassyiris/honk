@@ -297,6 +297,8 @@ pub(crate) struct ConfigService {
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
     /// The secret set for the accepted sources, keyed by the `SourceUpdate` it was built from.
     secrets: Mutex<Option<(Arc<SourceUpdate>, Arc<ListenerSecrets>)>>,
+    /// The accepted snapshot `warn_secret_collisions` last reported, by `SourceUpdate` and generation.
+    warned: Mutex<Option<(Arc<SourceUpdate>, u64)>>,
     store: RwLock<Option<SourceStore>>,
     recording: RwLock<RecordState>,
     #[cfg(test)]
@@ -370,6 +372,7 @@ impl ConfigService {
             last_reload: RwLock::new(None),
             phase: RwLock::new(None),
             secrets: Mutex::new(None),
+            warned: Mutex::new(None),
             store: RwLock::new(None),
             recording: RwLock::new(RecordState::Idle),
             #[cfg(test)]
@@ -394,7 +397,13 @@ impl ConfigService {
     pub(crate) fn write_refusal(&self) -> Option<WriteRefusal> {
         if !self.settings.config_write || !self.settings.credentialed() {
             Some(WriteRefusal::WritesDisabled)
-        } else if !self.sources.available() || self.sender.lock().is_none() {
+        } else if !self.sources.available()
+            || self
+                .sender
+                .lock()
+                .as_ref()
+                .is_none_or(mpsc::Sender::is_closed)
+        {
             Some(WriteRefusal::ConfigurationUnavailable)
         } else {
             None
@@ -449,15 +458,12 @@ impl ConfigService {
     /// The refusal `/nodes` and `/providers` writes get while the main source cannot take them.
     pub(super) fn manage_admission(&self) -> Result<(), ApiError> {
         let accepted = self.sources.accepted.read().clone();
-        let running = self
-            .sender
-            .lock()
-            .as_ref()
-            .is_some_and(|sender| !sender.is_closed());
-        let Some(accepted) = accepted.filter(|_| running) else {
-            return Err(super::management::unsupported()
-                .with_reason(WriteRefusal::ConfigurationUnavailable));
-        };
+        if let Some(reason) = self.write_refusal() {
+            return Err(super::management::unsupported().with_reason(reason));
+        }
+        let accepted = accepted.ok_or_else(|| {
+            super::management::unsupported().with_reason(WriteRefusal::ConfigurationUnavailable)
+        })?;
         if let Some(reason) = self.source_refusal(&accepted, 0) {
             return Err(super::management::unsupported().with_reason(reason));
         }
@@ -576,6 +582,49 @@ impl ConfigService {
         }
     }
 
+    /// Why the listed source at `index` is read-only in the accepted snapshot; `None` when it is
+    /// writable.
+    fn read_only_reason(
+        &self,
+        accepted: &Accepted,
+        index: usize,
+        secrets: &ListenerSecrets,
+    ) -> Option<WriteRefusal> {
+        match self.source_refusal_with_secrets(accepted, index, secrets) {
+            refusal @ Some(WriteRefusal::WritesDisabled) => refusal,
+            _ if self.store_blocked() => Some(WriteRefusal::StoreBlocked),
+            refusal => refusal,
+        }
+    }
+
+    /// Warns once per accepted snapshot about each source that a listener secret value in its text
+    /// makes read-only; the fix is a secret no source contains.
+    pub(crate) fn warn_secret_collisions(&self) {
+        let guard = self.sources.accepted.read();
+        let Some(accepted) = guard.as_ref() else {
+            return;
+        };
+        {
+            let mut warned = self.warned.lock();
+            if warned.as_ref().is_some_and(|(update, generation)| {
+                Arc::ptr_eq(update, &accepted.update) && *generation == accepted.generation
+            }) {
+                return;
+            }
+            *warned = Some((Arc::clone(&accepted.update), accepted.generation));
+        }
+        let secrets = self.secrets(Some(accepted));
+        for (index, source) in accepted.update.sources.iter().enumerate() {
+            if secrets.contains(&source.content) {
+                tracing::warn!(
+                    source_id = %accepted.ids[&source.path],
+                    path = %secrets.mask(&source_path(accepted, index).to_string_lossy()).0,
+                    "configuration source is read-only because its text contains a listener secret value"
+                );
+            }
+        }
+    }
+
     pub(crate) fn group_writable(&self, name: &str) -> bool {
         self.editable()
             && self
@@ -659,13 +708,17 @@ impl ConfigService {
         let source = &accepted.update.sources[index];
         let (content, mut redacted) = secrets.mask(&source.content);
         let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
+        let read_only_reason = self.read_only_reason(accepted, index, secrets);
         let mut value = json!({
             "id":accepted.ids[&source.path], "path":path,
             "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
-            "writable":self.source_refusal_with_secrets(accepted,index,secrets).is_none() && !self.store_blocked(), "loaded_at":timestamp(accepted.accepted_at),
+            "writable":read_only_reason.is_none(), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(), "content":content,
         });
+        if let Some(reason) = read_only_reason {
+            value["read_only_reason"] = json!(reason.as_str());
+        }
         // Database source paths are labels, not files an operator could open.
         if !matches!(*self.store.read(), Some(SourceStore::Db(_))) {
             let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());

@@ -8,39 +8,8 @@ use crate::native_api::store::startup::{ImportError, import_tree};
 impl Worker {
     /// Reads the `-c` tree, strips its listener secrets and validates it as the next revision.
     pub(super) async fn prepare_import(&self, principal: &str) -> Result<Prepared, ApiError> {
-        self.prepare_tree(
-            principal,
-            Some(Origin::Import),
-            move |database, diagnostics| {
-                let entry = database.import_entry();
-                if entry != database.entry() {
-                    return Err(denied().with_reason(WriteRefusal::ImportEntryChanged));
-                }
-                let originals = Config::from_dae_file_with_sources(
-                    entry,
-                    &HashMap::new(),
-                    SourceLimits::DEFAULT,
-                    diagnostics,
-                )
-                .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
-                let (loaded, _) = import_tree(entry, &originals.config, &originals.sources)
-                    .map_err(|error| match error {
-                        ImportError::SecretCopy(_) => management::unsupported_value(
-                            "A listener secret also appears outside its secret field",
-                            json!({"resource":"/x-honk/config/import","check":"secret_copy"}),
-                        ),
-                        ImportError::Load(error) => {
-                            config_error(error, diagnostics, &[], None, None)
-                        }
-                        ImportError::Changed => management::unsupported_value(
-                            "Removing listener secrets changes the configuration",
-                            json!({"resource":"/x-honk/config/import","check":"stripped_config"}),
-                        ),
-                    })?;
-                Ok(loaded)
-            },
-        )
-        .await
+        self.prepare_tree(principal, Some(Origin::Import), read_import)
+            .await
     }
 
     /// Validates stored revision `number` as the next revision, recorded with `origin`;
@@ -90,4 +59,35 @@ impl Worker {
         .await
         .map_err(|_| unavailable())?
     }
+}
+
+pub(super) fn read_import(
+    database: &DbStore,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<LoadedConfig, ApiError> {
+    let entry = database.import_entry();
+    if entry != database.entry() {
+        return Err(denied().with_reason(WriteRefusal::ImportEntryChanged));
+    }
+    let originals = Config::from_dae_file_with_sources(
+        entry,
+        &HashMap::new(),
+        SourceLimits::DEFAULT,
+        diagnostics,
+    )
+    .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
+    let (loaded, _) =
+        import_tree(entry, &originals.config, &originals.sources).map_err(|error| match error {
+            ImportError::SecretCopy(_) => management::unsupported_value(
+                "A listener secret also appears outside its secret field",
+                json!({"resource":"/x-honk/config/import","check":"secret_copy"}),
+            )
+            .with_reason(WriteRefusal::ListenerSecretInContent),
+            ImportError::Load(error) => config_error(error, diagnostics, &[], None, None),
+            ImportError::Changed => management::unsupported_value(
+                "Removing listener secrets changes the configuration",
+                json!({"resource":"/x-honk/config/import","check":"stripped_config"}),
+            ),
+        })?;
+    Ok(loaded)
 }

@@ -452,6 +452,7 @@ fn source_content(row: &Value) -> Value {
     let mut row = row.clone();
     let object = row.as_object_mut().unwrap();
     assert!(object.remove("writable").is_some() && object.remove("loaded_at").is_some());
+    object.remove("read_only_reason");
     row
 }
 fn source<'a>(config: &'a Value, content: &str) -> &'a Value {
@@ -627,7 +628,9 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|row| row["content"].is_string() && row["writable"] == false)
+                .all(|row| row["content"].is_string()
+                    && row["writable"] == false
+                    && row["read_only_reason"] == "writes_disabled")
         );
         assert!(!config.to_string().contains(SECRET));
         let main = source(&config, &fixture.originals["main.dae"]);
@@ -675,6 +678,10 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         let id = row["id"].as_str().unwrap();
         assert!(!id.is_empty() && !id.contains(name));
         assert_eq!(row["writable"], *name != "auth.dae");
+        assert_eq!(
+            row.get("read_only_reason").cloned(),
+            (*name == "auth.dae").then(|| json!("listener_secret_source"))
+        );
         assert_eq!(row["absolute_path"], fixture.path(name).to_str().unwrap());
         if *name == "auth.dae" {
             assert!(row["content"].as_str().unwrap().contains("enabled: true"));
@@ -736,7 +743,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     .await;
     assert_eq!(
         refused["error"]["details"],
-        json!({"reason":"listener_settings_changed"})
+        json!({"reason":"credential_sources_changed"})
     );
     error(
         fixture
@@ -800,6 +807,8 @@ async fn refused_source_writes_name_the_listener_secret_reason() {
             .clone()
     };
     let (locked, editable) = (row("locked.dae"), row("editable.dae"));
+    assert_eq!(locked["read_only_reason"], "listener_secret_in_content");
+    assert!(editable.get("read_only_reason").is_none());
     let before = disk(fixture.directory.path());
     let reason = |response: Response| async move {
         error(response, StatusCode::FORBIDDEN, "permission_denied").await["error"]["details"]
@@ -848,13 +857,19 @@ async fn writes_after_the_coordinator_stopped_are_unavailable() {
     fixture.shutdown().await;
 }
 
-type RequestLine = (tracing::Level, HashMap<String, String>);
+type LogLine = (tracing::Level, HashMap<String, String>);
 
-/// Request log lines as level and field text, from the test thread's own dispatcher.
-#[derive(Clone, Default)]
-struct RequestLines(Arc<parking_lot::Mutex<Vec<RequestLine>>>);
+/// Log lines with one message, as level and field text, from the test thread's own dispatcher.
+#[derive(Clone)]
+struct LogLines(&'static str, Arc<parking_lot::Mutex<Vec<LogLine>>>);
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLines {
+impl LogLines {
+    fn new(message: &'static str) -> Self {
+        Self(message, Arc::default())
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLines {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         struct Fields(HashMap<String, String>);
         impl tracing::field::Visit for Fields {
@@ -867,8 +882,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestLines {
         }
         let mut fields = Fields(HashMap::new());
         event.record(&mut fields);
-        if fields.0.get("message").map(String::as_str) == Some("native HTTP request") {
-            self.0.lock().push((*event.metadata().level(), fields.0));
+        if fields.0.get("message").map(String::as_str) == Some(self.0) {
+            self.1.lock().push((*event.metadata().level(), fields.0));
         }
     }
 }
@@ -882,7 +897,7 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
     ) {
         return;
     }
-    let lines = RequestLines::default();
+    let lines = LogLines::new("native HTTP request");
     let _dispatch =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
     let fixture = Fixture::new(Access::Metadata, false).await;
@@ -905,7 +920,7 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
     )
     .await;
     fixture.shutdown().await;
-    let lines = lines.0.lock();
+    let lines = lines.1.lock();
     let refused: Vec<_> = lines
         .iter()
         .filter(|(_, fields)| fields["method"] == "PUT")
@@ -922,6 +937,90 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
         .unwrap();
     assert_eq!(*level, tracing::Level::INFO);
     assert!(!fields.contains_key("reason"));
+}
+
+#[tokio::test]
+async fn a_listener_secret_in_source_text_warns_once_per_accepted_reload() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::a_listener_secret_in_source_text_warns_once_per_accepted_reload",
+    ) {
+        return;
+    }
+    let lines = LogLines::new(
+        "configuration source is read-only because its text contains a listener secret value",
+    );
+    let _dispatch =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
+    // A glob loads the file so that only its own text and path hold the Clash secret.
+    let fixture = Fixture::new_custom(Access::Admin, false, |directory, files| {
+        std::fs::create_dir(directory.join("extra")).unwrap();
+        files
+            .get_mut("auth.dae")
+            .unwrap()
+            .push_str("experimental { clash_api { secret: 'clash-listener-token' } }\n");
+        files
+            .get_mut("main.dae")
+            .unwrap()
+            .push_str("include { 'extra/*.dae' }\n");
+        files.insert(
+            "extra/clash-listener-token.dae",
+            "# clash-listener-token copied here\n".into(),
+        );
+    })
+    .await;
+    let config = fixture.get(CONFIG).await;
+    let collided = source(
+        &config,
+        &fixture.originals["extra/clash-listener-token.dae"],
+    );
+    assert_eq!(collided["read_only_reason"], "listener_secret_in_content");
+    let auth = source(&config, &fixture.originals["auth.dae"]);
+    let expected = vec![
+        (
+            auth["id"].as_str().unwrap().to_owned(),
+            "auth.dae".to_owned(),
+        ),
+        (
+            collided["id"].as_str().unwrap().to_owned(),
+            "extra/<redacted>.dae".to_owned(),
+        ),
+    ];
+    let warnings = || {
+        lines
+            .1
+            .lock()
+            .iter()
+            .map(|(level, fields)| {
+                assert_eq!(*level, tracing::Level::WARN);
+                (fields["source_id"].clone(), fields["path"].clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(warnings(), expected);
+    // A reload whose sources lost the acceptance race reports the snapshot already reported.
+    fixture.service.warn_secret_collisions();
+    assert_eq!(warnings().len(), 2);
+    let reload = || async {
+        let operation = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+        fixture.terminal(&operation).await
+    };
+    // An unchanged configuration is accepted again as a no-op.
+    assert_eq!(reload().await["status"], "succeeded");
+    assert_eq!(warnings().len(), 4);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Reject as u8, Ordering::SeqCst);
+    assert_eq!(reload().await["error"]["code"], "reload_rejected");
+    assert_eq!(warnings().len(), 4);
+    fixture
+        .reject_reloads
+        .store(ReloadBehavior::Degraded as u8, Ordering::SeqCst);
+    let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    std::fs::write(fixture.path("main.dae"), edited).unwrap();
+    assert_eq!(reload().await["error"]["code"], "reload_degraded");
+    assert_eq!(warnings(), vec![expected; 3].concat());
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -1152,4 +1251,77 @@ fn malformed_credential_source_is_withheld_without_panicking() {
         secrets.mask("ordinary content"),
         ("ordinary content".into(), false)
     );
+}
+
+#[test]
+fn every_secret_bearing_accepted_source_warns_even_when_writes_are_disabled() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::every_secret_bearing_accepted_source_warns_even_when_writes_are_disabled",
+    ) {
+        return;
+    }
+    let lines = LogLines::new(
+        "configuration source is read-only because its text contains a listener secret value",
+    );
+    let _dispatch =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(lines.clone()));
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("extra")).unwrap();
+    let entry = directory.path().join("main.dae");
+    std::fs::write(&entry, "include { 'auth.dae'\n 'extra/*.dae' }\n").unwrap();
+    std::fs::write(
+        directory.path().join("auth.dae"),
+        format!("experimental {{ native_api {{ secret: '{SECRET}' }} }}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join(format!("extra/{SECRET}.dae")),
+        format!("# {SECRET}\n"),
+    )
+    .unwrap();
+    let loaded = Config::from_dae_file_with_sources(
+        &entry,
+        &HashMap::new(),
+        SourceLimits::DEFAULT,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let owner = crate::native_api::observation::NativeObservation::new(&loaded.config);
+    let service = &owner.configuration;
+    let update = SourceUpdate {
+        sources: loaded.sources,
+        dependencies: vec![],
+        geo_sources: None,
+    };
+    service
+        .sources
+        .accept(service.sources.prepare_accept(&update), 1);
+    service.warn_secret_collisions();
+    service.warn_secret_collisions();
+    let accepted = service.sources.accepted.read().clone().unwrap();
+    let expected = [
+        (
+            accepted.ids[&directory.path().join("auth.dae")].clone(),
+            "auth.dae",
+        ),
+        (
+            accepted.ids[&directory.path().join(format!("extra/{SECRET}.dae"))].clone(),
+            "extra/<redacted>.dae",
+        ),
+    ];
+    {
+        let captured = lines.1.lock();
+        assert_eq!(captured.len(), 2);
+        for ((level, fields), (id, path)) in captured.iter().zip(&expected) {
+            assert_eq!(*level, tracing::Level::WARN);
+            assert_eq!(&fields["source_id"], id);
+            assert_eq!(&fields["path"], path);
+            assert!(!fields.values().any(|value| value.contains(SECRET)));
+        }
+    }
+    service.sources.generation_committed("next-generation", 2);
+    service.warn_secret_collisions();
+    service.warn_secret_collisions();
+    assert_eq!(lines.1.lock().len(), 4);
 }

@@ -98,9 +98,10 @@ pub(in crate::native_api) async fn source(
         .observation
         .configuration
         .source_value(accepted, index, &secrets);
-    // Both change while the bytes stay the same, so they would break content_sha256 as the tag.
+    // These change while the bytes stay the same, so they would break content_sha256 as the tag.
     let object = value.as_object_mut().expect("source value is an object");
     object.remove("writable");
+    object.remove("read_only_reason");
     object.remove("loaded_at");
     let mut response = Json(value).into_response();
     // A masked body is not the representation that PUT replaces.

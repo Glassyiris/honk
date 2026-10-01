@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorCode {
@@ -70,11 +70,14 @@ impl Serialize for ErrorCode {
     }
 }
 
-/// Why a configuration write was refused, sent as `details.reason`.
+/// Why a configuration write was refused, sent as `details.reason`, or why a listed source is
+/// read-only, sent as its `read_only_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteRefusal {
     WritesDisabled,
     ConfigurationUnavailable,
+    /// Only a source listing names it: a failed record blocks writes until the head is activated.
+    StoreBlocked,
     ListenerSecretSource,
     ListenerSecretInContent,
     ListenerSettingsChanged,
@@ -84,9 +87,10 @@ pub(crate) enum WriteRefusal {
 }
 
 impl WriteRefusal {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::WritesDisabled,
         Self::ConfigurationUnavailable,
+        Self::StoreBlocked,
         Self::ListenerSecretSource,
         Self::ListenerSecretInContent,
         Self::ListenerSettingsChanged,
@@ -104,6 +108,7 @@ impl WriteRefusal {
         match self {
             Self::WritesDisabled => "writes_disabled",
             Self::ConfigurationUnavailable => "configuration_unavailable",
+            Self::StoreBlocked => "store_blocked",
             Self::ListenerSecretSource => "listener_secret_source",
             Self::ListenerSecretInContent => "listener_secret_in_content",
             Self::ListenerSettingsChanged => "listener_settings_changed",
@@ -164,15 +169,21 @@ impl ApiError {
 
     pub fn with_details(mut self, details: Value) -> Self {
         self.error.details = Some(details);
+        if let Some(reason) = self.reason {
+            self = self.with_reason(reason);
+        }
         self
     }
 
-    /// Adds `reason` to the details, keeping what they already hold.
+    /// Adds `reason`, preserving object fields or wrapping other details in `value`.
     pub(crate) fn with_reason(mut self, reason: WriteRefusal) -> Self {
-        let details = self.error.details.get_or_insert_with(|| json!({}));
-        if let Some(details) = details.as_object_mut() {
-            details.insert("reason".into(), json!(reason.as_str()));
-        }
+        let mut details = match self.error.details.take() {
+            Some(Value::Object(details)) => details,
+            Some(value) => Map::from_iter([("value".into(), value)]),
+            None => Map::new(),
+        };
+        details.insert("reason".into(), json!(reason.as_str()));
+        self.error.details = Some(Value::Object(details));
         self.reason = Some(reason);
         self
     }
@@ -525,3 +536,6 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
         },
     })
 }
+
+#[cfg(test)]
+mod tests;
