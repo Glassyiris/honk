@@ -93,9 +93,50 @@ pub struct UrlProbeMember {
     pub native: Option<GroupProbeContext>,
 }
 
+/// Healthy-only latency statistics for one retained key; absent while the key is unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealthAverages {
+    /// Halving average `(prev + sample) / 2`, the formula URLTest ranks by.
+    pub moving: Option<Duration>,
+    /// Arithmetic mean of the newest `AVG_WINDOW` successful probes, fewer while warming up.
+    pub avg10: Option<Duration>,
+}
+
+const AVG_WINDOW: usize = 10;
+
+/// Fed only by native probe observations, never by the legacy restored/traffic collections.
+#[derive(Default)]
+pub(super) struct LatencyAverages {
+    moving: Option<Duration>,
+    recent: [Duration; AVG_WINDOW],
+    count: usize,
+}
+
+impl LatencyAverages {
+    fn fold(&mut self, latency: Duration) {
+        self.moving = Some(self.moving.map_or(latency, |moving| (moving + latency) / 2));
+        self.recent[self.count % AVG_WINDOW] = latency;
+        self.count += 1;
+    }
+
+    fn report(&self) -> HealthAverages {
+        let filled = self.count.min(AVG_WINDOW);
+        HealthAverages {
+            moving: self.moving,
+            avg10: (filled > 0)
+                .then(|| self.recent[..filled].iter().sum::<Duration>() / filled as u32),
+        }
+    }
+}
+
+pub(super) struct RetainedHealth {
+    observation: HealthObservation,
+    averages: LatencyAverages,
+}
+
 #[derive(Default)]
 pub(super) struct HealthHistory {
-    pub nodes: HashMap<Uuid, Vec<HealthObservation>>,
+    pub nodes: HashMap<Uuid, Vec<RetainedHealth>>,
     pub groups: VecDeque<GroupHealthObservation>,
     epoch: Option<Uuid>,
 }
@@ -196,12 +237,31 @@ impl AliveDialerSet {
 
     /// Read completed global checks only; custom group targets remain separate.
     pub fn health_observations(&self, node: Uuid) -> Vec<HealthObservation> {
+        self.health_samples(node)
+            .into_iter()
+            .map(|(observation, _)| observation)
+            .collect()
+    }
+
+    /// Like [`Self::health_observations`], with each key's averages while it is healthy.
+    pub fn health_samples(&self, node: Uuid) -> Vec<(HealthObservation, HealthAverages)> {
         self.health_observations
             .read()
             .as_ref()
             .and_then(|observations| observations.nodes.get(&node))
-            .cloned()
-            .unwrap_or_default()
+            .map_or_else(Vec::new, |retained| {
+                retained
+                    .iter()
+                    .map(|entry| {
+                        let averages = if entry.observation.state == HealthState::Healthy {
+                            entry.averages.report()
+                        } else {
+                            HealthAverages::default()
+                        };
+                        (entry.observation, averages)
+                    })
+                    .collect()
+            })
     }
 
     pub(super) fn record_health_observation(
@@ -237,14 +297,27 @@ impl AliveDialerSet {
         let observations = retained.nodes.entry(node).or_default();
         if let Some(previous) = observations
             .iter_mut()
-            .find(|old| old.same_key(&observation))
+            .find(|old| old.observation.same_key(&observation))
         {
-            if observation.observed_at < previous.observed_at {
+            if observation.observed_at < previous.observation.observed_at {
                 return false;
             }
-            *previous = observation;
+            // A replay at the same instant must not weigh twice.
+            if observation.observed_at > previous.observation.observed_at
+                && let Some(latency) = observation.latency
+            {
+                previous.averages.fold(latency);
+            }
+            previous.observation = observation;
         } else {
-            observations.push(observation);
+            let mut averages = LatencyAverages::default();
+            if let Some(latency) = observation.latency {
+                averages.fold(latency);
+            }
+            observations.push(RetainedHealth {
+                observation,
+                averages,
+            });
         }
         true
     }
@@ -354,6 +427,58 @@ mod tests {
             Some(Duration::from_millis(1)),
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         )
+    }
+
+    #[test]
+    fn averages_follow_healthy_probes_only() {
+        let set = AliveDialerSet::new();
+        let node = Uuid::from_u128(1);
+        set.enable_health_history();
+        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        let at = |second| SystemTime::UNIX_EPOCH + Duration::from_secs(second);
+        let probe = |latency: Option<u64>, second| {
+            HealthObservation::probe(
+                ProbeDomain::Tcp,
+                HealthMeasurement::TcpConnect,
+                IpVersion::V4,
+                latency.map(Duration::from_millis),
+                at(second),
+            )
+        };
+        let record = |observation| {
+            let ticket = set.probe_ticket(node);
+            assert!(set.complete_probe(&ticket, None, observation));
+        };
+        let averages = || set.health_samples(node)[0].1;
+        let ms = |value| Some(Duration::from_millis(value));
+
+        record(probe(Some(100), 1));
+        assert_eq!((averages().moving, averages().avg10), (ms(100), ms(100)));
+        record(probe(Some(200), 2));
+        assert_eq!((averages().moving, averages().avg10), (ms(150), ms(150)));
+
+        let ticket = set.probe_ticket(node);
+        assert!(set.complete_probe(&ticket, None, probe(Some(900), 2)));
+        assert_eq!(averages().avg10, ms(150), "same-instant replay weighs once");
+        assert!(!set.complete_probe(&ticket, None, probe(Some(900), 1)));
+
+        record(probe(None, 3));
+        assert_eq!(
+            averages(),
+            HealthAverages::default(),
+            "unavailable hides averages"
+        );
+        record(probe(Some(300), 4));
+        assert_eq!(
+            averages().avg10,
+            ms(200),
+            "failure leaves the window untouched"
+        );
+
+        for second in 5..15 {
+            record(probe(Some(10), second));
+        }
+        assert_eq!(averages().avg10, ms(10), "only the newest ten count");
     }
 
     #[test]

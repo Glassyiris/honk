@@ -20,7 +20,7 @@ use honk_config::{
     group::{Group, GroupPolicy},
 };
 use honk_outbound::{
-    alive::{AliveDialerSet, HealthObservation},
+    alive::{AliveDialerSet, HealthAverages, HealthObservation},
     group::{GroupManager, GroupMember, SelectionNetwork},
 };
 use serde_json::{Value, json};
@@ -104,7 +104,11 @@ impl Write for BoundedJson {
     }
 }
 
-fn health(observation: HealthObservation) -> Value {
+fn millis(duration: Option<std::time::Duration>) -> Option<f64> {
+    duration.map(|duration| duration.as_secs_f64() * 1000.0)
+}
+
+fn health(observation: HealthObservation, averages: HealthAverages) -> Value {
     json!({
         "transport": observation.transport,
         "purpose": observation.purpose,
@@ -113,9 +117,9 @@ fn health(observation: HealthObservation) -> Value {
         "measurement": observation.measurement,
         "sample_source": "probe",
         "state": observation.state,
-        "latency_ms": observation.latency.map(|latency| latency.as_secs_f64() * 1000.0),
-        "moving_avg_ms": null,
-        "avg10_ms": null,
+        "latency_ms": millis(observation.latency),
+        "moving_avg_ms": millis(averages.moving),
+        "avg10_ms": millis(averages.avg10),
         "observed_at": timestamp(observation.observed_at),
         "error": observation.error,
     })
@@ -173,9 +177,9 @@ fn node_row<'a>(
             .or_else(|| is_inline_node(node).then_some(ProviderId::Inline("inline"))),
         group_ids,
         health: alive
-            .health_observations(node.id)
+            .health_samples(node.id)
             .into_iter()
-            .map(health)
+            .map(|(observation, averages)| health(observation, averages))
             .collect(),
     }
 }
@@ -380,6 +384,7 @@ fn group_health(
                 sample.member_id.to_string(),
                 sample.node_id,
                 sample.observation,
+                HealthAverages::default(),
             )
         })
         .collect();
@@ -392,7 +397,7 @@ fn group_health(
             if !seen.insert(node.id) {
                 continue;
             }
-            for sample in alive.health_observations(node.id) {
+            for (sample, averages) in alive.health_samples(node.id) {
                 if samples.iter().any(|retained| {
                     retained.member_id == node.id
                         && retained.observation.transport == sample.transport
@@ -403,15 +408,25 @@ fn group_health(
                 }) {
                     continue;
                 }
-                result.push(group_observation(node.id.to_string(), node.id, sample));
+                result.push(group_observation(
+                    node.id.to_string(),
+                    node.id,
+                    sample,
+                    averages,
+                ));
             }
         }
     }
     result
 }
 
-fn group_observation(member_id: String, node_id: Uuid, sample: HealthObservation) -> Value {
-    let mut result = health(sample);
+fn group_observation(
+    member_id: String,
+    node_id: Uuid,
+    sample: HealthObservation,
+    averages: HealthAverages,
+) -> Value {
+    let mut result = health(sample, averages);
     result["member_id"] = json!(member_id);
     result["resolved_leaf_node_id"] = json!(node_id.to_string());
     result["sorting_latency_ms"] = Value::Null;
