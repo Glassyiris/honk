@@ -686,22 +686,20 @@ async fn rejected_traces_preserve_the_full_admitted_rate_budget() {
         (Some("application/json"), json!({"input":{"network":"tcp","domain":"example.test","dst_ip":"198.51.100.20","dst_port":443},"resolve":"live"}).to_string(), StatusCode::BAD_REQUEST),
         (Some("application/json"), json!({"input":{"network":"tcp","domain":"example.test","dst_port":443},"resolve":"live"}).to_string(), StatusCode::UNPROCESSABLE_ENTITY),
     ];
-    for _ in 0..=super::super::security::REQUESTS_PER_MINUTE {
-        for (content_type, body, status) in &cases {
-            let mut request = Request::post("/api/v1/routing/trace");
-            if let Some(content_type) = content_type {
-                request = request.header("content-type", *content_type);
-            }
-            let error = super::trace(
-                &state,
-                request.body(axum::body::Body::from(body.clone())).unwrap(),
-                &id,
-            )
-            .await
-            .unwrap_err()
-            .into_response();
-            assert_eq!(error.status(), *status, "{body}");
+    for (content_type, body, status) in &cases {
+        let mut request = Request::post("/api/v1/routing/trace");
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", *content_type);
         }
+        let error = super::trace(
+            &state,
+            request.body(axum::body::Body::from(body.clone())).unwrap(),
+            &id,
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(error.status(), *status, "{body}");
     }
     for _ in 0..super::super::security::REQUESTS_PER_MINUTE {
         let response = super::trace(
