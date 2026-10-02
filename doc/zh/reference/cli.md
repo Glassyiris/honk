@@ -70,6 +70,7 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `HONK_QUIC_GSO=0|1` | QUIC 出站 | 强制关闭/开启 UDP GSO。未覆盖时，保守的 1252-byte MTU 保持关闭；显式设置更大的 `mtu` 时自动开启，并把批量限制为最多 16 个 segment。 |
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
 | `MIMALLOC_PURGE_DELAY` | 启用 `mimalloc` 的 `honk-core` | mimalloc 自带的 purge 延迟（毫秒）：已释放页面在归还 OS 前保持 committed 的时间。honk 启动时设为 `100`（mimalloc v3 默认 `1000`），在连接、探测与 DNS 的分配抖动下降低 RSS，批量 relay 的吞吐与 CPU 无可测量变化；环境变量中设置的任何值都优先，包括无法解析的值（此时保持 mimalloc 的 `1000`）。`0` 立即归还（RSS 最低、CPU 略增），`-1` 从不归还。 |
+| `TOKIO_WORKER_THREADS` | `honk-core` | Tokio 自带的 worker 数量。`honk-core` 使用默认的多线程 runtime，因此默认等于核数。每个 worker 持有独立的 allocator 堆，在多核网关上调低该值可降低 RSS（实验室，4 核主机，120 条连接加 DNS：16 个 worker 约 85 MiB，8 个约 66 MiB，4 个约 60 MiB，CPU 相同）。relay 路径运行在这些 worker 上，请按流量取值。 |
 | `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖解析进程名字段偏移所用的原始内核 BTF 文件。未设置时，honk 依次检查 `/sys/kernel/btf/vmlinux` 与 `/usr/lib/debug/boot/vmlinux`；若运行时 BTF 偏移或内核 argv 访问无法通过 verifier，pname 同步回退到调用线程的 `comm`。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
 
