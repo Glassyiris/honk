@@ -599,20 +599,28 @@ async fn writable_waits_for_queue_space_then_wakes() {
     for _ in 0..TRANSPORT_QUEUE_CAP {
         send_one(&socket).unwrap();
     }
+    // The sender takes the first packet and blocks on the gate; refill the
+    // slot it freed so the queue is genuinely full.
+    tokio::task::yield_now().await;
+    send_one(&socket).unwrap();
     assert_eq!(
         send_one(&socket).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
     assert!(poll_writable_once(&mut poller).await.is_pending());
 
+    // Only the poller's own wakeup can finish this task: a timer wake on the
+    // test task would re-poll an in-line future and find the freed slot.
+    let waiter = tokio::spawn(async move {
+        std::future::poll_fn(|cx| quinn::UdpPoller::poll_writable(poller.as_mut(), cx)).await
+    });
+    tokio::task::yield_now().await;
     transport.gate.add_permits(1);
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        std::future::poll_fn(|cx| quinn::UdpPoller::poll_writable(poller.as_mut(), cx)),
-    )
-    .await
-    .expect("freed queue space never woke the poller")
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("freed queue space never woke the poller")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
