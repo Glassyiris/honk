@@ -32,7 +32,7 @@ group {
 | ------- | -------- | ------ | ---- |
 | （子节名） | `name` | 必填 | 在路由和 API 中用作出站的组 tag。 |
 | `policy` | `policy` | `selector` | 成员选择策略；接受的拼写见下表。 |
-| `icon` | `icon` | `null` | 原样提供给原生组 summary/detail 的绝对 HTTP(S) URL 或 data URI，最多 2048 个字符，无空白/控制字符；HTTP(S) 不得含凭据，data URI 必须含逗号。不推测或下载图标。 |
+| `icon` | `icon` | `null` | 经过校验的绝对 HTTP(S) URL 或 data URI，最多 2048 个字符，无空白或控制字符；HTTP(S) 不得含凭据，data URI 必须含逗号。向原生组摘要和详情返回时遮蔽其中至少 8 字节长的监听凭据值，不推测或下载图标。 |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | 按节点名选择节点。解析器把匹配结果解析为节点 UUID。 |
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
@@ -70,9 +70,9 @@ UDP 资格同时要求协议／配置支持和健康条件；VMess 与显式仅�
 
 每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。
 
-原生 `PUT /groups/{id}/selection` 用直接成员 ID 和必填 `network=tcp|udp|both` 更新；`both` 一次校验、原子发布，TCP 写入不改变 UDP。Clash 写入映射为 both，`now` 明确显示 TCP 选择。两者共用 control/reload owner、分网络持久化与预热回调；中断只影响实际发生选择变化的网络，且按既有流量捕获的组路径匹配，不用当前叶节点列表倒推。Selector 固定预热跟随 TCP 选择，UDP 预热集使用 UDP 选择。
+原生 `PUT /api/v1/groups/{groupId}/selection` 接受直接成员的 `member_id` 和必填 `network: "tcp"|"udp"|"both"`，用于更新选择；`both` 一次校验、原子发布，TCP 写入不改变 UDP。Clash 写入映射为 `both`，`now` 明确显示 TCP 选择。两者共用 control/reload 所有者、分网络持久化与预热回调；中断只影响实际发生选择变化的网络，且按既有流量捕获的组路径匹配，不用当前叶节点列表倒推。Selector 固定预热跟随 TCP 选择，UDP 预热集使用 UDP 选择。
 
-组 PATCH 通过 parser 来源位置修改可写 `.dae` 的 policy/default/final/tolerance/idle_timeout/interrupt_connections，保留其他原文字节并经完整校验、耐久写入与真实 reload；不是只改内存。需要组 ETag 的强 `If-Match`，与源文件 hash 独立校验；写后激活被拒绝不回滚磁盘。Icon 可在配置/源编辑器修改，不属于受限 PATCH 字段。自动策略组可在运行时固定成员，下次配置激活或 DELETE selection 时清除，详见[原生组控制](./api.md#节点与组)。
+组 PATCH 通过解析器记录的来源位置修改可写 `.dae` 的 `policy`、`default`、`final`、`tolerance`、`idle_timeout`、`interrupt_connections` 和 `check_url`，保留其他原文字节并经完整校验、持久写入与真实重载；不是只改内存。需要组 ETag 的强 `If-Match`，与源文件哈希独立校验；写后激活被拒绝不回滚磁盘。`icon` 可在配置或源编辑器修改，不属于受限 PATCH 字段。自动策略组可在运行时固定成员，下次配置激活或通过 DELETE 请求清除固定成员时失效，详见[原生组控制](./api.md#节点与组)。
 
 ### Score 策略
 

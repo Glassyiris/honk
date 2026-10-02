@@ -12,7 +12,7 @@ honk 将组解析为叶子出站，跟踪其健康状态，并限制预热资源
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-普通重载构建完整的替代 `GroupManager`，通过 `migrate_selector_choices_from` 分别迁移 TCP/UDP Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。两种 API 的选择写入与 accepted-manager 替换通过同一 control/reload owner 串行化，不能确认对旧管理器的写入。因此读取方只会看到完整旧图或新图。
+普通重载构建完整的替代 `GroupManager`，通过 `migrate_selector_choices_from` 分别迁移 TCP/UDP Selector 中仍存在的成员身份，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。已删除节点的选择不会转向同名替代节点。原生与 Clash API 的选择写入和管理器替换由同一 control/reload 所有者串行处理，不能确认对已被替换的管理器的写入。因此读取方只会看到完整的旧管理器或新管理器。
 
 共用的 `control/reload/fingerprint.rs` 重载规范化按同名保留配置组 UUID 与 `created_at`，不受插入、删除或重排影响。改名视为新组，不继承旧身份；程序化改名若仍携带旧 UUID，也会重新生成 UUID。SIGHUP、显式激活及 provider/runtime reload（含 no-op 比较）都遵循此规则，不依赖原生观测是否存在。
 
@@ -48,7 +48,7 @@ UDP 选择首先排除规范协议／配置不支持 UDP 的转发叶节点，�
 
 同一已捕获 owner 的并发 close 共用实际完成结果，退役失败也由所有等待者继承；不会仅因已处于 Closing 或 Failed 而报告 `Gone`。不存在或已被替换的 owner 仍是 `Gone`。自动中断回调只发起退役，需要确认的调用者等待该 owner 的 completion。
 
-组配置与运行时选择分离：受限原生 JSON Patch 由 parser span 和既有协调器持久化为 `.dae`，全量验证后真实 reload；accepted revision 与文件 hash 是不同 fence。配置 icon 原样展示经过校验的 HTTP(S)/data URI，不派生或抓取。自动策略的固定成员只存在于当前 GroupManager，配置激活后即失效；节点/provider 创建删除另经主文件源事务，修改已有条目仍用源 PUT，见[API 参考](../reference/api.md#主文件条目与-geodata-管理)。
+组配置与运行时选择分离：受限原生 JSON Patch 通过解析器记录的来源位置和既有协调器写入 `.dae`，完整校验后执行真实重载；已接受的配置 revision 与磁盘文件 SHA-256 分别用于校验，激活前还会再次检查 revision。配置的 `icon` 以经过校验并遮蔽至少 8 字节长的监听凭据值的 HTTP(S) URL 或 data URI 展示，不推测或下载图标。自动策略的固定成员只存在于当前 GroupManager，配置激活后即失效；节点和 provider 的创建、删除另经主文件源事务，修改已有条目仍用源 PUT，见[API 参考](../reference/api.md#主文件条目与-geodata-管理)。
 
 ### Score 评分与生命周期
 
@@ -188,7 +188,7 @@ Score 归属。普通成员/展示列表不包含 final 边；健康注册、预
 可用的普通 IPv4 代理路径，再执行 final，业务目标地址族不变。缺失或成环的
 final 仍然拒绝；这里不重试传输错误或终态 packet rejection。
 
-Selector 在候选展开和健康过滤前绑定具体节点或子组成员；节点 tag 重复时，按声明顺序绑定第一个匹配的 `NodeId`。服务选择只对已选子组执行 Apply，再检查父组健康条件；不预览未选兄弟，也不要求子组已提交的 Peek 必须先成功。TCP 与 UDP 的已选路径不可用时，都只能通过其显式配置的 final 继续选择。候选保留来源子组的引用，不再根据显示 tag 反查身份。选中的自动策略子组仍可在自己的成员范围内选择其他叶节点。唯一 TCP 叶节点的最后尝试遍历也遵守每一级 Selector 选择，而显式延迟测试仍可检查全部成员以发现恢复。
+Selector 在候选展开和健康过滤前绑定具体节点或子组成员；按名称配置的默认选择和 Clash 写入在节点 tag 重复时，按声明顺序绑定第一个匹配的 `NodeId`；原生成员 ID 可选择特定直接成员。服务选择只对已选子组执行 Apply，再检查父组健康条件；不预览未选兄弟，也不要求子组已提交的 Peek 必须先成功。TCP 与 UDP 的已选路径不可用时，都只能通过其显式配置的 final 继续选择。候选保留来源子组的引用，不再根据显示 tag 反查身份。选中的自动策略子组仍可在自己的成员范围内选择其他叶节点。唯一 TCP 叶节点的最后尝试遍历也遵守每一级 Selector 选择，而显式延迟测试仍可检查全部成员以发现恢复。
 
 展示和 API 输出仍使用成员 tag；即使物理拨号落到更深的叶节点，实际选择也会单独保留具体节点或子组身份：
 
@@ -285,7 +285,7 @@ VLESS pool/source key 与 QUIC 状态；配置变化时得到 fresh runtime。�
 maintenance pass 与其他 idle resource 一起回收未受 retention 的 idle VLESS
 carrier，不创建新的 protocol timer。
 
-原生探测固定成员到叶节点的关联和代次所有者，不推进策略状态。实际 TCP-connect、HTTP 和 TCP/UDP DNS 测量保留传输协议、用途、地址族及冷热状态；过期或取消的结果不发布新的健康状态。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。探测仍固定解析出的 IP。参见[有界探测](../reference/api.md#有界探测dns-与路由诊断)。
+原生探测固定成员到叶节点的关联和代次所有者，不推进策略状态。实际 TCP-connect、HTTP 和 TCP/UDP DNS 测量保留传输协议、用途、地址族及冷热状态；过期或取消的结果不发布新的健康状态。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。探测仍固定解析出的 IP。参见[有界探测](../reference/api.md#有界探测)。
 
 ## 拨号准入预算
 

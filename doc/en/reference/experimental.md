@@ -104,7 +104,7 @@ An absolute `external_ui` path is used literally. A relative path selects an exi
 
 ### Startup mode
 
-With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; with `cache_file.enabled: true`, a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and every accepted explicit activation (including no-op), and preservation across provider/network refresh. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
+With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; with `cache_file.enabled: true`, a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and on accepted explicit activation (including no-op) when the backend reset succeeds, and preservation across provider/network refresh. A reset failure after commit retains the previous mode, closes admission and returns `CommittedDegraded`. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
 
 ## `cache_file`
 
@@ -121,7 +121,7 @@ Upgrade note: omitting `cache_file.enabled` now keeps Selector choices and delay
 
 ### Persisted state
 
-Unless `enabled` is `false`, honk keeps per-network Selector choices and each node's last real delay sample in the state db, like mihomo's `store-selected`. Only `enabled: true` also restores and persists the Clash mode and the Clash GLOBAL selection, and only with native API disabled; otherwise a restart starts in `default_mode`. Delay samples are written as one batch every minute; restoration discards zero samples and samples older than 24 hours. Liveness is not restored.
+Unless `enabled` is `false`, honk keeps per-network Selector choices and each node's last real delay sample in the state db, like mihomo's `store-selected`. Only `enabled: true` also restores and persists the Clash mode and the Clash GLOBAL selection, and only with native API disabled; with native disabled and no restored mode, a restart starts in `default_mode`, while native enabled always starts in `Rule`. Delay samples are written as one batch every minute; restoration discards zero samples and samples older than 24 hours. Liveness is not restored.
 
 If the state db is corrupt and neither `--store db` nor `native_api.password_auth` is set, honk moves `honk.db` and `honk.db-wal` aside as `honk.db.corrupt` and `honk.db.corrupt-wal` once it holds the instance lock, and starts a new file. If `honk.db.corrupt` already exists, it keeps both files and runs without persistence until one is removed. In the same case a state db that is unavailable, unsafe (not a private file owned by the honk user) or locked by `honk-core admin reset` also leaves honk running without persistence, with a warning. For an unsafe path the `persistence_unavailable` degradation adds `rule` (`not_owner`, `group_or_other_bits`, `not_directory`, `not_file`, `symlink` or `identity_changed`) beside `reason`; the log names the path and how to fix it. A db from a newer honk or another program refuses startup in every mode, because moving it aside would destroy data only that program can read.
 
