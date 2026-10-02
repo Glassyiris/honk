@@ -284,6 +284,17 @@ impl TransportQuinnSocket {
             .map(TransportIoError::to_io_error)
     }
 
+    /// The send queue is closed: the stored cause, else a broken pipe.
+    fn closed_send_error(&self) -> io::Error {
+        self.send_error()
+            .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    /// A reserved slot means writable only while no fatal send error is stored.
+    fn writable_unless_failed(&self) -> io::Result<()> {
+        self.send_error().map_or(Ok(()), Err)
+    }
+
     fn recv_error(&self) -> Option<io::Error> {
         self.recv_error
             .lock()
@@ -351,11 +362,8 @@ impl quinn::UdpPoller for TransportUdpPoller {
                 reserved => {
                     coop.made_progress();
                     return Poll::Ready(match reserved {
-                        Ok(_) => this.socket.send_error().map_or(Ok(()), Err),
-                        Err(_) => Err(this
-                            .socket
-                            .send_error()
-                            .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))),
+                        Ok(_) => this.socket.writable_unless_failed(),
+                        Err(_) => Err(this.socket.closed_send_error()),
                     });
                 }
             }
@@ -366,14 +374,11 @@ impl quinn::UdpPoller for TransportUdpPoller {
             Poll::Ready(Ok(permit)) => {
                 drop(permit);
                 *writable = None;
-                Poll::Ready(this.socket.send_error().map_or(Ok(()), Err))
+                Poll::Ready(this.socket.writable_unless_failed())
             }
             Poll::Ready(Err(_)) => {
                 *writable = None;
-                Poll::Ready(Err(this
-                    .socket
-                    .send_error()
-                    .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))))
+                Poll::Ready(Err(this.socket.closed_send_error()))
             }
         }
     }
@@ -417,9 +422,7 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
                 }
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(self
-                .send_error()
-                .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(self.closed_send_error()),
         }
     }
     fn poll_recv(
