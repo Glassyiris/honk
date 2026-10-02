@@ -17,7 +17,7 @@ env:
 
 jobs:
   toolchain-preview:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,7 +39,7 @@ jobs:
           echo "nightly=$(rustc +nightly -V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: toolchain-preview-${{ steps.versions.outputs.stable }}-${{ steps.versions.outputs.nightly }}
+          key: toolchain-preview-${{ runner.arch }}-${{ steps.versions.outputs.stable }}-${{ steps.versions.outputs.nightly }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
@@ -77,8 +77,8 @@ jobs:
           set -euo pipefail
           source .github/ci/pins.env
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
-            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
-          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-aarch64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_AARCH64_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
           zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
       # Floating selectors deliberately bypass the repository pins to expose drift.
@@ -100,7 +100,7 @@ jobs:
 
   public-vless-loopback:
     name: Public VLESS loopback interop (3 cases)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -112,7 +112,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: public-vless-loopback-${{ steps.toolchain.outputs.stable }}
+          key: public-vless-loopback-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
@@ -130,15 +130,15 @@ jobs:
           source .github/ci/pins.env
           tools="$RUNNER_TEMP/public-vless-interop"
           mkdir -p "$tools"
-          curl -fsSL --retry 3 -o "$tools/Xray-linux-64.zip" \
-            "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip"
+          curl -fsSL --retry 3 -o "$tools/Xray-linux-arm64-v8a.zip" \
+            "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-arm64-v8a.zip"
           curl -fsSL --retry 3 -o "$tools/sing-box.tar.gz" \
-            "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz"
-          echo "$XRAY_SHA256  $tools/Xray-linux-64.zip" | sha256sum -c -
-          echo "$SING_BOX_SHA256  $tools/sing-box.tar.gz" | sha256sum -c -
-          unzip -j "$tools/Xray-linux-64.zip" xray -d "$tools"
+            "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-arm64-musl.tar.gz"
+          echo "$XRAY_AARCH64_SHA256  $tools/Xray-linux-arm64-v8a.zip" | sha256sum -c -
+          echo "$SING_BOX_AARCH64_SHA256  $tools/sing-box.tar.gz" | sha256sum -c -
+          unzip -j "$tools/Xray-linux-arm64-v8a.zip" xray -d "$tools"
           tar -xzf "$tools/sing-box.tar.gz" -C "$tools" --strip-components=1 \
-            "sing-box-$SING_BOX_VERSION-linux-amd64-musl/sing-box"
+            "sing-box-$SING_BOX_VERSION-linux-arm64-musl/sing-box"
           HONK_XRAY_BIN=$(realpath "$tools/xray")
           HONK_SING_BOX_BIN=$(realpath "$tools/sing-box")
           test -x "$HONK_XRAY_BIN"
@@ -192,7 +192,7 @@ jobs:
           path: target/nextest/ci/junit.xml
 
   pins:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -210,16 +210,19 @@ jobs:
           fetch "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat" "$GEOSITE_SHA256" geosite.dat
           fetch "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat" "$GEOIP_SHA256" geoip.dat
           fetch "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst" "$BPF_LINKER_SHA256" bpf-linker.tar.zst
+          fetch "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-aarch64-unknown-linux-musl.tar.zst" "$BPF_LINKER_AARCH64_SHA256" bpf-linker-aarch64.tar.zst
           fetch "$VIRTME_NG_WHEEL_URL" "$VIRTME_NG_SHA256" virtme-ng.whl
           fetch "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" "$XRAY_SHA256" Xray-linux-64.zip
+          fetch "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-arm64-v8a.zip" "$XRAY_AARCH64_SHA256" Xray-linux-arm64-v8a.zip
           fetch "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz" "$SING_BOX_SHA256" sing-box.tar.gz
+          fetch "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-arm64-musl.tar.gz" "$SING_BOX_AARCH64_SHA256" sing-box-arm64.tar.gz
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_IMAGE" "$KERNEL_FLOOR_IMAGE_SHA256" "$KERNEL_FLOOR_IMAGE"
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_MODULES" "$KERNEL_FLOOR_MODULES_SHA256" "$KERNEL_FLOOR_MODULES"
           fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_IMAGE" "$KERNEL_RECENT_IMAGE_SHA256" "$KERNEL_RECENT_IMAGE"
           fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_MODULES" "$KERNEL_RECENT_MODULES_SHA256" "$KERNEL_RECENT_MODULES"
 
   advisories:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -231,7 +234,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: advisories-${{ steps.toolchain.outputs.stable }}
+          key: advisories-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
@@ -240,7 +243,7 @@ jobs:
       - run: cargo audit
 
   fuzz:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/fuzz/target
@@ -254,7 +257,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.nightly }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: fuzz-${{ steps.toolchain.outputs.nightly }}
+          key: fuzz-${{ runner.arch }}-${{ steps.toolchain.outputs.nightly }}
           workspaces: fuzz -> target
           cache-on-failure: true
       - name: Install clang and pinned cargo-fuzz

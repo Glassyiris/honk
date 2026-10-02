@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -56,7 +57,7 @@ if args.json is not None:
         "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
         "lane": "reload",
         "matrix": {
-            "target": "x86_64-unknown-linux-gnu",
+            "target": f"{platform.machine()}-unknown-linux-gnu",
             "workload": "identical-config",
         },
         "measured_sha": os.environ.get("HONK_RELOAD_MEASURED_SHA", "0000000"),

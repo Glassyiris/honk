@@ -29,7 +29,7 @@ env:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     permissions:
       contents: read
@@ -129,7 +129,7 @@ jobs:
             if (parser) lanes.push("parser");
             if (floor) lanes.push("ebpf");
             const heavy = push || (dispatch && inputs.full) || (pr && (failed || full));
-            if (heavy) lanes.push("ebpf-recent", "aarch64", "features", "cross-musl");
+            if (heavy) lanes.push("ebpf-recent", "x86_64", "features", "cross-musl");
             if (docs) lanes.push("docs");
             if (pr) lanes.push("review-bot");
             fs.mkdirSync("target/ci-report", { recursive: true });
@@ -152,7 +152,7 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.parser == 'true' || needs.changes.outputs.full == 'true') }}
     name: dae-config parser (conformance + fuzz replay)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -164,7 +164,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: parser
+          key: parser-${{ runner.arch }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -231,7 +231,7 @@ jobs:
             fs.writeFileSync("target/ci-report/parser.json", JSON.stringify({
               schema_version: 1, run_id: context.runId,
               run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "parser",
-              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
               measured_sha: process.env.MEASURED_SHA, baseline_sha: null,
               units: {conformance_cases: "cases", fuzz_replay_inputs: "inputs"},
               values: {
@@ -253,7 +253,7 @@ jobs:
   docs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.docs == 'true' || needs.changes.outputs.full == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -266,7 +266,7 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
     name: fmt + clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -280,6 +280,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
+          key: ${{ runner.arch }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
@@ -324,7 +325,7 @@ jobs:
             fs.writeFileSync("target/ci-report/lint.json", JSON.stringify({
               schema_version: 1, run_id: context.runId,
               run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "lint",
-              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
               measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
               failure: status === "success" ? null : {summary: `lint lane ${status}`, detail_lines: []},
             }, null, 2) + "\n");
@@ -341,7 +342,7 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
     name: cargo nextest (workspace)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -354,6 +355,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
+          key: ${{ runner.arch }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
@@ -496,7 +498,7 @@ jobs:
               "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
               "lane": "test",
               "matrix": {
-                  "target": "x86_64-unknown-linux-gnu",
+                  "target": "aarch64-unknown-linux-gnu",
                   "toolchain": os.environ["TOOLCHAIN"],
               },
               "measured_sha": os.environ["MEASURED_SHA"],
@@ -523,7 +525,7 @@ jobs:
     name: DNS smoke (release honk-core)
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -536,6 +538,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
+          key: ${{ runner.arch }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
@@ -628,7 +631,7 @@ jobs:
               "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
               "lane": "smoke",
               "matrix": {
-                  "target": "x86_64-unknown-linux-gnu",
+                  "target": "aarch64-unknown-linux-gnu",
                   "toolchain": os.environ["TOOLCHAIN"],
                   "profile": "release",
               },
@@ -677,6 +680,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
+          key: ${{ runner.arch }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           workspaces: |
@@ -858,7 +862,7 @@ jobs:
     name: eBPF feature compile guard
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -878,7 +882,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
-          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          key: ${{ github.job }}-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
@@ -895,11 +899,11 @@ jobs:
         run: |
           set -euo pipefail
           source .github/ci/pins.env
-          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+          echo "sha256=$BPF_LINKER_AARCH64_SHA256" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bpf-linker
-          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+          key: bpf-linker-${{ github.job }}-${{ runner.arch }}-${{ steps.linker-pin.outputs.sha256 }}
       - name: Install pinned bpf-linker
         run: |
           set -euo pipefail
@@ -908,9 +912,9 @@ jobs:
           mkdir -p "$(dirname "$archive")"
           if ! test -f "$archive"; then
             curl -fsSL --retry 3 -o "$archive" \
-              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-aarch64-unknown-linux-musl.tar.zst"
           fi
-          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          echo "$BPF_LINKER_AARCH64_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
       - run: cargo check -p honk-core --features ebpf,native-api --tests
@@ -940,7 +944,7 @@ jobs:
             fs.writeFileSync("target/ci-report/ebpf-check.json", JSON.stringify({
               schema_version: 1, run_id: context.runId,
               run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf-check",
-              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "ebpf-tests"},
+              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "ebpf-tests"},
               measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
               failure: status === "success" ? null : {summary: `ebpf-check lane ${status}`, detail_lines: []},
             }, null, 2) + "\n");
@@ -978,7 +982,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
-          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          key: ${{ github.job }}-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           workspaces: |
@@ -1031,7 +1035,7 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bpf-linker
-          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+          key: bpf-linker-${{ github.job }}-${{ runner.arch }}-${{ steps.linker-pin.outputs.sha256 }}
       - name: Install pinned bpf-linker
         run: |
           set -euo pipefail
@@ -1170,11 +1174,11 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  aarch64:
+  x86_64:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
-    name: cargo nextest (aarch64)
-    runs-on: ubuntu-24.04-arm
+    name: cargo nextest (x86_64)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1187,7 +1191,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
-          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}
+          key: ${{ github.job }}-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
@@ -1231,13 +1235,19 @@ jobs:
           sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
       - run: cargo nextest run --workspace --profile ci
+      - name: Fetch doona for the native-ui feature
+        run: |
+          set -euo pipefail
+          dir=$(ci/fetch-doona.sh)
+          echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
+      - run: cargo nextest run --workspace --features honk-core/native-ui --profile ci
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aarch64-junit
+          name: x86_64-junit
           path: target/nextest/ci/junit.xml
-      - name: Write aarch64 CI report
+      - name: Write x86_64 CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -1260,19 +1270,19 @@ jobs:
               values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
             } catch {}
             const status = process.env.JOB_STATUS;
-            fs.writeFileSync("target/ci-report/aarch64.json", JSON.stringify({
+            fs.writeFileSync("target/ci-report/x86_64.json", JSON.stringify({
               schema_version: 1, run_id: context.runId,
-              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "aarch64",
-              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "x86_64",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
               measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
-              failure: status === "success" ? null : {summary: `aarch64 lane ${status}`, detail_lines: []},
+              failure: status === "success" ? null : {summary: `x86_64 lane ${status}`, detail_lines: []},
             }, null, 2) + "\n");
-      - name: Upload aarch64 CI report
+      - name: Upload x86_64 CI report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ci-report-aarch64
-          path: target/ci-report/aarch64.json
+          name: ci-report-x86_64
+          path: target/ci-report/x86_64.json
           retention-days: 30
           if-no-files-found: error
 
@@ -1280,7 +1290,7 @@ jobs:
     name: Independent feature sets
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1300,7 +1310,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
-          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          key: ${{ github.job }}-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
@@ -1317,11 +1327,11 @@ jobs:
         run: |
           set -euo pipefail
           source .github/ci/pins.env
-          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+          echo "sha256=$BPF_LINKER_AARCH64_SHA256" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bpf-linker
-          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+          key: bpf-linker-${{ github.job }}-${{ runner.arch }}-${{ steps.linker-pin.outputs.sha256 }}
       - name: Install pinned bpf-linker
         run: |
           set -euo pipefail
@@ -1330,9 +1340,9 @@ jobs:
           mkdir -p "$(dirname "$archive")"
           if ! test -f "$archive"; then
             curl -fsSL --retry 3 -o "$archive" \
-              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-aarch64-unknown-linux-musl.tar.zst"
           fi
-          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          echo "$BPF_LINKER_AARCH64_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
       - name: Prepare eBPF object
@@ -1407,7 +1417,7 @@ jobs:
             fs.writeFileSync("target/ci-report/features.json", JSON.stringify({
               schema_version: 1, run_id: context.runId,
               run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "features",
-              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "independent"},
+              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "independent"},
               measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
               failure: status === "success" ? null : {summary: `features lane ${status}`, detail_lines: []},
             }, null, 2) + "\n");
@@ -1445,7 +1455,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
-          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          key: ${{ github.job }}-${{ runner.arch }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
@@ -1466,7 +1476,7 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bpf-linker
-          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+          key: bpf-linker-${{ github.job }}-${{ runner.arch }}-${{ steps.linker-pin.outputs.sha256 }}
       - name: Install pinned bpf-linker
         run: |
           set -euo pipefail
@@ -1550,7 +1560,7 @@ jobs:
   review-bot:
     name: mechanical PR review
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     permissions:
       pull-requests: read

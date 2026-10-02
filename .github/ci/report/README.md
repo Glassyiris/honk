@@ -1,8 +1,10 @@
 # CI results report
 
-The `changes` job writes `ci-report-selection`; `lint`, `test`, `parser`, `smoke`, `ebpf-check`, `ebpf`, `ebpf-recent`, `aarch64`, `features`, `cross-musl`, and `review-bot` write schema-versioned lane artefacts described in `schema.md`, and the reload workflow writes `ci-report-reload`. `report.yml` runs after either workflow, checks out only the default branch, joins the triggering run with the latest completed pull-request companion for the same head, and compares it with the preceding successful `main` push.
+The `changes` job writes `ci-report-selection`; `lint`, `test`, `parser`, `smoke`, `ebpf-check`, `ebpf`, `ebpf-recent`, `x86_64`, `features`, `cross-musl`, and `review-bot` write schema-versioned lane artefacts described in `schema.md`, and the reload workflow writes `ci-report-reload`. `report.yml` runs after either workflow, checks out only the default branch, joins the triggering run with the latest completed pull-request companion for the same head, and compares it with the preceding successful `main` push.
 
 The reporter handles pull-request runs only. It reads per-attempt job conclusions and bounded artefact files as data, never imports, sources, evaluates, or executes artefact or pull-request content, and upserts the marker-bearing comment authored by `github-actions[bot]` on every matching open base-repository pull request.
+
+The ordinary `test` lane runs on Arm; the heavy `x86_64` lane uploads `ci-report-x86_64` containing `x86_64.json`. Measurement producers record their actual target architecture, including reload benchmarks run locally. Candidate and baseline matrices must match, so the first Arm measurements have no comparable x86 baseline. Existing x86 fixture data remains valid historical input.
 
 The renderer interface is:
 
@@ -17,3 +19,5 @@ The parser path filter selects config code, the Go oracle, fuzz inputs, manifest
 The parser job uses stable Rust plus Go from `tools/dae-parse/go.mod`; ordinary workspace tests need neither Go nor nightly. `ci-report-parser` records conformance counts and replay inputs and names the first failing case/path. Weekly fuzzing uses the pinned eBPF nightly and `CARGO_FUZZ_VERSION`, runs the three targets sequentially for 480 seconds each with two workers, and uploads `fuzz-inputs` even after failure. It has read-only repository permissions and creates no issues.
 
 Fork acceptance requires this reporter version on the fork's default branch before testing a branch that uploads `ci-report-parser`. Otherwise the old reporter cannot validate the fourth selection filter or display the new metrics.
+
+The trusted renderer on the default branch must also contain the `x86_64` selection/job mapping before it can identify a missing report from that renamed heavy lane.

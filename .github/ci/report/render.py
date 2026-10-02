@@ -54,7 +54,7 @@ SELECTION_JOBS = {
     "ebpf-check": "eBPF feature compile guard",
     "ebpf": "eBPF object + real VM kernel tests",
     "ebpf-recent": "eBPF real VM tests (recent kernel)",
-    "aarch64": "cargo nextest (aarch64)",
+    "x86_64": "cargo nextest (x86_64)",
     "features": "Independent feature sets",
     "cross-musl": "x86_64 musl release path",
     "review-bot": "mechanical PR review",
@@ -71,7 +71,7 @@ POLICY_GROUPS = (
     ({"ebpf"}, "eBPF VM not run: `ci:ebpf`"),
     ({"parser"}, "parser lane not run: `ci:full`"),
     (
-        {"ebpf-recent", "aarch64", "features", "cross-musl"},
+        {"ebpf-recent", "x86_64", "features", "cross-musl"},
         "full lanes not run: `ci:full`",
     ),
 )
