@@ -226,7 +226,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 支持经所选叶节点的 `PacketTransport`。 |
 | DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | QUIC 会话可使用所选叶节点的 `PacketTransport`。 |
 
-代理 DoQ 与 DoH3 会把 generation 固定的叶节点 `PacketTransport` 适配为 quinn `AsyncUdpSocket`。每个池化 QUIC connection 或 HTTP/3 session 持有一个有界 adapter 与 client endpoint，直到 retry 或 shutdown 将其关闭；datagram 边界和 peer 元数据保持不变，内层 QUIC payload 上限为 1252 bytes。adapter 的接收 worker 每读取 32 次 transport 就让出一次调度，使从不挂起的 transport 无法在 endpoint 消费之前写满 64 包接收队列；队列仍满时丢弃该 datagram 并计入 `transportRxDrops`，不会反压 transport。缺少代理 registry 或 packet capability 时会 fail closed，不会绕过为直连。直连 QUIC 仍复用带 bypass mark 的原生 endpoint。
+代理 DoQ 与 DoH3 会把 generation 固定的叶节点 `PacketTransport` 适配为 quinn `AsyncUdpSocket`。每个池化 QUIC connection 或 HTTP/3 session 持有一个有界 adapter 与 client endpoint，直到 retry 或 shutdown 将其关闭；datagram 边界和 peer 元数据保持不变，内层 QUIC payload 上限为 1252 bytes。adapter 的接收 worker 每读取 32 次 transport 就让出一次调度，使 endpoint driver 能在从不挂起的 transport 的两批读取之间得到调度；队列仍满时丢弃该 datagram 并计入 `transportRxDrops`，不会反压 transport。缺少代理 registry 或 packet capability 时会 fail closed，不会绕过为直连。直连 QUIC 仍复用带 bypass mark 的原生 endpoint。
 
 DNS client task owner 与捕获的 runtime owner 保留同一份 packet-adapter worker join，涵盖 session 发布前握手失败或被取消的路径。关闭和暂停等待这些 join；worker panic 在回收后仍保留，并使暂停失败。零 timeout 的 endpoint close 仅请求关闭，不确认 joined cleanup；健康探测共用同一 endpoint 关闭协议。
 
