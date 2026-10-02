@@ -173,8 +173,10 @@ pub(super) async fn session_writer(
     mut write: BoxedWriter,
     queue: Arc<WriterQueue>,
 ) {
-    let mut batch: Vec<FrameCommand> = Vec::with_capacity(WRITER_BATCH_MAX_FRAMES);
-    let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
+    // Both grow to the first real batch: a pooled idle session (health probes
+    // keep dozens warm) otherwise pins about 70 KiB each for nothing.
+    let mut batch: Vec<FrameCommand> = Vec::new();
+    let mut buf = bytes::BytesMut::new();
     let mut packet = 0u32;
     let mut send_padding = true;
     loop {
