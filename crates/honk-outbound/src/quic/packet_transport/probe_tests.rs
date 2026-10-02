@@ -508,21 +508,10 @@ async fn ready_burst_beyond_the_queue_reaches_a_live_consumer() {
     .expect("a ready burst overflowed the adapter queue and lost packets");
 }
 
-#[tokio::test]
-async fn rejected_packet_flood_does_not_monopolize_the_runtime() {
+async fn assert_flood_yields(packet: impl Fn() -> (Vec<u8>, SocketAddr)) {
     const FLOOD: usize = 4096;
     let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-    let wrong: SocketAddr = "127.0.0.2:443".parse().unwrap();
-    let transport = ImmediatePacketTransport::new(
-        remote,
-        (0..FLOOD).map(|i| {
-            if i % 2 == 0 {
-                (Vec::new(), remote)
-            } else {
-                (vec![1], wrong)
-            }
-        }),
-    );
+    let transport = ImmediatePacketTransport::new(remote, (0..FLOOD).map(|_| packet()));
     let socket = TransportQuinnSocket::new(transport.clone(), remote);
 
     // The current-thread runtime schedules this witness behind the workers.
@@ -537,6 +526,16 @@ async fn rejected_packet_flood_does_not_monopolize_the_runtime() {
         "the receiver served the whole flood in one poll"
     );
     assert!(socket.close_tasks().await);
+}
+
+#[tokio::test]
+async fn empty_packet_flood_does_not_monopolize_the_runtime() {
+    assert_flood_yields(|| (Vec::new(), "127.0.0.1:443".parse().unwrap())).await;
+}
+
+#[tokio::test]
+async fn wrong_peer_flood_does_not_monopolize_the_runtime() {
+    assert_flood_yields(|| (vec![1], "127.0.0.2:443".parse().unwrap())).await;
 }
 
 /// Holds every send until the test releases it, so the adapter queue can be filled.
