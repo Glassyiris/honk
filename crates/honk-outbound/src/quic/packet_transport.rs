@@ -30,6 +30,10 @@ const TRANSPORT_QUEUE_CAP: usize = 64;
 /// A queued QUIC datagram must not wait behind a full adapter queue longer
 /// than the longest per-packet send deadline.
 const TRANSPORT_PACKET_MAX_AGE: Duration = Duration::from_secs(5);
+/// The receive worker yields after this many transport reads: a transport that
+/// never returns `Pending` would otherwise overflow the 64-packet queue and
+/// drop the rest of a burst before the endpoint driver can run.
+const RECV_YIELD_EVERY: u32 = 32;
 
 #[derive(Debug)]
 struct QueuedTransportPacket {
@@ -190,7 +194,12 @@ impl TransportQuinnSocket {
             let recv_waker = Arc::clone(&recv_waker);
             async move {
                 let mut buf = vec![0u8; 65536];
+                let mut since_yield = 0;
                 loop {
+                    if since_yield == RECV_YIELD_EVERY {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                     let (n, source) = match transport.recv_packet(&mut buf).await {
                         Ok(packet) => packet,
                         Err(error) => {
@@ -199,6 +208,7 @@ impl TransportQuinnSocket {
                             return;
                         }
                     };
+                    since_yield += 1;
                     if n == 0 {
                         continue;
                     }
