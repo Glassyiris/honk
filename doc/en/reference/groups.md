@@ -32,7 +32,7 @@ group {
 | ------- | -------------- | ------- | ------- |
 | (section name) | `name` | required | Group tag used as an outbound in routing and APIs. |
 | `policy` | `policy` | `selector` | Member-selection policy; accepted spellings are listed below. |
-| `icon` | `icon` | `null` | Validated absolute HTTP(S) URL or data URI, at most 2048 characters; returned unchanged by native group reads, never guessed. |
+| `icon` | `icon` | `null` | Validated absolute HTTP(S) URL or data URI, at most 2048 characters; returned by native group reads with listener-secret values of at least 8 bytes masked, never guessed. |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | Select nodes by node name. The parser resolves matches to node UUIDs. |
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | Select nodes by the current tag of the subscription that produced them. |
 | `filter: group(...)` | `groups` | `[]` | Add nested group tags. Comma-separated arguments and pipe-separated tags are accepted. |
@@ -68,7 +68,7 @@ Named `final` nodes likewise resolve the first matching configuration declaratio
 
 Native `PUT /api/v1/groups/{groupId}/selection` accepts a direct `member_id` and `network: "tcp"|"udp"|"both"`. Both-network changes validate and publish together; Clash selection writes both and displays TCP. Per-network choices are retained by reload/persistence, and interruption is acknowledged only after actual closes. On an automatic group the same write pins the member until DELETE selection or the next configuration activation clears it.
 
-Restricted native Group PATCH edits parser-owned source spans only when the group's accepted source is writable. It supports policy, default member, final, tolerance, idle timeout and interruption—not icon, name or filters—and uses the quoted accepted group/config revision independently of source disk hashes. Full validation, durable write and reload still apply; a write is not activation success. See the [group API contract](./api.md#nodes-and-groups).
+Restricted native Group PATCH edits parser-owned source spans only when the group's accepted source is writable. It supports policy, default member, final, tolerance, idle timeout, interruption and check URL—not icon, name or filters—and uses the quoted accepted group/config revision independently of source disk hashes. Full validation, durable write and reload still apply; a write is not activation success. See the [group API contract](./api.md#nodes-and-groups).
 
 If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk can still dial the same leaf as a last resort, but only if the current Selector choices lead to it. This cannot bypass a chosen empty sub-group or imply a `direct` fallback. The node remains marked dead until real traffic or probes recover it; UDP keeps normal dead-member exclusion. Last-resort serving logs a rate-limited warning (60s per group).
 
