@@ -69,7 +69,7 @@ experimental {
 
 ### 共用采样与可选历史
 
-流量与内存 history 共用既有一秒 sampler，错过 tick 使用 Skip；仅存内存，重启清空，不插值、不补零，缺口与 null 原样保留。读取依据实际 RSS/cgroup v2 文件，不把未知值伪装为零，也不宣称内核内存核算。关闭 history 不关闭即时 runtime、出站或内存读取；所有记录开关仍需重启。已启用的日志/DNS 日志/flow 可通过 `/runtime/settings` 临时调整级别或留存上限，但不能动态开启被配置关闭的 recorder。合并全量校验后原子生效；显式配置激活（含 no-op）恢复配置值，provider/network refresh 保留临时值，见 [API 契约](./api.md#provider日志与临时设置)。
+流量与内存 history 共用既有一秒 sampler，错过 tick 使用 Skip；仅存内存，重启清空，不插值、不补零，缺口与 null 原样保留。读取依据实际 RSS/cgroup v2 文件，不把未知值伪装为零，也不宣称内核内存核算。关闭 history 不关闭即时 runtime、出站或内存读取；所有记录开关仍需重启。已启用的日志/DNS 日志/flow 可通过 `/runtime/settings` 临时调整级别或留存上限，但不能动态开启被配置关闭的 recorder。合并全量校验后原子生效；显式配置激活（含 no-op）恢复配置值，provider/network refresh 保留临时值，见 [API 契约](./api.md#原生日志与运行时设置)。
 
 ### 配置管理的信任边界
 
@@ -107,7 +107,7 @@ Dashboard 下载 URL 与出口见 [`assets.ui`](./assets.md)。
 
 ### 启动模式
 
-`default_mode` 接受规范模式 `Rule`、`Global` 和 `Direct`。`cache_file.enabled` 为 `true` 且包含有效的 Clash 缓存模式时，改为恢复该值。无效的缓存值或配置值回退到 `Rule`。
+原生 API 未启用时，`default_mode` 接受规范模式 `Rule`、`Global` 和 `Direct`。`cache_file.enabled` 为 `true` 且包含有效的 Clash 缓存模式时，改为恢复该值。无效的缓存值或配置值回退到 `Rule`。启用原生 API 后，两种 API 共用同一临时模式所有者，不恢复或持久化模式；启动时使用 `Rule`，已接受的显式配置激活（含 no-op）在后端重置成功时恢复 `Rule`，provider 刷新或网络刷新时保留模式。提交后重置失败则保留原模式、关闭准入并返回 `CommittedDegraded`。`Global` 模式绑定稳定的节点或组身份，刷新移除目标时拒绝新的流量。见[运行时模式](./api.md#连接关闭模式与数据面生命周期)。
 
 ## `cache_file`
 
@@ -124,7 +124,7 @@ Dashboard 下载 URL 与出口见 [`assets.ui`](./assets.md)。
 
 ### 持久化的状态
 
-除非 `enabled` 为 `false`，honk 在状态数据库中保存 TCP/UDP 各自的 Selector 选择和每个节点最后一次真实延迟样本，与 mihomo 的 `store-selected` 一致。只有 `enabled: true` 且 native API 未启用时，才恢复和保存 Clash 模式与 Clash GLOBAL 选择；其他情况下重启后使用 `default_mode`。延迟样本每分钟批量写入一次；恢复时丢弃为零或超过 24 小时的样本。存活状态不恢复。
+除非 `enabled` 为 `false`，honk 在状态数据库中保存 TCP/UDP 各自的 Selector 选择和每个节点最后一次真实延迟样本，与 mihomo 的 `store-selected` 一致。只有 `enabled: true` 且原生 API 未启用时，才恢复和保存 Clash 模式与 Clash GLOBAL 选择；原生 API 未启用且未恢复缓存模式时，重启后使用 `default_mode`；启用原生 API 后启动始终使用 `Rule`。延迟样本每分钟批量写入一次；恢复时丢弃为零或超过 24 小时的样本。存活状态不恢复。
 
 状态数据库损坏且未设置 `--store db` 与 `native_api.password_auth` 时，honk 在取得实例锁后把 `honk.db` 与 `honk.db-wal` 改名为 `honk.db.corrupt` 与 `honk.db.corrupt-wal`，再创建新文件。如果 `honk.db.corrupt` 已经存在，honk 保留两份文件，在其中一份被删除前不做持久化。同样条件下，状态数据库不可用、不安全（不是 honk 用户所有的私有文件）或被 `honk-core admin reset` 锁定时，honk 也记录警告并在不做持久化的情况下运行。路径不安全时，`persistence_unavailable` 降级在 `reason` 之外附带 `rule`（`not_owner`、`group_or_other_bits`、`not_directory`、`not_file`、`symlink` 或 `identity_changed`），日志给出路径与修复方法。来自更新版本 honk 或其他程序的数据库在任何模式下都拒绝启动，因为移走它会毁掉只有该程序才能读取的数据。
 
