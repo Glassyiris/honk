@@ -2,33 +2,44 @@
 
 本文说明透明 53 端口拦截与可选 `dns.bind` 监听器共用的用户态 DNS 架构。
 
-字段级设置、可接受的 URI 形式及默认值见 [DNS 配置参考](../reference/dns.md)。缓存完全位于用户态；active policy 的 domain map 保存学习到的谓词事实，不保存 DNS 应答。
+字段级设置、可接受的 URI 形式及默认值见 [DNS 配置参考](../reference/dns.md)。缓存完全位于用户态；由 generation 持有的路由投影与域名事实 map 保存学习到的谓词事实，不保存 DNS 应答。
 
 ## 架构
 
 ```mermaid
 flowchart LR
-    T[LAN/WAN TCP/UDP :53] --> E[既有入口与控制平面排除]
-    E --> R[正常有序流量策略]
-    R -->|direct must| N[Linux 原生路径]
-    R -->|block must| DROP[丢弃]
-    R -->|group must| RAW[原始 TCP relay / UDP PacketTransport]
-    R -->|非 must| C[DnsController]
+    T[TCP/UDP :53 after existing ingress and control-plane exclusions] --> TR[Ordered traffic policy]
+    TR -->|direct must| N[Native Linux path]
+    TR -->|block must| DROP[Drop]
+    TR -->|group must| RAW[Raw TCP/UDP group transport]
+    TR -->|non-must, including ordinary block| C[DnsController]
     B[dns.bind TCP/UDP] --> C
-    C --> G[固定 generation 的 DnsService]
-    G --> P[解析、hosts、策略、请求策略]
-    P --> F[缓存与 singleflight]
+    C --> G[Generation-pinned DnsService]
+    G --> P[Parse, hosts, strategy, request policy]
+    P --> F[Cache and singleflight]
     F --> U[UpstreamPool]
-    U --> RESPONSE[响应策略与严格校验]
-    RESPONSE --> O[类型化结果]
-    O --> X[入口应答]
-    O --> M[路由投影]
-    M --> D[Active policy 的域名事实 map]
+    U --> R[Response policy and strict validation]
+    R --> O[Typed outcome]
+    O --> X[Ingress reply]
+    O --> M[Routing projection]
+    M --> D[Generation-owned domain-fact maps]
 ```
 
 非 `must` 透明入口与独立 `dns.bind` 两个 adapter 使用同一个 `DnsController`、当前 `DnsServiceProvider`、forwarder、缓存、singleflight 集合、上游池与路由投影。adapter 从准入开始一直持有所有权，直至应答 I/O 完成；它不会直接写 domain route。终局 `group(must)` 使用原始 TCP relay / UDP `PacketTransport`，不进入这条 DNS 管线，跳过 hosts、缓存、请求/响应策略和投影。
 
+- [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) — `DnsConfig`（`bind`、`upstream`、`routing`、`strategy`、`cache`、`fixed_domain_ttl`）。`DnsBindEndpoint` / `DnsBindTransport` / `DnsBindError` 解析当前 dae 监听器配置，并支持语义相等判断；`DnsConfig::bind_endpoint` 将空值映射为关闭。监听器绑定语法见[配置指南](../configuration.md)。`DnsUpstream` 包含 `name`、`address`、`protocol: DnsProtocol`、`tls_server_name` 与拨号路径的代理 tag **`outbound: Option<String>`**。
+  Dae 路由按首次匹配执行 `DnsRequestRule`/`DnsResponseRule`；`DnsCond` 以 AND 组合，并支持否定。请求支持 `Qname`/`Qtype`/`Sip`；响应支持 `Qname`/`Qtype`/`Upstream`/`Ip`。`Sip` 接受混合主机地址/CIDR 参数，不可用于响应规则。动作包括 `Reject`/`AsIs`/`Accept`/`Upstream(name)`，旧 `rules`/`fallback` 会转换。`types.rs::DnsProtocol` 有六个变体：`Udp`、`Tcp`、`Tls`（DoT）、`Https`（DoH）、`H3`（DoH3）、`Quic`（DoQ）。只有 dae 解析器填充请求/响应规则，规则类型不参与 serde；路由包装类型仅序列化默认值，仅反序列化 null 值。
+
 [`honk-config/src/dns/validation.rs`](../../../crates/honk-config/src/dns/validation.rs) 负责命名上游引用校验，由启动、SIGHUP 和公开运行时重载入口的 `Config::validate` 调用。`DnsRouting` 的私有请求来源选择逻辑同时供校验和 `effective_request` 使用，既保留旧版字段的诊断路径，也避免在校验时分配转换后的规则。仅解析配置的接口不执行完整配置校验。
+
+- DNS hosts 使用不可变、固定 generation 的快照。有序 `use_host` 来源在请求路由、缓存查询及上游交换前合并。来源语法、优先级与事务性 SIGHUP 行为见[配置指南](../configuration.md)。
+- [`src/dns/`](../../../crates/honk-core/src/dns/) 的模块分工：
+    - `runtime.rs` / `runtime/provider.rs` — `DnsRuntime` 与 `DnsServiceProvider`；[generation 与退役](#generation-与-reload)。
+    - `forwarder/`、`engine/`、`planner.rs`、`policy.rs` — [解析管线](#解析管线)与请求/响应策略。
+    - `cache/` — [应答缓存与持久化](#缓存与持久化)。
+    - `upstream_pool/`、`transport/` — [上游 session 与 driver](#上游-transport)；`transport/retry.rs` 负责重试判定，`transport/lifecycle.rs` 负责 session 退役，`transport/udp_pool/error_queue.rs` 负责 Linux 错误引用报文接收。
+    - `projection/` — 由 generation 持有的路由投影与域名事实协调（[路由投影](#路由投影)）。
+    - `service.rs`、`resolver.rs` — 供透明 DNS、`dns.bind`、Clash API 与应用查询访问当前 provider。
 
 ## 入口路径
 
@@ -37,11 +48,13 @@ flowchart LR
 | 透明 53 端口，无终局用户 `must` 结果 | 按[流量规则所有权](../reference/routing.md#出站目标与-must)准入的有效查询进入 `DnsController`。 | 控制器接管的透明 UDP 使用绑定到原始目的地址的 anyfrom socket；TCP 在被拦截的 stream 上应答。请求动作 `asis` 拨该原始目的地址并保留 TCP/UDP，包括 UDP `TC` 后回退 TCP。 |
 | 独立 `dns.bind` | 所选 TCP/UDP socket 是 host network namespace 中普通且未打 mark 的 socket。它们没有拦截所得的目的地址。 | TCP 在 accept 得到的 socket 上应答。UDP 使用 packet info，使通配 bind 从查询实际命中的本地地址与网卡应答。 |
 
-`DnsRequestMeta` 以一个不可变值承载逻辑客户端来源与拦截所得目的地址。透明 adapter 和独立 adapter 都从 socket peer 设置 `source_ip`；只有透明拦截设置 `original_dst`。IPv4-mapped IPv6 peer 会规范化为 IPv4。代表已接纳 TCP/UDP 流执行的查询使用该流的客户端地址，且没有拦截所得的 DNS 目的地址。内部、bootstrap、prefetch 与 Clash API 查询两者都为空。
+`DnsRequestMeta { source_ip, original_dst }` 以一个不可变值承载逻辑客户端来源与拦截所得目的地址。透明 adapter 和独立 adapter 都从 socket peer 设置 `source_ip`；只有透明拦截设置 `original_dst`。IPv4-mapped IPv6 peer 会规范化为 IPv4。代表已接纳 TCP/UDP 流执行的查询使用该流的客户端地址，且没有拦截所得的 DNS 目的地址。内部、bootstrap、prefetch 与 Clash API 查询两者都为空。
 
 `asis` 仍然通过 honk 新建的 socket 查询原始目的解析器，不保留客户端的网络源地址。只有原生 `direct(must)` 绕过用户态重发；是否仍发生 SNAT/MASQUERADE 取决于其他防火墙和网络配置。原生直连或原始分组转发绕过的 DNS 回答不会补充 honk 的域名路由事实；anyfrom 负责客户端侧回复源地址，不是上游源地址伪装。私网 DNS 绕过迁移见[路由参考](../reference/routing.md#显式本地路由)。
 
 [TCP handoff 与 UDP 逐报文准入](./control-plane.md#透明代理入口)由控制面负责，包括两者不同的路由代际要求。
+
+过期缓存刷新与偏好地址族的附加查询保留发起者的 `DnsRequestMeta`。没有拦截目的地址的按客户端来源执行的流解析，在策略选择 `asis` 时 fail-closed。
 
 独立监听器具有以下生命周期与准入不变量：
 
@@ -58,7 +71,7 @@ flowchart LR
 
 ## DNS 所有权状态机
 
-下表区分 LAN 入站与普通主机/loopback 投递。`透明 Honk` 依赖真实 eBPF 数据面与已挂载的 LAN hook；mock 模式不能拦截报文。`must` 表示不再通过嗅探重判、保留已选出站，不是一个“绕过所有处理”的开关。
+下表区分 LAN 入站与普通主机/loopback 投递。honk 透明代理依赖真实 eBPF 数据面与已挂载的 LAN hook；mock 模式不能拦截报文。`must` 表示不再通过嗅探重判、保留已选出站，不是一个“绕过所有处理”的开关。
 
 | 查询路径 | 流量策略结果 | 接收者 | 应答路径 |
 | --- | --- | --- | --- |
@@ -79,9 +92,9 @@ flowchart LR
 以 dnsmasq 为后端时，LAN 查询可以先进入 Honk，而 dnsmasq 保留端口 53 监听：
 
 ```text
-LAN 客户端 -> 网关 :53 -> Honk 透明 DNS 策略
-                           | local 上游 -> 127.0.0.1:53 -> dnsmasq -> 外部解析器
-                           | remote 上游 -> 选定直连/代理传输
+LAN client -> gateway :53 -> transparent Honk DNS policy
+                              | local upstream -> 127.0.0.1:53 -> dnsmasq -> external resolver
+                              | remote upstream -> selected direct/proxy transport
 ```
 
 Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是 LAN 端口 53 的接管开关。主机 loopback 到 dnsmasq 的请求不会因为启动了 Honk 就变成 LAN 请求。如果改为 dnsmasq 把未命中请求转发给 Honk，Honk 的选定上游就不能再指回该 dnsmasq，否则形成递归环。只有 Honk DNS 策略选中 dnsmasq 后端时，才会获取它的本地/DHCP 名称与缓存应答。
@@ -89,6 +102,8 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是
 ## 解析管线
 
 生产路径顺序如下：
+
+生产路径中的 `DnsService` 调用方在发布缓存前要求严格校验查询和响应的报文格式。原始 `DnsForwarder::resolve*` 兼容接口仍供旧内部调用方使用。
 
 | 阶段 | 不变量 |
 | --- | --- |
@@ -279,11 +294,11 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 现有 TLS 维护任务也会回收当前 DNS registry 的空闲 connector。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
 
-发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程 join 后台 worker、关闭 DNS transport 及其私有代理 session，再退役捕获的普通流量 registry 中未转移的可复用状态。
+发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程等待后台工作任务结束并关闭 DNS transport；只有这些 transport 排空后，才关闭它们的私有 outbound runtime fork，再退役捕获的普通流量 registry 中未转移的可复用状态。
 
 30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全兜底，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。Forwarding 返回后的 bootstrap fallback 不在该取消范围内。最多保留四个已退役 runtime；超过上限与 provider 关闭会触发相同的强制取消。已就绪的终端 `SERVFAIL` 应答仍会尝试发送，但卡住的已准入应答 I/O 会取消；TCP 写入被取消时关闭连接。
 
-Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
+`DnsServiceProvider` 持有、回收全部退役与强制关闭 supervisor，并在关闭时等待它们结束。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
 

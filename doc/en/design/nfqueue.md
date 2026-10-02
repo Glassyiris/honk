@@ -53,9 +53,9 @@ flowchart LR
 The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 
 Linux mechanism used only by `honk-core`'s `ebpf` feature.
-Parse one exact-sized datagram allocation. `QueueStats` separates current-instance
-depth from process-wide drops accumulated across hard rebinds, reports latest
-kernel-read availability/errors, and always refreshes held-guard/effective-buffer gauges.
+Parse one exact-sized datagram allocation. The core sampler and `StatsManager` separate current-instance
+depth from process-wide drops accumulated across hard rebinds, report latest
+kernel-read availability/errors, and always refresh held-guard/effective-buffer gauges.
 Each sample opens procfs in the calling thread's queue namespace before reading
 asynchronously through that namespace-bound descriptor; neither the process leader
 nor a blocking worker selects the queue being sampled.
@@ -94,7 +94,7 @@ A token is ownership, not merely correlation metadata. It must agree across the 
 | Block | Commit token-bound `Block` → drop every original skb → retire the initializer as a kernel handoff |
 | Cancel or expiry | Abort only the matching pending incarnation → drop every original skb and retire its lease identity |
 
-Direct creates no userspace UDP socket, payload copy or replay, endpoint, or `/connections` entry. Its final verdict mark retains classification and removes the pending/token carrier. If another packet for the flow arrives after Arm, the correlator appends only its verdict guard, discards its payload and slow permit, and returns to the FIFO accept loop before activation.
+Direct creates no userspace UDP socket, payload copy or replay, `Ready` endpoint, or `/connections` entry. Its final verdict mark retains classification and removes the pending/token carrier. If another packet for the flow arrives after Arm, the correlator appends only its verdict guard, discards its payload and slow permit, and returns to the FIFO accept loop before activation.
 
 Proxy does not create a second routing path. It reuses the same `UdpInitLease` and `UdpEndpointPool` initializer used by ordinary transparent UDP. Publishing final kernel state before dial/send prevents a reply race; transferring only the retained payload and dropping the originals gives one send, with no replay fallback.
 

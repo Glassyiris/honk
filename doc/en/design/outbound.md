@@ -276,7 +276,7 @@ teardown, so it—not a sum of node-local pool caps—is the authoritative descr
 
 ### Stream transport
 
-`src/proxy/transport.rs` is shared by Trojan, VMess, and VLESS, driven by `node.transport`/`ws_path`/`ws_host`/`grpc_service`. The order is fixed:
+`src/proxy/transport.rs` is shared by Trojan, VMess, and VLESS, driven by `StreamTransportOptions` fields `transport`/`ws_path`/`ws_host`/`grpc_service` through `node.transport()`. The order is fixed:
 
 ```text
 TCP -> optional TLS or REALITY -> optional WebSocket or gRPC -> protocol header
@@ -372,11 +372,10 @@ attempt holds its own generation and process dial permits, so
 at the configured ceiling a fallback waits for an earlier attempt to finish;
 `max_concurrent_dials: 1` serializes addresses. The race stays inside the
 already selected node: socket marks and security settings are identical, and
-TLS and QUIC protocol setup run only on the winning transport, including QUIC
-protocol authentication. Errors are reported deterministically in original address order.
+TCP TLS setup and QUIC protocol setup/authentication run only on the winning transport; QUIC TLS handshakes participate in address racing. Errors are reported deterministically in original address order.
 
-`crates/honk-outbound/src/bootstrap.rs` provides bootstrap DNS resolution for proxy-server hostnames (dae `bootstrap_resolver` parity): process-wide resolver querying over bypass-marked UDP/TCP with a hand-rolled wire codec, falling back to the system resolver. Node dials must use it (wired into `util::connect_marked` and `quic.rs`), never bare `lookup_host` — otherwise resolution deadlocks against honk's own intercepted DNS path. Also carries the raw-query path behind ECH discovery: `query_ech_config` (HTTPS RR qtype 65, SVCB `ech` param parsing) used by `tls::discover_ech_config`.
-`crates/honk-outbound/src/util.rs` holds `connect_marked` / `connect_outbound` (TCP `SO_MARK`, keepalive, timeout), `udp_marked_bind`. `marked_udp_socket` requests 8 MiB `SO_RCVBUF`/`SO_SNDBUF`; the kernel clamps to 2×`rmem_max`. honk-core raises `net.core.rmem_max`/`wmem_max` to 16 MiB at startup: the 208 KiB default caps QUIC at ~2 Gbps/ms RTT. Follow the runtime **Bypass mark** invariant; otherwise `wan_egress` loops sockets into `daens`.
+`crates/honk-outbound/src/bootstrap.rs` provides bootstrap DNS resolution for proxy-server hostnames (dae `bootstrap_resolver` parity): process-wide resolver querying over bypass-marked UDP/TCP with a hand-rolled wire codec, falling back to `/etc/hosts` and marked DNS to the first numeric `/etc/resolv.conf` nameserver without libc NSS. Node dials must use it (wired into `util::connect_marked` and `quic.rs`), never bare `lookup_host` — otherwise resolution deadlocks against honk's own intercepted DNS path. Also carries the raw-query path behind ECH discovery: `query_ech_config` (HTTPS RR qtype 65, SVCB `ech` param parsing) used by `tls::discover_ech_config`.
+`crates/honk-outbound/src/util.rs` holds `connect_marked` / `connect_outbound` (TCP `SO_MARK`, keepalive, timeout), `udp_marked_bind`. `marked_udp_socket` requests 8 MiB `SO_RCVBUF`/`SO_SNDBUF`; Linux clamps each request to `rmem_max`/`wmem_max` respectively and reports twice the accounting value. Non-mock honk-core startup attempts to raise `net.core.rmem_max`/`wmem_max` to 16 MiB and only warns on failure: the 208 KiB default caps QUIC at ~2 Gbps/ms RTT. Follow the runtime **Bypass mark** invariant; otherwise `wan_egress` loops sockets into `daens`.
 
 ## TLS, fingerprinting, ECH, and pins
 
@@ -733,7 +732,7 @@ that many bytes are masked or unmasked. Treating every number as four bytes
 corrupts the following payload for short packet numbers and self-cancels against same-bug peers.
 
 A process-wide, bounded `SESSION_TICKETS` cache stores BoringSSL TLS 1.3
-sessions by server hostname. BoringSSL has no implicit client cache and requires
+sessions by ticket key (proxy keys include host, port, SNI, and ordered ALPN). BoringSSL has no implicit client cache and requires
 explicit `SSL_set_session` for resumption. `pinSHA256` nodes never resume because a PSK handshake would bypass
 the certificate pin. Rejected cached sessions are evicted without deleting a
 newer concurrent ticket.
@@ -765,12 +764,7 @@ connections are intentionally excluded.
 The same sample drives per-address-family flow-control profiles using honk Quinn's application-delivered/peer-acknowledged stream counters, connection-credit gauges, and stream-blocked frames. Ten-second
 receive and send goodput EWMAs require three consecutive high-BDP samples at
 SRTT >= 80 ms before raising the connection receive or send floor toward
-`2 x BDP`. A peer `DATA_BLOCKED` or `STREAM_DATA_BLOCKED` frame makes its sample
-qualify without the RTT gate and sets that floor's target to twice the current
-window, because a `2 x BDP` target derived from the throttled rate would be a
-no-op; the three-sample requirement and the cooldown below still apply. The
-stream floor takes `STREAM_DATA_BLOCKED` alone, since aggregate connection
-goodput cannot identify one stream's demand. Each floor is capped at 32 MiB, has its own five-minute promotion
+`2 x BDP`. A peer `DATA_BLOCKED` frame makes the connection receive sample qualify without the RTT gate and sets its floor's target to `max(adaptive_window(BDP), 2 × current_window)`, because a `2 x BDP` target derived from the throttled rate would be a no-op; the three-sample requirement and the cooldown below still apply. The stream receive floor doubles on `STREAM_DATA_BLOCKED` alone, without a three-sample requirement, since aggregate connection goodput cannot identify one stream's demand. Each floor is capped at 32 MiB, has its own five-minute promotion
 cooldown, never shrinks automatically, and applies to the live connection and
 active/future streams without reconnecting. Zero-progress samples preserve a pending
 promotion only while the corresponding connection credit remains pressured.
@@ -789,7 +783,7 @@ protocol heartbeat datagrams are unavailable.
 | --- | --- | --- | --- |
 | TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, with node overrides |
 | Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows |
-| Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | `hy2_up_mbps` selects `quic::BrutalConfig` (window = rate×RTT, ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
+| Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
 
 The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
 its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed

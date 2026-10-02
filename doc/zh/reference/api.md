@@ -191,7 +191,7 @@ R = {
   freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
   failStreakExcluded, exploreBackedOff, carrierPressure, carrierRttPressure,
   carrierLossPressure, carrierValidation
-} // R 的每个值均为 u64 计数
+} // every R value is a u64 count
 V = { provisionalSelections, usableSelections, validationSelections }
 B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
       reserved, spent, budgetBlocked, inFlightBlocked, refunded, expired,

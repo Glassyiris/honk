@@ -168,7 +168,7 @@ LAN/WAN 网卡地址，其 TCP/UDP 目的端口 `1–65535`（排除 `53`）均�
 进程等条件的规则，以及拆分的端口覆盖，可能是用户有意设置的合法策略，
 仍可能得到“无法确认”的告警；它不证明监听器、防火墙或端到端管理访问可达。
 
-现有宽泛私网 `direct(must)` 规则现在也会绕过 LAN 私网 DNS。希望保留这部分 DNS 接管时，由用户显式加入 `!dport(53)`。原生 `direct(must)` 不会由 honk 改写客户端源 IP/端口，但是否仍发生 SNAT/MASQUERADE 取决于其他防火墙和网络配置。绕过应答的投影影响及其与 `asis` 的区别见[DNS 来源边界](../design/dns.md#入口路径)。
+现有宽泛私网 `direct(must)` 规则现在也会绕过 LAN 私网 DNS。如需保留这部分 DNS 接管，必须在规则中显式加入 `&& !dport(53)`。原生 `direct(must)` 不会由 honk 改写客户端源 IP/端口，但是否仍发生 SNAT/MASQUERADE 取决于其他防火墙和网络配置。绕过应答的投影影响及其与 `asis` 的区别见[DNS 来源边界](../design/dns.md#入口路径)。
 
 ## Fail-closed 行为
 

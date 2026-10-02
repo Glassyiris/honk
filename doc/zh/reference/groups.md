@@ -93,7 +93,7 @@ setup/TX 后的定向 Traffic RX 可在 flow 结束前打开有额度的半开�
 
 持续且实际测得的 carrier 压力可以重新打开预算内比较，但不增加业务失败，也不直接改变赢家。这是 honk→代理服务器的提示证据，不是端到端 UDP 丢包率或首请求保证；不支持观测的路径仍未知。详见[提示范围](../design/groups.md#score-评分与生命周期)。
 
-全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
+全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。已建立连接的元数据不受影响。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
 独立比较存储最多有 512 个 cell，逻辑分配上限为 1 MiB，包含所持有键与 vector 的容量。这不是进程 RSS 上限，分配器开销和其他状态不在其中；缺失或被淘汰的支持保持未知。
 

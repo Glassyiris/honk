@@ -95,6 +95,7 @@ group {
 # 私网目的地直连，Web 流量经过代理组。
 routing {
     # 私网目的地不经过代理。
+    # 此规则也会绕过私网 DNS；需保留接管时显式加上 && !dport(53)。
     dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) -> direct(must)
     # 代理常用 Web 端口。
     dport(80, 443) -> proxy
@@ -152,6 +153,7 @@ group {
 }
 
 routing {
+    # 此规则也会绕过私网 DNS；需保留接管时显式加上 && !dport(53)。
     dip(geoip: private) -> direct(must)
     domain(geosite: geolocation-cn) -> direct
     domain(geosite: geolocation-!cn) -> proxy
@@ -224,7 +226,7 @@ experimental {
 
 ## 编写路由规则
 
-规则按 `priority` 升序执行；dae 解析器按源码顺序分配 `0, 1, ...`，同优先级保持稳定的源码顺序。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先包一层组（例如 `filter: name('节点名')`）。`(must)` 决策是终局的：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
+规则按 `priority` 升序执行；dae 解析器按源码顺序分配 `0, 1, ...`，同优先级保持稳定的源码顺序。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先将节点加入一个组（例如 `filter: name('node')`）。`(must)` 决策是最终结果：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
 
 网关管理访问与私网 DNS 绕过请按[显式本地路由迁移](./reference/routing.md#显式本地路由)配置；honk 不会自动生成接口规则。
 

@@ -32,13 +32,13 @@ global {
 
 ```mermaid
 flowchart LR
-  TC[LAN TC] -->|Pending mark + token| NFT[inet honk_nfqueue<br/>udp_decision，优先级 -250]
+  TC[LAN TC] -->|Pending mark + token| NFT[inet honk_nfqueue<br/>udp_decision, priority -250]
   NFT --> Q[NFQUEUE 320]
-  Q --> A[有界 ingest actor]
-  A --> C[Token correlator + 规范 UDP initializer]
-  C -->|Direct| ACCEPT[带 mark 的 NF_ACCEPT]
-  C -->|Proxy| PROXY[丢弃原始包；拨号/发送一次]
-  C -->|Block 或 cancel| DROP[NF_DROP]
+  Q --> A[Bounded ingest actor]
+  A --> C[Token correlator + canonical UDP initializer]
+  C -->|Direct| ACCEPT[Marked NF_ACCEPT]
+  C -->|Proxy| PROXY[Drop originals; dial/send once]
+  C -->|Block or cancel| DROP[NF_DROP]
 ```
 
 | 机制 | 当前契约 |
@@ -51,6 +51,8 @@ flowchart LR
 | 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。可识别的坏包、UDP payload 截断和校验和错误发送 `NF_DROP`；畸形队列元数据、无法识别的报文头、`ENOBUFS`、listener 退出和 verdict socket 失败仍为 fatal |
 
 服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
+
+此 Linux 机制仅用于 `honk-core` 的 `ebpf` feature。解析只分配一份与数据报大小相等的缓冲区。core 采样器与 `StatsManager` 区分当前实例队列深度与跨 hard rebind 累积的进程级丢包数，报告最近一次内核读取的可用性与错误，并始终刷新 held-guard/effective-buffer gauge。
 
 每次内核统计采样先在调用线程所在的队列网络命名空间中打开 procfs 文件，再通过已绑定该命名空间的文件描述符异步读取；采样对象不由进程主线程或阻塞工作线程的命名空间决定。
 
@@ -88,7 +90,7 @@ Token 表示所有权，而不只是相关性元数据。它必须在 skb mark�
 | Block | 提交 token-bound `Block` → 丢弃所有原始 skb → 以 kernel handoff 方式退役 initializer |
 | Cancel 或过期 | 只 abort 匹配的 Pending incarnation → 丢弃所有原始 skb，并退役其 lease identity |
 
-Direct 不创建用户空间 UDP 套接字、payload copy 或 replay、endpoint 或 `/connections` 条目。其最终 verdict mark 保留 classified 状态，并移除 Pending/token carrier。如果流的另一个包在 Arm 后到达，correlator 只追加其 verdict guard，丢弃 payload 和 slow permit，并在 activation 前返回 FIFO accept 循环。
+Direct 不创建用户空间 UDP 套接字、payload copy 或 replay、`Ready` endpoint 或 `/connections` 条目。其最终 verdict mark 保留 classified 状态，并移除 Pending/token carrier。如果流的另一个包在 Arm 后到达，correlator 只追加其 verdict guard，丢弃 payload 和 slow permit，并在 activation 前返回 FIFO accept 循环。
 
 Proxy 不会创建第二条路由路径。它复用普通透明 UDP 使用的同一个 `UdpInitLease` 和 `UdpEndpointPool` initializer。在拨号/发送前发布最终内核状态可以防止 reply race；只转移保留的 payload 并丢弃原始包，可确保只发送一次且没有 replay fallback。
 

@@ -86,8 +86,8 @@ bpf /sys/fs/bpf bpf defaults 0 0
 musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，吞吐优先；`-stock` 包使用系统 allocator，更适合关注内存高水位的小内存设备。
 
 ```shell
-tar -xzf honk-core-<版本>-<目标>.tar.gz
-sudo install -m 0755 honk-core-<版本>-<目标>/honk-core /usr/local/bin/honk-core
+tar -xzf honk-core-<version>-<target>.tar.gz
+sudo install -m 0755 honk-core-<version>-<target>/honk-core /usr/local/bin/honk-core
 honk-core --version
 ```
 

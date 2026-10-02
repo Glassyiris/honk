@@ -21,6 +21,8 @@
 `direct` 不使用代理协议而直接到达目标。`block` 终止请求。其他每个
 handler 都把选定节点转换成其代理服务器能够理解的字节。
 
+本 crate 负责出站拨号、组与健康检查，并由 `honk-core` 以 `honk_core::{proxy, group, outbound}` 重新导出。
+
 ## 实现模块归属
 
 公开的 `proxy::*`、`quic::*` 与 `quic_boring::*` import 路径保持支持；
@@ -46,16 +48,16 @@ stream transport 与 UoT 仍由多个协议共用，不归 VLESS 独占。既有
 
 ```mermaid
 flowchart LR
-    G[选定的叶子 Node] --> R[OutboundRuntimeRegistry]
+    G[Selected leaf Node] --> R[OutboundRuntimeRegistry]
     G --> P[ProxyRegistry / ProtocolEntry]
     R --> N[NodeRuntime / ProtocolRuntime]
     P --> T[TcpOutbound]
     P --> U[PacketOutbound]
     P --> W[WarmableOutbound]
     P --> Q[ProbeableOutbound]
-    T --> S[共享 transport 与协议 codec]
+    T --> S[Shared transport and protocol codec]
     U --> K[PacketTransport]
-    S --> B[代理服务器字节]
+    S --> B[Proxy server bytes]
     K --> B
 ```
 
@@ -96,7 +98,7 @@ transport 上实现 framing。
 
 ### 协议 descriptor
 
-`ProtocolDescriptor` 是唯一的逐协议事实表。predicate 接收具体节点，
+`src/descriptor.rs` 中的 `ProtocolDescriptor` 是唯一的逐协议事实表。predicate 接收具体节点，
 因为 VLESS 的 `network` 与 TCP path、以及 Trojan transport 会影响 capability
 或 pooling。Trojan 与 AnyTLS 共用 `network_allows_udp`；VLESS 使用规范的
 `VlessConfig::udp_enabled()`。
@@ -166,7 +168,7 @@ feature-off 构建不分配 VLESS runtime pool 或 carrier semaphore。单元测
 
 ## Runtime 所有权与 reload
 
-`OutboundRuntimeRegistry` 是控制面对一个不可变配置 generation 中可复用
+`src/runtime.rs` 定义的 `OutboundRuntimeRegistry` 是控制面对一个不可变配置 generation 中可复用
 出站状态的唯一所有者。它把 `Node.id` 映射到 `NodeRuntime`：
 
 - 不可变的 `Arc<Node>` 配置；
@@ -177,6 +179,12 @@ feature-off 构建不分配 VLESS runtime pool 或 carrier semaphore。单元测
 QUIC client 槽。每个 VLESS 节点都持有 `VlessRuntime`；其中只创建配置选择的
 H2/shared-Cool/separate-Cool pool，并保存 lazy private source-ID key。handler
 对这些 generation 所有的资源保持无状态。
+
+未知 transport、无效 pin/REALITY key、保留的内置名称或协议均 fail-closed。
+
+- 结构化或导入的 raw TCP TLS ALPN 存于 `TlsOptions.alpn`（flat serde 字段为 `tls_alpn`，空列表时省略）。`Node::validate_protocol` 要求 AnyTLS 或 TCP Trojan/VMess/VLESS 启用普通 TLS，拒绝 REALITY/WS/gRPC/QUIC override；ALPN 名称长度为 1–255 字节，编码后的列表最多 65,533 字节。非空 ALPN 以基础 ID 为命名空间、JSON 元组 `["tls-alpn", <ordered list>]` 为名称派生 UUID v5 子 ID，使其与任意凭据文本分离；空列表保留基础 ID，包括 VLESS 重新派生的身份。URI/v2rayN ALPN 兼容行为与 TUIC 独立的 `tuic_alpn` 不变。
+
+准入范围内的 TCP 反馈只开始一次：在首个获准的物理尝试开始时，或在复用 session/QUIC connection 上打开逻辑流之前。冷准入等待期间仍未开始；已经完成但未经过任一边界的路径仍使用完成时的回退机制。
 
 ### Generation 生命周期
 
@@ -246,7 +254,7 @@ I/O 经 provisional、active、draining 与 idle 状态一直保留到 task tear
 
 ### Stream transport
 
-`proxy/transport.rs` 由 Trojan、VMess 与 VLESS 共享。顺序固定：
+`src/proxy/transport.rs` 由 Trojan、VMess 与 VLESS 共享，由 `node.transport()` 返回的 `StreamTransportOptions` 中的 `transport`/`ws_path`/`ws_host`/`grpc_service` 驱动。顺序固定：
 
 ```text
 TCP -> optional TLS or REALITY -> optional WebSocket or gRPC -> protocol header
@@ -290,6 +298,8 @@ VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及�
 
 ### 带 mark socket 与名称解析
 
+`crates/honk-outbound/src/bootstrap.rs` 提供与 dae `bootstrap_resolver` 对应的进程级解析，通过 `util::connect_marked` 与 QUIC 建立路径使用。ECH 的 raw-query 发现由 `tls::discover_ech_config` 调用 `query_ech_config`。
+
 `util.rs` 集中创建出站 socket：
 
 - `connect_marked` 先解析再连接 TCP，并设置 timeout、nodelay、
@@ -324,13 +334,15 @@ A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机�
 `query_ech_config` 通过同一 raw 路径查询 DNS HTTPS 记录（`qtype 65`），
 并提取 SVCB `ech` 参数。
 
-解析完成后，代理服务器 TCP 与共享 QUIC client 会稳定交错两种地址族，并且
+解析完成后，`src/address_race.rs` 为代理服务器 TCP `connect_marked` 与共享 QUIC `QuicClient` 安排尝试，稳定交错 IPv4/IPv6，并且
 最多同时竞速两个地址。首个地址立即开始；fallback 在 250 ms 后启动。首个
 地址若更早失败会提前 fallback，但物理尝试之间仍至少间隔 10 ms。每个进行中
 的地址尝试分别持有 generation 与进程级拨号 permit；达到配置上限时，fallback
 必须等待先前尝试结束，因此
 `max_concurrent_dials: 1` 会串行尝试地址。竞速始终位于已经选定的同一节点
-内部：socket mark 与安全配置保持一致，QUIC 协议认证也只对胜出连接执行。
+内部：socket mark 与安全配置保持一致；TCP TLS 建立与 QUIC 协议初始化（包括 QUIC 协议认证）只在胜出的 transport 上执行；QUIC TLS 握手参与地址竞速。错误按原始地址顺序确定性地报告。
+
+`crates/honk-outbound/src/util.rs` 提供 `connect_marked` / `connect_outbound`（TCP `SO_MARK`、保活与超时）与 `udp_marked_bind`。`marked_udp_socket` 请求 8 MiB `SO_RCVBUF`/`SO_SNDBUF`；Linux 分别按 `rmem_max`/`wmem_max` 限制，并报告两倍记账值。honk-core 非 mock 启动时尝试将 `net.core.rmem_max`/`wmem_max` 提高到 16 MiB，失败时仅告警；208 KiB 默认窗口使 QUIC 在 1 ms RTT 下约受限于 2 Gbps。必须遵守 runtime 的 **Bypass mark** 不变量，否则 `wan_egress` 会把 socket 循环导入 `daens`。
 
 ## TLS、指纹、ECH 与 pin
 
@@ -338,6 +350,8 @@ A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机�
 `tokio-boring`；QUIC 使用自定义 `quinn-proto` crypto backend。信任库由
 `webpki-root-certs` 构建。显式 no-verify connector 用于配置的不安全模式
 和 REALITY；后者以自己的握手后检查替代 PKI。
+
+`src/tls.rs` 提供 BoringSSL TLS client；进程级 `set_tls_mode` 选择 TLS profile。`build_reality_connector(chrome)` 使用 `reality.rs` 的握手后 ed25519 认证替代 PKI，只允许 TLS 1.3 且不提供 REALITY resumption。显式结构化 TCP ALPN 在 tls/utls 模式下都传入 `build_connector`；空列表保留 profile 默认值，Chrome ALPS 取决于列表是否精确包含 `h2`。Registry 发布与直接 connector 构造都会校验非空 override；共享 stream dispatch 在选择 plaintext 或 REALITY 前校验，直接 QUIC 配置会拒绝 TCP ALPN，而不会忽略它。
 
 ### 进程级 TLS profile
 
@@ -368,13 +382,12 @@ DNS HTTPS 记录。正结果采用受限的记录 TTL，负结果缓存五分钟
 是 best-effort 且失败开放：查询失败表示该连接不使用真实 ECH，而 Chrome
 模式仍可发送 ECH GREASE。
 
-`pinSHA256` 比较叶证书的 SHA-256 digest，并替代 PKI chain 校验与主机名
+`pinSHA256`（`tls_pin_sha256`）比较叶证书的 SHA-256 digest，并替代 PKI chain 校验与主机名
 校验。无效 pin 失败关闭。TCP TLS 与 QUIC crypto backend 实现同一规则。
 
 ## REALITY client
 
-REALITY 是只允许 TLS 1.3 的专用 BoringSSL 握手。workspace 中 patched
-`boring-sys` 提供两个 client hook：
+`src/reality.rs` 通过 `RealityConfig`、`parse_reality_config` 与 `reality_connect` 实现只允许 TLS 1.3 的专用 REALITY BoringSSL 握手。workspace 中经修补的 `boring-sys` 提供两个客户端 hook（[Technology stack](../../../AGENTS.md#technology-stack)）：
 
 - `SSL_set1_client_x25519_private_key` 为独立 X25519 share 预置 honk 的
   临时私钥；以及
@@ -387,13 +400,9 @@ REALITY 是只允许 TLS 1.3 的专用 BoringSSL 握手。workspace 中 patched
 hybrid share，REALITY 认证仍刻意从预置的 classic X25519 私钥/share 派生。
 fixup callback 把 32 字节 legacy `session_id` 槽清零，并计算：
 
-```text
-shared  = X25519(client_ephemeral_private, server_public_key)
-authKey = HKDF-SHA256(shared, salt=clientRandom[0:20], info="REALITY")
-nonce   = clientRandom[20:32]
-plain   = [version: 1,3,3][reserved: 0][timestamp: u32 BE][shortId: 8]
-session_id = AES-256-GCM(authKey).Seal(nonce, plain, AAD=zeroed ClientHello)
-```
+- `authKey = HKDF-SHA256(X25519(eph, pbk), salt=clientRandom[:20], "REALITY")`；
+- nonce `clientRandom[20:32]`；以及
+- `AES-256-GCM(authKey).Seal([ver:3][0][ts:4][shortId:8])`，版本字节保持 `1,3,3`，保留字节为 `0`，时间戳为大端 u32，short ID 为八字节。AAD 是 `session_id` 置零后的完整 ClientHello。
 
 16 字节加密 plaintext 加 16 字节 GCM tag 恰好填满 session ID。空 short ID
 是八个零字节；配置值必须是至多八字节的偶数长度 hex，并向右补零。解析或
@@ -403,12 +412,7 @@ fixup 失败会在发送未认证 ClientHello 前中止。callback 只 seal 一�
 
 ### 服务端认证与指纹约束
 
-REALITY 以自有认证替代普通证书校验。peer leaf 必须是临时 ed25519 证书，
-signature 必须精确等于：
-
-```text
-HMAC-SHA512(authKey, raw_ed25519_public_key)
-```
+REALITY 以自有认证替代普通证书校验。对端叶证书必须是临时 ed25519 证书，签名必须精确等于 `HMAC-SHA512(authKey, raw ed25519 public key)`。
 
 不匹配、普通 mask-target 证书或其他认证失败都 fail-closed；客户端不会据此
 归因唯一远端原因。不会回退 PKI，也不使用 session resumption。
@@ -620,73 +624,63 @@ wire-copy buffer。
 
 ## QUIC 栈
 
-TUIC、Juicity 与 Hysteria2 使用 quinn 0.11。`quic.rs` 负责 transport
+TUIC、Juicity 与 Hysteria2 使用 quinn 0.11。`src/quic.rs` 负责 transport
 调优、带 mark endpoint、连接 single-flight、rotation、stream wrapper
 与共享分片支持。协议 handler 把节点设置转换成 `QuicClientOptions`；
 共享层不读取协议特有字段。
 
+异步 `client_config(node, alpn, QuicClientOptions)` 可发现 ECH，并用 BoringSSL crypto backend 构建 quinn ClientConfig。选项包括 cubic/new_reno/bbr 或 hy2 定速 `BrutalConfig` 的 `congestion_factory`、keep-alive、stream/conn 接收窗口与 MTU discovery。client `Endpoint` 使用带 `SO_MARK` 的 UDP socket。本模块还提供 `QuicBiStream` 与 `#[cfg(test)] testutil` 中基于 rustls 的进程内互通服务端。
+
 ### BoringSSL crypto backend
 
-`src/quic/boring.rs` 在 BoringSSL QUIC callback 上实现 client 侧
+`src/quic/boring.rs` 通过 BoringSSL QUIC API（`SSL_set_quic_method`、`SSL_provide_quic_data`、`SSL_export_keying_material`）实现 client 侧
 `quinn_proto::crypto::Session`。它提供：
 
 - TLS 1.3 握手字节与 traffic-secret 交付；
 - RFC 9001 initial、handshake 与 1-RTT packet key；
-- AES-GCM 与 ChaCha20-Poly1305 packet protection；
-- AES 或 ChaCha20 header protection；
+- 通过 `boring::aead` 实现 AES-GCM 与 ChaCha20-Poly1305 packet protection；
+- 通过 `aes` 与 `chacha20` 实现 AES 或 ChaCha20 header protection；
 - key update 与 Retry integrity；以及
 - QUIC transport-parameter 交换。
 
 Header protection 感知 packet-number 长度。接收时先 unmask 第一字节，
 再推导一到四字节的 packet-number 长度；仅 mask 或 unmask 这么多字节。
-把所有 packet number 当作四字节，会破坏短 packet number 后面的 payload。
+把所有 packet number 当作四字节，会破坏短 packet number 后面的 payload；与存在相同错误的对端互测时，错误会相互抵消。
 
-进程级、有界 `SESSION_TICKETS` cache 按服务端身份保存 BoringSSL TLS 1.3
-session。BoringSSL resumption 要求显式 `SSL_set_session`。`pinSHA256`
+进程级、有界 `SESSION_TICKETS` cache 按 ticket key 保存 BoringSSL TLS 1.3
+session（代理 key 包含 host、port、SNI 与有序 ALPN）。BoringSSL 没有隐式客户端缓存；会话恢复要求显式 `SSL_set_session`。`pinSHA256`
 节点绝不 resume，因为 PSK 握手会绕过证书 pin。被拒绝的缓存 session 会
 被淘汰，同时不会删除并发连接写入的更新 ticket。
 
-该 backend 可以承载真实 ECH 与 Chrome QUIC ClientHello。代理出站不向
+该 backend 可以为 hy2/juicity/tuic/DoQ/DoH3 承载真实 ECH 与 Chrome QUIC ClientHello。代理出站不向
 quinn 暴露 early packet key，因此不会发送 0-RTT early payload；互通
 检查中，受支持的官方 TUIC、Juicity 或 Hysteria2 服务端也都未接受这类
 early data。
 
+服务端探测（`rtt_probe`）发现 quic-go 支持会话恢复，官方 tuic-server 不发 ticket。rustls 缺少 client ECH；quiche 缺少逐连接 ECH hook。
+
 ### 共享 client 所有权
 
-每个 generation 所有的 QUIC runtime 有一个类型擦除的协议 client 槽。
-`QuicClient` 对连接构建 single-flight，因此并发的首次拨号共享一次握手。
+每个由 generation 持有的 `QuicRuntime` 有一个类型擦除的协议 client 槽（`QuicRuntimeClient`）。
+`QuicClient<C>` 对连接构建 single-flight，因此并发的首次拨号共享一次握手。
 它最多保留一条可复用 active 连接。
 
 Rotation 天然重叠：每个 flow 拥有自己的 `(Connection, protocol state)`
-pair。当 holder 替换已关闭或失效连接时，新工作使用 replacement，而现有
+pair，其类型为 `(Connection, Arc<C>)`。当 holder 替换已关闭或失效连接时，新工作使用 replacement，而现有
 flow 可以在旧 clone 上完成。移除最后一份 warm 所有权只会移除未来复用，
 不会切断 active flow。
-按地址族保存的自适应收发 floor 与 cooldown 属于 runtime，而不是可选的
+IPv4/IPv6 各自的有界流控 profile（包括自适应接收/发送下限与冷却期）属于 runtime，而不是可选的
 client 槽，因此 warm 释放、重建与 speculative client 会复用同一份已学习路径画像。
 
-每条池化 QUIC connection 每秒采样一次 Quinn path 与 UDP I/O counter，汇总到
-`/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。
-同一份采样也驱动按地址族保存的流控画像。收发方向使用 10 秒 goodput EWMA；
-只有 SRTT >= 80 ms 且连续三个样本确认高 BDP，才会把 connection 接收或发送
-floor 提高到约 `2 x BDP`。peer 发来的 `STREAM_DATA_BLOCKED` 会独立地把 stream
-接收 floor 加倍；connection 聚合 goodput 无法安全判断某一条 stream 的需求。
-每个 floor 独立执行五分钟升档冷却，最大 32 MiB，不自动缩小，并且无需重连即可
-更新当前 connection 与后续 stream。零进度样本只有在对应 connection credit
-仍受压时才会保留尚未完成的升档 streak。
-endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`。连续三次发送
-超时，或超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC packet 被确认，endpoint 会被退役
-并关闭该 connection，让下一条 flow 重新拨号。发送成功会重置超时 streak；确认进度
-会同时重置两个时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn
-PING keepalive，包括无法发送协议 heartbeat datagram 的 UDP-over-stream
-fallback。
+每条池化 QUIC connection 每秒采样一次 Quinn 路径与 UDP I/O 计数器，汇总到 `/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。同一份采样使用 honk Quinn 中应用已交付/对端已确认的 stream 计数器、connection-credit gauge 与 stream-blocked frame，驱动按地址族保存的流控 profile。收发方向使用 10 秒 goodput EWMA；SRTT >= 80 ms 且连续三个样本确认高 BDP 时，将 connection 接收或发送下限向 `2 x BDP` 提高。对端的 `DATA_BLOCKED` 使 connection 接收样本无需满足 RTT 条件即可合格，并把接收下限的目标设为 `max(adaptive_window(BDP), 2 × current_window)`，因为按受限速率计算的 `2 x BDP` 不会使窗口增长；仍需连续三个样本并遵守下述冷却。stream 接收下限单独由 `STREAM_DATA_BLOCKED` 触发加倍，不要求连续三个样本，因为 connection 聚合 goodput 无法判断单条 stream 的需求。每个下限最大 32 MiB，独立执行五分钟升档冷却，不自动缩小；无需重连即可更新当前 connection 与当前及后续 stream。零进度样本只有在对应 connection credit 仍受压时才会保留尚未完成的升档 streak。原生 TUIC 与 Hysteria2 UDP endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`。连续三次发送超时，或超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC 报文被确认，endpoint 会被退役并关闭该 connection，让下一条流重新拨号。发送成功重置连续发送超时计数；确认进度同时重置两个时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn PING 保活，包括无法发送协议心跳数据报的 UDP-over-stream 回退路径。
 
 ### 协议契约
 
 | 协议 | 认证与 TCP | UDP | Transport 策略 |
 | --- | --- | --- | --- |
-| TUIC v5 | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，可由节点覆盖 |
-| Juicity | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record 的 bi stream | 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口 |
-| Hysteria2 | ALPN `h3`；最小 HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 设置上传 Mbps 时使用 Brutal 定速发送端，否则 BBR；接收带宽按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口 |
+| TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，可由节点覆盖 |
+| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口 |
+| Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口 |
 
 Go `juicity-server` v0.4.3 有实现层面的 UDP relay 限制：它申请的 1,500 字节
 buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包。互操作实测
@@ -698,26 +692,29 @@ QPACK，以及认证所需的 HEADERS 处理。它不得宣告
 `SETTINGS_H3_DATAGRAM`；否则会启动一个竞争的 quic-go datagram reader，
 可能吞掉 Hysteria2 UDP packet。
 
-Hysteria2 沿用 sing-quic 的 lazy TCP 建立方式：首写合并 request 与 payload，首读移除 response，从而节省一次 RTT。
+Hysteria2 沿用 sing-quic 的惰性 TCP 建立方式：打开双向流后拨号即返回；首次写入合并请求与载荷，首次读取校验并移除响应，从而节省一次 RTT。
 
-Salamander obfuscation 在每个 wire datagram 前加 8 字节随机 salt，并用
+`salamander.rs` 实现自包含的 Salamander 混淆，在每个 wire datagram 前加 8 字节随机 salt，并用
 重复的 `BLAKE2b-256(password || salt)` 与 payload 做 XOR。client 端口
-跳跃从第一次发送起就选择配置的目标端口。服务端必须把该端口范围 DNAT
+跳跃（`hy2_port_hopping`/`hy2_hop_interval`）从第一次发送起就选择配置的目标端口。服务端必须把该端口范围 DNAT
 到 listener。接收 metadata 把回包源端口重写为 nominal remote 端口，
 使 QUIC 只看到一个稳定 peer。
 
+quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。已测得在 RTT 为 75 ms、丢包率为 15% 的链路上将窗口从 32 MiB 降至 8 MiB，不影响吞吐。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
+
 ## AnyTLS session 引擎
 
-AnyTLS handler 无状态。每个 generation 的 `NodeRuntime::AnyTls` 拥有一个
+`src/proxy/anytls/mod.rs` 实现 sing-anytls 多路复用，handler 无状态。每个 generation 的 `NodeRuntime::AnyTls` 拥有一个
 `SessionPool<AnyTlsSession>` 与 lazy materialize 的 BoringSSL connector。
 无 generation 调用使用带 guard 的 ephemeral 等价物。
 
 ### Pool 与 session 生命周期
 
-通用 `SessionPool` 强制 `Active`、`Draining` 与 `Closed` 状态、atomic
+`src/session.rs` 定义由节点持有的通用 `SessionPool`，供 AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool 使用（QUIC 使用 `quic::QuicClient`）。它强制执行 `Active`、`Draining` 与 `Closed` 状态约束、atomic
 stream permit、event-driven capacity wait、least-loaded 选择与 pool 所有的
 物理拨号 single-flight。Draining session 不计入可复用 cap，并可在存活
 stream 完成期间与 replacement 重叠。
+pool 还负责有界重试分类、退避、退役与幂等的强制关闭。
 初始化 waiter 接收同一个 `SharedError`；它通过 `Arc` clone 原始
 `anyhow::Error` 并保留 source chain。pool 在广播 builder failure 前绝不会
 把它压平成 display 文本。
@@ -727,7 +724,7 @@ AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spre
 least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每条代理 flow
 各执行一次物理连接。
 
-协商 v2 server settings 后，每个复用逻辑 stream（SID 2 及以后）的 SYN 写出后
+协商 v2 server settings（`CMD_SERVER_SETTINGS`、`v=2`）后，每个复用逻辑 stream（SID 2 及以后）的 SYN 写出后
 即加入按 SID 跟踪的 pending 集合，SYNACK 只结清自己的 SID——无关 stream 的应答
 不会清除其他 stream 的 deadline，本地拆流同样取消对应定时器。SYN 写出三秒后
 仍 pending 的 open，若窗口内 session 仍有入站帧（服务端活着只是未应答该开流）
@@ -735,7 +732,7 @@ least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每�
 继续复用已死 carrier。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
-`min_idle` floor 与 idle timeout 输入同一个节点局部 janitor。Selector 或
+`min_idle` floor（`anytls_min_idle_session`）与 `anytls_idle_session_timeout` 输入同一个节点局部 janitor。Selector 或
 UDP warm 所有权分别提高有效保留值；最后一个所有者释放时只排干未来复用，
 不终止存活 stream。
 
@@ -752,12 +749,14 @@ session 可以排队 56 MiB，线速上传会把它填满。预算不计 stream 
 permit 之前的 UoT 包与编码后的 batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
 最多对应一个 AnyTLS frame；原先读 64 KiB 会变成一个 65,535 字节的 frame 加一个
 1 字节的 frame。stream 的 SYN 与
-第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。
+第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。打开流的注册被中途放弃时，会发送 FIN，而不会终止 session。
 
 完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 63
 frame 或 256 KiB（均不含首帧），再执行一次 `write_all` 与一次 `flush`。它绝不等待
 凑满 batch。只有物理 batch 成功或 session 变为 terminal 后，才释放 data
 permit 与 confirmed-write completion。
+
+仅含控制帧的 batch 有 5 秒 deadline（与 sing-anytls `writeControlFrame` 一致），到期使 session 失败。含数据帧的 batch 没有 deadline：拥塞只对容量上限施加反压，不会终止同一 session 中的其他流。
 
 `AnyTlsStream::poll_write` 通过自有 outbound slot 保证 cancellation-safe。
 只有恰好这 `n` 字节进入有序 queue 后才返回 `Ok(n)`；取消既不会丢失
@@ -765,7 +764,7 @@ pending chunk，也不会重复入队。
 
 ### 非阻塞 demultiplex
 
-每个 TCP child 都有有界 delivery queue。队列满时，demultiplexer 把
+每个 TCP child 都有按 `sid` 分发的有界交付队列。队列满时，demultiplexer 把
 frame 按 SID 有序停放到 overflow，而不是等待，从而保持 sibling 进度与
 精确 frame/byte 计数。
 
@@ -777,7 +776,7 @@ Emergency hard limit 为每 session 768 个 parked frame；retained payload
 字节数由下文的 pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，
 admission 立即 reap 它。否则 demultiplexer 以有界
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
-在 reader progress 后重新判断。
+在 reader progress 后重新判断。这覆盖已测得的 9.4 Gbps 下 12–16 ms reader 启动延迟；正常读取端的首次 flush 通过 `overflow_notify` 唤醒等待。每次移除都把对应 overflow counter 归零。
 
 同一节点 pool 中所有 current 与 draining session 对 TCP 与 UoT retained
 payload 分别使用 12 MiB 的 pool-wide byte budget，aggregate ceiling 为
@@ -808,7 +807,7 @@ UoT delivery 使用非阻塞 `try_send`。UoT sink 满时会移除该 sink 并�
 
 ### Lazy UoT 创建
 
-打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT connect request。
+通过 `open_uot_stream` 打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT connect request。
 connect request 与第一条编码后 datagram 作为一个有序 PSH 一起发送。payload
 上限为 16 KiB，与 anytls-go 0.0.13 及 sing v0.5.1 的 relay buffer 一致；
 更大的输入会在消耗 lazy setup 或破坏逻辑 stream 之前失败。这样既避免原本
@@ -821,15 +820,14 @@ connect request 与第一条编码后 datagram 作为一个有序 PSH 一起发�
 
 Session pool 会原子返回已有共享 session 上的 permit，或一个计入 pool cap、
 由调用方所有的 provisional 物理拨号槽。detached AnyTLS 或 VLESS mux
-session 在 winner commit 前保持在可复用 pool 外。drop loser 会移除其
-受 generation 保护的槽，并同步关闭 attached session。
+session 在 winner commit 发布并启动 janitor 前保持在可复用 pool 外。丢弃未胜出的准备结果会取消物理拨号、移除受 generation 保护的槽与 SID，并同步关闭附着的 session。
 
 QUIC candidate 构建 detached client。Loser 会被 force-close。Winner
 commit 仅在 generation 槽仍为空时发布其 client。如果普通流量已经填充
 该槽，则保留 incumbent；winning flow 继续使用它已经拥有的 detached
 connection 与 protocol-state clone。
 
-Promotion 在暴露 `PacketTransport` 前完成。Commit failure 失败关闭并
+异步 `PreparedUdpTransport::commit` 在暴露 `PacketTransport` 前完成该协议的 promotion。Commit failure 失败关闭并
 drop transport。QUIC 槽仲裁在修改槽后不再 await，因此 cancellation
 不可能留下已经发布但未 commit 的 winner。
 
