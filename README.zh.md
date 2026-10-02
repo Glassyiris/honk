@@ -52,11 +52,11 @@
 - [x] eBPF 路由、map 与语义
 - [x] 控制面
 - [x] AnyTLS / Shadowsocks（含 2022）/ SOCKS5
-- [ ] RPRX（VLESS / XTLS / XHTTP / WSS / REALITY）
+- [x] RPRX（VLESS / XTLS / XHTTP / WSS / REALITY），不含 XHTTP
 - [ ] Trojan-GFW（需要 UoT 实现）
 - [x] DNS 逻辑
 - [ ] 配置解析器（dae 扩展）
-- [ ] 重载逻辑
+- [x] 重载逻辑
 - [x] 工具
 
 在所有当前尚未 review 的代码完成 review，并处理所有未经验证的 AI 生成实现前，不会发布 `test.1` release tag。
