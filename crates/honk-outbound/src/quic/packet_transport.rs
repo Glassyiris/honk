@@ -704,3 +704,6 @@ pub async fn quic_handshake_probe(
 
 #[cfg(test)]
 mod probe_tests;
+
+#[cfg(test)]
+mod poller_tests;
