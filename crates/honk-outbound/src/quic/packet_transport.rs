@@ -341,6 +341,24 @@ impl quinn::UdpPoller for TransportUdpPoller {
 
         let mut writable = this.writable.lock();
         if writable.is_none() {
+            // Spare capacity is the common case: admit it without building a
+            // reservation future, but keep charging Tokio's cooperative budget
+            // so a driver that polls readiness in a loop still yields.
+            let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+            match this.socket.outbound.try_reserve() {
+                // Dropping `coop` refunds the charge; the future charges its own polls.
+                Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {}
+                reserved => {
+                    coop.made_progress();
+                    return Poll::Ready(match reserved {
+                        Ok(_) => this.socket.send_error().map_or(Ok(()), Err),
+                        Err(_) => Err(this
+                            .socket
+                            .send_error()
+                            .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))),
+                    });
+                }
+            }
             *writable = Some(Box::pin(this.socket.outbound.clone().reserve_owned()));
         }
         match writable.as_mut().unwrap().as_mut().poll(cx) {

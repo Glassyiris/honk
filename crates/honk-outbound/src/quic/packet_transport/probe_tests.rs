@@ -539,6 +539,156 @@ async fn rejected_packet_flood_does_not_monopolize_the_runtime() {
     assert!(socket.close_tasks().await);
 }
 
+/// Holds every send until the test releases it, so the adapter queue can be filled.
+#[derive(Debug)]
+struct GatedSendTransport {
+    gate: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl PacketTransport for GatedSendTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        "127.0.0.1:443".parse().unwrap()
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
+        self.gate.acquire().await.unwrap().forget();
+        Ok(())
+    }
+
+    async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        std::future::pending().await
+    }
+}
+
+type BoxedPoller = Pin<Box<dyn quinn::UdpPoller>>;
+
+fn gated_socket() -> (
+    Arc<GatedSendTransport>,
+    Arc<TransportQuinnSocket>,
+    BoxedPoller,
+) {
+    let transport = Arc::new(GatedSendTransport {
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let socket = TransportQuinnSocket::new(transport.clone(), transport.relay_addr());
+    let poller = quinn::AsyncUdpSocket::create_io_poller(socket.clone());
+    (transport, socket, poller)
+}
+
+fn send_one(socket: &TransportQuinnSocket) -> io::Result<()> {
+    quinn::AsyncUdpSocket::try_send(
+        socket,
+        &quinn::udp::Transmit {
+            destination: socket.remote,
+            ecn: None,
+            contents: b"x",
+            segment_size: None,
+            src_ip: None,
+        },
+    )
+}
+
+async fn poll_writable_once(poller: &mut BoxedPoller) -> Poll<io::Result<()>> {
+    std::future::poll_fn(|cx| Poll::Ready(quinn::UdpPoller::poll_writable(poller.as_mut(), cx)))
+        .await
+}
+
+#[tokio::test]
+async fn writable_waits_for_queue_space_then_wakes() {
+    let (transport, socket, mut poller) = gated_socket();
+    for _ in 0..TRANSPORT_QUEUE_CAP {
+        send_one(&socket).unwrap();
+    }
+    assert_eq!(
+        send_one(&socket).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(poll_writable_once(&mut poller).await.is_pending());
+
+    transport.gate.add_permits(1);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        std::future::poll_fn(|cx| quinn::UdpPoller::poll_writable(poller.as_mut(), cx)),
+    )
+    .await
+    .expect("freed queue space never woke the poller")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_waiting_poller_releases_its_reserved_slot() {
+    let (_transport, socket, mut poller) = gated_socket();
+    for _ in 0..TRANSPORT_QUEUE_CAP {
+        send_one(&socket).unwrap();
+    }
+    assert!(poll_writable_once(&mut poller).await.is_pending());
+
+    // The sender takes the first packet, handing its slot to the waiting poller.
+    tokio::task::yield_now().await;
+    assert_eq!(
+        send_one(&socket).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(poller);
+    send_one(&socket).unwrap();
+}
+
+#[tokio::test]
+async fn writable_readiness_charges_the_cooperative_budget() {
+    let (_transport, _socket, mut poller) = gated_socket();
+    let (mut ready, mut yields) = (0, 0);
+    std::future::poll_fn(|cx| {
+        loop {
+            match quinn::UdpPoller::poll_writable(poller.as_mut(), cx) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    ready += 1;
+                    if ready == 1000 {
+                        break Poll::Ready(());
+                    }
+                }
+                Poll::Pending => {
+                    yields += 1;
+                    break Poll::Pending;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(yields > 0, "ready polls never yielded to the scheduler");
+}
+
+#[tokio::test]
+async fn stored_send_error_beats_an_exhausted_budget() {
+    let (_transport, socket, mut poller) = gated_socket();
+    let outcome = std::future::poll_fn(|cx| {
+        let exhausted =
+            (0..10_000).any(|_| quinn::UdpPoller::poll_writable(poller.as_mut(), cx).is_pending());
+        assert!(exhausted, "the cooperative budget never ran out");
+        *socket.send_error.lock() = Some(TransportIoError::fatal(io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        )));
+        Poll::Ready(quinn::UdpPoller::poll_writable(poller.as_mut(), cx))
+    })
+    .await;
+    let Poll::Ready(Err(error)) = outcome else {
+        panic!("an exhausted budget masked the stored send error: {outcome:?}");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+}
+
+#[tokio::test]
+async fn writable_reports_a_closed_queue_as_broken_pipe() {
+    let (_transport, socket, mut poller) = gated_socket();
+    assert!(socket.close_tasks().await);
+    let outcome = poll_writable_once(&mut poller).await;
+    let Poll::Ready(Err(error)) = outcome else {
+        panic!("closed queue reported as writable: {outcome:?}");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+}
+
 #[tokio::test]
 async fn handshake_crosses_packet_transport_adapter() {
     let (server, remote) = testutil::server_endpoint(&[b"h3"], true).unwrap();
