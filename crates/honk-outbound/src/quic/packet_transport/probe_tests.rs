@@ -437,6 +437,108 @@ async fn packet_transport_socket_accepts_full_cone_reply_metadata() {
     assert_eq!(meta[0].addr, remote);
 }
 
+/// Never suspends while packets remain, like a transport decoding frames from
+/// an already-buffered stream.
+#[derive(Debug)]
+struct ImmediatePacketTransport {
+    remote: SocketAddr,
+    packets: SyncMutex<std::collections::VecDeque<(Vec<u8>, SocketAddr)>>,
+    served: AtomicUsize,
+}
+
+impl ImmediatePacketTransport {
+    fn new(
+        remote: SocketAddr,
+        packets: impl IntoIterator<Item = (Vec<u8>, SocketAddr)>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            remote,
+            packets: SyncMutex::new(packets.into_iter().collect()),
+            served: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PacketTransport for ImmediatePacketTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.remote
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let next = self.packets.lock().pop_front();
+        let Some((packet, source)) = next else {
+            return std::future::pending().await;
+        };
+        self.served.fetch_add(1, Ordering::SeqCst);
+        buf[..packet.len()].copy_from_slice(&packet);
+        Ok((packet.len(), source))
+    }
+}
+
+#[tokio::test]
+async fn ready_burst_beyond_the_queue_reaches_a_live_consumer() {
+    const BURST: usize = 2 * TRANSPORT_QUEUE_CAP;
+    let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let packets = (0..BURST).map(|i| ((i as u16).to_be_bytes().to_vec(), remote));
+    let socket = TransportQuinnSocket::new(ImmediatePacketTransport::new(remote, packets), remote);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut data = [[0u8; 8]; 16];
+        let mut meta = [quinn::udp::RecvMeta::default(); 16];
+        let mut next = 0;
+        while next < BURST {
+            let count = std::future::poll_fn(|cx| {
+                let mut bufs = data.each_mut().map(|buf| std::io::IoSliceMut::new(buf));
+                quinn::AsyncUdpSocket::poll_recv(&*socket, cx, &mut bufs, &mut meta)
+            })
+            .await
+            .unwrap();
+            for (buf, meta) in data.iter().zip(&meta).take(count) {
+                assert_eq!(&buf[..meta.len], &(next as u16).to_be_bytes());
+                next += 1;
+            }
+        }
+    })
+    .await
+    .expect("a ready burst overflowed the adapter queue and lost packets");
+}
+
+#[tokio::test]
+async fn rejected_packet_flood_does_not_monopolize_the_runtime() {
+    const FLOOD: usize = 4096;
+    let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let wrong: SocketAddr = "127.0.0.2:443".parse().unwrap();
+    let transport = ImmediatePacketTransport::new(
+        remote,
+        (0..FLOOD).map(|i| {
+            if i % 2 == 0 {
+                (Vec::new(), remote)
+            } else {
+                (vec![1], wrong)
+            }
+        }),
+    );
+    let socket = TransportQuinnSocket::new(transport.clone(), remote);
+
+    // The current-thread runtime schedules this witness behind the workers.
+    let served = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.served.load(Ordering::SeqCst) }
+    })
+    .await
+    .unwrap();
+    assert!(
+        served < FLOOD,
+        "the receiver served the whole flood in one poll"
+    );
+    assert!(socket.close_tasks().await);
+}
+
 #[tokio::test]
 async fn handshake_crosses_packet_transport_adapter() {
     let (server, remote) = testutil::server_endpoint(&[b"h3"], true).unwrap();
