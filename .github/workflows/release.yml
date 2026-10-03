@@ -301,17 +301,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/debug.')
         run: bash release-source/.github/ci/check-debug-artifacts.sh
 
-      - name: Move rolling Debug tag
-        if: startsWith(github.ref, 'refs/tags/debug.')
-        working-directory: release-source
-        run: git push --force origin "$GITHUB_SHA:refs/tags/debug"
-
-      - name: Update Debug release
+      - name: Publish Debug release
         if: startsWith(github.ref, 'refs/tags/debug.')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: debug
-          name: Debug
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: "false"
@@ -319,7 +314,7 @@ jobs:
           overwrite_files: true
           fail_on_unmatched_files: true
           body: |
-            Rolling debug build; replaced by subsequent successful debug-tag runs.
+            Debug build of `${{ github.ref_name }}`.
 
             Source tag: `${{ github.ref_name }}`
             Commit: `${{ github.sha }}`
