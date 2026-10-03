@@ -13,6 +13,7 @@ pub(crate) mod flows;
 pub(crate) mod geodata;
 mod groups;
 mod handlers;
+mod hashed_asset;
 pub(crate) mod logs;
 mod management;
 pub(crate) mod observation;
