@@ -50,7 +50,8 @@ impl NameParseState {
 
 #[derive(Debug)]
 pub(super) struct ResourceRecord {
-    pub(super) name: DnsName,
+    /// Only OPT validation reads the owner, and only to require the root.
+    pub(super) root_owner: bool,
     pub(super) rtype: u16,
     pub(super) class: u16,
     pub(super) ttl: u32,
@@ -58,38 +59,12 @@ pub(super) struct ResourceRecord {
     pub(super) end: usize,
 }
 
-struct RrFields {
-    rtype: u16,
-    class: u16,
-    ttl: u32,
-    rdata: Range<usize>,
-    end: usize,
-}
-
 pub(super) fn parse_rr(
     raw: &[u8],
     start: usize,
     state: &mut NameParseState,
 ) -> Result<ResourceRecord, QueryError> {
-    let mut wire = [0; 255];
-    let (length, fields) = parse_rr_into(raw, start, state, &mut wire)?;
-    Ok(ResourceRecord {
-        name: DnsName(wire[..length].into()),
-        rtype: fields.rtype,
-        class: fields.class,
-        ttl: fields.ttl,
-        rdata: fields.rdata,
-        end: fields.end,
-    })
-}
-
-fn parse_rr_into(
-    raw: &[u8],
-    start: usize,
-    state: &mut NameParseState,
-    wire: &mut [u8; 255],
-) -> Result<(usize, RrFields), QueryError> {
-    let (length, name_end) = parse_name_into(raw, start, state, wire)?;
+    let (owner_length, name_end) = parse_name_into(raw, start, state, &mut [0; 255])?;
     let rtype = read_u16(raw, name_end)?;
     let class = read_u16(raw, name_end + 2)?;
     let ttl = read_u32(raw, name_end + 4)?;
@@ -99,39 +74,34 @@ fn parse_rr_into(
         .checked_add(rdlength)
         .filter(|end| *end <= raw.len())
         .ok_or(QueryError::TruncatedField)?;
-    Ok((
-        length,
-        RrFields {
-            rtype,
-            class,
-            ttl,
-            rdata: rdata_start..end,
-            end,
-        },
-    ))
+    Ok(ResourceRecord {
+        root_owner: owner_length == 1,
+        rtype,
+        class,
+        ttl,
+        rdata: rdata_start..end,
+        end,
+    })
 }
 
-fn walk_edns_options(
+/// Validate an OPT pseudo-RR, passing each option code to `each`.
+fn validate_opt(
     raw: &[u8],
-    rdata: &Range<usize>,
+    rr: &ResourceRecord,
     mut each: impl FnMut(u16),
 ) -> Result<(), QueryError> {
-    let mut cursor = rdata.start;
-    while cursor < rdata.end {
+    let mut cursor = rr.rdata.start;
+    while cursor < rr.rdata.end {
         let code = read_u16(raw, cursor).map_err(|_| QueryError::MalformedEdnsOption)?;
         let len =
             usize::from(read_u16(raw, cursor + 2).map_err(|_| QueryError::MalformedEdnsOption)?);
         cursor = cursor
             .checked_add(4 + len)
-            .filter(|end| *end <= rdata.end)
+            .filter(|end| *end <= rr.rdata.end)
             .ok_or(QueryError::MalformedEdnsOption)?;
         each(code);
     }
-    Ok(())
-}
-
-fn require_root_owner(name: &[u8]) -> Result<(), QueryError> {
-    if name != [0] {
+    if !rr.root_owner {
         return Err(QueryError::MalformedName);
     }
     Ok(())
@@ -139,8 +109,7 @@ fn require_root_owner(name: &[u8]) -> Result<(), QueryError> {
 
 pub(super) fn parse_edns(raw: &[u8], rr: &ResourceRecord) -> Result<EdnsMetadata, QueryError> {
     let mut option_codes = Vec::new();
-    walk_edns_options(raw, &rr.rdata, |code| option_codes.push(code))?;
-    require_root_owner(rr.name.0.as_ref())?;
+    validate_opt(raw, rr, |code| option_codes.push(code))?;
     let flags = u16::try_from(rr.ttl & 0xffff).map_err(|_| QueryError::TruncatedField)?;
     Ok(EdnsMetadata {
         advertised_size: rr.class,
@@ -173,11 +142,10 @@ pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, Quer
     let mut advertised_size = None;
     for (section, count) in counts.into_iter().enumerate() {
         for _ in 0..count {
-            let (length, rr) = parse_rr_into(raw, cursor, &mut state, &mut wire)?;
+            let rr = parse_rr(raw, cursor, &mut state)?;
             cursor = rr.end;
             if section == 2 && rr.rtype == OPT_TYPE {
-                walk_edns_options(raw, &rr.rdata, |_| {})?;
-                require_root_owner(&wire[..length])?;
+                validate_opt(raw, &rr, |_| {})?;
                 advertised_size.get_or_insert(rr.class);
             }
         }
