@@ -1647,3 +1647,13 @@ fn bare_ip_in_dip_sip_parses_as_host_route() {
     assert_eq!(hit("10.9.9.8", "192.168.222.2"), "proxy");
     assert_eq!(hit("10.9.9.9", "192.168.222.3"), "proxy");
 }
+
+#[test]
+fn lowercase_copies_only_names_that_change() {
+    assert!(matches!(
+        lowercase("www.example.com"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    assert_eq!(lowercase("WWW.Example.com"), "www.example.com");
+    assert_eq!(lowercase("É.example"), "é.example");
+}
