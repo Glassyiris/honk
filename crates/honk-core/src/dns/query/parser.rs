@@ -131,9 +131,10 @@ pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, Quer
     }
     let counts = [read_u16(raw, 6)?, read_u16(raw, 8)?, read_u16(raw, 10)?];
     let mut state = NameParseState::new(raw.len());
-    let mut wire = [0; 255];
-    let (length, mut cursor) = parse_name_into(raw, HEADER_LEN, &mut state, &mut wire)?;
-    if !is_utf8_wire_name(&wire[..length]) {
+    let mut qname = [0; 255];
+    let (length, mut cursor) = parse_name_into(raw, HEADER_LEN, &mut state, &mut qname)?;
+    // Length octets are ASCII, so the wire form is UTF-8 exactly when every label is.
+    if std::str::from_utf8(&qname[..length]).is_err() {
         return Err(QueryError::MalformedName);
     }
     read_u16(raw, cursor)?;
@@ -154,26 +155,6 @@ pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, Quer
         return Err(QueryError::TrailingBytes);
     }
     Ok(advertised_size)
-}
-
-fn is_utf8_wire_name(wire: &[u8]) -> bool {
-    let mut cursor = 0usize;
-    loop {
-        let Some(&length) = wire.get(cursor) else {
-            return false;
-        };
-        cursor += 1;
-        if length == 0 {
-            return cursor == wire.len();
-        }
-        let Some(label) = wire.get(cursor..cursor + usize::from(length)) else {
-            return false;
-        };
-        if std::str::from_utf8(label).is_err() {
-            return false;
-        }
-        cursor += usize::from(length);
-    }
 }
 
 pub(crate) fn parse_name(
