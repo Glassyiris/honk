@@ -413,9 +413,9 @@ impl QueryContext {
         if cursor != raw.len() {
             return Err(QueryError::TrailingBytes);
         }
-        let mut canonical_wire = raw.to_vec();
-        if let Some(id) = canonical_wire.get_mut(0..2) {
-            id.copy_from_slice(&[0, 0]);
+        let mut canonical_wire: Arc<[u8]> = Arc::from(raw);
+        if let Some(id) = Arc::get_mut(&mut canonical_wire).and_then(|wire| wire.get_mut(0..2)) {
+            id.fill(0);
         }
         let cacheable = flags & !ALLOWED_QUERY_FLAGS == 0
             && qdcount == 1
@@ -435,7 +435,7 @@ impl QueryContext {
             questions,
             edns,
             ingress,
-            canonical_wire: canonical_wire.into(),
+            canonical_wire,
             cacheable,
         })
     }
