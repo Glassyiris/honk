@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use super::{DnsName, EdnsMetadata, QueryError};
+use super::{DnsName, EdnsMetadata, HEADER_LEN, OPT_TYPE, QueryError};
 
 const MAX_POINTER_HOPS: usize = 128;
 
@@ -58,12 +58,38 @@ pub(super) struct ResourceRecord {
     pub(super) end: usize,
 }
 
+struct RrFields {
+    rtype: u16,
+    class: u16,
+    ttl: u32,
+    rdata: Range<usize>,
+    end: usize,
+}
+
 pub(super) fn parse_rr(
     raw: &[u8],
     start: usize,
     state: &mut NameParseState,
 ) -> Result<ResourceRecord, QueryError> {
-    let (name, name_end) = parse_name(raw, start, state)?;
+    let mut wire = [0; 255];
+    let (length, fields) = parse_rr_into(raw, start, state, &mut wire)?;
+    Ok(ResourceRecord {
+        name: DnsName(wire[..length].into()),
+        rtype: fields.rtype,
+        class: fields.class,
+        ttl: fields.ttl,
+        rdata: fields.rdata,
+        end: fields.end,
+    })
+}
+
+fn parse_rr_into(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+    wire: &mut [u8; 255],
+) -> Result<(usize, RrFields), QueryError> {
+    let (length, name_end) = parse_name_into(raw, start, state, wire)?;
     let rtype = read_u16(raw, name_end)?;
     let class = read_u16(raw, name_end + 2)?;
     let ttl = read_u32(raw, name_end + 4)?;
@@ -73,32 +99,48 @@ pub(super) fn parse_rr(
         .checked_add(rdlength)
         .filter(|end| *end <= raw.len())
         .ok_or(QueryError::TruncatedField)?;
-    Ok(ResourceRecord {
-        name,
-        rtype,
-        class,
-        ttl,
-        rdata: rdata_start..end,
-        end,
-    })
+    Ok((
+        length,
+        RrFields {
+            rtype,
+            class,
+            ttl,
+            rdata: rdata_start..end,
+            end,
+        },
+    ))
 }
 
-pub(super) fn parse_edns(raw: &[u8], rr: &ResourceRecord) -> Result<EdnsMetadata, QueryError> {
-    let mut cursor = rr.rdata.start;
-    let mut option_codes = Vec::new();
-    while cursor < rr.rdata.end {
+fn walk_edns_options(
+    raw: &[u8],
+    rdata: &Range<usize>,
+    mut each: impl FnMut(u16),
+) -> Result<(), QueryError> {
+    let mut cursor = rdata.start;
+    while cursor < rdata.end {
         let code = read_u16(raw, cursor).map_err(|_| QueryError::MalformedEdnsOption)?;
         let len =
             usize::from(read_u16(raw, cursor + 2).map_err(|_| QueryError::MalformedEdnsOption)?);
         cursor = cursor
             .checked_add(4 + len)
-            .filter(|end| *end <= rr.rdata.end)
+            .filter(|end| *end <= rdata.end)
             .ok_or(QueryError::MalformedEdnsOption)?;
-        option_codes.push(code);
+        each(code);
     }
-    if rr.name.0.as_ref() != [0] {
+    Ok(())
+}
+
+fn require_root_owner(name: &[u8]) -> Result<(), QueryError> {
+    if name != [0] {
         return Err(QueryError::MalformedName);
     }
+    Ok(())
+}
+
+pub(super) fn parse_edns(raw: &[u8], rr: &ResourceRecord) -> Result<EdnsMetadata, QueryError> {
+    let mut option_codes = Vec::new();
+    walk_edns_options(raw, &rr.rdata, |code| option_codes.push(code))?;
+    require_root_owner(rr.name.0.as_ref())?;
     let flags = u16::try_from(rr.ttl & 0xffff).map_err(|_| QueryError::TruncatedField)?;
     Ok(EdnsMetadata {
         advertised_size: rr.class,
@@ -108,6 +150,62 @@ pub(super) fn parse_edns(raw: &[u8], rr: &ResourceRecord) -> Result<EdnsMetadata
         option_codes,
         flags,
     })
+}
+
+/// Allocation-free twin of the walk in `QueryContext::parse_with_profile` for a
+/// one-question query: accepts exactly what it accepts and, because UDP ingress
+/// needs only that, returns the first OPT's advertised size. The question name
+/// must also decode as UTF-8 labels, as `DnsName::to_domain_name` requires.
+pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, QueryError> {
+    if raw.len() < HEADER_LEN {
+        return Err(QueryError::HeaderTruncated);
+    }
+    let counts = [read_u16(raw, 6)?, read_u16(raw, 8)?, read_u16(raw, 10)?];
+    let mut state = NameParseState::new(raw.len());
+    let mut wire = [0; 255];
+    let (length, mut cursor) = parse_name_into(raw, HEADER_LEN, &mut state, &mut wire)?;
+    if !is_utf8_wire_name(&wire[..length]) {
+        return Err(QueryError::MalformedName);
+    }
+    read_u16(raw, cursor)?;
+    read_u16(raw, cursor + 2)?;
+    cursor += 4;
+    let mut advertised_size = None;
+    for (section, count) in counts.into_iter().enumerate() {
+        for _ in 0..count {
+            let (length, rr) = parse_rr_into(raw, cursor, &mut state, &mut wire)?;
+            cursor = rr.end;
+            if section == 2 && rr.rtype == OPT_TYPE {
+                walk_edns_options(raw, &rr.rdata, |_| {})?;
+                require_root_owner(&wire[..length])?;
+                advertised_size.get_or_insert(rr.class);
+            }
+        }
+    }
+    if cursor != raw.len() {
+        return Err(QueryError::TrailingBytes);
+    }
+    Ok(advertised_size)
+}
+
+fn is_utf8_wire_name(wire: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    loop {
+        let Some(&length) = wire.get(cursor) else {
+            return false;
+        };
+        cursor += 1;
+        if length == 0 {
+            return cursor == wire.len();
+        }
+        let Some(label) = wire.get(cursor..cursor + usize::from(length)) else {
+            return false;
+        };
+        if std::str::from_utf8(label).is_err() {
+            return false;
+        }
+        cursor += usize::from(length);
+    }
 }
 
 pub(crate) fn parse_name(
