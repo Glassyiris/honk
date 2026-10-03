@@ -141,8 +141,13 @@ fn embed_native_ui() -> anyhow::Result<()> {
         fs::remove_dir_all(&compressed)?;
     }
     fs::create_dir(&compressed)?;
-    // Brotli at quality 11 is slow; one worker per core keeps its memory bounded.
+    // Brotli at quality 11 is slow; one worker per core keeps its memory bounded, and
+    // Cargo's job count caps it so `-j` still limits the build.
     let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = std::env::var("NUM_JOBS")
+        .ok()
+        .and_then(|jobs| jobs.parse::<usize>().ok())
+        .map_or(workers, |jobs| workers.min(jobs.max(1)));
     let encoded = std::thread::scope(|scope| {
         let tasks: Vec<_> = files
             .chunks(files.len().div_ceil(workers))
