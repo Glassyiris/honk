@@ -322,6 +322,21 @@ mod tests {
             ("assets/array-C0P64tl-.js", StatusCode::OK, IMMUTABLE),
             ("assets/locale-zh-CN-DF_91JnF.js", StatusCode::OK, IMMUTABLE),
             ("assets/lake-light-oWll36-V.webp", StatusCode::OK, IMMUTABLE),
+            ("assets/match.worker-B2aIccpg.js", StatusCode::OK, IMMUTABLE),
+            ("assets/x.y.z-AbCd1234.css", StatusCode::OK, IMMUTABLE),
+            ("assets/match.worker.js", StatusCode::OK, "no-cache"),
+            ("assets/match.worker-B2aIcc.js", StatusCode::OK, "no-cache"),
+            (
+                "assets/match-B2aIccpg.worker.js",
+                StatusCode::OK,
+                "no-cache",
+            ),
+            ("assets/index-BOpK0UVB.js.map", StatusCode::OK, "no-cache"),
+            (
+                "assets/match.worker-B2a.ccpg.js",
+                StatusCode::OK,
+                "no-cache",
+            ),
             (
                 "assets/index-BOpK0UVB.js",
                 StatusCode::PARTIAL_CONTENT,
