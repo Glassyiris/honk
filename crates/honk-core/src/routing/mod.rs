@@ -127,7 +127,7 @@ impl GeositeMatcher {
     }
 
     pub(crate) fn matches(&self, domain: &str) -> bool {
-        self.matches_bounded::<false>(domain, &domain.to_lowercase(), None)
+        self.matches_bounded::<false>(domain, &lowercase(domain), None)
     }
 
     fn matches_bounded<const BOUNDED: bool>(
@@ -239,7 +239,7 @@ impl DomainMatcher {
                 domain.contains(keyword)
             })
             || (!self.geosite.is_empty() && {
-                let lower = domain.to_lowercase();
+                let lower = lowercase(domain);
                 bounded_any::<BOUNDED, _>(&self.geosite, deadline, |matcher| {
                     matcher.matches_bounded::<BOUNDED>(domain, &lower, deadline)
                 })
@@ -257,6 +257,18 @@ fn bounded_any<const BOUNDED: bool, T>(
         .iter()
         .take_while(|_| !BOUNDED || deadline.is_some_and(|end| std::time::Instant::now() < end))
         .any(&mut matches)
+}
+
+/// Geosite sets are stored lowercased; query names almost always already are.
+fn lowercase(domain: &str) -> std::borrow::Cow<'_, str> {
+    if domain
+        .bytes()
+        .any(|b| b.is_ascii_uppercase() || !b.is_ascii())
+    {
+        std::borrow::Cow::Owned(domain.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(domain)
+    }
 }
 
 /// Keys copy each matcher's whole expansion and are read only by interning and
