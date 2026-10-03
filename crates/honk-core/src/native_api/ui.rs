@@ -148,7 +148,21 @@ impl Ui {
             files.clone().try_call(request).await
         };
         match result {
-            Ok(response) => response.map(Body::new),
+            Ok(response) => {
+                let mut response = response.map(Body::new);
+                // tower-http names accept-encoding in Vary only on responses carrying the file;
+                // a cache must key its 304 or 412 for that file by encoding too.
+                let status = response.status();
+                if matches!(
+                    status,
+                    StatusCode::NOT_MODIFIED | StatusCode::PRECONDITION_FAILED
+                ) {
+                    response
+                        .headers_mut()
+                        .append(header::VARY, HeaderValue::from_static("accept-encoding"));
+                }
+                response
+            }
             Err(error) => match error.kind() {
                 ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::NotADirectory => {
                     StatusCode::NOT_FOUND.into_response()
@@ -189,11 +203,14 @@ enum Encoding {
     Identity,
 }
 
-/// Picks the best stored coding for `Accept-Encoding`: highest q-value wins and brotli wins
-/// a tie. A missing header, or one that refuses both, means identity.
+/// Picks the coding with the highest q-value among br, gzip and identity, the three forms
+/// every compressed asset has; an explicit token overrides `*`, and ties prefer br, then
+/// gzip. Unlisted identity stays acceptable below any listed coding. When the header
+/// refuses everything, identity is served anyway: RFC 9110 lets a server disregard the
+/// header, and a 406 would only leave the UI blank.
 #[cfg(feature = "native-ui")]
 fn negotiate(headers: &axum::http::HeaderMap) -> Encoding {
-    let (mut br, mut gzip, mut any) = (None, None, None);
+    let (mut br, mut gzip, mut identity, mut any) = (None, None, None, None);
     for value in headers.get_all(header::ACCEPT_ENCODING) {
         let Ok(value) = value.to_str() else {
             continue;
@@ -215,6 +232,8 @@ fn negotiate(headers: &axum::http::HeaderMap) -> Encoding {
                 &mut br
             } else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
                 &mut gzip
+            } else if coding.eq_ignore_ascii_case("identity") {
+                &mut identity
             } else if coding == "*" {
                 &mut any
             } else {
@@ -225,9 +244,10 @@ fn negotiate(headers: &axum::http::HeaderMap) -> Encoding {
     }
     let br = br.or(any).unwrap_or(0.0);
     let gzip = gzip.or(any).unwrap_or(0.0);
-    if br > 0.0 && br >= gzip {
+    let identity = identity.or(any).unwrap_or(f32::MIN_POSITIVE);
+    if br > 0.0 && br >= gzip && br >= identity {
         Encoding::Brotli
-    } else if gzip > 0.0 {
+    } else if gzip > 0.0 && gzip >= identity {
         Encoding::Gzip
     } else {
         Encoding::Identity
@@ -271,12 +291,15 @@ fn embedded_response(path: &str, navigation: bool, head: bool, encoding: Encodin
         (EmbeddedAsset::Encoded { gzip, .. }, Encoding::Gzip) => {
             (Body::from(*gzip), gzip.len(), Some("gzip"))
         }
+        (EmbeddedAsset::Encoded { len, .. }, Encoding::Identity) if head => {
+            (Body::empty(), *len, None)
+        }
         (EmbeddedAsset::Encoded { gzip, len, .. }, Encoding::Identity) => {
+            // Browsers all accept gzip, so this whole-buffer decode serves only rare clients.
             let mut decoded = Vec::with_capacity(*len);
-            if !head
-                && flate2::read::GzDecoder::new(*gzip)
-                    .read_to_end(&mut decoded)
-                    .is_err()
+            if flate2::read::GzDecoder::new(*gzip)
+                .read_to_end(&mut decoded)
+                .is_err()
             {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -403,6 +426,15 @@ mod tests {
             (&["gzip;q=0.5, *"], Brotli),
             (&["identity;q=0"], Identity),
             (&["deflate", "gzip"], Gzip),
+            (&["identity;q=1, br;q=0.1"], Identity),
+            (&["identity, gzip;q=0.5"], Identity),
+            (&["IDENTITY;q=0.5, gzip"], Gzip),
+            (&["identity;q=0, gzip;q=0.1"], Gzip),
+            (&["identity;q=0, br;q=0, gzip;q=0"], Identity),
+            (&["*;q=0.5, br;q=0.1"], Gzip),
+            (&["*;q=0.5, gzip;q=0"], Brotli),
+            (&["*;q=0.2, identity;q=0.9"], Identity),
+            (&["*;q=0, identity"], Identity),
         ] {
             let mut headers = axum::http::HeaderMap::new();
             for value in values {

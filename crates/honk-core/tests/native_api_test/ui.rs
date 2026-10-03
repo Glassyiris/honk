@@ -85,6 +85,20 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
         );
         assert_eq!(response.text().await.unwrap(), body);
     }
+    for path in ["/ui/assets/hashed-Ab_9-xYz.js", "/ui/deep/navigation"] {
+        let response = app.client.get(app.url(path)).send().await.unwrap();
+        let etag = response.headers()["etag"].clone();
+        let response = app
+            .client
+            .get(app.url(path))
+            .header("if-none-match", etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{path}");
+        let vary: Vec<_> = response.headers().get_all("vary").iter().collect();
+        assert_eq!(vary, ["accept-encoding", "Origin"], "{path}");
+    }
     let head = app
         .client
         .head(app.url("/ui/deep/navigation"))
@@ -265,7 +279,14 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(response.headers()["content-encoding"], encoding, "{path}");
+            let Some(content_encoding) = response.headers().get("content-encoding") else {
+                // The build stores a file as is when compression does not shrink it.
+                assert!(expected.len() < 1024, "{path}");
+                assert_eq!(response.headers()["vary"], "Origin", "{path}");
+                assert_eq!(response.bytes().await.unwrap().as_ref(), expected, "{path}");
+                continue;
+            };
+            assert_eq!(content_encoding, encoding, "{path}");
             assert_eq!(response.headers()["vary"], "accept-encoding", "{path}");
             let length = response.headers()["content-length"]
                 .to_str()
