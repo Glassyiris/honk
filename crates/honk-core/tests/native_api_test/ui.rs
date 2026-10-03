@@ -18,6 +18,8 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
         ("assets/app.css", "body { color: black; }"),
         ("manifest.webmanifest", "{\"name\":\"hosting fixture\"}"),
         ("sw.js", "self.addEventListener('fetch', () => {});"),
+        ("assets/hashed-Ab_9-xYz.js", "window.hashedFixture = true;"),
+        ("assets/hashed-Ab_9-xYz.js.gz", "gzip fixture"),
     ] {
         std::fs::write(ui.join(path), content).unwrap();
     }
@@ -54,6 +56,34 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
             assert_eq!(body, index);
         }
         assert!(!body.contains(SECRET));
+    }
+    // Directory mode serves a precompressed sibling only when the administrator provides one.
+    for (encoding, content_encoding, body) in [
+        ("gzip", Some("gzip"), "gzip fixture"),
+        ("br", None, "window.hashedFixture = true;"),
+    ] {
+        let response = app
+            .client
+            .get(app.url("/ui/assets/hashed-Ab_9-xYz.js"))
+            .header("accept-encoding", encoding)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{encoding}");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["vary"], "accept-encoding");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().unwrap()),
+            content_encoding
+        );
+        assert_eq!(response.text().await.unwrap(), body);
     }
     let head = app
         .client
@@ -140,6 +170,8 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
 #[cfg(feature = "native-ui")]
 #[tokio::test]
 async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
+    use std::io::Read;
+
     let app = TestApp::new(|config| config.experimental.native_api.ui = "embedded".into()).await;
     for path in ["/", "/ui", "/ui/a/", "/ui/a/b"] {
         for method in [Method::GET, Method::HEAD] {
@@ -185,7 +217,15 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(response.headers()["cache-control"], "no-cache");
+            assert_eq!(
+                response.headers()["cache-control"],
+                if path.starts_with("./assets/") {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "no-cache"
+                },
+                "{path}"
+            );
             assert_eq!(response.headers()["x-content-type-options"], "nosniff");
             assert!(response.headers().get("x-frame-options").is_none());
             assert_eq!(
@@ -212,6 +252,40 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
             } else {
                 assert_eq!(body.as_ref(), expected, "{path}");
             }
+        }
+        if path.ends_with(".png") {
+            continue;
+        }
+        for encoding in ["br", "gzip"] {
+            let response = app
+                .client
+                .get(url.clone())
+                .header("accept-encoding", format!("identity;q=0.5, {encoding}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["content-encoding"], encoding, "{path}");
+            assert_eq!(response.headers()["vary"], "accept-encoding", "{path}");
+            let length = response.headers()["content-length"]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let body = response.bytes().await.unwrap();
+            assert_eq!(body.len(), length, "{path}");
+            assert!(body.len() < expected.len(), "{path}");
+            let mut decoded = Vec::new();
+            if encoding == "br" {
+                brotli::Decompressor::new(body.as_ref(), 4096)
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+            } else {
+                flate2::read::GzDecoder::new(body.as_ref())
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+            }
+            assert_eq!(decoded, expected, "{path}");
         }
     }
     let webp = std::fs::read_dir(std::path::Path::new(env!("HONK_DOONA_DIR")).join("assets"))

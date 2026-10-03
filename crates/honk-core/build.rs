@@ -61,6 +61,10 @@ fn emit_version() {
 }
 
 #[cfg(feature = "native-ui")]
+#[path = "src/native_api/hashed_asset.rs"]
+mod hashed_asset;
+
+#[cfg(feature = "native-ui")]
 fn embed_native_ui() -> anyhow::Result<()> {
     use std::{fmt::Write, fs, path::Path};
 
@@ -121,18 +125,99 @@ fn embed_native_ui() -> anyhow::Result<()> {
             .is_ok(),
         "native UI assets must include index.html"
     );
+    let unhashed: Vec<_> = files
+        .iter()
+        .filter(|path| path.starts_with("assets/") && !hashed_asset::is_hashed_asset(path))
+        .collect();
+    // The server caches assets/ as immutable, which is only safe for content-hashed names.
+    ensure!(
+        unhashed.is_empty(),
+        "native UI assets/ files must carry a content hash: {unhashed:?}"
+    );
+
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    let compressed = out.join("native_ui");
+    if compressed.exists() {
+        fs::remove_dir_all(&compressed)?;
+    }
+    fs::create_dir(&compressed)?;
+    // Brotli at quality 11 is slow; one worker per core keeps its memory bounded.
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let encoded = std::thread::scope(|scope| {
+        let tasks: Vec<_> = files
+            .chunks(files.len().div_ceil(workers))
+            .map(|chunk| {
+                scope.spawn(|| {
+                    chunk
+                        .iter()
+                        .map(|path| encode(&root.join(path)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .flat_map(|task| task.join().expect("native UI compression panicked"))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })?;
     let mut generated = String::from("&[\n");
-    for path in files {
-        let file = root.join(&path);
-        let file = file
-            .to_str()
-            .context("HONK_DOONA_DIR paths must be UTF-8")?;
-        writeln!(generated, "    ({path:?}, include_bytes!({file:?})),")?;
+    for (index, (path, encoded)) in files.iter().zip(encoded).enumerate() {
+        if let Some(Compressed { br, gzip, len }) = encoded {
+            let br_file = compressed.join(format!("{index}.br"));
+            let gzip_file = compressed.join(format!("{index}.gz"));
+            fs::write(&br_file, br)?;
+            fs::write(&gzip_file, gzip)?;
+            writeln!(
+                generated,
+                "    ({path:?}, EmbeddedAsset::Encoded {{ br: include_bytes!({:?}), gzip: include_bytes!({:?}), len: {len} }}),",
+                br_file.to_str().context("OUT_DIR must be UTF-8")?,
+                gzip_file.to_str().context("OUT_DIR must be UTF-8")?,
+            )?;
+        } else {
+            let file = root.join(path);
+            let file = file
+                .to_str()
+                .context("HONK_DOONA_DIR paths must be UTF-8")?;
+            writeln!(
+                generated,
+                "    ({path:?}, EmbeddedAsset::Identity(include_bytes!({file:?}))),"
+            )?;
+        }
     }
     generated.push_str("]\n");
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     fs::write(out.join("native_ui_assets.rs"), generated)?;
     Ok(())
+}
+
+#[cfg(feature = "native-ui")]
+struct Compressed {
+    br: Vec<u8>,
+    gzip: Vec<u8>,
+    len: usize,
+}
+
+/// Brotli and gzip variants of a text asset, or `None` to embed the file as is.
+#[cfg(feature = "native-ui")]
+fn encode(file: &std::path::Path) -> anyhow::Result<Option<Compressed>> {
+    use std::io::Write;
+
+    const TEXT: &[&str] = &["css", "html", "js", "json", "svg", "txt", "webmanifest"];
+    if !file
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| TEXT.contains(&extension))
+    {
+        return Ok(None);
+    }
+    let raw = std::fs::read(file)?;
+    let mut br = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
+    br.write_all(&raw)?;
+    let br = br.into_inner();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gzip.write_all(&raw)?;
+    let gzip = gzip.finish()?;
+    let len = raw.len();
+    Ok((br.len().max(gzip.len()) < len).then_some(Compressed { br, gzip, len }))
 }
 
 #[cfg(feature = "ebpf")]

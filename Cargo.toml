@@ -141,6 +141,7 @@ nix = { version = "0.31", features = [
 ] }
 pin-project-lite = "0.2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+flate2 = "1.1"
 
 # Dev/test utilities
 tempfile = "3"
