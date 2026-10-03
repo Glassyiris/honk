@@ -18,7 +18,8 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
         ("assets/app.css", "body { color: black; }"),
         ("manifest.webmanifest", "{\"name\":\"hosting fixture\"}"),
         ("sw.js", "self.addEventListener('fetch', () => {});"),
-        ("assets/app.js.gz", "gzip fixture"),
+        ("assets/hashed-Ab_9-xYz.js", "window.hashedFixture = true;"),
+        ("assets/hashed-Ab_9-xYz.js.gz", "gzip fixture"),
     ] {
         std::fs::write(ui.join(path), content).unwrap();
     }
@@ -59,17 +60,20 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
     // Directory mode serves a precompressed sibling only when the administrator provides one.
     for (encoding, content_encoding, body) in [
         ("gzip", Some("gzip"), "gzip fixture"),
-        ("br", None, "window.hostingFixture = true;"),
+        ("br", None, "window.hashedFixture = true;"),
     ] {
         let response = app
             .client
-            .get(app.url("/ui/assets/app.js"))
+            .get(app.url("/ui/assets/hashed-Ab_9-xYz.js"))
             .header("accept-encoding", encoding)
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{encoding}");
-        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         assert_eq!(response.headers()["vary"], "accept-encoding");
         assert_eq!(
@@ -213,7 +217,15 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(response.headers()["cache-control"], "no-cache");
+            assert_eq!(
+                response.headers()["cache-control"],
+                if path.starts_with("./assets/") {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "no-cache"
+                },
+                "{path}"
+            );
             assert_eq!(response.headers()["x-content-type-options"], "nosniff");
             assert!(response.headers().get("x-frame-options").is_none());
             assert_eq!(

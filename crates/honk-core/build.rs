@@ -61,6 +61,10 @@ fn emit_version() {
 }
 
 #[cfg(feature = "native-ui")]
+#[path = "src/native_api/hashed_asset.rs"]
+mod hashed_asset;
+
+#[cfg(feature = "native-ui")]
 fn embed_native_ui() -> anyhow::Result<()> {
     use std::{fmt::Write, fs, path::Path};
 
@@ -121,6 +125,16 @@ fn embed_native_ui() -> anyhow::Result<()> {
             .is_ok(),
         "native UI assets must include index.html"
     );
+    let unhashed: Vec<_> = files
+        .iter()
+        .filter(|path| path.starts_with("assets/") && !hashed_asset::is_hashed_asset(path))
+        .collect();
+    // The server caches assets/ as immutable, which is only safe for content-hashed names.
+    ensure!(
+        unhashed.is_empty(),
+        "native UI assets/ files must carry a content hash: {unhashed:?}"
+    );
+
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     let compressed = out.join("native_ui");
     if compressed.exists() {

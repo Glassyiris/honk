@@ -14,6 +14,10 @@ use axum::{
 };
 use tower_http::services::{ServeDir, ServeFile};
 
+use super::hashed_asset::is_hashed_asset;
+
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
 pub(super) enum Ui {
     Directory(Box<(ServeDir, ServeFile)>),
     #[cfg(feature = "native-ui")]
@@ -64,9 +68,15 @@ pub(super) async fn load(path: &str) -> anyhow::Result<Option<Ui>> {
 
 impl Ui {
     pub(super) async fn serve(&self, request: Request) -> Response {
+        let hashed = request
+            .uri()
+            .path()
+            .strip_prefix("/ui/")
+            .is_some_and(is_hashed_asset);
         let mut response = self.respond(request).await;
+        let cache = cache_control(hashed, response.status());
         let headers = response.headers_mut();
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
         headers.insert(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -146,6 +156,16 @@ impl Ui {
                 _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             },
         }
+    }
+}
+
+/// Only hashed names are safe to keep: everything else, including `index.html` and
+/// `sw.js`, must revalidate so a new build is picked up.
+fn cache_control(hashed: bool, status: StatusCode) -> &'static str {
+    if hashed && (status.is_success() || status == StatusCode::NOT_MODIFIED) {
+        IMMUTABLE
+    } else {
+        "no-cache"
     }
 }
 
@@ -291,10 +311,57 @@ fn decode_path(path: &str) -> Option<Cow<'_, str>> {
         .ok()
 }
 
-#[cfg(all(test, feature = "native-ui"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_successful_hashed_assets_are_immutable() {
+        for (path, status, expected) in [
+            ("assets/index-BOpK0UVB.js", StatusCode::OK, IMMUTABLE),
+            ("assets/array-C0P64tl-.js", StatusCode::OK, IMMUTABLE),
+            ("assets/locale-zh-CN-DF_91JnF.js", StatusCode::OK, IMMUTABLE),
+            ("assets/lake-light-oWll36-V.webp", StatusCode::OK, IMMUTABLE),
+            (
+                "assets/index-BOpK0UVB.js",
+                StatusCode::PARTIAL_CONTENT,
+                IMMUTABLE,
+            ),
+            (
+                "assets/index-BOpK0UVB.js",
+                StatusCode::NOT_MODIFIED,
+                IMMUTABLE,
+            ),
+            (
+                "assets/index-BOpK0UVB.js",
+                StatusCode::NOT_FOUND,
+                "no-cache",
+            ),
+            ("assets/index-BOpK0UV.js", StatusCode::OK, "no-cache"),
+            ("assets/index-BOpK0UVB", StatusCode::OK, "no-cache"),
+            ("assets/-BOpK0UVB.js", StatusCode::OK, "no-cache"),
+            ("assets/app.js", StatusCode::OK, "no-cache"),
+            (
+                "assets/nested/index-BOpK0UVB.js",
+                StatusCode::OK,
+                "no-cache",
+            ),
+            ("fonts/index-BOpK0UVB.js", StatusCode::OK, "no-cache"),
+            ("index.html", StatusCode::OK, "no-cache"),
+            ("sw.js", StatusCode::OK, "no-cache"),
+            ("manifest.webmanifest", StatusCode::OK, "no-cache"),
+            ("icons/icon-192.png", StatusCode::OK, "no-cache"),
+            ("", StatusCode::OK, "no-cache"),
+        ] {
+            assert_eq!(
+                cache_control(is_hashed_asset(path), status),
+                expected,
+                "{path} {status}"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-ui")]
     #[test]
     fn accept_encoding_picks_the_best_stored_coding() {
         use Encoding::{Brotli, Gzip, Identity};
