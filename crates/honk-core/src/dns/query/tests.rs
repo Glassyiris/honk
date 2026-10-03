@@ -289,6 +289,7 @@ fn allocation_free_scan_matches_full_parse() {
     two_opts[11] = 2;
     let mut foreign_owner = vec![1, b'a'];
     foreign_owner.extend_from_slice(&opt(512, 0, 0, &[]));
+    assert_eq!(full_parse_verdict(&with_opt(&foreign_owner)), None);
     let mut with_answer = plain.clone();
     with_answer[7] = 1;
     with_answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
