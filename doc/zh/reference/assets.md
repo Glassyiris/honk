@@ -24,9 +24,9 @@ assets {
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
 | `route` | `routing` | 配置文件中各项下载的默认出口；文件未指定出口时，已通过 API 保存的 geodata 出口继续生效。`routing` 遵循流量路由规则，`direct` 直连，组名强制经过该组；未知组在配置校验时被拒绝。 |
-| `geodata.geosite` | 内置 URL（有状态库时） | 已加载 geosite 资产的 HTTP(S) 下载来源，最长 4096 字节。没有状态库时，更新要求配置来源。 |
-| `geodata.geoip` | 内置 URL（有状态库时） | 已加载 geoip 资产的 HTTP(S) 下载来源，限制与 geosite 相同。 |
-| `geodata.route` | `assets.route` | Geodata 下载及校验请求的出口。有状态库时，配置中的 URL 和出口在启动时写入已存储来源；API 的修改可在下次启动前覆盖。 |
+| `geodata.geosite` | 内置 URL（有状态数据库时） | 已加载 geosite 资产的 HTTP(S) 下载来源，最长 4096 字节。没有状态数据库时，更新要求配置来源。 |
+| `geodata.geoip` | 内置 URL（有状态数据库时） | 已加载 geoip 资产的 HTTP(S) 下载来源，限制与 geosite 相同。 |
+| `geodata.route` | `assets.route` | Geodata 下载及校验请求的出口。有状态数据库时，配置中的 URL 和出口在启动时写入已存储来源；API 的修改可在下次启动前覆盖。 |
 | `ui.url` | 内置 zashboard URL | 外部 dashboard ZIP 来源；`HONK_UI_DOWNLOAD_URL` 的优先级更高。已配置的外部 UI 目录缺失或为空时才下载。 |
 | `ui.route` | `assets.route` | 外部 UI ZIP 下载的出口；也接受节点 tag。 |
 | `subscription.ua` | `honk/<version>` | 订阅条目的默认请求 User-Agent。 |

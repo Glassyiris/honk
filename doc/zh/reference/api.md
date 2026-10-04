@@ -1,12 +1,12 @@
 # 原生 API、Clash API 与 `/stats` 参考
 
-本页列出 honk 的原生 API、已实现的 Clash 兼容 HTTP 接口及其用户态统计快照。原生与 Clash API 具有独立的 feature、listener、凭证及 HTTP 边界，共用底层引擎 handles 与用户态统计。
+本页列出 honk 的原生 API、已实现的 Clash 兼容 HTTP 接口及其用户态统计快照。原生与 Clash API 的 feature、listener、凭据及 HTTP 边界相互独立，共用底层引擎 handles 与用户态统计。
 
 ## 原生 API
 
-本节说明当前已实现的原生观测与控制契约。`native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；两种 allocator 发布产物均包含它及内嵌 UI（`native-ui`），但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
+`native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；两种 allocator 发布产物均包含它及内嵌 UI（`native-ui`）。listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
-原生契约（包括认证、节点/provider 管理、geodata 与自动策略 override）为 [api-standardize 7a133b580afb66b00a1ddb24874bae778a27cb4c](https://github.com/daeuniverse/api-standardize/tree/7a133b580afb66b00a1ddb24874bae778a27cb4c)；`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该 bundle。原生 runtime mode 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
+原生契约（包括认证、节点/provider 管理、geodata 与自动策略 override）为 [api-standardize 7a133b580afb66b00a1ddb24874bae778a27cb4c](https://github.com/daeuniverse/api-standardize/tree/7a133b580afb66b00a1ddb24874bae778a27cb4c)；`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该 bundle。原生 runtime mode 仍未开放，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`。可用功能以 capabilities 和逐源权限为准，不按路由名称推断。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -65,7 +65,7 @@
 
 TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。`process.cpu_percent` 在获得两次可用 CPU 样本前为 null，见[出站、内存与历史](#出站内存与历史)。`generation.activated_at` 是当前 generation 的发布时间，启动 generation 取引擎首次进入运行状态的时间。配置激活进行期间，`generation.state` 为 `reloading`；引擎运行且健康时，`lifecycle.state` 同为 `reloading`。有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
-`degradations` 列出因故障降级但仍在运行的功能，每个组件最多一项。每项是一个安全错误（`code`、`message`、`details.reason`），另带 `component` 与 `since`；`since` 是该组件首次降级的时间，重复故障不更新。空列表表示没有已知降级；这些条目不改变 `lifecycle.state`。条目新增、变化或清除时发布 `runtime.updated`。组件：`persistence`（启动时无法打开或重置状态数据库）与 `state_cache`（无法打开其缓存表）在重启后清除；`quic_probe`（Score 组需要 QUIC 探测，但第一个 `tcp_check_url` 不是 HTTPS URL、主机无法解析或无法创建 QUIC 客户端；原因为 `restart_required` 时，启动时没有 Score 组，由重载加入）在应用的配置不再含 Score 组时清除，否则在重启后目标解析成功时清除；探测目标在启动时确定。`pname_routing`（路由规则使用了 `pname()`，但数据路径没有 cgroup v2 hook，`pname()` 条件取不到进程名，肯定条件永不匹配，否定条件总是匹配；原因为 `comm_fallback` 时规则匹配线程名而非 argv）在每次应用配置后重新判定。使用真实 eBPF 后端时，`iface_watch`（接口监视器无法启动）在重启后清除；`udp_trace`（记录流时内核 UDP 接收追踪不可用）在每次启动 UDP 监听器时重新判定。
+`degradations` 列出因故障降级但仍在运行的功能，每个组件最多一项。每项是一个安全错误（`code`、`message`、`details.reason`），另带 `component` 与 `since`；`since` 是该组件首次降级的时间，重复故障不更新。空列表表示没有已知降级；这些条目不改变 `lifecycle.state`。条目新增、变化或清除时发布 `runtime.updated`。组件：`persistence`（启动时无法打开或重置状态数据库）与 `state_cache`（无法打开其缓存表）在重启后清除；`quic_probe`（Score 组需要 QUIC 探测，但第一个 `tcp_check_url` 不是 HTTPS URL、主机无法解析或无法创建 QUIC 客户端；原因为 `restart_required` 时，启动时没有 Score 组，由重载加入）在应用的配置不再含 Score 组时清除，否则在重启后目标解析成功时清除；探测目标在启动时确定。`pname_routing`（路由规则使用了 `pname()`，但数据路径没有 cgroup v2 hook，`pname()` 条件无法获取进程名，肯定条件永不匹配，否定条件总是匹配；原因为 `comm_fallback` 时规则匹配线程名而非 argv）在每次应用配置后重新判定。使用真实 eBPF 后端时，`iface_watch`（接口监视器无法启动）在重启后清除；`udp_trace`（记录流时内核 UDP 接收追踪不可用）在每次启动 UDP 监听器时重新判定。
 
 所有认证模式都公开 `GET /api`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
@@ -133,9 +133,9 @@ Reset 在检查数据库是否存在前取得状态目录的排他锁，因此�
 | 成功 GET `/dns/log` | 仅 DNS 日志 |
 | 无过滤/非 flow `/events`、普通 API、validation、失败 GET 或 HEAD | 无 |
 
-Flow 事件需求指显式 `kinds` 包含 `flow.updated` 或 `flow.gap`，或非空白 `flow_id` 的有效 kinds 包含 flow 事件。没有该过滤器且省略 `kinds` 不请求 flows。每条获准的流独立持有恰好对应本次需求的租约；准入失败不取得租约，关闭/Drop 即释放，即使从未 poll。Flows、日志、DNS 日志各自在最后一条对应流关闭后，或对应 GET 成功后，保持独立的 60 秒需求宽限期；通用活动和其他需求种类不能续期它。不新增 DNS-log SSE kind。记录从需求建立时开始，首次历史为空是正常情况。
+Flow 事件需求指显式 `kinds` 包含 `flow.updated` 或 `flow.gap`，或非空白 `flow_id` 的有效 kinds 包含 flow 事件。没有该过滤器且省略 `kinds` 时，不请求 flow 记录。每条获准的流独立持有本次请求所需的租约；准入失败不取得租约，关闭/Drop 即释放，即使从未 poll。Flows、日志、DNS 日志各自在最后一条对应流关闭后，或对应 GET 成功后，保留独立的 60 秒需求宽限期。通用活动和其他需求不能延长该期限。没有 DNS-log SSE kind。记录从需求建立时开始，因此首次历史为空。
 
-`record_flows` 默认为 true，允许在 flow 诊断需求有效时记录。显式运行时设置 `record_flows: "on"` 可在无客户端时持续记录；运行时 `"off"` 强制关闭，配置中的 `record_flows: false` 禁止记录，修改后需重启。实际记录停止时释放 flow 记录和快照。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
+`record_flows` 默认为 true，允许在 flow 诊断需求有效时记录。显式运行时设置 `record_flows: "on"` 可在无客户端时持续记录；运行时 `"off"` 强制关闭，配置中的 `record_flows: false` 禁止记录，修改后需重启。实际记录停止时释放 flow 记录和快照。进程内最多保留 1024 条 flow、每条 64 个步骤，含快照与内核字典预留的总预算为 8 MiB。终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
 
 内核 witness 生产通过既有组合 datapath flags 跟随实际 flow 记录状态。既有 sampler 在后续 tick 同步变化；调度、telemetry 与发布锁竞争可能延迟收敛，不承诺固定一秒内完成。启用发布前已路由的流量可以明确报告内核证据缺失。关闭需求不丢弃已保留的 witness/字典，不改变路由或 NFQUEUE 权威，也不撤销操作已经取得的捕获资格。未录制的操作跳过 witness 解码。
 
@@ -157,8 +157,8 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无法识别的游标返回 `410 snapshot_expired`，可识别但过滤器或 `limit` 不同的游标返回 `400 invalid_request`。Groups 返回摘要数组；detail 含 `config_revision`，不带 `ETag`；`GET /groups/{groupId}/config` 返回 `{policy, config}`，并以该 revision 作为带引号的 `ETag`。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
-节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，复用源内容/flow 显示的监听凭据遮罩。节点快照在有界序列化前遮罩，续页保留同一份已遮罩字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
-既有遮罩阈值不变：不足八字节的监听凭据值不遮罩，启动时会发出警告。
+节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，采用与源内容/flow 显示相同的监听凭据遮蔽规则。节点快照在有界序列化前遮蔽凭据，续页保留同一份已遮蔽字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
+遮蔽阈值不变：不足八字节的监听凭据值不遮蔽，启动时会发出警告。
 
 健康数据来自 producer 已完成且符合资格要求的测量，不把乐观的 alive 标志、跨 IPv4/IPv6 复制的排名信号、合成失败或从缓存恢复的延迟当作真实测量。原始 TCP、HTTP 响应头、DNS 交换和 QUIC 握手测量保留实际目标地址族与完成时间。节点行另带每个测量维度的两个平均值，仅由成功的原生探测累计，重启后清零：`moving_avg_ms` 是 URLTest 排名使用的减半平均 `(previous + sample) / 2`，`avg10_ms` 是最近十次成功探测的算术平均（预热期不足十次时按已有次数）；测量行不可用时二者为 null，针对特定组的测量中恒为 null。未知的排名和冷热状态保持 null/unknown。针对特定组的测量保留测量时的成员和叶节点，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 返回通过配置校验并应用监听凭据遮罩的 HTTP(S) URL 或 data URI，未配置为 null，不猜测或抓取图标。
 
@@ -170,13 +170,13 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 ### 原生事件
 
-使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。16 个名额已满时新连接返回 `503 temporarily_unavailable` 并带 `Retry-After`。每 15 秒 heartbeat。每个连接都先发送 ready；有效续传的顺序为 ready→replay→live，ready 保留请求 cursor，之后由 replay 推进，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
+使用带 Bearer 与 `Accept: text/event-stream` 的流式 fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 个事件、60 秒，支持 16 个 client，每个 client 的 live 队列最多 64 条。队列满时断开流，不静默 skip 事件。16 个名额已满时，新连接返回 `503 temporarily_unavailable` 并带 `Retry-After`。每 15 秒发送 heartbeat。每个连接都先发送 ready；有效续传的顺序为 ready→replay→live，ready 保留请求游标，之后由 replay 推进，原子挂接不留空窗。过期、未知、旧实例或不同过滤器的游标在 HTTP 200 前返回 `409 event_cursor_expired`。
 
-每条事件/日志记录最多为其首个精确过滤绑定缓存一份完整 frame；其他绑定仍独立签名。既有 2 MiB 留存 ring 预算在发布前预留 payload、一份可能的缓存 frame 及 cache cell，因此接近单条上限的 payload 可能在达到笔数上限前过期。该 ring 预算不是所有排队或 HTTP 持有引用的进程级内存上限。
+每条事件/日志记录最多为其首个精确过滤绑定缓存一份完整 frame；其他绑定仍独立签名。既有 2 MiB 留存 ring 预算在发布前预留 payload、一份可能的缓存 frame 及 cache cell，因此接近单条上限的 payload 可能在达到条数上限前过期。该 ring 预算不是所有排队或 HTTP 持有引用的进程级内存上限。
 
 新连接的 ready 游标是不透明检查点，不是保留的事件记录。旧历史已经过期时，新签发的检查点仍可立即续传；它不会恢复已淘汰的记录游标，也不能跨过更新事件的丢失。时间、过滤器、instance 与记录重置检查保持有效。顺序指投递/重放位置，不是游标字节的排序。
 
-实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed` 及真实 operation 状态转换的 `operation.updated`；operation store 不依赖是否具有可写 `.dae` 来源。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
+发布的事件包括 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed`，以及反映实际 operation 状态转换的 `operation.updated`。operation store 不依赖是否具有可写 `.dae` 来源。generation 事件只来自已接受的发布，不来自 reload 请求接收。事件仅含有界的安全 ID/状态，不含报文正文或原始配置。Flow/event 记录只保存在内存中，不是持久化日志。
 
 `flow.updated` 是失效通知：通过其 `href` 读取最新保留 revision。每个客户端的 live 队列只保留同一 flow 尚未发送的最新通知，并按新事件序号追加到队尾；revision 可以跳跃，但发送游标保持有序。发布仍是即时的，包括终态更新，不增加批量定时器。事件捕获开启时，重放环记录每次发布，replay 不做合并。其他事件类型和日志不合并；不同 flow 或其他不可替换事件仍会在 live 队列满时断流。Flow 数据、revision 与捕获的 trace steps 不变。
 
@@ -196,7 +196,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，源 `path` 与规则 `file` 保留规范化的入口目录相对名称（例如 `config.d/routing.dae`），源 `absolute_path` 另行提供规范化绝对路径；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。因此 capabilities 中 `config.max_bytes` 为 61440，即 65536 字节正文上限扣除 4096 字节创建信封后单次请求能携带的最大替换或新建内容；`config_validate.max_bytes` 为 8 MiB 预算，因为完整校验还计入从磁盘读取的依赖。`resources.config` 不含 `content` 字段；替换或新建正文超过 `config.max_bytes` 时返回 `413 request_too_large`。
 
-获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的配置数据。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。写入内容含有被遮蔽的值（原文或 JSON 转义写法）时返回 `403 permission_denied`。不足八字节的值既不遮蔽也不拒绝写入，可以写进普通源，读取时原样返回。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能作为可编辑的往返载荷。
+获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的配置数据。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。写入内容含有被遮蔽的值（原文或 JSON 转义写法）时返回 `403 permission_denied`。不足八字节的值既不遮蔽也不拒绝写入，可以写进普通源，读取时原样返回。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能用于编辑后回写。
 
 启用 `config_write` 且配置非空 secret 或 `password_auth` 时，已接受的非凭据主文件与所有非凭据 include 均可写。只有已接受的源 ID 授权替换，新建只接受由 include 模式加载的新 `.dae` 路径，调用方提供的路径不能授权任意文件写入；generated/subscription 来源不可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
 
@@ -309,9 +309,9 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 `resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted 主文件可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。`resources.providers.create_options` 列出可选 provider 字段省略时的生效值：`update_interval`（秒，最多一年，`0` 表示只在请求时刷新，内置默认 `86400`）、`user_agent`（1 至 256 个可打印 ASCII 字符，内置默认 `honk/<version>`），以及仅在 `global.store_subscribe` 打开订阅存储时列出的 `cache`（内置默认 `true`）。内置默认值只是回退值；`assets.subscription` 设置了对应默认值时，`create_options` 返回该设置值。`resources.providers` 还会声明 `create_unfetched: true`，表示支持这种未拉取即创建的方式。显式提供选项的 provider 写作 `tag: 'url' { ... }`，`ua`、`interval` 和 `cache` 各占一行；schema 长度、pattern、kind、interval 或 user-agent 边界违规返回 `400 invalid_request`；未声明的选项（如没有 store 时的 `cache`）返回 `422 unsupported_value`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
 
-节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。schema 长度/pattern/enum/边界违规返回 `400 invalid_request`；重名返回 409；结构合法但不支持的链接、身份、provider URL scheme 或选项返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始；相同 source specification 的延迟拉取状态在无关编辑和 reload 中保留，直到显式 refresh。修改该 specification 或重启恢复普通订阅启动行为。API 不创建 same-fetch 别名，歧义删除直接拒绝，不让 ID/节点悄悄转移。
+节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。schema 长度、pattern、enum 或边界违规返回 `400 invalid_request`；重名返回 409；结构合法但不支持的链接、身份、provider URL scheme 或选项返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始。同一 source specification 的延迟拉取状态在无关编辑和 reload 中保留，直到显式 refresh。修改该 specification 或重启后，恢复普通订阅启动行为。API 不创建 same-fetch 别名；删除归属有歧义时直接拒绝，不转移 ID 或节点。
 
-DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`，body 超限时返回 `413 request_too_large`，二者均不带 `Retry-After`。未知 ID 无写入地返回 `{"deleted":0}`，成功删除在激活后返回 `{"deleted":1}`；builtin、订阅派生节点、非主文件条目及不支持/歧义归属返回 `404 capability_not_supported`。静态 include 仍在 inline 下可见；固定客户端没有逐节点 writable 字段，因此显示的删除按钮仍可能被拒绝。删除被某个 group 用作 `final` 的节点返回 `409 state_conflict`，`details.groups` 列出这些 group 的 ID；其他仍被引用的条目须先修正引用，否则写前校验失败。主文件读取后在磁盘上被修改时返回 `409 state_conflict`。编辑已有条目继续使用源 PUT，不新增 node/provider PATCH。
+DELETE 不接受 body/query：带有任一项时返回 `400 invalid_request`，body 超限时返回 `413 request_too_large`，二者均不带 `Retry-After`。未知 ID 返回 `{"deleted":0}`，不写入；成功删除在激活后返回 `{"deleted":1}`。builtin 节点、订阅派生节点、非主文件条目及不支持或有歧义的归属返回 `404 capability_not_supported`。静态 include 仍在 inline 下可见；固定客户端没有逐节点 writable 字段，因此显示的删除按钮仍可能被拒绝。删除被某个组用作 `final` 的节点返回 `409 state_conflict`，`details.groups` 列出这些组的 ID；其他仍被引用的条目须先修正引用，否则写前校验失败。主文件读取后在磁盘上被修改时返回 `409 state_conflict`。编辑已有条目继续使用源 PUT，没有 node/provider PATCH 接口。
 
 这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`（这类同步写入始终带此字段）、`written`、`durability_confirmed`（只在 `written` 为 true 时出现）与 `committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409，写入期间磁盘上的源被修改时返回 `409 state_conflict`（请求不带前置条件）；DELETE 的其他校验失败仍映射为 503。已耐久写入但激活被拒绝报告 written true/committed false；`--store db` 在激活前不写入，被拒绝时报告 written false；提交后降级报告 committed true 并带上 `active_generation_id`，无法确认时为 null，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
 
@@ -346,7 +346,7 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 默认关闭的 `native-ui` 隐含 `native-api`，编译时从 `HONK_DOONA_DIR` 指定的绝对路径目录读取 doona 构建产物并内嵌；未设置该变量时构建失败。`ci/fetch-doona.sh` 下载 `.github/ci/pins.env` 固定的发布包（当前为 doona `0.1.0-beta.12`、提交 `37fb8e64ee7a6d4bb6066b033592916a5b08e760`），校验 SHA-256，确认包内含 `THIRD-PARTY-NOTICES.txt` 及 `NOTICE` 引用的全部 `LICENSES/` 文件，删除字体并输出目录：`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。未设置该变量时，`just lint` 与 `just test-ci` 自动执行该脚本。发布产物包含内嵌 UI；二进制内嵌 doona 程序包自带的 notices，每个发布 tarball 也在 `doona/` 目录附带这些文件。内嵌产物不含 Noto Sans TC 与 SC 字体。doona 的 CSS 以 `font-display: optional` 声明这些字体，因此字体请求返回 404 时浏览器使用系统字体。需要 Noto Sans 时，将 [doona 发布页](https://github.com/Zakkaus/doona/releases)的 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz` 解压到同一目录并让 `ui` 指向该目录，或安装 `doona` 与 `doona-fonts` 软件包并设置 `ui: /usr/share/doona`。对应的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-beta.12`](https://github.com/Zakkaus/doona/tree/v0.1.0-beta.12)。发布流程将 `doona-source-0.1.0-beta.12.tar.gz` 附加到正式标签发布与滚动 Debug 发布；该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-beta.12 | gzip -n`（GNU gzip）。再分发 `native-ui` 二进制时，须按 GPL-3.0 第 6 条一并提供该源码包与 notices。
 
-复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 运行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1790716798 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。Cargo 构建只内嵌 `HONK_DOONA_DIR` 中的文件，不构建也不下载前端。真实 checker 在该源码的 `tools/conformance.mjs`；live walk 只读，主动跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器动作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
+复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 执行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1790716798 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。Cargo 构建只内嵌 `HONK_DOONA_DIR` 中的文件，不构建也不下载前端。该源码的 checker 为 `tools/conformance.mjs`；live walk 只读，跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器操作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
 
 ### 连接关闭、模式与数据面生命周期
 
@@ -356,7 +356,7 @@ DELETE 不接受 body/query：含 body 或 query 时返回 `400 invalid_request`
 
 显式激活的提交与模式 reset 是不同结果：若 routing/config 已提交但 backend mode 写入失败，settings 已恢复配置值，而 mode/source 保留先前值，控制面关闭准入并返回 committed-degraded，operation 失败。此时既不能声称 Rule 已生效，也不能声称配置回滚；通过 Clash `/configs`（启用时）与 operation 结果检查实际状态。正常 no-op 接受也触发 reset，provider/network 更新不触发。
 
-终止关闭不是硬时间上限承诺：abort async 外层不会取消已开始的 blocking 工作：StateTick 维护 owner 超过名义停止期限后告警，继续等待真实 SQLite 工作；凭据 KDF/数据库工作及已开始的系统解析/NSS 同样保留真实 join。清理阶段超期不能丢弃 owner。关闭准入并停止 watcher、detach hooks 后，健康运行中的连接有默认 5 秒 drain grace，随后强制取消并 join；故障退出不承诺该 grace。原生 HTTP 自身另有 5 秒 graceful drain，上述阻塞 join 仍可能延长总退出时间。
+关闭时间没有硬上限。abort async 外层不会取消已开始的 blocking 工作。StateTick 维护 owner 超过名义停止期限后告警，继续等待实际 SQLite 工作；凭据 KDF/数据库工作及已开始的系统解析/NSS 同样保留真实 join。清理阶段超期不能丢弃 owner。关闭准入、停止 watcher 并 detach hook 后，健康运行中的连接有默认 5 秒 drain grace，随后强制取消并 join；故障退出不承诺该 grace。原生 HTTP 自身另有 5 秒 graceful drain，上述阻塞 join 仍可能延长总退出时间。
 
 ## 启用与鉴权
 
