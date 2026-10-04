@@ -113,8 +113,6 @@ impl EncryptedStream {
             self.direct_write = true;
         }
         let Some(xor) = self.send_xor.as_mut() else {
-            // Native Direct writes the caller's bytes; no frame buffer remains in use.
-            self.write_wire = Vec::new();
             return Pin::new(&mut *self.inner).poll_write(cx, input);
         };
         if input.is_empty() {
