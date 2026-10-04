@@ -682,10 +682,12 @@ impl super::GroupManager {
                 effects,
             )),
             honk_config::group::GroupPolicy::LoadBalance => {
-                Some(self.pick_load_balance(&candidates, group, context.network, effects))
+                let index = self.pick_load_balance(&candidates, group, context.network, effects);
+                Some(candidates.swap_remove(index))
             }
             honk_config::group::GroupPolicy::Fallback => {
-                Some(self.pick_fallback(&candidates, group, context.network, effects))
+                let index = self.pick_fallback(&candidates, group, context.network, effects);
+                Some(candidates.swap_remove(index))
             }
             honk_config::group::GroupPolicy::Score => self.pick_score(
                 ScoreView {
