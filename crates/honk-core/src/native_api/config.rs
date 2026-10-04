@@ -60,8 +60,8 @@ pub(crate) type LocatedRule = (
 #[derive(Clone)]
 pub(crate) struct ListenerSecrets {
     values: Vec<String>,
-    /// Each value and, when it differs, its JSON-escaped form; built once rather than per check.
-    spellings: Vec<String>,
+    /// Raw spellings borrow values; only distinct JSON escapes need another allocation.
+    escaped: Vec<String>,
 }
 
 impl ListenerSecrets {
@@ -124,7 +124,7 @@ impl ListenerSecrets {
     pub(crate) fn empty() -> Self {
         Self {
             values: Vec::new(),
-            spellings: Vec::new(),
+            escaped: Vec::new(),
         }
     }
 
@@ -155,17 +155,21 @@ impl ListenerSecrets {
         let quoted = serde_json::to_string(&value).expect("listener secret is a string");
         let escaped = &quoted[1..quoted.len() - 1];
         if escaped != value {
-            self.spellings.push(escaped.to_owned());
+            self.escaped.push(escaped.to_owned());
         }
-        self.spellings.push(value.clone());
         self.values.push(value);
         self
     }
 
-    pub(crate) fn contains(&self, text: &str) -> bool {
-        self.spellings
+    fn spellings(&self) -> impl Iterator<Item = &str> {
+        self.values
             .iter()
-            .any(|secret| text.contains(secret.as_str()))
+            .chain(self.escaped.iter())
+            .map(String::as_str)
+    }
+
+    pub(crate) fn contains(&self, text: &str) -> bool {
+        self.spellings().any(|secret| text.contains(secret))
     }
 
     pub(crate) fn mask_borrowed<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
@@ -181,9 +185,9 @@ impl ListenerSecrets {
             return (text.to_owned(), false);
         }
         let mut hidden = vec![false; text.len()];
-        for secret in &self.spellings {
+        for secret in self.spellings() {
             let mut offset = 0;
-            while let Some(relative) = text[offset..].find(secret.as_str()) {
+            while let Some(relative) = text[offset..].find(secret) {
                 let start = offset + relative;
                 hidden[start..start + secret.len()].fill(true);
                 offset = start + text[start..].chars().next().unwrap().len_utf8();
