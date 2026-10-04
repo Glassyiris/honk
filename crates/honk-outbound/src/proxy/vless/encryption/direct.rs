@@ -79,6 +79,8 @@ impl EncryptedStream {
                 )));
             }
             self.direct_read = true;
+            // Drained above; reads no longer pass through the plaintext buffer.
+            self.read_plaintext = Vec::new();
         }
 
         let start = output.filled().len();
@@ -119,8 +121,9 @@ impl EncryptedStream {
         let input = &input[..input.len().min(super::MAX_FRAME_PLAINTEXT)];
         // Header XOR advances the keystream, so retries must resend these
         // exact bytes instead of re-encoding the caller's buffer.
-        let mut wire = std::mem::take(&mut self.direct_wire);
+        let mut wire = std::mem::take(&mut self.write_wire);
         wire.clear();
+        wire.reserve_exact(input.len());
         wire.extend_from_slice(input);
         self.send_header_xor.apply(xor, &mut wire, true);
         self.pending_write = Some(PendingWrite {
