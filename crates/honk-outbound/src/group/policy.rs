@@ -297,13 +297,13 @@ impl GroupManager {
     /// tracked connection of the group (that would defeat load balancing).
     /// Connections to a node that actually dies are reaped by the alive
     /// set's traffic-failure reporting instead.
-    pub(super) fn pick_load_balance<'a>(
+    pub(super) fn pick_load_balance(
         &self,
-        candidates: &[Candidate<'a>],
+        candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> Candidate<'a> {
+    ) -> usize {
         observation::reason("round_robin");
         let Some(counter) = self
             .lb_counters
@@ -311,14 +311,14 @@ impl GroupManager {
             .map(|counters| &counters[network.slot()])
         else {
             observation::reason("first_member");
-            return candidates[0].clone();
+            return 0;
         };
         let cursor = if effects.applies() {
             counter.fetch_add(1, Ordering::Relaxed)
         } else {
             counter.load(Ordering::Relaxed)
         };
-        candidates[cursor % candidates.len()].clone()
+        cursor % candidates.len()
     }
 
     /// Fallback policy: first alive candidate in member order, pinned.
@@ -330,13 +330,13 @@ impl GroupManager {
     /// flapping (a marginally-preferred member oscillating alive/dead
     /// would yank every connection twice) costs more than staying on a
     /// working lower-preference member until it actually fails.
-    pub(super) fn pick_fallback<'a>(
+    pub(super) fn pick_fallback(
         &self,
-        candidates: &[Candidate<'a>],
+        candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> Candidate<'a> {
+    ) -> usize {
         observation::reason("first_alive");
         {
             let cache = self.fallback_cache.read();
@@ -344,17 +344,16 @@ impl GroupManager {
                 .get(&group.name)
                 .and_then(|pins| pins[network.slot()].as_deref())
                 .inspect(|pinned| observation::previous_tag(self, group, pinned))
-                && let Some(c) = candidates.iter().find(|c| c.tag() == pinned)
+                && let Some(index) = candidates.iter().position(|c| c.tag() == pinned)
             {
                 observation::reason("pinned_alive");
-                return c.clone();
+                return index;
             }
         }
-        let first = candidates[0].clone();
-        if effects.applies() && self.cache_fallback_selection(group, network, &first) {
+        if effects.applies() && self.cache_fallback_selection(group, network, &candidates[0]) {
             self.maybe_interrupt(&group.name, network);
         }
-        first
+        0
     }
 
     /// Pick the candidate with the lowest probe latency from alive_set.
