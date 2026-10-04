@@ -9,8 +9,8 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, TRANSFER
 use reqwest::{Client, IntoUrl, Method, RequestBuilder, Response, Url};
 use serde_json::Value;
 
-// daeuniverse/api-standardize 1fb08ad (sha256 104e871b...), the bundle doona
-// 0.1.0-beta.10 was generated from; refresh it with the doona release honk ships.
+// The contract doona 0.1.0-beta.14 pins in contract/api-standardize/SOURCE.md
+// (sha256 9f1c20e2...); refresh it with the doona release honk ships.
 const CONTRACT: &str = include_str!("../fixtures/native_api_openapi.yaml");
 const CONTRACT_URL: &str = "https://contract.honk.invalid/openapi.json";
 
