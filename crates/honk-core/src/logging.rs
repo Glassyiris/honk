@@ -26,6 +26,11 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
 /// otherwise.
 pub(crate) const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off";
 
+/// The target [`QUIET_LOG_TARGETS`] silences; Clash and native log capture
+/// always exclude it.
+#[cfg(any(feature = "clash-api", feature = "native-api"))]
+pub(crate) const QUIET_TARGET: &str = "quinn::endpoint";
+
 /// Colour belongs on a terminal only: a service manager (procd, syslog) stores
 /// the escape codes verbatim. A non-empty `NO_COLOR` turns it off everywhere.
 pub(crate) fn console_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
