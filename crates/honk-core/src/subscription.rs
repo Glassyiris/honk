@@ -854,7 +854,7 @@ fn decode_base64_flexible(input: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn yaml_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
-    mapping.get(serde_yaml::Value::String(key.to_string()))
+    mapping.get(key)
 }
 
 #[cfg(test)]
