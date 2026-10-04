@@ -205,6 +205,7 @@ async fn direct_drains_authenticated_plaintext_and_keeps_encrypted_writes() {
         .await
         .unwrap();
     assert_eq!(plaintext, b"authenticated-outer");
+    assert_eq!(stream.read_plaintext.capacity(), 0);
 
     stream.write_all(b"uplink").await.unwrap();
     let mut header = [0_u8; FRAME_HEADER_LEN];
