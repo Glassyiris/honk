@@ -1435,8 +1435,12 @@ async fn test_group_delay_omits_failed_members() {
 async fn delay_owner_errors_distinguish_saturation_stop_and_failure() {
     use honk_outbound::alive::HealthCheckError;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let app = spawn_app("", "").await;
+    // State-db setup fsyncs; under disk pressure it alone can exceed the owner deadline.
+    let app = spawn_app("", "").await;
+    let failed = spawn_app("", "").await;
+    // Longer than shutdown_health_checks' own 5s drain deadline, so a stalled drain
+    // reports its typed error instead of racing this one.
+    tokio::time::timeout(Duration::from_secs(10), async {
         let owner = &app.state.alive_set;
         let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
         let mut jobs = Vec::new();
@@ -1470,8 +1474,6 @@ async fn delay_owner_errors_distinguish_saturation_stop_and_failure() {
             let body: serde_json::Value = response.json().await.unwrap();
             assert_eq!(body["message"], HealthCheckError::Stopped.to_string());
         }
-
-        let failed = spawn_app("", "").await;
         let permit = failed.state.alive_set.acquire_health_probe().unwrap();
         permit.cancellation().report_cleanup_failure();
         drop(permit);
@@ -1483,7 +1485,7 @@ async fn delay_owner_errors_distinguish_saturation_stop_and_failure() {
         }
     })
     .await
-    .unwrap();
+    .expect("delay owner section exceeded its deadline");
 }
 
 #[tokio::test]
