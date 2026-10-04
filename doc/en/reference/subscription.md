@@ -19,9 +19,9 @@ subscription {
 }
 ```
 
-The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` says how the fetch leaves (see below). A missing option takes the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
+The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` selects the fetch route (see below). A missing option uses the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
 
-Two earlier forms still read, without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block holding the URL (`detailed: { url: '…' ua: '…' }`), which also accepts `download_detour` as another name for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
+Two earlier forms still parse without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block containing the URL (`detailed: { url: '…' ua: '…' }`). The block also accepts `download_detour` as an alias for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
 
 Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
@@ -51,7 +51,7 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
 | `user_agent` | string or null | `honk/<version>` | Yes, as `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
-| `download_detour` | string | `""` | Yes, as `route` | How the fetch leaves: empty or `routing` follows the routing rules, `direct` connects straight to the host, and a group name always goes through that group. An unknown group is refused at validation. |
+| `download_detour` | string | `""` | Yes, as `route` | Fetch route: empty or `routing` follows the routing rules, `direct` connects directly to the host, and a group name forces that group. An unknown group is rejected during validation. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
 | `cache` | bool | `true` | Yes, as `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
