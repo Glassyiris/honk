@@ -74,8 +74,8 @@ where
         // completed attempt opened a slot after a deadline, this starts the
         // delayed candidate immediately instead of drifting the schedule.
         while next < candidates.len() && tasks.len() < 3 {
-            let node = candidates[next].clone();
-            if !(callbacks.is_eligible)(&node) {
+            let node = &candidates[next];
+            if !(callbacks.is_eligible)(node) {
                 next += 1;
                 continue;
             }
@@ -87,10 +87,11 @@ where
             if now < due {
                 break;
             }
-            if !(callbacks.allows_target)(&node) {
+            if !(callbacks.allows_target)(node) {
                 rejection = Some(honk_outbound::proxy::PacketRejection::Policy.into());
                 break 'schedule None;
             }
+            let node = node.clone();
             next += 1;
             if records_stagger_metrics {
                 (callbacks.on_attempt)();
