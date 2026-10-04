@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::ReadBuf;
 
-use super::{AesCtr, EncryptedStream, FRAME_HEADER_LEN, PendingWrite, ReadPhase};
+use super::{AesCtr, EncryptedStream, FRAME_HEADER_LEN, PendingWrite};
 
 /// One direction of Xray `XorConn`: XOR each TLS-shaped header and skip its
 /// body by the plaintext header's length.
@@ -72,7 +72,7 @@ impl EncryptedStream {
             return Poll::Ready(Ok(()));
         }
         if !self.direct_read {
-            if !matches!(self.read_phase, ReadPhase::Header) || self.read_offset != 0 {
+            if !self.at_frame_boundary() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "VLESS Encryption Direct switch outside a frame boundary",
