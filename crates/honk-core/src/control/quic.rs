@@ -88,36 +88,27 @@ impl InitialKeys {
         };
         let extract = Hkdf::<Sha256>::new(Some(salt), dcid);
         let mut secret = [0u8; 32];
-        extract
-            .expand(&hkdf_label(secret_label, 32), &mut secret)
-            .ok()?;
+        expand_label(&extract, secret_label, &mut secret)?;
         let mut keys = Self {
             key: [0; 16],
             iv: [0; 12],
             hp: [0; 16],
         };
-        hkdf_expand_label(&secret, key_label, &mut keys.key)?;
-        hkdf_expand_label(&secret, iv_label, &mut keys.iv)?;
-        hkdf_expand_label(&secret, hp_label, &mut keys.hp)?;
+        let expand = Hkdf::<Sha256>::from_prk(&secret).ok()?;
+        expand_label(&expand, key_label, &mut keys.key)?;
+        expand_label(&expand, iv_label, &mut keys.iv)?;
+        expand_label(&expand, hp_label, &mut keys.hp)?;
         Some(keys)
     }
 }
 
-/// Build the RFC 8446 §7.1 HkdfLabel info: `"tls13 " + label`, empty context.
-fn hkdf_label(label: &[u8], out_len: usize) -> Vec<u8> {
-    let mut info = Vec::with_capacity(4 + 6 + label.len());
-    info.extend_from_slice(&(out_len as u16).to_be_bytes());
-    info.push((6 + label.len()) as u8);
-    info.extend_from_slice(b"tls13 ");
-    info.extend_from_slice(label);
-    info.push(0); // zero-length context
-    info
-}
-
-/// HKDF-Expand-Label (RFC 9001 §5.1) from a 32-byte pseudorandom key.
-fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], out: &mut [u8]) -> Option<()> {
-    let hkdf = Hkdf::<Sha256>::from_prk(secret).ok()?;
-    hkdf.expand(&hkdf_label(label, out.len()), out).ok()
+/// HKDF-Expand-Label (RFC 8446 §7.1, RFC 9001 §5.1): the info is
+/// `length || len("tls13 " + label) || "tls13 " + label || empty context`.
+fn expand_label(hkdf: &Hkdf<Sha256>, label: &[u8], out: &mut [u8]) -> Option<()> {
+    let length = (out.len() as u16).to_be_bytes();
+    let label_len = [(6 + label.len()) as u8];
+    hkdf.expand_multi_info(&[&length, &label_len, b"tls13 ", label, &[0]], out)
+        .ok()
 }
 
 /// Read a QUIC variable-length integer (RFC 9000 §16).
