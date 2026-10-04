@@ -137,18 +137,17 @@ impl HandoffResult {
         let _ = (backend, key, atomic);
         handoff
     }
-    /// Convert the eBPF process name byte array to an optional string.
-    /// Treats the array as NUL-terminated or fixed-length, trimming trailing
-    /// NULs and whitespace.
+    /// Convert the eBPF process name byte array to an optional string: bytes
+    /// up to the first NUL (or the whole array), lossily decoded and trimmed.
     pub(super) fn process_name(&self) -> Option<String> {
-        let bytes: Vec<u8> = self.pname.iter().copied().take_while(|&b| b != 0).collect();
-        let s = String::from_utf8_lossy(&bytes);
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        let end = self
+            .pname
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.pname.len());
+        let name = String::from_utf8_lossy(&self.pname[..end]);
+        let trimmed = name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
     /// Resolve the process executable path from /proc. The process may have
