@@ -335,6 +335,7 @@ To reproduce the assets, extract the source archive into its own directory, use 
 ### Native logs and runtime settings
 
 `GET /logs` serves SSE to authenticated callers and admitted anonymous loopback callers, with optional minimum `level` and `target` prefix filter. Capture is a separate structured tracing layer, not formatted console/Clash text. Records contain actual `ts`, `level` and `target`; only audited static messages and bounded typed fields are disclosed. Unaudited messages are explicitly withheld and arbitrary Debug/error/config fields are not formatted into the native buffer. `record_logs` defaults true and permits capture while its independent `/logs` SSE demand is active, retaining up to 512 records for 60 seconds; the logs capability advertises these limits as `max_buffered_records` and `retention_seconds`, and lists `filters: [level, target]`. An explicit runtime `record_logs: "on"` keeps capture enabled without clients; configuration false prohibits it until changed and restarted. When effective recording stops, retained logs are released and resume cursors expire.
+Like Clash `/logs`, capture always omits the `quinn::endpoint` target: its endpoint-driver ERROR duplicates carrier failures that honk reports with their own context.
 
 Use `Last-Event-ID` for resume. Logs have independent stream/filter-bound cursors and, like `/events`, send ready → replay → live, retaining the supplied cursor on ready until replay advances it. Both reject expired/foreign/filter-changed cursors with `409 event_cursor_expired` before 200, allow 16 clients with 64 queued events each, disconnect full queues and send 15-second heartbeat comments. A new stream while all 16 slots are taken returns `503 temporarily_unavailable` with `Retry-After`. Retention shrink invalidates evicted cursors.
 
@@ -474,7 +475,7 @@ Successful measurements update the node latency history. Failures return `503` f
 
 On-demand delay exchanges retain Alive/API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server/session preparation may report aggregate warm-up setup only; it does not fabricate the caller's URL as its own target or provide promotion proof.
 
-Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner: after the bounded peer-notification grace, packet-adapter workers and Quinn drivers are stopped and joined. Actual owned-worker failure still closes health admission.
+Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner: after the bounded peer-notification grace, Quinn drivers and then packet-adapter workers are stopped and joined. Actual owned-worker failure still closes health admission.
 
 ### Score group representation
 

@@ -582,7 +582,7 @@ impl PacketTransportEndpoint {
     }
 
     /// Request closure, allow `timeout` for peer notification, then stop and join
-    /// adapter workers and Quinn drivers. Returns false only for a worker panic.
+    /// Quinn drivers and adapter workers. Returns false only for a worker panic.
     /// Zero only requests closure; retained owners still own all jobs.
     pub async fn close(&self, timeout: Duration) -> bool {
         self.endpoint.close(VarInt::from_u32(0), b"shutdown");
@@ -592,8 +592,10 @@ impl PacketTransportEndpoint {
         // Quinn's normal close linger is three PTOs and may exceed the grace.
         // Expiry ends peer notification, not successful owned teardown.
         let _ = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
-        let joined = self.socket.close_tasks().await;
+        // Drivers first: a live endpoint driver reads stopped adapters as a
+        // broken socket and quinn logs that intentional close as an ERROR.
         self.drivers.close().await;
+        let joined = self.socket.close_tasks().await;
         joined && !self.drivers.has_failed()
     }
 }
