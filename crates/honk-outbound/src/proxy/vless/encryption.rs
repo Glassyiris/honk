@@ -742,26 +742,23 @@ impl EncryptedStream {
         let mut header = [23, 3, 3, 0, 0];
         header[3..].copy_from_slice(&encode_length(plaintext_len + TAG_LEN));
         let rekey = self.send.nonce == MAX_NONCE;
-        let mut body = Vec::with_capacity(plaintext_len + TAG_LEN);
+        let prewrite = self.prewrite.as_deref().unwrap_or_default();
+        let header_start = prewrite.len();
+        let mut wire =
+            Vec::with_capacity(header_start + FRAME_HEADER_LEN + plaintext_len + TAG_LEN);
+        wire.extend_from_slice(prewrite);
+        wire.extend_from_slice(&header);
+        // The AEAD appends, so the ciphertext lands after the unmasked header.
         self.send
-            .seal(&plaintext[..plaintext_len], &header, &mut body)?;
+            .seal(&plaintext[..plaintext_len], &header, &mut wire)?;
         if rekey {
-            let mut context = Vec::with_capacity(header.len() + body.len());
-            context.extend_from_slice(&header);
-            context.extend_from_slice(&body);
-            self.send = StreamAead::new(&context, &self.united_key, self.use_aes)
+            self.send = StreamAead::new(&wire[header_start..], &self.united_key, self.use_aes)
                 .map_err(io::Error::other)?;
         }
         if let Some(xor) = self.send_xor.as_mut() {
-            xor.apply(&mut header);
+            xor.apply(&mut wire[header_start..header_start + FRAME_HEADER_LEN]);
         }
-        let prewrite_len = self.prewrite.as_ref().map_or(0, Vec::len);
-        let mut wire = Vec::with_capacity(prewrite_len + header.len() + body.len());
-        if let Some(prewrite) = self.prewrite.take() {
-            wire.extend_from_slice(&prewrite);
-        }
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(&body);
+        self.prewrite = None;
         Ok((wire, plaintext_len))
     }
 
