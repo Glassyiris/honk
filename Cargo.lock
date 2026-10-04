@@ -1709,6 +1709,7 @@ dependencies = [
  "sha3",
  "shake",
  "socket2",
+ "stats_alloc",
  "thiserror",
  "tokio",
  "tokio-boring",
