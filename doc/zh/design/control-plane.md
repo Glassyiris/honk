@@ -47,7 +47,7 @@
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
-UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。`cleanup()` 先卸载 ingress hook、join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活也会释放，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
+UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`。即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
 
 ## 透明代理入口
 
@@ -304,21 +304,21 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api)。
 
-出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
+出站读取保留共用计数的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一的一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存历史。关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
 
 `configuration/accepted.rs` 持有启动捕获的 `.dae` accepted 源及发布栅栏，`native_api/config.rs` 只投影权限与 HTTP。原生协调器在读盘前串行化 API 写入和 SIGHUP 加载，`configuration::Activation` 为 native 与 nonnative 调用方共用 reload、reply、订阅 reconciliation 链。HTTP 断开不取消 daemon-owned 任务，同 scope/key/body 重放共用结果；PUT 的 202 仅代表耐久写入且真实 reload 已排队。外部编辑器仍可能在最后检查与 rename 间竞争，rename 后目录 fsync 失败必须报告已写但耐久性未确认，不能称为回滚。
 
-`native_api/config/http.rs` 持有源 HTTP adapter。数据库记录通过 awaited blocking promotion 由协调器持续持有，包括 HTTP 取消与关闭；待记录的新 accepted 源不会被错误标成旧的耐久 revision。
+`native_api/config/http.rs` 持有源 HTTP adapter。协调器持续负责数据库记录，直到 awaited blocking promotion 结束；HTTP 取消与关闭不改变该所有权。待记录的新 accepted 源不会被错误标成旧的持久化 revision。
 
 Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，遵循上述包含 datapath flags publication 的锁序及订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。
 
-Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，不用 tracker 删除充数；同一 owner 的重复 close 共用完成结果与失败，不存在或 replacement 才是 Gone。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span、原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash/依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分；自动策略的分网络 pin/clear 已开放，pin 只属于当前 GroupManager。
+Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，而非只删除 tracker 记录。同一 owner 的重复关闭共用完成结果与失败，不存在或已被替换的 owner 才是 Gone。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span 和原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash 与依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分。自动策略的分网络 pin/clear 已开放，pin 成员只属于当前 GroupManager。
 
 主文件创建/删除复用相同协调器、parser span、revision fence 与 reload reply，但等真实激活后才返回 201/200。订阅 supervisor 持有绑定身份的初次拉取延迟，所有离线准入都携带这些排除项和有效运行时数据目录。Geodata 先暂存并验证所有资产，再经 FD 相对替换；临时不可变 `SourceUpdate.geo_sources` 同时进入 reload 的两条路径，发布后不再由 accepted 源元数据保留。Router/DnsRouter 保留实际加载字节的元数据，观测按 router-before-config 锁序且不重读磁盘；部分文件替换与提交后降级如实报告，不承诺回滚。
 
-暂存 writer 返回保留的 installed-file FD 及耐久结果；geodata 从待替换文件推进到 installed guards，不再重新打开文件重建所有权。路径、inode 与字节复查仍拒绝外部编辑；可见但未确认耐久的替换仍明确报告。
+暂存 writer 返回保留的 installed-file FD 及耐久结果。Geodata 从待替换文件转为 installed guard，不再重新打开文件重建所有权。路径、inode 与字节复查仍拒绝外部编辑；可见但未确认耐久的替换仍明确报告。
 
-激活执行只产生一份类型化完成结果，分别投影到 operation、管理响应和 SIGHUP 日志。创建响应在协调器接受下一项修改前保留已提交的资源表示。源元数据在取得 config 写锁前准备，发布时复核捕获的 revision/generation。Rename 前的依赖复查将逻辑读取方绑定到规范化目标及字节：有序 hosts/ECH 引用、订阅声明位置与 geodata 类型。它重新发现 source/glob 和依赖选择，但不重复编译未变化的已准入候选；交换两个读取方的文件目标仍会冲突。
+激活执行只产生一份类型化完成结果，分别投影到 operation、管理响应和 SIGHUP 日志。协调器接受下一项修改前，创建响应保留已提交的资源表示。源元数据在取得 config 写锁前准备，发布时复核捕获的 revision/generation。Rename 前的依赖复查将逻辑读取方绑定到规范化目标及字节：有序 hosts/ECH 引用、订阅声明位置与 geodata 类型。复查重新发现 source/glob 和依赖选择，但不重复编译未变化的已准入候选；交换两个读取方的文件目标仍会冲突。
 
 Probe worker 拥有有界准备/排队/执行/清理，DNS 诊断使用真实 generation 与精确缓存 owner，provider refresh 由 SubscriptionSupervisor 拉取并等待 revision-fenced publication；GET 不伪造这些 producer。Routing trace 只模拟当前 compiled predicate，不 DNS/探测/选组；当前规则字典只在 parser 来源可用时提供脱敏 source location。Runtime settings 由一个 owner 先校验全量 merge 再发布，native+Clash mode 共用 `DatapathFlagsHandle`。Native 启用时模式不恢复/持久化；显式接受配置激活（含 no-op）重置 Rule 与 settings，provider/network refresh 不重置。
 
@@ -328,7 +328,7 @@ Probe 准备阶段将捕获的计划消费为具体地址的可执行尝试或�
 
 Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange；native 保留总 deadline 且不写 Score，传统调用方保留分阶段预算。临时 runtime 的 joined cleanup 返回类型化结果：私有 child panic 令 operation 失败并阻止之后成功确认暂停，但保留已完成的测量证据；主动取消不伪造不健康样本。
 
-显式激活已提交 routing/config 后若 backend mode reset 失败，保留先前 mode/source，但 settings 已恢复配置值；事务报告 committed-degraded 并关闭准入，operation 失败。不把这一结果写成 mode 已重置为 Rule 或旧配置仍 active。
+显式激活已提交 routing/config 后，若 backend mode 重置失败，保留先前 mode/source，但设置已恢复配置值。事务报告 committed-degraded 并关闭准入，operation 失败。这不表示 mode 已重置为 Rule，也不表示旧配置仍 active。
 
 原生 mode 资源因固定 PUT 契约缺少生命周期冲突及 owner/backend 不可用的响应而暂缓；同一 capability 覆盖读写，所以 GET/HEAD/PUT 均返回 `404 capability_not_supported`。内部临时模式、Clash 控制与上述激活 reset 不受影响。
 
@@ -338,7 +338,7 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 
 网络维护任务属于 `RuntimeEpoch`。延迟缓存 writer 属于进程，仅在终止关闭时 join。
 
-已开始的 blocking 工作无法靠取消 async waiter 停止，持有它的 owner 必须等待实际 join。通用 cleanup/join 阶段使用十秒 `STAGE_TIMEOUT`，超时的已 join async task 会被 abort，teardown 报告失败。`control/cache.rs::StateTick` 是例外：十秒后告警并继续 join 真实维护任务及在途 blocking SQLite 写入，不 abort；取消这次等待时 handle 仍留在 owner，可再次等待；owner 被 Drop 时只发出停止信号，外层 task 继续持有 blocking 写入。因此总关闭时间没有严格十秒上限。TCP 连接任务 panic 时记录日志并回收，不停止引擎。正常退出保留既有 accepted-flow 五秒 drain grace，故障退出可跳过；原生 HTTP 另有五秒 graceful drain。
+已开始的阻塞工作无法靠取消 async waiter 停止，持有它的 owner 必须等待实际 join。通用清理/join 阶段使用十秒 `STAGE_TIMEOUT`，超时的 async task 会被 abort，teardown 报告失败。`control/cache.rs::StateTick` 是例外：十秒后告警并继续 join 实际维护任务及在途阻塞 SQLite 写入，不 abort。取消这次等待时，handle 仍留在 owner 中，可再次等待；owner 被 Drop 时只发出停止信号，外层 task 继续持有阻塞写入。因此总关闭时间没有严格十秒上限。TCP 连接任务 panic 时记录日志并回收，不停止引擎。正常退出保留既有的 accepted-flow 五秒 drain grace，故障退出可跳过；原生 HTTP 另有五秒 graceful drain。
 
 健康检查 owner 也会在五秒 drain deadline 后继续等待实际 drain（包括其阻塞解析任务），再返回 deadline 错误。若后续清理发现子任务失败，该失败优先于 deadline 错误。
 

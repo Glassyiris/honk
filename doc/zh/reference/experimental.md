@@ -1,6 +1,6 @@
 # Experimental 配置参考
 
-本文档说明 `experimental { ... }` 下当前支持的嵌套 section。
+`experimental { ... }` 当前支持以下嵌套 section。
 
 ## Section 概览
 
@@ -14,7 +14,7 @@
 
 ## `native_api`
 
-需要显式编译的 Cargo feature `native-api`（以 `--features native-api` 或 `native-ui` 构建；发布产物包含），不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有生效字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
+需要显式编译 Cargo feature `native-api`（以 `--features native-api` 或 `native-ui` 构建；发布产物包含），不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有生效字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -49,11 +49,11 @@ experimental {
 }
 ```
 
-非空原生 secret 必须为不含空白或逗号的可见 ASCII，与 HTTP bearer parser 一致；不支持的字节在共同配置准入处报错，不会启动一个无法认证的 listener。
+非空原生 secret 必须为不含空白或逗号的可见 ASCII，与 HTTP bearer parser 一致。不支持的字节在共用配置准入处报错，不会启动无法认证的 listener。
 
 认证模式变更需要重启。非空 `secret` 选择现有静态 token 模式；空 `secret` 与 `password_auth: true` 选择密码模式；空 `secret`、显式匿名 loopback 及实际 loopback 监听选择现有开发模式。启用 listener 却不满足任一模式时，配置校验失败。密码模式要求 `secret` 为空，且不能与 `allow_anonymous_loopback` 组合；`config_write: true` 同样要求 token 或密码模式。
 
-请替换示例 secret。本地无凭证开发需省略 `secret` 并显式设置 `allow_anonymous_loopback: true`；不能通过反向代理公开该匿名 listener。非 loopback 网络上的明文 HTTP 加 token 不是安全部署，应由可信代理终止 TLS。
+替换示例 secret。本地无凭据开发需省略 `secret` 并显式设置 `allow_anonymous_loopback: true`；不能通过反向代理公开该匿名 listener。非 loopback 网络上的明文 HTTP 加 token 不是安全部署，应由可信代理终止 TLS。
 
 默认 Host 只接受具体监听 authority；loopback 另接受同端口的 `localhost`、`127.0.0.1` 与 `[::1]`。通配监听接受同端口的任意 IP 字面量 Host 与 `localhost`，因为这些就是请求到达的那个监听器本身；DNS 名称仍不授权，因为只有名称能被重绑定。只有真实直连对应的明文 HTTP Origin 自动允许；通配监听时该 Origin 必须与请求自身的 Host 相同，同端口其他地址上的页面需列入 `allow_origins`。TLS 反代若保留 `Host: panel.example`，需配置 `allowed_hosts: 'panel.example'` 与 `allow_origins: 'https://panel.example'`；若保留 `Host: panel.example:443`，则使用 `allowed_hosts: 'panel.example', 'panel.example:443'`。Forwarded headers 不授予权限。
 
@@ -69,13 +69,13 @@ experimental {
 
 ### 共用采样与可选历史
 
-流量与内存 history 共用既有一秒 sampler，错过 tick 使用 Skip；仅存内存，重启清空，不插值、不补零，缺口与 null 原样保留。读取依据实际 RSS/cgroup v2 文件，不把未知值伪装为零，也不宣称内核内存核算。关闭 history 不关闭即时 runtime、出站或内存读取；所有记录开关仍需重启。已启用的日志/DNS 日志/flow 可通过 `/runtime/settings` 临时调整级别或留存上限，但不能动态开启被配置关闭的 recorder。合并全量校验后原子生效；显式配置激活（含 no-op）恢复配置值，provider/network refresh 保留临时值，见 [API 契约](./api.md#原生日志与运行时设置)。
+流量与内存历史共用既有一秒 sampler，错过 tick 时使用 Skip；仅存内存，重启清空，不插值、不补零，缺口与 null 原样保留。读取依据实际 RSS/cgroup v2 文件，未知值不设为零，不声明内核内存核算。关闭历史不关闭即时 runtime、出站或内存读取；所有记录开关仍需重启。已启用的日志/DNS 日志/flow 可通过 `/runtime/settings` 临时调整级别或留存上限，但不能动态开启被配置关闭的 recorder。完整合并结果通过校验后原子生效；显式配置激活（含 no-op）恢复配置值，provider/network refresh 保留临时值，见 [API 契约](./api.md#原生日志与运行时设置)。
 
 ### 配置管理的信任边界
 
 配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。配置读取返回已接受正文，仅遮蔽声明的监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持入口目录相对名称，`absolute_path` 提供规范化绝对路径。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
 
-启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用按磁盘字节 SHA-256 求值的 RFC 9110 If-Match（strong tag、列表/多个 field line 或 `*`；weak tag 永不匹配），组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和主文件创建/删除均复用来源权威；自动策略的固定成员只在运行时生效，不写回来源。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理)。
+启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖的实体化也计入预算；HTTP JSON body 仍最多 64 KiB。源 PUT 使用按磁盘字节 SHA-256 求值的 RFC 9110 If-Match（strong tag、列表/多个 field line 或 `*`；weak tag 永不匹配），组 PATCH 使用 accepted revision 并独立检查源与依赖。正文披露与写入许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和主文件创建/删除均复用来源权威；自动策略的固定成员只在运行时生效，不写回来源。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理)。
 
 
 ## `clash_api`
@@ -116,7 +116,7 @@ Dashboard 下载 URL 与出口见 [`assets.ui`](./assets.md)。
 | `enabled` | 未设置 | 在状态数据库 `<data_dir>/state/honk.db` 中持久化运行时状态。未设置时保存 Selector 选择与延迟样本；`true` 时还保存 Clash 模式与 GLOBAL 选择，并允许 `store_dns`；`false` 时不保存任何状态。 |
 | `store_dns` | `false` | 在 `enabled: true` 时同时持久化并恢复 DNS 缓存应答。 |
 
-两个字段都由启动阶段持有；SIGHUP 提交的候选配置修改其中任一字段时会被拒绝。
+两个字段都在启动时确定；SIGHUP 候选配置修改其中任一字段时会被拒绝。
 
 升级提示：省略 `cache_file.enabled` 现在默认保留 Selector 选择与延迟样本；mode/GLOBAL 须显式设置 `true`，DNS 应答还须单独启用 `store_dns: true`。显式 `false` 禁用这些运行时缓存存储，不关闭独立的配置、凭据或订阅存储。
 
