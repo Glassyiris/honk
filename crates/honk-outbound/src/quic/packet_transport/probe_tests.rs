@@ -437,8 +437,8 @@ async fn packet_transport_socket_accepts_full_cone_reply_metadata() {
     assert_eq!(meta[0].addr, remote);
 }
 
-#[tokio::test]
-async fn handshake_crosses_packet_transport_adapter() {
+/// One successful probe through the adapter against a local QUIC server.
+async fn probe_local_server() {
     let (server, remote) = testutil::server_endpoint(&[b"h3"], true).unwrap();
     let server_task = tokio::spawn(async move {
         server.accept().await.unwrap().await.unwrap();
@@ -467,6 +467,61 @@ async fn handshake_crosses_packet_transport_adapter() {
     .await
     .unwrap();
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn handshake_crosses_packet_transport_adapter() {
+    probe_local_server().await;
+}
+
+const TEARDOWN_LOG_CHILD: &str = "HONK_QUIC_TEARDOWN_LOG_CHILD";
+
+struct EndpointErrors(Arc<AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EndpointErrors {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let metadata = event.metadata();
+        if metadata.target() == "quinn::endpoint" && *metadata.level() == tracing::Level::ERROR {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Closing after a successful probe is intentional; quinn must not see it as
+/// a broken socket, which it logs at ERROR.
+#[tokio::test]
+async fn successful_probe_close_logs_no_endpoint_error() {
+    if std::env::var_os(TEARDOWN_LOG_CHILD).is_some() {
+        use tracing_subscriber::prelude::*;
+        let errors = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(EndpointErrors(Arc::clone(&errors))),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            probe_local_server().await;
+        }
+        assert_eq!(errors.load(Ordering::SeqCst), 0);
+        return;
+    }
+
+    // The child owns the global subscriber, so parallel tests cannot share
+    // its callsite interest.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "quic::packet_transport::probe_tests::successful_probe_close_logs_no_endpoint_error",
+            "--nocapture",
+        ])
+        .env(TEARDOWN_LOG_CHILD, "1")
+        .output()
+        .expect("isolated teardown log test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" 1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test(start_paused = true)]
