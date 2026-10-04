@@ -4,7 +4,7 @@ use super::{
     ChildCancellationGuard, ChildSink, Context, Datagram, Failure, Future, MAX_TCP_CHUNK,
     ManagedSession, Mutex, OpenError, Ordering, PacketTransport, Pin, Poll, QueuedPayload, ReadBuf,
     SessionPermit, SocketAddr, TCP_QUEUE_CAPACITY, UDP_QUEUE_CAPACITY, UdpDestination,
-    VlessCoolSession, WriterCommand, async_trait, connect, io, mpsc, oneshot,
+    VlessCoolSession, WriterCommand, async_trait, connect, io, mpsc,
 };
 
 pub(super) type IoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
@@ -148,12 +148,10 @@ impl AsyncWrite for VlessCoolStream {
                 Ok(frame) => frame,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            let (done, wait) = oneshot::channel();
-            drop(wait);
             let _sender = permit.send(WriterCommand {
                 frame,
                 flush: false,
-                done,
+                done: None,
             });
             return Poll::Ready(Ok(length));
         }
