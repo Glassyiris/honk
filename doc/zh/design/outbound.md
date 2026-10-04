@@ -620,9 +620,12 @@ Encryption 可以包装 direct 与 Xray/Mux.Cool path，包括受支持的 Visio
 outer transport 与 random 模式逐 record 的 header XOR 保持不变，并遵循 Xray
 `XorConn`，包括其对 TLS 形态 header 的跳过规则。这不表示 encrypted Vision 会
 cut over 到 raw socket。
-random-mode Direct 每次 write 最多确认并复制 8 KiB，保留 codec 既有的有界
-pending-write buffer。Header XOR 状态跨这些短写保留；native Direct 不增加
-wire-copy buffer。
+random-mode Direct 每次 write 最多确认并复制 8 KiB。Header XOR 状态跨这些短写
+保留；native Direct 不增加 wire-copy buffer。
+数据持续流动时，codec 复用一块写缓冲（与 random-mode Direct 共用），并在两块
+读缓冲之间轮换，因此稳定传输的 frame 不再分配。超过一个最大 frame 的写缓冲
+（例如较大的 0-RTT prewrite）用完即丢弃。flush 完成后释放写缓冲；读取在 frame
+边界等待时释放明文缓冲，所以空闲 stream 只保留 5 字节 header 缓冲。
 
 ## QUIC 栈
 
