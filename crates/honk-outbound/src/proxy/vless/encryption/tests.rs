@@ -150,6 +150,7 @@ async fn frame_buffers_are_reused_while_flowing_and_released_when_idle() {
     let payload = vec![0x5a; MAX_FRAME_PLAINTEXT];
 
     client.write_all(&payload).await.unwrap();
+    assert_eq!(client.write_wire.capacity(), MAX_RETAINED_WIRE);
     let write_backing = client.write_wire.as_ptr();
     for _ in 0..4 {
         client.write_all(&payload).await.unwrap();
