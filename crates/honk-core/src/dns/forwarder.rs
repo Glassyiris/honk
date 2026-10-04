@@ -411,8 +411,8 @@ mod message {
 
     /// Build a minimal DNS query for the given domain and query type.
     pub fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
-        let qname = encode_dns_name(domain);
-        let mut query = Vec::with_capacity(12 + qname.len() + 4);
+        // The encoded name is at most two bytes longer than the domain text.
+        let mut query = Vec::with_capacity(12 + domain.len() + 2 + 4);
 
         // Header: ID=0, flags=0x0100 (RD), QDCOUNT=1, rest=0
         query.extend_from_slice(&[0x00, 0x00]); // ID
@@ -422,30 +422,19 @@ mod message {
         query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
         query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
 
-        query.extend_from_slice(&qname);
+        if !matches!(domain, "" | ".") {
+            for label in domain.strip_suffix('.').unwrap_or(domain).split('.') {
+                if label.len() <= 63 {
+                    query.push(label.len() as u8);
+                    query.extend_from_slice(label.as_bytes());
+                }
+            }
+        }
+        query.push(0x00); // root terminator
         query.extend_from_slice(&qtype.to_be_bytes());
         query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
 
         query
-    }
-
-    /// Encode a domain name into DNS label format.
-    ///
-    /// Example: `"example.com"` → `[0x07, b'e', ..., 0x03, b'c', b'o', b'm', 0x00]`
-    fn encode_dns_name(domain: &str) -> Vec<u8> {
-        if domain == "." || domain.is_empty() {
-            return vec![0];
-        }
-        let mut encoded = Vec::new();
-        for label in domain.strip_suffix('.').unwrap_or(domain).split('.') {
-            if label.len() > 63 {
-                continue;
-            }
-            encoded.push(label.len() as u8);
-            encoded.extend_from_slice(label.as_bytes());
-        }
-        encoded.push(0x00); // terminator
-        encoded
     }
 
     /// Parse the first question from a raw DNS query.
