@@ -178,6 +178,20 @@ async fn frame_buffers_are_reused_while_flowing_and_released_when_idle() {
     assert!(server.read_wire.capacity() < MAX_FRAME_PLAINTEXT);
 }
 
+/// A full first frame that also carries the 0-RTT prewrite exceeds one
+/// maximum frame, so its buffer is dropped instead of kept.
+#[tokio::test]
+async fn oversized_first_frame_buffer_is_not_kept() {
+    let (client_io, _server_io) = tokio::io::duplex(1 << 20);
+    let mut client = ready_stream(client_io, None);
+    client.prewrite = Some(vec![0; IV_LEN]);
+    client
+        .write_all(&[0x5a; MAX_FRAME_PLAINTEXT])
+        .await
+        .unwrap();
+    assert_eq!(client.write_wire.capacity(), 0);
+}
+
 #[tokio::test]
 async fn direct_drains_authenticated_plaintext_and_keeps_encrypted_writes() {
     let key = vec![13_u8; 96];
