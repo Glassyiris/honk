@@ -192,14 +192,13 @@ pub(super) async fn session_writer(
         );
         batch.push(first);
         let next_packet = packet.wrapping_add(1);
-        let padding = session.padding_state.snapshot();
-        let apply_padding = send_padding && next_packet < padding.stop;
-        if send_padding && !apply_padding {
-            send_padding = false;
-        }
+        let padding = send_padding
+            .then(|| session.padding_state.snapshot())
+            .filter(|padding| next_packet < padding.stop);
+        send_padding = padding.is_some();
         let extra_frames = if initial {
             2
-        } else if apply_padding {
+        } else if padding.is_some() {
             0
         } else {
             WRITER_BATCH_MAX_FRAMES - 1
@@ -219,8 +218,8 @@ pub(super) async fn session_writer(
             .iter()
             .any(|cmd| matches!(cmd, FrameCommand::Data { .. }));
         let write_op = async {
-            if apply_padding {
-                write_padded(&mut write, &buf, &padding, packet).await?;
+            if let Some(padding) = &padding {
+                write_padded(&mut write, &buf, padding, packet).await?;
             } else {
                 write.write_all(&buf).await?;
             }

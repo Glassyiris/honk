@@ -142,7 +142,8 @@ struct FrameSendFailure {
 struct WriterCommand {
     frame: Bytes,
     flush: bool,
-    done: oneshot::Sender<Result<(), FrameSendFailure>>,
+    /// `None` when nobody awaits the write; failures still reach the session.
+    done: Option<oneshot::Sender<Result<(), FrameSendFailure>>>,
 }
 
 #[derive(Clone)]
@@ -198,7 +199,11 @@ impl CarrierWriter {
         if let Some(admitted) = admitted {
             admitted.store(true, Ordering::Release);
         }
-        permit.send(WriterCommand { frame, flush, done });
+        permit.send(WriterCommand {
+            frame,
+            flush,
+            done: Some(done),
+        });
         wait.await.unwrap_or_else(|_| {
             Err(FrameSendFailure {
                 failure: self
@@ -745,7 +750,9 @@ async fn run_writer<W: AsyncWrite + Unpin>(
         });
         match result {
             Ok(()) => {
-                let _ = command.done.send(Ok(()));
+                if let Some(done) = command.done {
+                    let _ = done.send(Ok(()));
+                }
             }
             Err(error) => {
                 let failure = FrameSendFailure {
@@ -755,7 +762,9 @@ async fn run_writer<W: AsyncWrite + Unpin>(
                 if let Some(session) = session.upgrade() {
                     session.fail(failure.failure.clone());
                 }
-                let _ = command.done.send(Err(failure));
+                if let Some(done) = command.done {
+                    let _ = done.send(Err(failure));
+                }
                 return;
             }
         }
