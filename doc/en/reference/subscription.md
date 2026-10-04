@@ -19,9 +19,9 @@ subscription {
 }
 ```
 
-The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` says how the fetch leaves (see below). A missing option takes the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
+The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` selects the fetch route (see below). A missing option uses the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
 
-Two earlier forms still read, without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block holding the URL (`detailed: { url: '…' ua: '…' }`), which also accepts `download_detour` as another name for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
+Two earlier forms still parse without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block containing the URL (`detailed: { url: '…' ua: '…' }`). The block also accepts `download_detour` as an alias for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
 
 Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
@@ -51,7 +51,7 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
 | `user_agent` | string or null | `honk/<version>` | Yes, as `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
-| `download_detour` | string | `""` | Yes, as `route` | How the fetch leaves: empty or `routing` follows the routing rules, `direct` connects straight to the host, and a group name always goes through that group. An unknown group is refused at validation. |
+| `download_detour` | string | `""` | Yes, as `route` | Fetch route: empty or `routing` follows the routing rules, `direct` connects directly to the host, and a group name forces that group. An unknown group is rejected during validation. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
 | `cache` | bool | `true` | Yes, as `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
@@ -194,7 +194,7 @@ Import defaults are source-specific. They do not all mean honk's canonical `pack
 | enabled `smux`/`multiplex` with `protocol: h2mux` or explicit `padding` | auto (inactive while wrapped) | H2MUX | enabled unless `udp: false` |
 | `mux: { enabled: true, ... }` | `auto`, unless an explicit packet encoding remains reachable through protocol fallback or `skip` | Xray Mux.Cool | enabled unless `udp: false` |
 
-For H2MUX, `padding: true` selects the existing padded wire format; false selects unpadded H2MUX. Existing `only-tcp`, Brutal, and nonzero `max-connections`/`min-streams`/`max-streams` restrictions remain. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are simply inactive behind the selected wrapper.
+For H2MUX, `padding: true` selects the existing padded wire format; false selects unpadded H2MUX. Existing `only-tcp`, Brutal, and nonzero `max-connections`/`min-streams`/`max-streams` restrictions remain. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are inactive behind the selected wrapper.
 
 An enabled Clash `mux` block accepts active settings only for `enabled`, signed-`i16` `concurrency`, signed-`i16` `xudpConcurrency`, and `xudpProxyUDP443`; inactive extras are ignored. Zero TCP concurrency allows 8 concurrent logical children per carrier, a negative value disables TCP mux, and a positive value sets that per-carrier concurrency up to 128—it never specifies a physical-carrier count. Zero XUDP concurrency shares the enabled TCP pool and its per-carrier concurrency, or follows the packet fallback when TCP mux is disabled; negative always follows the fallback, and positive creates a separate UDP pool with that per-carrier logical-child concurrency, capped at 128. UDP/443 policy is `allow` by default and also accepts `skip` or `reject`; its precedence is documented in the [node reference](./nodes.md#vless-udp-and-multiplexing).
 

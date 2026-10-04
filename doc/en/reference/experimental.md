@@ -14,7 +14,7 @@ This reference describes the current nested sections under `experimental { ... }
 
 ## `native_api`
 
-Requires the opt-in `native-api` Cargo feature (build with `--features native-api` or `native-ui`; release builds include it); it does not require `clash-api`, and the listener remains default-off. Enabling it without that feature fails startup. All effective fields are restart-required: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
+Requires the opt-in `native-api` Cargo feature (build with `--features native-api` or `native-ui`; release builds include it). It does not require `clash-api`, and the listener is disabled by default. Enabling it without that feature fails startup. All effective fields require restart: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -100,7 +100,7 @@ An explicitly enabled non-loopback bind with an empty secret emits `unsafe-api-b
 
 An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing directory below `/var/share/honk`, then an existing working-directory-relative directory; if none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `assets.ui.url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
 
-`assets.ui.route` takes precedence over `assets.route` for the initial request and every redirect. `direct` downloads directly, `block` aborts when selected by routing rules, and a group resolves its authoritative leaf for each exchange. With no configured route, each URL follows the normal traffic routing decision. An unavailable tag, download failure, or extraction failure is logged without stopping the engine. The archive is written to an unnamed private file in the target's parent directory rather than memory; nothing of it remains after extraction or a failed download. Extraction is refused past 10,000 entries or 128 MiB of content, the same bound as the archive itself; the partly written directory is emptied, so the next start downloads again.
+`assets.ui.route` takes precedence over `assets.route` for the initial request and every redirect. `direct` downloads directly, `block` aborts when selected by routing rules, and a group resolves its authoritative leaf for each exchange. With no configured route, each URL follows the normal traffic routing decision. An unavailable tag, download failure, or extraction failure is logged without stopping the engine. The archive is written to an unnamed private file in the target's parent directory rather than memory; the archive is removed after extraction or a failed download. Extraction is refused past 10,000 entries or 128 MiB of content, the same bound as the archive itself. The partly written directory is emptied, so the next start downloads again.
 
 ### Startup mode
 
@@ -129,7 +129,7 @@ If the state db is corrupt and neither `--store db` nor `native_api.password_aut
 
 A maintenance tick runs every 60 seconds. A Selector choice is kept only for a Selector group in the configuration, and a delay sample only for a configured node; a row whose group or node is missing at two consecutive ticks is deleted, so a reload that briefly drops one keeps its row. Delay samples older than 24 hours and expired DNS rows are deleted at each tick, and each tick returns up to 1 MiB of freed pages to the filesystem. At most 4,096 DNS rows are kept; after each batch the earliest expiry is evicted first.
 
-When a start opens the state db (because `--store db`, `password_auth`, `store_subscribe` or `cache_file` needs it), `enabled: false` empties the Selector, delay, Clash-state and DNS tables, an unset `enabled` empties the Clash-state and DNS tables, `store_dns: false` empties the DNS table, and an enabled native API or a disabled Clash API empties the Clash-state table. A start that opens no state db leaves the file as it is.
+At startup, if honk opens the state db (because `--store db`, `password_auth`, `store_subscribe` or `cache_file` needs it), `enabled: false` empties the Selector, delay, Clash-state and DNS tables; an unset `enabled` empties the Clash-state and DNS tables; `store_dns: false` empties the DNS table; and an enabled native API or a disabled Clash API empties the Clash-state table. Startup without a state db leaves the file unchanged.
 
 The state db file is capped at 112 MiB. Cache writes keep 24 MiB of it free for configuration revisions and subscription bodies: when a batch would leave more than 88 MiB in use, the writer first deletes DNS rows down to 2,048, and rolls the batch back if that is not enough; skipped DNS entries are counted as `budget_skipped`, not as written. The legacy `cache.db` import obeys the same budget: a copy that would pass it is not committed, and the next start tries again.
 

@@ -491,7 +491,7 @@ JA4 value is promised.
 Target buffering is a server-version constraint, not a universal honk client
 certificate limit. The documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer uses
 an [8192-byte buffer for target TLS records](https://github.com/MetaCubeX/utls/blob/v1.8.0/reality.go),
-including record framing; this is not simply a DER certificate-length limit.
+including record framing; the limit is not based on DER certificate length alone.
 The reviewed [XTLS/REALITY implementation](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go)
 uses a 17-KiB buffer. Choose a target compatible with the deployed server version.
 
@@ -843,11 +843,11 @@ settles only its own SID — an unrelated acknowledgement never clears another
 stream's deadline, and local stream teardown cancels it. An open still pending
 three seconds after its SYN was written is reset at stream level when the
 session kept receiving frames during the window (the server was alive but
-never acknowledged that open). A fully silent window is not proof of a dead
-carrier, because a loss burst silences every stream at once and TCP delivers
-afterwards: it resets only that open and takes the session out of rotation, and
-the session is retired with its streams only if it stays silent for another ten
-seconds, so the pool still redials instead of reusing a dead carrier.
+never acknowledged that open). A fully silent window does not prove the carrier
+is dead: a loss burst silences every stream at once, and TCP delivers afterwards.
+In that case, only the pending open is reset and the session leaves rotation.
+The session and its streams retire only after another ten seconds of silence,
+so the pool redials instead of reusing a dead carrier.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor (`anytls_min_idle_session`) and `anytls_idle_session_timeout` feed one node-local janitor.

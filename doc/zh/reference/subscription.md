@@ -4,7 +4,7 @@
 
 ## `subscription {}` 语法
 
-URL 写在条目这一行。要为单个订阅覆盖下载设置，在带引号的 URL 后接一个块，每行一个键：
+URL 写在条目行。要为单个订阅覆盖下载设置，在带引号的 URL 后接一个块，每行一个键：
 
 ```dae
 subscription {
@@ -19,7 +19,7 @@ subscription {
 }
 ```
 
-条目块接受 `ua`、`interval`、`cache` 和 `route`。`interval` 是 duration，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。`route` 指定拉取的出口（见下文）。未设置的项依次取 `assets.subscription` 的默认值（出口取 `assets.route`）和内置默认值：User-Agent `honk/<version>`、`86400s`、开启缓存、`routing`。见 [Assets 配置参考](./assets.md)。
+条目块接受 `ua`、`interval`、`cache` 和 `route`。`interval` 是 duration，设为 `0` 可禁用定期刷新。`cache: false` 使该订阅的正文不写入订阅存储。`route` 指定拉取出口（见下文）。未设置的项依次取 `assets.subscription` 的默认值（出口取 `assets.route`）和内置默认值：User-Agent `honk/<version>`、`86400s`、开启缓存、`routing`。见 [Assets 配置参考](./assets.md)。
 
 两种旧写法仍可读取，且不产生警告：带引号的 URL 后追加 `(UA)`（`compatible: 'https://example.net/sub'(honk/1.0 like)`），以及把 URL 写在块内（`detailed: { url: '…' ua: '…' }`）；后者也接受 `download_detour` 作为 `route` 的别名，两者同时设置时报 `conflicting-subscription-route`。下文关于后缀和紧贴注释的规则适用于 `(UA)` 写法。
 
@@ -78,7 +78,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | 位置 | 状态数据库 `<data_dir>/state/honk.db` 的 `subscription_body` 表（文件权限 0600，目录 0700，见 [API 参考](./api.md#配置数据库--store-db)）；`data_dir` 默认值为 `/var/lib/honk`。 |
 | Key | 对带长度边界的 URL、配置中的 user agent 覆盖值（未设置或为空时为空）及有序 header key/value 对计算 SHA-256，再用 URL-safe Base64 编码并添加 `.sub`。版本化的默认请求 UA 不参与 key，因此默认订阅升级后仍保留已存正文。请求身份不会以明文暴露。 |
 | 写入边界 | HTTP 成功且正文通过导入校验后，在一个事务中保存完整原始响应，包括被拒绝的条目。 |
-| 容量限制 | 单个正文最多 8 MiB，全部正文合计最多 32 MiB。写入会超过 32 MiB 时，先删除已不再启用的订阅的正文；仍然超出时拒绝写入，保留原正文，本次拉取报告 `subscription-store-write-failed`。订阅连续两次维护（每 60 秒一次）都未启用时，其正文被删除；`store_subscribe: false` 的启动若因 `cache_file`、`password_auth` 或 `--store db` 仍打开状态数据库，会清空该表。 |
+| 容量限制 | 单个正文最多 8 MiB，全部正文合计最多 32 MiB。写入会超过 32 MiB 时，先删除已停用订阅的正文。仍然超出时拒绝写入，保留原正文，本次拉取报告 `subscription-store-write-failed`。订阅连续两次维护（每 60 秒一次）都未启用时，其正文被删除。`store_subscribe: false` 的启动若因 `cache_file`、`password_auth` 或 `--store db` 仍打开状态数据库，会清空该表。 |
 | 从 `.sub` 升级 | 取得实例锁后，honk 每次启动时依次在 `<data_dir>/.sub`、`/var/share/honk/.sub`、`./.sub` 中查找第一个私有的旧存储，复制已启用订阅的正文；状态数据库中已有的正文优先。随后 honk 删除已复制的 `*.sub` 与该目录中所有 `.*.tmp`，目录为空时一并删除；其他旧位置保持不变。无法读取、超过 8 MiB 或会使合计超过 32 MiB 的正文保留在原处，honk 记录警告；已停用订阅的正文同样保留，之后启用该订阅的启动无需拉取即可导入。此时旧进程已经退出，它最后写入的正文与其他正文一样被复制。此后再启动旧版本时，它只能找到保留的正文，其余订阅会重新拉取。 |
 | 重定向 | 最多 5 跳。从 `https` 重定向到其他 scheme 会让本次拉取失败；重定向到配置 URL 自身未使用的回环、私有、链路本地或未指定字面地址同样失败。解析到这类地址的主机名不在检测范围内。 |
 | 正文大小 | 最多 8 MiB，在读取过程中判定，而不是缓冲完整正文之后。 |
@@ -91,7 +91,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 路由在启动阶段的订阅处理之后才就绪。因此只有 `direct` 订阅参与 5 秒首次拉取等待；经路由的订阅在此阶段恢复已存正文，路由就绪后立即拉取。
 
-启动时会在开始联网刷新前解析已存正文。有效恢复立即提供活动节点，并让该订阅退出五秒首次拉取等待；其刷新仍在后台运行。缺失、无效或空正文被忽略。只有未有效恢复的 direct 订阅进入共享的有界等待，直至拉取结束或 deadline 到期；经路由的订阅在路由就绪后拉取。后续通过校验的刷新替换 SQLite 正文行，而不是旧存储文件。
+启动时先解析已存正文，再开始联网刷新。有效恢复立即提供活动节点，并让该订阅退出五秒首次拉取等待；其刷新仍在后台运行。缺失、无效或空正文被忽略。只有未有效恢复的 direct 订阅进入共享的有界等待，直至拉取结束或 deadline 到期；经路由的订阅在路由就绪后拉取。后续通过校验的刷新替换 SQLite 正文行，而不是旧存储文件。
 
 恢复或首次拉取的正文中，若有节点 ID 已被内联节点或其他订阅的节点占用，启动配置会排除该订阅，而不是让启动失败；运行时发布同样会拒绝这种冲突。正文仍可替换该订阅自己的节点。原生 API provider 报告 `last_error.code` 为 `publication_rejected`，`last_error.details.diagnostic_code` 为 `duplicate-node-id`。以此方式被拒绝的已恢复正文仍视为已恢复：该订阅不参与首次拉取等待，其后台刷新仍会运行并重复该检查。
 
