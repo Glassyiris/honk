@@ -126,6 +126,57 @@ async fn frame_codec_round_trips_large_payload() {
     server_task.await.unwrap();
 }
 
+/// Frames reuse one write buffer and two read buffers while traffic flows,
+/// and an idle stream (flushed, reader waiting at a frame boundary) keeps
+/// only the five-byte header buffer.
+#[tokio::test]
+async fn frame_buffers_are_reused_while_flowing_and_released_when_idle() {
+    let key = vec![23_u8; 96];
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let mut client = ready_stream(client_io, None);
+    let mut server = EncryptedStream::new(
+        Box::new(server_io),
+        key.clone(),
+        true,
+        StreamAead::new(b"server", &key, true).unwrap(),
+        Some(StreamAead::new(b"client", &key, true).unwrap()),
+        None,
+        None,
+        None,
+        PeerInit::Ready,
+        None,
+        false,
+    );
+    let payload = vec![0x5a; MAX_FRAME_PLAINTEXT];
+
+    client.write_all(&payload).await.unwrap();
+    let write_backing = client.write_wire.as_ptr();
+    for _ in 0..4 {
+        client.write_all(&payload).await.unwrap();
+        assert_eq!(client.write_wire.as_ptr(), write_backing);
+    }
+    client.flush().await.unwrap();
+    assert_eq!(client.write_wire.capacity(), 0);
+
+    let mut received = vec![0; MAX_FRAME_PLAINTEXT];
+    server.read_exact(&mut received).await.unwrap();
+    let mut backings = [server.read_wire.as_ptr(), server.read_plaintext.as_ptr()];
+    backings.sort();
+    for _ in 0..4 {
+        server.read_exact(&mut received).await.unwrap();
+        let mut now = [server.read_wire.as_ptr(), server.read_plaintext.as_ptr()];
+        now.sort();
+        assert_eq!(now, backings);
+    }
+    assert_eq!(received, payload);
+
+    let mut more = [0u8; 1];
+    let idle = tokio::time::timeout(std::time::Duration::from_millis(20), server.read(&mut more));
+    assert!(idle.await.is_err(), "no frame is pending");
+    assert_eq!(server.read_plaintext.capacity(), 0);
+    assert!(server.read_wire.capacity() < MAX_FRAME_PLAINTEXT);
+}
+
 #[tokio::test]
 async fn direct_drains_authenticated_plaintext_and_keeps_encrypted_writes() {
     let key = vec![13_u8; 96];
@@ -268,7 +319,7 @@ async fn native_direct_write_passes_bytes_through_unframed() {
     let mut received = Vec::new();
     server_io.read_to_end(&mut received).await.unwrap();
     assert_eq!(received, b"raw-inner-tls");
-    assert_eq!(stream.direct_wire.capacity(), 0);
+    assert_eq!(stream.write_wire.capacity(), 0);
 }
 
 /// Xray `XorConn.Write` skips any body whose plaintext header starts

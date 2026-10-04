@@ -37,6 +37,8 @@ const TAG_LEN: usize = 16;
 const FRAME_HEADER_LEN: usize = 5;
 const MAX_FRAME_PLAINTEXT: usize = 8192;
 const MAX_FRAME_CIPHERTEXT: usize = 16_640;
+/// Largest write buffer kept between frames; a larger first-frame prewrite is not.
+const MAX_RETAINED_WIRE: usize = FRAME_HEADER_LEN + MAX_FRAME_PLAINTEXT + TAG_LEN;
 const MAX_NONCE: [u8; NONCE_LEN] = [u8::MAX; NONCE_LEN];
 const KDF_CTR: &[u8] = b"VLESS";
 
@@ -685,8 +687,9 @@ pub(crate) struct EncryptedStream {
     recv_header_xor: direct::HeaderXor,
     direct_write: bool,
     send_header_xor: direct::HeaderXor,
-    /// Reused random-mode Direct wire buffer; native modes never allocate it.
-    direct_wire: Vec<u8>,
+    /// Write buffer reused while traffic flows; empty while `pending_write`
+    /// owns it and released once the stream flushes idle.
+    write_wire: Vec<u8>,
     ticket_use: Option<TicketUse>,
 }
 
@@ -732,7 +735,7 @@ impl EncryptedStream {
             recv_header_xor: direct::HeaderXor::default(),
             direct_write: false,
             send_header_xor: direct::HeaderXor::default(),
-            direct_wire: Vec::new(),
+            write_wire: Vec::new(),
             ticket_use,
         }
     }
@@ -744,8 +747,9 @@ impl EncryptedStream {
         let rekey = self.send.nonce == MAX_NONCE;
         let prewrite = self.prewrite.as_deref().unwrap_or_default();
         let header_start = prewrite.len();
-        let mut wire =
-            Vec::with_capacity(header_start + FRAME_HEADER_LEN + plaintext_len + TAG_LEN);
+        let mut wire = std::mem::take(&mut self.write_wire);
+        wire.clear();
+        wire.reserve_exact(header_start + FRAME_HEADER_LEN + plaintext_len + TAG_LEN);
         wire.extend_from_slice(prewrite);
         wire.extend_from_slice(&header);
         // The AEAD appends, so the ciphertext lands after the unmasked header.
@@ -782,8 +786,8 @@ impl EncryptedStream {
             .pending_write
             .take()
             .expect("completed pending write exists");
-        if self.direct_write {
-            self.direct_wire = done.wire;
+        if done.wire.capacity() <= MAX_RETAINED_WIRE {
+            self.write_wire = done.wire;
         }
         Poll::Ready(Ok(done.plaintext_len))
     }
@@ -850,7 +854,12 @@ impl AsyncWrite for EncryptedStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        Pin::new(&mut *self.inner).poll_flush(cx)
+        let flushed = Pin::new(&mut *self.inner).poll_flush(cx);
+        if flushed.is_ready() {
+            // The relay flushes once its source would block: release until traffic resumes.
+            self.write_wire = Vec::new();
+        }
+        flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -903,7 +912,13 @@ impl AsyncRead for EncryptedStream {
                         self.invalidate_ticket();
                         return Poll::Ready(Err(error));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if start == 0 && matches!(self.read_phase, ReadPhase::Header) {
+                            // Idle at a frame boundary: keep only the header buffer.
+                            self.read_plaintext = Vec::new();
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
 
@@ -941,6 +956,7 @@ impl AsyncRead for EncryptedStream {
                 }
                 ReadPhase::Header => {
                     let mut header: [u8; FRAME_HEADER_LEN] = wire
+                        .as_slice()
                         .try_into()
                         .expect("VLESS Encryption frame header length");
                     if let Some(xor) = self.recv_xor.as_mut() {
@@ -960,7 +976,14 @@ impl AsyncRead for EncryptedStream {
                         header,
                         ciphertext_len,
                     };
-                    self.read_wire = vec![0; ciphertext_len];
+                    // The drained plaintext buffer receives the body; the header
+                    // buffer waits in the empty plaintext slot until it returns.
+                    std::mem::swap(&mut wire, &mut self.read_plaintext);
+                    self.read_plaintext.clear();
+                    wire.clear();
+                    wire.reserve_exact(ciphertext_len);
+                    wire.resize(ciphertext_len, 0);
+                    self.read_wire = wire;
                 }
                 ReadPhase::Body {
                     header,
@@ -995,10 +1018,12 @@ impl AsyncRead for EncryptedStream {
                     }
                     wire.truncate(plaintext_len);
                     self.ticket_use = None;
-                    self.read_plaintext = wire;
+                    let mut header_wire = std::mem::replace(&mut self.read_plaintext, wire);
                     self.read_plaintext_offset = 0;
                     self.read_phase = ReadPhase::Header;
-                    self.read_wire = vec![0; FRAME_HEADER_LEN];
+                    header_wire.clear();
+                    header_wire.resize(FRAME_HEADER_LEN, 0);
+                    self.read_wire = header_wire;
                     if self.copy_plaintext(output) {
                         return Poll::Ready(Ok(()));
                     }
