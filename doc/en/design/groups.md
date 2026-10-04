@@ -14,7 +14,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager.
 
-The shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` by the same name, independent of insertion, deletion or reordering. A rename is a new group, not a transfer of the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
+Shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` when its name is unchanged, regardless of insertion, deletion or reordering. A rename creates a new group rather than transferring the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -48,7 +48,7 @@ Selector validation/publication is one shared transition; callbacks run after sy
 
 Concurrent closes of the same captured owner share its real completion and inherit a failed retirement; they do not report `Gone` merely because it is already Closing or Failed. A missing or replaced owner remains `Gone`. Automatic interrupt callbacks only start retirement; callers that require confirmation wait on that owner's completion.
 
-Native group observations are non-mutating, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload—not a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. An automatic-policy pin lives only in the running GroupManager, so an activation drops it; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups).
+Native group observations are read-only, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload. It does not create a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. An automatic-policy pin lives only in the running GroupManager, so an activation drops it; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups).
 
 ### Score scoring and lifecycle
 
