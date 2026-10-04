@@ -810,6 +810,10 @@ impl EncryptedStream {
         true
     }
 
+    fn at_frame_boundary(&self) -> bool {
+        matches!(self.read_phase, ReadPhase::Header) && self.read_offset == 0
+    }
+
     fn invalidate_ticket(&mut self) {
         if let Some(ticket_use) = self.ticket_use.take() {
             ticket_use.invalidate();
@@ -897,7 +901,7 @@ impl AsyncRead for EncryptedStream {
                 };
                 match poll {
                     Poll::Ready(Ok(())) if read == 0 => {
-                        if start == 0 && matches!(self.read_phase, ReadPhase::Header) {
+                        if self.at_frame_boundary() {
                             self.read_eof = true;
                             return Poll::Ready(Ok(()));
                         }
@@ -913,7 +917,7 @@ impl AsyncRead for EncryptedStream {
                         return Poll::Ready(Err(error));
                     }
                     Poll::Pending => {
-                        if start == 0 && matches!(self.read_phase, ReadPhase::Header) {
+                        if self.at_frame_boundary() {
                             // Idle at a frame boundary: keep only the header buffer.
                             self.read_plaintext = Vec::new();
                         }
