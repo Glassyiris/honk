@@ -60,6 +60,8 @@ pub(crate) type LocatedRule = (
 #[derive(Clone)]
 pub(crate) struct ListenerSecrets {
     values: Vec<String>,
+    /// Each value and, when it differs, its JSON-escaped form; built once rather than per check.
+    spellings: Vec<String>,
 }
 
 impl ListenerSecrets {
@@ -116,11 +118,14 @@ impl ListenerSecrets {
         }
         values.sort_unstable();
         values.dedup();
-        Self { values }
+        values.into_iter().fold(Self::empty(), Self::push)
     }
 
     pub(crate) fn empty() -> Self {
-        Self { values: Vec::new() }
+        Self {
+            values: Vec::new(),
+            spellings: Vec::new(),
+        }
     }
 
     pub(crate) fn from_config(config: &Config) -> Self {
@@ -139,25 +144,28 @@ impl ListenerSecrets {
             .with_secret(&secrets.clash_api)
     }
 
-    pub(crate) fn with_secret(mut self, secret: &str) -> Self {
+    pub(crate) fn with_secret(self, secret: &str) -> Self {
         if secret.len() >= MIN_MASKED_SECRET && !self.values.iter().any(|value| value == secret) {
-            self.values.push(secret.to_owned());
+            return self.push(secret.to_owned());
         }
         self
     }
 
-    fn spellings(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
-        self.values.iter().flat_map(|value| {
-            let quoted = serde_json::to_string(value).expect("listener secret is a string");
-            [
-                std::borrow::Cow::Borrowed(value.as_str()),
-                std::borrow::Cow::Owned(quoted[1..quoted.len() - 1].to_owned()),
-            ]
-        })
+    fn push(mut self, value: String) -> Self {
+        let quoted = serde_json::to_string(&value).expect("listener secret is a string");
+        let escaped = &quoted[1..quoted.len() - 1];
+        if escaped != value {
+            self.spellings.push(escaped.to_owned());
+        }
+        self.spellings.push(value.clone());
+        self.values.push(value);
+        self
     }
 
     pub(crate) fn contains(&self, text: &str) -> bool {
-        self.spellings().any(|value| text.contains(value.as_ref()))
+        self.spellings
+            .iter()
+            .any(|secret| text.contains(secret.as_str()))
     }
 
     pub(crate) fn mask_borrowed<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
@@ -173,9 +181,9 @@ impl ListenerSecrets {
             return (text.to_owned(), false);
         }
         let mut hidden = vec![false; text.len()];
-        for secret in self.spellings() {
+        for secret in &self.spellings {
             let mut offset = 0;
-            while let Some(relative) = text[offset..].find(secret.as_ref()) {
+            while let Some(relative) = text[offset..].find(secret.as_str()) {
                 let start = offset + relative;
                 hidden[start..start + secret.len()].fill(true);
                 offset = start + text[start..].chars().next().unwrap().len_utf8();
