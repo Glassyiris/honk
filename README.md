@@ -4,17 +4,17 @@ English | [中文](./README.zh.md)
 
 <a id="english"></a>
 
-**honk** is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapath and configuration syntax are inspired by [dae](https://github.com/daeuniverse/dae); its outbound groups, multi-protocol dialers, and Clash-compatible API follow [sing-box](https://github.com/SagerNet/sing-box) designs. It is an independent implementation, not a line-for-line port.
+honk is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapath and configuration syntax are inspired by [dae](https://github.com/daeuniverse/dae); its outbound groups, multi-protocol dialers, and Clash-compatible API follow [sing-box](https://github.com/SagerNet/sing-box) designs. It is an independent implementation, not a line-for-line port.
 
 > **Early alpha (`v0.0.1-alpha`), not recommended for production.** Expect breaking changes, incomplete features, and limited real-world validation.
 
 ## Capabilities
 
-- **Transparent TCP/UDP:** LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing on Linux 6.12+.
-- **Outbounds:** SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS, plus built-in `direct` and `block`. VMess is TCP-only; protocol-specific limits are in the [node reference](doc/en/reference/nodes.md).
-- **Groups:** Selector, URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; select it with `policy: score`. Omitted policy remains Selector. See the [group reference](doc/en/reference/groups.md#score-policy).
-- **DNS:** UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
-- **Configuration and control:** dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.
+- Transparent TCP/UDP: LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing on Linux 6.12+.
+- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS, plus built-in `direct` and `block`. VMess is TCP-only; protocol-specific limits are in the [node reference](doc/en/reference/nodes.md).
+- Groups: Selector, URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; select it with `policy: score`. Omitted policy remains Selector. See the [group reference](doc/en/reference/groups.md#score-policy).
+- DNS: UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
+- Configuration and control: dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.
 
 Implemented does not mean fully reviewed; see [review status](#review-status). There is no FakeIP engine, full mihomo parity, or Windows/macOS datapath.
 
@@ -71,11 +71,11 @@ Track other work in [Issues](https://github.com/daeuniverse/honk/issues) and [Di
 
 ## Acknowledgments
 
-- [dae](https://github.com/daeuniverse/dae) / [daed-rs](https://github.com/daeuniverse/daed-rs) — eBPF transparent proxy lineage
-- [sing-box](https://github.com/SagerNet/sing-box) — outbound group and Clash API patterns
-- [daeuniverse/outbound](https://github.com/daeuniverse/outbound) — protocol reference
-- [juicity-rs](https://github.com/juicity/juicity-rs) by Markson Pigeonzilla Plus — Juicity protocol reference, wire-format alignment, and live interop testing
-- [aya-rs](https://github.com/aya-rs/aya) — Rust eBPF
+- [dae](https://github.com/daeuniverse/dae) / [daed-rs](https://github.com/daeuniverse/daed-rs): eBPF transparent proxy lineage
+- [sing-box](https://github.com/SagerNet/sing-box): outbound group and Clash API patterns
+- [daeuniverse/outbound](https://github.com/daeuniverse/outbound): protocol reference
+- [juicity-rs](https://github.com/juicity/juicity-rs) by Markson Pigeonzilla Plus: Juicity protocol reference, wire-format alignment, and live interop testing
+- [aya-rs](https://github.com/aya-rs/aya): Rust eBPF
 
 ## License
 

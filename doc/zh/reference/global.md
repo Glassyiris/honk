@@ -1,10 +1,10 @@
 # 全局配置参考
 
-本文定义当前 `global { ... }` 配置字段及其运行时效果。
+`global { ... }` 配置进程级设置。下表列出字段及其运行时效果。
 
 ## 字段
 
-仅兼容字段会被 dae 解析器接受并存入 `GlobalConfig`，但当前运行时不会使用它们。下表均已明确标注。
+仅用于兼容的字段会被 dae 解析器接受并存入 `GlobalConfig`，但当前运行时不会使用它们。下表均已明确标注。
 
 | dae 键 | 内部字段 | 默认值 | 含义 |
 | ------- | -------- | ------ | ---- |
@@ -12,7 +12,7 @@
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关；当前运行时不读取该字段。 |
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
-| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为 `--debug`、`RUST_LOG`、该值。通过 SIGHUP 修改需重启。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
+| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
@@ -94,7 +94,7 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 ## 网卡语义
 
-`lan_interface` 为空具有字面含义：honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机发起 TCP/UDP 仍会被代理，但不会增加任何合成的 LAN 拦截。
+`lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。
 
 `auto` 解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项会从期望 hook 集合中省略并保持待定。由于没有挂载 hook，未解析网卡上的流量保持 fail-open；同一列表中显式命名的网卡继续工作。
 

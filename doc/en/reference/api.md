@@ -1,6 +1,6 @@
 # Clash API and `/stats` reference
 
-This reference describes honk's implemented Clash-compatible HTTP surface and its userspace statistics snapshot.
+honk provides a Clash-compatible HTTP API and a userspace statistics snapshot.
 
 ## Enablement and authentication
 
@@ -229,8 +229,8 @@ once per second. Ten-second receive and send goodput EWMAs require at least
 connection receive or send floor toward `2 x BDP`. Peer `DATA_BLOCKED` and
 `STREAM_DATA_BLOCKED` frames are direct evidence that an advertised window is
 the constraint: they bypass the RTT gate and double the connection or stream
-receive floor instead — the goodput-derived estimate is understated exactly
-while a window throttles the flow. A
+receive floor instead. The goodput-derived estimate is understated while a
+window throttles the flow. A
 zero-progress sample preserves but does not advance a connection-level streak
 only while its credit remains pressured. Each floor has its own five-minute
 promotion cooldown, and automatic promotions are capped at 32 MiB without

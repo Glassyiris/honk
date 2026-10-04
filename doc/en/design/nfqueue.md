@@ -1,6 +1,6 @@
 # NFQUEUE held-first-packet UDP
 
-This document explains the fail-closed path that holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision.
+The NFQUEUE path holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision. It fails closed.
 
 ## Activation and scope
 
@@ -52,8 +52,8 @@ flowchart LR
 
 The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 
-Linux mechanism used only by `honk-core`'s `ebpf` feature.
-Parse one exact-sized datagram allocation. The core sampler and `StatsManager` separate current-instance
+`honk-core` uses this Linux mechanism only with the `ebpf` feature.
+Parsing uses one exact-sized datagram allocation. The core sampler and `StatsManager` separate current-instance
 depth from process-wide drops accumulated across hard rebinds, report latest
 kernel-read availability/errors, and always refresh held-guard/effective-buffer gauges.
 Each sample opens procfs in the calling thread's queue namespace before reading

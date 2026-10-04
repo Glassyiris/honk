@@ -1,6 +1,6 @@
 # 用户态控制平面
 
-本文描述位于内核数据路径与出站栈之间的 `honk-core` 用户态引擎。
+`honk-core` 用户态引擎连接内核数据路径与出站栈。
 
 ## 范围
 
@@ -100,16 +100,16 @@ UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP
 
 ### Transport 与事务
 
-普通 transport 使用 `PacketTransport`；native handler 包装真实 socket，tunnel
-直接实现 packet framing。来源共享的 VLESS XUDP/Mux.Cool 则提交类型化 source
-attachment，让 endpoint view 共用一条 transport receiver。两种形态都不创建
+普通 transport 使用 `PacketTransport`；原生 handler 包装真实 socket，tunnel 直接
+实现 packet framing。来源共享的 VLESS XUDP/Mux.Cool 则提交类型化 source
+attachment，让 endpoint view 共用一个 transport receiver。两种形态都不创建
 loopback bridge。
 
 Endpoint 创建是事务性的：
 
 1. 把 `(client, original destination)` 预留为 `Initializing`；lease 持有首个 datagram、queue permit、slow-path permit、token、generation 和 cancellation epoch。
 2. 路由、嗅探、选择并准备合格 transport。在发布前创建透明 anyfrom reply socket。
-3. 只提交选中候选的 `PreparedUdpTransport<T>` 或 VLESS source preparation；fallible commit 返回选中的 `Arc<T>`/attachment，drop loser 自动回滚。
+3. 只提交选中候选的 `PreparedUdpTransport<T>` 或 VLESS source preparation；fallible commit 返回选中的 `Arc<T>`/attachment，drop loser 会自动回滚。
 4. 启动 endpoint driver，并等待其 ready barrier。
 5. 在共享 epoch fence 下，把精确的 `Initializing` identity 原子替换为 `Ready`。
 6. 转移保留的首包，通过已提交 transport 发送并等待 acknowledgement。

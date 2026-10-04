@@ -1,6 +1,6 @@
 # DNS Canary and Rollback Runbook
 
-This deployment runbook is the operational companion to the [DNS design](../design/dns.md).
+Use this runbook to deploy the DNS subsystem described in [DNS design](../design/dns.md).
 
 This checklist is deployment-only. It was not executed in the local
 development environment because real eBPF load/attach, network namespace
@@ -32,8 +32,8 @@ explicitly authorized Linux host with root access.
    just dns-smoke
    ```
 
-   This command builds the debug `honk-core`, runs it with `--mock-ebpf`, and
-   proves the configured loopback listener over UDP and a persistent TCP
+   This command builds the debug `honk-core` and runs it with `--mock-ebpf`.
+   It verifies the configured loopback listener over UDP and a persistent TCP
    connection before and after an unchanged SIGHUP. It stops the process and
    removes all temporary resources before returning.
 3. Quiesce the installed service using its normal service manager. Copy the
@@ -42,7 +42,7 @@ explicitly authorized Linux host with root access.
    mode. Record checksums for all three rollback artifacts. Do not delete,
    rewrite, compact, or migrate the database.
 5. Restart the previous version and verify its UDP/TCP DNS smoke before
-   proceeding. This proves the rollback bundle rather than merely creating it.
+   proceeding. This verifies that the rollback bundle works.
 
 ## Privileged canary
 

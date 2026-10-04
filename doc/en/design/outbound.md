@@ -1,6 +1,6 @@
 # Outbound and proxy stack
 
-This document describes the path from a selected leaf node to protocol bytes sent to the proxy server or target.
+The outbound stack connects a selected leaf node to the proxy server or target and handles its protocol bytes.
 
 ## Scope
 
@@ -13,7 +13,7 @@ It does not define the node configuration surface; see
 [Node reference](../reference/nodes.md). It also does not choose a group
 member or define health policy; see [Group design](./groups.md).
 
-The boundary returned to an ordinary caller is one of:
+An ordinary caller receives one of:
 
 - `ProxyStream`, an established target-bound TCP byte stream; or
 - `Arc<dyn PacketTransport>`, an established framed packet path for one UDP target.
@@ -29,7 +29,7 @@ Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `ho
 ## Implementation ownership
 
 Public `proxy::*`, `quic::*`, and `quic_boring::*` imports remain supported.
-Implementation owners are smaller ordinary Rust modules:
+Implementations are split into ordinary Rust modules:
 
 | Area | Implementation owners |
 | --- | --- |
@@ -136,7 +136,7 @@ Bare-TCP keys remain proxy-server addresses; health purges remove that address's
 bare entries and only the current generation's matching identity's ready entries.
 
 A bare entry has completed only the proxy-server TCP connect. Before reuse,
-the pool rejects any queued inbound byte—including a fatal TLS alert—because
+the pool rejects any queued inbound byte, including a fatal TLS alert, because
 protocol/TLS setup has not started and no server byte can be valid yet. There is
 no SNI/alert special case and no handshake retry on that socket. A Ready entry
 has completed its target-bound protocol handshake, so already buffered target
@@ -206,7 +206,7 @@ parse-time `created_at` and `updated_at` metadata.
 
 Transfer occurs at the reload commit point. The old generation records moved
 `Node.id` values only after the replacement is published, then skips those
-runtimes during drain and shutdown. Consequently, unchanged nodes keep:
+runtimes during drain and shutdown. Unchanged nodes keep:
 
 - TUIC, Juicity, and Hysteria2 QUIC clients and connections;
 - AnyTLS physical sessions; and
@@ -228,7 +228,7 @@ even though its private carrier is not in a reusable session pool.
 
 ### Dial admission
 
-Physical outbound connects—including direct TCP and proxy TCP/QUIC attempts—and their protocol handshakes acquire two permits:
+Physical outbound connects (including direct TCP and proxy TCP/QUIC attempts) and their protocol handshakes acquire two permits:
 
 1. the captured generation's configured dial gate; then
 2. the immutable process-wide startup ceiling shared by overlapping reload
@@ -270,7 +270,7 @@ process-wide VLESS-carrier gate. The startup resource budget computes
 `min(after_dials / 8, 8192)` before sizing UDP endpoints; zero remains zero.
 Reloaded traffic and DNS runtime forks share the same gate. A permit stays with
 actual carrier I/O through provisional, active, draining, and idle task
-teardown, so it—not a sum of node-local pool caps—is the authoritative descriptor bound.
+teardown. This gate, not a sum of node-local pool caps, is the authoritative descriptor bound.
 
 ## Shared stream, socket, and bootstrap layers
 
@@ -490,7 +490,7 @@ JA4 value is promised.
 Target buffering is a server-version constraint, not a universal honk client
 certificate limit. The documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer uses
 an [8192-byte buffer for target TLS records](https://github.com/MetaCubeX/utls/blob/v1.8.0/reality.go),
-including record framing; this is not simply a DER certificate-length limit.
+including record framing; the limit is not based on DER certificate length alone.
 The reviewed [XTLS/REALITY implementation](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go)
 uses a 17-KiB buffer. Choose a target compatible with the deployed server version.
 
@@ -837,12 +837,12 @@ failures use bounded backoff instead of one physical connect per proxied flow.
 H2MUX and Mux.Cool instead fill the least-loaded carrier within their caps.
 
 After v2 server-settings negotiation (`CMD_SERVER_SETTINGS`, `v=2`), every reused logical stream (SID 2 and
-later) joins a per-SID pending set once its SYN is on the wire, and a SYNACK
-settles only its own SID — an unrelated acknowledgement never clears another
-stream's deadline, and local stream teardown cancels it. An open still pending
+later) joins a per-SID pending set once its SYN is on the wire. A SYNACK settles
+only its own SID; an unrelated acknowledgement never clears another stream's
+deadline, and local stream teardown cancels it. An open still pending
 three seconds after its SYN was written is reset at stream level when the
 session kept receiving frames during the window (the server was alive but
-never acknowledged that open); a fully silent window retires the physical
+never acknowledged that open). A fully silent window retires the physical
 session so the pool redials instead of reusing a dead carrier.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
@@ -852,18 +852,18 @@ last owner release drains future reuse without terminating live streams.
 
 ### Ordered write path
 
-Every frame crosses one `WriterQueue` and one physical writer task. Data uses
-bounded permits in two units — 896 frames and 8 MiB of queued or in-flight
-payload per session, whichever fills first; a full budget backpressures the
-writing stream — control frames retain reserved headroom, and the whole queue
-is capped at 1,024 commands. The byte budget is what bounds queued payload: a
-frame carries up to 65,535 bytes, so frames alone allowed 56 MiB per session,
-which a line-rate upload fills. It does not count a stream's unqueued slot,
-a UoT packet before its permit, or the encoded batch buffer. Exhausting the
-1,024-command queue or a push after close makes the session terminal instead
-of growing memory. The relay reads at most 65,535 bytes at a time, so one
-nonempty read is at most one AnyTLS frame; a 64 KiB read became a
-65,535-byte frame and a 1-byte frame. A stream's SYN and first PSH are inserted as one atomic batch,
+Every frame crosses one `WriterQueue` and one physical writer task. Data permits
+are bounded by 896 frames and 8 MiB of queued or in-flight payload per session,
+whichever fills first. A full budget backpressures the writing stream.
+Control frames retain reserved headroom; the whole queue is capped at 1,024
+commands. The byte budget bounds queued payload: a frame carries up to 65,535
+bytes, so frames alone allowed 56 MiB per session, which a line-rate upload fills.
+It does not count a stream's unqueued slot, a UoT packet before its permit, or
+the encoded batch buffer. Exhausting the 1,024-command queue or a push after
+close makes the session terminal instead of growing memory. The relay reads at
+most 65,535 bytes at a time, so one nonempty read is at most one AnyTLS frame;
+a 64 KiB read became a 65,535-byte frame and a 1-byte frame. A stream's SYN and
+first PSH are inserted as one atomic batch,
 so another stream cannot interleave between them.
 Abandoned mid-open registrations send FIN rather than killing the session.
 

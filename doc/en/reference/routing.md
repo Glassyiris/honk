@@ -151,7 +151,7 @@ The compiled policy admits at most 256 distinct nonzero `direct(mark: ..., must)
 
 See the [global reference](./global.md) for runtime asset resolution. `geoip: private` uses a built-in CIDR set and does not require `geoip.dat`.
 
-When a referenced geo asset cannot be found, the engine logs a warning naming the missing file. Unused assets do not produce missing-file warnings.
+If a referenced geo asset is missing, the engine logs a warning naming the file. Unused assets do not produce missing-file warnings.
 
 A geosite code may select an attribute with `category@attr`. Attribute keys compare case-insensitively. Everything after the first `@` is the selector, including any later `@`. An unknown category or a selector matching no entries logs a warning, expands to zero matchers, and never matches.
 
@@ -215,7 +215,7 @@ routing {
 }
 ```
 
-Here `proxy`, `hk`, and `resilient` are all group names.
+`proxy`, `hk`, and `resilient` are group names.
 
 ## Related docs
 

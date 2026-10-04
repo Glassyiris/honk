@@ -4,29 +4,29 @@
 
 ## 范围
 
-出站栈从路由和组选择产生一个叶子 `Node` 后开始。它负责 capability
-分派、可复用协议状态、transport 建立、TLS 与 REALITY、代理 framing，
-以及返回给控制面的 TCP 或 UDP 对象。
+路由和组选择产生一个叶子 `Node` 后，出站栈负责 capability 分派、可复用协议状
+态、transport 建立、TLS 与 REALITY、代理 framing，以及返回给控制面的 TCP 或
+UDP 对象。
 
-本文不定义节点配置面；见[节点参考](../reference/nodes.md)。本文也不
-选择组成员或定义健康策略；见[组设计](./groups.md)。
+节点配置见[节点参考](../reference/nodes.md)，组成员选择与健康策略见
+[组设计](./groups.md)，不属于出站栈职责。
 
-普通调用方向外返回以下边界之一：
+普通调用方收到以下对象之一：
 
 - `ProxyStream`：已经建立、绑定目标的 TCP 字节流；或
 - `Arc<dyn PacketTransport>`：已经建立、面向一个 UDP 目标的分帧报文路径。
 
 推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享的 VLESS 路径把类型化 `VlessXudpTransport` 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用 receiver。
 
-`direct` 不使用代理协议而直接到达目标。`block` 终止请求。其他每个
-handler 都把选定节点转换成其代理服务器能够理解的字节。
+`direct` 不使用代理协议，直接连接目标。`block` 终止请求。其他每个 handler 都根据
+选定节点生成代理服务器能够理解的协议字节。
 
 本 crate 负责出站拨号、组与健康检查，并由 `honk-core` 以 `honk_core::{proxy, group, outbound}` 重新导出。
 
 ## 实现模块归属
 
-公开的 `proxy::*`、`quic::*` 与 `quic_boring::*` import 路径保持支持；
-实现拆为较小的普通 Rust 模块：
+公开的 `proxy::*`、`quic::*` 与 `quic_boring::*` import 路径仍受支持；实现拆为较
+小的普通 Rust 模块：
 
 | 范围 | 实现模块 |
 | --- | --- |
@@ -37,10 +37,10 @@ handler 都把选定节点转换成其代理服务器能够理解的字节。
 | Score 与健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
 | Session pool | `session/{maintenance,speculative}.rs` |
 
-共享状态仍留在共同祖先中，子模块实现不会把字段公开。REALITY、TLS、
-stream transport 与 UoT 仍由多个协议共用，不归 VLESS 独占。既有测试主题
-名称在对应协议族内保留。物理文件/行号及定义模块 metadata 随归属变化；
-公开 reexport 不会保留 `type_name` 或默认 tracing target。旧 `quic_boring`、
+共享状态仍留在共同父模块中，子模块不公开这些字段。REALITY、TLS、stream transport
+与 UoT 仍由多个协议共用，不归 VLESS 独占。既有测试主题名称在对应协议族内保留。物
+理文件、行号及定义模块 metadata 随归属变化；公开 reexport 不会保留 `type_name`
+或默认 tracing target。旧 `quic_boring`、
 `vless_mux`、`shadowsocks_2022` 日志过滤目标应改为 `honk_outbound::` 前缀下的
 `quic::boring`、`proxy::vless::mux`、`proxy::shadowsocks::aead2022`。
 
@@ -445,7 +445,7 @@ target 缓冲限制取决于服务端版本，不是 honk 客户端统一的证�
 ## VLESS wire 契约
 
 规范配置是 `honk-config/src/node/vless.rs` 中的 `VlessConfig`。UDP permission、
-协议 packet encoding 与 multiplex 是三条独立轴：
+协议 packet encoding 与 multiplex 是三个互相独立的维度：
 
 | 轴 | 值 | 路径作用 |
 | --- | --- | --- |
@@ -459,15 +459,15 @@ Xray TCP concurrency 为零表示 8，负值关闭 TCP mux。XUDP concurrency �
 没有 pool 时使用协议 encoding。显式 `reject` 即使在两个 pool 都关闭时仍是
 终态；`skip` 使用协议 encoding 而不是 pool。Vision 不隐式限制 443 端口。
 
-客户端绝不探测另一条服务端 path、以其他 framing 重试或重放首个 UDP packet。
+客户端不探测另一条服务端 path、不以其他 framing 重试，也不重放首个 UDP packet。
 原生 VLESS 使用 u16 分帧的 connected command-UDP，不发送 UoT magic destination
-或 setup preamble。发送范围为 1–8190 字节；收到的零长度 frame 是 datagram，
-不是 EOF。writer 会确认 flush，取消后的歧义写入不会重放。
+或 setup preamble。发送范围为 1–8190 字节；收到的零长度 frame 是 datagram，不是
+EOF。writer 会确认 flush，不重放取消后结果不明确的写入。
 
 类型化 policy、size 与 carrier-capacity 拒绝都是 terminal local result，与拥塞
-或 transport failure 分开；它们不降低健康或 Score。候选准入在提交协议状态前
-检查 policy；DNS、health 与 CLI 调用方保留该拒绝，不选择 fallback，也不把
-路径报告为不适用。
+或 transport failure 分开；它们不降低健康状态或 Score。候选准入在提交协议状态前
+检查 policy；DNS、health 与 CLI 调用方保留该拒绝，不选择 fallback，也不将路径报
+告为不适用。
 
 ### H2MUX
 
@@ -532,18 +532,18 @@ Score reporter；匹配 reply 与共享 terminal outcome 分别结算这些 flow
 reply 没有逐 flow Score。source 容量耗尽返回 `PacketRejection::Capacity`：对该
 候选终结，但不影响 health 或 Score。
 
-source 关闭准入时同时发布中立或失败的结算结果；即使 driver cleanup 抢先取得
-reporter，统一的 endpoint Score 结算入口也使用该结果。未绑定的 view，以及
-在 source 关闭前已经退役的 view，保留自己的局部结果；shutdown 仍保持中立。
-最后一个已绑定 view 只在 pending attachment 也全部释放后才退休 source；
-兄弟 view 退休时，已有 attachment 仍可完成 commit。
+source 关闭准入时同时发布中性或失败的结算结果；即使 driver cleanup 抢先取得
+reporter，统一的 endpoint Score 结算入口也使用该结果。未绑定的 view，以及在
+source 关闭前已经退役的 view，保留自己的局部结果；shutdown 仍保持中性。最后一个
+已绑定 view 只在 pending attachment 也全部释放后才退役 source；sibling view 退役
+时，已有 attachment 仍可完成 commit。
 
 endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
 也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
 避免兄弟 flow 的发送将其重新解释为 carrier 故障。
 发送开始、完成与退役意图共用 source-state 临界区；先记录匹配 sender 的意图，
-再在同一临界区发布 endpoint 和 source-view 退役标志，之后发送或接收端才能
-对取消原因进行分类。
+再在同一临界区发布 endpoint 和 source-view 退役标志，之后发送或接收端才能分类
+取消原因。
 
 Selector 与 UDP warm retention 独立解析：TCP 所选 pool 响应
 `WarmRequirement::Session`，UDP 所选 pool 响应 `WarmRequirement::Udp`。因此
@@ -643,9 +643,10 @@ TUIC、Juicity 与 Hysteria2 使用 quinn 0.11。`src/quic.rs` 负责 transport
 - key update 与 Retry integrity；以及
 - QUIC transport-parameter 交换。
 
-Header protection 感知 packet-number 长度。接收时先 unmask 第一字节，
-再推导一到四字节的 packet-number 长度；仅 mask 或 unmask 这么多字节。
-把所有 packet number 当作四字节，会破坏短 packet number 后面的 payload；与存在相同错误的对端互测时，错误会相互抵消。
+Header protection 感知 packet-number 长度。接收时先 unmask 第一字节，再推导一到
+四字节的 packet-number 长度；仅仅 mask 或 unmask 相应数量的字节。若将所有 packet
+number 视为四字节，就会破坏短 packet number 后面的 payload；与存在相同错误的对端
+互测时，错误会相互抵消。
 
 进程级、有界 `SESSION_TICKETS` cache 按 ticket key 保存 BoringSSL TLS 1.3
 session（代理 key 包含 host、port、SNI 与有序 ALPN）。BoringSSL 没有隐式客户端缓存；会话恢复要求显式 `SSL_set_session`。`pinSHA256`
@@ -690,7 +691,7 @@ buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包
 Hysteria2 HTTP/3 层刻意保持本地且最小：control/QPACK uni stream、静态表
 QPACK，以及认证所需的 HEADERS 处理。它不得宣告
 `SETTINGS_H3_DATAGRAM`；否则会启动一个竞争的 quic-go datagram reader，
-可能吞掉 Hysteria2 UDP packet。
+可能读走 Hysteria2 UDP packet。
 
 Hysteria2 沿用 sing-quic 的惰性 TCP 建立方式：打开双向流后拨号即返回；首次写入合并请求与载荷，首次读取校验并移除响应，从而节省一次 RTT。
 
@@ -704,9 +705,10 @@ quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。c
 
 ## AnyTLS session 引擎
 
-`src/proxy/anytls/mod.rs` 实现 sing-anytls 多路复用，handler 无状态。每个 generation 的 `NodeRuntime::AnyTls` 拥有一个
-`SessionPool<AnyTlsSession>` 与 lazy materialize 的 BoringSSL connector。
-无 generation 调用使用带 guard 的 ephemeral 等价物。
+`src/proxy/anytls/mod.rs` 实现 sing-anytls 多路复用，handler 无状态。每个
+generation 的 `NodeRuntime::AnyTls` 拥有一个 `SessionPool<AnyTlsSession>` 与 lazy
+materialize 的 BoringSSL connector。无 generation 调用使用由 guard 持有的
+ephemeral 等价对象。
 
 ### Pool 与 session 生命周期
 
@@ -751,10 +753,10 @@ permit 之前的 UoT 包与编码后的 batch 缓冲。relay 每次最多读 65,
 1 字节的 frame。stream 的 SYN 与
 第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。打开流的注册被中途放弃时，会发送 FIN，而不会终止 session。
 
-完成一次 blocking pop 后，writer 只 gather 已经排队的 frame，最多 63
-frame 或 256 KiB（均不含首帧），再执行一次 `write_all` 与一次 `flush`。它绝不等待
-凑满 batch。只有物理 batch 成功或 session 变为 terminal 后，才释放 data
-permit 与 confirmed-write completion。
+完成一次 blocking pop 后，writer 只收集已排队的 frame，最多 63 frame 或 256 KiB
+（均不含首帧），再执行一次 `write_all` 与一次 `flush`，不等待凑满 batch。只有物
+理 batch 成功或 session 变为 terminal 后，才释放 data permit 与 confirmed-write
+completion。
 
 仅含控制帧的 batch 有 5 秒 deadline（与 sing-anytls `writeControlFrame` 一致），到期使 session 失败。含数据帧的 batch 没有 deadline：拥塞只对容量上限施加反压，不会终止同一 session 中的其他流。
 
@@ -764,9 +766,9 @@ pending chunk，也不会重复入队。
 
 ### 非阻塞 demultiplex
 
-每个 TCP child 都有按 `sid` 分发的有界交付队列。队列满时，demultiplexer 把
-frame 按 SID 有序停放到 overflow，而不是等待，从而保持 sibling 进度与
-精确 frame/byte 计数。
+每个 TCP child 都有按 `sid` 分发的有界交付队列。队列满时，demultiplexer 按 SID
+顺序将 frame 暂存到 overflow，不等待队列，保证 sibling 进度，并保留精确的
+frame/byte 计数。
 
 第一个 parked frame 启动每 250 ms tick
 一次的 watchdog。只有整整 3 秒没有成功 overflow flush 的 stream 才被
@@ -786,7 +788,7 @@ payload 分别使用 12 MiB 的 pool-wide byte budget，aggregate ceiling 为
 application-read progress 时，只 reset 该 stream 并丢弃其 retained payload。
 reader 持续推进会重新开始 grace。
 
-这样，一个被放弃的主队列不会占死 pool 中所有 sibling session。
+一个被放弃的主队列不会耗尽 pool 中所有 sibling session 的容量。
 
 FIN 与 error event 绕过 data-frame quota，使 termination 不会被满队列
 隐藏，但每个 SID 最多停放两个 terminal event。普通 overflow reap 会在 reset

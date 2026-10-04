@@ -1,6 +1,6 @@
 # NFQUEUE 持有首包的 UDP 路径
 
-本文说明 fail-closed 路径：它持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户空间得到 direct、proxy 或 block 终态决策。
+NFQUEUE 以 fail-closed 方式持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户态得到 direct、proxy 或 block 终态决策。
 
 ## 启用与范围
 
@@ -26,7 +26,7 @@ global {
 | 路由时已经确定安全的 direct 结果 | 走内核 direct 路径；绝不暂存 |
 | 已启用但尚未 ready 时的暂存候选 | 丢弃新流；无关的非暂存 UDP 保持正常路径 |
 
-“语义尚不明确”是指初步路由仍可能在用户空间路由、模式/组选择或域名/QUIC 检查后改变。该路径避免仅因初步结果不完整就靠猜测把数据包重定向到用户空间 relay。
+语义尚不明确是指初步路由仍可能在用户态路由、模式/组选择或域名/QUIC 检查后改变。该路径不会仅因初步结果不完整，就将数据包重定向到用户态 relay。
 
 ## 持包机制
 
@@ -96,7 +96,7 @@ Proxy 不会创建第二条路由路径。它复用普通透明 UDP 使用的同
 
 ## 截止时间与 fatal 策略
 
-每个包只有一个绝对 3 秒截止时间，从 raw-netlink listener 收包时开始计算。Actor 延迟和每一次后端锁等待都消耗同一预算，包括 Direct Arm 与 Activate 之间的第二次取锁。队列、correlator、slow path 或截止时间饱和时都 fail closed 丢包，而不会延长所有权或内存增长。
+每个包只有一个绝对 3 秒截止时间，从 raw-netlink listener 收包时开始计算。Actor 延迟和每一次后端锁等待都消耗同一预算，包括 Direct Arm 与 Activate 之间的第二次取锁。队列、correlator 或 slow path 饱和，或截止时间到期时，均按 fail-closed 丢包，不延长所有权，也不继续增加内存占用。
 
 Watchdog 独立检查被持有的 cell，并强制执行硬持有上限。Token、endpoint generation 或后端状态不匹配时会丢包，且不会修改更新的 incarnation。Verdict 失败或 Direct 已 Arm 后的任何失败都会使进程 fatal，因为用户空间已无法安全判断内核接受了哪些原始包。
 
@@ -140,7 +140,7 @@ WAN 用户态 UDP 即使 token 为零也使用同一 fence：显式 `RoutingMeta
 | 单个 flow cell | `64` 个被持有的 verdict guard，包括首包 |
 | UDP slow path | 启动时有效预算上限为 `256`；仅在 actor dequeue 时获取 permit |
 
-有效的 slow-path、endpoint、dial 和文件描述符预算来自进程启动时的 `RLIMIT_NOFILE` 规划，因此 `256` 是 ceiling，而不是保证可用的 permit 数。预算推导与所有权见[控制平面](./control-plane.md)。
+有效的 slow-path、endpoint、dial 和文件描述符预算来自进程启动时的 `RLIMIT_NOFILE` 规划，因此 `256` 是上限，而不是保证可用的 permit 数。预算推导与所有权见[控制平面](./control-plane.md)。
 
 ## 可观测性
 

@@ -1,6 +1,6 @@
 # Group Selection, Health, and Warm-up Design
 
-This document explains how honk resolves groups to leaf outbounds, tracks their health, and retains bounded warm resources.
+honk resolves groups to leaf outbounds, tracks their health, and retains bounded warm resources.
 
 ## Scope
 
@@ -44,7 +44,7 @@ UDP selection first excludes forwarding leaves whose canonical protocol/configur
 
 ### Score scoring and lifecycle
 
-Score first runs the same liveness filter as every other policy. The filter's health family describes connectivity to the proxy server; the separately carried target family selects the scoring bucket. Consequently a server reached over IPv4 remains eligible for an IPv6 business target, while no score can return a node already excluded as dead.
+Score first runs the same liveness filter as every other policy. The filter's health family describes connectivity to the proxy server; the separately carried target family selects the scoring bucket. A server reached over IPv4 therefore remains eligible for an IPv6 business target, while no score can return a node already excluded as dead.
 
 The exact key is `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`. Domains are ASCII-lowercased with one trailing dot removed and retain their port; IP targets retain the socket address. A second bounded `(group, TCP/UDP, target family or no family, NodeId)` aggregate supplies the prior for cold targets and receives targetless warm-up samples. Global aggregate, family aggregate, and exact-target evidence blend hierarchically until the more specific layer has enough evidence. Recursive selection carries the same target context and attributes the leaf outcome to every Score group traversed.
 
@@ -154,9 +154,9 @@ The effective tolerance is `max(configured tolerance, 1 ms)` (`group.tolerance.m
 
 `best latency + tolerance >= incumbent current measured latency`
 
-The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior. Hysteresis is skipped for an incumbent carrying failure strikes — a just-failed incumbent is replaced immediately.
+The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior. Hysteresis is skipped for an incumbent carrying failure strikes: a just-failed incumbent is replaced immediately.
 
-Probe failures update only liveness and cooldown; they never create synthetic latency samples or ranking strikes. Only two consecutive real dial failures append a display-excluded synthetic 10-second placeholder plus one failure strike — a lone transient failure (the retry race rescues that flow) leaves no selection state, and only a real dial success resets the streak, so a probe-alive but dial-dead node still accumulates. Real history and moving average are retained, but a candidate with pending dial-failure strikes ranks below every non-demoted candidate. Strikes clear only after `max(strikes, 2)` consecutive real successes — this is the flap guard that stops a fast-but-flaky node from reclaiming first place with one lucky probe.
+Probe failures update only liveness and cooldown; they never create synthetic latency samples or ranking strikes. Two consecutive real dial failures append a display-excluded synthetic 10-second placeholder plus one failure strike. A lone transient failure rescued by the retry race leaves no selection state. Only a real dial success resets the streak, so a probe-alive but dial-dead node still accumulates failures. Real history and moving average are retained, but a candidate with pending dial-failure strikes ranks below every non-demoted candidate. Strikes clear only after `max(strikes, 2)` consecutive real successes. This flap guard stops a fast-but-flaky node from reclaiming first place with one lucky probe.
 
 Real traffic also feeds ranking directly (TCP only). Each node keeps a self-referential EMA (α=1/8, after 3 warmup dials) of fresh dial latencies; pool-ready hits are excluded because they perform no network round trip. Three consecutive dials slower than `max(min(2×EMA, EMA+500 ms), 250 ms)` (`max(min(2×ema, ema+500ms), 250ms)` in `report_dial_latency`) append one failure strike and fire an emergency probe; the 250 ms floor keeps a fast incumbent's normal load jitter (e.g. 60→120 ms) from tripping the detector. The probe moving average is never touched, and a false positive (a shifted target mix rather than node decay) self-heals when the emergency probe succeeds and consecutive probe successes clear the strike. Gradual drift stays owned by the probe cycle; UDP degradation keeps the probe-cycle plus `DataUdp` traffic-threshold path.
 

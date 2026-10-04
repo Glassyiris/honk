@@ -1,8 +1,8 @@
 # Architecture overview
 
-`honk` is a Linux eBPF transparent-proxy engine for gateway and host traffic; this page summarizes its architecture and load-bearing runtime rules. The project is experimental alpha `v0.0.1-alpha`, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
+`honk` is a Linux eBPF transparent-proxy engine for gateway and host traffic. This page describes its architecture and runtime invariants. The project is experimental alpha `v0.0.1-alpha`, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
 
-Its configuration syntax and TC datapath have dae lineage and remain dae-compatible where documented. Its outbound handlers, groups, and Clash API are shaped by sing-box designs. `honk` is an independent implementation and has diverged substantially from both.
+Its configuration syntax and TC datapath derive from dae and remain dae-compatible where documented. Its outbound handlers, groups, and Clash API follow sing-box designs. `honk` is an independent implementation and has diverged substantially from both.
 
 ## Goals and non-goals
 
@@ -52,7 +52,7 @@ Changes to shared map keys, values, constants, or layouts must move together acr
 
 Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, chrono, uuid; `libc` getifaddrs enumerates interface addresses without an `ip` subprocess.
 
-- `from_file` selects by extension. Recognized `.json`/`.yaml`/`.toml` try that format, then only TOML/YAML/JSON fallbacks—never dae. Unknown/missing extensions try file-aware dae (including `include`) → TOML → YAML → JSON. These serde loaders are undocumented compatibility; dae is primary.
+- `from_file` selects by extension. Recognized `.json`/`.yaml`/`.toml` try that format, then only TOML/YAML/JSON fallbacks, never dae. Unknown/missing extensions try file-aware dae (including `include`) → TOML → YAML → JSON. These serde loaders are undocumented compatibility; dae is primary.
 - Standalone Node serde reports ignored protocol-incompatible fields once, even when later conversion fails. Diagnostics contain schema field names, not node names or values. `node::NodeSeed` returns the same warnings through a caller-owned sink without logging; `FlatNode` remains the only flat wire adapter.
 - `ConfigSeed` uses the Node seed for every original array element. Structured failures retain original node, group and subscription indices in map or declaration-order sequence input, safe schema paths and decoder-provided line/column, never decoder error prose. Detailed file/JSON loaders preserve the caller's diagnostic prefix on failure; a successful format fallback removes only abandoned attempts. When every format fails, attempted diagnostics remain ordered with one terminal cause. A dae semantic failure is final unless the complete document decodes as a YAML, TOML or JSON mapping with at least one known Config root key; then the structured loaders report their own outcome. Include and unsupported-policy errors remain final.
 - Parser and share-link data entrypoints retain safe diagnostics without logging. Scalar values, names, links and raw error payloads are withheld; static failure causes and migration guidance remain available, including replacing `dns.hosts_file` with `dns.use_host`. Group/filter/subscription/entry positions use original ordinals. Detailed dae diagnostics share a metadata-only source table with include-parent links and available physical line numbers. Only the outer attempt appends a terminal cause.
@@ -64,7 +64,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 - `src/share_link.rs` is the sole `Node::from_share_link` parser. `src/share_link/options.rs` maps URI packet encoding and independent mux controls into the canonical protocol model, then normalization/validation precedes identity derivation. It does not retain a second VLESS mode model.
 - `src/node/wire.rs` is the sole flat serde adapter. It rejects the removed VLESS legacy field by raw presence, including `null`; the same field on non-VLESS input remains only a compatibility artifact. `VlessConfig.network`, `udp_encoding`, and `multiplex` determine identity, so a canonical cutover can change a VLESS `Node.id` without changing VMess behavior or identity.
 - Canonical VLESS behavior is summarized in [Outbound design](./outbound.md#vless-wire-contracts); field-level syntax and URI values belong in the [node reference](../reference/nodes.md).
-- `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }. The dae parser explicitly whitelists both current nested sections and accepts the deprecated `udp_nfqueue` section only as a migration input; it warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
+- `src/experimental.rs`: `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }. The dae parser explicitly whitelists both current nested sections. It accepts the deprecated `udp_nfqueue` section only as a migration input and warns; `enabled` is copied to `GlobalConfig::nfqueue_enable` only when `global.nfqueue_enable` is absent.
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 11 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ## High-level data path
@@ -134,8 +134,8 @@ flowchart TB
 
 ## Authorship disclosure
 
-- The eBPF datapath—`honk-ebpf`, `honk-ebpf-common`, and the attach/map path in `honk-core`—is the project maintainer's primary human design, implementation-review, and verification focus.
-- Most remaining userspace subsystems—configuration parsers, outbound handlers, groups and health checks, userspace DNS, Clash API, and much of the control-plane glue—were largely authored with AI assistance. The maintainer performed partial code review rather than line-by-line ownership.
+- The eBPF datapath (`honk-ebpf`, `honk-ebpf-common`, and the attach/map path in `honk-core`) is the project maintainer's primary human design, implementation-review, and verification focus.
+- Most remaining userspace subsystems (configuration parsers, outbound handlers, groups and health checks, userspace DNS, Clash API, and much of the control-plane glue) were largely authored with AI assistance. The maintainer performed partial code review rather than line-by-line ownership.
 
 ## Related docs
 

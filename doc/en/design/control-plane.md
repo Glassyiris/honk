@@ -1,10 +1,10 @@
 # Userspace control plane
 
-This document describes the `honk-core` userspace engine between the kernel datapath and the outbound stack.
+The `honk-core` userspace engine connects the kernel datapath to the outbound stack.
 
 ## Scope
 
-The control plane owns transparent ingress, kernel handoff consumption, userspace routing, sniffing, outbound selection, relay, resource admission, and runtime publication. The kernel mechanisms that deliver flows are covered in [Datapath design](./datapath.md). Group policy and health-driven selection are covered in [Group design](./groups.md), and DNS runtime behavior is covered in [DNS design](./dns.md).
+The control plane owns transparent ingress, kernel handoff consumption, userspace routing, sniffing, outbound selection, relay, resource admission, and runtime publication. [Datapath design](./datapath.md) describes kernel flow delivery, [Group design](./groups.md) describes group policy and health-driven selection, and [DNS design](./dns.md) describes DNS runtime behavior.
 
 The main implementation is `crates/honk-core/src/control/`. It consumes `EbpfBackend` state and hands TCP streams or the `PacketTransport` UDP contract to `honk-outbound`.
 

@@ -1,6 +1,6 @@
 # DNS 子系统
 
-本文说明透明 53 端口拦截与可选 `dns.bind` 监听器共用的用户态 DNS 架构。
+透明 53 端口拦截与可选 `dns.bind` 监听器共用用户态 DNS 架构。
 
 字段级设置、可接受的 URI 形式及默认值见 [DNS 配置参考](../reference/dns.md)。缓存完全位于用户态；由 generation 持有的路由投影与域名事实 map 保存学习到的谓词事实，不保存 DNS 应答。
 
@@ -54,11 +54,11 @@ flowchart LR
 
 [TCP handoff 与 UDP 逐报文准入](./control-plane.md#透明代理入口)由控制面负责，包括两者不同的路由代际要求。
 
-过期缓存刷新与偏好地址族的附加查询保留发起者的 `DnsRequestMeta`。没有拦截目的地址的按客户端来源执行的流解析，在策略选择 `asis` 时 fail-closed。
+过期缓存刷新与偏好地址族的附加查询保留发起者的 `DnsRequestMeta`。为流执行的 DNS 解析按客户端来源进行，但没有被拦截的目的地址；策略选择 `asis` 时会 fail-closed。
 
 独立监听器具有以下生命周期与准入不变量：
 
-- 启动 supervisor 前，同步且 all-or-nothing 地 bind 全部所选 transport。任一 bind 失败都会关闭部分集合并令启动失败。
+- 启动 supervisor 前，同步绑定全部所选 transport。任一绑定失败都会关闭已绑定的部分，并令启动失败。
 - 只转发完整、结构有效的单问题请求。无效 UDP 请求收到 `FORMERR`；畸形或不完整 TCP frame 会关闭连接。
 - UDP 入口 profile 将声明的应答大小钳制到 `512..=1232`。Packet-info provenance 保留通配应答源地址选择。
 - TCP 使用持久 RFC 7766 双字节 framing。每次长度读取、正文读取和应答写入都有 30 秒限制。
@@ -137,8 +137,8 @@ waiter clone 原始 causal chain，而不是从 display 文本重建。完成的
 | `both` | 内部/应用 A+AAAA 名称解析并发启动两个符合资格的地址族查询，并保留两者的可用记录。调用方的单条 DNS 查询不会被压制。 |
 | `preferipv4` | A+AAAA 名称解析并发启动两者，但以 IPv4 作为偏好结果集。对普通 AAAA 请求，forwarder 通过正常管线发起 A sibling；仅当 sibling 含可用 IPv4 记录时才返回 NODATA。 |
 | `preferipv6` | 与 `preferipv4` 对称：仅当 AAAA sibling 含可用 IPv6 记录时才压制 A 响应。 |
-| `ipv4only` | 只有 A 符合资格。AAAA 不进行上游 I/O，直接应答 NODATA。 |
-| `ipv6only` | 只有 AAAA 符合资格。A 不进行上游 I/O，直接应答 NODATA。 |
+| `ipv4only` | 只有 A 符合资格。AAAA 不执行上游 I/O，直接应答 NODATA。 |
+| `ipv6only` | 只有 AAAA 符合资格。A 不执行上游 I/O，直接应答 NODATA。 |
 
 偏好地址族 sibling 查询只修改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、逻辑客户端来源、原始目的地址及其余 wire profile 均保持不变。Sibling 普通失败或 NODATA 不会压制可用的非偏好响应；typed local packet refusal 则以原始原因终止调用方的解析。对于内部/应用主机名解析，bootstrap fallback 仅在所有符合资格的地址族均不可用时运行一次，随后用同一地址族资格过滤 fallback 地址。
 
@@ -241,11 +241,10 @@ DoH 与 DoH3 在分配或读取响应体前判定 HTTP 状态。2xx/5xx 之外�
 GOAWAY 由外层重试所有者处理，不在单次查询的可取消 timeout 内关闭 session，
 也不增加嵌套查询尝试。重试决策由 `transport/retry.rs` 管理。
 
-DoH、DoH3 和 DoQ 的失败只保留弱引用会话见证，错误对象本身不会延长 driver
-的生命周期。退役在 slot 锁内核对身份，因此迟到的失败不能关闭替代 session。
-取消 closer 后，teardown
-仍保留在 slot 中，后续 acquire 或 close 会继续同一份清理，完成后才重建。
-Shutdown 仍关闭当前资源，不依赖最后使用它的是哪个查询。
+DoH、DoH3 和 DoQ 的失败只通过弱引用关联会话，错误对象本身不会延长 driver 的生命
+周期。退役在 slot 锁内核对身份，因此迟到的失败不能关闭替代 session。取消 closer
+后，teardown 仍保留在 slot 中；后续 acquire 或 close 会继续同一份清理，完成后才
+重建。Shutdown 仍会关闭当前资源，不依赖最后使用它的是哪个查询。
 销毁最后一个 owner 仍会中止其 driver；任务计数也覆盖首次 poll 之前的取消。
 
 直连 UDP 为每个查询分配由 CSPRNG 选择的新 16-bit ID，接收时同时校验 ID 与 question，恢复调用方 ID，并将退役 ID 隔离三秒。因此延迟报文无法在 ID 复用后满足另一个问题。
@@ -300,7 +299,7 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 `DnsServiceProvider` 持有、回收全部退役与强制关闭 supervisor，并在关闭时等待它们结束。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
-SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
+SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布时持有控制面 routing/config lock；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器属于进程级资源，reload 会被拒绝并要求重启。
 
 路由发布在准入前拒绝旧代排队元数据；已准入查询保留原代 lease。20 位 carrier 使用持久化、启动周期内不回绕的分配器，也计入只替换 descriptor 的 NFQUEUE fence。失败预留值不复用，普通重启不重置耗尽；见[路由发布](./routing.md)。
 

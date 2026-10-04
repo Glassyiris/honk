@@ -10,7 +10,7 @@ condition [&& condition ...] -> direct(mark: value[, must])
 fallback: outbound[(must)] | direct(mark: value[, must])
 ```
 
-- 规则按 `priority` 升序执行，数值越小越先运行；同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配 `0, 1, ...`，流量规则及其顺序完全由用户配置决定。
+- 规则按 `priority` 升序执行，数值越小越先匹配；同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配 `0, 1, ...`，流量规则及其顺序完全由用户配置决定。
 - `default:` 是 `fallback:` 的别名。没有规则最终确定结果时使用 fallback 目标；省略时默认为 `direct`。
 - 同一个 matcher 内以逗号分隔的参数互为备选。不同的非空条件组必须全部匹配。
 - 匹配器的括号参数列表可以在同一源文件内跨物理行，语句一直延续到右括号和 `-> outbound`。被包含的文件不能补全另一文件中未完成的调用。
@@ -61,7 +61,7 @@ domain pattern/suffix/keyword/regex 与 `geosite` 都是同一条件内的备选
 | `block` | 内建阻断出站 |
 | 组名 | 按该出站组及其策略解析 |
 
-裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。每份配置最多可定义 250 个顶层用户组；更高的路由序号由 ABI 保留。
+裸节点名不是合法的出站目标，`Config::validate` 会拒绝：应先将节点加入一个组（例如 `filter: name('node')`），再引用组名。组与节点也不允许同名。每份配置最多可定义 250 个顶层用户组；更高的路由序号由 ABI 保留。
 
 追加 `(must)` 后，命中的结果立即终结规则搜索，并跳过嗅探与后续域名重路由（`no_sniff` 语义）。它保留选中的 direct、block 或 group 动作，并非一概绕过 honk。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续扫描”的 `MustRules` opcode。
 
@@ -72,7 +72,7 @@ TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` 监听 socket 不
 | `direct(must)` | 跳过 DNS 控制器。LAN 流量及无 mark 的 WAN 流量使用 Linux 原生交付；非零 mark 的 WAN 结果由带 mark 的直连套接字重新执行策略路由查找。 |
 | `block(must)` | 丢弃报文。 |
 | `group(must)` | 通过该组的原始 TCP relay / UDP `PacketTransport` 转发，跳过 honk DNS 的 hosts、缓存、请求/响应策略和投影。 |
-| 非 `must` 的 `direct`、组或 `block` | 有效 DNS 查询仍归 DNS 控制器处理；Clash 模式直连 offload 不会抢走接管权限。 |
+| 非 `must` 的 `direct`、组或 `block` | 有效 DNS 查询仍归 DNS 控制器处理；Clash 模式直连 offload 不会剥夺接管权限。 |
 
 畸形的非 `must` UDP53 payload 保留通用 UDP 回退，不进入 `DnsController`；控制器一行不表示所有端口 53 payload 都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)。LAN 本地 socket 优先接收仅适用于非 53 目的端口，按 transport 分别判断；通配监听仍需完整 FIB 返回 `NOT_FWDED`，非 DNS TCP 纯 SYN 仍跳过探测。透明 LAN 与原生/loopback 交付的区别见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
 

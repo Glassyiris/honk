@@ -41,9 +41,9 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 **破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及 session 状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
 
-不要为了迁移 ID 而删除缓存。持久化已启用且可读时，未变更的组名、成员名可用于恢复 Selector 选择；有效且不超过 24 小时的 TCP-v4 延迟样本会在启动时按节点名关联到新 ID。这些样本只用于排名，不恢复存活性；改名或重复名称不能保证恢复同一个叶节点。就绪流原本就随所属 generation 退役，`name`/`subtag` 筛选语义不变。
+不要为了迁移 ID 而删除缓存。持久化已启用且可读时，未变更的组名、成员名可用于恢复 Selector 选择；有效且不超过 24 小时的 TCP-v4 延迟样本会在启动时按节点名关联到新 ID。这些样本只用于排名，不恢复存活状态；改名或重复名称不能保证恢复同一个叶节点。就绪流原本就随所属 generation 退役，`name`/`subtag` 筛选语义不变。
 
-只要可拨号端点和 dial shape 不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
+只要可拨号端点和 dial shape 不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置与运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何传入的 nil ID。
 
 ## 节点字段
 
@@ -101,7 +101,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 
 ### 结构化 loader 兼容性
 
-TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所选 `protocol` 自己的字段；其他协议遗留的非默认字段会被剥离而不会拒绝节点，并由一条警告列出被剥离的字段名。例如，`ss` 节点上的 `tls: true` 会被忽略并告警，而不会开启 TLS。对 Trojan、VLESS、Hysteria2 与 AnyTLS，`username` 不是凭证别名；缺少该协议实际凭证字段时，单独提供的 `username` 会被剥离并触发针对性警告，从而保持旧版行为与 ID。所选协议实际使用的值仍会正常解析与校验。Honk 自身输出仍可安全 round-trip。启用 `store_subscribe` 时，原始订阅正文仅在解析成功后持久化；被拒绝的刷新不会覆盖上一份有效正文。
+TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所选 `protocol` 的字段；其他协议遗留的非默认字段会被移除，但不会拒绝节点。一条警告列出所有移除的字段名。例如，`ss` 节点上的 `tls: true` 会被忽略并告警，不会开启 TLS。对 Trojan、VLESS、Hysteria2 与 AnyTLS，`username` 不是凭证别名；缺少该协议实际凭证字段时，单独提供的 `username` 会被移除并触发针对性警告，保持旧版行为与 ID。所选协议实际使用的值仍会正常解析与校验。Honk 自身输出仍可安全 round-trip。启用 `store_subscribe` 时，原始订阅正文仅在解析成功后持久化；被拒绝的刷新不会覆盖上一份有效正文。
 
 VLESS 扁平输入已移除 `vless_mode`。只要原始输入中出现该字段，节点就会被拒绝，包括值为 `null` 或任一旧版已知拼写；请用 `network` 表示 packet 权限、`packet_encoding` 表示回退、`multiplex` 表示 carrier 选择。唯一保留的 `vless_mode: "legacy"` 是非 VLESS 扁平格式序列化的兼容占位字段。它不配置 VLESS，非 VLESS 行为与身份保持不变。
 
@@ -151,7 +151,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 
 没有 `rprx` Cargo feature 时，VMess 与 VLESS 节点仍能解析，但不会注册 handler，拨号以 `No handler for protocol` 失败；正常 feature-off 构建不会分配 VLESS pool 或 carrier semaphore。`honk-core` 与 `honk-tool` 默认启用 `rprx`。
 
-`honk-core` 在启动和 reload 时注入具有固定保留 ID 的 `direct` 与 `block`。用户节点不得使用这些名称或协议。组不会从节点池里取到它们，只有按名字写出的 `filter: name(direct)` 或 `name(block)` 才会收入，见[组参考](./groups.md#语法)。
+`honk-core` 在启动和 reload 时注入具有固定保留 ID 的 `direct` 与 `block`。用户节点不得使用这些名称或协议。组不会从节点池中自动纳入它们，只有精确匹配名称的 `filter: name(direct)` 或 `name(block)` 才会纳入，见[组参考](./groups.md#语法)。
 
 ## 协议参数
 
@@ -296,7 +296,7 @@ node {
 
 #### 从 `vless_mode` 迁移
 
-**破坏性配置变更：**`vless_mode` 已删除，不是兼容别名。升级前应迁移静态链接与 provider 内容。静态 `node {}` 中出现该字段会拒绝候选配置；订阅只丢弃对应条目，保留其他有效节点。全部使用旧模式的订阅缓存无法在离线状态下恢复节点；离线升级前应确保本地已有迁移后的 body，不要删除仍可用的 Selector 或延迟状态。单个 provider 恢复失败本身不导致启动退出，但最终组装的配置仍须通过校验。
+**破坏性配置变更：**`vless_mode` 已删除，不是兼容别名。升级前应迁移静态链接与 provider 内容。静态 `node {}` 中出现该字段会拒绝候选配置；订阅只丢弃对应条目，保留其他有效节点。全部使用旧模式的订阅缓存无法在离线状态下恢复节点；离线升级前应确保本地已有迁移后的正文，不要删除仍可用的 Selector 或延迟状态。单个 provider 恢复失败本身不导致启动退出，但最终组装的配置仍须通过校验。
 
 每种旧 mode 都有直接且保留能力的替代组合：
 

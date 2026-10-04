@@ -1,6 +1,6 @@
 # Experimental 配置参考
 
-本文档说明 `experimental { ... }` 下当前支持的两个嵌套 section。
+`experimental { ... }` 当前支持两个嵌套 section。
 
 ## Section 概览
 
@@ -9,24 +9,24 @@
 | `clash_api` | Clash 兼容 HTTP API 与外部 dashboard |
 | `cache_file` | 用 SQLite 持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
 
-`udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，打印迁移 warning，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
+`udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，输出迁移警告，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
 
 ## `clash_api`
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `external_controller` | `""` | HTTP 监听地址。空值关闭 API server。 |
+| `external_controller` | `""` | HTTP 监听地址。空值关闭 API 服务。 |
 | `external_ui` | `""` | 外部 dashboard 目录。空值关闭 dashboard 服务与下载。 |
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL。空值使用内建 zashboard URL。 |
 | `external_ui_download_detour` | `""` | 下载使用的节点或组 tag。空值遵循普通流量路由。 |
 | `secret` | `""` | API 鉴权 secret。空值关闭鉴权。 |
 | `default_mode` | `"Rule"` | 启动模式：`Rule`、`Global` 或 `Direct`。有效的缓存模式优先。 |
 
-所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。
+所有 `clash_api` 字段只在启动时生效。SIGHUP 提交的候选配置若修改其中任一字段，就会被拒绝。
 
 ### 鉴权与传输
 
-`secret` 非空时，API 请求使用 `Authorization: Bearer <secret>`；WebSocket upgrade 也可以改用 `?token=<secret>`。静态 `/ui` 内容不经过这层鉴权 middleware。内置 listener 只提供明文 HTTP，不提供 TLS。应绑定到 `127.0.0.1` 等 loopback 地址，或在前面部署带鉴权的 TLS reverse proxy；不得直接暴露到不受信任的网络。endpoint 清单见 [Clash API 参考](./api.md)。
+`secret` 非空时，API 请求使用 `Authorization: Bearer <secret>`；WebSocket upgrade 也可以改用 `?token=<secret>`。静态 `/ui` 内容不经过这层鉴权中间件。内置 listener 只提供明文 HTTP，不提供 TLS。应绑定到 `127.0.0.1` 等 loopback 地址，或在前面部署带鉴权的 TLS 反向代理；不得直接暴露到不受信任的网络。endpoint 清单见 [Clash API 参考](./api.md)。
 
 显式启用非回环地址监听且 secret 为空时，会在 `experimental.clash_api.external_controller` 产生 `unsafe-api-bind`，结构化输入也不例外。诊断不包含端点或 secret。使用回环地址的示例配置不产生该警告；此警告不会改变监听、鉴权或 CORS 规则。
 
@@ -34,7 +34,7 @@
 
 绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
-非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 仍按原有行为遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。
+非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 按普通流量路由选路。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。
 
 ### 启动模式
 
@@ -50,7 +50,7 @@
 | `store_fakeip` | `false` | 仅表示 FakeIP 持久化意图。已有 `fakeip:` 前缀和 flush API，但引擎尚不写入或恢复映射。 |
 | `store_dns` | `false` | 使用 exact-key v2 格式持久化并恢复 DNS 缓存应答。 |
 
-整个 `cache_file` section 都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改任一字段就会被拒绝。
+整个 `cache_file` section 只在启动时生效。SIGHUP 提交的候选配置若修改任一字段，就会被拒绝。
 
 ### 始终持久化的状态
 

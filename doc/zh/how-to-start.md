@@ -1,6 +1,6 @@
 # honk 直通手册
 
-honk 是 Linux 上的实验性 eBPF 透明代理引擎。本文只说明普通用户需要的安装、配置和启动步骤；配置字段与实现细节请查阅文末链接。
+honk 是 Linux 上的实验性 eBPF 透明代理引擎。本文说明普通用户需要的安装、配置和启动步骤；配置字段与实现细节见文末链接。
 
 > **注意**
 >
@@ -60,7 +60,7 @@ CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 
 ### bpffs
 
-eBPF map 必须 pin 在 bpffs，而不是普通目录：
+eBPF map 必须 pin 在 bpffs，不能使用普通目录：
 
 ```shell
 sudo install -d -m 0755 /sys/fs/bpf
@@ -83,7 +83,7 @@ bpf /sys/fs/bpf bpf defaults 0 0
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
 
-musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，吞吐优先；`-stock` 包使用系统 allocator，更适合关注内存高水位的小内存设备。
+musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备。
 
 ```shell
 tar -xzf honk-core-<version>-<target>.tar.gz
@@ -260,7 +260,7 @@ sudo systemctl status honk-core
 sudo journalctl -xefu honk-core
 ```
 
-不要在未验证前添加严格的 capability bounding、只读 `/proc/sys` 或 `NoNewPrivileges=yes`；启动需要 BPF、网络管理、network namespace、mount、sysctl 和 transparent socket 权限。
+不要在未验证前添加严格的 capability bounding、只读 `/proc/sys` 或 `NoNewPrivileges=yes`；启动需要 BPF、网络管理、网络命名空间、挂载、sysctl 和 transparent socket 权限。
 
 ## 检查运行状态
 
@@ -291,7 +291,7 @@ sudo systemctl reload honk-core
 sudo /usr/local/bin/honk-core reload
 ```
 
-是否应用成功以运行日志中的 `applied` 或 `rejected` 为准。接口、TPROXY、`data_dir`、NFQUEUE 开关、DNS bind、Clash API listener/secret、cache 等进程级设置发生变化时，需要 restart。
+是否应用成功以运行日志中的 `applied` 或 `rejected` 为准。接口、TPROXY、`data_dir`、NFQUEUE 开关、DNS bind、Clash API listener/secret、cache 等进程级设置发生变化时，需要重启。
 
 正常停止：
 
@@ -303,7 +303,7 @@ sudo systemctl stop honk-core
 
 ## 无 root 开发
 
-`--mock-ebpf` 可以验证配置、API、DNS 和 userspace 出站，但不会拦截任何真实流量。
+`--mock-ebpf` 可以验证配置、API、DNS 和用户态出站，但不会拦截任何真实流量。
 
 将以下内容保存为 `/tmp/honk.dae`：
 
@@ -332,7 +332,7 @@ cargo run --release -p honk-core -- \
 - group 支持 Selector、URLTest、LoadBalance、Fallback 和 Score。
 - DNS 上游支持 UDP、TCP、DoT、DoH、DoH3 和 DoQ，也可经 node/group 出站。
 - `direct` 和 `block` 是内建节点，不要在配置中重复声明。
-- `nfqueue_enable` 默认开启，固定使用 queue 320，并独占 `inet honk_nfqueue` / `udp_decision`。同一 network namespace 中的防火墙管理器不能改动这些对象。
+- `nfqueue_enable` 默认开启，固定使用 queue 320，并独占 `inet honk_nfqueue` / `udp_decision`。同一网络命名空间中的防火墙管理器不能改动这些对象。
 - mock 或未启用 Cargo `ebpf` feature 的构建不会提供透明代理。普通 `cargo build --release` 不包含真实 datapath；必须使用 `--features ebpf`。
 - 当前没有 VMess UDP、rootless datapath、Dockerfile 或 docker-compose 配置，也不支持非 Linux 系统。
 

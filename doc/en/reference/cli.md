@@ -1,6 +1,6 @@
 # Command-Line Reference
 
-This reference covers the current `honk-core` engine CLI and the `honk-tool` diagnostics toolbox.
+`honk-core` runs the engine; `honk-tool` provides diagnostics.
 
 ## `honk-core`
 
@@ -85,7 +85,7 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 
 ### Build and deployment
 
-A normal development build is:
+Build for development:
 
 ```bash
 cargo build --release -p honk-tool
@@ -155,7 +155,7 @@ vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp
 
 Probe eligibility is `supported`, `invalid-uuid`, `invalid-reality`, `invalid-config`, `unsupported-transport`, `unsupported-flow`, or `vision-without-tls`/`vision-non-tcp`; invalid and intentionally unsupported entries remain visible but perform no network work. Vision may use TCP only with an eligible direct carrier, while UDP-only Xray mux remains valid. VLESS Encryption can combine with Vision; only unencrypted Vision additionally requires TLS 1.3 or REALITY on raw TCP.
 
-`n/a` means a probe was not applicable—for example, packet dialing is disabled or UDP/443 policy rejects that target. A local carrier-capacity refusal is an attempted terminal failure and appears as `FAIL(...)`, not `n/a`; it remains neutral to remote endpoint health. This distinction matters because the shared global file-descriptor budget can admit fewer physical VLESS carriers than the per-node mux limits request.
+`n/a` means a probe was not applicable, for example because packet dialing is disabled or UDP/443 policy rejects that target. A local carrier-capacity refusal is an attempted terminal failure and appears as `FAIL(...)`, not `n/a`; it remains neutral to remote endpoint health. The shared global file-descriptor budget can admit fewer physical VLESS carriers than the per-node mux limits request.
 
 UDP DNS target resolution, packet-transport setup, send, and receive share one `--timeout` budget. A resolution failure or timeout is reported only in the DNS column; TCP, URLTest, and QUIC probes continue. Unsupported UDP nodes skip this resolution, and a failed hostname is never replaced with another target.
 

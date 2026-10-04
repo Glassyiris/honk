@@ -1,6 +1,6 @@
 # 订阅参考
 
-本文说明当前 runtime 接受的 `subscription {}` 条目、持久化恢复机制与订阅正文格式。
+`subscription {}` 配置远程节点列表。本页说明条目、持久化恢复机制与支持的订阅正文格式。
 
 ## `subscription {}` 语法
 
@@ -19,7 +19,7 @@ subscription {
 }
 ```
 
-简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua` 和可选的 `interval`；`interval` 是 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。
+简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua` 和可选的 `interval`；`interval` 表示 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。
 
 tag 可以省略。条目不带引号时，第一个 `:` 之前的文本是 tag；如果该冒号属于 `://`，则没有 tag，也不会按 URL 中后续的冒号拆分。tag 和 URL 都可以使用配对的单引号或双引号。带引号的 tag 后接 `:` 表示显式 tag；否则，解析器先去掉 URL 的外层引号，再应用相同的首个冒号规则。因此，`'paid:https://example.com/sub'` 的 tag 是 `paid`，而 `'https://example.com/sub'` 没有 tag。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，会自动识别下文列出的正文格式。
 
@@ -54,7 +54,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | `node_count` | u32 | `0` | 否 | 模型元数据；当前 core runtime 不更新它。 |
 | `created_at` | datetime | 构造时间 | 否 | 模型构造时间。 |
 
-内部正文选择行为如下：
+按以下规则选择正文解析器：
 
 | `sub_type` | 解析行为 |
 | --- | --- |
@@ -88,7 +88,7 @@ SIGHUP 时，fetch 身份（URL + 配置的 `ua` + headers）相同的订阅保�
 失败处理会保留可用 runtime，而不会清空它：
 
 - HTTP、UTF-8 编码、解析或无可用节点错误不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。通过校验的正文按原始字节保存，不修复编码。
-- 持久化写入在解析成功后失败属于非致命错误：新解析出的节点仍会返回用于发布，而原子写入路径绝不会安装只写了一部分的正文。下次重启因此可以恢复磁盘上保留的任一完整有效正文。
+- 解析成功后，持久化写入失败属于非致命错误。新解析出的节点仍会返回用于发布，原子写入不会保存不完整的正文。下次重启可以恢复磁盘上保留的任一完整有效正文。
 - 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的 proxy 索引和固定拒绝原因，不包含原始记录或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
 
 上一次有效正文指通过当前导入规则校验的正文，不是最后一次成功发布的运行时配置。部分条目无效但仍有一个可用节点的正文可以替换存储；全部无效的正文不能。恢复时会按当前规则重新解析，因此旧版本保存的正文可能被拒绝。写入成功后，若节点集合校验或发布失败，活动配置保持不变，但磁盘上可能已保存新正文。磁盘与活动配置不属于同一事务。
@@ -222,11 +222,11 @@ Surge `server-cert-fingerprint-sha256` 映射到 honk 的叶证书 pin：两者�
 
 记录格式会在赋值前比较 `skip-cert-verify`、`allow-insecure`、`insecure`，以及取反后的 `tls-verification`。`tls-verification=false,insecure=true` 一致；`tls-verification=true,insecure=true` 则拒绝该条目。记录文本仅接受不区分大小写的 `true/yes/1/on` 和 `false/no/0/off`；空文本及 `t/y/f/n` 仍为无效值。证书固定规则的限制不变。
 
-有效的 Quantumult X `tls-cert-sha256` / `tls-pubkey-sha256` 固定证书设置会被拒绝：honk 的叶证书 pin 会替代 PKI，不能拿它替换尚未确认等价的外部验证约定。显式设置 `tls-verification=false` 时，QX 会忽略两类 pin，导入会保留该禁用验证行为。有效的 QX REALITY 会按[官方配置](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf)忽略自定义 `tls-alpn` 和 session-ticket 设置；普通 TLS 不适用该例外。旧 VMess `aead=false`、启用的 Shadowsocks UoT/SSR、不支持的 TLS ALPN 和禁用 TLS session 复用会被拒绝，不会静默丢弃。
+有效的 Quantumult X `tls-cert-sha256` / `tls-pubkey-sha256` 固定证书设置会被拒绝：honk 的叶证书 pin 会替代 PKI，不能替换尚未确认等价的外部验证约定。显式设置 `tls-verification=false` 时，QX 会忽略两类 pin，导入会保留该禁用验证行为。有效的 QX REALITY 会按[官方配置](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf)忽略自定义 `tls-alpn` 和 session-ticket 设置；普通 TLS 不适用该例外。旧 VMess `aead=false`、启用的 Shadowsocks UoT/SSR、不支持的 TLS ALPN 和禁用 TLS session 复用会被拒绝，不会静默丢弃。
 
 ## 离线解析与探测
 
-`honk-tool sub` 接受需要拉取的订阅 URL，或任一种受支持正文格式的本地文件。本地文件不会触发订阅下载，适合离线解析；随后命令仍会执行所配置的连通性与延迟探测：
+`honk-tool sub` 接受需要拉取的订阅 URL，或任一种受支持正文格式的本地文件。本地文件不触发订阅下载，可用于离线解析；随后命令仍会执行配置的连通性与延迟探测：
 
 ```console
 honk-tool sub ./share-links.txt --limit 10

@@ -1,8 +1,8 @@
 # honk Configuration Guide
 
-This guide shows how to assemble and operate a honk configuration without repeating the field inventories in the reference docs.
+Use this guide to assemble and operate a honk configuration; the reference docs list individual fields.
 
-honk uses dae configuration syntax as a dialect: the known differences from dae are listed in the [dialect reference](./reference/dialect.md). The runtime sections and CLI entry point are listed below; `include {}` composes files and is covered next.
+honk uses a dialect of dae configuration syntax; the [dialect reference](./reference/dialect.md) lists known differences. The table lists runtime sections and the CLI entry point. `include {}` composes files.
 
 | Section | Purpose | Reference |
 | --- | --- | --- |
@@ -15,7 +15,7 @@ honk uses dae configuration syntax as a dialect: the known differences from dae 
 | `experimental` | Enable the Clash API or persistent cache. | [Experimental reference](./reference/experimental.md) |
 | CLI | Select a config, backend, object file, or local command. | [CLI reference](./reference/cli.md) |
 
-The built-in outbounds `direct` and `block` are injected at startup and may be used in groups and routing rules.
+honk injects the built-in outbounds `direct` and `block` at startup. They may be used in groups and routing rules.
 
 ## Configuration format
 
@@ -287,7 +287,7 @@ These mechanisms are independent and bounded by configured groups or explicit bu
 | UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, runs at most 4 attempts concurrently, and caps retained nodes at `4×N`. UDP and Selector ownership are independent. |
 | Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and handshakes per generation. Ready-pool hits, logical streams on warm transports, `direct`, and `block` are exempt; overlapping reload generations also share the startup descriptor gate. |
 
-Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests: cold reusable transports warm outside the timer and close afterward, and the reported latency is the second request on the warmed connection — one round trip, with dial and TLS excluded. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
+Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests. Cold reusable transports warm outside the timer and close afterward. The reported latency is the second request on the warmed connection: one round trip, with dial and TLS excluded. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
 
 See the [group selection design](./design/groups.md).
 
@@ -315,7 +315,7 @@ See the [CLI reference](./reference/cli.md).
 2. Ensure every routing rule/fallback, DNS fallback, group `final`, and `->` proxy target names an existing group, node, `direct`, or `block` as appropriate.
 3. For first-connection domain rules, use `dial_mode: domain`/`domain++` or ensure client DNS passes through honk so the domain routing map is populated.
 4. After changing groups or policies, SIGHUP rebuilds `GroupManager`; a still-valid Selector choice migrates to the replacement generation.
-5. Changing `global.nfqueue_enable` requires a restart; when activation is desired, verify the real eBPF backend and startup prerequisites, and ensure the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
+5. Changing `global.nfqueue_enable` requires a restart. To enable staging, verify the real eBPF backend and startup prerequisites, and ensure the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
 6. When adding or changing configuration fixtures, run `cargo test -p honk-config` to keep parser examples valid.
 
 ## Related docs

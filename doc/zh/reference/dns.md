@@ -1,6 +1,6 @@
 # DNS 配置参考
 
-本文定义当前 dae 语法的 `dns { ... }` 段及其运行时语义。
+本页列出 dae 语法的 `dns { ... }` 配置段及其运行时语义。
 
 ## 顶层键
 
@@ -210,7 +210,7 @@ NXDOMAIN 和 SERVFAIL 应答会直接返回，不经过应答路由，也不应�
 | `max_cache_size` | `10000` | 条目上限。它还按每个配置条目 4 KiB 缩放保留 query/response wire 字节预算；每个分片至少 65,535 字节，全局上限 64 MiB。`0` 会告警并钳制为一个条目。 |
 | `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 禁止缓存所有响应码的应答，包括 NXDOMAIN 和 SERVFAIL。 |
 
-Request 路由先于缓存查询执行。缓存与后台 refresh 的标识使用选中的上游或精确 `asis` 目的地址，而不是原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
+Request 路由先于缓存查询执行。缓存与后台刷新的标识使用选中的上游或精确 `asis` 目的地址，不使用原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
 
 设置 `optimistic_cache_ttl: 0` 且没有 `fixed_domain_ttl` 覆盖时，NOERROR 正应答使用 answer、authority 和 additional 段中所有非 OPT 记录的最小 TTL。任一记录 TTL 为零时，honk 不缓存该应答，并移除精确缓存槽，避免旧地址或更早的负应答再次返回。非零的配置 TTL 或固定 TTL 仍可覆盖零值。其他失败响应码的 TTL 行为不变。
 

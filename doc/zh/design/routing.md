@@ -3,7 +3,7 @@
 ## 范围
 
 路由只有一个手写语义模型，执行方式可以不同：用户态 `Router` 解释规范化的
-policy IR，受限编译器把同一 IR 降低为原生 eBPF 比较代码。内核不再解释第二套
+policy IR，受限编译器把同一 IR 编译为原生 eBPF 比较代码。内核不解释第二套
 policy 表示。真实后端的内核基线为 Linux 6.12。
 
 静态 TC 程序继续负责报文解析、特殊/本地排除、DNS 接管判断、conntrack、mode 与健康检查、
@@ -33,10 +33,10 @@ native-direct 与已有流缓存路径保持原生执行。
 
 ## 内核路由
 
-切换保留当前用户态匹配语义：
+切换后保留当前用户态匹配语义：
 
-- 普通 domain pattern/suffix/keyword 是同一条件内的 OR；与 geosite 字段同时存在
-  时，geosite 仍是独立条件。suffix、regex、keyword、大小写和 geosite 属性行为不变。
+- 普通 domain pattern/suffix/keyword/regex 与 geosite 在同一条件内按 OR 匹配。
+  suffix、regex、keyword、大小写和 geosite 属性行为不变。
 - 目的/源 IP 保留 IPv4/IPv6 身份，覆盖 `/0`、裸主机地址及重叠前缀。
 - 端口区间包含两端；TCP/UDP 和 IPv4/IPv6 mask 可以同时包含两种值。
 - pname 保留配置端 15 字节规范化及子串匹配语义。内核进程字节按照 handoff 相同的
@@ -169,7 +169,7 @@ map 指针合并成一个状态，于是跨越后续规则仍然存活的事实�
 加上就超过 1,000,000）。复制出来的 bitmap 是标量，其余状态相容时，已记录的非精确
 标量状态可以吸收其他路径。
 
-分支布局也是其中一环：verifier 先探索未定条件跳转的
+分支布局也受 verifier 约束：verifier 先探索未定条件跳转的
 fall-through，所以每个分叉（包括 IPv4/IPv6 分派）都把从 map value 复制的路径放在
 fall-through、填零放在跳转目标；先被记录的填零路径一旦有 bit 测试可预测就会变成
 精确值，无法吸收后来的未知值。同一内核上实测，这份策略去掉两条规则时处理 53,383

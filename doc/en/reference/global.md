@@ -1,6 +1,6 @@
 # Global configuration reference
 
-This page defines the current `global { ... }` configuration fields and their runtime effect.
+`global { ... }` configures process-wide settings. The fields and their runtime effects are listed below.
 
 ## Fields
 
@@ -12,7 +12,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | Compatibility switch intended to prevent re-interception of the transparent port. The current runtime does not read it. |
 | `pprof_port` | `pprof_port` | `0` | Compatibility pprof HTTP port; `0` means disabled. honk currently starts no pprof server and does not read this field. |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0` (effective `0x100`) | Process-wide `SO_MARK` for honk-originated sockets and exact datapath bypass. A nonzero value replaces `0x100`, not ORs with it; changing the setting requires restart. Bits `0xc8000000` are reserved and rejected. See [Socket marks](#socket-marks). |
-| `log_level` | `log_level` | `"info"` | Startup log filter. `--debug` takes precedence, followed by `RUST_LOG`, then this value. A SIGHUP change is restart-required. `info` covers runtime state (startup, reloads, health, subscriptions); the per-connection routing lines (`TCP connection`, `UDP connection`, eBPF offload) are `debug`, so a router's syslog is not flooded by traffic. To audit routing decisions, run with `debug` or read `/logs?level=debug` from the API. |
+| `log_level` | `log_level` | `"info"` | Startup log filter. A valid `RUST_LOG` takes precedence, followed by `--debug`, then this value. A SIGHUP change is restart-required. `info` covers runtime state (startup, reloads, health, subscriptions); the per-connection routing lines (`TCP connection`, `UDP connection`, eBPF offload) are `debug`, so a router's syslog is not flooded by traffic. To audit routing decisions, run with `debug` or read `/logs?level=debug` from the API. |
 | `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled. SIGHUP requires restart only when the resolved effective destination changes; `--log-file` shadows this value. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
@@ -44,7 +44,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | Requested generation-local cap on physical proxied connects and protocol handshakes; runtime resource budgeting may clamp it. |
 | — (not settable in dae syntax) | `tproxy_mark` | `0x08000000` | Fixed fwmark shared by userspace policy routing and the compiled eBPF datapath. |
 | — (not settable in dae syntax) | `udphop_interval_secs` | `30s` | Legacy global UDP-hop interval. Current dialers do not read it; protocol-specific hopping uses node fields. |
-| — (not settable in dae syntax) | `connect_timeout_ms` | `3000ms` | Stage timeout used by proxy connects, protocol preparation, preconnect, health probes, and control-plane dials. Transparent TCP candidate races and UDP transport preparation additionally share an absolute overall budget of `max(10s, 4 × connect_timeout)`; this adds no configuration key. |
+| — (not settable in dae syntax) | `connect_timeout_ms` | `3000ms` | Stage timeout used by proxy connects, protocol preparation, preconnect, health probes, and control-plane dials. Transparent TCP candidate races and UDP transport preparation additionally share an absolute budget of `max(10s, 4 × connect_timeout)`; this adds no configuration key. |
 | — (not settable in dae syntax) | `dns_resolve_timeout_ms` | `2000ms` | Timeout for control-plane DNS resolution, including targets that must be converted to an IP before dialing. |
 | — (not settable in dae syntax) | `relay_idle_timeout_secs` | `300s` | Legacy relay-idle timeout field. The current relay path does not read it. |
 

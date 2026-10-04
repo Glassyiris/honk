@@ -1,6 +1,6 @@
 # eBPF kernel datapath
 
-This document covers kernel-side interception; the userspace path is described in [Control plane](./control-plane.md), and held-first-packet UDP is described in [NFQUEUE](./nfqueue.md).
+The kernel datapath intercepts traffic. [Control plane](./control-plane.md) describes the userspace path; [NFQUEUE](./nfqueue.md) describes held-first-packet UDP.
 
 ## Namespace and hook architecture
 
@@ -27,7 +27,7 @@ flowchart LR
 
 A throwaway thread calls `unshare(CLONE_NEWNET)`, opens `/proc/thread-self/ns/net`, and hands the resulting `OwnedFd` to the process. That FD pins `daens` for the process lifetime. `/var/run/netns/daens` is only a best-effort compatibility bind mount; the engine does not use it as the namespace owner.
 
-Rtnetlink creates `dae0`/`dae0peer` as an L2 netkit pair when the kernel supports it, otherwise as a veth pair. It moves `dae0peer` by namespace FD and configures links, addresses, neighbors, policy rules, and routes. Current addressing is:
+Rtnetlink creates `dae0`/`dae0peer` as an L2 netkit pair when the kernel supports it, otherwise as a veth pair. It moves `dae0peer` by namespace FD and configures links, addresses, neighbors, policy rules, and routes. The addresses are:
 
 | Side | IPv4 | IPv6 |
 | --- | --- | --- |
@@ -122,7 +122,7 @@ Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in sha
 `crates/honk-ebpf-common/src/conn.rs` — `ConnState` (including `UdpDecisionState` and `decision_token`), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, and `TcpState`.
 `crates/honk-ebpf/src/maps.rs` — static TC map declarations and their kernel-side capacities.
 `crates/honk-ebpf/src/route.rs` — static root/slot facade and fixed-ABI dispatch; generated policy code is loaded by userspace.
-`crates/honk-ebpf-common/src/event.rs` — fixed-layout ring events including conntrack overflow and UDP decision-token exhaustion. `crates/honk-ebpf-common/src/dae_ip.rs` — `In6Addr` union and v4-mapped helpers.
+`crates/honk-ebpf-common/src/event.rs`: fixed-layout ring events including conntrack overflow and UDP decision-token exhaustion. `crates/honk-ebpf-common/src/dae_ip.rs`: `In6Addr` union and v4-mapped helpers.
 `crates/honk-core/src/routing/ir.rs` — canonical `CompiledPredicate` and userspace `PortRange`; `crates/honk-core/src/control/routing_matcher.rs` lowers them into the generated function ABI.
 
 ## Marks and mark ownership

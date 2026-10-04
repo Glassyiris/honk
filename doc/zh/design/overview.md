@@ -1,15 +1,15 @@
 # 架构概览
 
-`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎；本页概述其架构及承载运行时的关键规则。项目当前为实验性 alpha `v0.0.1-alpha`，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
+`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎；本页说明其架构及关键运行时规则。项目当前为实验性 alpha `v0.0.1-alpha`，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
 
-其配置语法和 TC 数据路径源自 dae 技术脉络，并在文档声明的范围内保持 dae 兼容；出站 Handler、组与 Clash API 则采用 sing-box 风格的设计。`honk` 是独立实现，现已与两者显著分化。
+其配置语法和 TC 数据路径源自 dae，并在文档声明的范围内保持 dae 兼容；出站 Handler、组与 Clash API 则采用 sing-box 风格的设计。`honk` 是独立实现，现已与两者显著分化。
 
 ## 目标与非目标
 
 ### 目标
 
 - 通过 eBPF 透明代理数据路径拦截 Linux 上的 LAN 转发流量和本机发起流量。
-- 将原生 `.dae` 配置语法保持为首要且唯一有文档说明的配置格式。
+- 以原生 `.dae` 配置语法作为首要且唯一有文档说明的配置格式。
 - 提供多协议出站、Selector/URLTest/LoadBalance/Fallback/Score 组、健康检查和 Clash 兼容控制 API。
 - 只交付引擎 `honk-core`，不另设 GraphQL 服务或内置 dashboard 应用。
 
@@ -29,7 +29,7 @@
 | `honk-nfqueue` | 成员 | raw `NETLINK_NETFILTER` 队列 `320`、verdict 所有权和自有 nftables 事务。 |
 | `honk-outbound` | 成员 | 协议 Handler、逐节点 runtime、出站组、健康状态、URLTest 探测和始终编译的 Score 评分器。 |
 | `honk-core` | 成员 | 引擎库与二进制：eBPF/NFQUEUE runtime、控制面、DNS、路由、中继和 Clash API。 |
-| `honk-tool` | 成员 | 用于订阅/节点探测、数据路径诊断、固定 map 检查和 geo 资源查询的 CLI 工具箱。 |
+| `honk-tool` | 成员 | 用于订阅/节点探测、数据路径诊断、已固定 map 检查和 geo 资源查询的 CLI 工具箱。 |
 | `honk-ebpf` | 排除 | TC、`sk_lookup` 和 cgroup eBPF 程序；单独构建，并在启用真实 eBPF 时嵌入 `honk-core`。 |
 
 ```mermaid
@@ -48,7 +48,7 @@ flowchart LR
   TOOL -->|core library| CORE
 ```
 
-共享 map 键、值、常量或布局的修改必须同步落到 `honk-ebpf-common`、`honk-ebpf` 和 `honk-core` 的 map 写入逻辑。
+修改共享 map 键、值、常量或布局时，必须同步修改 `honk-ebpf-common`、`honk-ebpf` 和 `honk-core` 的 map 写入逻辑。
 
 `honk-config` 提供共享配置模型与解析器。纯 Rust 依赖包括 serde、regex、url、base64、chrono、uuid；`libc` 的 `getifaddrs` 枚举接口地址，不调用 `ip` 子进程。
 
@@ -70,7 +70,7 @@ flowchart LR
 
 遍历语法区分单行条目和多行表达式；括号保护状态仅随实际返回的表达式语句跨越同源分段，在来源边界重置。已建立索引的起始花括号保留其块头和子树归属。订阅原始字段独立于结构块头视图保留完整起始词法单元的字节。
 
-`src/share_link.rs` 是唯一的 `Node::from_share_link` 解析器；`src/share_link/options.rs` 把 URI 报文编码与独立的多路复用控制项归入规范协议模型，先执行规范化与校验，再派生身份，不保留第二套 VLESS mode 模型。`src/node/wire.rs` 是唯一 flat serde adapter；VLESS 输入即使以 `null` 出现已移除的旧字段也会拒绝，而同一字段在非 VLESS 输入上仅为兼容 artifact。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
+`src/share_link.rs` 是唯一的 `Node::from_share_link` 解析器；`src/share_link/options.rs` 把 URI 报文编码与独立的多路复用控制项归入规范协议模型，先执行规范化与校验，再派生身份，不保留第二套 VLESS mode 模型。`src/node/wire.rs` 是唯一的 flat serde adapter；VLESS 输入只要含有已移除的旧字段，即使值为 `null`，也会被拒绝。同一字段在非 VLESS 输入上仅为兼容 artifact 而保留。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity 派生，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 
 - `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }。dae parser 显式允许当前两个嵌套节，旧 `udp_nfqueue` 仅作为迁移输入：发出告警，仅在未配置 `global.nfqueue_enable` 时将 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
 - `src/subscription.rs`、`src/types.rs`（`NodeProtocol` 有 11 个变体，Direct/Block 留给内建节点；`DialMode` 为 ip/domain/domain+/domain++；另有 `SubscriptionType`、`DnsProtocol` 与共享 `default_true`/`parse_duration_secs` helper）、`src/error.rs`（`ConfigError`）。
@@ -142,8 +142,8 @@ flowchart TB
 
 ## 作者与分工说明
 
-- eBPF 数据路径——`honk-ebpf`、`honk-ebpf-common` 以及 `honk-core` 中的挂载/map 路径——是项目维护者主要投入人工设计、实现 review 与验证的部分。
-- 其余多数用户态子系统——配置解析器、出站 Handler、组与健康检查、用户态 DNS、Clash API 及大量控制面粘合代码——主要由 AI 辅助编写。维护者做了部分代码 review，并非逐行负责。
+- 项目维护者主要负责 eBPF 数据路径的人工设计、实现 review 与验证，包括 `honk-ebpf`、`honk-ebpf-common` 以及 `honk-core` 中的挂载/map 路径。
+- 其余多数用户态子系统主要由 AI 辅助编写，包括配置解析器、出站 Handler、组与健康检查、用户态 DNS、Clash API 及大量控制面衔接代码。维护者做了部分代码 review，并非逐行负责。
 
 ## 相关文档
 

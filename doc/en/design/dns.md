@@ -1,6 +1,6 @@
 # DNS subsystem
 
-This document describes the userspace DNS architecture shared by transparent port-53 interception and the optional `dns.bind` listener.
+Transparent port-53 interception and the optional `dns.bind` listener share the userspace DNS architecture.
 
 Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; generation-owned routing projection and domain-fact maps store learned predicate facts, not DNS responses.
 
@@ -188,7 +188,7 @@ The wire identity retains flags, exact question encoding, QCLASS, and EDNS mater
 
 Client IP is not part of cache or persistence identity. Different sources selecting the same named upstream share its source-neutral answer; sources selecting different upstreams partition naturally, and `asis` remains partitioned by original destination. A foreground `FlightKey::Resolve` wraps the resolve `CacheKey`, always adds strict/compatibility mode, and adds `DnsRequestMeta` only when a preference-sensitive sibling query can change the published response. Other foreground flights still coalesce across clients. A background `FlightKey::Refresh` contains only the refresh `CacheKey`; its leader captures the initiating metadata and mode. Positive, negative, and stale cache hits rerun preference rendering with the current caller's metadata.
 
-A response chain accepted only by compatibility mode—for example, one ending at a response-routing cycle/depth limit or failing strict response-template validation—is not admitted to shared memory cache or persistence. A later strict lookup therefore cannot inherit compatibility-only acceptance. Because HDNS v2 stores no execution-mode provenance, restored entries remain compatibility-only until a current-process exchange replaces them; the persistence codec stays at v2.
+A response chain accepted only by compatibility mode (for example, one ending at a response-routing cycle/depth limit or failing strict response-template validation) is not admitted to shared memory cache or persistence. A later strict lookup therefore cannot inherit compatibility-only acceptance. Because HDNS v2 stores no execution-mode provenance, restored entries remain compatibility-only until a current-process exchange replaces them; the persistence codec stays at v2.
 
 Reuse is limited to a standard single-question QUERY with no answer or authority records and at most one option-free EDNS-v0 OPT. ECS, COOKIE, any other EDNS option, EDNS-v1, multiple OPT records, or unusual flags bypass both cache and singleflight. The request still uses the normal strict exchange path.
 

@@ -1,14 +1,14 @@
 # honk 配置指南
 
-本指南说明如何组合和运行 honk 配置；字段清单不在此重复，统一由参考文档提供。
+本指南说明 honk 配置的组合和运行方法。字段清单见参考文档。
 
-honk 使用 dae 配置语法的一种方言；与 dae 的已知差异见[方言参考](./reference/dialect.md)。下表列出运行时分段与 CLI 入口；`include {}` 用于组合文件，下一节单独说明。
+honk 使用 dae 配置语法的方言；与 dae 的已知差异见[方言参考](./reference/dialect.md)。下表列出运行时分段与 CLI 入口；`include {}` 用于组合文件。
 
 | 分段 | 用途 | 参考 |
 | --- | --- | --- |
 | `global` | 选择接口、拨号行为、健康检查与运行时路径。 | [Global 参考](./reference/global.md) |
 | `node` | 用分享链接声明静态代理节点。 | [节点参考](./reference/nodes.md) |
-| `group` | 在节点与嵌套组之间进行选择。 | [组参考](./reference/groups.md) |
+| `group` | 在节点与嵌套组之间选择。 | [组参考](./reference/groups.md) |
 | `routing` | 应用有序流量规则与默认出站。 | [路由参考](./reference/routing.md) |
 | `dns` | 配置监听、上游、请求/响应策略与缓存行为。 | [DNS 参考](./reference/dns.md) |
 | `subscription` | 获取远程节点列表。 | [订阅参考](./reference/subscription.md) |
@@ -39,11 +39,11 @@ include {
 
 `include` 条目可裸写或加引号，并支持 `*`、`?`、`[]` glob 模式。模式按声明顺序执行，每个模式的匹配项按字典序加载。未匹配的模式、目录以及扩展名不是 `.dae` 的文件会被跳过。
 
-被包含的空文件或纯注释 `.dae` 文件不贡献配置段；dae 入口文档必须含块的要求不适用于这些片段。
+被包含的空文件或纯注释 `.dae` 文件不提供配置段；dae 入口文档必须含块的要求不适用于这些片段。
 
 只有顶层 `include` 允许起始花括号另起一行，并产生 `legacy-include-opener` 警告；建议在同一行写 `include {`。`include` 注释遵循词法单元规则：`path.dae # note` 加载 `path.dae`，而 `path.dae#note` 是字面 glob 模式，并产生 `legacy-include-hash` 警告。字面 `#` 可加引号，以免触发迁移警告。字符串解析检查 `include` 结构，但不打开被包含文件；`include` 不能把片段拼接到尚未闭合的块中。
 
-所有相对 include，包括嵌套被包含文件中的 include，都以传给 `--config` 的入口配置所在目录为基准解析。加载器会 canonicalize 入口目录与每个匹配项；指向该目录之外的绝对路径或符号链接会被拒绝。同一个 canonical 文件无论直接重复还是通过循环再次加载，也会被拒绝。
+所有相对 include，包括嵌套包含文件中的 include，都以传给 `--config` 的入口配置所在目录为基准解析。加载器会 canonicalize 入口目录与每个匹配项；指向该目录之外的绝对路径或符号链接会被拒绝。同一 canonical 文件无论直接重复加载，还是通过循环再次加载，都会被拒绝。
 
 入口文件自身的分段始终最先合并，不受 `include` 块位置影响；之后依次合并每个被包含文件及其后代。后出现的标量键覆盖先前值。节点、订阅、组、DNS 上游、固定 TTL 与路由规则等集合条目按合并顺序追加。
 
@@ -55,7 +55,7 @@ include {
 
 ## 最小配置
 
-部署前请替换 `eth0` 与示例节点地址。每条注释只说明对应配置项或规则的一项用途。
+部署前须替换 `eth0` 与示例节点地址。每条注释只说明对应配置项或规则的一项用途。
 
 ```dae
 # 设置拦截基线。
@@ -197,9 +197,9 @@ experimental {
 
 ## 选择接口
 
-将 `lan_interface` 设为接收 LAN 转发流量的一个或多个逗号分隔接口，将 `wan_interface` 设为承载本机发起流量的接口。`auto` 跟随 IPv4 默认路由接口；没有默认路由时保持待定而不会回退到 loopback，之后在链路、地址或路由变化时自动协调。仅代理本机流量时省略 `lan_interface`：已配置的 WAN hook 仍处理本机发起的 TCP 与 UDP。绝不要把 `lo` 当作虚构的 LAN 接口加入配置。
+将 `lan_interface` 设为接收 LAN 转发流量的接口，多个接口用逗号分隔。将 `wan_interface` 设为承载本机发起流量的接口。`auto` 跟随 IPv4 默认路由接口；没有默认路由时保持待定，不会回退到 loopback，之后在链路、地址或路由变化时自动协调。仅代理本机流量时省略 `lan_interface`：已配置的 WAN hook 仍处理本机发起的 TCP 与 UDP。不得把 `lo` 作为虚构的 LAN 接口加入配置。
 
-详见 [Global 参考](./reference/global.md)。
+接口设置详见 [Global 参考](./reference/global.md)。
 
 ## 选择拨号模式
 
@@ -210,7 +210,7 @@ experimental {
 | `domain+` | 嗅探但不执行目的 IP reality check；保留初始路由，仅把嗅探名称作为代理目标。 |
 | `domain++` | 嗅探但不校验，并强制根据 SNI/HTTP Host 重新执行非保留决策。 |
 
-详见 [Global 参考](./reference/global.md)。
+拨号模式详见 [Global 参考](./reference/global.md)。
 
 ## 声明节点
 
@@ -226,7 +226,7 @@ experimental {
 
 ## 编写路由规则
 
-规则按 `priority` 升序执行；dae 解析器按源码顺序分配 `0, 1, ...`，同优先级保持稳定的源码顺序。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先将节点加入一个组（例如 `filter: name('node')`）。`(must)` 决策是最终结果：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
+规则按 `priority` 升序执行；dae 解析器按源码顺序分配 `0, 1, ...`，同优先级保持稳定的源码顺序。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝，须先将节点加入一个组（例如 `filter: name('node')`）。`(must)` 决策是最终结果：跳过嗅探，且 Clash Global/Direct 模式不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
 
 网关管理访问与私网 DNS 绕过请按[显式本地路由迁移](./reference/routing.md#显式本地路由)配置；honk 不会自动生成接口规则。
 
@@ -260,7 +260,7 @@ dns {
 
 独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以同时控制 DNS 结果和 bootstrap 解析出的上游拨号顺序；偏好地址族拨号失败时会回退到另一地址族。
 
-`client_subnet` 默认关闭。需要确定性的 ECS 时写固定 IPv4/CIDR；写 `auto` 则无需 DNS 或 HTTP，把公网路径上的首个公网 hop 推断为 `/24`。自动推断会在 reload 与网络变化时刷新；有界探测失败时不生成 ECS。客户端自带的 ECS 始终优先。启用前请阅读参考文档中的隐私警告。
+`client_subnet` 默认关闭。需要确定性的 ECS 时写固定 IPv4/CIDR；写 `auto` 则无需 DNS 或 HTTP，将公网路径上的首个公网 hop 推断为 `/24`。自动推断会在 reload 与网络变化时刷新；有界探测失败时不生成 ECS。客户端自带的 ECS 始终优先。启用前须阅读参考文档中的隐私警告。
 
 详见 [DNS 参考](./reference/dns.md)。
 
@@ -282,7 +282,7 @@ dns {
 
 ## 预热与拨号预算
 
-这些机制互相独立，按已配置组或显式预算限制，而不会按原始订阅规模无限增长。按需 Clash 延迟测试属于独立路径：冷 session/QUIC 节点只在临时 runtime 中预热 transport，并在测量结束后关闭。
+这些机制互相独立，受已配置组或显式预算限制，不会按原始订阅规模无限增长。按需 Clash 延迟测试使用独立路径：冷 session/QUIC 节点只在临时 runtime 中预热 transport，并在测量结束后关闭。
 
 | 机制 | 配置项 | 默认 | 行为 |
 | --- | --- | --- | --- |
@@ -291,7 +291,7 @@ dns {
 | UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每个 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，并将驻留节点封顶为 `4×N`。UDP 与 Selector 所有权互相独立。 |
 | 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接与握手。Ready 池命中、已热 transport 上的逻辑流、`direct` 与 `block` 不占额度；重叠的 reload generation 还共享启动时描述符 gate。 |
 
-周期 HTTP 健康检查与 Clash 延迟测试使用相同的临时暖路径计时：冷的可复用 transport 在计时外预热，并在结束后关闭；报告的延迟是已热连接上第二个请求的耗时——一个 round trip，拨号与 TLS 握手不计。只有预热后的目标交换成功才报告健康并提供选择 RTT；setup 与交换失败都会更新活性/冷却，但不产生延迟样本或排名 strike。扫描也不会为每个节点保留一条空闲隧道。
+周期 HTTP 健康检查与 Clash 延迟测试使用相同的临时预热路径：冷的可复用 transport 在计时外预热，并在结束后关闭。报告的延迟是已预热连接上第二个请求的耗时，即一次往返，不计拨号与 TLS 握手。只有预热后的目标交换成功才报告健康并提供选择 RTT；setup 与交换失败都会更新活性/冷却，但不产生延迟样本或排名 strike。扫描不会为每个节点保留一条空闲隧道。
 
 详见 [组选择设计](./design/groups.md)。
 

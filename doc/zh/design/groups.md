@@ -1,10 +1,10 @@
 # 组选择、健康检查与预热设计
 
-本文说明 honk 如何把组解析为叶子出站、跟踪其健康状态，并以有界方式保留预热资源。
+honk 将组解析为叶子出站，跟踪其健康状态，并限制预热资源的保留量。
 
 ## 范围
 
-本文覆盖 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源 coordinator。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
+本页涵盖 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源 coordinator。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
 
 ## 组管理器与选择流水线
 
@@ -44,7 +44,7 @@ UDP 选择首先排除规范协议／配置不支持 UDP 的转发叶节点，�
 
 ### Score 评分与生命周期
 
-Score 首先运行与其他策略相同的存活性过滤。过滤所用的 health family 描述到代理服务器的连通性；单独携带的 target family 决定评分分桶。因此经 IPv4 到达的服务器仍可承载 IPv6 业务目标，而评分绝不会让已被判死的节点重新入选。健康过滤后的计划只包含一个权威叶节点；只有冷 URLTest 仍可按既有规则进行推测准备。
+Score 首先运行与其他策略相同的存活性过滤。过滤所用的 health family 描述到代理服务器的连通性；单独携带的 target family 决定评分分桶。因此经 IPv4 到达的服务器仍可承载 IPv6 业务目标，而评分绝不会让已被判死的节点重新入选。健康过滤后的计划只包含一个权威叶节点；只有冷 URLTest 仍可按既有规则推测准备。
 
 精确键为 `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`。domain 会转为 ASCII 小写、去掉一个末尾点并保留端口；IP 目标保留 socket address。第二个有界的 `(group, TCP/UDP, target family or no family, NodeId)` 聚合层为冷目标提供先验，并接收无目标预热样本。精确目标、target-family 和全局聚合层按衰减后的有效证据分层混合：精确证据增多时逐渐覆盖聚合证据，老化后又逐渐让出权重。递归选择携带同一 target context，并把叶节点结果归因到路径上的每个 Score 组。
 
@@ -98,7 +98,7 @@ Carrier 压力提示独立于业务结果和性能评分。与 Score 绑定的 r
 
 采样使用 1–10 秒活跃区间，要求有新 ACK 进展，以及至少 4 KiB payload 字节进展或 32 个 QUIC DATAGRAM frame。RTT 先以四个活跃样本训练基线，再要求连续三个区间同时达到基线的 1.5 倍且增加至少 20 ms。发送侧重传／丢包压力要求足够出站 payload、至少 32 次发送、三个重传／丢失包、非零重传／丢失字节及 5% 计数比，连续满足三个区间。这只是压力启发式，不是应用丢包率，计数未必对应同一批包。未知／空闲区间不能证明压力或恢复；两个合格正常区间才能重新解锁事件。每个 runtime／carrier 地址族至多每 30 秒发布一次，提示在 60 秒后过期，读取不续期。
 
-健康过滤地址族不一定是地址竞速最终使用的 socket 地址族。生产者保留实际地址族槽，Score 则把最新新鲜事件视为节点所有者需要重新比较的提示，而非目标／地址族性能惩罚。只有被测 carrier 承载的网络接收提示，Shadowsocks TCP 压力不影响原生 Shadowsocks UDP。热连接上的配置探测可能贡献 carrier 活动，但不能成为业务证据。普通 UDP 丢包、裸 SOCKS／direct splice、反向丢包及代理到目标的丢包仍未知。reload 隔离旧事件和被替换所有者，不导出 carrier 或目标身份。
+健康过滤地址族不一定是地址竞速最终使用的 socket 地址族。生产者保留实际地址族槽，Score 则把最新新鲜事件视为节点所有者需要重新比较的提示，而非目标／地址族性能惩罚。只有被测 carrier 承载的网络接收提示，Shadowsocks TCP 压力不影响原生 Shadowsocks UDP。热连接上的配置探测可能贡献 carrier 活动，但不能成为业务证据。普通 UDP 丢包、裸 SOCKS／direct splice、反向丢包及代理到目标的丢包仍未知。reload 隔离旧事件和已替换的所有者，不导出 carrier 或目标身份。
 
 Score 状态随 manager 初始化，证据条目按需填充，由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。精确目标证据衡量 transport 质量，并不是语义解锁能力的结果；需要这种粗粒度 cohort 时，可用已有 routing 或 geosite 规则选择专用服务 Score 组。已提交的进程内 reload 会复用同一状态 `Arc`、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
 
@@ -120,7 +120,7 @@ Score 状态随 manager 初始化，证据条目按需填充，由 mutex 保护�
 
 每个 Score 组／网络只拥有一个已提交的服务候选池，所有父组入口与 target 共用。普通首次选择、失败逃逸、恢复、晋升和可选试用都从池内选择，胜者不再额外占用一个名额。冷启动把普通首选纳入已排名名额，刷新排序先考虑普通资格，再比较 utility 与探测平局，避免未合格成员挤掉唯一可用服务。容量 k 仍随真实业务变化：原始开始数按五分钟半衰期衰减，再折算到 30 分钟证据半衰期；在 `q = 16` 下赚得的可选开始额度，一半用于让每个挑战者保持四个有效完成。记折算需求为 D，则 k = 1 + ⌊D/128⌋；超过四个唯一候选的视图下限为 3，上限为 min(25, ⌈√n⌉ + 1)，45 个候选时为 8。更小的组只使用实际可用成员。视图大于 k 时，从这 k 个名额中保留一个十分钟轮转位置。轮转成员被选为普通服务胜者时，与一个已排名成员交换位置，成员集合不变，被换出的成员获得新的轮转周期；不能仅因轮转到期就驱逐该服务胜者。该上限集中工作，但不保证足够的可比流量或全局最优选择。
 
-只有已授权 Apply 初始化或刷新候选池。周期重新排名每五分钟进行；扩大等到该刷新，需求下降引起的收缩要求 k 至少下降 2。连续三次节点级失败或权威健康过滤可以提前换入替补，但不增加容量。仅在过滤／重试视图中暂缺，或某个精确目标失败，本身不会移除共享成员。没有替补时，失败成员仍可进行预算内恢复。Reload 重置成员与容量并保留衰减后的需求；Readonly／Peek 使用已提交成员，初始化前则使用临时有界投影。
+只有已授权 Apply 初始化或刷新候选池。每五分钟重新排名一次；容量扩大等待该刷新，需求下降引起的收缩要求 k 至少下降 2。连续三次节点级失败或权威健康过滤可以提前换入替补，但不增加容量。仅在过滤／重试视图中暂缺，或某个精确目标失败，本身不会移除共享成员。没有替补时，失败成员仍可在预算内恢复。Reload 重置成员与容量并保留衰减后的需求；Readonly／Peek 使用已提交成员，初始化前则使用临时有界投影。
 
 嵌套名额保存直接子组名称，而不是可配置 UUID。该子组提供不同的合格代表节点时，Apply 在同一名额内替换旧代表；暂缺子组和直接成员不会被误判为代表发生变化。Selector 只 Apply 已选子组，即使子组当前已提交的 Peek 看不到成员，也不能阻断这次 Apply。Selector 父组不另建 Score 池或钱包；独立配置为 Score 的祖先仍拥有各自预算。
 
@@ -154,9 +154,9 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 `best latency + tolerance >= incumbent current measured latency`
 
-当前选择的基线在每次选择时重新读取，而不是保留它胜出时的旧值。因此已退化的当前节点可以被替换；这与 sing-box `Select()` 行为一致。若当前节点带有未清除的失败标记（strike），则跳过滞后——刚失败的当前节点会被立即替换。
+当前选择的基线在每次选择时重新读取，不保留胜出时的旧值。因此，已退化的当前节点可以被替换；这与 sing-box `Select()` 行为一致。若当前节点带有未清除的失败标记（strike），则跳过滞后，立即替换刚失败的节点。
 
-探测失败只更新活性与冷却，不会产生合成延迟样本或排名 strike。只有连续两次真实拨号失败才会追加一个不显示的 10 秒合成占位样本并记一次失败 strike——单次瞬时失败（该流量由重试 race 救回）不留任何选路状态；只有真实拨号成功才清零连续计数，因此探测存活但拨号失败的节点仍会累积。真实历史与移动平均仍保留，但带有未清除拨号失败 strike 的候选排在所有无降级候选之后。strike 只有在连续 `max(strikes, 2)` 次真实成功后才会清除——这就是防止不稳定节点凭一次走运探测重回第一的防抖保护。
+探测失败只更新活性与冷却，不产生合成延迟样本或排名 strike。只有连续两次真实拨号失败才会追加一个不显示的 10 秒合成占位样本，并记一次失败 strike。单次瞬时失败（该流量由重试 race 救回）不留任何选路状态；只有真实拨号成功才清零连续计数，因此探测存活但拨号失败的节点仍会累积失败。真实历史与移动平均仍保留，但带有未清除拨号失败 strike 的候选排在所有未降级候选之后。strike 只有在连续 `max(strikes, 2)` 次真实成功后才会清除，防止不稳定节点凭一次探测成功重新排到第一。
 
 真实流量也会直接回馈排名（仅 TCP）。每个节点为自身的新鲜拨号延迟维护一个自引用 EMA（α=1/8，前 3 次拨号为预热期）；命中就绪连接池的拨号不产生网络往返，不计入。连续 3 次拨号慢于 `max(min(2×EMA, EMA+500 ms), 250 ms)`（`report_dial_latency` 中为 `max(min(2×ema, ema+500ms), 250ms)`）会记一次失败 strike 并触发紧急探测；250 ms 下限避免当前选中低延迟节点的正常负载抖动（如 60→120 ms）误触发判定。探测移动平均不受影响；误报（目标分布变化而非节点劣化）会自愈——紧急探测成功后，连续探测成功会清除 strike。渐进式劣化仍由探测周期负责；UDP 劣化保持探测周期加 `DataUdp` 流量阈值的处理方式。
 
@@ -166,9 +166,9 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 ## 嵌套组与成员身份
 
-`Group.groups` 指定子组。每个子组只贡献一个候选：该子组自己的策略针对当前网络和地址族选出的叶节点。父组把它作为一个成员进行排名或固定，而不是把所有后代合并进父策略。
+`Group.groups` 指定子组。每个子组只贡献一个候选：该子组策略针对当前网络和地址族选出的叶节点。父组将其作为一个成员排名或固定，不把所有后代合并进父策略。
 
-解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，并切断每条形成环的边，同时打印告警。这些检查可防止异常组图卡住选择或内省。
+解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，切断每条形成环的边并打印告警，防止异常组图阻塞选择或内省。
 
 成员边与显式 `final` 边使用同一个有界递归解析器。子组策略没有合格选择时，
 只沿自己的配置 final 继续；父组仍把该子组视为已选成员。Final 链保留选择链和
@@ -246,13 +246,13 @@ API 返回的首轮预热回退值不会作为配置方法的 Score 证据发布
 - 两个 UDP 域都明确死亡：排除，即使 TCP 存活。
 - 从未记录过 UDP 状态：继承 TCP 存活性。
 
-这样既不会让 TCP 健康但 UDP 已坏的节点继续吸引报文流，也不会惩罚尚未启用 UDP 探测的部署。
+TCP 健康但 UDP 已失效的节点不再接收报文流，尚未启用 UDP 探测的部署不受影响。
 
 ## eBPF 连通性发布
 
 eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族，发布值使用所有可达叶成员状态的 OR，并保留“恰有一个唯一叶节点且未配置 `final`”的 TCP 准入例外。由单个节点转换触发的回调会重新计算该组值；绝不会直接写入正在转换节点自身的值。准入不覆盖用户态选择：即使该 slot 仍存活，选中的空 Selector 路径仍会拒绝流量。
 
-重载先把旧组或新组布局所需的所有 slot 设置为存活，使转换期 fail-open。发布新路由 generation 后，honk 再写入精确的新组快照。因此组重排不会继承陈旧的 ordinal 状态；若精确发布中途失败，尚未填写的转换 slot 保持 fail-open，而不会错误地杀死某个组。
+重载先把旧组或新组布局所需的所有 slot 设置为存活，使转换期 fail-open。发布新路由 generation 后，honk 再写入精确的新组快照。因此组重排不会继承过时的 ordinal 状态；若精确发布中途失败，尚未填写的转换 slot 保持 fail-open，不会错误地将某个组标为失活。
 
 ## 预热与所有权
 
@@ -265,14 +265,13 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 | UDP 预热集 | 需显式启用；每轮对每个地址族重新选择各组 top `min(N, 3)` 的可复用 UDP 叶节点，再按 UUID 全局去重。 | UDP path 选择的可复用状态，包括 VLESS H2/shared/separate Mux.Cool pool，或一个 QUIC client | 最多并发 4 个预热尝试；进程保留集会重新排名并封顶 `4 × N`。 |
 
 Selector 与 UDP ownership 是 reusable node runtime 上相互独立的 bit。
-`WarmRequirement::Session` 跟随 TCP path，`WarmRequirement::Udp` 跟随 UDP
-path，因此仅 UDP 的 VLESS pool 不改变 direct-TCP warming 或 bare-TCP
-eligibility。移除一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用
-owner 释放后才排空未来 reuse。active flow 不会被切断，startup preconnect
-仍只是一颗 pool seed。
+`WarmRequirement::Session` 跟随 TCP path，`WarmRequirement::Udp` 跟随 UDP path，
+因此仅 UDP 的 VLESS pool 不改变 direct-TCP warming 或 bare-TCP eligibility。移除
+一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用 owner 释放后才排空未来
+reuse。active flow 不会被切断，startup preconnect 仍只是一颗 pool seed。
 
-重载时，配置不变的节点把现有 `NodeRuntime` 转移给 replacement，包括 AnyTLS、
-VLESS pool/source key 与 QUIC state；配置变化时得到 fresh runtime。现有 outbound
+重载时，配置不变的节点将现有 `NodeRuntime` 转移给 replacement，包括 AnyTLS、
+VLESS pool/source key 与 QUIC 状态；配置变化时得到 fresh runtime。现有 outbound
 maintenance pass 与其他 idle resource 一起回收未受 retention 的 idle VLESS
 carrier，不创建新的 protocol timer。
 

@@ -1,6 +1,6 @@
 # honk Quick Start
 
-honk is an experimental eBPF transparent proxy engine for Linux. This guide covers the installation, configuration, and startup steps needed by regular users. See the links at the end for configuration fields and implementation details.
+honk is an experimental eBPF transparent proxy engine for Linux. Follow this guide to install, configure, and start it. Links at the end cover configuration fields and implementation details.
 
 > **Warning**
 >
@@ -27,7 +27,7 @@ uname -r
 
 ### Kernel configuration
 
-Desktop and server distributions usually enable the required features. Minimal systems such as OpenWrt, Armbian, and VyOS need explicit checking. Display the current kernel configuration with:
+Desktop and server distributions usually enable the required features. Check them explicitly on minimal systems such as OpenWrt, Armbian, and VyOS. Display the current kernel configuration with:
 
 ```shell
 zcat /proc/config.gz 2>/dev/null || cat /boot/config-$(uname -r)
@@ -152,7 +152,7 @@ sudo install -m 0755 target/release/honk-core /usr/local/bin/honk-core
 
 ## Minimal configuration
 
-Start with a direct-only configuration to prove that the datapath works, then add subscriptions or proxy nodes. Replace `br-lan` with the LAN interface that actually receives client traffic. Remove `lan_interface` when only local traffic should be intercepted.
+Start with a direct-only configuration to verify the datapath, then add subscriptions or proxy nodes. Replace `br-lan` with the LAN interface receiving client traffic. Remove `lan_interface` to intercept only local traffic.
 
 ```dae
 global {
@@ -176,7 +176,7 @@ sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
 
-The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback; honk does not automatically relocate them; writable state remains active in place. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path; relative logs are created only below the configured directory.
+The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. honk does not automatically relocate them; writable state remains active in place. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below the configured directory.
 
 Start honk in the foreground:
 
@@ -281,7 +281,7 @@ sudo ./target/release/honk-tool diagnose \
   --api http://127.0.0.1:9090 --pin-root /sys/fs/bpf
 ```
 
-Finally, use a real client to exercise direct and proxied TCP, UDP, and DNS traffic, plus IPv4/IPv6 where required. The presence of `dae0` or a reachable API is not an end-to-end traffic check.
+Use a real client to exercise direct and proxied TCP, UDP, and DNS traffic, plus IPv4/IPv6 where required. The presence of `dae0` or a reachable API is not an end-to-end traffic check.
 
 ## Reload and stop
 

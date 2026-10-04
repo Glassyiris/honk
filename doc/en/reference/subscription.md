@@ -1,6 +1,6 @@
 # Subscription reference
 
-This reference defines `subscription {}` entries, durable recovery, and the subscription body formats accepted by the current runtime.
+`subscription {}` configures remote node lists. This reference covers entries, durable recovery, and accepted subscription body formats.
 
 ## `subscription {}` syntax
 
@@ -54,7 +54,7 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `node_count` | u32 | `0` | No | Model metadata; the current core runtime does not update it. |
 | `created_at` | datetime | construction time | No | Model construction time. |
 
-The internal body-selector behavior is:
+Body parser selection:
 
 | `sub_type` | Parser behavior |
 | --- | --- |
@@ -182,7 +182,7 @@ Import defaults are source-specific. They do not all mean honk's canonical `pack
 | enabled `smux`/`multiplex` with `protocol: h2mux` or explicit `padding` | auto (inactive while wrapped) | H2MUX | enabled unless `udp: false` |
 | `mux: { enabled: true, ... }` | `auto`, unless an explicit packet encoding remains reachable through protocol fallback or `skip` | Xray Mux.Cool | enabled unless `udp: false` |
 
-For H2MUX, `padding: true` selects the existing padded wire format; false selects unpadded H2MUX. Existing `only-tcp`, Brutal, and nonzero `max-connections`/`min-streams`/`max-streams` restrictions remain. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are simply inactive behind the selected wrapper.
+For H2MUX, `padding: true` selects the existing padded wire format; false selects unpadded H2MUX. Existing `only-tcp`, Brutal, and nonzero `max-connections`/`min-streams`/`max-streams` restrictions remain. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are inactive behind the selected wrapper.
 
 An enabled Clash `mux` block accepts active settings only for `enabled`, signed-`i16` `concurrency`, signed-`i16` `xudpConcurrency`, and `xudpProxyUDP443`; inactive extras are ignored. Zero TCP concurrency allows 8 concurrent logical children per carrier, a negative value disables TCP mux, and a positive value sets that per-carrier concurrency up to 128—it never specifies a physical-carrier count. Zero XUDP concurrency shares the enabled TCP pool and its per-carrier concurrency, or follows the packet fallback when TCP mux is disabled; negative always follows the fallback, and positive creates a separate UDP pool with that per-carrier logical-child concurrency, capped at 128. UDP/443 policy is `allow` by default and also accepts `skip` or `reject`; its precedence is documented in the [node reference](./nodes.md#vless-udp-and-multiplexing).
 

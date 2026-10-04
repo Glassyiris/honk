@@ -37,11 +37,11 @@ directly; use a group (including a one-node filter group).
 
 ## Kernel routing
 
-The cutover preserves the current userspace matching contract:
+Kernel routing preserves the userspace matching contract:
 
-- Ordinary domain pattern/suffix/keyword alternatives form one condition;
-  geosite is a separate condition when both fields are present. Existing suffix,
-  regex, keyword, case, and geosite attribute behavior is retained.
+- Ordinary domain pattern/suffix/keyword/regex and geosite alternatives form one
+  condition. Existing suffix, regex, keyword, case, and geosite attribute behavior
+  is retained.
 - Destination/source IP predicates preserve IPv4/IPv6 identity, including `/0`,
   host addresses and overlapping prefixes.
 - Port ranges are inclusive. TCP/UDP and IPv4/IPv6 masks retain both alternatives.
@@ -208,7 +208,7 @@ value there. A marked or `must` fallback stores its mark, `must` and direct-mark
 index only on the fallback exit reached after every rule; a plain fallback adds
 no stores.
 
-The verifier is why. A pointer's type depends on the lookup outcome, and the
+The copy exists for the verifier. A pointer's type depends on the lookup outcome, and the
 verifier never merges a NULL with a map pointer, so a fact pointer kept live
 across later rules multiplied the states walked through everything emitted
 after it; two `sip && dip && dport` rules ahead of fifteen process-name rules

@@ -1,6 +1,6 @@
 # DNS configuration reference
 
-This page defines the current dae-syntax `dns { ... }` section and its runtime semantics.
+`dns { ... }` configures DNS in dae syntax. This reference covers its fields and runtime semantics.
 
 ## Top-level keys
 
@@ -57,7 +57,7 @@ Absolute paths remain explicit. Relative paths prefer an existing copy below `gl
 
 Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its addresses. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
 
-After hard `ipv4only`/`ipv6only` filtering, a known IN-class A or AAAA name takes precedence over request rules—including `reject`—and over cache lookup and upstream exchange. If the name exists but has no address in the requested family, honk returns NOERROR/NODATA without querying an upstream. Other classes and qtypes continue through the normal pipeline. Hosts answers use a 60-second TTL and bypass honk's DNS cache.
+After hard `ipv4only`/`ipv6only` filtering, a known IN-class A or AAAA name takes precedence over request rules (including `reject`), cache lookup, and upstream exchange. If the name exists but has no address in the requested family, honk returns NOERROR/NODATA without querying an upstream. Other classes and qtypes continue through the normal pipeline. Hosts answers use a 60-second TTL and bypass honk's DNS cache.
 
 SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule aborts startup; on reload the replacement generation fails before publication and the active generation remains in use.
 
@@ -141,7 +141,7 @@ Put each complete call and action on one physical line. Incomplete nonblank line
 | `upstream(name, ...)` | Response only | Match the upstream that produced the current response. |
 | `ip(192.0.2.0/24, geoip: private, ...)` | Response only | Match when any answer IP belongs to a listed CIDR or GeoIP set. |
 
-For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution performed for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
+For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
 
 DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresses mean `/32` and `/128`; CIDR host bits are truncated with `dns-network-host-bits`. Malformed networks produce located `invalid-dns-network` diagnostics and omit the whole dae rule; constructed invalid routing fails router/policy construction. Equivalent network spellings use the same policy identity without reordering or deduplicating arguments.
 
