@@ -547,6 +547,38 @@ async fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
     }
 }
 
+#[tokio::test]
+async fn quinn_endpoint_errors_are_not_captured() {
+    if run_isolated("native_api::logs::tests::quinn_endpoint_errors_are_not_captured") {
+        return;
+    }
+    let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
+    owner
+        .settings
+        .renew(&owner, super::super::settings::Demand::LOGS);
+    let store = Arc::clone(&owner.logs);
+    let dispatch = capture(&store);
+    let mut stream = response(&store, "", None).into_body().into_data_stream();
+    let baseline = next(&mut stream).await;
+    drop(stream);
+    tracing::dispatcher::with_default(&dispatch, || {
+        tracing::error!(target: "quinn::endpoint", "I/O error: broken pipe");
+        tracing::error!(target: "honk_core::control::runtime", "after the quinn error");
+    });
+    let mut resumed = response(&store, "", Some(cursor(&baseline)))
+        .into_body()
+        .into_data_stream();
+    assert!(
+        next(&mut resumed)
+            .await
+            .starts_with("event: stream.ready\n")
+    );
+    assert_eq!(
+        data(&next(&mut resumed).await)["target"],
+        "honk_core::control::runtime"
+    );
+}
+
 #[test]
 fn listener_ready_is_admitted_only_at_its_pinned_target() {
     // startup.rs pins `target: "honk_core"`; its module path is not audited.
