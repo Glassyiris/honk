@@ -375,7 +375,7 @@ mod hosts;
 mod refresh;
 pub(crate) use hosts::{HostsSnapshot, HostsSourceSet};
 mod message {
-    use crate::dns::query::{NameParseState, parse_name};
+    use crate::dns::query::parse_name;
     use std::net::{IpAddr, SocketAddr};
 
     use super::AsIsExchangeError;
@@ -457,8 +457,7 @@ mod message {
             return None;
         }
 
-        let mut state = NameParseState::new(data.len());
-        let (name, question_end) = parse_name(data, 12, &mut state).ok()?;
+        let (name, question_end) = parse_name(data, 12).ok()?;
         let fields_end = question_end.checked_add(4)?;
         let fields = data.get(question_end..fields_end)?;
         let qtype = u16::from_be_bytes([fields[0], fields[1]]);

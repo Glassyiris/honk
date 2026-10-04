@@ -5,8 +5,8 @@ use thiserror::Error;
 
 mod parser;
 
-pub(crate) use parser::{NameParseState, parse_name, parse_name_into};
 use parser::{parse_edns, parse_rr, read_u16};
+pub(crate) use parser::{parse_name, parse_name_into};
 
 const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;
@@ -418,11 +418,10 @@ impl QueryContext {
         if usize::from(qdcount) > (raw.len() - HEADER_LEN) / MIN_QUESTION_WIRE_LEN {
             return Err(QueryError::TruncatedField);
         }
-        let mut name_state = NameParseState::new(raw.len());
         let mut questions = Vec::new();
         for _ in 0..qdcount {
             let start = cursor;
-            let (name, end) = parse_name(raw, cursor, &mut name_state)?;
+            let (name, end) = parse_name(raw, cursor)?;
             cursor = end;
             let qtype = QType(read_u16(raw, cursor)?);
             let qclass = QClass(read_u16(raw, cursor + 2)?);
@@ -438,15 +437,15 @@ impl QueryContext {
             });
         }
         for _ in 0..ancount {
-            cursor = parse_rr(raw, cursor, &mut name_state)?.end;
+            cursor = parse_rr(raw, cursor)?.end;
         }
         for _ in 0..nscount {
-            cursor = parse_rr(raw, cursor, &mut name_state)?.end;
+            cursor = parse_rr(raw, cursor)?.end;
         }
         let mut edns = None;
         let mut opt_count = 0u16;
         for _ in 0..arcount {
-            let rr = parse_rr(raw, cursor, &mut name_state)?;
+            let rr = parse_rr(raw, cursor)?;
             cursor = rr.end;
             if rr.rtype == OPT_TYPE {
                 opt_count = opt_count.saturating_add(1);
