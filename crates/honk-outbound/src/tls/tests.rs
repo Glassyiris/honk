@@ -36,18 +36,23 @@ fn dials_share_one_context_per_shape() {
     use foreign_types::ForeignTypeRef;
     let mut node = test_node();
     node.tls_mut().unwrap().pin_sha256 = Some("ee".repeat(32));
-    let context = |node: &Node| build_connector(node).unwrap().connector.context().as_ptr();
-    // Other tests flip the process-wide TLS mode; retry until it held still.
+    // Other tests flip the process-wide TLS mode; each connector records the
+    // mode its context was keyed by. Holding them keeps their contexts alive,
+    // so a later context cannot reuse a compared address.
     let (first, second) = loop {
-        let mode = chrome_mode();
-        let pair = (context(&node), context(&node));
-        if chrome_mode() == mode {
+        let pair = (
+            build_connector(&node).unwrap(),
+            build_connector(&node).unwrap(),
+        );
+        if pair.0.chrome == pair.1.chrome {
             break pair;
         }
     };
-    assert_eq!(first, second);
+    let context = |connector: &TlsConnector| connector.connector.context().as_ptr();
+    assert_eq!(context(&first), context(&second));
     node.tls_mut().unwrap().pin_sha256 = Some("ef".repeat(32));
-    assert_ne!(context(&node), first);
+    let other_pin = build_connector(&node).unwrap();
+    assert_ne!(context(&other_pin), context(&first));
 }
 
 /// The pin decides the handshake even when an unpinned context of the same
