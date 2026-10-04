@@ -4,50 +4,6 @@ use super::{DnsName, EdnsMetadata, HEADER_LEN, OPT_TYPE, QueryError};
 
 const MAX_POINTER_HOPS: usize = 128;
 
-pub(crate) struct NameParseState {
-    visited: Vec<u32>,
-    epoch: u32,
-    pointer_hops: usize,
-}
-
-impl NameParseState {
-    pub(crate) fn new(message_len: usize) -> Self {
-        Self {
-            visited: vec![0; message_len],
-            epoch: 0,
-            pointer_hops: 0,
-        }
-    }
-
-    fn begin_name(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.visited.fill(0);
-            self.epoch = 1;
-        }
-        self.pointer_hops = 0;
-    }
-
-    fn visit_pointer(&mut self, target: usize, cursor: usize) -> Result<(), QueryError> {
-        if target >= cursor {
-            return Err(QueryError::MalformedName);
-        }
-        self.pointer_hops += 1;
-        if self.pointer_hops > MAX_POINTER_HOPS {
-            return Err(QueryError::MalformedName);
-        }
-        let mark = self
-            .visited
-            .get_mut(target)
-            .ok_or(QueryError::MalformedName)?;
-        if *mark == self.epoch {
-            return Err(QueryError::MalformedName);
-        }
-        *mark = self.epoch;
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct ResourceRecord {
     /// Only OPT validation reads the owner, and only to require the root.
@@ -59,12 +15,8 @@ pub(super) struct ResourceRecord {
     pub(super) end: usize,
 }
 
-pub(super) fn parse_rr(
-    raw: &[u8],
-    start: usize,
-    state: &mut NameParseState,
-) -> Result<ResourceRecord, QueryError> {
-    let (owner_length, name_end) = parse_name_into(raw, start, state, &mut [0; 255])?;
+pub(super) fn parse_rr(raw: &[u8], start: usize) -> Result<ResourceRecord, QueryError> {
+    let (owner_length, name_end) = parse_name_into(raw, start, &mut [0; 255])?;
     let rtype = read_u16(raw, name_end)?;
     let class = read_u16(raw, name_end + 2)?;
     let ttl = read_u32(raw, name_end + 4)?;
@@ -130,9 +82,8 @@ pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, Quer
         return Err(QueryError::HeaderTruncated);
     }
     let counts = [read_u16(raw, 6)?, read_u16(raw, 8)?, read_u16(raw, 10)?];
-    let mut state = NameParseState::new(raw.len());
     let mut qname = [0; 255];
-    let (length, mut cursor) = parse_name_into(raw, HEADER_LEN, &mut state, &mut qname)?;
+    let (length, mut cursor) = parse_name_into(raw, HEADER_LEN, &mut qname)?;
     // Length octets are ASCII, so the wire form is UTF-8 exactly when every label is.
     if std::str::from_utf8(&qname[..length]).is_err() {
         return Err(QueryError::MalformedName);
@@ -143,7 +94,7 @@ pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, Quer
     let mut advertised_size = None;
     for (section, count) in counts.into_iter().enumerate() {
         for _ in 0..count {
-            let rr = parse_rr(raw, cursor, &mut state)?;
+            let rr = parse_rr(raw, cursor)?;
             cursor = rr.end;
             if section == 2 && rr.rtype == OPT_TYPE {
                 validate_opt(raw, &rr, |_| {})?;
@@ -157,32 +108,34 @@ pub(super) fn scan_single_question_query(raw: &[u8]) -> Result<Option<u16>, Quer
     Ok(advertised_size)
 }
 
-pub(crate) fn parse_name(
-    raw: &[u8],
-    start: usize,
-    state: &mut NameParseState,
-) -> Result<(DnsName, usize), QueryError> {
+pub(crate) fn parse_name(raw: &[u8], start: usize) -> Result<(DnsName, usize), QueryError> {
     let mut wire = [0; 255];
-    let (length, end) = parse_name_into(raw, start, state, &mut wire)?;
+    let (length, end) = parse_name_into(raw, start, &mut wire)?;
     Ok((DnsName(wire[..length].into()), end))
 }
 
+/// Pointers jump strictly backward, so a compression loop must cross a
+/// non-root label, and each one adds at least two bytes to `wire`. A loop
+/// therefore ends at the hop budget or the 255-byte name limit with the same
+/// error a visited-offset table would report.
 pub(crate) fn parse_name_into(
     raw: &[u8],
     start: usize,
-    state: &mut NameParseState,
     wire: &mut [u8; 255],
 ) -> Result<(usize, usize), QueryError> {
-    state.begin_name();
     let mut cursor = start;
     let mut end = None;
     let mut length = 0;
+    let mut pointer_hops = 0;
     loop {
         let octet = *raw.get(cursor).ok_or(QueryError::MalformedName)?;
         if octet & 0xc0 == 0xc0 {
             let second = *raw.get(cursor + 1).ok_or(QueryError::MalformedName)?;
             let target = usize::from((u16::from(octet & 0x3f) << 8) | u16::from(second));
-            state.visit_pointer(target, cursor)?;
+            pointer_hops += 1;
+            if target >= cursor || pointer_hops > MAX_POINTER_HOPS {
+                return Err(QueryError::MalformedName);
+            }
             if end.is_none() {
                 end = Some(cursor + 2);
             }

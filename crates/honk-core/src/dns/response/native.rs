@@ -7,7 +7,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::{RecordBoundary, ResponseError, Section, read_u16, visit_layout};
-use crate::dns::query::{IngressProfile, NameParseState, QueryContext, parse_name_into};
+use crate::dns::query::{IngressProfile, QueryContext, parse_name_into};
 
 pub(crate) const MAX_JSON_BYTES: usize = 262_144;
 
@@ -82,7 +82,6 @@ pub(crate) fn project(
     // The complete expansion is charged before allocating any answer strings/vector.
     *budget -= charge;
     let mut answers = Vec::with_capacity(usize::from(read_u16(response, 6)?));
-    let mut names = NameParseState::new(response.len());
     let mut result: Result<(), ProjectionError> = Ok(());
     visit_response(&query, response, |record| {
         if record.section != Section::Answer || result.is_err() {
@@ -90,20 +89,13 @@ pub(crate) fn project(
         }
         result = (|| {
             let mut name = [0; 255];
-            let (length, end) = parse_name_into(response, record.wire.start, &mut names, &mut name)
+            let (length, end) = parse_name_into(response, record.wire.start, &mut name)
                 .map_err(|_| ProjectionError::Invalid)?;
             let rtype = read_u16(response, end)?;
             let mut owner = String::new();
             write_name(&mut owner, &name[..length]).map_err(|_| ProjectionError::Invalid)?;
             let mut data = String::new();
-            write_data(
-                &mut data,
-                response,
-                rtype,
-                end + 10,
-                record.wire.end,
-                &mut names,
-            )?;
+            write_data(&mut data, response, rtype, end + 10, record.wire.end)?;
             answers.push(DnsAnswer {
                 name: owner,
                 rtype: record_type(rtype),
@@ -127,7 +119,6 @@ pub(crate) fn measure(
         return Err(ProjectionError::Invalid);
     }
     let mut charged = 2usize;
-    let mut names = NameParseState::new(response.len());
     let mut result = Ok(());
     visit_response(query, response, |record| {
         if result.is_err() {
@@ -135,19 +126,12 @@ pub(crate) fn measure(
         }
         result = (|| {
             let mut name = [0; 255];
-            let (length, end) = parse_name_into(response, record.wire.start, &mut names, &mut name)
+            let (length, end) = parse_name_into(response, record.wire.start, &mut name)
                 .map_err(|_| ProjectionError::Invalid)?;
             let rtype = read_u16(response, end)?;
             let mut size = JsonTextSize(0);
             write_name(&mut size, &name[..length]).map_err(|_| ProjectionError::Invalid)?;
-            write_data(
-                &mut size,
-                response,
-                rtype,
-                end + 10,
-                record.wire.end,
-                &mut names,
-            )?;
+            write_data(&mut size, response, rtype, end + 10, record.wire.end)?;
             if record.section == Section::Answer {
                 // Object punctuation, type/class, TTL and the vector slot are bounded here.
                 charged = charged.saturating_add(size.0 + 128 + size_of::<DnsAnswer>());
@@ -223,11 +207,10 @@ fn data_name(
     response: &[u8],
     cursor: &mut usize,
     end: usize,
-    names: &mut NameParseState,
 ) -> Result<(), ProjectionError> {
     let mut wire = [0; 255];
-    let (length, next) = parse_name_into(response, *cursor, names, &mut wire)
-        .map_err(|_| ProjectionError::Invalid)?;
+    let (length, next) =
+        parse_name_into(response, *cursor, &mut wire).map_err(|_| ProjectionError::Invalid)?;
     if next > end {
         return Err(ProjectionError::Invalid);
     }
@@ -250,7 +233,6 @@ fn write_data(
     rtype: u16,
     mut cursor: usize,
     end: usize,
-    names: &mut NameParseState,
 ) -> Result<(), ProjectionError> {
     let data = response.get(cursor..end).ok_or(ProjectionError::Invalid)?;
     fn invalid<T>(_: T) -> ProjectionError {
@@ -266,7 +248,7 @@ fn write_data(
             write!(output, "{}", Ipv6Addr::from(bytes)).map_err(invalid)?;
         }
         2 | 5 | 12 | 39 => {
-            data_name(output, response, &mut cursor, end, names)?;
+            data_name(output, response, &mut cursor, end)?;
             if cursor != end {
                 return Err(ProjectionError::Invalid);
             }
@@ -280,15 +262,15 @@ fn write_data(
                 write!(output, "{} ", read_u16(response, cursor)?).map_err(invalid)?;
                 cursor += 2;
             }
-            data_name(output, response, &mut cursor, end, names)?;
+            data_name(output, response, &mut cursor, end)?;
             if cursor != end {
                 return Err(ProjectionError::Invalid);
             }
         }
         6 => {
-            data_name(output, response, &mut cursor, end, names)?;
+            data_name(output, response, &mut cursor, end)?;
             output.write_char(' ').map_err(invalid)?;
-            data_name(output, response, &mut cursor, end, names)?;
+            data_name(output, response, &mut cursor, end)?;
             if end - cursor != 20 {
                 return Err(ProjectionError::Invalid);
             }
@@ -347,12 +329,10 @@ pub(crate) fn status(response: &[u8]) -> String {
     }
     let mut code = low;
     let mut seen_opt = false;
-    let mut names = NameParseState::new(response.len());
     let mut invalid = false;
     let parsed = super::visit_message(None, response, |record| {
         let mut name = [0; 255];
-        let Ok((length, end)) = parse_name_into(response, record.wire.start, &mut names, &mut name)
-        else {
+        let Ok((length, end)) = parse_name_into(response, record.wire.start, &mut name) else {
             invalid = true;
             return;
         };
