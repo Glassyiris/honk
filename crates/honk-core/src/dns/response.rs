@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use thiserror::Error;
 
-use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name_into};
+use super::query::{IngressProfile, QueryContext, TxId, parse_name_into};
 
 #[cfg(feature = "native-api")]
 pub(crate) mod native;
@@ -190,12 +190,11 @@ fn visit_message(
     if request.is_some_and(|request| usize::from(qdcount) != request.questions().len()) {
         return Err(ResponseError::QuestionMismatch);
     }
-    let mut name_state = NameParseState::new(response.len());
     let mut cursor = HEADER_LEN;
     let mut expected = request.map(QueryContext::questions);
     for _ in 0..qdcount {
         let mut name = [0; 255];
-        let (length, name_end) = parse_name_into(response, cursor, &mut name_state, &mut name)
+        let (length, name_end) = parse_name_into(response, cursor, &mut name)
             .map_err(|_| ResponseError::QuestionMismatch)?;
         let qtype = read_u16(response, name_end)?;
         let qclass = read_u16(response, name_end + 2)?;
@@ -218,7 +217,7 @@ fn visit_message(
     for (section, count) in sections {
         for _ in 0..count {
             let start = cursor;
-            cursor = record_end(response, cursor, &mut name_state)?;
+            cursor = record_end(response, cursor)?;
             visit(RecordBoundary {
                 section,
                 wire: start..cursor,
@@ -231,14 +230,10 @@ fn visit_message(
     Ok(question_end)
 }
 
-fn record_end(
-    response: &[u8],
-    start: usize,
-    name_state: &mut NameParseState,
-) -> Result<usize, ResponseError> {
+fn record_end(response: &[u8], start: usize) -> Result<usize, ResponseError> {
     let mut name = [0; 255];
-    let (_, name_end) = parse_name_into(response, start, name_state, &mut name)
-        .map_err(|_| ResponseError::MalformedRecord)?;
+    let (_, name_end) =
+        parse_name_into(response, start, &mut name).map_err(|_| ResponseError::MalformedRecord)?;
     let rdlength = usize::from(read_u16(response, name_end + 8)?);
     (name_end + 10)
         .checked_add(rdlength)
