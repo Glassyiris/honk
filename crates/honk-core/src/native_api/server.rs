@@ -23,13 +23,14 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous: Option<(Instant, Option<(u64, u64)>)> = None;
     let mut previous_cpu: Option<(Instant, Duration)> = None;
+    let mut trace_failing = false;
     loop {
         tokio::select! {
             biased;
             _ = stop.changed() => break,
             _ = interval.tick() => {
                 state.observation.settings.maintain(&state.observation);
-                reconcile_kernel_trace(&state).await;
+                reconcile_kernel_trace(&state, &mut trace_failing).await;
                 state.observation.core.flows.maintain();
                 let now = Instant::now();
                 let totals = state.stats.traffic_totals();
@@ -64,13 +65,27 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
 
 /// Settings owns demand; the existing sampler publishes it on its next tick.
 /// Scheduling and publication/telemetry contention can delay that tick.
-async fn reconcile_kernel_trace(state: &NativeState) {
-    if let Some(flags) = &state.datapath_flags
-        && let Err(error) = flags
-            .reconcile_kernel_trace(|| state.observation.settings.flow_recording())
-            .await
+/// A persistent failure repeats every tick; warn once per episode.
+async fn reconcile_kernel_trace(state: &NativeState, failing: &mut bool) {
+    let Some(flags) = &state.datapath_flags else {
+        return;
+    };
+    match flags
+        .reconcile_kernel_trace(|| state.observation.settings.flow_recording())
+        .await
     {
-        tracing::warn!(%error, "kernel trace admission retains its previous state");
+        Ok(()) => {
+            if std::mem::replace(failing, false) {
+                tracing::info!("kernel trace admission recovered");
+            }
+        }
+        Err(error) => {
+            crate::logging::warn_on_entry!(
+                !std::mem::replace(failing, true),
+                %error,
+                "kernel trace admission retains its previous state"
+            );
+        }
     }
 }
 
@@ -358,6 +373,8 @@ async fn supervise(
     let mut sampler = tokio::spawn(sample_traffic(Arc::clone(&state), sampler_receiver));
     let mut sampler_running = true;
     let mut children = JoinSet::new();
+    // A persistent accept error repeats every iteration; warn once per episode.
+    let mut accept_failing = false;
     loop {
         tokio::select! {
             biased;
@@ -386,7 +403,10 @@ async fn supervise(
                 let (stream, peer) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
-                        tracing::warn!(message = "native HTTP listener failed");
+                        crate::logging::warn_on_entry!(
+                            !std::mem::replace(&mut accept_failing, true),
+                            message = "native HTTP listener failed"
+                        );
                         // Resource exhaustion persists across retries; back off instead of spinning.
                         if matches!(
                             error.raw_os_error(),
@@ -397,6 +417,9 @@ async fn supervise(
                         continue;
                     }
                 };
+                if std::mem::replace(&mut accept_failing, false) {
+                    tracing::info!(message = "native HTTP listener recovered");
+                }
                 let peer = Peer(peer.ip().to_canonical());
                 let service = tower::Layer::layer(&Extension(peer), router.clone());
                 children.spawn(serve(stream, service, connection_receiver.clone()));
@@ -418,7 +441,7 @@ async fn supervise(
     if sampler_running {
         let _ = sampler.await;
     }
-    reconcile_kernel_trace(&state).await;
+    reconcile_kernel_trace(&state, &mut false).await;
     let _ = schedule_stop.send(true);
     if schedule_running {
         let _ = schedule.await;

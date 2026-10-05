@@ -31,6 +31,20 @@ pub(crate) const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off";
 #[cfg(any(feature = "clash-api", feature = "native-api"))]
 pub(crate) const QUIET_TARGET: &str = "quinn::endpoint";
 
+/// WARN when a persisting state is entered, DEBUG for its repeats, so a
+/// failure retried every tick reports once per episode. The caller decides
+/// entry (e.g. `!flag.swap(true)`); the event keeps the caller's target.
+macro_rules! warn_on_entry {
+    ($entered:expr, $($arg:tt)+) => {
+        if $entered {
+            tracing::warn!($($arg)+)
+        } else {
+            tracing::debug!($($arg)+)
+        }
+    };
+}
+pub(crate) use warn_on_entry;
+
 /// Colour belongs on a terminal only: a service manager (procd, syslog) stores
 /// the escape codes verbatim. A non-empty `NO_COLOR` turns it off everywhere.
 pub(crate) fn console_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {

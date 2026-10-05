@@ -736,6 +736,8 @@ impl ControlPlane {
             {
                 warn!(%error, "sd_notify readiness failed");
             }
+            // A persistent accept error repeats every iteration; warn once per episode.
+            let mut accept_failing = false;
             while fatal.is_none() && !self.shutdown_requested.load(Ordering::Acquire) {
                 match active.next(self, &mut commands).await {
                     EpochEvent::Command(command) => {
@@ -761,6 +763,9 @@ impl ControlPlane {
                     }
                     EpochEvent::Reaped => {}
                     EpochEvent::Accepted(Ok((stream, address, family, permit))) => {
+                        if std::mem::replace(&mut accept_failing, false) {
+                            info!("TPROXY TCP accept recovered");
+                        }
                         if self.drain_tracker.should_reject() {
                             continue;
                         }
@@ -778,7 +783,11 @@ impl ControlPlane {
                         });
                     }
                     EpochEvent::Accepted(Err(error)) => {
-                        error!(%error, "TPROXY TCP accept failed");
+                        crate::logging::warn_on_entry!(
+                            !std::mem::replace(&mut accept_failing, true),
+                            %error,
+                            "TPROXY TCP accept failed"
+                        );
                         if error.raw_os_error() == Some(libc::EMFILE) {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
