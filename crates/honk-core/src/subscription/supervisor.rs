@@ -498,7 +498,11 @@ impl SupervisorState {
                 self.publication_ids.insert(task.id(), id);
             }
             Some(Err(error)) => {
-                warn!(%error, "Subscription refresh failed; keeping active nodes");
+                warn!(
+                    subscription = %completion.authorized.subscription.name,
+                    %error,
+                    "Subscription refresh failed; keeping active nodes"
+                );
                 self.finish(id, Err(super::failure_code(&error)));
             }
             None => self.finish(id, Err("supervisor_stopped")),
@@ -554,7 +558,11 @@ impl SupervisorState {
                     let id = completion.authorized.subscription.id;
                     match completion.result {
                         Some(Err(error)) => {
-                            warn!(%error, "Subscription refresh failed; keeping active nodes");
+                            warn!(
+                                subscription = %completion.authorized.subscription.name,
+                                %error,
+                                "Subscription refresh failed; keeping active nodes"
+                            );
                             self.finish(id, Err("fetch_failed"));
                         }
                         Some(Ok(_)) | None => self.finish(id, Err("supervisor_stopped")),

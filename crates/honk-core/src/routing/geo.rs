@@ -564,7 +564,7 @@ impl GeoAssets {
                 tracing::debug!("expanded geosite codes into {} domain matchers", out.len());
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     "geosite.dat unavailable; geosite conditions {:?} match nothing",
                     codes
                 );
@@ -623,7 +623,7 @@ impl GeoAssets {
                     }
                 }
                 None => {
-                    tracing::warn!(
+                    tracing::debug!(
                         "geoip.dat unavailable; geoip condition '{}' matches nothing",
                         code
                     );

@@ -5,13 +5,13 @@
 use nix::sys::socket::{
     AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, socket,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::ebpf::{DynamicHooks, EbpfBackend, IfaceRole};
 
@@ -67,7 +67,7 @@ impl IfaceWatcher {
         let fd = match subscribe_network_events() {
             Ok(fd) => fd,
             Err(e) => {
-                warn!(
+                error!(
                     "interface watcher disabled; subscribe network events failed: {}",
                     e
                 );
@@ -130,7 +130,7 @@ async fn run(
     {
         Ok(f) => f,
         Err(e) => {
-            warn!("interface watcher disabled: AsyncFd setup failed: {}", e);
+            error!("interface watcher disabled: AsyncFd setup failed: {}", e);
             degradations.set(
                 crate::degradations::Component::IfaceWatch,
                 watcher_disabled("poll_setup_failed"),
@@ -144,6 +144,7 @@ async fn run(
     let mut network_state = read_network_state(&config).await;
     let mut pending_notification = true;
     let mut netlink_retry_at = tokio::time::Instant::now();
+    let mut attach_warned = HashSet::new();
 
     // Interface-dependent state may have changed before the watcher was ready;
     // the control-plane refresh is content-deduplicated.
@@ -152,6 +153,7 @@ async fn run(
         &config,
         &commands,
         &mut attached,
+        &mut attach_warned,
         true,
         &mut pending_notification,
     )
@@ -169,7 +171,7 @@ async fn run(
             }
             _ = ticker.tick() => {
                 let changed = update_network_state(&config, &mut network_state).await;
-                reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed, &mut pending_notification).await;
+                reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut attach_warned, changed, &mut pending_notification).await;
             }
             guard = async {
                 tokio::time::sleep_until(netlink_retry_at).await;
@@ -180,7 +182,7 @@ async fn run(
                 let mut guard = match guard {
                     Ok(g) => g,
                     Err(e) => {
-                        warn!("interface watcher: netlink wait failed: {}", e);
+                        debug!("interface watcher: netlink wait failed: {}", e);
                         netlink_retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
                         continue;
                     }
@@ -212,10 +214,10 @@ async fn run(
                             guard.clear_ready();
                         }
                         let changed = update_network_state(&config, &mut network_state).await;
-                        reconcile_and_notify(&ebpf, &config, &commands, &mut attached, changed, &mut pending_notification).await;
+                        reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut attach_warned, changed, &mut pending_notification).await;
                     }
                     Ok(Err(e)) => {
-                        warn!("interface watcher: netlink recv failed: {}", e);
+                        debug!("interface watcher: netlink recv failed: {}", e);
                         netlink_retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
                     }
                     // Spurious readiness; nothing was drained.
@@ -252,11 +254,12 @@ async fn reconcile_and_notify(
     config: &Arc<RwLock<Arc<honk_config::Config>>>,
     commands: &mpsc::Sender<crate::control::ControlCommand>,
     attached: &mut AttachedMap,
+    attach_warned: &mut HashSet<String>,
     network_state_changed: bool,
     pending_notification: &mut bool,
 ) {
     *pending_notification |= network_state_changed;
-    match reconcile(ebpf, config, attached).await {
+    match reconcile(ebpf, config, attached, attach_warned).await {
         Ok(changed) => *pending_notification |= changed,
         Err(_) => *pending_notification = true,
     }
@@ -276,6 +279,9 @@ async fn reconcile(
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: &Arc<RwLock<Arc<honk_config::Config>>>,
     attached: &mut AttachedMap,
+    // Interfaces whose attach failure was already warned; reconcile retries
+    // on every event and tick.
+    attach_warned: &mut HashSet<String>,
 ) -> anyhow::Result<bool> {
     let (desired, single_homed) = {
         let cfg = config.read().await;
@@ -346,11 +352,18 @@ async fn reconcile(
                 if matches!(role, IfaceRole::Wan | IfaceRole::LanWan) {
                     crate::enable_wan_accept_ra(&name);
                 }
+                attach_warned.remove(&name);
                 info!(interface = %name, role = ?role, "attached eBPF programs to new interface");
                 changed = true;
             }
             Err(e) => {
-                warn!(interface = %name, role = ?role, "dynamic attach failed: {}", e);
+                crate::logging::warn_on_entry!(
+                    attach_warned.insert(name.clone()),
+                    interface = %name,
+                    role = ?role,
+                    "dynamic attach failed: {}",
+                    e
+                );
                 attach_error
                     .get_or_insert_with(|| e.context(format!("attach {role:?} interface {name}")));
             }
@@ -537,14 +550,23 @@ mod tests {
         config.global.lan_interface = vec!["lo".to_string()];
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
+        let mut warned = HashSet::new();
 
-        assert!(reconcile(&ebpf, &config, &mut attached).await.unwrap());
+        assert!(
+            reconcile(&ebpf, &config, &mut attached, &mut warned)
+                .await
+                .unwrap()
+        );
         let first = attach.load(Ordering::Relaxed);
         {
             let mut config = config.write().await;
             Arc::make_mut(&mut config).global.wan_interface = vec!["lo".to_string()];
         }
-        assert!(reconcile(&ebpf, &config, &mut attached).await.unwrap());
+        assert!(
+            reconcile(&ebpf, &config, &mut attached, &mut warned)
+                .await
+                .unwrap()
+        );
 
         assert_eq!(forget.load(Ordering::Relaxed), 1);
         assert_eq!(attach.load(Ordering::Relaxed), first + 1);
@@ -552,7 +574,41 @@ mod tests {
             attached.get("lo").map(|state| state.role),
             Some(IfaceRole::LanWan)
         );
-        assert!(!reconcile(&ebpf, &config, &mut attached).await.unwrap());
+        assert!(
+            !reconcile(&ebpf, &config, &mut attached, &mut warned)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_failure_warning_rearms_after_success() {
+        let mut config = honk_config::Config::default();
+        config.global.lan_interface = vec!["lo".to_string()];
+        let config = Arc::new(RwLock::new(Arc::new(config)));
+        let mut faulty = crate::ebpf::mock::MockEbpfBackend::new();
+        faulty.dynamic_attach_fault = true;
+        let faulty: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(faulty)));
+        let healthy: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        )));
+        let mut attached = AttachedMap::new();
+        let mut warned = HashSet::new();
+
+        for _ in 0..2 {
+            assert!(
+                reconcile(&faulty, &config, &mut attached, &mut warned)
+                    .await
+                    .is_err()
+            );
+            assert!(warned.contains("lo"));
+        }
+        assert!(
+            reconcile(&healthy, &config, &mut attached, &mut warned)
+                .await
+                .unwrap()
+        );
+        assert!(warned.is_empty());
     }
 
     #[tokio::test]
@@ -563,6 +619,7 @@ mod tests {
         config.global.lan_interface = vec!["lo".to_string()];
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
+        let mut warned = HashSet::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let mut pending_notification = false;
         reconcile_and_notify(
@@ -570,6 +627,7 @@ mod tests {
             &config,
             &tx,
             &mut attached,
+            &mut warned,
             false,
             &mut pending_notification,
         )
@@ -584,6 +642,7 @@ mod tests {
             &config,
             &tx,
             &mut attached,
+            &mut warned,
             false,
             &mut pending_notification,
         )
@@ -598,6 +657,7 @@ mod tests {
             &config,
             &tx,
             &mut attached,
+            &mut warned,
             true,
             &mut pending_notification,
         )
@@ -701,13 +761,18 @@ mod tests {
         config.global.lan_interface = vec!["lo".to_string()];
         let config = Arc::new(RwLock::new(Arc::new(config)));
         let mut attached = AttachedMap::new();
+        let mut warned = HashSet::new();
 
-        reconcile(&ebpf, &config, &mut attached).await.unwrap();
+        reconcile(&ebpf, &config, &mut attached, &mut warned)
+            .await
+            .unwrap();
         let first = attach.load(Ordering::Relaxed);
         assert!(first >= 1, "first reconcile attaches the configured LAN");
         assert_eq!(detach.load(Ordering::Relaxed), 0);
 
-        reconcile(&ebpf, &config, &mut attached).await.unwrap();
+        reconcile(&ebpf, &config, &mut attached, &mut warned)
+            .await
+            .unwrap();
         assert_eq!(
             attach.load(Ordering::Relaxed),
             first,
