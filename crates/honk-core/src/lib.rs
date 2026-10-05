@@ -60,7 +60,7 @@ use logging::{
 use state::startup::{claim_state, open_state_db};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Raise the soft descriptor limit toward the hard maximum, then return the
 /// one startup snapshot used to size every control-plane descriptor owner.
@@ -737,7 +737,7 @@ fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
 /// Render one runtime admission rejection at the process reporting boundary.
 pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
     let diagnostic = error.diagnostic.as_ref();
-    tracing::error!(
+    tracing::warn!(
         code = diagnostic.code,
         setting = %diagnostic.setting,
         value = %diagnostic.value,
@@ -1633,11 +1633,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             warn!(generation, "SIGHUP reload committed with degraded datapath");
                         }
                         Err(configuration::ActivationFailure::Reconciliation(generation)) => {
-                            warn!(generation, "SIGHUP reload worker reconciliation failed");
+                            error!(generation, "SIGHUP reload worker reconciliation failed");
                             break;
                         }
                         Err(failure) => {
-                            warn!(?failure, "SIGHUP reload request {request_id} failed");
+                            error!(?failure, "SIGHUP reload request {request_id} failed");
                             let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
                             break;
                         }

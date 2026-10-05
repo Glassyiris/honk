@@ -113,7 +113,7 @@ impl OwnerCollector {
             }
             let covered = self.sweep().await;
             if covered < self.worker_count {
-                tracing::warn!(
+                tracing::debug!(
                     covered,
                     expected = self.worker_count,
                     "mimalloc owner sweep could not reach every Tokio worker"
