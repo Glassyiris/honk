@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{debug, error, info};
 
 const MAX_UDP_DNS_MESSAGE: usize = u16::MAX as usize;
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
@@ -366,10 +366,12 @@ async fn run_udp_supervisor(
     let local_addr = match socket.local_addr() {
         Ok(local_addr) => local_addr,
         Err(error) => {
-            warn!(error_kind = ?error.kind(), "standalone UDP DNS receive failed");
+            error!(error_kind = ?error.kind(), "standalone UDP DNS receive failed");
             return Err(error.into());
         }
     };
+    // A persistent receive error repeats every iteration; warn once per episode.
+    let mut receive_failing = false;
 
     loop {
         tokio::select! {
@@ -386,15 +388,22 @@ async fn run_udp_supervisor(
                 let (length, client_addr, meta) = match received {
                     Ok(received) => received,
                     Err(error) => {
-                        warn!(error_kind = ?error.kind(), "standalone UDP DNS receive failed");
+                        crate::logging::warn_on_entry!(
+                            !std::mem::replace(&mut receive_failing, true),
+                            error_kind = ?error.kind(),
+                            "standalone UDP DNS receive failed"
+                        );
                         continue;
                     }
                 };
+                if std::mem::replace(&mut receive_failing, false) {
+                    info!("standalone UDP DNS receive recovered");
+                }
                 if *phase.borrow() != ListenerPhase::Running {
                     break;
                 }
                 let Some(response_source) = udp_response_source(&meta) else {
-                    warn!(%client_addr, "standalone UDP DNS datagram has no reply source address");
+                    debug!(%client_addr, "standalone UDP DNS datagram has no reply source address");
                     continue;
                 };
                 let query = &buffer[..length];
@@ -574,6 +583,8 @@ async fn run_tcp_supervisor(
 ) -> anyhow::Result<()> {
     let mut children = JoinSet::new();
     let mut failure = None;
+    // A persistent accept error repeats every iteration; warn once per episode.
+    let mut accept_failing = false;
 
     loop {
         tokio::select! {
@@ -590,10 +601,17 @@ async fn run_tcp_supervisor(
                 let (mut stream, client_addr) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
-                        warn!(error_kind = ?error.kind(), "standalone TCP DNS accept failed");
+                        crate::logging::warn_on_entry!(
+                            !std::mem::replace(&mut accept_failing, true),
+                            error_kind = ?error.kind(),
+                            "standalone TCP DNS accept failed"
+                        );
                         continue;
                     }
                 };
+                if std::mem::replace(&mut accept_failing, false) {
+                    info!("standalone TCP DNS accept recovered");
+                }
                 if *phase.borrow() != ListenerPhase::Running || drain.should_reject() {
                     continue;
                 }

@@ -268,6 +268,12 @@ pub(super) async fn send_udp_reply_from_orig_dst(
     if original_dst.port() == 53 {
         match send_dns_reply_cached(data, client_addr, original_dst).await {
             Some(Ok(n)) => {
+                let fallback = &DNS_REPLY_FALLBACK[usize::from(original_dst.is_ipv6())];
+                if fallback.load(std::sync::atomic::Ordering::Relaxed)
+                    && fallback.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    info!("cached DNS reply socket recovered");
+                }
                 debug!(
                     "UDP reply sent to {} from {} ({} bytes)",
                     client_addr, original_dst, n
@@ -275,7 +281,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
                 return Ok(n);
             }
             Some(Err(e)) => {
-                warn!(
+                debug!(
                     "UDP reply to {} from {} failed: {}",
                     client_addr, original_dst, e
                 );
@@ -295,7 +301,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
             Ok(n)
         }
         Err(e) => {
-            warn!(
+            debug!(
                 "UDP reply to {} from {} failed: {}",
                 client_addr, original_dst, e
             );
@@ -378,6 +384,14 @@ fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
 static DNS_REPLY_SOCK_V4: Mutex<Option<Arc<UdpSocket>>> = Mutex::new(None);
 #[cfg(target_os = "linux")]
 static DNS_REPLY_SOCK_V6: Mutex<Option<Arc<UdpSocket>>> = Mutex::new(None);
+
+/// Per-family flag set while cached DNS replies fall back to one-shot
+/// sockets, so a persistent failure warns once per episode, not per reply.
+#[cfg(target_os = "linux")]
+static DNS_REPLY_FALLBACK: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
 
 /// Source port every DNS reply is sent from (the port clients send queries to).
 #[cfg(target_os = "linux")]
@@ -512,7 +526,9 @@ async fn send_dns_reply_cached(
     let sock = match get_dns_reply_socket(is_v6) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
+            crate::logging::warn_on_entry!(
+                !DNS_REPLY_FALLBACK[usize::from(is_v6)]
+                    .swap(true, std::sync::atomic::Ordering::Relaxed),
                 "cached DNS reply socket unavailable ({}); falling back to one-shot",
                 e
             );
@@ -540,7 +556,9 @@ async fn send_dns_reply_cached(
     let sock = match replace_dns_reply_socket(is_v6, &sock) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
+            crate::logging::warn_on_entry!(
+                !DNS_REPLY_FALLBACK[usize::from(is_v6)]
+                    .swap(true, std::sync::atomic::Ordering::Relaxed),
                 "cached DNS reply socket rebuild failed ({}); falling back to one-shot",
                 e
             );

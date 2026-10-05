@@ -517,7 +517,7 @@ impl UdpLoopState {
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     if let Err(error) = handle.serve_udp_connection(lease).await {
-                        warn!(%src_addr, %original_dst, %error, "Error handling UDP");
+                        debug!(%src_addr, %original_dst, %error, "Error handling UDP");
                     }
                 });
             }
@@ -681,17 +681,27 @@ pub(super) async fn udp_listener_loop(
             return;
         }
     };
+    // A persistent receive error repeats every iteration; warn once per episode.
+    let mut receive_failing = false;
     loop {
         if let Err(error) = recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch).await {
-            error!(family, %error, "UDP receive failed");
+            crate::logging::warn_on_entry!(
+                !std::mem::replace(&mut receive_failing, true),
+                family,
+                %error,
+                "UDP receive failed"
+            );
             continue;
+        }
+        if std::mem::replace(&mut receive_failing, false) {
+            info!(family, "UDP receive recovered");
         }
         let enqueued_at = udp_endpoint::queue_now();
         for index in 0..batch.len() {
             let (data, src_addr, metadata) = match batch.packet(index) {
                 Ok(packet) => packet,
                 Err(error) => {
-                    error!(family, %error, "Invalid UDP receive metadata");
+                    debug!(family, %error, "Invalid UDP receive metadata");
                     continue;
                 }
             };
