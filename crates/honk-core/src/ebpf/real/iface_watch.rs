@@ -287,6 +287,8 @@ async fn reconcile(
         let cfg = config.read().await;
         desired_interfaces(&cfg)
     };
+    // An interface that leaves the desired set ends its failure episode.
+    attach_warned.retain(|name| desired.contains_key(name));
     let wanted = |role: IfaceRole| match role {
         IfaceRole::Lan => DynamicHooks {
             ingress: true,
@@ -608,6 +610,32 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(warned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_failure_warning_ends_when_interface_is_no_longer_desired() {
+        let mut config = honk_config::Config::default();
+        config.global.lan_interface = vec!["lo".to_string()];
+        let config = Arc::new(RwLock::new(Arc::new(config)));
+        let mut faulty = crate::ebpf::mock::MockEbpfBackend::new();
+        faulty.dynamic_attach_fault = true;
+        let faulty: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(faulty)));
+        let mut attached = AttachedMap::new();
+        let mut warned = HashSet::new();
+
+        assert!(
+            reconcile(&faulty, &config, &mut attached, &mut warned)
+                .await
+                .is_err()
+        );
+        Arc::make_mut(&mut *config.write().await)
+            .global
+            .lan_interface
+            .clear();
+        reconcile(&faulty, &config, &mut attached, &mut warned)
+            .await
+            .unwrap();
         assert!(warned.is_empty());
     }
 
