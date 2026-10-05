@@ -407,9 +407,12 @@ fn parse_http_host(data: &[u8]) -> Option<String> {
     }
 
     for line in text.lines() {
-        let lower = line.trim().to_lowercase();
-        if lower.starts_with("host:") {
-            let host = line.trim()["host:".len()..].trim();
+        let line = line.trim();
+        if line
+            .get(.."host:".len())
+            .is_some_and(|name| name.eq_ignore_ascii_case("host:"))
+        {
+            let host = line["host:".len()..].trim();
             let host = host.split(':').next().unwrap_or(host);
             if !host.is_empty() && is_valid_hostname(host) {
                 return Some(host.to_lowercase());
