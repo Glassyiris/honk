@@ -149,6 +149,9 @@ struct Writer {
     budget_pages: i64,
     /// Batches skipped for the page budget; the first one is logged.
     skipped: u64,
+    /// Failure episodes of the point and delay batches.
+    points_failing: bool,
+    delays_failing: bool,
     // The directory lock must outlive the writer connection.
     _state: Arc<StateDb>,
 }
@@ -264,23 +267,46 @@ impl Writer {
     }
 }
 
+/// Logs a recurring failure: WARN when the site's failure episode starts,
+/// DEBUG while it lasts.
+fn note_failure(failing: &mut bool, what: &'static str, error: impl std::fmt::Display) {
+    crate::logging::warn_on_entry!(!std::mem::replace(failing, true), %error, "{what} failed");
+}
+
+/// Ends a failure episode with one INFO line.
+fn note_success(failing: &mut bool, what: &'static str) {
+    if std::mem::take(failing) {
+        tracing::info!("{what} recovered");
+    }
+}
+
 fn run_writer(mut writer: Writer, receiver: mpsc::Receiver<Write>) {
     while let Ok(write) = receiver.recv() {
         match write {
             Write::Set(key, value) => {
                 writer.latest.insert(key, value);
-                if writer.latest.len() >= 64
-                    && let Err(error) = writer.write_points()
-                {
-                    tracing::warn!(error = %CacheDbError::from(error), "state cache point-write batch failed");
+                if writer.latest.len() >= 64 {
+                    const WHAT: &str = "state cache point-write batch";
+                    match writer.write_points() {
+                        Ok(()) => note_success(&mut writer.points_failing, WHAT),
+                        Err(error) => note_failure(
+                            &mut writer.points_failing,
+                            WHAT,
+                            CacheDbError::from(error),
+                        ),
+                    }
                 }
             }
             Write::Barrier(ack) => {
                 let _ = ack.send(writer.write_points().map_err(CacheDbError::from));
             }
             Write::Delays(samples) => {
-                if let Err(error) = writer.write_delays(&samples) {
-                    tracing::warn!(error = %CacheDbError::from(error), "state cache delay batch failed");
+                const WHAT: &str = "state cache delay batch";
+                match writer.write_delays(&samples) {
+                    Ok(()) => note_success(&mut writer.delays_failing, WHAT),
+                    Err(error) => {
+                        note_failure(&mut writer.delays_failing, WHAT, CacheDbError::from(error))
+                    }
                 }
             }
             Write::DeleteDelaysBefore(cutoff) => {
@@ -410,6 +436,9 @@ pub struct CacheDb {
     pending: Arc<Mutex<HashMap<Key, PendingWrite>>>,
     writer: mpsc::SyncSender<Write>,
     next_sequence: std::sync::atomic::AtomicU64,
+    /// Set once the writer thread is gone or the pending map is poisoned;
+    /// neither recovers, so only the first rejection is an ERROR.
+    writer_lost: std::sync::atomic::AtomicBool,
     flush: Arc<FlushSignal>,
     #[cfg(test)]
     write_attempted: std::sync::atomic::AtomicBool,
@@ -434,6 +463,8 @@ impl CacheDb {
             latest: HashMap::new(),
             budget_pages: state.cache_budget_pages(),
             skipped: 0,
+            points_failing: false,
+            delays_failing: false,
             _state: Arc::clone(&state),
         };
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -449,14 +480,17 @@ impl CacheDb {
         std::thread::Builder::new()
             .name("honk-cache-db-flusher".into())
             .spawn(move || {
+                const WHAT: &str = "state cache periodic point-write flush";
+                let mut failing = false;
                 // A pending write reaches SQLite within `FLUSH_INTERVAL`.
                 while signal.wait() {
                     std::thread::sleep(FLUSH_INTERVAL);
                     let Some(pending) = flush_pending.upgrade() else {
                         break;
                     };
-                    if let Err(error) = flush_pending_writes(&pending, &flush_writer) {
-                        tracing::warn!(%error, "state cache periodic point-write flush failed");
+                    match flush_pending_writes(&pending, &flush_writer) {
+                        Ok(()) => note_success(&mut failing, WHAT),
+                        Err(error) => note_failure(&mut failing, WHAT, error),
                     }
                     // Writes that arrived during the flush wait for the next round.
                     if pending.lock().is_ok_and(|pending| !pending.is_empty()) {
@@ -471,6 +505,7 @@ impl CacheDb {
             pending,
             writer,
             next_sequence: std::sync::atomic::AtomicU64::new(1),
+            writer_lost: std::sync::atomic::AtomicBool::new(false),
             flush,
             #[cfg(test)]
             write_attempted: std::sync::atomic::AtomicBool::new(false),
@@ -497,12 +532,22 @@ impl CacheDb {
         .ok()
     }
 
+    fn first_writer_loss(&self) -> bool {
+        !self
+            .writer_lost
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn set(&self, key: Key, value: String) {
         let sequence = self
             .next_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Ok(mut pending) = self.pending.lock() else {
-            tracing::warn!("state cache pending-write lock poisoned");
+            if self.first_writer_loss() {
+                tracing::error!("state cache pending-write lock poisoned");
+            } else {
+                tracing::debug!("state cache pending-write lock poisoned");
+            }
             return;
         };
         let previous = pending.insert(
@@ -521,7 +566,11 @@ impl CacheDb {
                     pending.remove(&key);
                 }
             }
-            tracing::warn!(%error, "state cache writer closed; point write rejected");
+            if self.first_writer_loss() {
+                tracing::error!(%error, "state cache writer closed; point write rejected");
+            } else {
+                tracing::debug!(%error, "state cache writer closed; point write rejected");
+            }
             return;
         }
         drop(pending);
@@ -589,7 +638,11 @@ impl CacheDb {
             return;
         }
         if let Err(error) = self.writer.send(Write::Delays(samples)) {
-            tracing::warn!(%error, "state cache writer closed; delay batch rejected");
+            if self.first_writer_loss() {
+                tracing::error!(%error, "state cache writer closed; delay batch rejected");
+            } else {
+                tracing::debug!(%error, "state cache writer closed; delay batch rejected");
+            }
         }
     }
 
@@ -618,7 +671,11 @@ impl CacheDb {
                 .collect()
         })();
         if let Err(error) = self.writer.send(Write::DeleteDelaysBefore(cutoff)) {
-            tracing::warn!(%error, "state cache writer closed; delay prune rejected");
+            if self.first_writer_loss() {
+                tracing::error!(%error, "state cache writer closed; delay prune rejected");
+            } else {
+                tracing::debug!(%error, "state cache writer closed; delay prune rejected");
+            }
         }
         rows.unwrap_or_else(|error| {
             tracing::warn!(error = %CacheDbError::from(error), "state cache delay load failed");
@@ -766,6 +823,12 @@ pub(crate) struct Missing {
     groups: HashSet<String>,
     nodes: HashSet<String>,
     bodies: HashSet<String>,
+    /// Failure episodes of the tick's steps, so a persistent failure is
+    /// reported once rather than every tick.
+    bodies_failing: bool,
+    groups_read_failing: bool,
+    nodes_read_failing: bool,
+    maintain_failing: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -790,25 +853,31 @@ pub(crate) fn maintenance_tick(
     owners: TickOwners,
     now: u64,
 ) {
-    if owners.store_subscribe
-        && let Err(error) = crate::subscription::prune_bodies(state, &mut missing.bodies)
-    {
-        tracing::warn!(%error, "state db subscription body maintenance failed");
+    if owners.store_subscribe {
+        let what = "state db subscription body maintenance";
+        match crate::subscription::prune_bodies(state, &mut missing.bodies) {
+            Ok(()) => note_success(&mut missing.bodies_failing, what),
+            Err(error) => note_failure(&mut missing.bodies_failing, what, error),
+        }
     }
     let Some(db) = db else {
         return;
     };
     db.save_delay_samples(samples);
-    let stale = |rows: Result<Vec<String>, _>,
+    let stale = |rows: Result<Vec<String>, CacheDbError>,
                  present: &HashSet<String>,
-                 previous: &mut HashSet<String>| {
+                 previous: &mut HashSet<String>,
+                 failing: &mut bool| {
+        let what = "state db maintenance read";
         let current: HashSet<String> = match rows {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|key| !present.contains(key))
-                .collect(),
+            Ok(rows) => {
+                note_success(failing, what);
+                rows.into_iter()
+                    .filter(|key| !present.contains(key))
+                    .collect()
+            }
             Err(error) => {
-                tracing::warn!(%error, "state db maintenance read failed");
+                note_failure(failing, what, error);
                 HashSet::new()
             }
         };
@@ -821,13 +890,21 @@ pub(crate) fn maintenance_tick(
             db.selector_groups(),
             &live.selector_groups,
             &mut missing.groups,
+            &mut missing.groups_read_failing,
         ),
-        nodes: stale(db.delay_nodes(), &live.nodes, &mut missing.nodes),
+        nodes: stale(
+            db.delay_nodes(),
+            &live.nodes,
+            &mut missing.nodes,
+            &mut missing.nodes_read_failing,
+        ),
         delay_cutoff: now.saturating_sub(DELAY_SAMPLE_MAX_AGE_SECS),
         dns_expired_at: owners.store_dns.then_some(now),
     };
-    if let Err(error) = db.maintain(work) {
-        tracing::warn!(%error, "state db maintenance failed");
+    let what = "state db maintenance";
+    match db.maintain(work) {
+        Ok(()) => note_success(&mut missing.maintain_failing, what),
+        Err(error) => note_failure(&mut missing.maintain_failing, what, error),
     }
 }
 

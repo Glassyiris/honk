@@ -88,7 +88,7 @@ pub(super) fn run(db: Arc<CacheDb>, receiver: mpsc::Receiver<Command>, counters:
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            tracing::warn!(%error, "DNS persistence worker runtime failed");
+            tracing::error!(%error, "DNS persistence worker runtime failed");
             return;
         }
     };

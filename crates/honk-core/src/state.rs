@@ -426,7 +426,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
         nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
     ) {
         Ok(_) => {
-            tracing::warn!(
+            tracing::error!(
                 database = %shown.join(DB_FILE).display(),
                 earlier = %shown.join(CORRUPT).display(),
                 "state database is corrupt and an earlier copy is kept; running without it"
@@ -441,7 +441,7 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
         match rename_noreplace(&directory, from, to) {
             Ok(()) | Err(Errno::ENOENT) => {}
             Err(Errno::EEXIST) => {
-                tracing::warn!(
+                tracing::error!(
                     earlier = %shown.join(to).display(),
                     "state database is corrupt and an earlier copy is kept; running without it"
                 );
@@ -825,7 +825,7 @@ where
 
 pub(crate) fn log_sql(error: &rusqlite::Error) {
     let code = error.sqlite_error().map(|error| error.extended_code);
-    tracing::warn!(sqlite_code = ?code, "state database operation failed");
+    tracing::debug!(sqlite_code = ?code, "state database operation failed");
 }
 
 pub(crate) fn sql(error: rusqlite::Error) -> StateError {
