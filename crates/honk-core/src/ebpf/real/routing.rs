@@ -37,6 +37,7 @@ pub(super) struct RoutingGeneration {
     _mac: RoutingLpm,
     descriptor: RoutingDescriptor,
     pub(super) trace_policy: u32,
+    #[cfg(feature = "native-api")]
     pub(super) fingerprint: [u8; 32],
     _btf: OwnedFd,
     _program: OwnedFd,
@@ -536,6 +537,7 @@ impl RealEbpfBackend {
             _mac: maps.mac,
             descriptor,
             trace_policy,
+            #[cfg(feature = "native-api")]
             fingerprint: plan.fingerprint,
             _btf: btf,
             _program: program,
@@ -600,8 +602,11 @@ impl RealEbpfBackend {
             next_trace_policy: 0,
             #[cfg(feature = "native-api")]
             trace_dictionaries: Default::default(),
+            #[cfg(feature = "native-api")]
             receive_trace: None,
+            #[cfg(feature = "native-api")]
             receive_trace_available: false,
+            #[cfg(feature = "native-api")]
             receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
         })

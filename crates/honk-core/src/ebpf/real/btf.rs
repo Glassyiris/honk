@@ -110,6 +110,7 @@ impl<'a> Btf<'a> {
     }
 
     /// Offset of a complete, non-bitfield member of exactly `width` bytes.
+    #[cfg(any(feature = "native-api", test))]
     pub(super) fn sized_member_offset(
         &self,
         type_name: &str,

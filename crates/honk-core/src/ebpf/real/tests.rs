@@ -254,6 +254,7 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
 }
 
+#[cfg(feature = "native-api")]
 #[tokio::test]
 #[ignore = "requires root; run via just test-netns"]
 async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
