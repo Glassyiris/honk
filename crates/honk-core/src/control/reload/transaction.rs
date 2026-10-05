@@ -92,6 +92,8 @@ impl ControlPlane {
         drain: &DrainTracker,
     ) -> ReloadOutcome {
         let _reload = self.reload_lock.lock().await;
+        // The previous subnet only lets ECS log a change rather than every re-resolution.
+        new_config.dns.resolved_client_subnet = self.config.read().await.dns.resolved_client_subnet;
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
         let update = DiagnosticUpdate::Replace(diagnostics);
         match self
@@ -137,6 +139,8 @@ impl ControlPlane {
         let current = Arc::clone(&current_guard);
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
         drop(current_guard);
+        // The previous subnet only lets ECS log a change rather than every re-resolution.
+        new_config.dns.resolved_client_subnet = current.dns.resolved_client_subnet;
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
         let declared = new_config
             .subscriptions
@@ -218,14 +222,14 @@ impl ControlPlane {
                 .iter()
                 .any(|(id, _)| !provider_ids.insert(*id))
             {
-                error!("reload rejected: duplicate provider diagnostic buckets");
+                warn!("reload rejected: duplicate provider diagnostic buckets");
                 return Ok(ReloadOutcome::Rejected);
             }
         }
         if let Err(error) =
             crate::subscription::validate_subscription_ids(&new_config.subscriptions)
         {
-            error!(%error, "reload rejected: invalid subscription ids");
+            warn!(%error, "reload rejected: invalid subscription ids");
             return Ok(ReloadOutcome::Rejected);
         }
         let current_router = self.router.read().await.clone();
@@ -242,7 +246,7 @@ impl ControlPlane {
                 &new_config.subscriptions,
             )
         {
-            error!("reload rejected: subscription worker changes require the control command path");
+            warn!("reload rejected: subscription worker changes require the control command path");
             return Ok(ReloadOutcome::Rejected);
         }
         // Same proof as at the public entry: equality with the admitted active
@@ -283,7 +287,7 @@ impl ControlPlane {
                 match crate::dns::forwarder::HostsSourceSet::probe_fingerprint(&new_config.dns) {
                     Ok(fingerprint) => fingerprint,
                     Err(error) => {
-                        error!(%error, "Failed to fingerprint DNS hosts snapshot");
+                        warn!(%error, "Failed to fingerprint DNS hosts snapshot");
                         self.stop_reload_rejection_if_healthy(drain);
                         return Ok(ReloadOutcome::Rejected);
                     }
@@ -309,7 +313,7 @@ impl ControlPlane {
                     let mut mode = flags.publication().await;
                     let mut backend = self.ebpf.write().await;
                     if let Err(error) = mode.reset_for_activation(backend.as_mut()) {
-                        error!(%error, "reload rejected: runtime mode reset failed");
+                        warn!(%error, "reload rejected: runtime mode reset failed");
                         return Ok(ReloadOutcome::Rejected);
                     }
                 }
@@ -347,7 +351,7 @@ impl ControlPlane {
         let restart_required =
             restart_required_fields(&current_config, &new_config, &self.log_files);
         if !restart_required.is_empty() {
-            error!(
+            warn!(
                 fields = ?restart_required.iter().map(|field| field.path).collect::<Vec<_>>(),
                 "reload rejected: changed fields require process restart"
             );
@@ -380,7 +384,7 @@ impl ControlPlane {
         let hosts_sources = match crate::dns::forwarder::HostsSourceSet::load(&new_config.dns) {
             Ok(sources) => sources,
             Err(error) => {
-                error!(%error, "Failed to load DNS hosts snapshot");
+                warn!(%error, "Failed to load DNS hosts snapshot");
                 self.stop_reload_rejection_if_healthy(drain);
                 return Ok(ReloadOutcome::Rejected);
             }
@@ -392,7 +396,7 @@ impl ControlPlane {
         ) {
             Ok(policy) => policy,
             Err(error) => {
-                error!(%error, "Failed to derive DNS policy identity");
+                warn!(%error, "Failed to derive DNS policy identity");
                 self.stop_reload_rejection_if_healthy(drain);
                 return Ok(ReloadOutcome::Rejected);
             }
@@ -412,7 +416,7 @@ impl ControlPlane {
             match Router::from_config_sharing(&new_config.routing, geo_sources, &mut shared) {
                 Ok(router) => router,
                 Err(error) => {
-                    error!(%error, "Failed to build new router");
+                    warn!(%error, "Failed to build new router");
                     self.stop_reload_rejection_if_healthy(drain);
                     return Ok(ReloadOutcome::Rejected);
                 }
@@ -448,7 +452,7 @@ impl ControlPlane {
             ) {
                 Ok((registry, reused)) => (Arc::new(registry), reused),
                 Err(e) => {
-                    error!("Failed to build runtime registry (reload aborted): {}", e);
+                    warn!("Failed to build runtime registry (reload aborted): {}", e);
                     self.stop_reload_rejection_if_healthy(drain);
                     return Ok(ReloadOutcome::Rejected);
                 }
@@ -466,7 +470,7 @@ impl ControlPlane {
             ) {
                 Ok(router) => Arc::new(router),
                 Err(error) => {
-                    error!(%error, "Failed to build DNS router");
+                    warn!(%error, "Failed to build DNS router");
                     self.stop_reload_rejection_if_healthy(drain);
                     return Ok(ReloadOutcome::Rejected);
                 }
@@ -480,7 +484,7 @@ impl ControlPlane {
             match hosts_sources.parse() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    error!(%error, "Failed to parse DNS hosts snapshot");
+                    warn!(%error, "Failed to parse DNS hosts snapshot");
                     self.stop_reload_rejection_if_healthy(drain);
                     return Ok(ReloadOutcome::Rejected);
                 }
@@ -500,7 +504,7 @@ impl ControlPlane {
         {
             Ok(runtime) => runtime,
             Err(e) => {
-                error!("Failed to build DNS forwarder: {}", e);
+                warn!("Failed to build DNS forwarder: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
                 return Ok(ReloadOutcome::Rejected);
             }
@@ -515,7 +519,7 @@ impl ControlPlane {
             match Self::compile_routing_plan(&new_config, &new_router) {
                 Ok(plan) => Arc::new(plan),
                 Err(error) => {
-                    error!(%error, "Failed to compile routing publication");
+                    warn!(%error, "Failed to compile routing publication");
                     self.stop_reload_rejection_if_healthy(drain);
                     return Ok(ReloadOutcome::Rejected);
                 }

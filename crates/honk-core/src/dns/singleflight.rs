@@ -110,7 +110,7 @@ impl Singleflight {
             if sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
-                tracing::warn!(
+                crate::logging::warn_throttled!(
                     saturation = "waiters",
                     action = "reject",
                     "DNS singleflight saturated"
@@ -132,7 +132,7 @@ impl Singleflight {
         if entries.len() >= MAX_ACTIVE_FLIGHTS {
             self.counters.rejections.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
-            tracing::warn!(
+            crate::logging::warn_throttled!(
                 saturation = "keys",
                 action = "reject",
                 "DNS singleflight saturated"

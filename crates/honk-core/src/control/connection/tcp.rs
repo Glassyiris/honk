@@ -261,7 +261,7 @@ impl ControlPlaneHandle {
                         d
                     }
                     Err(le) => {
-                        warn!(
+                        debug!(
                             "Failed to get original destination for {}: {}; local_addr also failed: {}",
                             client_addr, e, le
                         );
@@ -570,7 +570,7 @@ impl ControlPlaneHandle {
                         &candidates,
                         None,
                     );
-                    warn!(
+                    debug!(
                         "No available candidate nodes for outbound '{}' ({})",
                         outbound_name, client_addr
                     );
@@ -950,7 +950,7 @@ impl ControlPlaneHandle {
                             });
                         }
                         if !intentionally_closed {
-                            warn!("Failed to write sniffed bytes to proxy: {}", error);
+                            debug!("Failed to write sniffed bytes to proxy: {}", error);
                             self.stats.record_error(&outbound_name, outbound_kind);
                         }
                         drop(outbound_guard);
@@ -1061,10 +1061,13 @@ impl ControlPlaneHandle {
                                     client_addr, original_dst, io_err
                                 );
                             } else {
-                                warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
+                                debug!(
+                                    "Relay error for {} -> {}: {}",
+                                    client_addr, original_dst, e
+                                );
                             }
                         } else {
-                            warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
+                            debug!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                         }
                         self.stats.record_error(&outbound_name, outbound_kind);
                         if let Some(reporter) = &score_reporter {

@@ -88,7 +88,18 @@ impl Worker {
                 }
             }
             Err(details) => {
-                tracing::warn!(%details, "geodata update failed");
+                let checksum = plan.sources.is_some()
+                    && details["stage"]
+                        .as_str()
+                        .is_some_and(|stage| stage.starts_with("checksum_"));
+                if checksum {
+                    tracing::warn!(
+                        %details,
+                        "geodata update failed; for a mirror that publishes no usable .sha256sum, setting geodata.verify_checksum to false turns the check off"
+                    );
+                } else {
+                    tracing::warn!(%details, "geodata update failed");
+                }
                 if let Some(sources) = &plan.sources {
                     sources.record(Err(details["stage"]
                         .as_str()
@@ -170,11 +181,6 @@ impl Worker {
                 ) => result,
             };
             let (bytes, origin) = result.map_err(|error| {
-                if plan.sources.is_some() && error.code.starts_with("checksum_") {
-                    tracing::warn!(
-                        "geodata checksum check failed; for a mirror that publishes no usable .sha256sum, setting geodata.verify_checksum to false turns the check off"
-                    );
-                }
                 let mut details = failure(error.code, &writes);
                 details["asset"] = json!(asset.kind);
                 if let Some(status) = error.status {

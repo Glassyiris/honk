@@ -607,7 +607,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         "AnyTLS padding scheme updated"
                     );
                 } else {
-                    warn!(
+                    debug!(
                         session = session.seq,
                         "AnyTLS server sent an invalid padding scheme"
                     );

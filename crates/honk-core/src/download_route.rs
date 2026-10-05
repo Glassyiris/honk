@@ -24,7 +24,7 @@ use honk_outbound::runtime::{
 };
 use tokio::sync::RwLock;
 use tokio::time::{Instant, timeout_at};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::marked_http::{self, Deadline, Reply};
 use crate::routing::{ConnectionInfo, Router};
@@ -240,7 +240,7 @@ impl Outbounds<'_> {
                 feedback,
             },
         };
-        info!(
+        debug!(
             outbound = %outbound,
             rule = rule.as_deref().unwrap_or("fallback"),
             via = match &route {
@@ -406,7 +406,7 @@ impl Outbounds<'_> {
                     Ok(Ok(stream)) => get(stream, request).await,
                 };
                 if let Err(error) = tunnel.close().await {
-                    warn!(%error, "{purpose} tunnel did not close cleanly");
+                    debug!(%error, "{purpose} tunnel did not close cleanly");
                 }
                 reply?
             }

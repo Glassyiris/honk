@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use honk_config::Config;
-use tracing::warn;
+use tracing::{debug, error, warn};
 
 use crate::{Cli, ConfigStore, degradations, state, subscription};
 
@@ -34,7 +34,7 @@ pub(crate) fn open_state_db(
     match state::StateDb::open(data_dir) {
         Ok(db) => Ok((Some(Arc::new(db)), false)),
         Err(state::StateError::Corrupt) if !strict => {
-            warn!("state database is corrupt; it is moved aside once the instance lock is held");
+            debug!("state database is corrupt; it is moved aside once the instance lock is held");
             Ok((None, true))
         }
         Err(
@@ -42,7 +42,7 @@ pub(crate) fn open_state_db(
             | state::StateError::Unsafe(_)
             | state::StateError::Locked),
         ) if !strict => {
-            warn!(%error, "continuing without persistence");
+            debug!(%error, "continuing without persistence");
             persistence_lost(data_dir, degradations, error);
             Ok((None, false))
         }
@@ -61,7 +61,7 @@ pub(crate) fn reset_non_strict(
         Ok(Some(db)) => return Some(Arc::new(db)),
         Ok(None) => state::StateError::Corrupt,
         Err(error) => {
-            warn!(%error, "state database could not be reset; continuing without persistence");
+            debug!(%error, "state database could not be reset; continuing without persistence");
             error
         }
     };
@@ -69,6 +69,7 @@ pub(crate) fn reset_non_strict(
     None
 }
 
+/// The single report of lost persistence, whatever the cause.
 fn persistence_lost(
     data_dir: &std::path::Path,
     degradations: &degradations::Degradations,
@@ -77,7 +78,7 @@ fn persistence_lost(
     let rule = match error {
         state::StateError::Unsafe(refusal) => {
             let path = data_dir.join(refusal.target.relative_path());
-            warn!(
+            error!(
                 path = %path.display(),
                 rule = refusal.rule.as_str(),
                 fix = %refusal.fix(&path),
@@ -85,7 +86,12 @@ fn persistence_lost(
             );
             Some(refusal.rule.as_str())
         }
-        _ => None,
+        // reset_corrupt already named the earlier copy that blocks the move.
+        state::StateError::Corrupt => None,
+        _ => {
+            error!(%error, "continuing without persistence");
+            None
+        }
     };
     degradations.set_with_rule(
         degradations::Component::Persistence,
@@ -149,7 +155,7 @@ pub(crate) fn claim_state(
         }
         None => {
             if config.global.store_subscribe {
-                warn!("Subscription store unavailable; continuing without persistence");
+                debug!("Subscription store unavailable; continuing without persistence");
             }
             None
         }
