@@ -59,6 +59,23 @@ pub fn congestion_factory(
     }
 }
 
+/// HKDF-Expand-Label (RFC 8446 §7.1) with the empty context QUIC uses
+/// (RFC 9001 §5.1); `label` excludes the `tls13 ` prefix. Labels over 249
+/// bytes and outputs over 65535 bytes do not fit the encoding.
+pub fn hkdf_expand_label<H: hkdf::HmacImpl>(
+    prk: &hkdf::GenericHkdf<H>,
+    label: &[u8],
+    out: &mut [u8],
+) -> Result<(), hkdf::InvalidLength> {
+    const PREFIX: &[u8] = b"tls13 ";
+    let length = u16::try_from(out.len()).map_err(|_| hkdf::InvalidLength)?;
+    let label_len = u8::try_from(PREFIX.len() + label.len()).map_err(|_| hkdf::InvalidLength)?;
+    prk.expand_multi_info(
+        &[&length.to_be_bytes(), &[label_len], PREFIX, label, &[0]],
+        out,
+    )
+}
+
 /// Fixed-rate "brutal" sender (hysteria2 parity): paces at a constant rate
 /// and ignores loss entirely. quinn's token-bucket pacer refills at
 /// window/RTT, so reporting a window of `rate × RTT` yields the target
@@ -468,6 +485,20 @@ mod brutal_tests;
 
 #[cfg(test)]
 mod client_tests;
+
+#[cfg(test)]
+mod label_tests {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    #[test]
+    fn hkdf_expand_label_rejects_labels_beyond_the_encoding() {
+        let prk = Hkdf::<Sha256>::from_prk(&[7; 32]).unwrap();
+        let mut out = [0; 16];
+        assert!(super::hkdf_expand_label(&prk, &[b'a'; 249], &mut out).is_ok());
+        assert!(super::hkdf_expand_label(&prk, &[b'a'; 250], &mut out).is_err());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // QUIC over a proxied UDP tunnel
