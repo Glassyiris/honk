@@ -1487,6 +1487,83 @@ fn test_death_callback_skipped_while_udp_sibling_alive() {
     );
 }
 
+const HEALTH_LOG_CHILD: &str = "HONK_ALIVE_HEALTH_LOG_CHILD";
+
+struct HealthFlipLogs {
+    deaths: Arc<std::sync::atomic::AtomicUsize>,
+    revivals: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HealthFlipLogs {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let metadata = event.metadata();
+        if metadata.target() != "honk_outbound::alive::health" {
+            return;
+        }
+        let counter = match *metadata.level() {
+            tracing::Level::WARN => &self.deaths,
+            tracing::Level::INFO => &self.revivals,
+            _ => return,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A death and a revival each log once, not once per failed or successful
+/// report.
+#[test]
+fn test_health_flips_log_once() {
+    if std::env::var_os(HEALTH_LOG_CHILD).is_some() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::prelude::*;
+        let deaths = Arc::new(AtomicUsize::new(0));
+        let revivals = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(
+            HealthFlipLogs {
+                deaths: Arc::clone(&deaths),
+                revivals: Arc::clone(&revivals),
+            },
+        ))
+        .unwrap();
+        let set = AliveDialerSet::new();
+        // Unregistered → outside grace; the TCP probe threshold is 3.
+        for _ in 0..5 {
+            set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
+        }
+        assert!(!set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
+        for _ in 0..2 {
+            set.report_available_traffic(id(1), ProbeDomain::Tcp, IpVersion::V4);
+        }
+        assert!(set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
+        assert_eq!(
+            (
+                deaths.load(Ordering::SeqCst),
+                revivals.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+        return;
+    }
+
+    // The child owns the global subscriber, so parallel tests cannot share
+    // its callsite interest.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "alive::tests::test_health_flips_log_once",
+            "--nocapture",
+        ])
+        .env(HEALTH_LOG_CHILD, "1")
+        .output()
+        .expect("isolated health log test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" 1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Restored (persisted) delay samples seed ranking data without touching
 /// liveness: an unknown node stays in its default alive state, and a
 /// previously dead node stays dead.

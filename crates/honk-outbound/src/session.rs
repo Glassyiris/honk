@@ -773,6 +773,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         DialSignal::Failed(crate::SharedError::fanout(e.context(context)))
                                     }
                                     Err(_panic) => {
+                                        // A dial must fail with an error, never panic.
+                                        tracing::error!(id, "session dial panicked");
                                         pool.dial_failures += 1;
                                         pool.next_dial_at =
                                             Some(Instant::now() + config.dial_backoff);

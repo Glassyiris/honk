@@ -242,7 +242,7 @@ impl TlsConnector {
                     && let Some(ssl) = e.ssl()
                     && ssl.get_ech_retry_configs().is_some()
                 {
-                    tracing::info!(
+                    tracing::debug!(
                         sni = domain,
                         "ECH rejected; server offered retry ECH configs (not persisted)"
                     );
