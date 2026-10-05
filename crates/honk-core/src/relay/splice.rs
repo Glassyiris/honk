@@ -22,14 +22,14 @@
 //!
 //! Go ref: `tcp_copy_linux.go` (340L), `tcp_copy_engine.go` (118L)
 
-use super::{RelayStats, is_ignorable_connection_error, relay_tcp};
+use super::{RelayStats, relay_tcp};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::Interest;
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Upper bound requested for one active splice direction. A live pipe owns
 /// two FDs and at most this many kernel-buffer bytes; a full-duplex relay is
@@ -437,12 +437,6 @@ pub async fn relay_splice(
             Err(e) => {
                 shutdown_write(client);
                 shutdown_write(&upstream);
-                if !is_ignorable_connection_error(&e.error) {
-                    warn!(
-                        "TCP splice relay error for {} → {}: {}",
-                        client_addr, target_addr, e.error
-                    );
-                }
                 Err(e.into_anyhow())
             }
         },

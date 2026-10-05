@@ -10,14 +10,13 @@ use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 #[cfg(test)]
 use crate::routing::Router;
-use parking_lot::Mutex;
 use std::future::Future;
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, TryAcquireError};
-use tracing::warn;
+use tracing::{debug, warn};
 
 mod transport;
 
@@ -306,15 +305,7 @@ impl DnsController {
                 DnsClientAnswer(Err(build_dns_refused(data)))
             }
             Err(error) => {
-                // A wedged upstream layer must be visible at the default
-                // level without one line per query. Monotonic clock: a
-                // wall-clock step must not mute the alarm.
-                static LAST_SERVFAIL_LOG: Mutex<Option<Instant>> = Mutex::new(None);
-                let mut last = LAST_SERVFAIL_LOG.lock();
-                if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
-                    *last = Some(Instant::now());
-                    warn!(error = %error, "DNS controller forward failed; sending SERVFAIL");
-                }
+                debug!(error = %error, "DNS controller forward failed; sending SERVFAIL");
                 DnsClientAnswer(Err(build_dns_servfail(data)))
             }
         };

@@ -410,7 +410,7 @@ pub(super) fn log_request(
     reason: Option<WriteRefusal>,
 ) {
     if let Some(reason) = reason {
-        tracing::warn!(
+        tracing::info!(
             method,
             route = template,
             status,
@@ -420,7 +420,7 @@ pub(super) fn log_request(
             message = "native HTTP request"
         );
     } else if status >= 400 {
-        tracing::info!(
+        tracing::debug!(
             method,
             route = template,
             status,

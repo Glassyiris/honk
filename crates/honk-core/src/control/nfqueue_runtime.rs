@@ -472,7 +472,7 @@ impl ControlPlane {
         }
         if !self.rotate_udp_decision_generation().await? {
             runtime.defer_token_retry();
-            warn!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
+            debug!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
             return Ok(());
         }
         runtime
@@ -587,7 +587,7 @@ impl ControlPlane {
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            warn!(%error, "NFQUEUE UDP initializer failed");
+                            debug!(%error, "NFQUEUE UDP initializer failed");
                             let _ = pending.cancel(identity).await;
                         }
                         Err(_) => {
