@@ -149,7 +149,6 @@ struct Writer {
     budget_pages: i64,
     /// Batches skipped for the page budget; the first one is logged.
     skipped: u64,
-    /// Failure episodes of the point and delay batches.
     points_failing: bool,
     delays_failing: bool,
     // The directory lock must outlive the writer connection.
@@ -267,13 +266,20 @@ impl Writer {
     }
 }
 
-/// Logs a recurring failure: WARN when the site's failure episode starts,
-/// DEBUG while it lasts.
+macro_rules! writer_lost {
+    ($cache:expr, $($arg:tt)+) => {
+        if !$cache.writer_lost.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!($($arg)+)
+        } else {
+            tracing::debug!($($arg)+)
+        }
+    };
+}
+
 fn note_failure(failing: &mut bool, what: &'static str, error: impl std::fmt::Display) {
     crate::logging::warn_on_entry!(!std::mem::replace(failing, true), %error, "{what} failed");
 }
 
-/// Ends a failure episode with one INFO line.
 fn note_success(failing: &mut bool, what: &'static str) {
     if std::mem::take(failing) {
         tracing::info!("{what} recovered");
@@ -538,22 +544,12 @@ impl CacheDb {
         .ok()
     }
 
-    fn first_writer_loss(&self) -> bool {
-        !self
-            .writer_lost
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-    }
-
     fn set(&self, key: Key, value: String) {
         let sequence = self
             .next_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Ok(mut pending) = self.pending.lock() else {
-            if self.first_writer_loss() {
-                tracing::error!("state cache pending-write lock poisoned");
-            } else {
-                tracing::debug!("state cache pending-write lock poisoned");
-            }
+            writer_lost!(self, "state cache pending-write lock poisoned");
             return;
         };
         let previous = pending.insert(
@@ -572,11 +568,7 @@ impl CacheDb {
                     pending.remove(&key);
                 }
             }
-            if self.first_writer_loss() {
-                tracing::error!(%error, "state cache writer closed; point write rejected");
-            } else {
-                tracing::debug!(%error, "state cache writer closed; point write rejected");
-            }
+            writer_lost!(self, %error, "state cache writer closed; point write rejected");
             return;
         }
         drop(pending);
@@ -644,11 +636,7 @@ impl CacheDb {
             return;
         }
         if let Err(error) = self.writer.send(Write::Delays(samples)) {
-            if self.first_writer_loss() {
-                tracing::error!(%error, "state cache writer closed; delay batch rejected");
-            } else {
-                tracing::debug!(%error, "state cache writer closed; delay batch rejected");
-            }
+            writer_lost!(self, %error, "state cache writer closed; delay batch rejected");
         }
     }
 
@@ -677,11 +665,7 @@ impl CacheDb {
                 .collect()
         })();
         if let Err(error) = self.writer.send(Write::DeleteDelaysBefore(cutoff)) {
-            if self.first_writer_loss() {
-                tracing::error!(%error, "state cache writer closed; delay prune rejected");
-            } else {
-                tracing::debug!(%error, "state cache writer closed; delay prune rejected");
-            }
+            writer_lost!(self, %error, "state cache writer closed; delay prune rejected");
         }
         rows.unwrap_or_else(|error| {
             tracing::warn!(error = %CacheDbError::from(error), "state cache delay load failed");
