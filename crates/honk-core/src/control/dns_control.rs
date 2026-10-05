@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, TryAcquireError};
-use tracing::{debug, warn};
+use tracing::warn;
 
 mod transport;
 
@@ -305,7 +305,10 @@ impl DnsController {
                 DnsClientAnswer(Err(build_dns_refused(data)))
             }
             Err(error) => {
-                debug!(error = %error, "DNS controller forward failed; sending SERVFAIL");
+                crate::logging::warn_throttled!(
+                    error = %error,
+                    "DNS controller forward failed; sending SERVFAIL"
+                );
                 DnsClientAnswer(Err(build_dns_servfail(data)))
             }
         };

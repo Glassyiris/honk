@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
 
 use honk_config::dns::DnsStrategy;
 
@@ -111,14 +110,11 @@ impl Singleflight {
             if sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
-                static LAST_WARN: Mutex<Option<Instant>> = Mutex::new(None);
-                if saturation_warn_due(&LAST_WARN) {
-                    tracing::warn!(
-                        saturation = "waiters",
-                        action = "reject",
-                        "DNS singleflight saturated"
-                    );
-                }
+                crate::logging::warn_throttled!(
+                    saturation = "waiters",
+                    action = "reject",
+                    "DNS singleflight saturated"
+                );
                 return FlightRole::Rejected;
             }
             self.counters.waiters.fetch_add(1, Ordering::Relaxed);
@@ -136,14 +132,11 @@ impl Singleflight {
         if entries.len() >= MAX_ACTIVE_FLIGHTS {
             self.counters.rejections.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
-            static LAST_WARN: Mutex<Option<Instant>> = Mutex::new(None);
-            if saturation_warn_due(&LAST_WARN) {
-                tracing::warn!(
-                    saturation = "keys",
-                    action = "reject",
-                    "DNS singleflight saturated"
-                );
-            }
+            crate::logging::warn_throttled!(
+                saturation = "keys",
+                action = "reject",
+                "DNS singleflight saturated"
+            );
             return FlightRole::Rejected;
         }
         let (sender, _) = broadcast::channel(1);
@@ -229,17 +222,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Saturation repeats per rejected query under load: warn at most once per
-/// 10s per site. Monotonic clock: a wall-clock step must not mute the alarm.
-fn saturation_warn_due(last: &Mutex<Option<Instant>>) -> bool {
-    let mut last = lock(last);
-    let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(10));
-    if due {
-        *last = Some(Instant::now());
-    }
-    due
 }
 
 #[cfg(test)]
