@@ -386,8 +386,8 @@ pub(super) async fn boundary(
         | Method::PATCH => method.as_str(),
         _ => "OTHER",
     };
-    // A dashboard polls every few seconds; only rejected or failed requests earn an INFO line,
-    // and a refused configuration write a WARN line naming why.
+    // A dashboard polls every few seconds: requests log at DEBUG, and only a
+    // refused configuration write earns an INFO line naming why.
     let status = response.status().as_u16();
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     log_request(
@@ -418,15 +418,6 @@ pub(super) fn log_request(
             request_id = %request_id,
             reason = reason.as_str(),
             message = "native HTTP request"
-        );
-    } else if status >= 400 {
-        tracing::debug!(
-            method,
-            route = template,
-            status,
-            elapsed_ms,
-            request_id = %request_id,
-            "native HTTP request"
         );
     } else {
         tracing::debug!(
