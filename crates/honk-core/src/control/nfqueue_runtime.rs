@@ -457,7 +457,10 @@ impl ControlPlane {
         &self,
         runtime: &mut NfqueueRuntime,
     ) -> anyhow::Result<()> {
-        if runtime.sequence_ready {
+        // Only the call that fences open staging starts the outage; startup
+        // reports an already-fenced queue itself.
+        let fenced_now = runtime.sequence_ready;
+        if fenced_now {
             let flags = self
                 .datapath_flags
                 .as_ref()
@@ -472,7 +475,10 @@ impl ControlPlane {
         }
         if !self.rotate_udp_decision_generation().await? {
             runtime.defer_token_retry();
-            debug!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
+            crate::logging::warn_on_entry!(
+                fenced_now,
+                "all UDP decision token generations remain live; NFQUEUE staging stays fenced"
+            );
             return Ok(());
         }
         runtime
