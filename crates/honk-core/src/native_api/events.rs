@@ -297,13 +297,20 @@ impl EventHub {
         if epoch.is_multiple_of(2) {
             return;
         }
+        fn flow_href<S: serde::Serializer>(
+            resource_id: &&str,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.collect_str(&format_args!("/api/v1/flows/{resource_id}"))
+        }
         #[derive(serde::Serialize)]
         struct Update<'a> {
             instance_id: &'a str,
             observed_at: String,
             resource_id: &'a str,
             revision: u64,
-            href: String,
+            #[serde(serialize_with = "flow_href")]
+            href: &'a str,
         }
         let payload = identifier(flow_id)
             .filter(|_| (1..=MAX_SAFE_UINT).contains(&revision))
@@ -313,7 +320,7 @@ impl EventHub {
                     observed_at: timestamp(SystemTime::now()),
                     resource_id,
                     revision,
-                    href: format!("/api/v1/flows/{resource_id}"),
+                    href: resource_id,
                 };
                 (
                     Kind::FlowUpdated,

@@ -791,6 +791,12 @@ fn optional_bytes<const N: usize>(values: [&Option<String>; N]) -> usize {
 }
 
 fn redact_display(value: &mut Option<String>, redacted: &mut bool, overflow: &mut bool) {
+    if value
+        .as_ref()
+        .is_some_and(|text| display_text(text) && text.capacity() == text.len())
+    {
+        return;
+    }
     if let Some(text) = value {
         *value = super::bounded_display(text, redacted, overflow);
     }
