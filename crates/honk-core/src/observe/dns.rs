@@ -48,7 +48,12 @@ impl DnsRecorder {
         data: StepData,
     ) -> bool {
         self.flows.upgrade().is_some_and(|flows| {
-            flows.record_step(&context.flow_id.to_string(), Some(context.generation), data)
+            let mut text = uuid::Uuid::encode_buffer();
+            flows.record_step(
+                context.flow_id.hyphenated().encode_lower(&mut text),
+                Some(context.generation),
+                data,
+            )
         })
     }
 

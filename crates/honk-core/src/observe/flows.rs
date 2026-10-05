@@ -57,6 +57,7 @@ struct Store {
     recording: bool,
     max_records: usize,
     retention: Duration,
+    earliest_ended: Option<Instant>,
     records: VecDeque<Record>,
     snapshots: Vec<Snapshot>,
     tombstones: VecDeque<(String, Instant)>,
@@ -141,6 +142,7 @@ impl Store {
             recording,
             max_records: MAX_RECORDS,
             retention: TERMINAL_TTL,
+            earliest_ended: None,
             records: VecDeque::new(),
             snapshots: Vec::new(),
             tombstones: VecDeque::new(),
@@ -337,8 +339,16 @@ impl FlowStore {
         record.summary.revision += 1;
         record.bytes = record.retained_bytes();
         let new_bytes = record.bytes;
+        let ended = record.ended;
         self.updated(record);
         store.record_bytes = store.record_bytes - old_bytes + new_bytes;
+        if let Some(ended) = ended {
+            store.earliest_ended = Some(
+                store
+                    .earliest_ended
+                    .map_or(ended, |earliest| earliest.min(ended)),
+            );
+        }
         if self.enforce_limit(&mut store, now) {
             store.records.iter().any(|record| record.id() == id)
         } else {
@@ -467,17 +477,27 @@ impl FlowStore {
         {
             store.tombstones.pop_front();
         }
+        if store
+            .earliest_ended
+            .is_none_or(|ended| now.saturating_duration_since(ended) < store.retention)
+        {
+            return;
+        }
+        let mut earliest_ended: Option<Instant> = None;
         let mut index = 0;
         while index < store.records.len() {
-            if store.records[index]
-                .ended
-                .is_some_and(|ended| now.saturating_duration_since(ended) >= store.retention)
-            {
+            let Some(ended) = store.records[index].ended else {
+                index += 1;
+                continue;
+            };
+            if now.saturating_duration_since(ended) >= store.retention {
                 self.evict(store, index, now, "evicted");
             } else {
+                earliest_ended = Some(earliest_ended.map_or(ended, |earliest| earliest.min(ended)));
                 index += 1;
             }
         }
+        store.earliest_ended = earliest_ended;
     }
 
     pub(crate) fn page(

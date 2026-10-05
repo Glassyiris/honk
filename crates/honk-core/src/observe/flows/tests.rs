@@ -628,15 +628,32 @@ fn retention_distinguishes_expired_unknown_and_active_records() {
         "dial_failed",
     );
     let active = begin(&store, crate::observe::vocab::Network::Udp);
-    let future = Instant::now() + TERMINAL_TTL;
-    store.prune(&mut store.inner.lock(), future);
+    store.set_limits(MAX_RECORDS, 1);
+    let reduced_deadline = Instant::now() + Duration::from_secs(1);
+    store.prune(&mut store.inner.lock(), reduced_deadline);
     assert_eq!(store.get(terminal.id()).unwrap_err(), FlowMissing::Expired);
     assert_eq!(
         store.get("not-a-recorded-id").unwrap_err(),
         FlowMissing::NotFound
     );
     assert_eq!(store.get(active.id()).unwrap()["state"], "observed");
-    store.prune(&mut store.inner.lock(), future + TERMINAL_TTL);
+
+    let extended = begin(&store, crate::observe::vocab::Network::Tcp);
+    extended.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    store.set_limits(MAX_RECORDS, TERMINAL_TTL.as_secs());
+    store.prune(
+        &mut store.inner.lock(),
+        Instant::now() + Duration::from_secs(1),
+    );
+    assert!(store.get(extended.id()).is_ok());
+    let extended_deadline = Instant::now() + TERMINAL_TTL;
+    store.prune(&mut store.inner.lock(), extended_deadline);
+    assert_eq!(store.get(extended.id()).unwrap_err(), FlowMissing::Expired);
+
+    store.prune(&mut store.inner.lock(), extended_deadline + TERMINAL_TTL);
     assert_eq!(store.get(terminal.id()).unwrap_err(), FlowMissing::NotFound);
 }
 
@@ -885,6 +902,32 @@ fn step_capacity_not_only_string_length_counts_toward_retention() {
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
     assert_eq!(detail["trace"]["missing"], json!(["buffer_overflow"]));
     assert_eq!(detail["state"], "closed");
+
+    let display_flow = begin(&store, crate::observe::vocab::Network::Tcp);
+    let mut domain = String::with_capacity(MAX_STEP_BYTES + 1);
+    domain.push_str("cdn.example.test");
+    display_flow.step(
+        None,
+        StepData::DialMode {
+            configured: DialMode::Domain,
+            effective_target: "domain",
+            domain: Some(domain),
+            domain_source: Some(DomainSource::DnsMapping),
+            verification: "matched",
+            reason: "configured",
+        },
+    );
+    display_flow.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        "relay_finished",
+    );
+    let detail = store.get(display_flow.id()).unwrap();
+    assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        detail["trace"]["steps"][1]["data"]["domain"],
+        "cdn.example.test"
+    );
+    assert_eq!(detail["trace"]["missing"], json!([]));
 }
 
 #[test]
