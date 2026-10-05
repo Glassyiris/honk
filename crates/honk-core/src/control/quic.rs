@@ -30,6 +30,7 @@ use aes_gcm::aes::cipher::BlockCipherEncrypt;
 use aes_gcm::aes::{Aes128, Block as AesBlock};
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
+use honk_outbound::quic::hkdf_expand_label;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 
@@ -88,27 +89,18 @@ impl InitialKeys {
         };
         let extract = Hkdf::<Sha256>::new(Some(salt), dcid);
         let mut secret = [0u8; 32];
-        expand_label(&extract, secret_label, &mut secret)?;
+        hkdf_expand_label(&extract, secret_label, &mut secret).ok()?;
         let mut keys = Self {
             key: [0; 16],
             iv: [0; 12],
             hp: [0; 16],
         };
         let expand = Hkdf::<Sha256>::from_prk(&secret).ok()?;
-        expand_label(&expand, key_label, &mut keys.key)?;
-        expand_label(&expand, iv_label, &mut keys.iv)?;
-        expand_label(&expand, hp_label, &mut keys.hp)?;
+        hkdf_expand_label(&expand, key_label, &mut keys.key).ok()?;
+        hkdf_expand_label(&expand, iv_label, &mut keys.iv).ok()?;
+        hkdf_expand_label(&expand, hp_label, &mut keys.hp).ok()?;
         Some(keys)
     }
-}
-
-/// HKDF-Expand-Label (RFC 8446 §7.1, RFC 9001 §5.1): the info is
-/// `length || len("tls13 " + label) || "tls13 " + label || empty context`.
-fn expand_label(hkdf: &Hkdf<Sha256>, label: &[u8], out: &mut [u8]) -> Option<()> {
-    let length = (out.len() as u16).to_be_bytes();
-    let label_len = [(6 + label.len()) as u8];
-    hkdf.expand_multi_info(&[&length, &label_len, b"tls13 ", label, &[0]], out)
-        .ok()
 }
 
 /// Read a QUIC variable-length integer (RFC 9000 §16).
