@@ -149,6 +149,33 @@ pub(super) struct OutboundHealthPublisher {
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
     alive_set: Arc<AliveDialerSet>,
+    /// Per-group bitmask of datapath slots last computed as not alive, so only
+    /// transitions are logged. Reloads republish connectivity without this
+    /// map, so it restarts with each config generation.
+    dead_slots: parking_lot::Mutex<(
+        std::sync::Weak<Config>,
+        std::collections::HashMap<String, u8>,
+    )>,
+}
+
+/// Record one group slot's computed liveness; returns whether it flipped.
+/// Unknown slots start alive.
+fn group_slot_flipped(
+    dead_slots: &mut std::collections::HashMap<String, u8>,
+    group: &str,
+    slot: u8,
+    alive: bool,
+) -> bool {
+    let bit = 1u8 << slot;
+    match dead_slots.get_mut(group) {
+        Some(mask) if (*mask & bit == 0) != alive => *mask ^= bit,
+        Some(_) => return false,
+        None if alive => return false,
+        None => {
+            dead_slots.insert(group.to_owned(), bit);
+        }
+    }
+    true
 }
 
 impl OutboundHealthPublisher {
@@ -163,6 +190,7 @@ impl OutboundHealthPublisher {
             config,
             group_manager,
             alive_set,
+            dead_slots: parking_lot::Mutex::default(),
         }
     }
 
@@ -182,6 +210,14 @@ impl OutboundHealthPublisher {
             IpVersion::V4
         };
         let group_manager = self.group_manager.read().clone();
+        let slot = probe_domain as u8 * 2 + ip_version as u8;
+        let mut slots = self.dead_slots.lock();
+        let (generation, dead_slots) = &mut *slots;
+        // The held Weak keeps the old allocation, so its address cannot be reused.
+        if !std::ptr::eq(generation.as_ptr(), Arc::as_ptr(&*config)) {
+            *generation = Arc::downgrade(&*config);
+            dead_slots.clear();
+        }
         for (index, group) in config.groups.iter().enumerate() {
             if !group_manager.group_reaches_node(&group.name, node_id) {
                 continue;
@@ -202,6 +238,23 @@ impl OutboundHealthPublisher {
                     ipver,
                     "failed to update outbound health in eBPF"
                 );
+            }
+            if group_slot_flipped(dead_slots, &group.name, slot, alive) {
+                if alive {
+                    info!(
+                        group = %group.name,
+                        ?probe_domain,
+                        ?ip_version,
+                        "outbound group is alive again"
+                    );
+                } else {
+                    warn!(
+                        group = %group.name,
+                        ?probe_domain,
+                        ?ip_version,
+                        "outbound group has no alive outbound"
+                    );
+                }
             }
         }
     }
@@ -318,7 +371,7 @@ impl ControlPlane {
                     let config = self.config.read().await;
                     subscription_authorizations.committed(&config.subscriptions)
                 } else {
-                    warn!("SIGHUP reload request {request_id} rejected");
+                    info!("SIGHUP reload request {request_id} rejected");
                     Vec::new()
                 };
                 if result
@@ -340,7 +393,7 @@ impl ControlPlane {
                 diagnostics,
                 result,
             } => {
-                info!(
+                debug!(
                     nodes = nodes.len(),
                     message = "Publishing accepted subscription body"
                 );
@@ -356,14 +409,14 @@ impl ControlPlane {
                     .await
                 {
                     Ok(outcome) if outcome.accepted() => {
-                        info!(
+                        debug!(
                             ?outcome,
                             message = "Subscription runtime publication applied"
                         );
                         (outcome, None)
                     }
                     Ok(outcome) => {
-                        warn!(message = "Subscription runtime publication rejected");
+                        debug!(message = "Subscription runtime publication rejected");
                         (outcome, None)
                     }
                     Err(error) => {
@@ -595,5 +648,19 @@ mod tests {
         drop(stopped);
         assert!(fatal_rx.try_recv().is_ok());
         assert!(fatal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn group_slot_logs_only_transitions() {
+        let mut dead = std::collections::HashMap::new();
+        assert!(!group_slot_flipped(&mut dead, "g", 0, true));
+        assert!(group_slot_flipped(&mut dead, "g", 0, false));
+        assert!(!group_slot_flipped(&mut dead, "g", 0, false));
+        assert!(group_slot_flipped(&mut dead, "g", 5, false));
+        assert!(!group_slot_flipped(&mut dead, "other", 0, true));
+        assert!(group_slot_flipped(&mut dead, "g", 0, true));
+        assert!(!group_slot_flipped(&mut dead, "g", 0, true));
+        assert!(!group_slot_flipped(&mut dead, "g", 5, false));
+        assert!(group_slot_flipped(&mut dead, "g", 0, false));
     }
 }
