@@ -103,7 +103,7 @@ impl ControlPlane {
             drop(config_guard);
             let _config = self.config.write().await;
             self.diagnostics.write().buckets.apply(diagnostic_update);
-            info!(
+            debug!(
                 subscription_id = %subscription_id,
                 "subscription unchanged; skipping runtime rebuild"
             );
@@ -135,7 +135,7 @@ impl ControlPlane {
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
         if !authorizations.authorizes(subscription_id, revision) {
-            warn!(
+            debug!(
                 %subscription_id,
                 revision,
                 "discarding stale subscription refresh"

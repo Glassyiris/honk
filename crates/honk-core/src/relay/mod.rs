@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Relay a transparent client connection through a dialed proxy stream.
 ///
@@ -524,15 +524,7 @@ fn relay_outcome(
 
             Ok(stats)
         }
-        Err(e) => {
-            if !is_ignorable_connection_error(&e.error) {
-                warn!(
-                    "TCP relay error for {} → {}: {}",
-                    client_addr, target_addr, e.error
-                );
-            }
-            Err(e.into_anyhow())
-        }
+        Err(e) => Err(e.into_anyhow()),
     }
 }
 

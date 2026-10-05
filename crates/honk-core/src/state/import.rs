@@ -78,7 +78,7 @@ pub fn import_cache_db(state: &StateDb, legacy: &LegacyCache, scope: &ImportScop
     let source = source_key(&file.path, &legacy.cache_id);
     match copy_cache_db(state, &file, &legacy.cache_id, &source, scope) {
         Ok(false) => {}
-        Ok(true) if !legacy.cache_id.is_empty() => tracing::warn!(
+        Ok(true) if !legacy.cache_id.is_empty() => tracing::info!(
             path = %file.path.display(),
             "imported this instance's cache_id from the legacy cache.db; the file is kept because another instance may use it"
         ),

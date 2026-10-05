@@ -281,6 +281,60 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn map_health_warnings_rearm_after_pressure_ends() {
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+        Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+    let janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
+    let high = (AUX_MAP_CAPACITY as f64 * AUX_MAP_PRESSURE_WATERMARK) as usize + 1;
+    let redirect = |scanned, complete| {
+        [
+            AuxScanResult {
+                deleted: 0,
+                scanned,
+                complete,
+            },
+            AuxScanResult::default(),
+            AuxScanResult::default(),
+        ]
+    };
+    let mut failures = [0; 3];
+    let mut aux_warned = [false; 3];
+    let mut pressure_warned = [false; 4];
+    for (utilization, pressure, scans, aux_expected, occupancy_expected) in [
+        (
+            CONN_STATE_PRESSURE_WATERMARK,
+            true,
+            redirect(high, true),
+            true,
+            true,
+        ),
+        // A bounded scan below the watermark is only a lower bound.
+        (0.0, false, redirect(0, false), true, false),
+        (0.0, false, redirect(0, true), false, false),
+        (
+            CONN_STATE_PRESSURE_WATERMARK,
+            true,
+            redirect(high, true),
+            true,
+            true,
+        ),
+    ] {
+        janitor
+            .check_map_health(
+                utilization,
+                pressure,
+                scans,
+                &mut failures,
+                &mut aux_warned,
+                &mut pressure_warned,
+            )
+            .await;
+        assert_eq!(aux_warned[0], aux_expected);
+        assert_eq!(pressure_warned[3], occupancy_expected);
+    }
+}
+
+#[tokio::test]
 async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
     let pinned_active = test_tuple(10_001, IPPROTO_TCP);
     let pinned_closing = test_tuple(10_002, IPPROTO_TCP);

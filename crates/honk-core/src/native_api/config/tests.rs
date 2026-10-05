@@ -927,7 +927,7 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
         .collect();
     assert_eq!(refused.len(), 1, "{lines:?}");
     let (level, fields) = refused[0];
-    assert_eq!(*level, tracing::Level::WARN);
+    assert_eq!(*level, tracing::Level::INFO);
     assert_eq!(fields["reason"], "writes_disabled");
     assert_eq!(fields["status"], "403");
     assert!(!fields.values().any(|value| value.contains("main.dae")));
@@ -935,7 +935,7 @@ async fn a_refused_write_logs_its_reason_on_the_request_line() {
         .iter()
         .find(|(_, fields)| fields["status"] == "404")
         .unwrap();
-    assert_eq!(*level, tracing::Level::INFO);
+    assert_eq!(*level, tracing::Level::DEBUG);
     assert!(!fields.contains_key("reason"));
 }
 

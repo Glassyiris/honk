@@ -540,7 +540,7 @@ async fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
         known["fields"],
         json!({"reason":"writes_disabled","status":403,"native_withheld_fields":true})
     );
-    for _ in 0..3 {
+    for _ in 0..2 {
         let withheld = data(&next(&mut resumed).await);
         assert_eq!(withheld["message"], WITHHELD);
         assert!(withheld["fields"].is_null(), "{withheld}");

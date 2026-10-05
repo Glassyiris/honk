@@ -1142,7 +1142,7 @@ impl EbpfBackend for RealEbpfBackend {
             if let Err(e) = aya::programs::tc::qdisc_add_clsact(iface)
                 && !e.to_string().contains("File exists")
             {
-                warn!("failed to add clsact qdisc to {}: {}", iface, e);
+                debug!("failed to add clsact qdisc to {}: {}", iface, e);
             }
         }
 
@@ -1180,7 +1180,7 @@ impl EbpfBackend for RealEbpfBackend {
             if let Err(error) = aya::programs::tc::qdisc_add_clsact("dae0peer")
                 && !error.to_string().contains("File exists")
             {
-                warn!("failed to add clsact qdisc to dae0peer: {}", error);
+                debug!("failed to add clsact qdisc to dae0peer: {}", error);
             }
 
             let id = Self::attach_tc(self.bpf_mut()?, "dae0peer_ingress", "dae0peer")
@@ -1264,7 +1264,7 @@ impl EbpfBackend for RealEbpfBackend {
                 sockets.set(key, &socket, 0).map_err(|error| {
                     anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' set[{key}]: {error}")
                 })?;
-                info!(fd, key, "Published listener socket to LISTEN_SOCKET_MAP");
+                debug!(fd, key, "Published listener socket to LISTEN_SOCKET_MAP");
             }
         }
         self.listeners_published = true;

@@ -106,6 +106,7 @@ impl SupervisorState {
                                     startup_diagnostics
                                         .replace_provider(subscription.id, diagnostics);
                                     info!(
+                                        subscription = %subscription.name,
                                         nodes = count,
                                         "Subscription body accepted; startup publication pending"
                                     );
@@ -125,7 +126,7 @@ impl SupervisorState {
                             requires_network.remove(&id);
                             self.fail_startup_load(id, "fetch_failed");
                         }
-                        warn!(%error, "Subscription startup task failed");
+                        tracing::error!(%error, "Subscription startup task failed");
                     }
                     None => break,
                 },

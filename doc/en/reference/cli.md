@@ -43,6 +43,15 @@ The source comment records the intended order as `--debug` → `RUST_LOG` → `g
 
 See the [global configuration reference](./global.md) for `log_level`.
 
+Levels carry fixed meanings, so the default `info` stays low-rate:
+
+| Level | Meaning |
+| --- | --- |
+| `error` | Configured function is lost until an operator acts: activation committed degraded, the process stops, a subsystem stops permanently, or an internal invariant breaks. |
+| `warn` | Degraded but running, logged once when the state is entered: a fallback, a resource ceiling, a node or group becoming unavailable, a rejected configuration while the previous one keeps running. A failure repeated per DNS query (SERVFAIL, singleflight saturation) warns at most every 10 seconds. |
+| `info` | Start, stop, activation, operator actions and recovery from a warned state. |
+| `debug` | Single connection, request and DNS query outcomes, including individual dial and relay failures, and periodic maintenance results. Native flows record the same per-flow outcomes. |
+
 ### Subcommands
 
 | Command | Current behavior | Persistence / runtime effect |

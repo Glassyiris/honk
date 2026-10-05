@@ -2,8 +2,6 @@ use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::warn;
-
 /// One-release projection of detailed diagnostics. Data entrypoints never log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigDiagnostic {
@@ -11,14 +9,6 @@ pub struct ConfigDiagnostic {
     /// Arbitrary values are redacted; filters retain ordinals and policies are withheld.
     pub value: String,
     pub message: String,
-}
-
-/// Log each diagnostic as a structured warning. The plain entry points call this
-/// at parse time; the daemon calls it once its subscriber is installed.
-pub fn report_diagnostics(diagnostics: &[ConfigDiagnostic]) {
-    for d in diagnostics {
-        warn!(setting = %d.setting, value = %d.value, "{}", d.message);
-    }
 }
 
 /// Metadata only: diagnostic ownership must never keep input buffers alive.
@@ -423,11 +413,9 @@ pub fn report_detailed_diagnostics(diagnostics: &[DetailedDiagnostic]) {
             Severity::Info => {
                 tracing::info!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
             }
-            Severity::Warning => {
+            // Non-terminal: loading continues, so even error-severity findings warn.
+            Severity::Warning | Severity::Error => {
                 tracing::warn!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
-            }
-            Severity::Error => {
-                tracing::error!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
             }
         }
     }

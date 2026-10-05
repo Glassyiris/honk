@@ -325,7 +325,9 @@ impl ControlPlaneHandle {
         let mut ebpf = self.ebpf.write().await;
         match ebpf.add_domain_ip_bitmap(&lpm_key, &bitmap) {
             Ok(()) => debug!(%domain, %dst_ip, "sniffed domain facts published"),
-            Err(error) => warn!(%error, %domain, %dst_ip, "failed to publish sniffed domain facts"),
+            Err(error) => {
+                debug!(%error, %domain, %dst_ip, "failed to publish sniffed domain facts")
+            }
         }
     }
 }
