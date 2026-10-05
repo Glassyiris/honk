@@ -624,7 +624,7 @@ fn optional_priority_cmsg_cannot_reject_or_relabel_packet_marks() {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
 #[test]
 #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
 fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Result<()> {
