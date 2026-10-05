@@ -126,7 +126,9 @@ impl RealEbpfBackend {
                 .override_global("TASK_MM_OFFSET", &offsets.task_mm, true)
                 .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
         }
+        #[cfg(feature = "native-api")]
         let receive_trace_offsets = receive_trace::detect();
+        #[cfg(feature = "native-api")]
         if let Some(offsets) = &receive_trace_offsets {
             offsets.configure(&mut loader);
         }
@@ -555,8 +557,11 @@ impl RealEbpfBackend {
             next_trace_policy: 0,
             #[cfg(feature = "native-api")]
             trace_dictionaries: Default::default(),
+            #[cfg(feature = "native-api")]
             receive_trace: None,
+            #[cfg(feature = "native-api")]
             receive_trace_available: receive_trace_offsets.is_some(),
+            #[cfg(feature = "native-api")]
             receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
         })

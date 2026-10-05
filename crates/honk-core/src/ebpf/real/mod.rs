@@ -106,8 +106,11 @@ pub struct RealEbpfBackend {
     next_trace_policy: u32,
     #[cfg(feature = "native-api")]
     trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
+    #[cfg(feature = "native-api")]
     receive_trace: Option<std::sync::Arc<receive_trace::ReceiveTrace>>,
+    #[cfg(feature = "native-api")]
     receive_trace_available: bool,
+    #[cfg(feature = "native-api")]
     receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
 }
@@ -147,6 +150,7 @@ mod events;
 mod iface_watch;
 mod observation;
 mod process_name;
+#[cfg(feature = "native-api")]
 pub(crate) mod receive_trace;
 mod routing;
 mod syscall;
@@ -916,6 +920,7 @@ impl EbpfBackend for RealEbpfBackend {
         }
     }
 
+    #[cfg(feature = "native-api")]
     fn receive_trace(&mut self) -> Option<std::sync::Arc<receive_trace::ReceiveTrace>> {
         if !self.receive_trace_attempted {
             self.receive_trace_attempted = true;
@@ -1306,6 +1311,7 @@ impl EbpfBackend for RealEbpfBackend {
             h.abort();
             let _ = h.await;
         }
+        #[cfg(feature = "native-api")]
         drop(self.receive_trace.take());
 
         // Drop object map fds before unlinking generation-owned pins; both

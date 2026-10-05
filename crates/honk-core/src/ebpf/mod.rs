@@ -670,7 +670,7 @@ pub trait EbpfBackend: Send + Sync {
         Err("kernel_trace_unsupported")
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", feature = "native-api"))]
     fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
         None
     }
