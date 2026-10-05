@@ -7,7 +7,7 @@ use honk_outbound::group::GroupManager;
 use honk_outbound::group::{
     ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -140,7 +140,7 @@ impl UpstreamPool {
                 {
                     return selected;
                 }
-                warn!(
+                debug!(
                     "DNS outbound group '{}' has no available node (GroupManager)",
                     outbound
                 );
@@ -160,7 +160,7 @@ impl UpstreamPool {
         {
             return SelectedLeaf::explicit(node);
         }
-        warn!("DNS outbound '{}' resolved to no node", outbound);
+        debug!("DNS outbound '{}' resolved to no node", outbound);
         SelectedLeaf::default()
     }
     pub(super) fn tcp_feedback_for_route(

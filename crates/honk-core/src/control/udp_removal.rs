@@ -52,7 +52,7 @@ pub(crate) fn spawn_udp_removal_worker(
                         | Ok(crate::ebpf::UdpDecisionCommitResult::Missing)
                         | Ok(crate::ebpf::UdpDecisionCommitResult::Superseded) => true,
                         Ok(result) => {
-                            warn!(
+                            error!(
                                 ?result,
                                 token = removal.decision_token,
                                 generation = removal.generation,

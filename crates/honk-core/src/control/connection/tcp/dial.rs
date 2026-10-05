@@ -257,7 +257,7 @@ impl ControlPlaneHandle {
                     } else {
                         timeout_started_score_reporters(&started_reporters);
                     }
-                    warn!(
+                    debug!(
                         "Overall dial deadline reached for outbound '{}' ({} candidates, {} remaining)",
                         outbound_name,
                         candidates.len(),
@@ -447,7 +447,7 @@ impl ControlPlaneHandle {
                             target, last_name, last_msg
                         );
                     } else {
-                        warn!(
+                        debug!(
                             "All {} candidate(s) failed to dial {} ({} timed out; first error from '{}': {}; last error from '{}': {})",
                             candidates.len(),
                             target,

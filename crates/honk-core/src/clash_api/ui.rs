@@ -33,7 +33,7 @@ use honk_outbound::runtime::SharedRuntimeRegistry;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::download_route::{Outbounds, Route as UiRoute};
 use crate::routing::Router;
@@ -309,7 +309,7 @@ async fn fetch_routed(
                     original_business = Some(original.continuation()?);
                 }
                 url = parsed.join(&location)?.to_string();
-                info!(url = %url, "external UI download following redirect");
+                debug!(url = %url, "external UI download following redirect");
             }
         }
     }

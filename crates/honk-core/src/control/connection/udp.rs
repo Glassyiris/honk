@@ -547,7 +547,7 @@ impl ControlPlaneHandle {
         lease.set_connection_guard(self.stats.track_outbound(outbound_tracker.clone()));
 
         if plan.nodes.is_empty() {
-            warn!(
+            debug!(
                 "No available candidate nodes for UDP outbound '{}' ({})",
                 outbound_name, client_addr
             );
