@@ -281,24 +281,30 @@ fn note_success(failing: &mut bool, what: &'static str) {
 }
 
 fn run_writer(mut writer: Writer, receiver: mpsc::Receiver<Write>) {
+    const POINTS: &str = "state cache point-write batch";
     while let Ok(write) = receiver.recv() {
         match write {
             Write::Set(key, value) => {
                 writer.latest.insert(key, value);
                 if writer.latest.len() >= 64 {
-                    const WHAT: &str = "state cache point-write batch";
                     match writer.write_points() {
-                        Ok(()) => note_success(&mut writer.points_failing, WHAT),
+                        Ok(()) => note_success(&mut writer.points_failing, POINTS),
                         Err(error) => note_failure(
                             &mut writer.points_failing,
-                            WHAT,
+                            POINTS,
                             CacheDbError::from(error),
                         ),
                     }
                 }
             }
             Write::Barrier(ack) => {
-                let _ = ack.send(writer.write_points().map_err(CacheDbError::from));
+                // The barrier's sender reports its failure; its success still
+                // ends a batch failure episode.
+                let result = writer.write_points();
+                if result.is_ok() {
+                    note_success(&mut writer.points_failing, POINTS);
+                }
+                let _ = ack.send(result.map_err(CacheDbError::from));
             }
             Write::Delays(samples) => {
                 const WHAT: &str = "state cache delay batch";
