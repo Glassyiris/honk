@@ -2,10 +2,10 @@ use super::*;
 
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
 const SO_RCVPRIORITY_OPT: libc::c_int = 82;
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
 pub(super) fn set_so_recvpriority(socket: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let enabled: libc::c_int = 1;
     let status = unsafe {
@@ -694,7 +694,7 @@ pub(super) struct UdpRecvMeta {
     pub(super) packet_dst_ip: Option<std::net::IpAddr>,
     pub(super) packet_ifindex: Option<u32>,
     pub(super) packet_mark: Option<u32>,
-    #[cfg(any(feature = "ebpf", feature = "native-api", test))]
+    #[cfg(any(feature = "native-api", test))]
     pub(super) packet_priority: Option<u32>,
     pub(super) local_addr: SocketAddr,
 }
@@ -728,7 +728,7 @@ pub(super) struct UdpRecvBatch {
     results: [Option<io::Result<UdpRecvPacket>>; UDP_RECV_BATCH_SIZE],
     received: usize,
     limit: usize,
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
     trace: Option<crate::ebpf::real::receive_trace::ReceiveRegistration>,
 }
 
@@ -764,12 +764,12 @@ impl UdpRecvBatch {
             results: std::array::from_fn(|_| None),
             received: 0,
             limit: UDP_RECV_BATCH_SIZE,
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
             trace: None,
         })
     }
 
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
     pub(super) fn enable_trace(
         &mut self,
         socket: &UdpSocket,
@@ -782,7 +782,7 @@ impl UdpRecvBatch {
         self.register_trace(socket, &trace)
     }
 
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
     fn register_trace(
         &mut self,
         socket: &UdpSocket,
@@ -833,7 +833,7 @@ impl UdpRecvBatch {
             message.msg_controllen = CMSG_CONTROL_CAPACITY as _;
         }
 
-        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
         let trace_armed = self.trace.as_mut().is_some_and(|trace| trace.begin(fd));
 
         // SAFETY: every mmsghdr points to live, disjoint storage above and the
@@ -848,7 +848,7 @@ impl UdpRecvBatch {
             )
         };
         let receive_error = (count < 0).then(io::Error::last_os_error);
-        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
         let trace_packets = self
             .trace
             .as_mut()
@@ -910,7 +910,7 @@ impl UdpRecvBatch {
                     message.msg_hdr.msg_flags,
                     local_addr,
                 )?;
-                #[cfg(all(feature = "ebpf", target_os = "linux"))]
+                #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
                 let meta = if let Some(packets) = trace_packets {
                     UdpRecvMeta {
                         packet_priority: crate::ebpf::real::receive_trace::packet_priority(
@@ -1043,9 +1043,9 @@ pub(super) fn parse_cmsg_control(
     let mut packet_dst_ip = None;
     let mut packet_ifindex = None;
     let mut packet_mark = None;
-    #[cfg(any(feature = "ebpf", feature = "native-api", test))]
+    #[cfg(any(feature = "native-api", test))]
     let mut packet_priority = None;
-    #[cfg(any(feature = "ebpf", feature = "native-api", test))]
+    #[cfg(any(feature = "native-api", test))]
     let mut priority_seen = false;
     while offset < control.len() {
         if control.len() - offset < header_len {
@@ -1129,7 +1129,7 @@ pub(super) fn parse_cmsg_control(
             // SAFETY: the exact native-u32 payload length was checked above.
             packet_mark = Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<u32>()) });
         } else if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SO_PRIORITY {
-            #[cfg(any(feature = "ebpf", feature = "native-api", test))]
+            #[cfg(any(feature = "native-api", test))]
             {
                 packet_priority = if priority_seen {
                     None
@@ -1162,7 +1162,7 @@ pub(super) fn parse_cmsg_control(
         packet_dst_ip,
         packet_ifindex,
         packet_mark,
-        #[cfg(any(feature = "ebpf", feature = "native-api", test))]
+        #[cfg(any(feature = "native-api", test))]
         packet_priority,
         local_addr,
     })
