@@ -1710,7 +1710,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
-source = { file = "doc/en/reference/experimental.md", lines = "146-157" }
+source = { file = "doc/en/reference/experimental.md", lines = "150-161" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1721,7 +1721,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-experimental-02"
-source = { file = "doc/en/reference/experimental.md", lines = "161-166" }
+source = { file = "doc/en/reference/experimental.md", lines = "165-170" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1868,7 +1868,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-configuration-02"
-source = { file = "doc/zh/configuration.md", lines = "62-118" }
+source = { file = "doc/zh/configuration.md", lines = "62-119" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1880,7 +1880,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-03"
-source = { file = "doc/zh/configuration.md", lines = "126-203" }
+source = { file = "doc/zh/configuration.md", lines = "127-205" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1892,7 +1892,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-04"
-source = { file = "doc/zh/configuration.md", lines = "250-262" }
+source = { file = "doc/zh/configuration.md", lines = "252-264" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2016,7 +2016,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
-source = { file = "doc/zh/reference/experimental.md", lines = "149-160" }
+source = { file = "doc/zh/reference/experimental.md", lines = "153-164" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2027,7 +2027,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-02"
-source = { file = "doc/zh/reference/experimental.md", lines = "164-169" }
+source = { file = "doc/zh/reference/experimental.md", lines = "168-173" }
 wrap = ""
 layer = "structure"
 honk = "accept"
