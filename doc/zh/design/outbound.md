@@ -734,7 +734,7 @@ Hysteria2 沿用 sing-quic 的惰性 TCP 建立方式：打开双向流后拨号
 到 listener。接收 metadata 把回包源端口重写为 nominal remote 端口，
 使 QUIC 只看到一个稳定 peer。
 
-quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。它从 8 MiB 起步，honk 的 quinn fork（`TransportConfig::receive_window_autotune`）按 quic-go 的方式增长：一个 epoch 内应用读走超过半个窗口、且读走该比例耗时少于 `4 × 比例 × RTT` 时翻倍，上限取 32 MiB 与配置窗口中较大者。增长只由应用实际读走的字节驱动，处理缓慢的接收方不会放大窗口，窗口也不会缩小。64 路下载、25 ms 延迟加 1% 丢包时约两秒内到达 32 MiB。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
+quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。它从 8 MiB 起步，honk 的 quinn fork（`TransportConfig::receive_window_autotune`）按 quic-go 的方式增长：一个 epoch 内应用读走超过半个窗口、且读走该比例耗时少于 `4 × 比例 × RTT` 时翻倍，上限取 32 MiB 与配置窗口中较大者。增长只由应用实际读走的字节驱动，处理缓慢的接收方不会放大窗口，窗口也不会缩小。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
 
 ## AnyTLS session 引擎
 
