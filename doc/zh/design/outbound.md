@@ -684,9 +684,9 @@ client 槽，因此 warm 释放、重建与 speculative client 会复用同一�
 
 | 协议 | 认证与 TCP | UDP | Transport 策略 |
 | --- | --- | --- | --- |
-| TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，可由节点覆盖 |
-| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口 |
-| Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口 |
+| TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB，可由节点覆盖 |
+| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB |
+| Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口，connection 窗口同样自动调整 |
 
 Go `juicity-server` v0.4.3 有实现层面的 UDP relay 限制：它申请的 1,500 字节
 buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包。互操作实测
@@ -706,7 +706,7 @@ Hysteria2 沿用 sing-quic 的惰性 TCP 建立方式：打开双向流后拨号
 到 listener。接收 metadata 把回包源端口重写为 nominal remote 端口，
 使 QUIC 只看到一个稳定 peer。
 
-quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。已测得在 RTT 为 75 ms、丢包率为 15% 的链路上将窗口从 32 MiB 降至 8 MiB，不影响吞吐。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
+quinn 的 1.25 MiB 窗口使 stream 在 100 ms RTT 下约受限于 12.5 MB/s。connection window 也限制内存；处理缓慢的接收方会缓冲约三倍于 connection window 的数据。它从 8 MiB 起步，honk 的 quinn fork（`TransportConfig::receive_window_autotune`）按 quic-go 的方式增长：一个 epoch 内应用读走超过半个窗口、且读走该比例耗时少于 `4 × 比例 × RTT` 时翻倍，上限取 32 MiB 与配置窗口中较大者。增长只由应用实际读走的字节驱动，处理缓慢的接收方不会放大窗口，窗口也不会缩小。可用 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window` 与 hy2 `hy2_init_*` 覆盖默认值。
 
 ## AnyTLS session 引擎
 

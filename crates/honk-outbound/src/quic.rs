@@ -379,6 +379,9 @@ pub async fn client_config(
     }
     if let Some(w) = options.conn_receive_window {
         transport.receive_window(VarInt::from_u64(w)?);
+        transport.receive_window_autotune(Some(VarInt::from_u64(
+            w.max(flow_control::FLOW_CONTROL_MAX_WINDOW),
+        )?));
     }
     if let Some(mtu) = options.max_udp_payload_size {
         let mtu = clamp_quic_payload_size(mtu);

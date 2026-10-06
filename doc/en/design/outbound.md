@@ -787,9 +787,9 @@ protocol heartbeat datagrams are unavailable.
 
 | Protocol | Authentication and TCP | UDP | Transport policy |
 | --- | --- | --- | --- |
-| TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, with node overrides |
-| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows |
-| Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
+| TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB, with node overrides |
+| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB |
+| Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows with the same connection auto-tuning |
 
 The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
 its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed
@@ -813,8 +813,12 @@ The server must DNAT the range to its listener. Receive metadata rewrites the
 reply source port to the nominal remote port so QUIC sees one stable peer.
 
 quinn's 1.25 MiB limits streams to ~12.5MB/s per 100ms RTT. The connection window
-also budgets memory; slow consumers buffer ~3× it. Reducing 32→8 MiB was
-throughput-neutral on a 75ms/15%-loss link. Overrides:
+also budgets memory; slow consumers buffer ~3× it. It starts at 8 MiB and honk's
+quinn fork grows it (`TransportConfig::receive_window_autotune`) like quic-go: when
+more than half the window was read in an epoch and reading that fraction took under
+`4 × fraction × RTT`, it doubles, up to the larger of 32 MiB and the configured
+window. Growth is driven by bytes the application read, so a slow consumer does not
+inflate it, and the window never shrinks. Overrides:
 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window`, hy2 `hy2_init_*`.
 
 ## AnyTLS session engine

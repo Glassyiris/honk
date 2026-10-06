@@ -2778,7 +2778,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.11.12"
-source = "git+https://github.com/Glassyiris/quinn?rev=47852e8b#47852e8b4809311b1ba28e709df2338754c86c06"
+source = "git+https://github.com/Glassyiris/quinn?rev=b29ded20#b29ded2045ebff03f74855b7921123a03fbc2abe"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2798,7 +2798,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.19"
-source = "git+https://github.com/Glassyiris/quinn?rev=47852e8b#47852e8b4809311b1ba28e709df2338754c86c06"
+source = "git+https://github.com/Glassyiris/quinn?rev=b29ded20#b29ded2045ebff03f74855b7921123a03fbc2abe"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2822,7 +2822,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.5.16"
-source = "git+https://github.com/Glassyiris/quinn?rev=47852e8b#47852e8b4809311b1ba28e709df2338754c86c06"
+source = "git+https://github.com/Glassyiris/quinn?rev=b29ded20#b29ded2045ebff03f74855b7921123a03fbc2abe"
 dependencies = [
  "cfg_aliases",
  "libc",
