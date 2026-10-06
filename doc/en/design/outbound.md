@@ -818,8 +818,7 @@ quinn fork grows it (`TransportConfig::receive_window_autotune`) like quic-go: w
 more than half the window was read in an epoch and reading that fraction took under
 `4 × fraction × RTT`, it doubles, up to the larger of 32 MiB and the configured
 window. Growth is driven by bytes the application read, so a slow consumer does not
-inflate it, and the window never shrinks. A 64-stream, 25 ms + 1 % loss download
-reaches 32 MiB within about two seconds. Overrides:
+inflate it, and the window never shrinks. Overrides:
 `tuic_init_stream_recv_window`/`tuic_init_conn_recv_window`, hy2 `hy2_init_*`.
 
 ## AnyTLS session engine
