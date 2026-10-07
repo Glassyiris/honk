@@ -5,8 +5,8 @@ use anyhow::anyhow;
 use tokio::time::Instant;
 
 use super::{
-    DetachedSessionReservation, DialSignal, ManagedSession, PoolState, SessionPermit, SessionPool,
-    SessionState, SpeculativeCheckout,
+    DetachedSessionReservation, DialSignal, KeyPool, ManagedSession, PoolState, SessionPermit,
+    SessionPool, SessionState, SpeculativeCheckout,
 };
 
 impl<S: ManagedSession + 'static> std::fmt::Debug for SpeculativeCheckout<S> {
@@ -180,21 +180,15 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             if self.pool.state() == PoolState::Running {
                 if let Some(session) = session {
                     pool.sessions.retain(|existing| !existing.is_closed());
-                    // Normal offers don't count provisional slots. Preserve their
-                    // in-flight publication slot as well as established sessions;
-                    // detached winners keep their already-reserved streams drain-only.
-                    let active = pool
+                    let committed = Arc::clone(&session);
+                    let mut active = pool
                         .sessions
                         .iter()
                         .filter(|s| s.state() == SessionState::Active)
                         .count();
-                    if active + usize::from(pool.dial_done.is_some())
-                        >= self.pool.config.max_sessions
-                    {
-                        session.begin_drain();
-                    }
-                    pool.sessions.push(Arc::clone(&session));
-                    Ok(session)
+                    active += usize::from(pool.dial_done.is_some());
+                    self.publish(&mut pool, session, &mut active);
+                    Ok(committed)
                 } else {
                     Err(None)
                 }
@@ -213,6 +207,69 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
                 Err(SessionPool::<S>::pool_closed_err())
             }
         }
+    }
+
+    /// Publish one preparation's physical sessions under a single pool lock.
+    /// Every reservation is validated before any session becomes reusable.
+    pub(crate) fn commit_all(mut reservations: Vec<Self>) -> anyhow::Result<()> {
+        let Some(first) = reservations.first() else {
+            return Ok(());
+        };
+        let owner = Arc::clone(&first.pool);
+        anyhow::ensure!(
+            reservations
+                .iter()
+                .all(|reservation| Arc::ptr_eq(&owner, &reservation.pool)),
+            "detached sessions belong to different pools"
+        );
+        {
+            let mut pool = owner.pool.lock();
+            if owner.state() != PoolState::Running {
+                return Err(SessionPool::<S>::pool_closed_err());
+            }
+            // Validate the entire winner before exposing any member to other flows.
+            for reservation in &reservations {
+                let session = pool
+                    .provisional
+                    .get(&reservation.slot_id)
+                    .and_then(Option::as_ref);
+                match session.map(|session| session.state()) {
+                    Some(SessionState::Active) if reservation.active => {}
+                    Some(SessionState::Draining) if reservation.active => {}
+                    _ => return Err(SessionPool::<S>::pool_closed_err()),
+                }
+            }
+            pool.sessions.retain(|session| !session.is_closed());
+            let mut active = pool
+                .sessions
+                .iter()
+                .filter(|session| session.state() == SessionState::Active)
+                .count();
+            active += usize::from(pool.dial_done.is_some());
+            for reservation in &mut reservations {
+                let session = pool
+                    .provisional
+                    .remove(&reservation.slot_id)
+                    .flatten()
+                    .expect("validated detached session");
+                reservation.publish(&mut pool, session, &mut active);
+                reservation.active = false;
+            }
+        };
+        owner.capacity_notify.notify_waiters();
+        Ok(())
+    }
+
+    fn publish(&self, pool: &mut KeyPool<S>, session: Arc<S>, active: &mut usize) {
+        // Normal offers may fill the pool while these already-admitted streams are private.
+        if session.state() == SessionState::Active {
+            if *active >= self.pool.config.max_sessions {
+                session.begin_drain();
+            } else {
+                *active += 1;
+            }
+        }
+        pool.sessions.push(session);
     }
 }
 

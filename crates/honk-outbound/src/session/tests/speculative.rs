@@ -133,36 +133,6 @@ async fn detached_commit_inserts_once_into_the_captured_pool() {
 }
 
 #[tokio::test]
-async fn detached_commit_at_capacity_admits_drain_only() {
-    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
-        max_sessions: 1,
-        ..Default::default()
-    }));
-    let mut reservation = match pool.checkout_speculative().await.unwrap() {
-        SpeculativeCheckout::Detached(reservation) => reservation,
-        SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
-    };
-    let winner = ReservedTestSession::new(1);
-    let _permit = reservation.attach(&winner).unwrap();
-    // Normal offers don't count provisional slots, so the pool can fill
-    // while the speculative dial is detached.
-    let active = pool
-        .offer(|| async { Ok(ReservedTestSession::new(1)) })
-        .await
-        .unwrap();
-
-    let committed = reservation.commit().unwrap();
-
-    assert!(Arc::ptr_eq(&committed, &winner));
-    assert_eq!(
-        committed.state(),
-        SessionState::Draining,
-        "a commit arriving at a full pool must not exceed max_sessions"
-    );
-    assert_eq!(active.state(), SessionState::Active);
-}
-
-#[tokio::test]
 async fn detached_commit_preserves_inflight_normal_dial_slot() {
     let pool = Arc::new(SessionPool::new(SessionPoolConfig {
         max_sessions: 1,
@@ -400,4 +370,172 @@ async fn normal_dial_publication_wakes_a_speculative_capacity_waiter() {
         panic!("normal publication stranded an already-parked speculative checkout");
     };
     assert!(Arc::ptr_eq(&reused, &session));
+}
+
+#[tokio::test]
+async fn detached_batch_commit_publishes_all_sessions_once() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 2,
+        ..Default::default()
+    }));
+    let mut reservations = Vec::new();
+    let mut sessions = Vec::new();
+    let mut permits = Vec::new();
+    for _ in 0..2 {
+        let SpeculativeCheckout::Detached(mut reservation) =
+            pool.checkout_speculative().await.unwrap()
+        else {
+            panic!("unpublished sessions must remain private");
+        };
+        let session = ReservedTestSession::new(1);
+        permits.push(reservation.attach(&session).unwrap());
+        sessions.push(session);
+        reservations.push(reservation);
+    }
+    assert_eq!(pool.live_session_count(), 0);
+    DetachedSessionReservation::commit_all(reservations).unwrap();
+    {
+        let published = pool.pool.lock();
+        assert_eq!(published.sessions.len(), 2);
+        for (expected, actual) in sessions.iter().zip(&published.sessions) {
+            assert!(Arc::ptr_eq(expected, actual));
+            assert_eq!(actual.state(), SessionState::Active);
+        }
+    }
+    assert_eq!(pool.live_session_count(), 2);
+    assert!(pool.pool.lock().provisional.is_empty());
+    drop(permits);
+    pool.shutdown();
+}
+
+#[tokio::test]
+async fn detached_batch_commit_publishes_draining_members_without_charging_capacity() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 2,
+        ..Default::default()
+    }));
+    let mut reservations = Vec::new();
+    let mut sessions = Vec::new();
+    let mut permits = Vec::new();
+    for draining in [true, false] {
+        let SpeculativeCheckout::Detached(mut reservation) =
+            pool.checkout_speculative().await.unwrap()
+        else {
+            panic!("unpublished sessions must remain private");
+        };
+        let session = ReservedTestSession::new(2);
+        permits.push(reservation.attach(&session).unwrap());
+        if draining {
+            session.begin_drain();
+        }
+        sessions.push(session);
+        reservations.push(reservation);
+    }
+    let incumbent = ReservedTestSession::new(1);
+    let incumbent_permit = incumbent.try_reserve().unwrap();
+    pool.insert(&incumbent);
+    DetachedSessionReservation::commit_all(reservations).unwrap();
+    assert_eq!(pool.live_session_count(), 3);
+    assert!(pool.pool.lock().provisional.is_empty());
+    assert_eq!(sessions[0].state(), SessionState::Draining);
+    assert!(!sessions[0].is_closed());
+    let SpeculativeCheckout::Shared { session, permit } =
+        pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("the active member must remain reusable");
+    };
+    assert!(Arc::ptr_eq(&session, &sessions[1]));
+    drop(permit);
+    drop(incumbent_permit);
+    drop(permits);
+    pool.shutdown();
+    assert!(sessions.iter().all(|session| session.is_closed()));
+}
+
+#[tokio::test]
+async fn detached_batch_commit_rejects_terminal_or_invalid_member_without_partial_publication() {
+    for shutdown in [false, true] {
+        let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+            max_sessions: 2,
+            ..Default::default()
+        }));
+        let mut reservations = Vec::new();
+        let mut sessions = Vec::new();
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            let SpeculativeCheckout::Detached(mut reservation) =
+                pool.checkout_speculative().await.unwrap()
+            else {
+                panic!("unpublished sessions must remain private");
+            };
+            let session = ReservedTestSession::new(1);
+            permits.push(reservation.attach(&session).unwrap());
+            sessions.push(session);
+            reservations.push(reservation);
+        }
+        if shutdown {
+            pool.shutdown();
+        } else {
+            sessions[1].close();
+        }
+        assert!(DetachedSessionReservation::commit_all(reservations).is_err());
+        assert_eq!(pool.live_session_count(), 0);
+        assert!(pool.pool.lock().provisional.is_empty());
+        assert!(sessions.iter().all(|session| session.is_closed()));
+        drop(permits);
+    }
+}
+
+#[tokio::test]
+async fn detached_winners_at_capacity_publish_drain_only_without_disturbing_incumbents() {
+    for batch in [false, true] {
+        let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+            max_sessions: 2,
+            max_streams_per_session: 1,
+            ..Default::default()
+        }));
+        let mut reservations = Vec::new();
+        let mut winners = Vec::new();
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            let SpeculativeCheckout::Detached(mut reservation) =
+                pool.checkout_speculative().await.unwrap()
+            else {
+                panic!("unpublished sessions must remain private");
+            };
+            let winner = ReservedTestSession::new(1);
+            permits.push(reservation.attach(&winner).unwrap());
+            winners.push(winner);
+            reservations.push(reservation);
+        }
+        let mut incumbents = Vec::new();
+        for _ in 0..2 {
+            let incumbent = pool
+                .offer(|| async { Ok(ReservedTestSession::new(1)) })
+                .await
+                .unwrap();
+            permits.push(pool.try_reserve(&incumbent).unwrap());
+            incumbents.push(incumbent);
+        }
+        if batch {
+            DetachedSessionReservation::commit_all(reservations).unwrap();
+        } else {
+            for (reservation, winner) in reservations.into_iter().zip(&winners) {
+                assert!(Arc::ptr_eq(&reservation.commit().unwrap(), winner));
+            }
+        }
+        assert!(winners.iter().all(|session| {
+            session.state() == SessionState::Draining && session.active_streams() == 1
+        }));
+        assert!(
+            incumbents
+                .iter()
+                .all(|session| session.state() == SessionState::Active)
+        );
+        assert_eq!(pool.active_session_total(), 2);
+        assert_eq!(pool.live_session_count(), 4);
+        assert!(pool.pool.lock().provisional.is_empty());
+        drop(permits);
+        assert_eq!(pool.reap_unretained_idle(), 4);
+    }
 }

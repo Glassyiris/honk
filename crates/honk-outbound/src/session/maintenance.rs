@@ -10,7 +10,6 @@ use super::{ManagedSession, PoolState, SessionPool, SessionState};
 impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Drain idle sessions above the configured or runtime-retained reusable floor.
     /// Sessions with live streams are never disturbed; terminal sessions are pruned.
-    #[cfg(any(feature = "rprx", test))]
     pub fn reap_unretained_idle(&self) -> usize {
         if self.state() != PoolState::Running {
             return 0;
@@ -228,9 +227,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             };
             if current < min_idle {
                 let admission = self
-                    .dial_admission
-                    .read()
-                    .clone()
+                    .dial_admission()
                     .unwrap_or_else(crate::runtime::capture_dial_admission);
                 if let Ok(s) = admission
                     .scope(self.offer({
@@ -243,6 +240,14 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
             }
         }
+    }
+
+    pub(crate) fn dial_admission(&self) -> Option<crate::runtime::CapturedDialAdmission> {
+        self.dial_admission.read().clone()
+    }
+
+    pub(crate) fn clear_dial_admission(&self) {
+        self.dial_admission.write().take();
     }
 
     pub(crate) fn set_dial_admission(&self, admission: crate::runtime::CapturedDialAdmission) {
@@ -312,7 +317,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         {
             return;
         }
-        self.dial_admission.write().take();
+        self.clear_dial_admission();
         let _ = self.shutdown_tx.send(true);
         // Dials and janitors observe this signal. A late dial verifies the
         // terminal state under the registration lock before publication.
@@ -397,7 +402,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
             }
         }
-        self.dial_admission.write().take();
+        self.clear_dial_admission();
         let _ = self.shutdown_tx.send(true);
         // Dials and janitors observe the terminal signal; terminal
         // registration checks close late dial results safely.

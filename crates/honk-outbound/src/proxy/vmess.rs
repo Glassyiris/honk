@@ -2,6 +2,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use honk_config::node::Node;
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -9,13 +10,16 @@ use rand::RngExt;
 use sha2::Sha256;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::addr::{self, SocksAddr};
-use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
+use super::{
+    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+};
 
 /// VMess protocol version byte.
 const VMESS_VERSION: u8 = 0x01;
@@ -459,6 +463,11 @@ impl VmessHandler {
     }
 }
 
+fn uuid(node: &Node) -> anyhow::Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(node.vmess().unwrap().uuid.as_deref().unwrap_or(""))
+        .map_err(|error| anyhow::anyhow!("invalid VMess UUID: {}", error))
+}
+
 #[async_trait]
 impl TcpOutbound for VmessHandler {
     async fn dial(
@@ -468,13 +477,10 @@ impl TcpOutbound for VmessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.vmess().unwrap().uuid.as_deref().unwrap_or("");
-        let uuid = uuid::Uuid::parse_str(password)
-            .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
-        let uuid_bytes = uuid.as_bytes();
+        let uuid = uuid(node)?;
 
         let stream = super::transport::wrap_transport(node, None, connect_timeout).await?;
-        Self::perform_handshake(uuid_bytes, stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 
     async fn dial_with_tcp(
@@ -485,13 +491,35 @@ impl TcpOutbound for VmessHandler {
         tcp: TcpStream,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let password = node.vmess().unwrap().uuid.as_deref().unwrap_or("");
-        let uuid = uuid::Uuid::parse_str(password)
-            .map_err(|e| anyhow::anyhow!("invalid VMess UUID: {}", e))?;
-        let uuid_bytes = uuid.as_bytes();
+        let uuid = uuid(node)?;
 
         let stream = super::transport::wrap_transport(node, Some(tcp), connect_timeout).await?;
-        Self::perform_handshake(uuid_bytes, stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let uuid = uuid(&runtime.node)?;
+        let stream =
+            super::transport::wrap_transport_runtime(&runtime, None, connect_timeout).await?;
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+    }
+}
+
+#[async_trait]
+impl WarmableOutbound for VmessHandler {
+    async fn warm(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: std::time::Duration,
+        _requirement: WarmRequirement,
+    ) -> anyhow::Result<()> {
+        super::transport::xhttp::XhttpRuntime::warm(&runtime, connect_timeout).await
     }
 }
 
@@ -618,13 +646,18 @@ async fn vmess_relay(
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
         loop {
-            let n = client_read.read(&mut buf).await?;
+            let n = match client_read.read(&mut buf).now_or_never() {
+                Some(read) => read?,
+                None => {
+                    server_write.flush().await?;
+                    client_read.read(&mut buf).await?
+                }
+            };
             if n == 0 {
                 break;
             }
             let chunk = body.seal_chunk(&buf[..n]);
             server_write.write_all(&chunk).await?;
-            server_write.flush().await?;
         }
         let term = body.seal_chunk(&[]);
         server_write.write_all(&term).await?;

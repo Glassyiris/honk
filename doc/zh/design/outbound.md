@@ -36,6 +36,8 @@ UDP 对象。
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score 与健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
 | Session pool | `session/{maintenance,speculative}.rs` |
+| Stream transport | `proxy/transport/{grpc,h2_io}.rs`；`proxy/transport/xhttp/{preparation,request,response,runtime,session,stream,upload}.rs` |
+| Pooled runtime 生命周期 | `runtime/pooled.rs` |
 
 共享状态仍留在共同父模块中，子模块不公开这些字段。REALITY、TLS、stream transport
 与 UoT 仍由多个协议共用，不归 VLESS 独占。既有测试主题名称在对应协议族内保留。物
@@ -106,9 +108,9 @@ transport 上实现 framing。
 | 协议 | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | 分享链接 scheme |
 | --- | --- | --- | --- | --- | --- |
 | Shadowsocks（含 2022） | 是 | 否 | 是 | `None` | `ss` |
-| Trojan | `network` 缺省或包含 `udp` 时 | 仅 `tcp`/空 transport | 是 | `None` | `trojan` |
-| VMess | 否 | 否 | 是 | `None` | `vmess` |
-| VLESS | `network` 允许 UDP 时 | 否 | TCP path 为 direct 时 | `Vless` | `vless` |
+| Trojan | `network` 缺省或包含 `udp` 时 | 仅 `tcp`/空 transport | XHTTP 之外 | `None` | `trojan` |
+| VMess | 否 | 否 | XHTTP 之外 | `None` | `vmess` |
+| VLESS | `network` 允许 UDP 时 | 否 | direct TCP path 且非 XHTTP | `Vless` | `vless` |
 | SOCKS5 | 是 | 是 | 是 | `None` | `socks5`、`socks4`、`socks4a` |
 | Hysteria2 | 是 | 否 | 否 | `Quic` | `hysteria2`、`hysteria` |
 | TUIC | 是 | 否 | 否 | `Quic` | `tuic` |
@@ -122,6 +124,7 @@ Ready-stream pooling 保存已经完成且绑定目标的握手。Bare-TCP pooli
 TCP multiplex 与 QUIC 协议排除两者，因为 generation runtime 持有复用状态。
 Direct 也排除两者，因为每条流的 socket 携带各自的规则 mark 或全局 mark。
 即使配置了独立的仅 UDP Xray pool，direct TCP 的 VLESS 仍可进入 bare pool。
+XHTTP 排除两类 preconnect pool，由自身 transport runtime 拥有物理 H2 复用。
 
 Ready stream 按 runtime generation、节点身份和目标分别保存，只能由使用
 拨号时所属 generation 的流取出。reload 发布新 generation 后，连接池在
@@ -172,8 +175,9 @@ feature-off 构建不分配 VLESS runtime pool 或 carrier semaphore。单元测
 出站状态的唯一所有者。它把 `Node.id` 映射到 `NodeRuntime`：
 
 - 不可变的 `Arc<Node>` 配置；
-- 节点相关的 `udp_capable` 结果；以及
-- 由 descriptor 选择的一个 `ProtocolRuntime`。
+- 节点相关的 `udp_capable` 结果；
+- 由 descriptor 选择的一个 `ProtocolRuntime`；以及
+- 可选的 XHTTP transport 状态，与协议 runtime 并存而非替代它。
 
 `ProtocolRuntime` 可以是 `None`、AnyTLS 状态、`VlessRuntime` 或类型擦除的
 QUIC client 槽。每个 VLESS 节点都持有 `VlessRuntime`；其中只创建配置选择的
@@ -183,6 +187,8 @@ H2/shared-Cool/separate-Cool pool，并保存 lazy private source-ID key。handl
 未知 transport、无效 pin/REALITY key、保留的内置名称或协议均 fail-closed。
 
 - 结构化或导入的 raw TCP TLS ALPN 存于 `TlsOptions.alpn`（flat serde 字段为 `tls_alpn`，空列表时省略）。`Node::validate_protocol` 要求 AnyTLS 或 TCP Trojan/VMess/VLESS 启用普通 TLS，拒绝 REALITY/WS/gRPC/QUIC override；ALPN 名称长度为 1–255 字节，编码后的列表最多 65,533 字节。非空 ALPN 以基础 ID 为命名空间、JSON 元组 `["tls-alpn", <ordered list>]` 为名称派生 UUID v5 子 ID，使其与任意凭据文本分离；空列表保留基础 ID，包括 VLESS 重新派生的身份。URI/v2rayN ALPN 兼容行为与 TUIC 独立的 `tuic_alpn` 不变。
+
+XHTTP 使用独立的 H2-only profile。规范节点携带 `["h2"]`；普通 TLS 与 REALITY 设置该 offer，不改变 raw TCP、WS 或 gRPC profile。普通 TLS 在发送代理字节前拒绝没有协商 H2 的对端。认证后的 REALITY 按 transport 契约选择 H2；官方 Xray 会有意省略服务端 ALPN。显式明文 XHTTP 要求对端支持 H2。规范请求形态与 TLS/明文安全配置参与节点身份及 reload 复用。
 
 准入范围内的 TCP 反馈只开始一次：在首个获准的物理尝试开始时，或在复用 session/QUIC connection 上打开逻辑流之前。冷准入等待期间仍未开始；已经完成但未经过任一边界的路径仍使用完成时的回退机制。
 
@@ -235,7 +241,10 @@ Pool waiter 在检查容量前注册容量变化通知。每个由 pool 持有�
 拨号发起者在启动 task 前订阅结果，并直接消费该次尝试的结果。即使已有 warm
 session 可以承接普通 spread 拨号失败，已完成的本地拒绝仍保持终态。
 Pool-owned task 在 poll 拨号前重新检查终态。进行中的普通拨号预留一个可复用
-slot；并发的 detached commit 在该预留占满上限时进入 drain-only，保留已有 child。
+slot。如果普通 offer 或进行中的拨号填满上限，detached winner commit（包括多
+carrier 批次）将超出的 private carrier 以 drain-only 发布，保留已经准入的 stream。
+批次先校验全部成员再发布任何成员；丢弃 loser 或向已退役 pool 提交时，仍只关闭
+其 private carrier。
 解除 warm retention 时，多余的 live carrier 进入 Draining 后也会唤醒容量
 waiter，无需等待这些 carrier 上已有的 child 结束。
 maintenance 因 max-age 退役或清理已关闭 session 释放容量时，也会发布通知，
@@ -254,20 +263,21 @@ I/O 经 provisional、active、draining 与 idle 状态一直保留到 task tear
 
 ### Stream transport
 
-`src/proxy/transport.rs` 由 Trojan、VMess 与 VLESS 共享，由 `node.transport()` 返回的 `StreamTransportOptions` 中的 `transport`/`ws_path`/`ws_host`/`grpc_service` 驱动。顺序固定：
+`src/proxy/transport.rs` 由 Trojan、VMess 与 VLESS 共享，由 `node.transport()` 返回的 `StreamTransportOptions` 中的 `transport`/`ws_path`/`ws_host`/`grpc_service`/`xhttp` 驱动。顺序固定：
 
 ```text
-TCP -> optional TLS or REALITY -> optional WebSocket or gRPC -> protocol header
+TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol header
 ```
 
 `maybe_tls_wrap_concrete` 保留 Vision 所需的具体 TCP/TLS 类型。存在
 REALITY 参数时，它使用[有界认证建立过程](#服务端认证与指纹约束)，而不是普通 TLS。因此同一
-共享路径为 Trojan、VMess 与 VLESS 提供一致的 TLS、REALITY、WS 与 gRPC
-建立过程。
+共享路径为 Trojan、VMess 与 VLESS 提供一致的 TLS、REALITY、WS、gRPC 与
+XHTTP 建立过程。
 
 Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
 TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
 错误，不会把该错误转换成 EOF。
+
 
 `transport_quality` 管理按 runtime 所有者归属的 carrier 压力提示。共享 TCP/TLS/REALITY 与 AnyTLS 在物理 I/O 层观测，Shadowsocks 借用已有 socket half。Linux `TCP_INFO` 每个活跃秒最多读取一次，各字段按内核返回 ABI 长度独立检查；缺失或读取失败保持未知，不能改变 I/O。Vision Direct 与 ready pool 的 FD 存活性检查保留 socket 路径。Hy2/TUIC/Juicity 复用已有每秒物理 QUIC 采样，隔离握手确认／发布前历史，peer 改变时重建基线；逻辑 mux 子流不会重复报告同一事件。不额外持有 FD，也不创建逐 TCP 定时任务；静止 TCP 不产生新的事件驱动观测。详见 [Score 压力语义](./groups.md#score-评分与生命周期)。
 
@@ -295,6 +305,24 @@ opening request 不设置 `END_STREAM`；TLS 请求使用 `:scheme: https`，并
 
 VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及消息体解码
 失败传递到流所有者，而不是变成 EOF。
+
+#### XHTTP carrier 与逻辑流所有权
+
+`proxy/transport/xhttp.rs` 将原始 H2 body 适配为已有 stream 契约，持有节点级 `SessionPool`，不是新代理协议或 loopback relay。Pool 最多保留两条可复用物理 carrier；draining carrier 可在既有进程 FD/VLESS-carrier gate 下与 replacement 短暂重叠。物理 driver 拥有 socket、观测和 carrier permit；HTTP 请求与逻辑代理流使用独立 reservation。对端公布的并发 stream 上限保持权威，包括零、一与后续缩小。
+
+每条 carrier 最多保留 2048 个本地 reset 请求（16 个准入窗口），使用 h2 默认的一秒在途 frame 宽限期，并保留其默认、有限的终身 1024 次协议错误 reset 预算；持续的短 flow churn 会在旧 reset 状态过期前取消多个准入窗口，因此保留数量必须高于活跃请求上限。
+
+Stream-one 使用一个 POST，stream-up 使用 GET 与流式 POST，packet-up 使用 GET 与有序有限 POST。建链无需等待响应头即可返回可写流。上传响应中的 padding 持续排空并丢弃，不记作应用 RX。Packet-up 在空闲后的首批数据到达时立即发送，不额外等待凑批。连续 POST 遵守 `scMinPostsIntervalMs`；POST 等待节奏间隔或其 body 正在发送时接纳的字节合并到下一次 POST。每流字节缓冲和最多八个未完成响应的 POST 限制背压；前一个 body 物理写完后即可继续后续 POST，不必等待它的响应。
+
+Legacy 上传 padding 的 Referer 使用配置的基础 path，并将其 query 替换为生成的 `x_padding` 值；请求本身保留配置的 query。
+
+Stream-one 与 stream-up 的 flush 在当前 H2 流控下等待字节所有权释放及物理 I/O 刷新。Packet-up 的协议建立 flush 和首次应用写入 flush 等待其完整的已接纳字节前缀物理刷新，包括跨越多个 POST 的情况；VLESS Encryption 预留一个额外的建立屏障，在恢复的 0-RTT 连接中即使握手与协议头共享 flush 也保留该屏障。没有新字节的 flush 不消耗这些屏障。之后的 packet-up flush 只检查保留的错误且不等待 POST，因此逐 datagram 的 write/flush 循环可跨节奏间隔合并批次。未调用 shutdown 就丢弃 packet-up stream 会丢弃已接纳但尚未上传的字节；shutdown 是其唯一的上传完成屏障。缓冲下载字节先于终端错误交付。上传 shutdown 保留响应方向；stream-up 在请求 END_STREAM 物理刷新后完成，并继续排空 POST 响应，保留延迟到达的上传拒绝。Packet-up 的 shutdown 等待每个已接纳字节所属 POST 的响应完成并检查状态，不伪造 EOF 标记。优雅 GOAWAY 停止向该 carrier 开新请求并保留已接纳 stream；仅未来的新 POST 转到 replacement，不重放交付状态不明的应用字节。退役关闭新逻辑流准入，但已经接纳的 packet flow 保留完成所需的请求容量。
+
+如果对端缩小 stream 上限导致已保留的 packet-up 上传 lane 不可用，则先将该 carrier 转为 draining，再接纳 replacement。已有 GET 保持存活，replacement 获取上传容量；旧 reservation 不会占住可复用 carrier 上限。
+
+Stream-up 上传响应错误已经就绪时，优先于同时完成的请求 END_STREAM 处理，因此 shutdown 返回该拒绝错误，而不是报告半关闭成功。
+
+Ephemeral 建立过程在取消期间也受 guard 管理，pool 自主管理的握手有 deadline，speculative UDP carrier 只有胜者 fallible commit 后才发布；关闭或丢弃 preparation 回滚 reservation。清理由既有 runtime shutdown、retirement 与 idle maintenance 拥有，不新增协议 janitor 或生产逐包 telemetry。
 
 ### 带 mark socket 与名称解析
 
@@ -712,7 +740,7 @@ ephemeral 等价对象。
 
 ### Pool 与 session 生命周期
 
-`src/session.rs` 定义由节点持有的通用 `SessionPool`，供 AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool 使用（QUIC 使用 `quic::QuicClient`）。它强制执行 `Active`、`Draining` 与 `Closed` 状态约束、atomic
+`src/session.rs` 定义由节点持有的通用 `SessionPool`，供 AnyTLS、VLESS H2MUX、VLESS Mux.Cool 与 XHTTP 使用（QUIC 使用 `quic::QuicClient`）。它强制执行 `Active`、`Draining` 与 `Closed` 状态约束、atomic
 stream permit、event-driven capacity wait、least-loaded 选择与 pool 所有的
 物理拨号 single-flight。Draining session 不计入可复用 cap，并可在存活
 stream 完成期间与 replacement 重叠。
