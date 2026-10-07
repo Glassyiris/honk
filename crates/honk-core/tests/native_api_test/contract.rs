@@ -1,5 +1,5 @@
 //! Checks every `/api` response the suite receives against the OpenAPI
-//! contract the embedded doona build was generated from, so handler drift fails CI.
+//! contract pinned below, so handler drift fails CI.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -9,8 +9,9 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, TRANSFER
 use reqwest::{Client, IntoUrl, Method, RequestBuilder, Response, Url};
 use serde_json::Value;
 
-// The contract doona 0.1.0-beta.17 pins in contract/api-standardize/SOURCE.md
-// (sha256 9f1c20e2...); refresh it with the doona release honk ships.
+// api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f, copied from
+// doona contract/api-standardize/openapi.yaml with its read_only_reason extension.
+// SHA-256: ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646.
 const CONTRACT: &str = include_str!("../fixtures/native_api_openapi.yaml");
 const CONTRACT_URL: &str = "https://contract.honk.invalid/openapi.json";
 

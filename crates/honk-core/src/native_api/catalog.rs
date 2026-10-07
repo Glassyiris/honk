@@ -137,6 +137,7 @@ struct NodeRow<'a> {
     id: Uuid,
     name: Cow<'a, str>,
     protocol: &'static str,
+    stream_transport: Option<&'static str>,
     subscription_tag: Option<Cow<'a, str>>,
     provider_id: Option<ProviderId>,
     group_ids: Vec<&'a String>,
@@ -162,6 +163,9 @@ fn node_row<'a>(
         id: node.id,
         name: secrets.mask_borrowed(&node.name),
         protocol: node.protocol().as_str(),
+        stream_transport: node
+            .transport()
+            .and_then(|t| honk_config::options::vocab::xhttp_stream_transport(&t.transport).ok()),
         subscription_tag: node
             .subscription_id
             .and_then(|id| {

@@ -774,3 +774,54 @@ async fn degraded_refresh_reports_userspace_commit_without_a_kernel_generation()
         })
     );
 }
+
+#[tokio::test]
+async fn refresh_publishes_configured_xhttp_transport_in_node_catalog() {
+    let mut origin = Origin::new().await;
+    let subscription = origin.subscription();
+    let config = Config {
+        subscriptions: vec![subscription.clone()],
+        ..Default::default()
+    };
+    let mut fixture = Fixture::start(config, None, Some(OLD), &mut origin).await;
+    let accepted: Value = fixture
+        .refresh(subscription.id, "xhttp")
+        .await
+        .json()
+        .await
+        .unwrap();
+    respond(origin.next().await,
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:443?type=splithttp&security=tls&path=%2Fprivate-path#refreshed",
+    ).await;
+    let command = timeout(WAIT, fixture.merges.recv()).await.unwrap().unwrap();
+    let before = fixture.get("/api/v1/nodes").await;
+    let old = before["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "old")
+        .unwrap();
+    assert_eq!(old.get("stream_transport"), Some(&Value::Null));
+    fixture.commands.send(command).await.unwrap();
+    assert_eq!(fixture.terminal(&accepted).await["status"], "succeeded");
+    let after = fixture.get("/api/v1/nodes").await;
+    let row = after["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "refreshed")
+        .unwrap();
+    assert_eq!(row["protocol"], "vless");
+    assert_eq!(row["stream_transport"], "xhttp");
+    assert_eq!(row["provider_id"], subscription.id.to_string());
+    assert!(
+        !after["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == old["id"])
+    );
+    assert!(!row.to_string().contains("private-path"));
+    fixture.stop().await;
+    origin.stop().await;
+}
