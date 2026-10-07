@@ -422,3 +422,24 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     );
     assert_eq!(alive.health_observations(node.id), global);
 }
+
+#[test]
+fn unknown_configured_stream_transport_is_null() {
+    let mut config = fixture();
+    let mut node =
+        honk_config::node::Node::from_share_link("trojan://password@127.0.0.1:443?type=ws")
+            .unwrap();
+    node.transport_mut().unwrap().transport = "future-private-transport".into();
+    config.nodes.push(node);
+    let row = serde_json::to_value(node_row(
+        config.nodes.last().unwrap(),
+        &config,
+        &AliveDialerSet::new(),
+        vec![],
+        &ListenerSecrets::from_config(&config),
+    ))
+    .unwrap();
+    assert_eq!(row.get("stream_transport"), Some(&Value::Null));
+    assert_eq!(row["protocol"], "trojan");
+    assert!(!row.to_string().contains("future-private-transport"));
+}

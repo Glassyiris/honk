@@ -6,7 +6,9 @@
 
 `native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；两种 allocator 发布产物均包含它及内嵌 UI（`native-ui`）。listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
-原生契约（包括认证、节点/provider 管理、geodata 与自动策略 override）为 [api-standardize 7a133b580afb66b00a1ddb24874bae778a27cb4c](https://github.com/daeuniverse/api-standardize/tree/7a133b580afb66b00a1ddb24874bae778a27cb4c)；`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该 bundle。原生 runtime mode 仍未开放，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`。可用功能以 capabilities 和逐源权限为准，不按路由名称推断。
+原生契约（包括认证、节点/provider 管理、geodata 与自动策略 override）为 [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f)；`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该 bundle。原生 runtime mode 仍未开放，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`。可用功能以 capabilities 和逐源权限为准，不按路由名称推断。
+
+`Node.stream_transport` 是可选、可为 null 的字符串，投影已接受的 Trojan/VMess/VLESS 配置：`tcp`、`ws`、`grpc` 或 `xhttp`（包括 `splithttp` 别名）。无法识别或不适用时，honk 返回 null。该字段表示配置的传输方式，不表示协商结果或健康状态；`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、path、extra 选项或链接。测试 fixture 复制 doona 契约 bundle，保留其 `read_only_reason` 扩展（SHA-256 `ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646`）；此固定版本不代表已发布的前端版本。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |

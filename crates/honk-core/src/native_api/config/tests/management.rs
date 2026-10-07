@@ -39,6 +39,78 @@ async fn reload(fixture: &Fixture) {
 }
 
 #[tokio::test]
+async fn created_nodes_list_only_canonical_configured_stream_transport() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    for (name, link, protocol, transport) in [
+        (
+            "ws",
+            "trojan://private-password@127.0.0.1:443?type=ws&path=%2Fprivate-path",
+            "trojan",
+            Some("ws"),
+        ),
+        (
+            "grpc",
+            "vmess://eyJ2IjoiMiIsInBzIjoiZ3JwYyIsImFkZCI6IjEyNy4wLjAuMSIsInBvcnQiOiI0NDMiLCJpZCI6ImI4MzEzODFkLTYzMjQtNGQ1My1hZDRmLThjZGE0OGIzMDgxMSIsImFpZCI6IjAiLCJuZXQiOiJncnBjIiwicGF0aCI6InByaXZhdGUtc2VydmljZSIsInRscyI6InRscyJ9",
+            "vmess",
+            Some("grpc"),
+        ),
+        (
+            "tcp",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:443?type=tcp",
+            "vless",
+            Some("tcp"),
+        ),
+        ("plain", LINK, "socks5", None),
+        (
+            "xhttp",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:443?type=xhttp&security=tls&path=%2Fprivate-path&extra=%7B%22noGRPCHeader%22%3Atrue%7D",
+            "vless",
+            Some("xhttp"),
+        ),
+        (
+            "split",
+            "trojan://private-password@127.0.0.1:443?type=splithttp&path=%2Fsplit-path",
+            "trojan",
+            Some("xhttp"),
+        ),
+    ] {
+        let response = create_node(&fixture, name, link).send().await.unwrap();
+        let status = response.status();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "creating node {name}: {}",
+            response.text().await.unwrap()
+        );
+        let node = created(response, "nodes").await;
+        assert_eq!(node["protocol"], protocol);
+        assert_eq!(node.get("stream_transport"), Some(&json!(transport)));
+        assert!(
+            fixture.get(NODES).await["nodes"]
+                .as_array()
+                .unwrap()
+                .contains(&node)
+        );
+        for field in ["password", "host", "path", "extra", "link", "transport"] {
+            assert!(node.get(field).is_none(), "{field}");
+        }
+        let encoded = node.to_string();
+        for private in [
+            "private-password",
+            "private-path",
+            "private-service",
+            "split-path",
+            "noGRPCHeader",
+            "127.0.0.1",
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+        ] {
+            assert!(!encoded.contains(private), "{private}");
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn node_management_commits_disk_catalog_and_generation_before_success() {
     let fixture = Fixture::new(Access::Admin, false).await;
     std::fs::write(
