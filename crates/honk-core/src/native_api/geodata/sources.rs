@@ -2,7 +2,7 @@
 //! schedule, and the outcome of the last update attempt.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use honk_config::experimental::{MAX_GEODATA_URL_BYTES, NativeApiConfig, parse_geodata_url};
 use parking_lot::Mutex;
@@ -18,6 +18,9 @@ pub(super) const MAX_URLS: usize = 4;
 pub(super) const INTERVAL_HOURS: std::ops::RangeInclusive<u64> = 6..=168;
 const MAX_JITTER_SECS: u64 = 3600;
 const FIRST_BACKOFF: Duration = Duration::from_secs(3600);
+/// The shortest wait before an automatic check, so a startup never downloads
+/// at once, however long ago the last check was.
+const STARTUP_DELAY: Duration = Duration::from_secs(300);
 /// MetaCubeX full, raw first; jsDelivr serves the same bytes where GitHub is slow.
 const DEFAULT_URLS: [[&str; 2]; 2] = [
     [
@@ -328,6 +331,78 @@ struct Status {
     fetched: [Option<Fetched>; 2],
 }
 
+impl Status {
+    fn stored(&self) -> StoredStatus {
+        StoredStatus {
+            last_checked_at: self.last_checked_at.and_then(unix_secs),
+            last_updated_at: self.last_updated_at.and_then(unix_secs),
+            last_error: self.last_error.clone(),
+            failures: self.failures,
+        }
+    }
+}
+
+/// The part of `Status` kept in the state db's `geodata_status` row, so the
+/// schedule and the last outcome survive a restart. Times are whole seconds
+/// since the Unix epoch.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct StoredStatus {
+    last_checked_at: Option<u64>,
+    last_updated_at: Option<u64>,
+    last_error: Option<String>,
+    failures: u32,
+}
+
+impl From<StoredStatus> for Status {
+    fn from(stored: StoredStatus) -> Self {
+        let time = |secs: u64| UNIX_EPOCH.checked_add(Duration::from_secs(secs));
+        Self {
+            last_checked_at: stored.last_checked_at.and_then(time),
+            last_updated_at: stored.last_updated_at.and_then(time),
+            last_error: stored.last_error,
+            failures: stored.failures,
+            ..Self::default()
+        }
+    }
+}
+
+fn unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// The stored status, or an empty one when the row is missing; a row that
+/// cannot be read is ignored the same way, with a warning.
+fn read_status(db: &StateDb) -> Status {
+    let record = db
+        .strict()
+        .query_row(
+            "SELECT record FROM geodata_status WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional();
+    let stored = match record {
+        Ok(None) => return Status::default(),
+        Ok(Some(record)) => serde_json::from_str::<StoredStatus>(&record).ok(),
+        Err(error) => {
+            crate::state::log_sql(&error);
+            None
+        }
+    };
+    stored.map_or_else(
+        || {
+            tracing::warn!(
+                "stored geodata update status is unusable and ignored; the next check comes after the startup delay"
+            );
+            Status::default()
+        },
+        Status::from,
+    )
+}
+
 pub(crate) struct Sources {
     db: Arc<StateDb>,
     stored: Mutex<Stored>,
@@ -336,9 +411,10 @@ pub(crate) struct Sources {
 }
 
 impl Sources {
-    /// Reads the stored settings and seeds the configuration file's URLs.
-    /// A record that fails its checks is ignored until the next write
-    /// replaces it; a state db that cannot be read or written is an error.
+    /// Reads the stored settings and update status and seeds the configuration
+    /// file's URLs. A record that fails its checks is ignored until the next
+    /// write replaces it; a state db that cannot be read or written is an
+    /// error, except for the status, which then starts empty.
     pub(crate) fn open(db: Arc<StateDb>, settings: &NativeApiConfig) -> rusqlite::Result<Self> {
         let record: Option<String> = db
             .strict()
@@ -359,10 +435,11 @@ impl Sources {
                     Stored::default()
                 })
         });
+        let status = read_status(&db);
         let sources = Self {
             db,
             stored: Mutex::new(stored),
-            status: Mutex::new(Status::default()),
+            status: Mutex::new(status),
             changed: tokio::sync::Notify::new(),
         };
         sources.seed(settings)?;
@@ -486,14 +563,21 @@ impl Sources {
         self.changed.notified()
     }
 
-    /// Before this process has checked, the wait counts from `now`, so a
-    /// startup never downloads at once, whatever the loaded files' age.
+    /// The wait counts from the last check, kept across restarts. A check
+    /// that is already due, that was never made, or that is recorded later
+    /// than `now` (a clock that ran ahead) comes `STARTUP_DELAY` after `now`:
+    /// a startup never downloads at once, a host that restarts more often than
+    /// the interval still updates, and that check replaces a bad time.
     fn reschedule(&self, now: SystemTime) {
         let stored = self.stored.lock();
         let auto = effective(&stored).auto_update;
         let mut status = self.status.lock();
         status.next_check_at = auto.enabled.then(|| {
-            status.last_checked_at.unwrap_or(now) + wait(auto, status.failures) + jitter()
+            let due = status
+                .last_checked_at
+                .filter(|checked| *checked <= now)
+                .map_or(now, |checked| checked + wait(auto, status.failures));
+            due.max(now + STARTUP_DELAY) + jitter()
         });
         drop(status);
         drop(stored);
@@ -501,10 +585,11 @@ impl Sources {
     }
 
     /// Records a finished attempt, manual or automatic; `replaced` when it
-    /// changed a loaded file.
+    /// changed a loaded file. A status the state db cannot store is kept in
+    /// memory and logged.
     pub(crate) fn record(&self, outcome: Result<(Vec<Fetched>, bool), String>) {
         let now = SystemTime::now();
-        {
+        let stored = {
             let mut status = self.status.lock();
             status.last_checked_at = Some(now);
             match outcome {
@@ -525,8 +610,23 @@ impl Sources {
                     status.last_error = Some(code);
                 }
             }
+            status.stored()
+        };
+        if let Err(error) = self.write_status(&stored) {
+            crate::state::log_sql(&error);
+            tracing::warn!("geodata update status could not be stored; it is kept until a restart");
         }
         self.reschedule(now);
+    }
+
+    fn write_status(&self, status: &StoredStatus) -> rusqlite::Result<()> {
+        let record = serde_json::to_string(status).expect("stored status serializes");
+        self.db.strict().execute(
+            "INSERT INTO geodata_status (id, record) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET record = excluded.record",
+            [&record],
+        )?;
+        Ok(())
     }
 
     /// Moves a due check an hour on while an update that will record its
