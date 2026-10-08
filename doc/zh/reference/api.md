@@ -341,9 +341,9 @@ DELETE 不接受 body/query：带有任一项时返回 `400 invalid_request`，b
 
 `verify_checksum` 默认为 `true`。设为 `false` 后，手动和自动更新都不请求 `.sha256sum`，下载的文件一律按未校验使用：`verified` 为 `false`，`sha256` 照常报告。此设置用于缺少校验文件时返回非 404 状态或返回非校验内容页面的镜像。以 `checksum_unavailable` 或 `checksum_mismatch` 失败时，日志中的警告会指出此设置；校验不会被自动关闭。
 
-此时 `GET /geodata` 还为每个资产报告 `fetched_url_redacted`（已加载文件的下载 URL，显示方式与 `source_redacted` 相同）、`verified` 与 `download_route`（`route` 为该次下载时设置的路由，`group_id` 为请求经过的组，包括规则选中的组，否则为 null），并在顶层报告 `last_checked_at`、`last_updated_at`、`next_check_at`、`last_error` 和 `required_codes`；后者按资产列出当前配置引用的分类，已排序。`last_error.code` 为失败阶段，例如 `http_status_rejected`、`checksum_mismatch` 或 `asset_validation_failed`。这些状态只存于内存，因此重启后在下一次尝试前为 null，`verified` 为 false。
+此时 `GET /geodata` 还为每个资产报告 `fetched_url_redacted`（已加载文件的下载 URL，显示方式与 `source_redacted` 相同）、`verified` 与 `download_route`（`route` 为该次下载时设置的路由，`group_id` 为请求经过的组，包括规则选中的组，否则为 null），并在顶层报告 `last_checked_at`、`last_updated_at`、`next_check_at`、`last_error` 和 `required_codes`；后者按资产列出当前配置引用的分类，已排序。`last_error.code` 为失败阶段，例如 `http_status_rejected`、`checksum_mismatch` 或 `asset_validation_failed`。`last_checked_at`、`last_updated_at`、`last_error` 与连续失败次数存于状态库的严格表 `geodata_status`，重启后保留。`next_check_at` 不存储，每次启动时据此重新计算，并重新抽取随机延迟。每个资产的字段只存于内存，因此重启后在下一次尝试前为 null，`verified` 为 false。
 
-自动更新默认开启，间隔 24 小时；将 `auto_update.enabled` 设为 `false` 即关闭。启动后的首次检查在一个间隔加随机延迟之后执行，与已加载文件的新旧无关，因此升级或重启不会立即触发下载；需要立即更新时调用 `POST /geodata/update`。自动更新使用同一个 `geodata_update` operation，因此自动更新执行期间的手动更新返回 `409 state_conflict`；自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔；成功后恢复正常间隔。
+自动更新默认开启，间隔 24 小时；将 `auto_update.enabled` 设为 `false` 即关闭。启动后从上次记录的检查时间继续计时。若该时间距今已超过等待时间、晚于当前时间（时钟曾经超前），或没有记录，首次检查在启动后 5 分钟加随机延迟时执行，因此重启不会立即触发下载，重启间隔短于更新间隔的主机也会更新。需要立即更新时调用 `POST /geodata/update`。自动更新使用同一个 `geodata_update` operation，因此自动更新执行期间的手动更新返回 `409 state_conflict`；自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔，失败次数在重启后保留；成功后恢复正常间隔。
 
 ### 内嵌 doona 来源
 

@@ -184,15 +184,152 @@ fn the_default_interval_is_a_day() {
     assert_eq!(sources.effective().auto_update.interval_hours, 24);
 }
 
+fn unix(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Stores `value`, an SQL expression, as the status row.
+fn store_status(directory: &std::path::Path, value: &str) {
+    db(directory)
+        .strict()
+        .execute(
+            &format!("INSERT INTO geodata_status (id, record) VALUES (1, {value})"),
+            [],
+        )
+        .unwrap();
+}
+
+fn stored_status(directory: &std::path::Path) -> Option<String> {
+    db(directory)
+        .strict()
+        .query_row(
+            "SELECT record FROM geodata_status WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+/// Opens with the last check `ago` before now and returns the scheduled
+/// check with the times just before and after the open.
+fn reopened_after(ago: Duration) -> (SystemTime, SystemTime, SystemTime, SystemTime) {
+    let directory = tempfile::tempdir().unwrap();
+    let checked = SystemTime::UNIX_EPOCH + Duration::from_secs(unix(SystemTime::now())) - ago;
+    store_status(
+        directory.path(),
+        &format!("'{{\"last_checked_at\":{}}}'", unix(checked)),
+    );
+    let before = SystemTime::now();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    let after = SystemTime::now();
+    let next = sources.next_check_at().expect("a check is scheduled");
+    (checked, before, after, next)
+}
+
 #[test]
-fn startup_waits_one_interval_before_the_first_check() {
+fn a_first_startup_waits_only_the_startup_delay() {
     let directory = tempfile::tempdir().unwrap();
     let before = SystemTime::now();
     let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
     let after = SystemTime::now();
     let next = sources.next_check_at().expect("a check is scheduled");
-    assert!(next >= before + 24 * HOUR, "{next:?}");
-    assert!(next <= after + 25 * HOUR, "{next:?}");
+    assert!(next >= before + STARTUP_DELAY, "{next:?}");
+    assert!(next <= after + STARTUP_DELAY + HOUR, "{next:?}");
+}
+
+#[test]
+fn the_update_status_survives_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    sources.record(Ok((Vec::new(), true)));
+    sources.record(Err("download_failed".into()));
+    let (checked, updated) = {
+        let status = sources.status.lock();
+        (
+            status.last_checked_at.unwrap(),
+            status.last_updated_at.unwrap(),
+        )
+    };
+    drop(sources);
+    let reopened = Sources::open(db(directory.path()), &settings("")).unwrap();
+    let status = reopened.status.lock();
+    assert_eq!(status.last_checked_at.map(unix), Some(unix(checked)));
+    assert_eq!(status.last_updated_at.map(unix), Some(unix(updated)));
+    assert_eq!(status.last_error.as_deref(), Some("download_failed"));
+    assert_eq!(status.failures, 1);
+    // One failure: the backoff of an hour, not the interval, still applies.
+    let wait = status
+        .next_check_at
+        .unwrap()
+        .duration_since(status.last_checked_at.unwrap())
+        .unwrap();
+    assert!(wait >= HOUR && wait <= 2 * HOUR, "{wait:?}");
+}
+
+#[test]
+fn a_restart_after_a_missed_check_waits_only_the_startup_delay() {
+    let (_, before, after, next) = reopened_after(48 * HOUR);
+    assert!(next >= before + STARTUP_DELAY, "{next:?}");
+    assert!(next <= after + STARTUP_DELAY + HOUR, "{next:?}");
+}
+
+#[test]
+fn a_restart_after_a_recent_check_waits_out_the_interval() {
+    let (checked, _, _, next) = reopened_after(2 * HOUR);
+    assert!(next >= checked + 24 * HOUR, "{next:?}");
+    assert!(next <= checked + 25 * HOUR, "{next:?}");
+}
+
+// A clock that ran ahead and was corrected leaves a last check in the future.
+// Every restart treats it as due, so a host that restarts more often than the
+// interval still checks, and that check replaces the bad time.
+#[test]
+fn a_check_recorded_in_the_future_is_due_after_every_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let future = unix(SystemTime::now() + 30 * 24 * HOUR);
+    store_status(
+        directory.path(),
+        &format!("'{{\"last_checked_at\":{future}}}'"),
+    );
+    for _ in 0..3 {
+        let before = SystemTime::now();
+        let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+        let after = SystemTime::now();
+        let next = sources.next_check_at().expect("a check is scheduled");
+        assert!(next >= before + STARTUP_DELAY, "{next:?}");
+        assert!(next <= after + STARTUP_DELAY + HOUR, "{next:?}");
+    }
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    sources.record(Ok((Vec::new(), false)));
+    let checked = sources.status.lock().last_checked_at.unwrap();
+    drop(sources);
+    let reopened = Sources::open(db(directory.path()), &settings("")).unwrap();
+    let next = reopened.next_check_at().expect("a check is scheduled");
+    let checked = SystemTime::UNIX_EPOCH + Duration::from_secs(unix(checked));
+    assert!(next >= checked + 24 * HOUR, "{next:?}");
+    assert!(next <= checked + 25 * HOUR, "{next:?}");
+}
+
+#[test]
+fn an_unreadable_update_status_is_ignored_and_replaced() {
+    for value in ["'not json'", "x'ff'", r#"'{"failures":-1}'"#] {
+        let directory = tempfile::tempdir().unwrap();
+        store_status(directory.path(), value);
+        let before = SystemTime::now();
+        let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+        let next = sources.next_check_at().expect("a check is scheduled");
+        assert!(
+            next <= before + STARTUP_DELAY + 2 * HOUR,
+            "{value}: {next:?}"
+        );
+        assert!(sources.status.lock().last_checked_at.is_none(), "{value}");
+        sources.record(Ok((Vec::new(), false)));
+        let record = stored_status(directory.path()).expect("the status is stored");
+        assert!(record.contains("last_checked_at"), "{value}: {record}");
+    }
 }
 
 #[test]
