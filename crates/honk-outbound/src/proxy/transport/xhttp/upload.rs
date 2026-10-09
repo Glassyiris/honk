@@ -278,7 +278,7 @@ pub(super) async fn packet_upload(
         .xhttp
         .as_ref()
         .expect("packet-up requires its XHTTP runtime");
-    let template = transport.template().map_err(shared_io_error)?;
+    let template = transport.upload.template().map_err(shared_io_error)?;
     let mut responses = Responses::new();
     let mut lane = first_upload;
     let mut seq = 0;

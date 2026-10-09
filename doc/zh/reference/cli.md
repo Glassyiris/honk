@@ -178,7 +178,7 @@ vless/{plain|tls|reality}/{tcp|ws|grpc|xhttp}[/vision]/tcp={plain|h2mux|mux-cool
 
 UDP DNS 目标解析、packet transport 建立、发送与接收共用一个 `--timeout` 预算。解析失败或超时只体现在 DNS 列，TCP、URLTest 和 QUIC 探测继续执行。不支持 UDP 的节点跳过该解析；主机名解析失败时不会替换为另一个目标。
 
-外层逐节点预算另留两秒用于 join QUIC 清理，再加一秒调度余量。清理耗时不是延迟样本，也不应抹掉已完成的其他探测结果。
+节点的每个非 QUIC 列各自以 `--timeout` 加一秒为上限。URLTest 与地址族探测的拨号、目标 TLS 和每次交换各有独立的 `--timeout`，因此较慢的冷启动 carrier 建立可能触及该上限；此时该列报告 `timeout`（UDP 策略拒绝目标时为 `n/a`），其余列保留各自结果。QUIC 列额外留两秒用于 join 清理；清理耗时不是延迟样本。
 
 UDP DNS 主机名目标使用共享异步解析器，读取 `/etc/resolv.conf` 中首个数字形式的 nameserver（UDP 端口 `53`），并在 `/etc/hosts` 存在时加载它，不执行阻塞的 NSS 查询。此路径不应用 NSS 插件或解析器搜索后缀。解析器不可用时，DNS 列报告 `resolve`，不会回退到公共解析器；字面量目标不需要解析器。
 

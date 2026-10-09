@@ -177,3 +177,109 @@ fn request_escapes_literal_path_without_reencoding_the_query() {
         );
     }
 }
+
+#[test]
+fn chrome_major_matches_xrays_random_delay_estimate() {
+    use super::super::browser::chrome_major_at;
+
+    let max_r = f64::from_bits(1.0_f64.to_bits() - 1);
+    // Xray 836a6fed `common/utils/browser.go`: 144 + trunc((days - 20466 - 35
+    // - floor(r² * 105)) / 35); r ∈ [0, 1), so the extreme delays are 0 and 104.
+    for (secs, earliest, latest) in [
+        (1_768_262_400, 143, 141), // 2026-01-13 UTC
+        (1_791_504_000, 150, 147), // 2026-10-09 UTC
+        (1_799_798_400, 153, 150), // 2027-01-13 UTC
+    ] {
+        assert_eq!(chrome_major_at(secs, 0.0), earliest);
+        assert_eq!(chrome_major_at(secs, max_r), latest);
+    }
+    let first_step = 1_768_262_400 + 70 * 86_400;
+    assert_eq!(chrome_major_at(first_step - 1, 0.0), 144);
+    assert_eq!(chrome_major_at(first_step, 0.0), 145);
+}
+
+#[test]
+fn absent_user_agent_sends_xrays_chrome_fetch_headers() {
+    use super::super::browser::sec_ch_ua;
+    // Reference strings from Xray v26.3.27 `getGreasedChUa(major, "chrome")`.
+    for (major, expected) in [
+        (
+            144,
+            r#""Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144""#,
+        ),
+        (
+            145,
+            r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#,
+        ),
+        (
+            151,
+            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
+        ),
+        (
+            152,
+            r#""Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152""#,
+        ),
+    ] {
+        assert_eq!(sec_ch_ua(major), expected);
+    }
+
+    let mut node = node(XhttpMode::PacketUp, 32);
+    let headers = &mut node
+        .transport_mut()
+        .unwrap()
+        .xhttp
+        .as_mut()
+        .unwrap()
+        .headers;
+    headers.insert("accept".into(), "text/plain".into());
+    headers.insert("sec-fetch-mode".into(), "navigate".into());
+    let template = super::super::request::RequestTemplate::new(&node).unwrap();
+    let request = template.request("session", Some(0), true, Some(1)).unwrap();
+    let headers = request.headers();
+    let user_agent = headers["user-agent"].to_str().unwrap();
+    assert!(user_agent.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit"));
+    let major = user_agent
+        .split("Chrome/")
+        .nth(1)
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap();
+    assert!(
+        headers["sec-ch-ua"]
+            .to_str()
+            .unwrap()
+            .contains(&format!("\"Chromium\";v=\"{major}\""))
+    );
+    for (name, value) in [
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("dnt", "1"),
+        ("accept-language", "en-US,en;q=0.9"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "empty"),
+        ("sec-fetch-site", "same-origin"),
+        ("priority", "u=1, i"),
+        ("cache-control", "no-cache"),
+        ("pragma", "no-cache"),
+        ("accept", "text/plain"),
+        ("x-peer-test", "raw"),
+    ] {
+        assert_eq!(headers[name], value, "{name}");
+    }
+
+    node.transport_mut()
+        .unwrap()
+        .xhttp
+        .as_mut()
+        .unwrap()
+        .headers = [("user-agent".into(), "custom/1".into())].into();
+    let template = super::super::request::RequestTemplate::new(&node).unwrap();
+    let headers = template
+        .request("session", None, false, None)
+        .unwrap()
+        .headers()
+        .clone();
+    assert_eq!(headers["user-agent"], "custom/1");
+    assert!(!headers.contains_key("sec-ch-ua") && !headers.contains_key("accept"));
+}
