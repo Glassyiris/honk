@@ -39,14 +39,67 @@ impl Lifecycle {
     }
 }
 
+type SharedTemplate = Arc<Result<RequestTemplate, crate::SharedError>>;
+
+/// One endpoint: its dial node, carriers and request shape.
+#[derive(Debug, Clone)]
+pub(super) struct Peer {
+    pub(super) node: Arc<Node>,
+    pub(super) pool: Arc<SessionPool<XhttpSession>>,
+    template: SharedTemplate,
+}
+
+fn template_for(node: &Node) -> SharedTemplate {
+    Arc::new(RequestTemplate::new(node).map_err(crate::SharedError::new))
+}
+
+impl Peer {
+    pub(super) fn template(&self) -> anyhow::Result<&RequestTemplate> {
+        self.template
+            .as_ref()
+            .as_ref()
+            .map_err(|error| anyhow::Error::new(error.clone()))
+    }
+
+    pub(super) async fn reserve(
+        &self,
+        runtime: &Arc<NodeRuntime>,
+        tcp: Arc<Mutex<Option<TcpStream>>>,
+        timeout: Duration,
+    ) -> anyhow::Result<(Arc<XhttpSession>, SessionPermit<XhttpSession>)> {
+        let runtime = runtime.clone();
+        let node = self.node.clone();
+        let admission = self
+            .pool
+            .dial_admission()
+            .unwrap_or_else(crate::runtime::capture_dial_admission);
+        admission
+            .scope(self.pool.open_with(
+                move || XhttpRuntime::dial(runtime, node, tcp, timeout),
+                |session, permit| std::future::ready(Ok::<_, OpenError>((session, permit))),
+            ))
+            .await
+    }
+}
+
+fn carrier_pool() -> Arc<SessionPool<XhttpSession>> {
+    Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: MAX_CARRIERS,
+        max_streams_per_session: MAX_REQUESTS,
+        ..SessionPoolConfig::default()
+    }))
+}
+
 #[derive(Debug)]
 pub(crate) struct XhttpRuntime {
+    /// Upload carriers, and GET carriers too without a download peer.
     pub(crate) pool: Arc<SessionPool<XhttpSession>>,
+    download: Option<Peer>,
     // Leave room for uploads: GET-only packet flows cannot consume every request slot.
     flows: Arc<Semaphore>,
     admission: tokio::sync::Mutex<()>,
     pub(super) lifecycle: Mutex<Lifecycle>,
-    template: Result<RequestTemplate, crate::SharedError>,
+    template: SharedTemplate,
     pub(super) lifecycle_changed: Notify,
 }
 
@@ -61,30 +114,47 @@ fn packet_flush_barriers(node: &Node) -> FlushBarriers {
 
 impl XhttpRuntime {
     pub(crate) fn new(node: &Node) -> Option<Arc<Self>> {
-        if !node.is_xhttp() {
-            return None;
-        }
-        Some(Arc::new(Self {
-            pool: Arc::new(SessionPool::new(SessionPoolConfig {
-                max_sessions: MAX_CARRIERS,
-                max_streams_per_session: MAX_REQUESTS,
-                ..SessionPoolConfig::default()
-            })),
+        node.is_xhttp()
+            .then(|| Self::with_download(node, node.xhttp_download_view()))
+    }
+
+    pub(super) fn with_download(node: &Node, download: Option<Node>) -> Arc<Self> {
+        Arc::new(Self {
+            pool: carrier_pool(),
+            download: download.map(|node| Peer {
+                template: template_for(&node),
+                node: Arc::new(node),
+                pool: carrier_pool(),
+            }),
             flows: Arc::new(Semaphore::new(MAX_REQUESTS)),
             admission: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(Lifecycle {
                 phase: Phase::Running,
                 warm_retained: false,
             }),
-            template: RequestTemplate::new(node).map_err(crate::SharedError::new),
+            template: template_for(node),
             lifecycle_changed: Notify::new(),
-        }))
+        })
+    }
+
+    pub(crate) fn pools(&self) -> impl Iterator<Item = &Arc<SessionPool<XhttpSession>>> {
+        std::iter::once(&self.pool).chain(self.download.as_ref().map(|download| &download.pool))
+    }
+
+    pub(super) fn upload(&self, runtime: &NodeRuntime) -> Peer {
+        Peer {
+            node: runtime.node.clone(),
+            pool: self.pool.clone(),
+            template: self.template.clone(),
+        }
     }
 
     pub(crate) fn set_dial_admission(&self, admission: crate::runtime::CapturedDialAdmission) {
         let lifecycle = self.lifecycle.lock();
         if !lifecycle.is_retired() {
-            self.pool.set_dial_admission(admission);
+            for pool in self.pools() {
+                pool.set_dial_admission(admission.clone());
+            }
         }
     }
 
@@ -93,7 +163,9 @@ impl XhttpRuntime {
         if lifecycle.phase == Phase::Running {
             lifecycle.phase = Phase::Retired;
         }
-        self.pool.clear_dial_admission();
+        for pool in self.pools() {
+            pool.clear_dial_admission();
+        }
         self.lifecycle_changed.notify_waiters();
         self.finish_retirement_locked(&lifecycle);
     }
@@ -102,14 +174,18 @@ impl XhttpRuntime {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle.phase = Phase::ShuttingDown;
         self.lifecycle_changed.notify_waiters();
-        self.pool.shutdown();
+        for pool in self.pools() {
+            pool.shutdown();
+        }
     }
 
     pub(crate) fn set_warm_retained(&self, retained: bool) {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle.warm_retained = retained;
         if retained || self.flows.available_permits() == MAX_REQUESTS {
-            self.pool.set_warm_retained(retained);
+            for pool in self.pools() {
+                pool.set_warm_retained(retained);
+            }
         }
     }
 
@@ -119,6 +195,7 @@ impl XhttpRuntime {
 
     pub(super) fn template(&self) -> anyhow::Result<&RequestTemplate> {
         self.template
+            .as_ref()
             .as_ref()
             .map_err(|error| anyhow::Error::new(error.clone()))
     }
@@ -131,15 +208,18 @@ impl XhttpRuntime {
         if self.flows.available_permits() != MAX_REQUESTS {
             return;
         }
-        if lifecycle.is_retired() {
-            self.pool.retire();
-        } else {
-            self.pool.set_warm_retained(lifecycle.warm_retained);
+        for pool in self.pools() {
+            if lifecycle.is_retired() {
+                pool.retire();
+            } else {
+                pool.set_warm_retained(lifecycle.warm_retained);
+            }
         }
     }
 
     pub(super) fn dial(
         runtime: Arc<NodeRuntime>,
+        node: Arc<Node>,
         tcp: Arc<Mutex<Option<TcpStream>>>,
         timeout: Duration,
     ) -> Pin<Box<impl Future<Output = anyhow::Result<Arc<XhttpSession>>> + Send>> {
@@ -152,7 +232,7 @@ impl XhttpRuntime {
             let setup = scope.scope(quality.scope(async move {
                 let permit = runtime.acquire_carrier_permit()?;
                 let tcp = tcp.lock().take();
-                let stream = maybe_tls_wrap(&runtime.node, tcp, timeout).await?;
+                let stream = maybe_tls_wrap(&node, tcp, timeout).await?;
                 let stream: Box<dyn AsyncReadWrite> = match permit {
                     Some(permit) => Box::new(crate::proxy::RuntimeOwnedIo {
                         inner: stream,
@@ -183,32 +263,16 @@ impl XhttpRuntime {
             .xhttp
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no XHTTP runtime"))?;
-        let runtime = runtime.clone();
         anyhow::ensure!(!transport.is_retired(), "XHTTP runtime retired");
-        transport
-            .pool
-            .offer(move || Self::dial(runtime, Arc::new(Mutex::new(None)), timeout))
-            .await?;
+        let download = transport.download.as_ref();
+        for peer in std::iter::once(&transport.upload(runtime)).chain(download) {
+            let runtime = runtime.clone();
+            let node = peer.node.clone();
+            peer.pool
+                .offer(move || Self::dial(runtime, node, Arc::new(Mutex::new(None)), timeout))
+                .await?;
+        }
         Ok(())
-    }
-
-    pub(super) async fn reserve_pooled(
-        &self,
-        runtime: &Arc<NodeRuntime>,
-        tcp: Arc<Mutex<Option<TcpStream>>>,
-        timeout: Duration,
-    ) -> anyhow::Result<(Arc<XhttpSession>, SessionPermit<XhttpSession>)> {
-        let runtime = runtime.clone();
-        let admission = self
-            .pool
-            .dial_admission()
-            .unwrap_or_else(crate::runtime::capture_dial_admission);
-        admission
-            .scope(self.pool.open_with(
-                move || Self::dial(runtime, tcp, timeout),
-                |session, permit| std::future::ready(Ok::<_, OpenError>((session, permit))),
-            ))
-            .await
     }
 
     pub(super) async fn retired(&self) {
@@ -229,10 +293,15 @@ impl XhttpRuntime {
         tcp: Option<TcpStream>,
         timeout: Duration,
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, XhttpPreparation)> {
-        let state = PreparationState::new(self.clone());
-        let preparation = XhttpPreparation::new(state.clone());
+        let state = PreparationState::new(self.clone(), self.upload(runtime));
+        let download = self
+            .download
+            .as_ref()
+            .map(|download| PreparationState::new(self.clone(), download.clone()));
+        let preparation =
+            XhttpPreparation::new(download.iter().cloned().chain([state.clone()]).collect());
         let stream = tokio::select! {
-            result = self.open_inner(runtime, tcp, timeout, state) => result?,
+            result = self.open_inner(runtime, tcp, timeout, state, download) => result?,
             _ = self.retired() => anyhow::bail!("XHTTP runtime retired"),
         };
         Ok((stream, preparation))
@@ -244,6 +313,7 @@ impl XhttpRuntime {
         tcp: Option<TcpStream>,
         timeout: Duration,
         preparation: Arc<PreparationState>,
+        download_preparation: Option<Arc<PreparationState>>,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         // GET plus its reserved upload lane are one logical admission unit.
         let admission_guard = self.admission.lock().await;
@@ -269,6 +339,20 @@ impl XhttpRuntime {
             timeout,
             preparation: &preparation,
         };
+        // The GET template and carriers come from one peer. A supplied socket reaches the upload
+        // endpoint, so the download peer dials its own.
+        let (get, get_context) = match &download_preparation {
+            Some(preparation) => (
+                preparation.peer.template()?,
+                RequestContext {
+                    runtime,
+                    tcp: Arc::new(Mutex::new(None)),
+                    timeout,
+                    preparation,
+                },
+            ),
+            None => (template, context.clone()),
+        };
         let (download, upload) = match template.mode {
             ResolvedMode::StreamOne => {
                 let request = context
@@ -277,8 +361,8 @@ impl XhttpRuntime {
                 Upload::stream_one(request)
             }
             ResolvedMode::StreamUp => {
-                let download = context
-                    .request_with_retry(template.request(&session, None, false, None)?, true, None)
+                let download = get_context
+                    .request_with_retry(get.request(&session, None, false, None)?, true, None)
                     .await?;
                 let download = Upload::download(download);
                 let upload = context
@@ -290,8 +374,8 @@ impl XhttpRuntime {
                 )
             }
             ResolvedMode::PacketUp => {
-                let download = context
-                    .request_with_retry(template.request(&session, None, false, None)?, true, None)
+                let download = get_context
+                    .request_with_retry(get.request(&session, None, false, None)?, true, None)
                     .await?;
                 let download = Upload::download(download);
                 // Reserve alongside GET so one-request peers cannot strand the upload.
@@ -355,6 +439,8 @@ impl XhttpRuntime {
 
 impl Drop for XhttpRuntime {
     fn drop(&mut self) {
-        self.pool.shutdown();
+        for pool in self.pools() {
+            pool.shutdown();
+        }
     }
 }
