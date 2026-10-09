@@ -50,7 +50,7 @@ fn pragmas_read_back_on_a_fresh_and_a_reopened_file() {
         ("page_size", "Integer(4096)"),
         ("auto_vacuum", "Integer(2)"),
         ("application_id", "Integer(1752133227)"),
-        ("user_version", "Integer(2)"),
+        ("user_version", "Integer(3)"),
     ]
     .into_iter()
     .map(|(name, value)| (name, value.to_owned()))
@@ -564,13 +564,15 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
 }
 
 // Builds before the schema was folded into one statement wrote version 1
-// without `geodata_settings`; later builds wrote version 1 with it. Both
-// upgrade to the current version and keep their rows.
+// without `geodata_settings`; later builds wrote version 1 with it. Version 2
+// added no `geodata_status`. All upgrade to the current version and keep their
+// rows.
 #[test]
-fn both_forms_of_a_version_1_database_upgrade() {
+fn older_databases_upgrade() {
     for downgrade in [
-        "DROP TABLE geodata_settings; PRAGMA user_version = 1;",
-        "INSERT INTO geodata_settings (id, record) VALUES (1, '{}'); PRAGMA user_version = 1;",
+        "DROP TABLE geodata_status; DROP TABLE geodata_settings; PRAGMA user_version = 1;",
+        "DROP TABLE geodata_status; INSERT INTO geodata_settings (id, record) VALUES (1, '{}'); PRAGMA user_version = 1;",
+        "DROP TABLE geodata_status; INSERT INTO geodata_settings (id, record) VALUES (1, '{}'); PRAGMA user_version = 2;",
     ] {
         let directory = tempfile::tempdir().unwrap();
         drop(StateDb::open(directory.path()).unwrap());
@@ -593,5 +595,10 @@ fn both_forms_of_a_version_1_database_upgrade() {
             .query_row("SELECT record FROM geodata_settings", [], |row| row.get(0))
             .unwrap();
         assert_eq!(record, "{\"a\":1}");
+        let status: i64 = state
+            .strict()
+            .query_row("SELECT count(*) FROM geodata_status", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, 0);
     }
 }
