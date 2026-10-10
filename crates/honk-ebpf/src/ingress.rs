@@ -218,7 +218,11 @@ fn redirect_lan_packet_to_control_plane(
             // Do not redirect when reply restoration cannot be guaranteed.
             return Err(TC_ACT_SHOT);
         }
-        if pkt.l4proto == IPPROTO_UDP {
+        // DNS replies always leave from the queried address and match exactly;
+        // recording each query's random port would only churn the LRU.
+        if pkt.l4proto == IPPROTO_UDP
+            && !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five)
+        {
             publish_client_reply(scratch);
         }
     }

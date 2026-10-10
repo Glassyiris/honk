@@ -94,7 +94,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | --- | --- |
 | `CONN_STATE_MAP` | 不预分配的普通 hash，最多 524,288 项。保存每流 TCP/UDP 状态和已发布路由元数据；用户空间负责压力驱逐。 |
 | `REDIRECT_TRACK` | 不预分配的 65,536 项 hash。把有方向的五元组映射到原始 MAC/接口、出站、时间戳和决策身份，用于恢复回复路径。 |
-| `CLIENT_REPLY_TRACK` | 16,384 项 LRU hash。把客户端 UDP 地址和端口（目的字段清零）映射到与 `REDIRECT_TRACK` 相同的帧信息记录（token 已清除），使未联系过的对端的回复无需经过主机转发即可到达客户端。内核 LRU 淘汰是近似的：接近容量时（CPU 越多越明显），近期未发包的客户端可能在表满之前就被淘汰。该客户端的这类回复随后退回主机转发；不会造成错误路由，也没有用户空间清扫。 |
+| `CLIENT_REPLY_TRACK` | 16,384 项 LRU hash。把非 DNS UDP 客户端地址和端口（目的字段清零）映射到与 `REDIRECT_TRACK` 相同的帧信息记录（token 已清除），使未联系过的对端的回复无需经过主机转发即可到达客户端。内核 LRU 淘汰是近似的：接近容量时（CPU 越多越明显），近期未发包的客户端可能在表满之前就被淘汰。该客户端的这类回复随后退回主机转发；不会造成错误路由，也没有用户空间清扫。 |
 | `ROUTING_HANDOFF_MAP` | 不预分配的 65,536 项 hash；TCP SYN handoff 包含已提交策略代际，暂存 UDP 携带 decision token。原始 must UDP/53 不发布 tuple handoff，所有权使用逐报文 mark；非 must UDP/53 保留供畸形 payload 回退使用的事实。 |
 | `ROUTING_POLICY_ROOT` | 单项 map-in-map，选择不可变 policy descriptor 和两个同步生成函数槽之一。root 成功替换返回后，旧 non-sleepable 读者已完成 grace。 |
 | 按代持有的 IP/MAC 索引 | 分离的目的/源 IPv4、IPv6 LPM maps 及 MAC LPM。value 是完整的本代谓词 bitmap，更具体前缀继承祖先位。 |
