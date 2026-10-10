@@ -15,8 +15,8 @@ use honk_ebpf_common::{
     KernelRouteOutput, ROUTE_FACT_PRESENT_SHIFT, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_ENABLED,
     ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW, ROUTE_TRACE_VALUES,
     ROUTE_TRACE_VERSION, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
-    ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN,
-    RoutingDecision, RoutingInput,
+    ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_INPUT_ALLOW_DIRECT_FINALITY,
+    ROUTING_INPUT_MAC_PRESENT, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
 };
 
 const R0: u8 = 0;
@@ -49,7 +49,7 @@ const INPUT_PROTO: i16 = std::mem::offset_of!(RoutingInput, l4proto) as i16;
 const INPUT_VERSION: i16 = std::mem::offset_of!(RoutingInput, ip_version) as i16;
 const INPUT_DSCP: i16 = std::mem::offset_of!(RoutingInput, dscp) as i16;
 const INPUT_PNAME_LEN: i16 = std::mem::offset_of!(RoutingInput, pname_len) as i16;
-const INPUT_MAC_PRESENT: i16 = std::mem::offset_of!(RoutingInput, mac_present) as i16;
+const INPUT_FLAGS: i16 = std::mem::offset_of!(RoutingInput, flags) as i16;
 const OUTBOUND: i16 = std::mem::offset_of!(RoutingDecision, outbound) as i16;
 const MARK: i16 = std::mem::offset_of!(RoutingDecision, mark) as i16;
 const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
@@ -319,6 +319,8 @@ pub fn emit_routing_program(
         emit_fact_lookup(&mut asm, FactKind::Domain, &fds)?;
     }
 
+    let domain_reroute = plan.features & ROUTING_FEATURE_DOMAIN_REROUTE != 0;
+    let mut domain_prefix = false;
     let mut trace_slot = 0;
     for rule in &plan.rules {
         let rule_slot = trace_slot;
@@ -331,6 +333,7 @@ pub fn emit_routing_program(
         let fail = asm.label();
         let mut conditional = false;
         for (rank, (_, condition)) in rule.runtime_conditions().enumerate() {
+            domain_prefix |= matches!(condition.predicate, KernelPredicate::Domain(_));
             let pass = asm.label();
             if plan.trace_enabled {
                 let missed = asm.label();
@@ -346,7 +349,12 @@ pub fn emit_routing_program(
             emit_trace_outcome(&mut asm, rule_slot + 1 + rank, ROUTE_TRACE_MATCHED)?;
         }
         emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_MATCHED)?;
-        emit_action(&mut asm, rule.action, Some(rule.id))?;
+        emit_action(
+            &mut asm,
+            rule.action,
+            Some(rule.id),
+            domain_reroute && !domain_prefix,
+        )?;
         emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
@@ -360,7 +368,12 @@ pub fn emit_routing_program(
     // The prologue's zero MARK seeds READY, so fallback options are stored only here.
     asm.source(0, "fallback");
     emit_trace_outcome(&mut asm, trace_slot, ROUTE_TRACE_MATCHED)?;
-    emit_action(&mut asm, plan.fallback, None)?;
+    emit_action(
+        &mut asm,
+        plan.fallback,
+        None,
+        domain_reroute && !domain_prefix,
+    )?;
     emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
     asm.mov_imm(R0, 0)?;
     asm.exit()?;
@@ -371,7 +384,19 @@ fn emit_action(
     asm: &mut Assembler,
     action: KernelAction,
     rule_id: Option<u32>,
+    refine_direct_finality: bool,
 ) -> anyhow::Result<()> {
+    if refine_direct_finality
+        && action.outbound == honk_ebpf_common::OutboundIndex::Direct as u8
+        && !action.must
+    {
+        let not_final = asm.label();
+        asm.ldx_w(R0, R6, INPUT_FLAGS)?;
+        asm.and_imm(R0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32)?;
+        asm.jump(BPF_JEQ, R0, 0, not_final)?;
+        asm.st_imm(R7, DOMAIN_FINAL, 1)?;
+        asm.bind(not_final);
+    }
     if rule_id.is_some() {
         asm.st_imm(R7, OUTBOUND, action.outbound as i32)?;
     }
@@ -769,7 +794,8 @@ fn emit_fact_lookup(
             load_map_fd(asm, fds.domain)?;
         }
         FactKind::Mac => {
-            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
+            asm.ldx_w(R0, R6, INPUT_FLAGS)?;
+            asm.and_imm(R0, ROUTING_INPUT_MAC_PRESENT as i32)?;
             asm.jump(BPF_JEQ, R0, 0, absent)?;
             write_key_from_input(asm, INPUT_MAC, 128)?;
             load_map_fd(asm, fds.mac)?;

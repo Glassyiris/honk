@@ -113,8 +113,7 @@ fn btf_bytes(fd: &OwnedFd) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Validate the actual freplace output parameter, a `KernelRouteOutput` whose
-/// first member is the `RoutingDecision`, before writing generated fields.
+/// Validate the freplace input and output before reading or writing generated fields.
 fn validate_routing_decision_abi(data: &[u8], slot: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         btf::Btf::parse(data)
@@ -131,6 +130,11 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
     if read(prototype + 4)? != (13 << 24) | 2 {
         return None;
     }
+    let input_pointer = btf.type_by_id(read(prototype + 16)?)?;
+    if btf.kind(input_pointer)? != 2 {
+        return None;
+    }
+    let signature_input = btf.resolve_composite(read(input_pointer + 8)?)?;
     let pointer = btf.type_by_id(read(prototype + 24)?)?;
     if btf.kind(pointer)? != 2 {
         return None;
@@ -159,6 +163,27 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
         let member = output + 12 + index * 12;
         if btf.string(read(member)?) != Some(name) || read(member + 8)? != offset as u32 * 8 {
             return None;
+        }
+        if name == "input" {
+            let input = btf.resolve_composite(read(member + 4)?)?;
+            if input != signature_input
+                || btf.kind(input)? != 4
+                || read(input + 8)? != size_of::<RoutingInput>() as u32
+            {
+                return None;
+            }
+            let flags = (0..read(input + 4)? & 0xffff).find_map(|index| {
+                let field = input + 12 + index as usize * 12;
+                (btf.string(read(field)?) == Some("flags")).then_some(field)
+            })?;
+            let flags_type = btf.resolve_modifiers(read(flags + 4)?)?;
+            if read(flags + 8)? != offset_of!(RoutingInput, flags) as u32 * 8
+                || btf.kind(flags_type)? != 1
+                || read(flags_type + 8)? != 4
+                || read(flags_type + 12)? & 0x00ff_ffff != 32
+            {
+                return None;
+            }
         }
     }
     let structure = btf.resolve_composite(read(output + 16)?)?;

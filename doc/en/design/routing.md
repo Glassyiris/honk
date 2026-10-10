@@ -122,10 +122,21 @@ and family masks, DSCP, and provenance/presence information. `RoutingDecision`
 contains outbound, mark, must, domain-finality, and rule ID. A scalar return code
 separates a successful decision from an unavailable or failed evaluator.
 
+`RoutingInput.flags` keeps MAC presence separate from direct-finality permission.
+The static caller rebuilds that permission from the same captured Rule-mode
+flags used for enforcement, not a second map read. The input remains 128 bytes;
+the loader rejects older external eBPF objects whose last member is still
+`mac_present`. Rebuild those objects before using this userspace compiler.
+
 `domain_final` means that a later domain routing observation cannot change this
 phase's route under its dial mode: the policy has no domain predicates, domain
-rerouting is disabled, or a complete learned-domain bitmap was available. It is
-policy-generation data, not a separately published global routing flag.
+rerouting is disabled, or a complete learned-domain bitmap was available. In
+Rule mode, an ordinary direct action is also final when every live rule through
+and including its matching rule is domain-independent. Later domain rules cannot
+preempt that first match; folded-false rules do not count, while positive and
+negated domain predicates both do. The same prefix proof applies to fallback.
+Without the captured Rule-mode permission, this additional proof is not applied,
+preserving the existing Global-mode handoff and hostname-sniffing authority.
 
 For non-DNS traffic, a non-`must` direct result with unresolved domain finality is
 encoded as `ControlPlaneRouting` when handed to userspace. Passing it as final

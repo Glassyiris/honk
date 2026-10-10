@@ -216,7 +216,7 @@ impl KernelTraceDictionary {
             )
             .into_owned()
         });
-        let src_mac = (input.mac_present != 0).then(|| {
+        let src_mac = (input.flags & ROUTING_INPUT_MAC_PRESENT != 0).then(|| {
             input.mac[10..]
                 .iter()
                 .map(|byte| format!("{byte:02x}"))

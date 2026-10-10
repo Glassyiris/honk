@@ -52,6 +52,7 @@ fn captured(backend: &mut MockEbpfBackend, token: u32) -> (TuplesKey, u32, u64) 
     witness.output.input.src_port = u32::from(key.src_port);
     witness.output.input.dst_port = u32::from(key.dst_port);
     witness.output.input.l4proto = 2;
+    witness.output.input.flags = ROUTING_INPUT_ALLOW_DIRECT_FINALITY;
     witness.output.outcomes[0] = ROUTE_TRACE_MATCHED;
     let id = backend.capture_route_witness(witness);
     (key, id, descriptor.generation)
@@ -88,6 +89,7 @@ fn old_witness_keeps_accepted_generation_across_fences_and_failed_publication() 
     assert_eq!(result.rule_id.as_deref(), Some("instance:17:fallback"));
     assert_eq!(result.rules[0].result, "matched");
     assert_eq!(result.gap, None);
+    assert!(result.input.src_mac.is_none());
     assert_eq!(
         backend
             .capture_kernel_route(
