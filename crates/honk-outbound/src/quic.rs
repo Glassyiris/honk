@@ -179,9 +179,9 @@ impl congestion::Controller for Brutal {
 }
 
 const QUIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-/// Connection-wide QUIC delivery progress. Packet sends only read atomics;
-/// Quinn statistics are sampled at most once per second, plus on a send
-/// deadline and the watchdog's one-second tick.
+/// Connection-wide QUIC delivery progress. Quinn statistics are sampled at
+/// most once per second, shared by packet sends, completions and the
+/// watchdog's tick.
 #[derive(Debug)]
 pub(crate) struct QuicPathHealth {
     ack_state: AtomicU64,
@@ -192,18 +192,10 @@ pub(crate) struct QuicPathHealth {
     waiting_acked_baseline: AtomicU64,
     unacked_since_ms: AtomicU64,
     last_sample_ms: AtomicU64,
-    timeout_state: AtomicU64,
-    waiting_since_ms: AtomicU64,
     send_timeout_ms: AtomicU64,
     path_stall_timeout_ms: AtomicU64,
     path_stalled: AtomicBool,
     telemetry_enabled: AtomicBool,
-}
-
-enum SendCompletion {
-    Success,
-    Timeout,
-    Failure,
 }
 
 #[derive(Debug, Default)]

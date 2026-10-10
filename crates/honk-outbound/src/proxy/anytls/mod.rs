@@ -31,7 +31,7 @@ use inbound::{
     INBOUND_PAYLOAD_BUDGET, InboundPayload, InboundPayloadBudget, TcpInbound, TcpReceiveState,
     session_demux,
 };
-use overflow::{OVERFLOW_EMERGENCY_WAIT, OVERFLOW_STALL_GRACE, OverflowLimit, StreamOverflow};
+use overflow::{OVERFLOW_EMERGENCY_WAIT, OVERFLOW_STALL_GRACE, StreamOverflow};
 use padding::PaddingInstruction;
 pub(crate) use uot::AnyTlsUotTransport;
 use uot::{UOT_DRAIN_QUEUE_CAP, UotReceiveState};
@@ -142,7 +142,6 @@ struct OverflowState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OverflowVictim {
     sid: u32,
-    limit: OverflowLimit,
     session: OverflowUsage,
     stream: OverflowUsage,
     stalled_for: Duration,
@@ -347,10 +346,6 @@ pub(crate) struct AnyTlsSession {
     /// Wakes the demux waiting at an emergency hard cap when a flush
     /// actually frees overflow space (reader progress).
     overflow_notify: tokio::sync::Notify,
-    /// Overflow stall watchdog (reaps parked streams with no flush
-    /// progress past the grace): spawned by the first park, retires when
-    /// the overflow drains, aborted on close. `None` while not running.
-    watchdog: Mutex<Option<tokio::task::AbortHandle>>,
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
@@ -405,7 +400,6 @@ impl AnyTlsSession {
             killed_streams: Mutex::new(HashSet::new()),
             overflow: parking_lot::Mutex::new(OverflowState::default()),
             overflow_notify: tokio::sync::Notify::new(),
-            watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             idle: crate::session::IdleClock::new(),
             capacity_notify: std::sync::OnceLock::new(),
@@ -1012,7 +1006,7 @@ impl AnyTlsSession {
 
     /// Unregister a stream, optionally notifying the server with FIN. This is
     /// synchronous so cleanup is ordered before the stream permit is dropped.
-    /// Returns whether the watchdog had killed this stream.
+    /// Returns whether an overflow or byte-budget reap had killed this stream.
     fn end_stream(&self, sid: u32, notify_fin: bool) -> bool {
         self.settle_syn_pending(sid);
         self.end_observation(sid);
@@ -1101,9 +1095,6 @@ impl AnyTlsSession {
         }
         self.clear_synack_pending();
         self.observations.lock().clear();
-        if let Some(handle) = self.watchdog.lock().unwrap().take() {
-            handle.abort();
-        }
         self.writer_q.close();
         if let Some(notify) = self.capacity_notify.get() {
             notify.notify_waiters();
@@ -1112,8 +1103,8 @@ impl AnyTlsSession {
     }
 
     /// Deliver a server TCP payload without blocking the demultiplexer.
-    /// Full per-stream queues park in SID order until reader progress, while
-    /// the stall watchdog resets only consumers idle past the grace period.
+    /// Full per-stream queues park in SID order until reader progress; a
+    /// consumer is reset only once the session cap or byte budget is hit.
     #[cfg(test)]
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
         let (credit, _wait) = self

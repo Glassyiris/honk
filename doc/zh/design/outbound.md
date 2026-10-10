@@ -706,7 +706,7 @@ flow 可以在旧 clone 上完成。移除最后一份 warm 所有权只会移�
 IPv4/IPv6 各自的有界流控 profile（包括自适应接收/发送下限与冷却期）属于 runtime，而不是可选的
 client 槽，因此 warm 释放、重建与 speculative client 会复用同一份已学习路径画像。
 
-每条池化 QUIC connection 每秒采样一次 Quinn 路径与 UDP I/O 计数器，汇总到 `/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。同一份采样使用 honk Quinn 中应用已交付/对端已确认的 stream 计数器、connection-credit gauge 与 stream-blocked frame，驱动按地址族保存的流控 profile。收发方向使用 10 秒 goodput EWMA；SRTT >= 80 ms 且连续三个样本确认高 BDP 时，将 connection 接收或发送下限向 `2 x BDP` 提高。对端的 `DATA_BLOCKED` 使 connection 接收样本无需满足 RTT 条件即可合格，并把接收下限的目标设为 `max(adaptive_window(BDP), 2 × current_window)`，因为按受限速率计算的 `2 x BDP` 不会使窗口增长；仍需连续三个样本并遵守下述冷却。stream 接收下限单独由 `STREAM_DATA_BLOCKED` 触发加倍，不要求连续三个样本，因为 connection 聚合 goodput 无法判断单条 stream 的需求。每个下限最大 32 MiB，独立执行五分钟升档冷却，不自动缩小；无需重连即可更新当前 connection 与当前及后续 stream。零进度样本只有在对应 connection credit 仍受压时才会保留尚未完成的升档 streak。原生 TUIC 与 Hysteria2 UDP endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`。连续三次发送超时，或超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC 报文被确认，endpoint 会被退役并关闭该 connection，让下一条流重新拨号。发送成功重置连续发送超时计数；确认进度同时重置两个时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn PING 保活，包括无法发送协议心跳数据报的 UDP-over-stream 回退路径。
+每条池化 QUIC connection 每秒采样一次 Quinn 路径与 UDP I/O 计数器，汇总到 `/stats` 的 `quic` 字段；临时 URL/健康探测连接明确排除。同一份采样使用 honk Quinn 中应用已交付/对端已确认的 stream 计数器、connection-credit gauge 与 stream-blocked frame，驱动按地址族保存的流控 profile。收发方向使用 10 秒 goodput EWMA；SRTT >= 80 ms 且连续三个样本确认高 BDP 时，将 connection 接收或发送下限向 `2 x BDP` 提高。对端的 `DATA_BLOCKED` 使 connection 接收样本无需满足 RTT 条件即可合格，并把接收下限的目标设为 `max(adaptive_window(BDP), 2 × current_window)`，因为按受限速率计算的 `2 x BDP` 不会使窗口增长；仍需连续三个样本并遵守下述冷却。stream 接收下限单独由 `STREAM_DATA_BLOCKED` 触发加倍，不要求连续三个样本，因为 connection 聚合 goodput 无法判断单条 stream 的需求。每个下限最大 32 MiB，独立执行五分钟升档冷却，不自动缩小；无需重连即可更新当前 connection 与当前及后续 stream。零进度样本只有在对应 connection credit 仍受压时才会保留尚未完成的升档 streak。原生 TUIC 与 Hysteria2 UDP endpoint 的单次发送截止时间为 `clamp(4 × SRTT, 1 s, 5 s)`；仅发送超时不会关闭 connection，因为 Quinn 会在拥塞控制占用容量时挂起发送。只有在最近一次确认之后发出的 ack-eliciting 报文至少有三个仍未确认，且超过 `max(8 × SRTT, 10 s)` 没有新的 QUIC 报文被确认时，路径 watchdog 才会关闭该 connection 并退役 endpoint，让下一条流重新拨号。确认进度会重置该时钟；已尝试的 UDP 报文绝不重放。TUIC 还启用 Quinn PING 保活，包括无法发送协议心跳数据报的 UDP-over-stream 回退路径。
 
 ### 协议契约
 
@@ -804,13 +804,13 @@ pending chunk，也不会重复入队。
 顺序将 frame 暂存到 overflow，不等待队列，保证 sibling 进度，并保留精确的
 frame/byte 计数。
 
-第一个 parked frame 启动每 250 ms tick
-一次的 watchdog。只有整整 3 秒没有成功 overflow flush 的 stream 才被
-reset；仅存在 queued byte 不是 stall 证据。
-
-Emergency hard limit 为每 session 768 个 parked frame；retained payload
-字节数由下文的 pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，
-admission 立即 reap 它。否则 demultiplexer 以有界
+没有独立的计时器会 reset parked stream：reader 可以暂停任意长时间，仅存在
+queued byte 不是 stall 证据。Emergency hard limit 为每 session 768 个 parked
+data frame（每个 SID 最多两个 terminal event）；达到该上限时，只有整整 3 秒
+没有成功 overflow flush 的 stream 才会被 reset。retained payload 字节数由下文的
+pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，达到 hard limit
+时 admission 立即 reap 它。
+否则 demultiplexer 以有界
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
 在 reader progress 后重新判断。这覆盖已测得的 9.4 Gbps 下 12–16 ms reader 启动延迟；正常读取端的首次 flush 通过 `overflow_notify` 唤醒等待。每次移除都把对应 overflow counter 归零。
 
