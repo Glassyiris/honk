@@ -1031,20 +1031,20 @@ async fn resolve_quic_score_target(
 
 /// Returns true if `ip` belongs to honk's own dae0 link subnets.
 ///
-/// The subnet constants (`crate::DAE0_IPV6_PREFIX_HI`, `crate::DAE0_IPV4_NET`)
-/// live in the crate root next to the `DAENS_*` address strings used by the
-/// netns setup, so this datapath check and the interface configuration
-/// cannot drift apart.
+/// The subnet constants (`honk_ebpf_common::DAE0_IPV6_PREFIX_HI`,
+/// `DAE0_IPV4_NET`) are shared with the kernel datapath and sit next to the
+/// address helper there; the `DAENS_*` strings in the crate root configure the
+/// interfaces, so this check and the netns setup cannot drift apart.
 pub(super) fn is_honk_internal_addr(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V6(v6) => {
             let octets = v6.octets();
             let hi = u64::from_be_bytes(octets[..8].try_into().unwrap());
-            hi == crate::DAE0_IPV6_PREFIX_HI // fd00:686f:6e6b::/64
+            hi == honk_ebpf_common::DAE0_IPV6_PREFIX_HI // fd00:686f:6e6b::/64
         }
         std::net::IpAddr::V4(v4) => {
             let addr: u32 = u32::from(*v4);
-            (addr & 0xFFFF0000) == crate::DAE0_IPV4_NET // 169.254.0.0/16
+            (addr & 0xFFFF0000) == honk_ebpf_common::DAE0_IPV4_NET // 169.254.0.0/16
         }
     }
 }

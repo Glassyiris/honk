@@ -611,6 +611,11 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                         "DNS UDP must not allocate conn state"
                     );
                     assert_eq!(
+                        hash_count::<RedirectTuple, RedirectEntry>(&backend, "CLIENT_REPLY_TRACK"),
+                        0,
+                        "DNS UDP must not record client reply framing"
+                    );
+                    assert_eq!(
                         backend.udp_decision_sequence_status().unwrap(),
                         before_sequence
                     );
