@@ -341,6 +341,12 @@ impl PartialEq<Vec<u8>> for InboundPayload {
         self.data.as_ref() == other.as_slice()
     }
 }
+
+/// Peer silence mid-frame after a budget wait. Independent of the overflow
+/// reap grace: that one is tuned for reader progress, this one for a peer
+/// that stops sending a frame body it announced.
+const FRAME_BODY_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn complete_frame_body<T>(
     budget_waited: bool,
     body: impl Future<Output = std::io::Result<T>>,
@@ -348,7 +354,7 @@ async fn complete_frame_body<T>(
     if !budget_waited {
         return body.await;
     }
-    tokio::time::timeout(OVERFLOW_STALL_GRACE, body)
+    tokio::time::timeout(FRAME_BODY_STALL_TIMEOUT, body)
         .await
         .map_err(|_| {
             std::io::Error::new(

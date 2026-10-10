@@ -804,13 +804,13 @@ pending chunk，也不会重复入队。
 顺序将 frame 暂存到 overflow，不等待队列，保证 sibling 进度，并保留精确的
 frame/byte 计数。
 
-第一个 parked frame 启动每 250 ms tick
-一次的 watchdog。只有整整 3 秒没有成功 overflow flush 的 stream 才被
-reset；仅存在 queued byte 不是 stall 证据。
-
-Emergency hard limit 为每 session 768 个 parked frame；retained payload
-字节数由下文的 pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，
-admission 立即 reap 它。否则 demultiplexer 以有界
+没有独立的计时器会 reset parked stream：reader 可以暂停任意长时间，仅存在
+queued byte 不是 stall 证据。Emergency hard limit 为每 session 768 个 parked
+data frame（每个 SID 最多两个 terminal event）；达到该上限时，只有整整 3 秒
+没有成功 overflow flush 的 stream 才会被 reset。retained payload 字节数由下文的
+pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，达到 hard limit
+时 admission 立即 reap 它。
+否则 demultiplexer 以有界
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
 在 reader progress 后重新判断。这覆盖已测得的 9.4 Gbps 下 12–16 ms reader 启动延迟；正常读取端的首次 flush 通过 `overflow_notify` 唤醒等待。每次移除都把对应 overflow counter 归零。
 

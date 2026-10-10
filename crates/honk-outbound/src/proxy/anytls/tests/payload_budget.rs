@@ -567,3 +567,107 @@ async fn budget_wait_to_body_handoff_is_atomic_for_synack_liveness() {
         "a peer-stalled frame body must not count as completed activity"
     );
 }
+
+/// A peer that goes silent mid-frame after a local budget wait is cut off
+/// once the 3-second frame-body deadline elapses. The same silence without a
+/// budget wait is not this timeout's business.
+#[tokio::test(start_paused = true)]
+async fn frame_body_times_out_only_after_a_budget_wait() {
+    const BUDGET: usize = 8;
+    // Spelled out, not read from the implementation constant, so changing
+    // the deadline breaks this test.
+    let timeout = Duration::from_secs(3);
+    let budget = InboundPayloadBudget::new(BUDGET);
+    let (blocker, mut blocker_server) =
+        establish_test_session_with_budget("body-blocker", Arc::clone(&budget)).await;
+    let (waited, mut waited_server) =
+        establish_test_session_with_budget("body-waited", Arc::clone(&budget)).await;
+    let (free, mut free_server) =
+        establish_test_session_with_budget("body-free", InboundPayloadBudget::new(BUDGET)).await;
+    expect_handshake(&mut blocker_server).await;
+    expect_handshake(&mut waited_server).await;
+    expect_handshake(&mut free_server).await;
+
+    let (blocker_tx, blocker_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    blocker
+        .streams
+        .lock()
+        .unwrap()
+        .insert(7, StreamSink::Tcp(blocker_tx));
+    let blocker_stream = AnyTlsStream::new(
+        Arc::clone(&blocker),
+        7,
+        blocker_rx,
+        blocker.try_reserve().unwrap(),
+    );
+    write_frame(&mut blocker_server, CMD_PSH, 7, &[1; BUDGET])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if budget.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), 0);
+
+    let mut partial = Vec::new();
+    write_frame(&mut partial, CMD_PSH, 9, b"xy").await.unwrap();
+    let mut keep_alive = Vec::new();
+    for (session, server) in [(&waited, &mut waited_server), (&free, &mut free_server)] {
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(9, StreamSink::Tcp(tx));
+        keep_alive.push(AnyTlsStream::new(
+            Arc::clone(session),
+            9,
+            rx,
+            session.try_reserve().unwrap(),
+        ));
+        server
+            .write_all(&partial[..FRAME_HEADER_LEN + 1])
+            .await
+            .unwrap();
+    }
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    drop(blocker_stream);
+    for _ in 0..100 {
+        if budget.available_permits() == BUDGET - 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.available_permits(), BUDGET - 2);
+    // The permit lands before the demux task runs; let it arm its body
+    // timer so the advances below are measured from the budget wait's end.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(timeout - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!waited.is_closed());
+    tokio::time::advance(Duration::from_millis(2)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        waited.is_closed(),
+        "a body stalled after a budget wait must end the session"
+    );
+
+    tokio::time::advance(timeout * 3).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !free.is_closed(),
+        "a body that never waited for budget has no frame-body deadline"
+    );
+    free.close();
+    drop(keep_alive);
+}

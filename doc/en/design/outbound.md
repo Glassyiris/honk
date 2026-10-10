@@ -927,13 +927,14 @@ Each TCP child has a bounded delivery queue, demultiplexed by `sid`. When it fil
 parks frames in a per-SID ordered overflow instead of waiting, preserving
 sibling progress and exact frame/byte accounting.
 
-The first parked frame starts a watchdog ticking every 250 ms; it retires on
-overflow drain and is aborted on close. Only a stream with no successful overflow flush
-for a full 3 seconds is reset; queued bytes alone are not evidence of a stall.
-
-The emergency hard limit is 768 parked frames per session. Retained payload bytes
-are bounded separately by the pool-wide budgets below. If a stream is
-already past the 3-second grace, admission reaps that stream immediately.
+No separate timer resets a parked stream: a reader may pause for any
+length of time, and queued bytes alone are not evidence of a stall. The
+emergency hard limit is 768 parked data frames per session (at most two
+terminal events per SID); there a stream is reset only if it has had no
+successful overflow flush for a full 3 seconds. Retained payload bytes are
+bounded separately by the pool-wide budgets below. If a stream is already
+past the 3-second grace, admission at the hard limit reaps that stream
+immediately.
 Otherwise the demultiplexer waits in bounded 100 ms
 `OVERFLOW_EMERGENCY_WAIT` rounds, shortened to the nearest grace expiry, and
 re-evaluates after reader progress. This covers the measured 12–16 ms reader
