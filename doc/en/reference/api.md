@@ -618,8 +618,12 @@ probes separately. `txIos` and `rxIos` expose batching efficiency.
 `transportTxDrops` counts datagrams intentionally discarded after the proxied
 transport reports congestion or timeout. `transportRxDrops` counts full adapter
 receive queues, and `sessionRxDrops` counts full 256-packet TUIC/Hysteria2
-session queues. `sendTimeouts` and `pathStalls` are process-lifetime recovery
-events.
+session queues. `sendTimeouts` counts UDP packet sends on a metrics-enabled
+connection whose deadline expired while the send was still accepted into the
+connection's current no-ACK wait; it is a congestion diagnostic, not a count of
+every timeout, node failures or recoveries. `pathStalls` counts shared QUIC
+connections the path watchdog retired after a full no-ACK grace; it is not a
+packet-loss, affected-flow or recovery count. Both are process-lifetime totals.
 
 ### Score selection-reason fields
 
