@@ -162,7 +162,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
 }
 
 #[tokio::test]
-async fn other_query_types_keep_learned_ipv4_association() {
+async fn projection_follows_query_family_until_nxdomain() {
     struct QtypeUpstream;
 
     #[async_trait::async_trait]
@@ -172,10 +172,10 @@ async fn other_query_types_keep_learned_ipv4_association() {
             if qtype == 1 {
                 return Ok(a_response(raw, [192, 0, 2, 10]));
             }
-            let mut nodata = raw.to_vec();
-            nodata[2] = 0x81;
-            nodata[3] = 0x80;
-            Ok(nodata)
+            let mut reply = raw.to_vec();
+            reply[2] = 0x81;
+            reply[3] = if qtype == 16 { 0x83 } else { 0x80 };
+            Ok(reply)
         }
     }
 
@@ -196,18 +196,39 @@ async fn other_query_types_keep_learned_ipv4_association() {
             .runtime()
             .routing_projection(),
     );
-    // A, then the AAAA and HTTPS NODATA a dual-stack browser sends next.
-    for qtype in [1, 28, 65] {
-        controller
+    let v4 = std::net::IpAddr::from([192, 0, 2, 10]);
+    let v6 = std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
+    controller.routing_projection.submit(
+        Arc::clone(&snapshot),
+        crate::dns::projection::ProjectionObservation::Positive {
+            domain: "example.com",
+            family: honk_outbound::alive::IpVersion::V6,
+            ips: &[v6],
+            advertised_ttl: Duration::from_secs(30),
+        },
+    );
+    // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,
+    // then NXDOMAIN for an unrelated type.
+    for (qtype, rcode, expected) in [
+        (1, 0, &[v4, v6][..]),
+        (65, 0, &[v4, v6]),
+        (28, 0, &[v4]),
+        (16, 3, &[]),
+    ] {
+        let reply = controller
             .answer_query_for_test(
                 &crate::dns::forwarder::build_dns_query("example.com", qtype),
                 DnsRequestMeta::EMPTY,
                 IngressProfile::Internal,
             )
             .await;
-        let projected = controller.project_routes(&snapshot);
-        assert_eq!(projected.len(), 1, "association lost after QTYPE {qtype}");
-        assert_eq!(projected[0].0, std::net::IpAddr::from([192, 0, 2, 10]));
+        assert_eq!(reply[3] & 0x0f, rcode, "QTYPE {qtype} reply");
+        let projected = controller
+            .project_routes(&snapshot)
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .collect::<Vec<_>>();
+        assert_eq!(projected, expected, "after QTYPE {qtype}");
     }
     controller.shutdown(Duration::from_secs(1)).await;
 }
