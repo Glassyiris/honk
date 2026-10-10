@@ -2241,9 +2241,10 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
 /// Addressing for the dae0/dae0peer link pair between the host namespace and
 /// the isolated `daens` namespace.  These strings are the canonical values:
 /// the netns setup consumes them (ebpf feature only), while the control
-/// plane's internal-traffic filter (`control::is_honk_internal_addr`) uses
-/// the numeric forms `DAE0_IPV6_PREFIX_HI` / `DAE0_IPV4_NET` below in every
-/// build.  `control` tests assert both forms agree.
+/// plane's internal-traffic filter (`control::is_honk_internal_addr`) and the
+/// kernel datapath use the numeric forms `DAE0_IPV6_PREFIX_HI` /
+/// `DAE0_IPV4_NET` in `honk-ebpf-common` in every build.  `control` tests
+/// assert both forms agree.
 ///
 /// Link-local addresses (169.254.0.0/16) are used instead of a private
 /// subnet so that the kernel treats daens-originated traffic as local — no
@@ -2259,13 +2260,6 @@ pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
 pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
 #[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
-
-/// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the
-/// fd00:686f:6e6b::/64 ULA prefix — as a big-endian u64.
-pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
-/// `DAENS_HOST_IP`/`DAENS_PEER_IP` with the host bits masked off
-/// (169.254.0.0/16), as a big-endian u32.
-pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
 
 pub(crate) fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on

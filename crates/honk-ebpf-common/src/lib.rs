@@ -408,6 +408,12 @@ impl Default for RoutingMeta {
     }
 }
 
+/// First 64 bits of the dae0/dae0peer ULA addresses (`fd00:686f:6e6b::/64`)
+/// as a big-endian u64.
+pub const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
+/// The dae0/dae0peer link-local subnet (`169.254.0.0/16`) as a big-endian u32.
+pub const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
+
 /// Directional five-tuple used as the `REDIRECT_TRACK` map key.
 ///
 /// The key is deliberately not canonicalized: the redirecting packet is

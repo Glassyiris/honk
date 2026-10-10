@@ -138,6 +138,16 @@ pub fn udp_decision_retiring(key: &TuplesKey) -> bool {
 pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = HashMap::new();
 
 #[btf_map]
+/// LAN framing of the client side of a redirected UDP flow, keyed by the
+/// client address and port alone (destination zeroed, token cleared). A reply
+/// from a peer the client never contacted has no exact `REDIRECT_TRACK` entry
+/// but must still reach the same client. Kernel LRU eviction is approximate:
+/// near capacity, and sooner with many CPUs, it can drop a quiet client before
+/// the map is full. That only restores the previous behaviour for that client,
+/// unlike the plain hashes above, so no userspace sweep owns it.
+pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
+
+#[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
 /// timeout).
 pub static ROUTING_HANDOFF_MAP: HashMap<

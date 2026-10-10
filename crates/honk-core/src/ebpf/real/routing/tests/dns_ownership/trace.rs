@@ -166,6 +166,12 @@ fn staged_udp_witness_uses_exact_token_and_generation() {
             assert_eq!(result.verdict, TC_ACT_OK);
             let entry = handoff(&backend, &key);
             assert_ne!(entry.result.decision_token, 0);
+            // A staged first packet already records its client, token-free.
+            let mut client = RedirectTuple::from_tuples(&key);
+            (client.dst_ip, client.dst_port) = (In6Addr::zero(), 0);
+            let map = backend.bpf().unwrap().map("CLIENT_REPLY_TRACK").unwrap();
+            let record: RedirectEntry = HashMap::try_from(map).unwrap().get(&client, 0).unwrap();
+            assert_eq!(record.decision_token, 0);
             assert_eq!(
                 result.mark & NFQUEUE_TOKEN_MASK,
                 entry.result.decision_token

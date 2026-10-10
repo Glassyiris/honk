@@ -33,6 +33,7 @@ use honk_ebpf_common::{
     L4ProtoType, NFQUEUE_PENDING_MARK, NFQUEUE_SIGNATURE_MARK, RedirectEntry, RedirectTuple,
     RoutingMeta, TPROXY_MARK, UdpDnsRoute,
     conn::{BpfStatsKey, ConnState, UdpDecisionState},
+    dae_ip::In6Addr,
     pack_nfqueue_mark,
     redirect_need::{RoutingHandoffEntry, TuplesKey},
 };
@@ -44,8 +45,8 @@ use network_types::{
 
 use crate::{
     maps::{
-        PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP,
-        increment_bpf_stat,
+        CLIENT_REPLY_TRACK, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTING_HANDOFF_MAP,
+        UDP_DECISION_SCRATCH_MAP, UdpDecisionScratch, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT},
     sk,
@@ -193,21 +194,32 @@ fn redirect_lan_packet_to_control_plane(
         }
     };
     if write_track {
-        let mut redirect_entry: RedirectEntry = unsafe { mem::zeroed() };
-        redirect_entry.ifindex = unsafe { (*ctx.skb.skb).ifindex };
-        redirect_entry.smac.copy_from_slice(&pkt.ethh.src_addr);
-        redirect_entry.dmac.copy_from_slice(&pkt.ethh.dst_addr);
-        redirect_entry.last_seen_ns = now;
+        // Built in per-CPU scratch, not on the stack: the LAN classifier is at
+        // the verifier's combined stack limit.
+        let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
+            increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
+            return Err(TC_ACT_SHOT);
+        };
+        let scratch = unsafe { &mut *scratch };
+        scratch.redirect_key = redirect_tuple;
+        unsafe { ptr::write_bytes(&mut scratch.redirect, 0, 1) };
+        scratch.redirect.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+        scratch.redirect.smac.copy_from_slice(&pkt.ethh.src_addr);
+        scratch.redirect.dmac.copy_from_slice(&pkt.ethh.dst_addr);
+        scratch.redirect.last_seen_ns = now;
         // Record the final outbound so dae0_ingress can attribute replies.
-        redirect_entry.outbound = unsafe { routing_meta.data.outbound };
-        redirect_entry.decision_token = decision_token;
+        scratch.redirect.outbound = unsafe { routing_meta.data.outbound };
+        scratch.redirect.decision_token = decision_token;
         if REDIRECT_TRACK
-            .insert(redirect_tuple, redirect_entry, 0)
+            .insert(&scratch.redirect_key, &scratch.redirect, 0)
             .is_err()
         {
             increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
             // Do not redirect when reply restoration cannot be guaranteed.
             return Err(TC_ACT_SHOT);
+        }
+        if pkt.l4proto == IPPROTO_UDP {
+            publish_client_reply(scratch);
         }
     }
 
@@ -245,6 +257,37 @@ fn remove_udp_stage_aux(key: &TuplesKey, decision_token: u32) {
     {
         let _ = REDIRECT_TRACK.remove(redirect_tuple);
     }
+}
+
+/// Record the client's LAN framing so a reply from a peer it never contacted
+/// can still reach it; see `CLIENT_REPLY_TRACK`. Rewrites the scratch copy of
+/// the exact record in place, because the callers have no stack left to build
+/// another. Best effort: a failed insert must not fail the flow, it only leaves
+/// the previous reply behaviour.
+#[inline(always)]
+fn publish_client_reply(scratch: &mut UdpDecisionScratch) {
+    scratch.redirect_key.dst_ip.u6_addr64 = [0, 0];
+    scratch.redirect_key.dst_port = 0;
+    scratch.redirect.decision_token = 0;
+    let _ = CLIENT_REPLY_TRACK.insert(&scratch.redirect_key, &scratch.redirect, 0);
+}
+
+/// The client record for a UDP reply with no exact flow record. Replies from
+/// honk's own link addresses come from the TPROXY listener and are never
+/// forwarded to a client.
+#[inline(always)]
+fn client_reply_entry(
+    pkt: &ParsedPacket,
+    mut key: RedirectTuple,
+) -> Option<&'static mut RedirectEntry> {
+    if pkt.l4proto != IPPROTO_UDP || pkt.tuples.five.src_ip.is_dae0_link() {
+        return None;
+    }
+    key.dst_ip = In6Addr::zero();
+    key.dst_port = 0;
+    CLIENT_REPLY_TRACK
+        .get_ptr_mut(key)
+        .map(|entry| unsafe { &mut *entry })
 }
 
 /// Publish all token-bound auxiliary state before exposing Pending to followers.
@@ -297,6 +340,7 @@ fn stage_udp_decision(
         crate::contrack::remove_udp_preparing(&pkt.tuples.five);
         return Err(TC_ACT_SHOT);
     }
+    publish_client_reply(scratch);
 
     scratch.handoff.last_seen_ns = now;
     scratch.handoff.routing_generation = routing_generation;
@@ -1167,18 +1211,24 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     }
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five).reverse();
 
-    let entry_ptr = REDIRECT_TRACK.get_ptr_mut(redirect_tuple);
-    if entry_ptr.is_none() {
-        return Err(TC_ACT_OK);
-    }
-    let entry = unsafe { &mut *entry_ptr.unwrap() };
-
-    let now = unsafe { bpf_ktime_get_ns() };
-    if now.wrapping_sub(entry.last_seen_ns) >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS {
-        entry.last_seen_ns = now;
-    }
-
-    crate::stats::count_rx(ctx, entry.outbound);
+    let entry = match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
+        Some(entry) => {
+            let entry = unsafe { &mut *entry };
+            let now = unsafe { bpf_ktime_get_ns() };
+            if now.wrapping_sub(entry.last_seen_ns)
+                >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+            {
+                entry.last_seen_ns = now;
+            }
+            crate::stats::count_rx(ctx, entry.outbound);
+            entry
+        }
+        // No outbound owns this reply, so it is not counted against one.
+        None => match client_reply_entry(pkt, redirect_tuple) {
+            Some(entry) => entry,
+            None => return Err(TC_ACT_OK),
+        },
+    };
 
     // Restore the original LAN framing and redirect to its interface.
     //
