@@ -1,4 +1,5 @@
 use super::*;
+use crate::config_diagnostics::DiagnosticUpdate;
 
 /// Build the config produced by merging one subscription's freshly fetched
 /// nodes. A non-empty result replaces the previous node set for
@@ -33,40 +34,134 @@ pub(in crate::control) fn config_with_subscription_nodes(
     );
     config
 }
+fn subscription_provenance_error(index: usize) -> honk_config::error::DetailedConfigError {
+    let ordinal = index + 1;
+    let source = honk_config::diagnostic::DiagnosticSources::new(None).root();
+    let mut error = honk_config::error::DetailedConfigError::new(
+        honk_config::error::ErrorCategory::Validation,
+        "invalid-subscription-provenance",
+        source,
+        honk_config::diagnostic::SettingPath::new("nodes").index(ordinal),
+        "subscription node provenance does not match the authorized provider",
+    );
+    error.diagnostic.value = honk_config::diagnostic::SafeValue::Ordinal(ordinal);
+    error.diagnostic.entry_index = Some(ordinal);
+    error
+}
 
 impl ControlPlane {
-    /// Merge freshly fetched subscription nodes into the running config,
-    /// replacing the previous node set of `subscription_id`, and run the
-    /// shared rebuild pipeline. The snapshot, no-op check, and build all stay
-    /// under the reload lock so a concurrent reload cannot be overwritten.
-    pub(in crate::control) async fn merge_subscription_nodes_with_drain(
+    async fn merge_subscription_nodes_locked(
         &self,
         subscription_id: uuid::Uuid,
         mut nodes: Vec<Node>,
+        mut diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
-    ) -> bool {
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         if nodes.is_empty() {
-            return true;
+            return Ok(ReloadOutcome::Noop {
+                generation: self
+                    .dns_controller
+                    .runtime_provider()
+                    .current_generation()
+                    .get(),
+            });
         }
-        let _reload = self.reload_lock.lock().await;
-        let current = self.config.read().await.clone();
-        if subscription_nodes_unchanged(&current, subscription_id, &mut nodes) {
-            info!(
+        honk_config::node::validate_node_collection(&nodes)?;
+        if let Some(index) = nodes.iter().position(|node| {
+            node.subscription_id
+                .is_some_and(|provider| provider != subscription_id)
+        }) {
+            return Err(subscription_provenance_error(index));
+        }
+        for node in &mut nodes {
+            if node.subscription_id.is_none() {
+                node.subscription_id = Some(subscription_id);
+            }
+        }
+        let config_guard = self.config.read().await;
+        let current = Arc::clone(&config_guard);
+        let incoming_len = nodes.len();
+        let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
+        new_config.validate_assembled()?;
+        if let Some(subscription) = current
+            .subscriptions
+            .iter()
+            .find(|subscription| subscription.id == subscription_id)
+        {
+            crate::config_diagnostics::declare_provider_diagnostics(subscription, &mut diagnostics);
+        }
+        let diagnostic_update = DiagnosticUpdate::ReplaceProvider {
+            id: subscription_id,
+            diagnostics,
+        };
+        let candidate_start = new_config.nodes.len() - incoming_len;
+        if subscription_nodes_unchanged(
+            &current,
+            subscription_id,
+            &mut new_config.nodes[candidate_start..],
+        ) {
+            drop(config_guard);
+            let _config = self.config.write().await;
+            self.diagnostics.write().buckets.apply(diagnostic_update);
+            debug!(
                 subscription_id = %subscription_id,
                 "subscription unchanged; skipping runtime rebuild"
             );
-            return true;
+            return Ok(ReloadOutcome::Noop {
+                generation: self.diagnostics.read().generation,
+            });
         }
-        let new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
-        self.apply_runtime_config_locked(new_config, drain).await
+        drop(config_guard);
+        crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
+        self.apply_resolved_runtime_config_locked(
+            new_config,
+            drain,
+            diagnostic_update,
+            None,
+            #[cfg(feature = "native-api")]
+            None,
+        )
+        .await
     }
 
-    /// Public test/control wrapper for a subscription merge.
-    pub async fn merge_subscription_nodes(&self, subscription_id: uuid::Uuid, nodes: Vec<Node>) {
+    pub(in crate::control) async fn merge_authorized_subscription_nodes_with_drain(
+        &self,
+        subscription_id: uuid::Uuid,
+        revision: u64,
+        authorizations: &crate::subscription::SubscriptionAuthorizations,
+        nodes: Vec<Node>,
+        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
+        drain: &DrainTracker,
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
+        let _reload = self.reload_lock.lock().await;
+        if !authorizations.authorizes(subscription_id, revision) {
+            debug!(
+                %subscription_id,
+                revision,
+                "discarding stale subscription refresh"
+            );
+            return Ok(ReloadOutcome::Rejected);
+        }
+        self.merge_subscription_nodes_locked(subscription_id, nodes, diagnostics, drain)
+            .await
+    }
+
+    /// Publish a programmatic provider candidate and its diagnostics.
+    /// An empty node set leaves active nodes and diagnostics untouched.
+    pub async fn merge_subscription_nodes(
+        &self,
+        subscription_id: uuid::Uuid,
+        nodes: Vec<Node>,
+        diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
+    ) {
         let drain = Arc::clone(&self.drain_tracker);
-        let _ = self
-            .merge_subscription_nodes_with_drain(subscription_id, nodes, &drain)
-            .await;
+        let _reload = self.reload_lock.lock().await;
+        if let Err(error) = self
+            .merge_subscription_nodes_locked(subscription_id, nodes, diagnostics, &drain)
+            .await
+        {
+            crate::report_runtime_admission_error(&error);
+        }
     }
 }
 

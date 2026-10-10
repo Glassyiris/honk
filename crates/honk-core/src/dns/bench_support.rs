@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -72,13 +71,7 @@ impl ProjectionBenchmark {
             mark: 0,
         };
         let matcher = Arc::new(Router::new(&[rule], "direct").expect("benchmark router"));
-        let mut bitmap = honk_ebpf_common::DomainRouting::default();
-        bitmap.bitmap[0] = 1;
-        let snapshot = Arc::new(RoutingProjectionSnapshot::new(
-            1,
-            matcher,
-            HashMap::from([("projection-bench".to_owned(), vec![bitmap])]),
-        ));
+        let snapshot = Arc::new(RoutingProjectionSnapshot::new(1, matcher));
         Self {
             replacement: ProjectionReplacementBenchmark::new(
                 snapshot,
@@ -106,7 +99,8 @@ pub struct RuntimeBenchmark {
 }
 
 struct RuntimeShared {
-    forwarder: Arc<DnsForwarder>,
+    cache: Arc<Mutex<DnsCache>>,
+    dns_router: Arc<DnsRouter>,
     router: Arc<Router>,
 }
 
@@ -117,15 +111,9 @@ impl RuntimeBenchmark {
         let dns_router =
             Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("benchmark DNS router"));
         let shared = RuntimeShared {
-            forwarder: Arc::new(DnsForwarder::new(
-                Arc::new(UnusedPool),
-                Arc::clone(&cache),
-                dns_router,
-            )),
-            router: Arc::new(
-                Router::new(&config.routing.rules, &config.routing.default_outbound)
-                    .expect("benchmark router"),
-            ),
+            cache,
+            dns_router,
+            router: Arc::new(Router::from_config(&config.routing).expect("benchmark router")),
         };
         let initial = runtime(&shared, 1);
         Self {
@@ -136,7 +124,12 @@ impl RuntimeBenchmark {
     }
 
     pub fn acquire_generation(&self) -> u64 {
-        self.provider.acquire().runtime().generation().get()
+        self.provider
+            .try_acquire()
+            .expect("benchmark DNS runtime is active")
+            .runtime()
+            .generation()
+            .get()
     }
 
     pub fn publish_next(&mut self) {
@@ -183,11 +176,15 @@ pub fn observability_snapshot_checksum() -> u64 {
 fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        forwarder: Arc::clone(&shared.forwarder),
+        udp_query_limit: 256,
+        forwarder: Arc::new(DnsForwarder::new(
+            Arc::new(UnusedPool),
+            Arc::clone(&shared.cache),
+            Arc::clone(&shared.dns_router),
+        )),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
             Arc::clone(&shared.router),
-            Default::default(),
         )),
         outbound_runtime: None,
         transport: Arc::new(NoopTransport),

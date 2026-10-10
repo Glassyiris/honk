@@ -8,7 +8,7 @@
 //! - DoH3: one QUIC+H3 session, POST `application/dns-message`.
 //! - TCP plain: idle stream pool (same shape as DoT without TLS).
 //!
-//! All direct dials use `DAE_BYPASS_MARK` so eBPF does not re-intercept
+//! All direct dials use the configured bypass mark so eBPF does not re-intercept
 //! control-plane DNS. Hostnames resolve via `honk_outbound::bootstrap`.
 
 mod body;
@@ -28,16 +28,12 @@ mod tcp_pool;
 mod udp_pool;
 
 #[cfg(test)]
-mod idle_pool_tests;
-#[cfg(test)]
 mod tests_proto;
-#[cfg(test)]
-mod upstream_lifecycle_tests;
 
 use body::{DnsMessageBody, doh_content_length};
 #[cfg(test)]
 use body::{DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE};
-use doh_message::{build_doh_request, finish_doh_response};
+use doh_message::{build_doh_request, check_doh_status, finish_doh_response};
 use idle_pool::{IdlePoolState, close_idle_pool, idle_pool_exchange};
 use quic::{SharedQuicEndpoint, dns_quic_config, quic_connect_endpoint};
 use retry::exchange_with_retry;

@@ -7,9 +7,9 @@
 //! reach. dae solves this with `bootstrap_resolver`: a plain, direct DNS
 //! server that honk queries itself on a bypass-marked socket.
 //!
-//! [`resolve`] checks the configured bootstrap resolver first and falls back
-//! to the system resolver on any failure, so behavior is unchanged when no
-//! `bootstrap_resolver` is configured.
+//! [`resolve`] checks the configured bootstrap resolver first, then `/etc/hosts`
+//! and the first numeric `/etc/resolv.conf` nameserver. Every DNS socket is
+//! bypass-marked; libc NSS/search-suffix resolution is deliberately not used.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -64,8 +64,8 @@ pub fn global_server() -> Option<SocketAddr> {
     GLOBAL.read().unwrap().map(|r| r.server)
 }
 
-/// Resolve `host` to IP addresses, preferring the configured bootstrap
-/// resolver (direct, bypass-marked) and falling back to the system resolver.
+/// Resolve `host`, preferring the configured bootstrap resolver and falling back
+/// to `/etc/hosts` and bypass-marked queries to the system nameserver.
 pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     resolve_with(global(), host).await
 }
@@ -79,97 +79,182 @@ pub async fn resolve_with(
     host: &str,
 ) -> io::Result<Vec<IpAddr>> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Some(ip) = crate::runtime::pinned_server_address(host) {
+        return Ok(vec![ip]);
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
     if let Some(resolver) = resolver {
-        match tokio::time::timeout(Duration::from_secs(3), resolver.query(host)).await {
-            Ok(Ok(ips)) if !ips.is_empty() => return Ok(ips),
-            Ok(Ok(_)) => {
-                tracing::debug!("bootstrap resolver returned no records for '{}'", host)
-            }
-            Ok(Err(e)) => {
-                tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e)
-            }
-            Err(_) => {
-                tracing::debug!("bootstrap resolution of '{}' timed out", host)
-            }
+        match resolver.query(host).await {
+            Ok(ips) if !ips.is_empty() => return Ok(ips),
+            Ok(_) => tracing::debug!("bootstrap resolver returned no records for '{}'", host),
+            Err(e) => tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e),
         }
     }
-    let addrs: Vec<IpAddr> = tokio::net::lookup_host(format!("{}:0", host))
-        .await?
-        .map(|a| a.ip())
-        .collect();
+    resolve_system(host).await
+}
+
+/// `/etc/hosts`, then bypass-marked queries to the first numeric system nameserver.
+/// A hosts answer is observed as its own lookup; each nameserver query observes itself.
+async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
+    if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
+        let addrs = hosts_addresses(&contents, host);
+        if !addrs.is_empty() {
+            if let Some(mut observation) =
+                LookupObservation::start(host, "UNKNOWN", LookupOrigin::Hosts)
+            {
+                observation.finish(Ok::<_, &io::Error>(addrs.iter().copied()));
+            }
+            return Ok(addrs);
+        }
+    }
+    let server = system_nameserver().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no numeric system DNS nameserver")
+    })?;
+    let resolver = BootstrapResolver {
+        server,
+        use_tcp: false,
+    };
+    let addrs = resolver.query(host).await?;
+    if addrs.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no DNS addresses"));
+    }
     Ok(addrs)
 }
 
+fn hosts_addresses(contents: &str, host: &str) -> Vec<IpAddr> {
+    let mut addrs = Vec::new();
+    let host = host.trim_end_matches('.');
+    for line in contents.lines() {
+        let mut fields = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split_ascii_whitespace();
+        let Some(ip) = fields.next().and_then(|ip| ip.parse::<IpAddr>().ok()) else {
+            continue;
+        };
+        if fields.any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(host))
+            && !addrs.contains(&ip)
+        {
+            addrs.push(ip);
+        }
+    }
+    addrs
+}
+
+/// Budget for one address family's exchange, connect included.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl BootstrapResolver {
     /// Query A and AAAA records for `host` directly from the configured
-    /// server over a bypass-marked socket.
-    async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        if self.use_tcp {
-            let ips_a = self.query_tcp(host, 1).await?;
-            let ips_aaaa = self.query_tcp(host, 28).await.unwrap_or_default();
-            Ok([ips_a, ips_aaaa].concat())
-        } else {
-            let ips_a = self.query_udp(host, 1).await?;
-            let ips_aaaa = self.query_udp(host, 28).await.unwrap_or_default();
-            Ok([ips_a, ips_aaaa].concat())
+    /// server over bypass-marked sockets, without a system-resolver fallback.
+    pub async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        // Separate budgets: a stalled or failing family must not discard the other's answer.
+        match tokio::join!(self.query_family(host, 1), self.query_family(host, 28)) {
+            (Err(e), Err(_)) => Err(e),
+            (a, aaaa) => Ok([a.unwrap_or_default(), aaaa.unwrap_or_default()].concat()),
         }
     }
 
-    async fn query_udp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        parse_answers(&query_udp_raw(self.server, host, qtype).await?, qtype)
+    async fn query_family(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+        let mut observation = LookupObservation::start(
+            host,
+            qtype_name(qtype),
+            LookupOrigin::Upstream(self.server, if self.use_tcp { "tcp" } else { "udp" }),
+        );
+        let result = async {
+            let msg = tokio::time::timeout(QUERY_TIMEOUT, self.query_raw(host, qtype))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out")
+                })??;
+            parse_answers(&msg, qtype)
+        };
+        let result = match &observation {
+            Some(observation) => observation.child().scope(result).await,
+            None => result.await,
+        };
+        if let Some(observation) = &mut observation {
+            observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
+        }
+        result
     }
 
-    async fn query_tcp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        parse_answers(&self.query_tcp_raw(host, qtype).await?, qtype)
-    }
-
-    /// Send a single query and return the raw response bytes.
+    /// Send a single query and return the raw response that answers it.
     async fn query_raw(&self, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
-        if self.use_tcp {
-            self.query_tcp_raw(host, qtype).await
-        } else {
-            query_udp_raw(self.server, host, qtype).await
+        let query = build_query(host, qtype);
+        if !self.use_tcp {
+            let response = self.exchange_udp(&query).await?;
+            // A truncated answer may omit records; libc's resolver retries it over TCP.
+            if response[2] & 0x02 == 0 {
+                return Ok(response);
+            }
         }
+        self.exchange_tcp(&query).await
     }
 
-    async fn query_tcp_raw(&self, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+    async fn exchange_tcp(&self, query: &[u8]) -> io::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = crate::util::connect_marked_addr(
             self.server,
-            Some(honk_ebpf_common::DAE_BYPASS_MARK),
-            Duration::from_secs(3),
+            Some(crate::util::bypass_mark()),
+            QUERY_TIMEOUT,
         )
         .await?;
-        let query = build_query(host, qtype);
         stream
             .write_all(&(query.len() as u16).to_be_bytes())
             .await?;
-        stream.write_all(&query).await?;
+        stream.write_all(query).await?;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let len = u16::from_be_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
+        if !answers_query(query, &buf) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response does not match query",
+            ));
+        }
         Ok(buf)
+    }
+
+    async fn exchange_udp(&self, query: &[u8]) -> io::Result<Vec<u8>> {
+        let bind: SocketAddr = if self.server.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = crate::util::udp_marked_bind(bind).await?;
+        socket.connect(self.server).await?;
+        socket.send(query).await?;
+        let mut buf = [0u8; 1500];
+        // Stray and off-path spoofed datagrams are skipped; the caller's deadline bounds the wait.
+        loop {
+            let n = socket.recv(&mut buf).await?;
+            if answers_query(query, &buf[..n]) {
+                return Ok(buf[..n].to_vec());
+            }
+        }
     }
 }
 
-/// One UDP query/response exchange with `server` over a bypass-marked socket.
-async fn query_udp_raw(server: SocketAddr, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
-    let bind: SocketAddr = if server.is_ipv4() {
-        (Ipv4Addr::UNSPECIFIED, 0).into()
-    } else {
-        (Ipv6Addr::UNSPECIFIED, 0).into()
-    };
-    let socket = crate::util::udp_marked_bind(bind).await?;
-    socket.connect(server).await?;
-    socket.send(&build_query(host, qtype)).await?;
-    let mut buf = [0u8; 1500];
-    let n = socket.recv(&mut buf).await?;
-    Ok(buf[..n].to_vec())
+/// Whether `resp` answers `query` (as built by [`build_query`]): same ID, QR
+/// set, same opcode and exactly the sent question. Names are case-insensitive
+/// in DNS, so only the name ignores ASCII case; type and class must match exactly.
+fn answers_query(query: &[u8], resp: &[u8]) -> bool {
+    let (name, type_class) = query[12..].split_at(query.len() - 16);
+    resp.len() >= 12
+        && resp[..2] == query[..2]
+        && resp[2] & 0x80 != 0
+        && (resp[2] ^ query[2]) & 0x78 == 0
+        && resp[4..6] == [0, 1]
+        && resp
+            .get(12..12 + name.len())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        && resp.get(12 + name.len()..query.len()) == Some(type_class)
 }
 
 /// First nameserver from /etc/resolv.conf (UDP, port 53). Used for record
@@ -177,8 +262,9 @@ async fn query_udp_raw(server: SocketAddr, host: &str, qtype: u16) -> io::Result
 fn system_nameserver() -> Option<SocketAddr> {
     let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
     for line in contents.lines() {
-        if let Some(rest) = line.trim().strip_prefix("nameserver")
-            && let Ok(ip) = rest.trim().parse::<IpAddr>()
+        let mut fields = line.split_ascii_whitespace();
+        if fields.next() == Some("nameserver")
+            && let Some(ip) = fields.next().and_then(|ip| ip.parse::<IpAddr>().ok())
         {
             return Some(SocketAddr::new(ip, 53));
         }
@@ -201,17 +287,35 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
     if host.parse::<IpAddr>().is_ok() {
         return Ok(None);
     }
-    let resolver = *GLOBAL.read().unwrap();
-    let msg = match resolver {
-        Some(r) => r.query_raw(host, QTYPE_HTTPS).await?,
+    let resolver = match global() {
+        Some(r) => r,
         None => {
             let Some(server) = system_nameserver() else {
                 return Ok(None);
             };
-            query_udp_raw(server, host, QTYPE_HTTPS).await?
+            BootstrapResolver {
+                server,
+                use_tcp: false,
+            }
         }
     };
-    Ok(parse_https_rr_ech(&msg))
+    let mut observation = LookupObservation::start(
+        host,
+        "HTTPS",
+        LookupOrigin::Upstream(
+            resolver.server,
+            if resolver.use_tcp { "tcp" } else { "udp" },
+        ),
+    );
+    let operation = resolver.query_raw(host, QTYPE_HTTPS);
+    let result = match &observation {
+        Some(observation) => observation.child().scope(operation).await,
+        None => operation.await,
+    };
+    if let Some(observation) = &mut observation {
+        observation.finish(result.as_ref().map(|_| std::iter::empty()));
+    }
+    Ok(parse_https_rr_ech(&result?))
 }
 
 /// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
@@ -278,7 +382,7 @@ fn parse_svcb_ech_param(rdata: &[u8]) -> Option<Vec<u8>> {
 /// Build a minimal DNS query (RD set, single question).
 fn build_query(host: &str, qtype: u16) -> Vec<u8> {
     let mut q = Vec::with_capacity(host.len() + 18);
-    q.extend_from_slice(&[0xda, 0xed]); // id
+    q.extend_from_slice(&rand::random::<u16>().to_be_bytes()); // id
     q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
     q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
     q.extend_from_slice(&[0; 6]); // an/ns/ar = 0
@@ -369,150 +473,129 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
     }
 }
 
+/// Human-readable qtype name for logs and flow observations.
+pub fn qtype_name(qtype: u16) -> &'static str {
+    match qtype {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        65 => "HTTPS",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Where an observed lookup's answer comes from.
+enum LookupOrigin {
+    /// `/etc/hosts`, without a DNS exchange.
+    Hosts,
+    /// A bypass-marked exchange with this nameserver over this transport.
+    Upstream(SocketAddr, &'static str),
+}
+
+struct LookupObservation {
+    observer: crate::runtime::flow_observation::FlowObserver,
+    data: crate::runtime::flow_observation::DnsLookup,
+    finished: bool,
+}
+
+impl LookupObservation {
+    fn start(host: &str, qtype: &str, origin: LookupOrigin) -> Option<Self> {
+        use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
+        let observer = current()?;
+        if host.is_empty() || host.len() > 253 {
+            observer.publish(FlowEvent::Gap(
+                crate::runtime::flow_observation::GapReason::Redacted,
+            ));
+            return None;
+        }
+        let context = observer.context();
+        let (source, upstream) = match origin {
+            LookupOrigin::Hosts => ("hosts", None),
+            LookupOrigin::Upstream(address, transport) => ("upstream", Some((address, transport))),
+        };
+        let data = DnsLookup {
+            lookup_id: uuid::Uuid::new_v4(),
+            parent_lookup_id: context.lookup_id,
+            attempt_id: context.attempt_id,
+            purpose: context.dns_purpose,
+            name: host.to_owned(),
+            qtype: qtype.to_owned(),
+            source,
+            upstream_transport: upstream.map(|(_, transport)| transport),
+            carrier_transport: upstream.map(|(_, transport)| transport),
+            cache: "bypass",
+            cache_entry_id: None,
+            upstream: upstream.map(|(address, _)| address.to_string()),
+            route_evaluation_ids: Vec::new(),
+            status: "started",
+            addresses: Vec::new(),
+            selected_ip: None,
+            error: None,
+        };
+        observer.publish(FlowEvent::Dns(data.clone()));
+        Some(Self {
+            observer,
+            data,
+            finished: false,
+        })
+    }
+
+    fn child(&self) -> crate::runtime::flow_observation::FlowObserver {
+        let mut context = self.observer.context();
+        context.lookup_id = Some(self.data.lookup_id);
+        self.observer.with_context(context)
+    }
+
+    fn finish<I: Iterator<Item = IpAddr>>(&mut self, result: Result<I, &io::Error>) {
+        use crate::runtime::flow_observation::FlowEvent;
+        self.finished = true;
+        match result {
+            Ok(addresses) => {
+                self.data.status = "succeeded";
+                for address in addresses {
+                    if self.data.addresses.contains(&address) {
+                        continue;
+                    }
+                    if self.data.addresses.len() == 32 {
+                        self.observer.publish(FlowEvent::Gap(
+                            crate::runtime::flow_observation::GapReason::BufferOverflow,
+                        ));
+                        break;
+                    }
+                    self.data.addresses.push(address);
+                }
+            }
+            Err(error) => {
+                self.data.status = "failed";
+                self.data.error = Some(if error.kind() == io::ErrorKind::TimedOut {
+                    "timeout"
+                } else {
+                    "resolution_failed"
+                });
+            }
+        }
+        self.observer.publish(FlowEvent::Dns(self.data.clone()));
+    }
+}
+
+impl Drop for LookupObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.data.status = "cancelled";
+            self.data.error = Some("cancelled");
+            self.observer
+                .publish(crate::runtime::flow_observation::FlowEvent::Dns(
+                    self.data.clone(),
+                ));
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_resolver() {
-        let r = BootstrapResolver::parse("udp://8.8.8.8:53").unwrap();
-        assert_eq!(r.server, "8.8.8.8:53".parse().unwrap());
-        assert!(!r.use_tcp);
-        let r = BootstrapResolver::parse("tcp://1.1.1.1:53").unwrap();
-        assert!(r.use_tcp);
-        let r = BootstrapResolver::parse("9.9.9.9:53").unwrap();
-        assert!(!r.use_tcp);
-        assert!(BootstrapResolver::parse("").is_none());
-        assert!(BootstrapResolver::parse("not-an-addr").is_none());
-    }
-
-    #[test]
-    fn test_build_and_parse_roundtrip() {
-        let query = build_query("example.com", 1);
-        let mut resp = query.clone();
-        resp[2] = 0x81;
-        resp[3] = 0x80;
-        resp[6] = 0;
-        resp[7] = 1; // ancount = 1
-        resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer
-        resp.extend_from_slice(&1u16.to_be_bytes()); // A
-        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
-        resp.extend_from_slice(&60u32.to_be_bytes()); // TTL
-        resp.extend_from_slice(&4u16.to_be_bytes()); // rdlen
-        resp.extend_from_slice(&[93, 184, 216, 34]);
-        let ips = parse_answers(&resp, 1).unwrap();
-        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_literal_ip_skips_lookup() {
-        let ips = resolve("1.2.3.4").await.unwrap();
-        assert_eq!(ips, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
-    }
-
-    /// End-to-end: a stub UDP DNS server on loopback answering A records,
-    /// installed as the global bootstrap resolver.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn test_resolve_via_bootstrap_udp() {
-        let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
-        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let mut resp = buf[..n].to_vec();
-            resp[2] = 0x81;
-            resp[3] = 0x80;
-            resp[6] = 0;
-            resp[7] = 1;
-            resp.extend_from_slice(&[0xC0, 0x0C]);
-            resp.extend_from_slice(&1u16.to_be_bytes());
-            resp.extend_from_slice(&1u16.to_be_bytes());
-            resp.extend_from_slice(&60u32.to_be_bytes());
-            resp.extend_from_slice(&4u16.to_be_bytes());
-            resp.extend_from_slice(&[10, 9, 8, 7]);
-            server.send_to(&resp, peer).await.unwrap();
-        });
-
-        set_global(BootstrapResolver::parse(&format!("udp://{}", server_addr)));
-        let ips = resolve("node.example.com").await.unwrap();
-        set_global(None);
-        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7))]);
-    }
-
-    /// Build a DNS response carrying one HTTPS (65) answer for the query's
-    /// question, with the given priority and `ech` SvcParam (or none).
-    fn make_https_response(query: &[u8], priority: u16, ech: Option<&[u8]>, ttl: u32) -> Vec<u8> {
-        let mut resp = query.to_vec();
-        resp[2] = 0x81;
-        resp[3] = 0x80;
-        resp[6] = 0;
-        resp[7] = 1; // ancount = 1
-        resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer to question
-        resp.extend_from_slice(&65u16.to_be_bytes()); // TYPE HTTPS
-        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
-        resp.extend_from_slice(&ttl.to_be_bytes());
-        let mut rdata = Vec::new();
-        rdata.extend_from_slice(&priority.to_be_bytes());
-        rdata.push(0); // target name = root
-        if let Some(ech) = ech {
-            rdata.extend_from_slice(&5u16.to_be_bytes()); // SvcParam key ech
-            rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
-            rdata.extend_from_slice(ech);
-        }
-        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        resp.extend_from_slice(&rdata);
-        resp
-    }
-
-    #[test]
-    fn test_parse_https_rr_ech() {
-        let query = build_query("example.com", 65);
-        let ech = b"\x00\x01fake-ech-config";
-        // ServiceMode (priority >= 1) with an ech param.
-        let resp = make_https_response(&query, 1, Some(ech), 300);
-        assert_eq!(
-            parse_https_rr_ech(&resp),
-            Some((ech.to_vec(), 300)),
-            "ServiceMode HTTPS RR with ech param"
-        );
-
-        // AliasMode (priority 0) carries no SvcParams — skipped even when
-        // bytes shaped like params follow (they are part of the TargetName).
-        let resp = make_https_response(&query, 0, Some(ech), 300);
-        assert_eq!(parse_https_rr_ech(&resp), None);
-
-        // ServiceMode without an ech param.
-        let resp = make_https_response(&query, 1, None, 300);
-        assert_eq!(parse_https_rr_ech(&resp), None);
-    }
-
-    /// End-to-end: stub UDP DNS server answering HTTPS records with an ech
-    /// SvcParam, installed as the global bootstrap resolver.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn test_query_ech_config_via_bootstrap_udp() {
-        let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
-        let ech = b"\x00\x02real-ech-bytes";
-        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let resp = make_https_response(&buf[..n], 1, Some(ech), 120);
-            server.send_to(&resp, peer).await.unwrap();
-        });
-
-        set_global(BootstrapResolver::parse(&format!("udp://{}", server_addr)));
-        let got = query_ech_config("node.example.com").await.unwrap();
-        set_global(None);
-        assert_eq!(got, Some((ech.to_vec(), 120)));
-
-        // IP literals never hit the network.
-        assert_eq!(query_ech_config("1.2.3.4").await.unwrap(), None);
-    }
-}
+mod tests;

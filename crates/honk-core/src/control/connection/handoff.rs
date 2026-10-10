@@ -1,3 +1,6 @@
+#[cfg(feature = "native-api")]
+use super::observation::ConnectionObservation;
+use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::{HashMap, HashSet};
 
@@ -46,10 +49,17 @@ pub(super) struct HandoffResult {
     pub(super) mark: u32,
     pub(super) must: u8,
     pub(super) decision_token: u32,
+    pub(super) routing_generation: u64,
     pub(super) dscp: u8,
     pub(super) mac: [u8; 6],
     pub(super) pname: [u8; 16],
     pub(super) pid: u32,
+    #[cfg(feature = "native-api")]
+    pub(super) trace_id: u32,
+    #[cfg(feature = "native-api")]
+    pub(super) capture: Option<crate::observe::flows::kernel::CapturedKernelRoute>,
+    #[cfg(feature = "native-api")]
+    pub(super) capture_gap: Option<&'static str>,
 }
 
 impl From<RoutingHandoffEntry> for HandoffResult {
@@ -59,27 +69,85 @@ impl From<RoutingHandoffEntry> for HandoffResult {
             mark: entry.result.mark,
             must: entry.result.must,
             decision_token: entry.result.decision_token,
+            routing_generation: entry.routing_generation,
             dscp: entry.result.dscp,
             mac: entry.result.mac,
             pname: entry.result.pname,
             pid: entry.result.pid,
+            #[cfg(feature = "native-api")]
+            trace_id: entry.trace_id,
+            #[cfg(feature = "native-api")]
+            capture: None,
+            #[cfg(feature = "native-api")]
+            capture_gap: Some("kernel_trace_not_captured"),
         }
     }
 }
 
 impl HandoffResult {
-    /// Convert the eBPF process name byte array to an optional string.
-    /// Treats the array as NUL-terminated or fixed-length, trimming trailing
-    /// NULs and whitespace.
-    pub(super) fn process_name(&self) -> Option<String> {
-        let bytes: Vec<u8> = self.pname.iter().copied().take_while(|&b| b != 0).collect();
-        let s = String::from_utf8_lossy(&bytes);
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+    fn captured(
+        backend: &dyn crate::ebpf::EbpfBackend,
+        key: &TuplesKey,
+        entry: RoutingHandoffEntry,
+        atomic: bool,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+    ) -> Self {
+        let handoff = Self::from(entry);
+        #[cfg(feature = "native-api")]
+        if !observation.is_recording() {
+            return handoff;
         }
+        #[cfg(feature = "native-api")]
+        let handoff = {
+            let mut handoff = handoff;
+            match backend.capture_kernel_route(key, (&entry).into()) {
+                Ok(mut capture) => {
+                    if !atomic {
+                        capture.gap = Some("kernel_handoff_nonatomic_take");
+                        capture.ambiguous = true;
+                    }
+                    if key.dst_port != 53 {
+                        let state = if key.l4proto == 6 {
+                            backend.tcp_conn_state_lookup(key)
+                        } else {
+                            backend.udp_conn_state_lookup(key)
+                        };
+                        if !state.ok().flatten().is_some_and(|state| {
+                            state.trace_id == entry.trace_id
+                                && state.decision_token == entry.result.decision_token
+                        }) {
+                            capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
+                            capture.ambiguous = true;
+                        }
+                    }
+                    handoff.capture_gap = capture.gap;
+                    handoff.capture = Some(capture);
+                }
+                Err(gap) => {
+                    handoff.capture_gap = Some(if atomic {
+                        gap
+                    } else {
+                        "kernel_handoff_nonatomic_take"
+                    })
+                }
+            }
+            handoff
+        };
+        #[cfg(not(feature = "native-api"))]
+        let _ = (backend, key, atomic);
+        handoff
+    }
+    /// Convert the eBPF process name byte array to an optional string: bytes
+    /// up to the first NUL (or the whole array), lossily decoded and trimmed.
+    pub(super) fn process_name(&self) -> Option<String> {
+        let end = self
+            .pname
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.pname.len());
+        let name = String::from_utf8_lossy(&self.pname[..end]);
+        let trimmed = name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
     /// Resolve the process executable path from /proc. The process may have
@@ -102,16 +170,19 @@ impl HandoffResult {
 
     /// Convert the eBPF MAC address to canonical lower-case colon form.
     pub(super) fn mac_address(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
         if self.mac == [0u8; 6] {
             return None;
         }
-        Some(
-            self.mac
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(":"),
+        let mut mac = String::with_capacity(17);
+        write!(
+            mac,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
         )
+        .expect("writing to a String cannot fail");
+        Some(mac)
     }
 }
 
@@ -230,12 +301,16 @@ impl TcpFlowGuard {
     pub(super) fn track_if_enabled(
         &mut self,
         make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
+        owner: crate::connection_tracker::ConnectionOwner,
     ) -> Option<String> {
         assert!(
             self.tracker_id.is_none(),
             "TCP flow tracker attached more than once"
         );
-        let id = self.tracker.register_if_enabled(make_entry)?;
+        if !self.tracker.is_enabled() {
+            return None;
+        }
+        let id = self.tracker.register_owned(make_entry(), owner);
         self.tracker_id = Some(id.clone());
         Some(id)
     }
@@ -257,28 +332,29 @@ impl TcpFlowGuard {
         }
     }
 
-    pub(super) async fn retire(mut self) {
-        self.untrack();
+    pub(super) async fn retire(mut self) -> bool {
         let now_ns = match crate::control::janitor::monotonic_now_ns() {
             Ok(now_ns) => now_ns,
             Err(error) => {
                 error!(%error, "TCP flow retirement could not read monotonic clock");
-                return;
+                return false;
             }
         };
         let retire_cutoff_ns = now_ns.saturating_sub(1);
         let ebpf = Arc::clone(&self.ebpf);
         let mut backend = ebpf.write().await;
-        if self.release_pin() != Some(true) {
-            return;
+        match self.release_pin() {
+            Some(false) => return true,
+            Some(true) => {}
+            None => return false,
         }
 
         let current = match backend.tcp_conn_state_lookup(&self.tuples) {
             Ok(Some(current)) => current,
-            Ok(None) => return,
+            Ok(None) => return true,
             Err(error) => {
                 error!(%error, ?self.tuples, "TCP flow retirement lookup failed");
-                return;
+                return false;
             }
         };
         match backend.conn_state_remove_if_unchanged(&[(self.tuples, current)], retire_cutoff_ns) {
@@ -288,9 +364,11 @@ impl TcpFlowGuard {
                         .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
                 }
                 debug!(removed, ?self.tuples, "TCP flow conn-state retired");
+                true
             }
             Err(error) => {
                 error!(%error, ?self.tuples, "TCP flow conditional retirement failed");
+                false
             }
         }
     }
@@ -301,6 +379,13 @@ impl Drop for TcpFlowGuard {
         self.untrack();
         self.release_pin();
     }
+}
+
+pub(super) struct ModeDecision {
+    pub(super) name: String,
+    pub(super) constraint: crate::control::reload::OutboundConstraint,
+    #[cfg(feature = "native-api")]
+    pub(super) group_id: Option<String>,
 }
 
 impl ControlPlaneHandle {
@@ -328,31 +413,56 @@ impl ControlPlaneHandle {
     /// backend state is touched.  The lock's sole role here is to keep the
     /// backend (and its map fds) alive against `cleanup()`, which takes the
     /// write lock.
-    pub(super) async fn lookup_handoff(&self, tuples: &TuplesKey) -> Option<HandoffResult> {
-        self.ebpf
-            .read()
-            .await
-            .routing_handoff_take(tuples)
+    pub(super) async fn lookup_handoff(
+        &self,
+        tuples: &TuplesKey,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+    ) -> Option<HandoffResult> {
+        let backend = self.ebpf.read().await;
+        backend
+            .routing_handoff_take_observed(tuples)
             .ok()
             .flatten()
-            .map(Into::into)
+            .map(|(entry, atomic)| {
+                HandoffResult::captured(
+                    backend.as_ref(),
+                    tuples,
+                    entry,
+                    atomic,
+                    #[cfg(feature = "native-api")]
+                    observation,
+                )
+            })
     }
 
     /// Staged UDP transitions consume their handoff atomically at commit, so
-    /// initialization may only inspect it. Legacy socket ingress keeps the
-    /// existing take-once behavior.
+    /// initialization may only inspect it. Legacy socket ingress consumes the
+    /// tuple once; UDP/53 retains only the non-must controller handoff.
     pub(super) async fn lookup_udp_handoff(
         &self,
         tuples: &TuplesKey,
         decision_token: u32,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<Option<HandoffResult>> {
         if decision_token == 0 {
-            return Ok(self.lookup_handoff(tuples).await);
+            let handoff = self
+                .lookup_handoff(
+                    tuples,
+                    #[cfg(feature = "native-api")]
+                    observation,
+                )
+                .await;
+            return Ok(if tuples.dst_port == 53 {
+                handoff.filter(|handoff| {
+                    handoff.outbound == OutboundIndex::ControlPlaneRouting as u8
+                        && handoff.must == 0
+                })
+            } else {
+                handoff
+            });
         }
-        let entry = self
-            .ebpf
-            .read()
-            .await
+        let backend = self.ebpf.read().await;
+        let entry = backend
             .routing_handoff_lookup(tuples)?
             .ok_or_else(|| anyhow::anyhow!("staged UDP flow has no routing handoff"))?;
         if entry.result.decision_token != decision_token {
@@ -362,13 +472,21 @@ impl ControlPlaneHandle {
                 entry.result.decision_token
             );
         }
-        Ok(Some(entry.into()))
+        Ok(Some(HandoffResult::captured(
+            backend.as_ref(),
+            tuples,
+            entry,
+            true,
+            #[cfg(feature = "native-api")]
+            observation,
+        )))
     }
 
     pub(super) async fn adopt_tcp_flow(
         &self,
         stream: TcpStream,
         tuples: TuplesKey,
+        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
         let backend = self.ebpf.read().await;
         match backend.tcp_conn_state_lookup(&tuples) {
@@ -389,10 +507,19 @@ impl ControlPlaneHandle {
             Arc::clone(&self.connection_tracker),
         );
         let handoff = backend
-            .routing_handoff_take(&tuples)
+            .routing_handoff_take_observed(&tuples)
             .ok()
             .flatten()
-            .map(Into::into);
+            .map(|(entry, atomic)| {
+                HandoffResult::captured(
+                    backend.as_ref(),
+                    &tuples,
+                    entry,
+                    atomic,
+                    #[cfg(feature = "native-api")]
+                    observation,
+                )
+            });
         Ok((flow, handoff))
     }
 
@@ -447,35 +574,122 @@ impl ControlPlaneHandle {
     /// - `block` results and `must` results (dae `(must)` rules / eBPF
     ///   handoff must flag) are never overridden — both are final routing
     ///   decisions that mode switches must not bypass.
-    pub(super) async fn apply_mode_override(&self, outbound_name: String, must: bool) -> String {
-        let Some(ref mode_state) = self.mode_state else {
-            return outbound_name;
+    ///
+    /// The route's rule mark survives only on a routed `direct` flow that
+    /// remains `direct`.
+    pub(super) async fn apply_mode_override(&self, route: &mut RoutingDecision) -> ModeDecision {
+        let decision = self.mode_override(route.outbound.clone(), route.must).await;
+        let replacement = (decision.name != route.outbound).then(|| decision.name.clone());
+        route.apply_final_outbound(replacement);
+        decision
+    }
+
+    /// Preserve exact native target identity until the selected generation is pinned.
+    async fn mode_override(&self, outbound_name: String, must: bool) -> ModeDecision {
+        let mut result = ModeDecision {
+            name: outbound_name,
+            constraint: Default::default(),
+            #[cfg(feature = "native-api")]
+            group_id: None,
         };
-        if must || outbound_name == "block" {
-            return outbound_name;
+        let Some(mode_state) = &self.mode_state else {
+            return result;
+        };
+        if must || result.name == "block" {
+            return result;
         }
-        let state = { mode_state.read().clone() };
-        // The GLOBAL selection needs a config lookup to decide whether it
-        // resolves to a group/node; only do it in Global mode.
-        let mut selection_resolvable = false;
-        if state.is_global() && !state.global_selection.is_empty() {
-            let selection = &state.global_selection;
-            selection_resolvable = *selection == "direct" || *selection == "block" || {
-                let config = self.config.read().await;
-                config.groups.iter().any(|g| g.name == *selection)
-                    || config.nodes.iter().any(|n| n.name == *selection)
+        let state = mode_state.read().clone();
+        #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+        if state.is_native() {
+            let config = self.config.read().await;
+            let state = mode_state.read().clone();
+            let Some(native) = &self.native else {
+                result.name = "block".into();
+                return result;
             };
-            if !selection_resolvable {
-                debug!(
-                    "clash Global selection '{}' does not resolve; keeping routed outbound '{}'",
-                    selection, outbound_name
-                );
+            let catalog = native.catalog.snapshot();
+            match state.native_override(&result.name, must, &config, &catalog.groups) {
+                crate::mode::ModeOverride::Unchanged => {}
+                crate::mode::ModeOverride::Direct => result.name = "direct".into(),
+                crate::mode::ModeOverride::Block => result.name = "block".into(),
+                crate::mode::ModeOverride::Node(id) => {
+                    result.name = config
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == id)
+                        .expect("validated mode target")
+                        .name
+                        .clone();
+                    result.constraint = crate::control::reload::OutboundConstraint::Node(id);
+                }
+                crate::mode::ModeOverride::Group(name) => {
+                    result.group_id = catalog.groups.get(&name).cloned();
+                    result.name = name;
+                }
             }
+            return result;
         }
-        state.override_outbound(&outbound_name, false, selection_resolvable)
+        let selection = state.global_selection();
+        let selection_resolvable = if state.is_global() && !selection.is_empty() {
+            let config = self.config.read().await;
+            matches!(selection, "direct" | "block")
+                || config.groups.iter().any(|group| group.name == selection)
+                || config.nodes.iter().any(|node| node.name == selection)
+        } else {
+            false
+        };
+        result.name = state.override_outbound(&result.name, false, selection_resolvable);
+        result
     }
 }
 
 #[cfg(test)]
 #[path = "tcp_flow_lifecycle_tests.rs"]
 mod tcp_flow_lifecycle_tests;
+
+#[cfg(all(test, feature = "native-api"))]
+#[test]
+fn handoff_capture_follows_admission_without_changing_authority() {
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let entry = RoutingHandoffEntry {
+        result: honk_ebpf_common::RoutingResult {
+            outbound: 2,
+            mark: 0x42,
+            must: 1,
+            ..Default::default()
+        },
+        routing_generation: 9,
+        ..Default::default()
+    };
+    for admitted in [false, true] {
+        let native =
+            crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
+        native.core.flows.set_recording(admitted);
+        let observation = ConnectionObservation::begin(
+            Some(&native.core),
+            crate::observe::vocab::Network::Tcp,
+            "127.0.0.1:31000".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        );
+        native.core.flows.set_recording(!admitted);
+        let result =
+            HandoffResult::captured(&backend, &TuplesKey::default(), entry, false, &observation);
+        assert_eq!(
+            result.capture_gap,
+            Some(if admitted {
+                "kernel_handoff_nonatomic_take"
+            } else {
+                "kernel_trace_not_captured"
+            })
+        );
+        assert_eq!(
+            (
+                result.outbound,
+                result.mark,
+                result.must,
+                result.routing_generation
+            ),
+            (2, 0x42, 1, 9)
+        );
+    }
+}

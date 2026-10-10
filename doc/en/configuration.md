@@ -1,8 +1,8 @@
 # honk Configuration Guide
 
-This guide shows how to assemble and operate a honk configuration without repeating the field inventories in the reference docs.
+Use this guide to assemble and operate a honk configuration; the reference docs list individual fields.
 
-honk uses dae configuration syntax. The runtime sections and CLI entry point are listed below; `include {}` composes files and is covered next.
+honk uses a dialect of dae configuration syntax; the [dialect reference](./reference/dialect.md) lists known differences. The table lists runtime sections and the CLI entry point. `include {}` composes files.
 
 | Section | Purpose | Reference |
 | --- | --- | --- |
@@ -12,18 +12,22 @@ honk uses dae configuration syntax. The runtime sections and CLI entry point are
 | `routing` | Apply ordered traffic rules and a fallback outbound. | [Routing reference](./reference/routing.md) |
 | `dns` | Configure listeners, upstreams, request/response policy, and cache behavior. | [DNS reference](./reference/dns.md) |
 | `subscription` | Fetch remote node lists. | [Subscription reference](./reference/subscription.md) |
-| `experimental` | Enable the Clash API or persistent cache. | [Experimental reference](./reference/experimental.md) |
+| `assets` | Set download defaults for geodata, the external UI, and subscriptions. | [Assets reference](./reference/assets.md) |
+| `experimental` | Enable the independent native API, Clash API, or persistent cache. | [Experimental reference](./reference/experimental.md) |
 | CLI | Select a config, backend, object file, or local command. | [CLI reference](./reference/cli.md) |
 
-The built-in outbounds `direct` and `block` are injected at startup and may be used in groups and routing rules.
+honk injects the built-in outbounds `direct` and `block` at startup. They may be used in groups and routing rules.
 
 ## Configuration format
 
-- Put settings in `section { ... }` blocks as one `key: value` pair per line.
+- Put settings in `section { ... }` blocks as one `key: value` pair per line. One-line blocks such as `global { log_level: debug }` and nested one-line blocks are accepted.
 - Quote URLs, values containing whitespace, and values containing syntax characters such as `:`, `+`, or `#`. Scalar values plus `include` and `node` entries accept single or double quotes; use single quotes for quoted `subscription` URLs.
+- Matching single or double quotes keep commas, closing parentheses, `&&`, and `->` literal in matcher arguments and filter/routing expressions. `group(...)` and `qtype(...)` still interpret quoted comma-separated text as lists.
 - Write lists accepted by a setting or matcher with commas: `lan_interface: eth0, eth1` or `dport(80, 443)`.
 - Second-based durations accept bare seconds or `ms`, `s`, `m`, and `h` suffixes. Millisecond settings such as `check_tolerance` accept bare milliseconds, `ms`, or `s`.
-- `#` starts a whole-line or unquoted trailing comment. Keep notes for `node` and `subscription` entries on separate comment lines.
+- An unquoted token-head `#` starts a comment; hashes inside bare values remain data. Entry readers also accept a glued `#` after a closing link quote or subscription `(UA)` suffix, with `legacy-glued-hash`; put whitespace before comments. Token-head comment braces never close blocks.
+- Braces inside matching single or double quotes are data. An unmatched closing `}` is ignored with a diagnostic; an unclosed block rejects the document. Detailed diagnostics carry physical line numbers where the current reader provides them; error text never echoes arbitrary input.
+- Unknown scalar keys are diagnosed and ignored. Unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains; unknown outer experimental settings and unsupported legacy NFQUEUE content are errors.
 
 ### Splitting a configuration with `include {}`
 
@@ -36,13 +40,17 @@ include {
 
 `include` entries may be bare or quoted and support `*`, `?`, and `[]` glob patterns. Patterns run in declaration order; each pattern's matches load in lexical order. Unmatched patterns, directories, and files without the `.dae` extension are skipped.
 
+Empty or comment-only included `.dae` files contribute no sections; the dae entry-document block requirement does not apply to these fragments.
+
+Only top-level `include` accepts an opener on a later line, with a `legacy-include-opener` warning; prefer `include {` on one line. Include comments follow the token rule: `path.dae # note` includes `path.dae`, but `path.dae#note` is a literal glob and emits `legacy-include-hash`. Quote literal hashes to avoid the migration warning. String parsing checks include structure but never opens included files; includes do not splice fragments into an open block.
+
 Every relative include, including one in a nested included file, resolves against the directory containing the entry config passed to `--config`. The loader canonicalizes the entry directory and every match; an absolute path or symlink target outside that directory is rejected. Loading the same canonical file twice, directly or through a cycle, is also rejected.
 
 The entry file's own sections merge first regardless of where its `include` block appears, followed by each included file and its descendants. Later scalar keys override earlier values. Collection entries such as nodes, subscriptions, groups, DNS upstreams, fixed TTLs, and routing rules append in merge order.
 
 ## Runtime data directory
 
-`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/share/honk`, must be a non-empty absolute path, and is restart-required. At startup honk recursively creates the directory, then verifies it by creating and removing a private random probe file without following a probe symlink. An unusable candidate falls back only to a working directory that passes the same probe; startup fails with both causes if neither works. Relative `global.log_file`, `experimental.cache_file.path`, `experimental.clash_api.external_ui`, the `.sub` subscription store, `geoip.dat`, `geosite.dat`, and node `ech_config_path` resolve under the effective directory; absolute child paths stay literal. If the preferred data-directory copy is absent, honk retains an existing legacy cache beside the entry config, an existing `./.sub` store, or an existing working-directory UI/ECH path until it is moved. Geo lookup checks an existing `$DAE_LOCATION_ASSET/<file>` first, followed by the effective data directory, working directory, and standard dae asset directories.
+`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/lib/honk`, must be a non-empty absolute path, and is restart-required. At startup honk recursively creates the directory and probes it with a private create-new/remove file; an unusable candidate falls back only to a working directory that passes the same probe. Existing artifacts under `/var/share/honk` (`LEGACY_DATA_DIR`) remain usable without automatic migration; reused writable state continues to be updated in place. For relative writable artifacts and read-only dependencies, honk checks an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then the existing per-caller legacy candidate (the original config directory for cache, or the working directory for other dependencies), and otherwise returns `<data_dir>/<path>` for creation. Relative logs are creation-only and always use `<data_dir>/<path>`; absolute paths stay literal. Geo assets use an independent regular-file search order: `$DAE_LOCATION_ASSET`, `<data_dir>`, `/var/share/honk`, the working directory, honk share directories, then dae share directories.
 
 See the [global reference](./reference/global.md).
 
@@ -88,6 +96,7 @@ group {
 # Route private destinations directly and web traffic through the group.
 routing {
     # Keep private destinations off the proxy.
+    # This also bypasses private DNS; add && !dport(53) if interception is wanted.
     dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) -> direct(must)
     # Proxy common web ports.
     dport(80, 443) -> proxy
@@ -122,7 +131,7 @@ global {
     log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     bootstrap_resolver: '1.1.1.1:53'
     store_subscribe: true
 }
@@ -132,7 +141,19 @@ node {
 }
 
 subscription {
-    paid: 'https://subscription.example/sub'
+    paid: 'https://subscription.example/sub' {
+        interval: 3600s
+    }
+}
+
+assets {
+    subscription {
+        ua: 'clash.meta'
+    }
+    ui {
+        url: 'https://example.com/dashboard.zip'
+        route: proxy
+    }
 }
 
 group {
@@ -145,6 +166,7 @@ group {
 }
 
 routing {
+    # This also bypasses private DNS; add && !dport(53) if interception is wanted.
     dip(geoip: private) -> direct(must)
     domain(geosite: geolocation-cn) -> direct
     domain(geosite: geolocation-!cn) -> proxy
@@ -173,14 +195,11 @@ experimental {
     clash_api {
         external_controller: '127.0.0.1:9090'
         external_ui: 'ui'
-        external_ui_download_url: 'https://example.com/dashboard.zip'
-        external_ui_download_detour: proxy
         secret: 'replace-me'
         default_mode: 'Rule'
     }
     cache_file {
         enabled: true
-        path: 'cache.db'
         store_dns: true
     }
 }
@@ -211,15 +230,15 @@ See the [node reference](./reference/nodes.md).
 
 ## Building groups
 
-Use `filter: name(...)` for static names, `filter: subtag(...)` for subscription provenance, and `filter: group(...)` for nested groups. Predicates joined by `&&` are ANDed and `!` negates one predicate; separate `filter:` lines are ORed. No filters and no nested groups include all nodes, while nested groups alone do not. Choose `selector`/`fixed`, `urltest`/`min_moving_avg`, `loadbalance`/`roundrobin`, or `fallback`; set `final` for the all-dead result. Group dials always resolve to one leaf node.
+Use `filter: name(...)` for static names, `filter: subtag(...)` for subscription provenance, and `filter: group(...)` for nested groups. Predicates joined by `&&` are ANDed and `!` negates one predicate; separate `filter:` lines are ORed. No filters and no nested groups include all nodes, while nested groups alone do not. Choose `selector`/`fixed`, `urltest`/`min_moving_avg`, `loadbalance`/`roundrobin`, or `fallback`; set `final` for an empty policy selection. Selector TCP and UDP follow the chosen member and never switch to a sibling because of health; the same-leaf TCP last resort does not bypass nested Selector choices. Group dials always resolve to one leaf node. A configuration may define at most 250 top-level user groups; higher ordinals are reserved by the routing ABI.
 
 See the [group reference](./reference/groups.md).
 
 ## Writing routing rules
 
-Rules are source-ordered and use `matcher(...) [&& !matcher(...)] -> outbound`, followed by `fallback: outbound`. Targets are `direct`, `block`, a node, or a group. `direct(must)` marks a non-finalizing must decision that later matches carry forward; Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
+Rules are evaluated by ascending `priority`; the dae parser assigns `0, 1, ...` in source order, and stable equal-priority ordering preserves source order. Targets are `direct`, `block`, or a group; a bare node name is rejected at load — wrap it in a group (e.g. `filter: name('node')`). A `(must)` decision is final: sniffing is skipped, and Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
 
-honk injects `dip(<every configured LAN/WAN interface address>) -> direct(must)` at startup and reload so gateway services do not depend on proxy health. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` keeps that same proxy as a last resort; UDP and all-dead multi-leaf groups remain fail-closed. Keep `dip(geoip: private) -> direct(must)`, point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
+For gateway management and private-DNS bypass, use the [explicit local-rule migration](./reference/routing.md#explicit-local-rules); honk does not synthesize interface rules. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` may retry that same proxy only within current Selector member paths; UDP and all-dead multi-leaf groups remain fail-closed. Point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
 
 See the [routing reference](./reference/routing.md).
 
@@ -245,7 +264,7 @@ dns {
 
 `sip(...)` is request-only and matches the logical DNS client IP against host addresses or CIDRs. Transparent port-53 and `dns.bind` queries use their socket peer; DNS lookups made for an admitted TCP/UDP flow use that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no client source, so neither `sip(...)` nor `!sip(...)` matches and routing falls through. A source-aware flow lookup still has no intercepted DNS-server destination, so selecting `asis` fails closed.
 
-Leave `bind` empty for transparent port-53 interception only. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family for both DNS results and bootstrap-resolved upstream dials; a failed preferred-family dial falls back to the other family.
+Leave `bind` empty to disable only standalone listening, not transparent port-53 interception; [traffic-rule ownership](./reference/routing.md#outbound-targets-and-must) still applies. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family for both DNS results and bootstrap-resolved upstream dials; a failed preferred-family dial falls back to the other family.
 
 `client_subnet` is off by default. Use a fixed IPv4/CIDR for deterministic ECS, or `auto` to infer the first public path hop as a `/24` without DNS or HTTP. Automatic inference is refreshed on reload and network changes; a bounded failure sends no generated ECS. Existing client ECS always wins. See the privacy warning in the reference before enabling it.
 
@@ -253,15 +272,19 @@ See the [DNS reference](./reference/dns.md).
 
 ## Subscriptions
 
-Declare each source as `tag: 'url'`; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `.sub`. Requests use `honk/<version>` unless the subscription's optional `user_agent` overrides it; the cache key uses the configured override (unset or empty is stable), so the versioned default request header does not invalidate stored bodies on upgrade. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. An empty refresh never clears the previous generation. Subscription nodes remain runtime-only. Changing `store_subscribe` requires a restart.
+Declare each source as `tag: 'url'`; add a block after the quoted URL for per-subscription `ua`, `interval`, `cache`, or `route` overrides. `assets.subscription` supplies shared `ua`, `interval`, and `cache` defaults; `assets.route` supplies the download route unless an entry overrides it. The tag is what `subtag(...)` matches. A successfully fetched and parsed raw body is stored in the state db only when `global.store_subscribe` (default `true`) and the entry's effective `cache` are both true. Requests use `honk/<version>` unless the entry or `assets.subscription` sets `ua`; the cache key includes the configured override, so distinct request identities keep distinct stored bodies. Startup restores valid non-empty stored bodies before background refresh; SIGHUP carries active subscription nodes but does not restore from the store. Fetch, parse, or no-usable-node failures keep the active nodes and last valid body. Subscription nodes remain runtime-only. Changing `store_subscribe` requires restart.
 
 See the [subscription reference](./reference/subscription.md).
 
 ## Enabling the Clash API, cache file, and held-first-packet UDP
 
-**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` resolves through `data_dir` and may be downloaded in the background when missing. `external_ui_download_url` selects the ZIP source, while `external_ui_download_detour` forces the download through one node or group; empty values retain the built-in URL and normal traffic routing.
+**Native API.** `native-api` is opt-in: build with `--features native-api` (or `native-ui`); release builds include it. The listener requires `experimental.native_api.enabled: true` and one of a bearer `secret`, `password_auth: true`, or `allow_anonymous_loopback: true` on a loopback `listen`. honk sets no minimum `secret` length; use a long random value. The default address is `127.0.0.1:9527`; explicitly anonymous loopback is for local development only. All effective native fields require restart. An optional `ui` directory needs readable `index.html`; alternatively `--features native-ui` enables `ui: embedded` with pinned real doona. Neither mode downloads/builds the UI at runtime. Traffic/memory histories default on and retain at most 600 points/600 seconds. See [native settings](./reference/experimental.md#native_api) and the [API contract](./reference/api.md#native-api).
 
-**Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` uses `data_dir`, subject to the legacy-path rule above.
+For a captured `.dae` startup, source metadata, offline validation and real reload operations share the existing engine. Configuration reads return accepted content with only listener-secret values masked, including duplicate/overridden values and their other occurrences; credential-bearing sources remain read-only with original-byte hashes. Source `path` remains relative and `absolute_path` adds the canonical absolute path. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. `config_write` defaults false and requires a nonempty secret or `password_auth`. Main-source node/provider creation and deletion, authorized whole-source PUT and restricted Group PATCH reuse this authority; all accepted noncredential includes qualify for source edits when `config_write` is enabled, but not dedicated entry deletion. Configured geodata updates use verified immutable bytes and the same reload owner. Written bytes are not automatically rolled back after activation failure. Avoid concurrent external edits; see [configuration safety](./reference/api.md#accepted-configuration-and-reload-operations) and [entry and geodata management](./reference/api.md#managed-entries-and-geodata).
+
+**Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` prefers an existing directory below `data_dir`, then `/var/share/honk`, then the working directory; if none exists, the dashboard is downloaded under `data_dir`. `assets.ui.url` selects the ZIP source, while `assets.ui.route` selects the download route, defaulting to `assets.route`. Without a configured URL or route, the built-in URL and normal traffic routing apply. `HONK_UI_DOWNLOAD_URL` overrides the ZIP URL.
+
+**Cache file.** By default, Selector choices and delay samples persist in `<data_dir>/state/honk.db`. `experimental.cache_file.enabled: true` also persists the Clash mode and GLOBAL selection, and with `store_dns: true` eligible DNS answers; `enabled: false` persists none of them. `path`, `cache_id` and `store_fakeip` no longer have an effect; the first start imports and removes a legacy `cache.db` ([upgrade notes](./reference/experimental.md#upgrading-from-cachedb)).
 
 **Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. If startup uses mock eBPF, lacks the `ebpf` feature, or fails the fixed-queue preflight, honk logs a warning and disables NFQUEUE for that process without rewriting the config file. After the real-instance lock is acquired, startup binds queue `320` and reclaims the stale owned nftables table before publishing `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate those reserved objects while honk runs.
 
@@ -278,7 +301,7 @@ These mechanisms are independent and bounded by configured groups or explicit bu
 | UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, runs at most 4 attempts concurrently, and caps retained nodes at `4×N`. UDP and Selector ownership are independent. |
 | Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and handshakes per generation. Ready-pool hits, logical streams on warm transports, `direct`, and `block` are exempt; overlapping reload generations also share the startup descriptor gate. |
 
-Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests: cold reusable transports warm outside the timer and close afterward. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
+Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests. Cold reusable transports warm outside the timer and close afterward. The reported latency is the second request on the warmed connection: one round trip, with dial and TLS excluded. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
 
 See the [group selection design](./design/groups.md).
 
@@ -306,7 +329,7 @@ See the [CLI reference](./reference/cli.md).
 2. Ensure every routing rule/fallback, DNS fallback, group `final`, and `->` proxy target names an existing group, node, `direct`, or `block` as appropriate.
 3. For first-connection domain rules, use `dial_mode: domain`/`domain++` or ensure client DNS passes through honk so the domain routing map is populated.
 4. After changing groups or policies, SIGHUP rebuilds `GroupManager`; a still-valid Selector choice migrates to the replacement generation.
-5. Changing `global.nfqueue_enable` requires a restart; when activation is desired, verify the real eBPF backend and startup prerequisites, and ensure the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
+5. Changing `global.nfqueue_enable` requires a restart. To enable staging, verify the real eBPF backend and startup prerequisites, and ensure the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
 6. When adding or changing configuration fixtures, run `cargo test -p honk-config` to keep parser examples valid.
 
 ## Related docs

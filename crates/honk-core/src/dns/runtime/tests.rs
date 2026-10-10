@@ -1,3 +1,6 @@
+mod lifecycle;
+mod release;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -103,12 +106,9 @@ fn runtime_with_outbound(
     );
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
+        udp_query_limit: 256,
         forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            generation,
-            router,
-            Default::default(),
-        )),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime,
         transport: transport.clone(),
     });
@@ -135,44 +135,12 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
     );
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
+        udp_query_limit: 256,
         forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            generation,
-            router,
-            Default::default(),
-        )),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime: None,
         transport: pool,
     })
-}
-
-#[tokio::test]
-async fn old_dns_request_keeps_generation_snapshots_after_publication() {
-    // Given: a request has leased the old runtime generation.
-    let (old, old_transport) = runtime(1, 11);
-    let provider = DnsServiceProvider::new(Arc::clone(&old));
-    let old_lease = provider.acquire();
-    let old_forwarder = Arc::clone(old_lease.runtime().forwarder());
-    let old_cache = old_lease.runtime().cache();
-    let (new, _) = runtime(2, 22);
-
-    // When: the new coherent runtime is published.
-    provider.publish(new);
-    let new_lease = provider.acquire();
-
-    // Then: each lease sees only its own generation's snapshot.
-    assert_eq!(old_lease.runtime().generation(), RuntimeGeneration::new(1));
-    assert_eq!(old_lease.runtime().routing_projection().generation(), 1);
-    assert!(Arc::ptr_eq(old_lease.runtime().forwarder(), &old_forwarder));
-    assert!(Arc::ptr_eq(&old_lease.runtime().cache(), &old_cache));
-    assert_eq!(new_lease.runtime().generation(), RuntimeGeneration::new(2));
-    assert_eq!(new_lease.runtime().routing_projection().generation(), 2);
-    assert!(!Arc::ptr_eq(
-        new_lease.runtime().forwarder(),
-        &old_forwarder
-    ));
-    assert!(!Arc::ptr_eq(&new_lease.runtime().cache(), &old_cache));
-    assert_eq!(old_transport.closes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -195,7 +163,7 @@ async fn lazy_bootstrap_resolution_stays_pinned_to_the_runtime_lease() {
     let provider = Arc::new(DnsServiceProvider::new(runtime_with_bootstrap_pool(
         1, old_pool,
     )));
-    let old_lease = provider.acquire();
+    let old_lease = provider.try_acquire().unwrap();
     let query = crate::dns::forwarder::build_dns_query("example.com", 1);
     let old_query = {
         let query = query.clone();
@@ -205,7 +173,7 @@ async fn lazy_bootstrap_resolution_stays_pinned_to_the_runtime_lease() {
 
     // When
     provider.publish(runtime_with_bootstrap_pool(2, new_pool));
-    let new_lease = provider.acquire();
+    let new_lease = provider.try_acquire().unwrap();
     let new_response = new_lease
         .runtime()
         .forwarder()
@@ -218,6 +186,7 @@ async fn lazy_bootstrap_resolution_stays_pinned_to_the_runtime_lease() {
     // Then
     assert_eq!(&old_response[old_response.len() - 4..], &[192, 0, 2, 10]);
     assert_eq!(&new_response[new_response.len() - 4..], &[198, 51, 100, 20]);
+    drop(new_lease);
     provider.shutdown().await;
 }
 
@@ -250,14 +219,17 @@ async fn publication_does_not_wait_for_old_lease_and_drop_awaits_close() {
     // Given: the old generation has an in-flight lease.
     let (old, transport) = runtime(1, 1);
     let provider = DnsServiceProvider::new(old);
-    let lease = provider.acquire();
+    let lease = provider.try_acquire().unwrap();
     let (new, _) = runtime(2, 2);
 
     // When: publication occurs while the old request remains stalled.
     provider.publish(new);
 
     // Then: new acquisition is immediate and old transport stays open.
-    assert_eq!(provider.acquire().runtime().generation().get(), 2);
+    assert_eq!(
+        provider.try_acquire().unwrap().runtime().generation().get(),
+        2
+    );
     assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
     drop(lease);
     tokio::time::timeout(Duration::from_secs(1), transport.closed.notified())
@@ -272,7 +244,7 @@ async fn retirement_deadline_closes_a_stalled_generation() {
     let before = crate::stats::dns_snapshot();
     let (old, transport) = runtime(1, 1);
     let provider = DnsServiceProvider::new(old);
-    let _lease = provider.acquire();
+    let _lease = provider.try_acquire().unwrap();
     let (new, _) = runtime(2, 2);
     provider.publish(new);
     tokio::task::yield_now().await;
@@ -300,7 +272,7 @@ async fn fifth_retirement_cancels_oldest_and_retains_four() {
     let (oldest, oldest_transport) =
         runtime_with_outbound(0, 0, Some(Arc::clone(&oldest_outbound)));
     let provider = DnsServiceProvider::new(oldest);
-    let oldest_lease = provider.acquire();
+    let oldest_lease = provider.try_acquire().unwrap();
 
     // When: five replacement generations are published.
     for generation in 1..=5 {
@@ -314,6 +286,7 @@ async fn fifth_retirement_cancels_oldest_and_retains_four() {
         .await
         .expect("oldest generation closed at retirement cap");
     assert_eq!(oldest_lease.runtime().state(), RuntimeState::Closed);
+    drop(oldest_lease);
     provider.shutdown().await;
     assert!(
         oldest_outbound.is_shutdown(),
@@ -380,4 +353,176 @@ async fn completed_retirement_supervisors_are_reaped_during_publication() {
         provider.supervisor_count() <= 2,
         "only supervisors from the latest publication may remain"
     );
+}
+struct DropSignal<'a>(&'a BlockingTransport);
+
+impl Drop for DropSignal<'_> {
+    fn drop(&mut self) {
+        let order = self.0.next_order.fetch_add(1, Ordering::AcqRel) + 1;
+        self.0.query_drop_order.store(order, Ordering::Release);
+        self.0.dropped.notify_waiters();
+    }
+}
+
+#[derive(Default)]
+struct BlockingTransport {
+    entered: Notify,
+    dropped: Notify,
+    next_order: AtomicUsize,
+    query_drop_order: AtomicUsize,
+    close_order: AtomicUsize,
+}
+
+#[async_trait]
+impl DnsUpstreamPool for BlockingTransport {
+    async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let _drop_signal = DropSignal(self);
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl RuntimeTransport for BlockingTransport {
+    async fn close(&self) {
+        let order = self.next_order.fetch_add(1, Ordering::AcqRel) + 1;
+        self.close_order.store(order, Ordering::Release);
+    }
+}
+
+fn prefetch_runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
+    let mut config = Config::default();
+    config.dns.routing.fallback = "default".to_owned();
+    let cache = Arc::new(Mutex::new(DnsCache::new(32)));
+    let router = Arc::new(
+        Router::new(&config.routing.rules, &config.routing.default_outbound).expect("valid router"),
+    );
+    let forwarder = Arc::new(DnsForwarder::new(
+        Arc::clone(&transport) as Arc<dyn DnsUpstreamPool>,
+        Arc::clone(&cache),
+        Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("valid DNS router")),
+    ));
+    DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(1),
+        udp_query_limit: 256,
+        forwarder,
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(1, router)),
+        outbound_runtime: None,
+        transport: transport.clone(),
+    })
+}
+
+#[tokio::test]
+async fn retirement_joins_blocked_prefetch_before_transport_close() {
+    let transport = Arc::new(BlockingTransport::default());
+    let runtime = prefetch_runtime(Arc::clone(&transport));
+    runtime
+        .forwarder()
+        .prefetch(&["blocked.example".to_owned()]);
+    transport.entered.notified().await;
+
+    Arc::clone(&runtime).retire(Duration::ZERO).await;
+
+    assert_eq!(transport.query_drop_order.load(Ordering::Acquire), 1);
+    assert_eq!(transport.close_order.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_cancels_every_foreground_entry_path() {
+    use crate::dns::query::{DnsRequestMeta, IngressProfile};
+    use crate::dns::runtime::DnsServiceProvider;
+    use crate::dns::service::DnsService;
+
+    enum Trigger {
+        Deadline,
+        Capacity,
+        Shutdown,
+    }
+    for trigger in [Trigger::Deadline, Trigger::Capacity, Trigger::Shutdown] {
+        let transport = Arc::new(BlockingTransport::default());
+        let old = prefetch_runtime(Arc::clone(&transport));
+        let provider = Arc::new(DnsServiceProvider::new(Arc::clone(&old)));
+        let service = DnsService::with_provider(Arc::clone(&provider));
+        let mut queries = tokio::task::JoinSet::new();
+        for caller in 0..4 {
+            let service = service.clone();
+            queries.spawn(async move {
+                let query = crate::dns::forwarder::build_dns_query("blocked.example", 1);
+                match caller {
+                    0 => service
+                        .resolve(&query, IngressProfile::Api)
+                        .await
+                        .map(|_| ()),
+                    1 => service
+                        .resolve_client_outcome_with_runtime(
+                            &service.provider().unwrap().try_acquire().unwrap(),
+                            &query,
+                            DnsRequestMeta::EMPTY,
+                            IngressProfile::Udp {
+                                advertised_size: 1232,
+                            },
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                    2 => service.resolve_name("blocked.example").await.map(|_| ()),
+                    _ => service
+                        .resolve_name_for_source(
+                            "blocked.example",
+                            "192.0.2.1:12345".parse().unwrap(),
+                        )
+                        .await
+                        .map(|_| ()),
+                }
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.lease_count() != 4 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("all foreground callers acquire their old-generation lease");
+        provider.publish(prefetch_runtime(Arc::new(BlockingTransport::default())));
+        tokio::task::yield_now().await;
+        assert_eq!(old.lease_count(), 4);
+        match trigger {
+            Trigger::Deadline => tokio::time::advance(super::RETIREMENT_DEADLINE).await,
+            Trigger::Capacity => {
+                for _ in 0..super::MAX_RETIRED_RUNTIMES {
+                    provider.publish(prefetch_runtime(Arc::new(BlockingTransport::default())));
+                }
+            }
+            Trigger::Shutdown => {
+                tokio::time::timeout(Duration::from_secs(1), provider.shutdown())
+                    .await
+                    .expect("shutdown cancels pending queries");
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(query) = queries.join_next().await {
+                assert!(query.unwrap().is_err(), "retired query must fail closed");
+            }
+        })
+        .await
+        .expect("retirement must cancel every service entry path");
+        assert_eq!(old.lease_count(), 0);
+        let closed_lease = provider.try_acquire().ok();
+        provider.begin_pause();
+        assert!(transport.query_drop_order.load(Ordering::Acquire) > 0);
+        if let Some(closed_lease) = closed_lease {
+            assert!(
+                closed_lease
+                    .run(std::pin::pin!(async {
+                        panic!("closed runtime must not poll a query")
+                    }))
+                    .await
+                    .is_err()
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), provider.shutdown())
+            .await
+            .expect("final shutdown joins every runtime");
+    }
 }

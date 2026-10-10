@@ -5,6 +5,8 @@
 //! and IPv6 (a full protocol dial through the node), and a proxied latency
 //! measurement (`urltest_node`).
 
+mod udp;
+
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,15 +15,20 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use clap::{Args, ValueEnum};
 use honk_config::Config;
-use honk_config::node::{Node, WireMode};
+use honk_config::node::{Node, VlessMultiplex, VlessTcpPath, VlessUdpMux};
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
+use honk_core::dns::DnsResolver;
 use honk_core::proxy::ProxyRegistry;
 use honk_core::subscription::SubscriptionManager;
 use honk_outbound::reality::parse_reality_config;
 use honk_outbound::urltest::urltest_node;
 use url::Url;
 use uuid::Uuid;
+
+use udp::{
+    UdpCheckTarget, parse_udp_check_target, probe_udp_dns, probe_udp_quic, system_dns_resolver,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum TlsImplementation {
@@ -64,6 +71,7 @@ enum ProbeFailureKind {
     Timeout,
     Exchange,
     Handler,
+    Admission,
 }
 
 impl ProbeFailureKind {
@@ -73,17 +81,26 @@ impl ProbeFailureKind {
             Self::Timeout => "timeout",
             Self::Exchange => "exchange",
             Self::Handler => "handler",
+            Self::Admission => "admission",
         }
     }
 }
 
 #[derive(Args)]
 pub struct SubArgs {
-    /// Subscription URL (http/https) or a local file with one share link per line.
+    /// Subscription URL (http/https) or a local subscription file.
     pub source: String,
     /// Test target for proxied connectivity/latency (host:port).
     #[arg(long, default_value = "cp.cloudflare.com:443")]
     pub target: String,
+    /// UDP DNS check targets; repeat the flag or separate targets with commas.
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        value_delimiter = ',',
+        default_values_t = honk_config::config::GlobalConfig::default().udp_check_dns
+    )]
+    pub udp_check: Vec<String>,
     /// Latency-test URL (defaults to https://www.gstatic.com/generate_204).
     #[arg(long)]
     pub url: Option<String>,
@@ -139,7 +156,23 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
 
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
     let (url_host, url_port) = split_host_port(&args.target)?;
+    let udp_dns = parse_udp_check_target(&args.udp_check)?;
+    let dns_resolver = if matches!(&udp_dns, UdpCheckTarget::Host { .. }) {
+        system_dns_resolver().map(Arc::new)
+    } else {
+        None
+    };
     let timeout = Duration::from_secs(args.timeout);
+    let targets = Arc::new(ProbeTargets {
+        host: url_host.to_string(),
+        port: url_port,
+        url: args.url,
+        timeout,
+        v4: args.v4_target,
+        v6: args.v6_target,
+        udp_dns,
+        dns_resolver,
+    });
 
     let mut set = tokio::task::JoinSet::new();
     let mut pending = nodes.into_iter();
@@ -151,14 +184,7 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
             && let Some(node) = pending.next()
         {
             let registry = Arc::clone(&registry);
-            let targets = Arc::new(ProbeTargets {
-                host: url_host.to_string(),
-                port: url_port,
-                url: args.url.clone(),
-                timeout,
-                v4: args.v4_target,
-                v6: args.v6_target,
-            });
+            let targets = Arc::clone(&targets);
             set.spawn(async move { probe_node(&registry, node, &targets).await });
             running += 1;
         }
@@ -238,7 +264,7 @@ fn parse_subscription_url_from_stdin(input: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-/// Load nodes from a subscription URL or a local share-link file.
+/// Load nodes from a subscription URL or a local subscription file.
 async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
     let source = if args.source == "-" {
         let mut input = String::new();
@@ -250,47 +276,27 @@ async fn load_nodes(args: &SubArgs) -> anyhow::Result<Vec<Node>> {
         args.source.clone()
     };
 
-    if args.source != "-" && std::path::Path::new(&source).exists() {
-        let content =
-            std::fs::read_to_string(&source).with_context(|| format!("read '{}'", args.source))?;
-        return parse_lines(&content);
-    }
-
     let sub = Subscription {
         name: "sub".into(),
         url: source,
         sub_type: SubscriptionType::Custom,
         user_agent: args.ua.clone(),
+        // A one-off probe has no routing to follow.
+        download_detour: "direct".into(),
         ..Default::default()
     };
+    if args.source != "-" && std::path::Path::new(&sub.url).exists() {
+        let content =
+            std::fs::read_to_string(&sub.url).with_context(|| format!("read '{}'", args.source))?;
+        let nodes = honk_core::subscription::parse_subscription_content(&sub, &content)
+            .context("parse subscription file")?;
+        println!("parsed {} node(s)", nodes.len());
+        return Ok(nodes);
+    }
     let manager = SubscriptionManager::new()?;
     let started = Instant::now();
     let nodes = manager.fetch(&sub).await.context("fetch subscription")?;
     println!("fetched {} node(s) in {:?}", nodes.len(), started.elapsed());
-    Ok(nodes)
-}
-
-/// Parse a local file of share links (one per line, `#` comments allowed).
-fn parse_lines(content: &str) -> anyhow::Result<Vec<Node>> {
-    let mut nodes = Vec::new();
-    let mut skipped = 0usize;
-    for line in content.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match Node::from_share_link(line) {
-            Ok(node) => nodes.push(node),
-            Err(_) => skipped += 1,
-        }
-    }
-    if nodes.is_empty() {
-        anyhow::bail!("no valid share links in file");
-    }
-    if skipped > 0 {
-        println!("parsed {} node(s), {skipped} line(s) skipped", nodes.len());
-    } else {
-        println!("parsed {} node(s)", nodes.len());
-    }
     Ok(nodes)
 }
 
@@ -327,22 +333,22 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
         false
     };
 
-    if !matches!(
-        vless.transport.transport.as_str(),
-        "" | "tcp" | "ws" | "grpc"
-    ) {
+    if honk_config::options::vocab::xhttp_stream_transport(&vless.transport.transport).is_err() {
         return ProbeEligibility::ExpectedUnsupported("unsupported-transport");
     }
 
     let flow = vless.flow.as_deref().filter(|flow| !flow.is_empty());
-    if flow.is_some_and(|flow| flow != "xtls-rprx-vision") {
+    let vision = vless.is_vision();
+    if flow.is_some() && !vision {
         return ProbeEligibility::ExpectedUnsupported("unsupported-flow");
     }
-    let vision = flow == Some("xtls-rprx-vision");
-    if vision && !vless.tls.enabled && !reality {
+    if vision && !vless.is_encrypted() && !vless.tls.enabled && !reality {
         return ProbeEligibility::InvalidConfig("vision-without-tls");
     }
-    if vision && matches!(vless.transport.transport.as_str(), "ws" | "grpc") {
+    if vision
+        && !vless.is_encrypted()
+        && (matches!(vless.transport.transport.as_str(), "ws" | "grpc") || node.is_xhttp())
+    {
         return ProbeEligibility::ExpectedUnsupported("vision-non-tcp");
     }
 
@@ -374,22 +380,39 @@ fn vless_shape(node: &Node) -> String {
         "" | "tcp" => "tcp",
         "ws" => "ws",
         "grpc" => "grpc",
+        "xhttp" => "xhttp",
         _ => "unsupported",
     };
-    let vision = if vless.flow.as_deref() == Some("xtls-rprx-vision") {
-        "/vision"
+    let vision = if vless.is_vision() { "/vision" } else { "" };
+    let tcp = match vless.tcp_path() {
+        VlessTcpPath::Direct => "plain",
+        VlessTcpPath::H2 => "h2mux",
+        VlessTcpPath::Cool => "mux-cool",
+    };
+    let (udp_label, udp) = if vless.udp_enabled() {
+        ("udp-fallback", vless.udp_encoding.as_str())
     } else {
-        ""
+        ("udp", "disabled")
     };
-    let wire = match vless.mode {
-        WireMode::Legacy => "",
-        WireMode::UotV2 => "/uot-v2",
-        WireMode::H2mux => "/h2mux",
-        WireMode::H2muxPadded => "/h2mux-padded",
-        WireMode::Xudp => "/xudp",
-        WireMode::MuxCool => "/mux-cool",
+    let mux = match &vless.multiplex {
+        VlessMultiplex::Off => String::new(),
+        VlessMultiplex::H2 { padding } => format!("/padding={padding}"),
+        VlessMultiplex::Xray { tcp, udp, udp443 } => {
+            let tcp = tcp.map_or(0, |limit| limit.get());
+            let udp = match udp {
+                VlessUdpMux::Protocol => "protocol".to_string(),
+                VlessUdpMux::SharedTcp => "shared".to_string(),
+                VlessUdpMux::Separate(limit) => limit.to_string(),
+            };
+            let policy = match udp443 {
+                honk_config::node::Udp443Policy::Reject => "reject",
+                honk_config::node::Udp443Policy::Skip => "skip",
+                honk_config::node::Udp443Policy::Allow => "allow",
+            };
+            format!("/mux={tcp}:{udp}:{policy}")
+        }
     };
-    format!("vless/{carrier}/{transport}{vision}{wire}")
+    format!("vless/{carrier}/{transport}{vision}/tcp={tcp}/{udp_label}={udp}{mux}")
 }
 
 /// Everything a probe run needs to reach the test target.
@@ -400,6 +423,8 @@ struct ProbeTargets {
     timeout: Duration,
     v4: Option<SocketAddr>,
     v6: Option<SocketAddr>,
+    udp_dns: UdpCheckTarget,
+    dns_resolver: Option<Arc<DnsResolver>>,
 }
 
 async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets) -> ProbeOutcome {
@@ -411,53 +436,78 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     if !eligibility.is_supported() {
         return ProbeOutcome::skipped(&node, eligibility);
     }
-
+    // Probes give each phase its own budget, so the node deadline caps every
+    // column separately: one slow column must not erase finished siblings.
     let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
-    match tokio::time::timeout(deadline, probe_supported_node(registry, &node, targets)).await {
-        Ok(outcome) => outcome,
-        Err(_) => ProbeOutcome::timed_out(registry, &node),
+    let timed_out = ProbeOutcome::timed_out(registry, &node, targets);
+    async fn bounded<T>(deadline: Duration, fallback: T, probe: impl Future<Output = T>) -> T {
+        tokio::time::timeout(deadline, probe)
+            .await
+            .unwrap_or(fallback)
     }
-}
-
-async fn probe_supported_node(
-    registry: &ProxyRegistry,
-    node: &Node,
-    targets: &ProbeTargets,
-) -> ProbeOutcome {
-    let server_families = server_families(node).await;
-    let (v4, v6, udp_dns, udp_quic, urltest) = tokio::join!(
-        probe_family(
-            registry,
-            node,
-            &targets.host,
-            targets.port,
-            false,
-            targets.timeout,
-            targets.v4,
+    let (server_families, v4, v6, udp_dns, udp_quic, urltest) = tokio::join!(
+        bounded(deadline, (false, false), server_families(&node)),
+        bounded(
+            deadline,
+            timed_out.v4,
+            probe_family(
+                registry,
+                &node,
+                &targets.host,
+                targets.port,
+                false,
+                targets.timeout,
+                targets.v4,
+            )
         ),
-        probe_family(
-            registry,
-            node,
-            &targets.host,
-            targets.port,
-            true,
-            targets.timeout,
-            targets.v6,
+        bounded(
+            deadline,
+            timed_out.v6,
+            probe_family(
+                registry,
+                &node,
+                &targets.host,
+                targets.port,
+                true,
+                targets.timeout,
+                targets.v6,
+            )
         ),
-        probe_udp_dns(registry, node, targets.timeout),
-        probe_udp_quic(registry, node, &targets.host, 443, targets.timeout),
-        probe_urltest(
-            registry,
-            node,
-            targets.url.as_deref().unwrap_or_default(),
-            targets.timeout,
+        bounded(
+            deadline,
+            timed_out.udp_dns,
+            probe_udp_dns(
+                registry,
+                &node,
+                &targets.udp_dns,
+                targets.dns_resolver.as_deref(),
+                targets.timeout,
+            )
+        ),
+        bounded(
+            deadline.saturating_add(Duration::from_secs(2)),
+            timed_out.udp_quic,
+            probe_udp_quic(
+                registry,
+                &node,
+                &targets.host,
+                targets.port,
+                targets.timeout
+            )
+        ),
+        bounded(
+            deadline,
+            timed_out.urltest,
+            probe_urltest(
+                registry,
+                &node,
+                targets.url.as_deref().unwrap_or_default(),
+                targets.timeout,
+            )
         ),
     );
 
     ProbeOutcome {
-        node_name: node.name.clone(),
-        shape: probe_shape(node),
-        eligibility: ProbeEligibility::Supported,
         server_v4: server_families.0,
         server_v6: server_families.1,
         v4,
@@ -465,6 +515,7 @@ async fn probe_supported_node(
         urltest,
         udp_dns,
         udp_quic,
+        ..timed_out
     }
 }
 
@@ -477,9 +528,14 @@ async fn probe_urltest(
     let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
-    let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
+    let mut guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
+        Ok(guard) => guard,
+        Err(_) => return Some(Err(ProbeFailureKind::Admission)),
+    };
     let measured = urltest_node(&guard.runtime(), entry.tcp.as_ref(), url, timeout).await;
-    guard.close().await;
+    if let Err(error) = guard.close().await {
+        eprintln!("probe runtime cleanup failed: {error}");
+    }
     Some(measured.map_err(|_| ProbeFailureKind::Exchange))
 }
 
@@ -499,12 +555,16 @@ impl ProbeOutcome {
         }
     }
 
-    fn timed_out(registry: &ProxyRegistry, node: &Node) -> Self {
-        let packet_result = registry
+    fn timed_out(registry: &ProxyRegistry, node: &Node, targets: &ProbeTargets) -> Self {
+        let packet_available = registry
             .find(node.protocol())
             .filter(|entry| (entry.descriptor.supports_udp)(node))
             .and_then(|entry| entry.packet.as_ref())
-            .map(|_| Err(ProbeFailureKind::Timeout));
+            .is_some();
+        let packet_result = |port| {
+            (packet_available && honk_outbound::descriptor::udp_target_allowed(node, port))
+                .then_some(Err(ProbeFailureKind::Timeout))
+        };
         Self {
             node_name: node.name.clone(),
             shape: probe_shape(node),
@@ -514,8 +574,8 @@ impl ProbeOutcome {
             v4: Some(Err(ProbeFailureKind::Timeout)),
             v6: Some(Err(ProbeFailureKind::Timeout)),
             urltest: Some(Err(ProbeFailureKind::Timeout)),
-            udp_dns: packet_result,
-            udp_quic: packet_result,
+            udp_dns: packet_result(targets.udp_dns.port()),
+            udp_quic: packet_result(targets.port),
         }
     }
 }
@@ -549,11 +609,10 @@ async fn server_families(node: &Node) -> (bool, bool) {
 }
 
 /// Probe one address family end-to-end: dial the family-specific target
-/// through the node and time the full HTTP HEAD exchange (TLS handshake
-/// included for https targets).  This is what makes the v4/v6 columns
-/// meaningful — a bare dial() return is free for session-multiplexed
-/// protocols (AnyTLS reuses the pooled session and never waits for the
-/// target), so only a real round-trip proves family reachability.
+/// through the node and complete a real HTTP HEAD round trip (so a bare
+/// dial() return, which is free for session-multiplexed protocols, proves
+/// nothing). The reported value follows urltest's warm-path convention —
+/// one round trip over the established connection, setup excluded.
 async fn probe_family(
     registry: &ProxyRegistry,
     node: &Node,
@@ -574,7 +633,10 @@ async fn probe_family(
         return Some(Err(ProbeFailureKind::Handler));
     };
     let url = format!("https://{url_host}/");
-    let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
+    let mut guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
+        Ok(guard) => guard,
+        Err(_) => return Some(Err(ProbeFailureKind::Admission)),
+    };
     let measured = honk_outbound::urltest::urltest_node_addr(
         &guard.runtime(),
         entry.tcp.as_ref(),
@@ -583,7 +645,9 @@ async fn probe_family(
         timeout,
     )
     .await;
-    guard.close().await;
+    if let Err(error) = guard.close().await {
+        eprintln!("probe runtime cleanup failed: {error}");
+    }
     Some(measured.map_err(|_| ProbeFailureKind::Exchange))
 }
 
@@ -638,354 +702,5 @@ fn split_host_port(s: &str) -> anyhow::Result<(&str, u16)> {
     Ok((host, port.parse()?))
 }
 
-/// Tiny xorshift PRNG seeded from the clock (avoids a rand dependency for the
-/// two probe packet builders).
-fn next_rand(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-fn rand_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64 | 1)
-        .unwrap_or(0x9e3779b97f4a7c15)
-}
-
-/// UDP probe: one minimal DNS A query through the node's UDP transport.
-/// Proves the node's UDP relay path end to end (mirrors the engine's
-/// `probe_node_udp` health check).
-async fn probe_udp_dns(
-    registry: &ProxyRegistry,
-    node: &Node,
-    timeout: Duration,
-) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol()) else {
-        return Some(Err(ProbeFailureKind::Handler));
-    };
-    if !(entry.descriptor.supports_udp)(node) {
-        return None;
-    }
-    let packet = entry.packet.as_ref()?;
-    let dns_server = SocketAddr::from(([8, 8, 8, 8], 53));
-    let transport = match packet
-        .dial_udp_transport(node, dns_server, None, timeout)
-        .await
-    {
-        Ok(transport) => transport,
-        Err(_) => return Some(Err(ProbeFailureKind::Exchange)),
-    };
-
-    let mut rng = rand_seed();
-    let id = next_rand(&mut rng) as u16;
-    let mut query = vec![
-        (id >> 8) as u8,
-        id as u8,
-        0x01,
-        0x00,
-        0x00,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-    ];
-    for label in ["google", "com"] {
-        query.push(label.len() as u8);
-        query.extend_from_slice(label.as_bytes());
-    }
-    query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
-
-    let start = Instant::now();
-    if transport.send_packet(&query).await.is_err() {
-        return Some(Err(ProbeFailureKind::Exchange));
-    }
-    let mut buf = [0u8; 512];
-    match tokio::time::timeout(timeout, transport.recv_packet(&mut buf)).await {
-        Ok(Ok((n, _))) if n >= 2 && buf[0] == query[0] && buf[1] == query[1] => {
-            Some(Ok(start.elapsed()))
-        }
-        Ok(Ok(_)) | Ok(Err(_)) => Some(Err(ProbeFailureKind::Exchange)),
-        Err(_) => Some(Err(ProbeFailureKind::Timeout)),
-    }
-}
-
-/// UDP probe for QUIC: run a real QUIC handshake through the node's UDP
-/// transport and time it.  Unlike a bare Version-Negotiation trigger (which
-/// most frontends silently drop), this proves TLS-in-QUIC reachability
-/// through the node's UDP path.
-async fn probe_udp_quic(
-    registry: &ProxyRegistry,
-    node: &Node,
-    url_host: &str,
-    url_port: u16,
-    timeout: Duration,
-) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol()) else {
-        return Some(Err(ProbeFailureKind::Handler));
-    };
-    if !(entry.descriptor.supports_udp)(node) {
-        return None;
-    }
-    let packet = entry.packet.as_ref()?;
-    let addr = match tokio::net::lookup_host((url_host, url_port)).await {
-        Ok(mut addrs) => addrs.find(SocketAddr::is_ipv4)?,
-        Err(_) => return Some(Err(ProbeFailureKind::Resolve)),
-    };
-    let transport = match packet.dial_udp_transport(node, addr, None, timeout).await {
-        Ok(transport) => transport,
-        Err(_) => return Some(Err(ProbeFailureKind::Exchange)),
-    };
-
-    let probe_node = Node {
-        outbound: honk_config::node::OutboundConfig::Hysteria2(
-            honk_config::node::Hysteria2Config {
-                quic: honk_config::node::QuicOptions {
-                    tls: honk_config::node::TlsOptions {
-                        skip_cert_verify: true,
-                        sni: Some(url_host.to_string()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        ),
-        ..Default::default()
-    };
-    let config = match honk_outbound::quic::client_config(
-        &probe_node,
-        &[b"h3"],
-        honk_outbound::quic::QuicClientOptions::default(),
-    )
-    .await
-    {
-        Ok(config) => config,
-        Err(_) => return Some(Err(ProbeFailureKind::Exchange)),
-    };
-
-    Some(
-        honk_outbound::quic::quic_handshake_probe(transport, addr, url_host, &config, timeout)
-            .await
-            .map_err(|_| ProbeFailureKind::Exchange),
-    )
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vless_node() -> Node {
-        Node {
-            name: "vless-test".into(),
-            address: "192.0.2.1:443".into(),
-            host: "192.0.2.1".into(),
-            port: 443,
-            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
-                uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
-                tls: honk_config::node::TlsOptions {
-                    enabled: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn registry_contains_node_dependent_vless_udp() {
-        let registry = ProxyRegistry::default_resolver().unwrap();
-        let entry = registry.find(NodeProtocol::VLess).unwrap();
-        assert_eq!(entry.descriptor.protocol, NodeProtocol::VLess);
-        assert!(entry.probeable.is_some());
-        assert!(entry.packet.is_some());
-        let mut node = vless_node();
-        assert!(!(entry.descriptor.supports_udp)(&node));
-        node.vless_mut().unwrap().mode = WireMode::UotV2;
-        assert!((entry.descriptor.supports_udp)(&node));
-    }
-
-    #[test]
-    fn stdin_subscription_url_rules() {
-        assert_eq!(
-            parse_subscription_url_from_stdin("  https://example.com/feed?token=value\n").unwrap(),
-            "https://example.com/feed?token=value"
-        );
-        assert_eq!(
-            parse_subscription_url_from_stdin("http://127.0.0.1/sub").unwrap(),
-            "http://127.0.0.1/sub"
-        );
-        for invalid in [
-            "",
-            "   \n",
-            "not a URL",
-            "ftp://example.com/sub",
-            "https:///",
-            "https://one.example/sub\nhttps://two.example/sub",
-        ] {
-            assert_eq!(
-                parse_subscription_url_from_stdin(invalid)
-                    .unwrap_err()
-                    .to_string(),
-                "invalid subscription URL from stdin"
-            );
-        }
-    }
-
-    #[test]
-    fn vless_probe_eligibility_precedence_and_reasons() {
-        assert_eq!(
-            classify_vless_node(&vless_node()),
-            ProbeEligibility::Supported
-        );
-
-        let mut node = vless_node();
-        let vless = node.vless_mut().unwrap();
-        vless.uuid = None;
-        vless.tls.reality_short_id = Some("abc".into());
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::InvalidConfig("invalid-uuid")
-        );
-
-        let mut node = vless_node();
-        let vless = node.vless_mut().unwrap();
-        vless.tls.reality_short_id = Some("abc".into());
-        vless.transport.transport = "kcp".into();
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::InvalidConfig("invalid-reality")
-        );
-
-        let mut node = vless_node();
-        node.vless_mut().unwrap().transport.transport = "kcp".into();
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::ExpectedUnsupported("unsupported-transport")
-        );
-
-        let mut node = vless_node();
-        node.vless_mut().unwrap().flow = Some("unsupported-flow-value".into());
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::ExpectedUnsupported("unsupported-flow")
-        );
-
-        let mut node = vless_node();
-        let vless = node.vless_mut().unwrap();
-        vless.tls.enabled = false;
-        vless.flow = Some("xtls-rprx-vision".into());
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::InvalidConfig("vision-without-tls")
-        );
-
-        let mut node = vless_node();
-        let vless = node.vless_mut().unwrap();
-        vless.transport.transport = "ws".into();
-        vless.flow = Some("xtls-rprx-vision".into());
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::ExpectedUnsupported("vision-non-tcp")
-        );
-
-        let mut node = vless_node();
-        node.name.clear();
-        assert_eq!(
-            classify_vless_node(&node),
-            ProbeEligibility::InvalidConfig("invalid-config")
-        );
-    }
-
-    #[test]
-    fn vless_shapes_are_fixed_and_non_identifying() {
-        let mut node = vless_node();
-        let vless = node.vless_mut().unwrap();
-        vless.tls.enabled = false;
-        vless.transport.transport.clear();
-        assert_eq!(vless_shape(&node), "vless/plain/tcp");
-
-        node.vless_mut().unwrap().mode = WireMode::Xudp;
-        assert_eq!(vless_shape(&node), "vless/plain/tcp/xudp");
-        node.vless_mut().unwrap().mode = WireMode::MuxCool;
-        assert_eq!(vless_shape(&node), "vless/plain/tcp/mux-cool");
-        node.vless_mut().unwrap().mode = WireMode::Legacy;
-
-        let vless = node.vless_mut().unwrap();
-        vless.tls.enabled = true;
-        vless.transport.transport = "ws".into();
-        assert_eq!(vless_shape(&node), "vless/tls/ws");
-
-        let vless = node.vless_mut().unwrap();
-        vless.tls.reality_public_key = Some("private-key-material".into());
-        vless.transport.transport = "grpc".into();
-        vless.flow = Some("xtls-rprx-vision".into());
-        assert_eq!(vless_shape(&node), "vless/reality/grpc/vision");
-
-        let vless = node.vless_mut().unwrap();
-        vless.transport.transport = "kcp-secret".into();
-        vless.flow = Some("provider-flow-secret".into());
-        assert_eq!(vless_shape(&node), "vless/reality/unsupported");
-    }
-
-    #[test]
-    fn vless_udp_is_rendered_as_not_applicable() {
-        let registry = ProxyRegistry::default_resolver().unwrap();
-        let outcome = ProbeOutcome::timed_out(&registry, &vless_node());
-        assert_eq!(outcome.udp_dns, None);
-        assert_eq!(outcome.udp_quic, None);
-        let rendered = render_outcome(&outcome);
-        assert!(rendered.contains("dns: n/a"));
-        assert!(rendered.contains("quic: n/a"));
-    }
-
-    #[test]
-    fn vless_udp_mode_is_rendered_as_probeable() {
-        let registry = ProxyRegistry::default_resolver().unwrap();
-        let mut node = vless_node();
-        node.vless_mut().unwrap().mode = WireMode::H2mux;
-        let outcome = ProbeOutcome::timed_out(&registry, &node);
-        assert!(matches!(
-            outcome.udp_dns,
-            Some(Err(ProbeFailureKind::Timeout))
-        ));
-        assert!(render_outcome(&outcome).contains("dns: FAIL(timeout)"));
-        assert_eq!(outcome.shape, "vless/tls/tcp/h2mux");
-    }
-
-    #[test]
-    fn rendered_failures_exclude_connection_identifiers() {
-        let mut node = vless_node();
-        node.host = "sentinel-host.invalid".into();
-        node.address = "sentinel-host.invalid:443".into();
-        let vless = node.vless_mut().unwrap();
-        vless.uuid = Some("sentinel-uuid".into());
-        vless.tls.sni = Some("sentinel-sni.invalid".into());
-        vless.tls.reality_public_key = Some("sentinel-reality-key".into());
-        let outcome = ProbeOutcome::skipped(&node, classify_vless_node(&node));
-        let rendered = render_outcome(&outcome);
-        for sentinel in [
-            "https://sentinel-url.invalid/private?token=secret",
-            "sentinel-host.invalid",
-            "sentinel-uuid",
-            "sentinel-sni.invalid",
-            "sentinel-reality-key",
-        ] {
-            assert!(!rendered.contains(sentinel));
-        }
-
-        for (kind, expected) in [
-            (ProbeFailureKind::Resolve, "FAIL(resolve)"),
-            (ProbeFailureKind::Timeout, "FAIL(timeout)"),
-            (ProbeFailureKind::Exchange, "FAIL(exchange)"),
-            (ProbeFailureKind::Handler, "FAIL(handler)"),
-        ] {
-            assert_eq!(render_probe_result(&Some(Err(kind)), "n/a"), expected);
-        }
-    }
-}
+mod tests;

@@ -17,9 +17,8 @@ pub struct RoutingRule {
     /// Priority (lower = higher priority)
     #[serde(default)]
     pub priority: u32,
-    /// If true, this is a "must" rule: matching it does NOT produce a final
-    /// outbound decision. Instead, the search continues and the must flag is
-    /// propagated to the next matching rule's outbound (Go dae compatible).
+    /// If true, this is a terminal "must" rule: matching it selects the
+    /// outbound and tells the control plane to skip TLS/HTTP sniffing.
     #[serde(default)]
     pub must: bool,
     /// fwmark to set on matched connections (0 = no mark).
@@ -262,8 +261,9 @@ fn clash_api_rule_type(kind: &'static str) -> &'static str {
     }
 }
 
-/// A routing target. Dae and supported structured formats use one node or
-/// group tag; partially wired chain/balancer variants were removed.
+/// A routing target: one group tag or the built-in `direct`/`block`.
+/// `Config::validate` rejects bare node names (they have no eBPF outbound id);
+/// partially wired chain/balancer variants were removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RoutingOutbound {
@@ -286,6 +286,12 @@ pub struct RoutingConfig {
     /// Default outbound when no rules match
     #[serde(default = "default_outbound")]
     pub default_outbound: String,
+    /// Makes the fallback action terminal, like a matched `must` rule.
+    #[serde(default)]
+    pub default_must: bool,
+    /// Fallback direct mark (0 = no mark).
+    #[serde(default)]
+    pub default_mark: u32,
     #[serde(skip)]
     complex_rule_sources: HashMap<String, String>,
 }
@@ -299,6 +305,8 @@ impl Default for RoutingConfig {
         Self {
             rules: vec![],
             default_outbound: "direct".to_string(),
+            default_must: false,
+            default_mark: 0,
             complex_rule_sources: HashMap::new(),
         }
     }

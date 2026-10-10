@@ -1,0 +1,2 @@
+unknown://secret.example:99
+socks5://127.0.0.1:0#invalid

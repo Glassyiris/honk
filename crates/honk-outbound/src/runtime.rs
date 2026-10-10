@@ -11,37 +11,71 @@
 //! AnyTLS, VLESS H2MUX, and VLESS Mux.Cool own node-local session pools here;
 //! QUIC protocols own their per-node client (and shared connection) here.
 
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
-const TLS_ACTIVE_RATIO_NUMERATOR: usize = 1;
-const TLS_ACTIVE_RATIO_DENOMINATOR: usize = 10;
-const TLS_ACTIVE_MIN: usize = 8;
-pub const TLS_IDLE_RETENTION: Duration = Duration::from_secs(10 * 60);
-pub const TLS_REAP_INTERVAL: Duration = Duration::from_secs(60);
+mod admission;
+pub mod flow_observation;
+mod pooled;
+mod tasks;
+pub use tasks::TaskOwner;
+pub use tasks::TaskScope;
+pub(crate) use tasks::{
+    RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
+};
+#[cfg(any(feature = "rprx", test))]
+mod vless;
+
+pub(crate) use admission::pinned_server_address;
+pub(crate) use admission::{
+    CapturedDialAdmission, admit_physical_dial, admit_replacement_dial, capture_dial_admission,
+    capture_dial_scope, start_scoped_dial, try_capture_dial_admission,
+};
+pub use admission::{DialPermit, DialScope};
+#[cfg(any(feature = "rprx", test))]
+pub use vless::VlessRuntime;
 
 use honk_config::node::Node;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
+#[cfg(any(feature = "rprx", test))]
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
+#[cfg(any(feature = "rprx", test))]
+static STANDALONE_VLESS_CARRIERS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(128)));
 
 /// The generation-scoped session runtime a protocol owns, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationRuntime {
     None,
     AnyTls,
-    VlessH2Mux,
-    VlessCoolMux,
+    Vless,
     Quic,
 }
 
 impl GenerationRuntime {
-    pub(crate) fn build(self) -> ProtocolRuntime {
+    pub(crate) fn build(
+        self,
+        node: &Node,
+        metrics_enabled: bool,
+        quality: Arc<crate::transport_quality::TransportQuality>,
+    ) -> ProtocolRuntime {
         match self {
             Self::None => ProtocolRuntime::None,
             Self::AnyTls => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
-            Self::VlessH2Mux => ProtocolRuntime::VlessMux(VlessMuxRuntime::h2()),
-            Self::VlessCoolMux => ProtocolRuntime::VlessMux(VlessMuxRuntime::cool()),
-            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new()),
+            #[cfg(any(feature = "rprx", test))]
+            Self::Vless => ProtocolRuntime::Vless(VlessRuntime::new(
+                node.vless().expect("VLESS runtime requires VLESS config"),
+            )),
+            #[cfg(not(any(feature = "rprx", test)))]
+            Self::Vless => {
+                let _ = node;
+                ProtocolRuntime::None
+            }
+            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new(metrics_enabled, quality)),
         }
     }
 }
@@ -54,8 +88,9 @@ pub enum ProtocolRuntime {
     None,
     /// One node-local AnyTLS session pool.
     AnyTls(AnyTlsRuntime),
-    /// One concrete node-local H2MUX or Mux.Cool session pool.
-    VlessMux(VlessMuxRuntime),
+    /// Node-local VLESS path pools and source-association key.
+    #[cfg(any(feature = "rprx", test))]
+    Vless(VlessRuntime),
     /// Type-erased TUIC, Juicity, or Hysteria2 client slot. Policy warm
     /// ownership may release the cached client before generation retirement.
     Quic(QuicRuntime),
@@ -67,6 +102,8 @@ pub enum ProtocolRuntime {
 #[async_trait::async_trait]
 pub trait QuicRuntimeClient: Send + Sync + 'static {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
+    /// Activate persistent-carrier telemetry without reporting business outcomes.
+    async fn enable_metrics(&self, _quality: Arc<crate::transport_quality::TransportQuality>) {}
     /// Close the cached connection and endpoint, awaiting any in-flight
     /// dial so its late-arriving connection is closed too.
     async fn force_close(&self);
@@ -83,12 +120,15 @@ pub trait QuicRuntimeClient: Send + Sync + 'static {
 /// speculative transport must converge on one reusable client.
 pub struct QuicRuntime {
     state: tokio::sync::Mutex<QuicRuntimeState>,
+    flow_control_profiles: Arc<crate::quic::AdaptiveFlowProfiles>,
+    transport_quality: Arc<crate::transport_quality::TransportQuality>,
 }
 
 #[derive(Default)]
 struct QuicRuntimeState {
     client: Option<Arc<dyn QuicRuntimeClient>>,
     closed: bool,
+    metrics_enabled: bool,
 }
 
 impl std::fmt::Debug for QuicRuntime {
@@ -96,12 +136,23 @@ impl std::fmt::Debug for QuicRuntime {
         f.debug_struct("QuicRuntime").finish_non_exhaustive()
     }
 }
-
 impl QuicRuntime {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        metrics_enabled: bool,
+        transport_quality: Arc<crate::transport_quality::TransportQuality>,
+    ) -> Self {
         Self {
-            state: tokio::sync::Mutex::new(QuicRuntimeState::default()),
+            flow_control_profiles: Arc::new(crate::quic::AdaptiveFlowProfiles::default()),
+            state: tokio::sync::Mutex::new(QuicRuntimeState {
+                metrics_enabled,
+                ..Default::default()
+            }),
+            transport_quality,
         }
+    }
+
+    pub(crate) fn flow_control_profiles(&self) -> Arc<crate::quic::AdaptiveFlowProfiles> {
+        Arc::clone(&self.flow_control_profiles)
     }
 
     pub async fn client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
@@ -121,6 +172,11 @@ impl QuicRuntime {
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"));
         }
         let client = build().await?;
+        if state.metrics_enabled {
+            client
+                .enable_metrics(Arc::clone(&self.transport_quality))
+                .await;
+        }
         state.client = Some(Arc::clone(&client) as Arc<dyn QuicRuntimeClient>);
         Ok(client)
     }
@@ -143,7 +199,17 @@ impl QuicRuntime {
                 .into_erased()
                 .downcast::<T>()
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"))?;
+            if state.metrics_enabled {
+                client
+                    .enable_metrics(Arc::clone(&self.transport_quality))
+                    .await;
+            }
             return Ok(());
+        }
+        if state.metrics_enabled {
+            client
+                .enable_metrics(Arc::clone(&self.transport_quality))
+                .await;
         }
         state.client = Some(client as Arc<dyn QuicRuntimeClient>);
         Ok(())
@@ -182,8 +248,8 @@ impl QuicRuntime {
     }
 }
 
-/// Lazily built TLS state. An in-flight handshake owns an `Arc`, so evicting
-/// the cached reference never invalidates active work.
+/// Lazily built, generation-local TLS state. Contexts are shared per shape in
+/// `tls`, so holding the connector costs a few KiB and needs no idle reaping.
 #[derive(Debug, Default)]
 struct TlsConnectorSlot {
     state: parking_lot::Mutex<TlsConnectorSlotState>,
@@ -191,51 +257,27 @@ struct TlsConnectorSlot {
 
 #[derive(Debug, Default)]
 struct TlsConnectorSlotState {
-    cached: Option<(Arc<crate::tls::TlsConnector>, Instant)>,
-    revision: u64,
+    cached: Option<Arc<crate::tls::TlsConnector>>,
+    closed: bool,
 }
 
 impl TlsConnectorSlot {
     fn get_or_build(&self, node: &Node) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let mut state = self.state.lock();
-        state.revision = state.revision.wrapping_add(1);
-        if let Some((connector, used_at)) = state.cached.as_mut() {
-            *used_at = Instant::now();
+        anyhow::ensure!(!state.closed, "TLS runtime is closed");
+        if let Some(connector) = &state.cached {
             return Ok(Arc::clone(connector));
         }
         let connector = Arc::new(crate::tls::build_connector(node)?);
-        state.cached = Some((Arc::clone(&connector), Instant::now()));
+        state.cached = Some(Arc::clone(&connector));
         Ok(connector)
     }
 
-    fn sample(&self) -> Option<(Instant, u64)> {
-        let state = self.state.lock();
-        state
-            .cached
-            .as_ref()
-            .map(|(_, used_at)| (*used_at, state.revision))
-    }
-
-    fn evict_if_sample(&self, sample: (Instant, u64)) -> bool {
+    // Pool shutdown signals detached factories; it does not join them.
+    fn close(&self) {
         let mut state = self.state.lock();
-        let unchanged = state.revision == sample.1
-            && state
-                .cached
-                .as_ref()
-                .is_some_and(|(_, used_at)| *used_at == sample.0);
-        if !unchanged {
-            return false;
-        }
-        state.cached.take();
-        state.revision = state.revision.wrapping_add(1);
-        true
-    }
-
-    fn evict(&self) {
-        let mut state = self.state.lock();
-        if state.cached.take().is_some() {
-            state.revision = state.revision.wrapping_add(1);
-        }
+        state.closed = true;
+        state.cached = None;
     }
 
     #[cfg(test)]
@@ -244,8 +286,8 @@ impl TlsConnectorSlot {
     }
 }
 
-/// AnyTLS session runtime: the pool stays generation-owned, while expensive
-/// BoringSSL state is materialized only for nodes entering the active set.
+/// AnyTLS session runtime: the pool stays generation-owned, while the TLS
+/// connector is materialized on the first dial.
 #[derive(Debug)]
 pub struct AnyTlsRuntime {
     pub(crate) pool: Arc<crate::proxy::anytls::AnyTlsPool>,
@@ -255,86 +297,13 @@ pub struct AnyTlsRuntime {
 impl AnyTlsRuntime {
     fn new() -> Self {
         Self {
-            pool: Arc::new(crate::session::SessionPool::new(
-                crate::proxy::anytls::session_pool_config(),
-            )),
+            pool: Arc::new(crate::proxy::anytls::AnyTlsPool::new()),
             tls: TlsConnectorSlot::default(),
         }
     }
 }
 
-#[derive(Debug)]
-pub enum VlessMuxRuntime {
-    H2(Arc<crate::proxy::vless_mux::VlessMuxPool>),
-    Cool(Arc<crate::proxy::vless_cool::VlessCoolPool>),
-}
-
-impl VlessMuxRuntime {
-    fn h2() -> Self {
-        Self::H2(Arc::new(crate::session::SessionPool::new(
-            crate::proxy::vless_mux::session_pool_config(),
-        )))
-    }
-
-    fn cool() -> Self {
-        Self::Cool(Arc::new(crate::session::SessionPool::new(
-            crate::proxy::vless_cool::session_pool_config(),
-        )))
-    }
-
-    fn set_warm_retained(&self, retained: bool) {
-        match self {
-            Self::H2(pool) => pool.set_warm_retained(retained),
-            Self::Cool(pool) => pool.set_warm_retained(retained),
-        }
-    }
-
-    fn shutdown(&self) {
-        match self {
-            Self::H2(pool) => pool.shutdown(),
-            Self::Cool(pool) => pool.shutdown(),
-        }
-    }
-
-    fn retire(&self) {
-        match self {
-            Self::H2(pool) => pool.retire(),
-            Self::Cool(pool) => pool.retire(),
-        }
-    }
-
-    fn has_usable_session(&self) -> bool {
-        match self {
-            Self::H2(pool) => pool.has_usable_session(),
-            Self::Cool(pool) => pool.has_usable_session(),
-        }
-    }
-
-    fn live_session_count(&self) -> usize {
-        match self {
-            Self::H2(pool) => pool.live_session_count(),
-            Self::Cool(pool) => pool.live_session_count(),
-        }
-    }
-
-    #[cfg(test)]
-    fn is_warm_retained(&self) -> bool {
-        match self {
-            Self::H2(pool) => pool.is_warm_retained(),
-            Self::Cool(pool) => pool.is_warm_retained(),
-        }
-    }
-
-    #[cfg(test)]
-    fn is_retired(&self) -> bool {
-        match self {
-            Self::H2(pool) => pool.is_retired(),
-            Self::Cool(pool) => pool.is_retired(),
-        }
-    }
-}
-
-/// Live warm-state gauge of one runtime: retained AnyTLS/VLESS mux sessions
+/// Live warm-state gauge of one runtime: retained AnyTLS/VLESS/XHTTP sessions
 /// and one occupied QUIC client slot (`None` = count unknown under lock
 /// contention, to be treated as warm rather than cold).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,98 +345,111 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub udp_capable: bool,
     pub runtime: ProtocolRuntime,
+    /// Transport-owned physical H2 sessions, independent of protocol UDP/mux state.
+    pub(crate) xhttp: Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>>,
+    transport_quality: Arc<crate::transport_quality::TransportQuality>,
     /// One-shot runtime outside any generation (see [`Self::ephemeral`]).
     /// Session protocols skip their standby janitor for these: there is no
     /// long-lived owner to keep warm state for, only [`Self::close`] to
     /// release it deterministically.
     ephemeral: bool,
+    #[cfg(feature = "owned-tasks")]
+    task_owner: Option<Arc<tasks::TaskOwner>>,
     /// Serializes warm establishment and release while tracking independent
     /// selector/UDP owners across runtime reuse on reload.
     warm_retention: Arc<tokio::sync::Mutex<u8>>,
-}
-
-/// Warm establishment transaction. Cancellation rolls back only a bit this
-/// attempt inserted; QUIC cleanup rechecks the bitmap after reacquiring the
-/// lock so it cannot dismantle a successor attempt's client.
-pub(crate) struct WarmAttempt {
-    runtime: Arc<NodeRuntime>,
-    retention: Option<tokio::sync::OwnedMutexGuard<u8>>,
-    reason: WarmRetention,
-    inserted: bool,
-}
-
-impl WarmAttempt {
-    pub(crate) fn commit(mut self) {
-        self.retention.take();
-    }
-
-    pub(crate) async fn rollback(mut self) {
-        let retention = self
-            .retention
-            .take()
-            .expect("live warm attempt owns the retention lock");
-        if self.inserted {
-            self.runtime
-                .release_warm_locked(retention, self.reason)
-                .await;
-        }
-    }
-}
-
-impl Drop for WarmAttempt {
-    fn drop(&mut self) {
-        if !self.inserted {
-            return;
-        }
-        let Some(mut retention) = self.retention.take() else {
-            return;
-        };
-        *retention &= !self.reason.bit();
-        if *retention != 0 {
-            return;
-        }
-        match &self.runtime.runtime {
-            ProtocolRuntime::AnyTls(runtime) => {
-                runtime.pool.set_warm_retained(false);
-                runtime.tls.evict();
-            }
-            ProtocolRuntime::VlessMux(runtime) => runtime.set_warm_retained(false),
-            ProtocolRuntime::Quic(_) => {
-                drop(retention);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let runtime = Arc::clone(&self.runtime);
-                    handle.spawn(async move { runtime.release_if_unretained().await });
-                }
-            }
-            ProtocolRuntime::None => {}
-        }
-    }
+    #[cfg(any(feature = "rprx", test))]
+    vless_carriers: Arc<tokio::sync::Semaphore>,
 }
 
 impl NodeRuntime {
-    /// A generation-free runtime for one-shot callers (standalone probing,
-    /// tests): session protocols get a throwaway pool per runtime. The
-    /// caller MUST [`Self::close`] it when done — an unclosed ephemeral
-    /// pool keeps its demux-held sessions (and their connections) open
-    /// forever. Prefer [`Self::ephemeral_guarded`], which closes on drop.
-    pub fn ephemeral(node: &Node) -> Arc<Self> {
-        Arc::new(Self {
-            node: Arc::new(node.clone()),
-            udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
-            runtime: crate::descriptor::descriptor(node.protocol())
-                .generation_runtime(node)
-                .build(),
-            ephemeral: true,
-            warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
-        })
+    fn build_xhttp(node: &Node) -> Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>> {
+        #[cfg(not(any(feature = "rprx", test)))]
+        if node.protocol() == honk_config::types::NodeProtocol::VLess {
+            return None;
+        }
+        crate::proxy::transport::xhttp::XhttpRuntime::new(node)
     }
 
-    /// [`Self::ephemeral`] wrapped in an ownership guard whose Drop starts
-    /// the close, so timeout/abort paths that simply drop the probe future
-    /// cannot leak the session-layer resources.
-    pub fn ephemeral_guarded(node: &Node) -> EphemeralRuntimeGuard {
+    fn build(
+        node: &Node,
+        ephemeral: bool,
+        #[cfg(feature = "owned-tasks")] task_owner: Option<Arc<tasks::TaskOwner>>,
+        #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<Self> {
+        let transport_quality = Arc::new(crate::transport_quality::TransportQuality::default());
+        let build = || {
+            Arc::new(Self {
+                node: Arc::new(node.clone()),
+                udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
+                runtime: crate::descriptor::descriptor(node.protocol())
+                    .generation_runtime
+                    .build(node, !ephemeral, Arc::clone(&transport_quality)),
+                xhttp: Self::build_xhttp(node),
+                ephemeral,
+                transport_quality,
+                #[cfg(feature = "owned-tasks")]
+                task_owner: task_owner.clone(),
+                warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
+                #[cfg(any(feature = "rprx", test))]
+                vless_carriers,
+            })
+        };
+        #[cfg(feature = "owned-tasks")]
+        return tasks::sync_scope_owner(task_owner.as_ref().map(Arc::downgrade), build);
+        #[cfg(not(feature = "owned-tasks"))]
+        build()
+    }
+
+    fn build_ephemeral_with_vless_carriers(
+        node: &Node,
+        #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<Self> {
+        Self::build(
+            node,
+            true,
+            #[cfg(feature = "owned-tasks")]
+            Some(Arc::new(tasks::TaskOwner::default())),
+            #[cfg(any(feature = "rprx", test))]
+            vless_carriers,
+        )
+    }
+
+    fn build_ephemeral(node: &Node) -> Arc<Self> {
+        Self::build_ephemeral_with_vless_carriers(
+            node,
+            #[cfg(any(feature = "rprx", test))]
+            Arc::clone(&STANDALONE_VLESS_CARRIERS),
+        )
+    }
+
+    /// Validate a node before any one-shot runtime state is cloned or built.
+    pub(crate) fn validate_for_ephemeral(node: &Node) -> Result<(), RuntimeRegistryError> {
+        honk_config::node::validate_node_collection(std::slice::from_ref(node))
+            .map_err(RuntimeRegistryError::Admission)
+    }
+
+    /// Admit a canonical node and build a generation-free one-shot runtime.
+    ///
+    /// Rejects nil IDs, intrinsic errors and stale IDs before allocating sessions.
+    /// The caller must [`Self::close`] session-owning runtimes when done; prefer
+    /// [`Self::try_ephemeral_guarded`] for cleanup on cancellation or drop.
+    pub fn try_ephemeral(node: &Node) -> Result<Arc<Self>, RuntimeRegistryError> {
+        Self::validate_for_ephemeral(node)?;
+        Ok(Self::build_ephemeral(node))
+    }
+
+    /// [`Self::try_ephemeral`] with an ownership guard that closes on drop.
+    pub fn try_ephemeral_guarded(
+        node: &Node,
+    ) -> Result<EphemeralRuntimeGuard, RuntimeRegistryError> {
+        Self::validate_for_ephemeral(node)?;
+        Ok(Self::ephemeral_guarded_after_admission(node))
+    }
+
+    pub(crate) fn ephemeral_guarded_after_admission(node: &Node) -> EphemeralRuntimeGuard {
         EphemeralRuntimeGuard {
-            runtime: Some(Self::ephemeral(node)),
+            runtime: Some(Self::build_ephemeral(node)),
         }
     }
 
@@ -475,91 +457,43 @@ impl NodeRuntime {
         self.ephemeral
     }
 
-    pub(crate) async fn retain_warm(self: &Arc<Self>, reason: WarmRetention) -> WarmAttempt {
-        let mut retention = Arc::clone(&self.warm_retention).lock_owned().await;
-        let bit = reason.bit();
-        let inserted = *retention & bit == 0;
-        let was_unretained = *retention == 0;
-        *retention |= bit;
-        if was_unretained {
-            match &self.runtime {
-                ProtocolRuntime::AnyTls(runtime) => runtime.pool.set_warm_retained(true),
-                ProtocolRuntime::VlessMux(runtime) => runtime.set_warm_retained(true),
-                ProtocolRuntime::None | ProtocolRuntime::Quic(_) => {}
-            }
+    /// Scope protocol jobs to this runtime, never to a caller's probe owner.
+    /// Callers retain and drain their own dialing future before final shutdown.
+    pub fn scope_tasks<T, F>(&self, future: F) -> impl Future<Output = anyhow::Result<T>>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        #[cfg(feature = "owned-tasks")]
+        match &self.task_owner {
+            Some(owner) => futures_util::future::Either::Left(owner.scope(future)),
+            None => futures_util::future::Either::Right(tasks::scope_owner(None, future)),
         }
-        WarmAttempt {
-            runtime: Arc::clone(self),
-            retention: Some(retention),
-            reason,
-            inserted,
-        }
+        #[cfg(not(feature = "owned-tasks"))]
+        future
     }
 
-    async fn release_warm_state(&self) {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => {
-                runtime.pool.set_warm_retained(false);
-                runtime.tls.evict();
-            }
-            ProtocolRuntime::VlessMux(runtime) => runtime.set_warm_retained(false),
-            ProtocolRuntime::Quic(runtime) => runtime.release_warm().await,
-            ProtocolRuntime::None => {}
+    pub(crate) fn task_scope(&self) -> TaskScope {
+        #[cfg(feature = "owned-tasks")]
+        if let Some(owner) = &self.task_owner {
+            return owner.task_scope();
         }
+        TaskScope::default()
     }
 
-    async fn release_warm_locked(
-        self: &Arc<Self>,
-        mut retention: tokio::sync::OwnedMutexGuard<u8>,
-        reason: WarmRetention,
-    ) {
-        let bit = reason.bit();
-        if *retention & bit == 0 {
-            return;
-        }
-        *retention &= !bit;
-        if *retention != 0 {
-            return;
-        }
-        if matches!(&self.runtime, ProtocolRuntime::Quic(_)) {
-            drop(retention);
-            let runtime = Arc::clone(self);
-            // Spawn before awaiting so cancellation of the releasing caller
-            // cannot strand a client after the ownership bit reached zero.
-            let cleanup = tokio::spawn(async move { runtime.release_if_unretained().await });
-            let _ = cleanup.await;
-        } else {
-            self.release_warm_state().await;
-        }
+    /// Advisory evidence belongs to this runtime, not merely its reusable node ID.
+    pub fn transport_quality(&self) -> Arc<crate::transport_quality::TransportQuality> {
+        Arc::clone(&self.transport_quality)
     }
 
-    /// Finish cancellation-driven QUIC cleanup after the owned guard drops.
-    /// A successor may have retained the runtime meanwhile, so zero is
-    /// revalidated under the same lock before releasing the client slot.
-    async fn release_if_unretained(self: Arc<Self>) {
-        let retention = Arc::clone(&self.warm_retention).lock_owned().await;
-        if *retention == 0 {
-            self.release_warm_state().await;
-        }
-    }
-
-    /// Release one policy's warm ownership. A later selection may warm this
-    /// runtime again; active logical flows are never cut.
-    pub async fn release_warm(self: &Arc<Self>, reason: WarmRetention) {
-        let retention = Arc::clone(&self.warm_retention).lock_owned().await;
-        self.release_warm_locked(retention, reason).await;
-    }
-
-    /// Close every session-layer resource this runtime owns: AnyTLS or VLESS
-    /// mux pool sessions (connections + drivers), or one cached QUIC client
-    /// (connection + endpoint driver). Terminal for the runtime; idempotent.
-    pub async fn close(&self) {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.pool.shutdown(),
-            ProtocolRuntime::VlessMux(runtime) => runtime.shutdown(),
-            ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
-            ProtocolRuntime::None => {}
-        }
+    /// Whether an owned protocol task panicked, including already reaped tasks.
+    pub fn tasks_failed(&self) -> bool {
+        #[cfg(feature = "owned-tasks")]
+        return self
+            .task_owner
+            .as_ref()
+            .is_some_and(|owner| owner.has_failed());
+        #[cfg(not(feature = "owned-tasks"))]
+        false
     }
 
     pub(crate) fn anytls_pool(&self) -> anyhow::Result<Arc<crate::proxy::anytls::AnyTlsPool>> {
@@ -569,24 +503,68 @@ impl NodeRuntime {
         Ok(Arc::clone(&runtime.pool))
     }
 
-    #[cfg_attr(not(feature = "rprx"), allow(dead_code))]
+    #[cfg(feature = "rprx")]
     pub(crate) fn vless_h2_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_mux::VlessMuxPool>> {
-        let ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(pool)) = &self.runtime else {
-            anyhow::bail!("node '{}' has no VLESS H2MUX runtime", self.node.name);
+    ) -> anyhow::Result<Arc<crate::proxy::vless::mux::VlessMuxPool>> {
+        let ProtocolRuntime::Vless(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };
-        Ok(Arc::clone(pool))
+        runtime.h2_pool()
     }
 
-    #[cfg_attr(not(feature = "rprx"), allow(dead_code))]
-    pub(crate) fn vless_cool_pool(
+    #[cfg(feature = "rprx")]
+    pub(crate) fn vless_shared_cool_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_cool::VlessCoolPool>> {
-        let ProtocolRuntime::VlessMux(VlessMuxRuntime::Cool(pool)) = &self.runtime else {
-            anyhow::bail!("node '{}' has no VLESS Mux.Cool runtime", self.node.name);
+    ) -> anyhow::Result<Arc<crate::proxy::vless::cool::VlessCoolPool>> {
+        let ProtocolRuntime::Vless(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };
-        Ok(Arc::clone(pool))
+        runtime.shared_cool_pool()
+    }
+
+    #[cfg(feature = "rprx")]
+    pub(crate) fn vless_separate_cool_pool(
+        &self,
+    ) -> anyhow::Result<Arc<crate::proxy::vless::cool::VlessCoolPool>> {
+        let ProtocolRuntime::Vless(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
+        };
+        runtime.separate_cool_pool()
+    }
+
+    #[cfg(any(feature = "rprx", test))]
+    pub fn vless_source_id(
+        &self,
+        client: std::net::SocketAddr,
+        path: honk_config::node::VlessUdpPath,
+        reply_destination: Option<std::net::SocketAddr>,
+    ) -> anyhow::Result<[u8; 8]> {
+        let ProtocolRuntime::Vless(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
+        };
+        Ok(runtime.source_id(client, path, reply_destination))
+    }
+
+    #[cfg(any(feature = "rprx", test))]
+    pub(crate) fn acquire_vless_carrier(
+        &self,
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.vless_carriers)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(crate::proxy::PacketRejection::Capacity))
+    }
+
+    /// Physical-carrier slot the node's protocol bounds process-wide, if any.
+    /// Transports hold it for the carrier's lifetime without naming protocols.
+    pub(crate) fn acquire_carrier_permit(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        #[cfg(any(feature = "rprx", test))]
+        if self.node.protocol() == honk_config::types::NodeProtocol::VLess {
+            return self.acquire_vless_carrier().map(Some);
+        }
+        Ok(None)
     }
 
     pub(crate) async fn quic_client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
@@ -598,7 +576,16 @@ impl NodeRuntime {
         let ProtocolRuntime::Quic(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no QUIC runtime", self.node.name);
         };
-        runtime.client(build).await
+        self.scope_tasks(runtime.client(build)).await
+    }
+
+    pub(crate) fn quic_flow_control_profiles(
+        &self,
+    ) -> anyhow::Result<Arc<crate::quic::AdaptiveFlowProfiles>> {
+        let ProtocolRuntime::Quic(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no QUIC runtime", self.node.name);
+        };
+        Ok(runtime.flow_control_profiles())
     }
 
     pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
@@ -608,53 +595,29 @@ impl NodeRuntime {
         runtime.tls.get_or_build(&self.node)
     }
 
-    /// Whether one-shot work should use this generation instead of an
-    /// ephemeral runtime. Stateless protocols are always safe; session
-    /// protocols qualify only when a reusable session/client exists or a
-    /// QUIC client build already holds the slot lock.
-    pub fn is_warm_or_stateless(&self) -> bool {
-        match &self.runtime {
-            ProtocolRuntime::None => true,
-            ProtocolRuntime::AnyTls(runtime) => runtime.pool.has_usable_session(),
-            ProtocolRuntime::VlessMux(runtime) => runtime.has_usable_session(),
-            ProtocolRuntime::Quic(runtime) => runtime.client_count().is_none_or(|count| count != 0),
-        }
+    /// Whether one-shot work for `requirement` should reuse this generation.
+    /// Stateless paths are always safe; pooled paths qualify only when their
+    /// selected pool already has a reusable session/client.
+    pub fn is_warm_or_stateless_for(&self, requirement: crate::proxy::WarmRequirement) -> bool {
+        self.pools_are_warm_for(requirement)
+            && match &self.runtime {
+                ProtocolRuntime::Quic(runtime) => {
+                    runtime.client_count().is_none_or(|count| count != 0)
+                }
+                _ => true,
+            }
     }
 
     /// Live reusable state: AnyTLS/VLESS sessions or one occupied QUIC client slot.
     /// `clients` is `None` while the slot lock is held; callers treat that
     /// in-flight state as warm rather than pruning its attribution.
     pub fn warm_counts(&self) -> WarmCounts {
-        match &self.runtime {
-            ProtocolRuntime::None => WarmCounts::default(),
-            ProtocolRuntime::AnyTls(runtime) => WarmCounts {
-                sessions: runtime.pool.live_session_count(),
-                clients: Some(0),
+        WarmCounts {
+            sessions: self.pooled_session_count(),
+            clients: match &self.runtime {
+                ProtocolRuntime::Quic(runtime) => runtime.client_count(),
+                _ => Some(0),
             },
-            ProtocolRuntime::VlessMux(runtime) => WarmCounts {
-                sessions: runtime.live_session_count(),
-                clients: Some(0),
-            },
-            ProtocolRuntime::Quic(runtime) => WarmCounts {
-                sessions: 0,
-                clients: runtime.client_count(),
-            },
-        }
-    }
-
-    fn tls_connector_sample(&self) -> Option<(Instant, u64)> {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.sample(),
-            ProtocolRuntime::None | ProtocolRuntime::VlessMux(_) | ProtocolRuntime::Quic(_) => None,
-        }
-    }
-
-    fn evict_tls_connector_if_sample(&self, sample: (Instant, u64)) -> bool {
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.evict_if_sample(sample),
-            ProtocolRuntime::None | ProtocolRuntime::VlessMux(_) | ProtocolRuntime::Quic(_) => {
-                false
-            }
         }
     }
 
@@ -662,12 +625,14 @@ impl NodeRuntime {
     pub(crate) fn tls_connector_loaded(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
-            ProtocolRuntime::None | ProtocolRuntime::VlessMux(_) | ProtocolRuntime::Quic(_) => {
-                false
-            }
+            ProtocolRuntime::None | ProtocolRuntime::Vless(_) | ProtocolRuntime::Quic(_) => false,
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("outbound runtime cleanup failed")]
+pub struct RuntimeCleanupError;
 
 /// Ownership guard for an ephemeral [`NodeRuntime`]: Drop initiates the
 /// close, so a probe future dropped mid-flight (timeout, task abort) still
@@ -689,29 +654,53 @@ impl EphemeralRuntimeGuard {
     }
 
     /// Initiate the close without awaiting it: idempotent and Drop-safe.
-    /// AnyTLS/VLESS mux pool teardown is synchronous and completes here;
-    /// QUIC client teardown awaits locks, so it is handed to a runtime-driven
-    /// task when one is available.
+    /// This signals background work but does not join it; native supervisors
+    /// retain the runtime and await [`NodeRuntime::close`] before releasing work.
     pub fn request_close(&mut self) {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        match &runtime.runtime {
-            ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
-            ProtocolRuntime::VlessMux(vless) => vless.shutdown(),
-            ProtocolRuntime::Quic(_) => {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move { runtime.close().await });
-                }
-            }
-            ProtocolRuntime::None => {}
+        #[cfg(feature = "owned-tasks")]
+        if let Some(owner) = &runtime.task_owner {
+            owner.abort();
+        }
+        runtime.shutdown_pools();
+        if matches!(&runtime.runtime, ProtocolRuntime::Quic(_))
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move { runtime.close().await });
         }
     }
 
-    /// Close the runtime and await full teardown.
-    pub async fn close(mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.close().await;
+    /// Close and join all owned work. Cancelling this waiter retains ownership
+    /// in the guard so another waiter can finish the same teardown. Once a call
+    /// completes, later calls return `Ok(())`; an error only reports that an
+    /// owned task failed, after teardown has finished.
+    pub async fn close(&mut self) -> Result<(), RuntimeCleanupError> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(());
+        };
+        runtime.close().await;
+        let result = if runtime.tasks_failed() {
+            Err(RuntimeCleanupError)
+        } else {
+            Ok(())
+        };
+        self.runtime.take();
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_xhttp(
+        node: &Node,
+        xhttp: Arc<crate::proxy::transport::xhttp::XhttpRuntime>,
+    ) -> Self {
+        let mut runtime = NodeRuntime::try_ephemeral(node).unwrap();
+        Arc::get_mut(&mut runtime)
+            .expect("a fresh ephemeral runtime is unshared")
+            .xhttp = Some(xhttp);
+        Self {
+            runtime: Some(runtime),
         }
     }
 }
@@ -726,26 +715,20 @@ impl Drop for EphemeralRuntimeGuard {
 /// the parse-time `created_at`/`updated_at` stamps (metadata, not dial
 /// configuration).
 fn same_node_config(a: &Node, b: &Node) -> bool {
-    let (mut a, b) = (a.clone(), b.clone());
+    let mut a = a.clone();
     a.created_at = b.created_at;
     a.updated_at = b.updated_at;
-    a == b
+    &a == b
 }
 
 /// Registry build/validation errors. A failure here aborts the reload
 /// (the current generation stays live).
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeRegistryError {
-    #[error("node '{0}' has a nil UUID")]
-    NilId(String),
-    #[error("duplicate node UUID {0} (nodes '{1}' and '{2}')")]
-    DuplicateId(uuid::Uuid, String, String),
-    #[error("node '{node}' has invalid TLS configuration: {source}")]
-    Tls {
-        node: String,
-        #[source]
-        source: anyhow::Error,
-    },
+    #[error("registry node admission failed")]
+    Admission(#[source] honk_config::error::DetailedConfigError),
+    #[error("node TLS configuration rejected")]
+    Tls(#[source] Option<std::io::Error>),
 }
 
 /// The single owner of per-node session runtimes for one config
@@ -754,6 +737,7 @@ pub enum RuntimeRegistryError {
 /// through to a newer generation.
 #[derive(Debug)]
 pub struct OutboundRuntimeRegistry {
+    generation: u64,
     nodes: HashMap<uuid::Uuid, Arc<NodeRuntime>>,
     terminal: AtomicBool,
     /// Runtimes a successor generation took over at the reload commit point.
@@ -761,167 +745,19 @@ pub struct OutboundRuntimeRegistry {
     /// leaves this generation's ownership untouched; drain/shutdown skip
     /// exactly these entries (the successor closes them as their full owner).
     moved_out: parking_lot::Mutex<HashSet<uuid::Uuid>>,
-    /// Generation-local configured admission budget. The process-wide
-    /// descriptor gate below is shared by every overlapping generation.
+    /// Generation-local configured admission budget. DNS forks share the
+    /// source generation's semaphore so one config generation cannot exceed
+    /// its configured aggregate dial limit.
     dial_semaphore: Arc<tokio::sync::Semaphore>,
     dial_limit: usize,
+    /// Process-wide descriptor gate shared by every overlapping generation.
     dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
     dial_ceiling_limit: usize,
-}
-#[derive(Clone)]
-struct DialAdmission {
-    generation: Arc<tokio::sync::Semaphore>,
-    process: Arc<tokio::sync::Semaphore>,
-}
-
-impl DialAdmission {
-    fn for_registry(registry: &OutboundRuntimeRegistry) -> Self {
-        Self {
-            generation: Arc::clone(&registry.dial_semaphore),
-            process: Arc::clone(&registry.dial_ceiling_semaphore),
-        }
-    }
-
-    fn standalone() -> Self {
-        STANDALONE_DIAL_ADMISSION.clone()
-    }
-
-    fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
-        Arc::ptr_eq(&self.generation, &registry.dial_semaphore)
-            && Arc::ptr_eq(&self.process, &registry.dial_ceiling_semaphore)
-    }
-
-    async fn acquire(self) -> DialPermit {
-        let generation = Arc::clone(&self.generation)
-            .acquire_owned()
-            .await
-            .expect("dial semaphore is never closed");
-        let process = Arc::clone(&self.process)
-            .acquire_owned()
-            .await
-            .expect("dial ceiling semaphore is never closed");
-        DialPermit {
-            _generation: generation,
-            _process: process,
-        }
-    }
-}
-
-static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| DialAdmission {
-    generation: Arc::new(tokio::sync::Semaphore::new(
-        tokio::sync::Semaphore::MAX_PERMITS,
-    )),
-    process: Arc::new(tokio::sync::Semaphore::new(
-        tokio::sync::Semaphore::MAX_PERMITS,
-    )),
-});
-
-type DialStart = Arc<parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
-
-#[derive(Default)]
-struct HeldDialPermits {
-    first: Option<DialPermit>,
-    extra: Vec<DialPermit>,
-}
-
-struct DialScope {
-    admission: DialAdmission,
-    held: parking_lot::Mutex<HeldDialPermits>,
-    on_start: Option<DialStart>,
-}
-
-impl DialScope {
-    fn new(admission: DialAdmission, on_start: Option<DialStart>) -> Arc<Self> {
-        Arc::new(Self {
-            admission,
-            held: parking_lot::Mutex::new(HeldDialPermits::default()),
-            on_start,
-        })
-    }
-
-    fn start(&self) {
-        let callback = self
-            .on_start
-            .as_ref()
-            .and_then(|callback| callback.lock().take());
-        if let Some(callback) = callback {
-            callback();
-        }
-    }
-}
-
-tokio::task_local! {
-    static DIAL_SCOPE: Arc<DialScope>;
-}
-
-/// One physical proxy dial admitted by both its generation and the shared
-/// process descriptor partition.
-pub struct DialPermit {
-    _generation: tokio::sync::OwnedSemaphorePermit,
-    _process: tokio::sync::OwnedSemaphorePermit,
-}
-
-#[derive(Clone)]
-pub(crate) struct CapturedDialScope(Arc<DialScope>);
-
-impl CapturedDialScope {
-    fn standalone() -> Self {
-        Self(DialScope::new(DialAdmission::standalone(), None))
-    }
-
-    pub(crate) async fn scope<F>(self, future: F) -> F::Output
-    where
-        F: Future,
-    {
-        DIAL_SCOPE.scope(self.0, future).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn matches_registry(&self, registry: &OutboundRuntimeRegistry) -> bool {
-        self.0.admission.matches_registry(registry)
-    }
-}
-
-pub(crate) fn capture_dial_scope() -> CapturedDialScope {
-    DIAL_SCOPE
-        .try_with(|scope| CapturedDialScope(Arc::clone(scope)))
-        .unwrap_or_else(|_| CapturedDialScope::standalone())
-}
-
-pub(crate) fn try_capture_dial_admission() -> Option<CapturedDialScope> {
-    DIAL_SCOPE
-        .try_with(|scope| CapturedDialScope(DialScope::new(scope.admission.clone(), None)))
-        .ok()
-}
-
-pub(crate) fn capture_dial_admission() -> CapturedDialScope {
-    try_capture_dial_admission().unwrap_or_else(CapturedDialScope::standalone)
-}
-
-pub(crate) async fn admit_physical_dial<T, E, F>(future: F) -> Result<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    let scope = DIAL_SCOPE.try_with(Arc::clone).ok();
-    let permit = match &scope {
-        Some(scope) => scope.admission.clone().acquire().await,
-        None => DialAdmission::standalone().acquire().await,
-    };
-    if let Some(scope) = &scope {
-        scope.start();
-    }
-    let result = future.await;
-    if result.is_ok()
-        && let Some(scope) = scope
-    {
-        let mut held = scope.held.lock();
-        if held.first.is_none() {
-            held.first = Some(permit);
-        } else {
-            held.extra.push(permit);
-        }
-    }
-    result
+    #[cfg(feature = "owned-tasks")]
+    own_node_tasks: bool,
+    background_tasks: std::sync::LazyLock<Arc<tasks::TaskOwner>>,
+    #[cfg(any(feature = "rprx", test))]
+    vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -939,6 +775,27 @@ impl OutboundRuntimeRegistry {
         .map(|(registry, _)| registry)
     }
 
+    /// Admit a cold one-shot runtime using this generation's shared carrier budget.
+    /// The caller must scope dials to this registry and close the returned guard.
+    #[cfg(feature = "owned-tasks")]
+    pub fn try_ephemeral_guarded(
+        &self,
+        node: &Node,
+    ) -> Result<EphemeralRuntimeGuard, RuntimeRegistryError> {
+        NodeRuntime::validate_for_ephemeral(node)?;
+        Ok(self.ephemeral_guarded_after_admission(node))
+    }
+
+    pub(crate) fn ephemeral_guarded_after_admission(&self, node: &Node) -> EphemeralRuntimeGuard {
+        EphemeralRuntimeGuard {
+            runtime: Some(NodeRuntime::build_ephemeral_with_vless_carriers(
+                node,
+                #[cfg(any(feature = "rprx", test))]
+                Arc::clone(&self.vless_carrier_semaphore),
+            )),
+        }
+    }
+
     /// Build with a generation-local dial limit. Descriptor-aware owners that
     /// overlap generations should use [`Self::build_reusing_with_dial_ceiling`].
     pub fn build_reusing(
@@ -946,23 +803,62 @@ impl OutboundRuntimeRegistry {
         max_concurrent_dials: usize,
         previous: Option<&Self>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
-        let dial_ceiling_limit = max_concurrent_dials.max(1);
+        let dial_ceiling_limit = previous.map_or(max_concurrent_dials.max(1), |previous| {
+            previous.dial_ceiling_limit
+        });
+        #[cfg(any(feature = "rprx", test))]
+        let vless_carriers = previous.map_or_else(
+            || Arc::clone(&STANDALONE_VLESS_CARRIERS),
+            |previous| Arc::clone(&previous.vless_carrier_semaphore),
+        );
         Self::build_reusing_with_admission(
             nodes,
             max_concurrent_dials,
-            Arc::new(tokio::sync::Semaphore::new(dial_ceiling_limit)),
+            previous.map_or_else(
+                || Arc::new(tokio::sync::Semaphore::new(dial_ceiling_limit)),
+                |previous| Arc::clone(&previous.dial_ceiling_semaphore),
+            ),
             dial_ceiling_limit,
+            #[cfg(any(feature = "rprx", test))]
+            vless_carriers,
+            previous.is_some_and(Self::owns_tasks),
             previous,
         )
     }
 
-    /// Build while sharing one immutable process-wide dial descriptor ceiling
+    /// Build a DNS-owned runtime fork from this generation's immutable node
+    /// configuration. The fork owns fresh protocol sessions and terminal
+    /// lifecycle state, while sharing this generation's dial admission and
+    /// startup dial/VLESS-carrier ceilings.
+    pub fn fork_for_dns(&self) -> Result<Self, RuntimeRegistryError> {
+        let nodes: Vec<Node> = self
+            .nodes
+            .values()
+            .map(|runtime| runtime.node.as_ref().clone())
+            .collect();
+        let (mut fork, _) = Self::build_reusing_with_admission(
+            &nodes,
+            self.dial_limit,
+            Arc::clone(&self.dial_ceiling_semaphore),
+            self.dial_ceiling_limit,
+            #[cfg(any(feature = "rprx", test))]
+            Arc::clone(&self.vless_carrier_semaphore),
+            self.owns_tasks(),
+            None,
+        )?;
+        fork.dial_semaphore = Arc::clone(&self.dial_semaphore);
+        Ok(fork)
+    }
+
+    /// Build while sharing immutable process-wide dial and VLESS carrier ceilings
     /// with `previous`. A successor may change its generation-local configured
-    /// limit, but old and new permits together never exceed the startup gate.
+    /// dial limit, but old and new lifetime permits never exceed the startup gates.
     pub fn build_reusing_with_dial_ceiling(
         nodes: &[Node],
         max_concurrent_dials: usize,
         startup_dial_ceiling: usize,
+        startup_vless_carrier_ceiling: usize,
+        own_tasks: bool,
         previous: Option<&Self>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         let (dial_ceiling_semaphore, dial_ceiling_limit) = match previous {
@@ -975,11 +871,21 @@ impl OutboundRuntimeRegistry {
                 (Arc::new(tokio::sync::Semaphore::new(limit)), limit)
             }
         };
+        #[cfg(any(feature = "rprx", test))]
+        let vless_carrier_semaphore = previous.map_or_else(
+            || Arc::new(tokio::sync::Semaphore::new(startup_vless_carrier_ceiling)),
+            |previous| Arc::clone(&previous.vless_carrier_semaphore),
+        );
+        #[cfg(not(any(feature = "rprx", test)))]
+        let _ = startup_vless_carrier_ceiling;
         Self::build_reusing_with_admission(
             nodes,
             max_concurrent_dials,
             dial_ceiling_semaphore,
             dial_ceiling_limit,
+            #[cfg(any(feature = "rprx", test))]
+            vless_carrier_semaphore,
+            own_tasks,
             previous,
         )
     }
@@ -989,26 +895,44 @@ impl OutboundRuntimeRegistry {
         max_concurrent_dials: usize,
         dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
         dial_ceiling_limit: usize,
+        #[cfg(any(feature = "rprx", test))] vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
+        own_tasks: bool,
         previous: Option<&Self>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
+        honk_config::node::validate_node_collection(nodes)
+            .map_err(RuntimeRegistryError::Admission)?;
+        let own_tasks = cfg!(feature = "owned-tasks") && own_tasks;
         let mut map = HashMap::with_capacity(nodes.len());
         let mut reused = HashSet::new();
         for node in nodes {
-            if node.id.is_nil() {
-                return Err(RuntimeRegistryError::NilId(node.name.clone()));
-            }
             // Validate cheap, fail-closed TLS inputs before publishing the
             // generation. The heavyweight SSL_CTX/root store stays lazy.
-            if node.tls().is_some_and(|tls| tls.enabled) {
-                crate::tls::validate_connector_config(node).map_err(|source| {
-                    RuntimeRegistryError::Tls {
-                        node: node.name.clone(),
-                        source,
-                    }
+            if node
+                .tls()
+                .is_some_and(|tls| tls.enabled || !tls.alpn.is_empty())
+            {
+                crate::tls::validate_connector_config(node).map_err(|error| {
+                    // Preserve typed I/O failures without retaining paths or raw TLS values.
+                    RuntimeRegistryError::Tls(error.chain().find_map(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .map(|error| std::io::Error::from(error.kind()))
+                    }))
                 })?;
             }
             let reused_runtime = previous.and_then(|previous| {
+                if previous.is_shutdown() || previous.owns_tasks() != own_tasks {
+                    return None;
+                }
                 let runtime = previous.get(&node.id)?;
+                #[cfg(feature = "owned-tasks")]
+                if runtime
+                    .task_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.is_closed())
+                {
+                    return None;
+                }
                 same_node_config(&runtime.node, node).then_some(runtime)
             });
             let runtime = match reused_runtime {
@@ -1016,28 +940,20 @@ impl OutboundRuntimeRegistry {
                     reused.insert(node.id);
                     runtime
                 }
-                None => Arc::new(NodeRuntime {
-                    node: Arc::new(node.clone()),
-                    udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(
-                        node,
-                    ),
-                    runtime: crate::descriptor::descriptor(node.protocol())
-                        .generation_runtime(node)
-                        .build(),
-                    ephemeral: false,
-                    warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
-                }),
+                None => NodeRuntime::build(
+                    node,
+                    false,
+                    #[cfg(feature = "owned-tasks")]
+                    own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
+                    #[cfg(any(feature = "rprx", test))]
+                    Arc::clone(&vless_carrier_semaphore),
+                ),
             };
-            if let Some(prev) = map.insert(node.id, runtime) {
-                return Err(RuntimeRegistryError::DuplicateId(
-                    node.id,
-                    prev.node.name.clone(),
-                    node.name.clone(),
-                ));
-            }
+            map.insert(node.id, runtime);
         }
         Ok((
             Self {
+                generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
                 nodes: map,
                 terminal: AtomicBool::new(false),
                 moved_out: parking_lot::Mutex::new(HashSet::new()),
@@ -1047,14 +963,50 @@ impl OutboundRuntimeRegistry {
                 dial_limit: max_concurrent_dials.max(1).min(dial_ceiling_limit),
                 dial_ceiling_semaphore,
                 dial_ceiling_limit,
+                #[cfg(feature = "owned-tasks")]
+                own_node_tasks: own_tasks,
+                background_tasks: std::sync::LazyLock::new(|| {
+                    Arc::new(tasks::TaskOwner::production())
+                }),
+                #[cfg(any(feature = "rprx", test))]
+                vless_carrier_semaphore,
             },
             reused,
         ))
     }
 
+    fn owns_tasks(&self) -> bool {
+        #[cfg(feature = "owned-tasks")]
+        return self.own_node_tasks;
+        #[cfg(not(feature = "owned-tasks"))]
+        false
+    }
+
+    /// Spawn generation-local deposits, never accepted flows or reused-node drivers.
+    pub fn spawn_background<F>(&self, future: F) -> Option<tokio::task::AbortHandle>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if self.is_shutdown() {
+            if let Some(owner) = std::sync::LazyLock::get(&self.background_tasks) {
+                owner.sync_scope(|| drop(future));
+            }
+            return None;
+        }
+        let owner = std::sync::LazyLock::force(&self.background_tasks);
+        if self.is_shutdown() {
+            owner.abort();
+        }
+        owner.spawn(future)
+    }
+
     /// Wrap into the shared cell used by the control plane.
     pub fn into_shared(self) -> SharedRuntimeRegistry {
         Arc::new(parking_lot::RwLock::new(Arc::new(self)))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn get(&self, id: &uuid::Uuid) -> Option<Arc<NodeRuntime>> {
@@ -1074,40 +1026,21 @@ impl OutboundRuntimeRegistry {
         self.nodes.is_empty()
     }
 
-    /// Retain the most recently used AnyTLS connectors as the hot working set.
-    /// Idle entries are always released; under a broad burst, the newest 10%
-    /// (at least eight) remain ready so common nodes avoid connector rebuilds.
-    pub fn reap_tls_connectors(&self, now: Instant) -> usize {
-        let anytls_count = self
-            .nodes
-            .values()
-            .filter(|runtime| matches!(runtime.runtime, ProtocolRuntime::AnyTls(_)))
-            .count();
-        let target = anytls_count
-            .saturating_mul(TLS_ACTIVE_RATIO_NUMERATOR)
-            .div_ceil(TLS_ACTIVE_RATIO_DENOMINATOR)
-            .max(TLS_ACTIVE_MIN)
-            .min(anytls_count);
-        let mut loaded: Vec<_> = self
-            .nodes
-            .values()
-            .filter_map(|runtime| {
-                runtime
-                    .tls_connector_sample()
-                    .map(|sample| (sample, runtime))
-            })
-            .collect();
-        loaded.sort_unstable_by_key(|((used_at, _), _)| std::cmp::Reverse(*used_at));
-
-        let mut evicted = 0;
-        for (index, (sample, runtime)) in loaded.into_iter().enumerate() {
-            if (index >= target || now.saturating_duration_since(sample.0) >= TLS_IDLE_RETENTION)
-                && runtime.evict_tls_connector_if_sample(sample)
-            {
-                evicted += 1;
+    /// Reap finished tasks and idle VLESS/XHTTP carriers above explicit or runtime
+    /// warm retention.
+    pub fn reap_idle_resources(&self) -> usize {
+        if let Some(owner) = std::sync::LazyLock::get(&self.background_tasks) {
+            owner.reap();
+        }
+        #[cfg(feature = "owned-tasks")]
+        {
+            for runtime in self.nodes.values() {
+                if let Some(owner) = &runtime.task_owner {
+                    owner.reap();
+                }
             }
         }
-        evicted
+        self.reap_session_pools()
     }
 
     /// Whether this generation has become terminal. Warm-up work must reject
@@ -1116,49 +1049,21 @@ impl OutboundRuntimeRegistry {
         self.terminal.load(Ordering::Acquire)
     }
 
-    /// Configured admission ceiling for this immutable generation.
-    pub fn dial_limit(&self) -> usize {
-        self.dial_limit
-    }
-
-    /// Acquire generation-local admission before the shared process gate so
-    /// low configured limits cannot hoard process capacity while waiting.
-    pub async fn acquire_dial_permit(&self) -> DialPermit {
-        DialAdmission::for_registry(self).acquire().await
-    }
-
-    /// Bind physical attempts made by `future` to this generation's gates.
-    /// Nested dispatch through the same registry keeps the existing scope.
-    pub async fn scope_dials<F>(&self, future: F) -> F::Output
-    where
-        F: Future,
-    {
-        if DIAL_SCOPE
-            .try_with(|scope| scope.admission.matches_registry(self))
-            .unwrap_or(false)
+    /// Sticky task failure status for this generation's retained ownership.
+    pub fn tasks_failed(&self) -> bool {
+        if std::sync::LazyLock::get(&self.background_tasks).is_some_and(|owner| owner.has_failed())
         {
-            return future.await;
+            return true;
         }
-        DIAL_SCOPE
-            .scope(
-                DialScope::new(DialAdmission::for_registry(self), None),
-                future,
-            )
-            .await
-    }
-
-    /// As [`Self::scope_dials`], starting feedback at the first admitted
-    /// physical attempt. A warm logical dial starts feedback on completion.
-    pub async fn scope_dials_with_start<F, C>(&self, future: F, on_start: C) -> F::Output
-    where
-        F: Future,
-        C: FnOnce() + Send + 'static,
-    {
-        let callback: DialStart = Arc::new(parking_lot::Mutex::new(Some(Box::new(on_start))));
-        let scope = DialScope::new(DialAdmission::for_registry(self), Some(callback));
-        let output = DIAL_SCOPE.scope(Arc::clone(&scope), future).await;
-        scope.start();
-        output
+        #[cfg(feature = "owned-tasks")]
+        {
+            let moved_out = self.moved_out.lock();
+            self.nodes
+                .iter()
+                .any(|(id, runtime)| !moved_out.contains(id) && runtime.tasks_failed())
+        }
+        #[cfg(not(feature = "owned-tasks"))]
+        false
     }
 
     /// Make the generation unavailable to new generation-owned work without
@@ -1166,16 +1071,8 @@ impl OutboundRuntimeRegistry {
     /// captured this generation starts pool draining after its leases retire.
     pub fn begin_retirement(&self) {
         self.terminal.store(true, Ordering::Release);
-    }
-
-    /// Rebind autonomous AnyTLS replacement dials after this generation is
-    /// published. Reused pools must stop consulting the predecessor's gate.
-    pub fn activate_background_dial_admission(&self) {
-        let scope = CapturedDialScope(DialScope::new(DialAdmission::for_registry(self), None));
-        for runtime in self.nodes.values() {
-            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
-                anytls.pool.set_dial_scope(scope.clone());
-            }
+        if let Some(owner) = std::sync::LazyLock::get(&self.background_tasks) {
+            owner.abort();
         }
     }
 
@@ -1187,23 +1084,19 @@ impl OutboundRuntimeRegistry {
         self.moved_out.lock().extend(ids);
     }
 
-    /// Reject new pool work and let published sessions close after their last
-    /// stream releases. Existing streams remain usable while draining.
-    /// Runtimes transferred to a successor generation are left alone. QUIC
-    /// connections need no drain step: new work is rejected by the terminal
-    /// flag at the registry checks, and in-flight flows keep their
-    /// connections until they finish.
-    pub fn drain_session_pools(&self) {
+    /// Reject new reusable work and release every non-flow resource after the
+    /// generation's leases drain. Active streams and QUIC flows keep their
+    /// own handles. Runtimes transferred to a successor are left untouched.
+    pub async fn retire_reusable_state(&self) {
         self.begin_retirement();
-        let moved_out = self.moved_out.lock();
+        let moved_out: HashSet<uuid::Uuid> = self.moved_out.lock().clone();
         for (id, runtime) in &self.nodes {
             if moved_out.contains(id) {
                 continue;
             }
-            match &runtime.runtime {
-                ProtocolRuntime::AnyTls(anytls) => anytls.pool.retire(),
-                ProtocolRuntime::VlessMux(vless) => vless.retire(),
-                ProtocolRuntime::None | ProtocolRuntime::Quic(_) => {}
+            runtime.retire_pools();
+            if let ProtocolRuntime::Quic(quic) = &runtime.runtime {
+                quic.release_warm().await;
             }
         }
     }
@@ -1212,8 +1105,21 @@ impl OutboundRuntimeRegistry {
     /// drain; unlike retirement this deliberately terminates all sessions.
     /// Idempotent, including after [`Self::begin_retirement`].
     pub async fn shutdown(&self) {
-        self.terminal.store(true, Ordering::Release);
+        self.begin_retirement();
         let moved_out: HashSet<uuid::Uuid> = self.moved_out.lock().clone();
+        #[cfg(feature = "owned-tasks")]
+        {
+            for (id, runtime) in &self.nodes {
+                if !moved_out.contains(id)
+                    && let Some(owner) = &runtime.task_owner
+                {
+                    owner.abort();
+                }
+            }
+        }
+        if let Some(owner) = std::sync::LazyLock::get(&self.background_tasks) {
+            owner.close().await;
+        }
         for (id, runtime) in &self.nodes {
             if moved_out.contains(id) {
                 continue;
@@ -1224,703 +1130,4 @@ impl OutboundRuntimeRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use honk_config::types::NodeProtocol;
-    use std::sync::atomic::AtomicUsize;
-
-    fn node(name: &str, protocol: NodeProtocol) -> Node {
-        Node {
-            id: uuid::Uuid::new_v4(),
-            name: name.to_string(),
-            address: "1.2.3.4:443".to_string(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
-            ..Default::default()
-        }
-    }
-
-    fn vless_node(name: &str, mode: honk_config::node::WireMode) -> Node {
-        let mut node = node(name, NodeProtocol::VLess);
-        node.vless_mut().unwrap().mode = mode;
-        node
-    }
-
-    #[test]
-    fn vless_registry_runtime_follows_wire_mode() {
-        use honk_config::node::WireMode;
-        for (mode, expected) in [
-            (WireMode::Legacy, 0),
-            (WireMode::UotV2, 0),
-            (WireMode::Xudp, 0),
-            (WireMode::H2mux, 1),
-            (WireMode::H2muxPadded, 1),
-            (WireMode::MuxCool, 2),
-        ] {
-            let node = vless_node("vless", mode);
-            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-            let actual = match &registry.get(&node.id).unwrap().runtime {
-                ProtocolRuntime::None => 0,
-                ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_)) => 1,
-                ProtocolRuntime::VlessMux(VlessMuxRuntime::Cool(_)) => 2,
-                _ => panic!("unexpected VLESS runtime"),
-            };
-            assert_eq!(actual, expected);
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeQuicClient {
-        force_closed: AtomicBool,
-        warm_released: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl QuicRuntimeClient for FakeQuicClient {
-        fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
-            self
-        }
-
-        async fn force_close(&self) {
-            self.force_closed.store(true, Ordering::Release);
-        }
-
-        async fn release_warm(&self) {
-            self.warm_released.store(true, Ordering::Release);
-        }
-    }
-
-    #[test]
-    fn anytls_connector_is_lazy_shared_and_generation_local() {
-        let node = node("anytls", NodeProtocol::AnyTLS);
-        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let first_runtime = first.get(&node.id).unwrap();
-        assert!(!first_runtime.tls_connector_loaded());
-        let first_connector = first_runtime.anytls_tls_connector().unwrap();
-        assert!(first_runtime.tls_connector_loaded());
-        let same_connector = first.get(&node.id).unwrap().anytls_tls_connector().unwrap();
-        assert!(Arc::ptr_eq(&first_connector, &same_connector));
-
-        let reloaded = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let reloaded_connector = reloaded
-            .get(&node.id)
-            .unwrap()
-            .anytls_tls_connector()
-            .unwrap();
-        assert!(!Arc::ptr_eq(&first_connector, &reloaded_connector));
-    }
-
-    #[tokio::test]
-    async fn warm_retention_releases_only_after_last_owner() {
-        for node in [
-            node("anytls-retained", NodeProtocol::AnyTLS),
-            vless_node("vless-retained", honk_config::node::WireMode::H2mux),
-        ] {
-            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-            let runtime = registry.get(&node.id).unwrap();
-
-            runtime.retain_warm(WarmRetention::Selector).await.commit();
-            runtime.retain_warm(WarmRetention::Udp).await.commit();
-            let retained = || match &runtime.runtime {
-                ProtocolRuntime::AnyTls(anytls) => anytls.pool.is_warm_retained(),
-                ProtocolRuntime::VlessMux(vless) => vless.is_warm_retained(),
-                _ => panic!("session protocol must own a pool"),
-            };
-            assert!(retained());
-
-            runtime.release_warm(WarmRetention::Selector).await;
-            assert!(retained());
-
-            runtime.release_warm(WarmRetention::Udp).await;
-            assert!(!retained());
-        }
-    }
-
-    #[test]
-    fn refreshed_connector_rejects_stale_reaper_sample() {
-        let node = node("anytls", NodeProtocol::AnyTLS);
-        let slot = TlsConnectorSlot::default();
-        let first = slot.get_or_build(&node).unwrap();
-        let stale_sample = slot.sample().unwrap();
-
-        let refreshed = slot.get_or_build(&node).unwrap();
-        assert!(Arc::ptr_eq(&first, &refreshed));
-        assert!(!slot.evict_if_sample(stale_sample));
-        assert!(slot.is_loaded());
-
-        assert!(slot.evict_if_sample(slot.sample().unwrap()));
-        assert!(!slot.is_loaded());
-    }
-
-    #[test]
-    fn reap_keeps_recent_active_ratio_and_rebuilds_evicted_connectors() {
-        let nodes: Vec<_> = (0..20)
-            .map(|index| node(&format!("anytls-{index}"), NodeProtocol::AnyTLS))
-            .collect();
-        let registry = OutboundRuntimeRegistry::build(&nodes).unwrap();
-        let loaded: Vec<_> = nodes
-            .iter()
-            .map(|node| {
-                let runtime = registry.get(&node.id).unwrap();
-                let connector = runtime.anytls_tls_connector().unwrap();
-                (runtime, connector)
-            })
-            .collect();
-
-        assert_eq!(registry.reap_tls_connectors(Instant::now()), 12);
-        assert_eq!(
-            loaded
-                .iter()
-                .filter(|(runtime, _)| runtime.tls_connector_loaded())
-                .count(),
-            8
-        );
-        let evicted = loaded
-            .iter()
-            .find(|(runtime, _)| !runtime.tls_connector_loaded())
-            .unwrap();
-        let rebuilt = evicted.0.anytls_tls_connector().unwrap();
-        assert!(!Arc::ptr_eq(&evicted.1, &rebuilt));
-    }
-
-    #[test]
-    fn reap_drops_idle_connector_even_inside_hot_ratio() {
-        let node = node("anytls", NodeProtocol::AnyTLS);
-        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let runtime = registry.get(&node.id).unwrap();
-        runtime.anytls_tls_connector().unwrap();
-        assert_eq!(
-            registry.reap_tls_connectors(Instant::now() + TLS_IDLE_RETENTION),
-            1
-        );
-        assert!(!runtime.tls_connector_loaded());
-    }
-
-    #[tokio::test]
-    async fn warm_resources_report_session_state_only() {
-        let anytls = node("anytls", NodeProtocol::AnyTLS);
-        let trojan = node("trojan", NodeProtocol::Trojan);
-        let tuic = node("tuic", NodeProtocol::Tuic);
-        let registry =
-            OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone(), tuic.clone()])
-                .unwrap();
-
-        let anytls_runtime = registry.get(&anytls.id).unwrap();
-        let tuic_runtime = registry.get(&tuic.id).unwrap();
-        assert!(!anytls_runtime.is_warm_or_stateless());
-        assert!(!tuic_runtime.is_warm_or_stateless());
-        assert!(
-            registry.get(&trojan.id).unwrap().is_warm_or_stateless(),
-            "session-less protocols have nothing to retain either way"
-        );
-
-        struct FakeClient;
-        #[async_trait::async_trait]
-        impl QuicRuntimeClient for FakeClient {
-            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
-                self
-            }
-            async fn force_close(&self) {}
-            async fn release_warm(&self) {}
-        }
-        let ProtocolRuntime::Quic(quic) = &tuic_runtime.runtime else {
-            panic!("tuic runtime expected");
-        };
-        quic.client(|| async { Ok(Arc::new(FakeClient)) })
-            .await
-            .unwrap();
-        assert!(tuic_runtime.is_warm_or_stateless());
-    }
-
-    #[tokio::test]
-    async fn build_and_get_roundtrip() {
-        let nodes = vec![
-            node("a", NodeProtocol::AnyTLS),
-            node("b", NodeProtocol::Trojan),
-        ];
-        let registry = OutboundRuntimeRegistry::build(&nodes).unwrap();
-        assert_eq!(registry.len(), 2);
-        let rt = registry.get(&nodes[0].id).unwrap();
-        assert_eq!(rt.node.name, "a");
-        assert!(rt.udp_capable);
-        registry.shutdown().await; // terminal cleanup is idempotent
-    }
-
-    #[test]
-    fn rejects_nil_uuid() {
-        let mut n = node("nil", NodeProtocol::Trojan);
-        n.id = uuid::Uuid::nil();
-        let err = OutboundRuntimeRegistry::build(&[n]).unwrap_err();
-        assert!(matches!(err, RuntimeRegistryError::NilId(_)));
-    }
-
-    #[test]
-    fn rejects_duplicate_uuid() {
-        let a = node("a", NodeProtocol::Trojan);
-        let mut b = node("b", NodeProtocol::SS);
-        b.id = a.id;
-        let err = OutboundRuntimeRegistry::build(&[a, b]).unwrap_err();
-        assert!(matches!(err, RuntimeRegistryError::DuplicateId(..)));
-    }
-
-    #[test]
-    fn explicit_dial_limit_is_generation_owned() {
-        let (registry, _) = OutboundRuntimeRegistry::build_reusing(&[], 7, None).unwrap();
-        assert_eq!(registry.dial_limit(), 7);
-        let (minimum, _) = OutboundRuntimeRegistry::build_reusing(&[], 0, None).unwrap();
-        assert_eq!(minimum.dial_limit(), 1);
-    }
-
-    #[tokio::test]
-    async fn overlapping_generations_share_the_startup_dial_ceiling() {
-        let (first, _) =
-            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, None).unwrap();
-        let mut held = Vec::new();
-        for _ in 0..3 {
-            held.push(first.acquire_dial_permit().await);
-        }
-
-        let (second, _) =
-            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, Some(&first))
-                .unwrap();
-        assert_eq!(second.dial_limit(), 4);
-        held.push(second.acquire_dial_permit().await);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), second.acquire_dial_permit())
-                .await
-                .is_err()
-        );
-
-        drop(held.pop());
-        tokio::time::timeout(Duration::from_millis(100), second.acquire_dial_permit())
-            .await
-            .expect("released process capacity must admit the successor");
-    }
-
-    #[tokio::test]
-    async fn one_dial_permit_serializes_real_tcp_fallbacks() {
-        struct Active(Arc<AtomicUsize>);
-        impl Drop for Active {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
-        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_addr = first_listener.local_addr().unwrap();
-        let second_addr = second_listener.local_addr().unwrap();
-        let addrs = [first_addr, second_addr];
-        let release_first = Arc::new(tokio::sync::Notify::new());
-        let first_started = Arc::new(tokio::sync::Notify::new());
-        let second_started = Arc::new(tokio::sync::Notify::new());
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let registry = Arc::new(
-            crate::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
-                .unwrap()
-                .0,
-        );
-
-        let dial = tokio::spawn({
-            let release_first = Arc::clone(&release_first);
-            let first_started = Arc::clone(&first_started);
-            let second_started = Arc::clone(&second_started);
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            let generation = Arc::clone(&registry);
-            async move {
-                generation
-                    .scope_dials(async move {
-                        crate::address_race::race_resolved_addrs_with_stagger(
-                            &addrs,
-                            Duration::ZERO,
-                            move |addr| {
-                                let release_first = Arc::clone(&release_first);
-                                let first_started = Arc::clone(&first_started);
-                                let second_started = Arc::clone(&second_started);
-                                let active = Arc::clone(&active);
-                                let peak = Arc::clone(&peak);
-                                async move {
-                                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                                    peak.fetch_max(now, Ordering::SeqCst);
-                                    let _active = Active(active);
-                                    if addr == second_addr {
-                                        second_started.notify_one();
-                                    }
-                                    let stream = tokio::net::TcpStream::connect(addr).await?;
-                                    if addr == first_addr {
-                                        first_started.notify_one();
-                                        release_first.notified().await;
-                                        drop(stream);
-                                        Err(std::io::Error::other("first address failed"))
-                                    } else {
-                                        Ok(stream)
-                                    }
-                                }
-                            },
-                        )
-                        .await
-                    })
-                    .await
-            }
-        });
-
-        first_started.notified().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), second_started.notified())
-                .await
-                .is_err(),
-            "the fallback started without a second physical permit"
-        );
-        release_first.notify_one();
-        let winner = dial.await.unwrap().unwrap().unwrap();
-        assert_eq!(winner.peer_addr().unwrap(), second_addr);
-        assert_eq!(peak.load(Ordering::SeqCst), 1);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-
-        let (mut first_server, _) = first_listener.accept().await.unwrap();
-        let (second_server, _) = second_listener.accept().await.unwrap();
-        use tokio::io::AsyncReadExt as _;
-        let mut byte = [0];
-        let read = tokio::time::timeout(Duration::from_secs(1), first_server.read(&mut byte))
-            .await
-            .expect("failed TCP attempt stayed open")
-            .unwrap();
-        assert_eq!(read, 0);
-        drop((winner, second_server));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn overlapping_generations_bound_physical_address_attempts() {
-        struct Active(Arc<AtomicUsize>);
-        impl Drop for Active {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
-        let (first, _) =
-            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, None).unwrap();
-        let (second, _) =
-            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, Some(&first))
-                .unwrap();
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let run = |generation: Arc<OutboundRuntimeRegistry>| {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            async move {
-                let addrs = [
-                    "192.0.2.1:443".parse().unwrap(),
-                    "[2001:db8::1]:443".parse().unwrap(),
-                ];
-                generation
-                    .scope_dials(crate::address_race::race_resolved_addrs_with_stagger(
-                        &addrs,
-                        Duration::ZERO,
-                        move |addr| {
-                            let active = Arc::clone(&active);
-                            let peak = Arc::clone(&peak);
-                            async move {
-                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                                peak.fetch_max(now, Ordering::SeqCst);
-                                let _active = Active(active);
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                                Err::<(), _>(addr)
-                            }
-                        },
-                    ))
-                    .await
-            }
-        };
-
-        let (old_result, new_result) = tokio::join!(run(Arc::new(first)), run(Arc::new(second)));
-        assert!(matches!(old_result, Some(Err(_))));
-        assert!(matches!(new_result, Some(Err(_))));
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn udp_capability_matrix() {
-        let anytls = node("x", NodeProtocol::AnyTLS);
-        assert!((crate::descriptor::descriptor(anytls.protocol()).supports_udp)(&anytls));
-        let vmess = node("x", NodeProtocol::VMess);
-        assert!(!(crate::descriptor::descriptor(vmess.protocol()).supports_udp)(&vmess));
-        let hy2 = node("x", NodeProtocol::Hysteria2);
-        assert!((crate::descriptor::descriptor(hy2.protocol()).supports_udp)(&hy2));
-    }
-
-    #[test]
-    fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
-        let unchanged = vless_node("vless", honk_config::node::WireMode::H2mux);
-        let mut changed = node("tuic", NodeProtocol::Tuic);
-        let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
-        let first_unchanged = first.get(&unchanged.id).unwrap();
-        let first_changed = first.get(&changed.id).unwrap();
-
-        changed.tls_mut().unwrap().sni = Some("new.example.com".to_string());
-        let (second, reused) = OutboundRuntimeRegistry::build_reusing(
-            &[unchanged.clone(), changed.clone()],
-            64,
-            Some(&first),
-        )
-        .unwrap();
-        assert_eq!(reused, HashSet::from([unchanged.id]));
-        assert!(Arc::ptr_eq(
-            &first_unchanged,
-            &second.get(&unchanged.id).unwrap()
-        ));
-        assert!(!Arc::ptr_eq(
-            &first_changed,
-            &second.get(&changed.id).unwrap()
-        ));
-    }
-
-    #[tokio::test]
-    async fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
-        let unchanged = node("anytls", NodeProtocol::AnyTLS);
-        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
-        let (second, _) = OutboundRuntimeRegistry::build_reusing(
-            std::slice::from_ref(&unchanged),
-            64,
-            Some(&first),
-        )
-        .unwrap();
-
-        // A build alone transfers nothing: the old generation still closes
-        // the runtime if the reload aborts before the commit point.
-        first.shutdown().await;
-        let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
-            panic!("anytls runtime expected");
-        };
-        assert!(
-            anytls.pool.is_retired(),
-            "aborted reload: old generation remains the owner"
-        );
-
-        // Committed transfer: the old generation skips the moved runtime;
-        // the new generation closes it as its full owner.
-        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
-        let (second, reused) = OutboundRuntimeRegistry::build_reusing(
-            std::slice::from_ref(&unchanged),
-            64,
-            Some(&first),
-        )
-        .unwrap();
-        first.mark_moved_out(reused);
-        first.drain_session_pools();
-        first.shutdown().await;
-        let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
-            panic!("anytls runtime expected");
-        };
-        assert!(
-            !anytls.pool.is_retired(),
-            "committed reload: old generation leaves the moved runtime alone"
-        );
-        second.shutdown().await;
-        assert!(
-            anytls.pool.is_retired(),
-            "the new generation owns the reused runtime's shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn vless_mux_pools_retire_and_shut_down_with_their_generation() {
-        use honk_config::node::WireMode;
-        for mode in [WireMode::H2mux, WireMode::MuxCool] {
-            let node = vless_node("vless", mode);
-            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-            let runtime = registry.get(&node.id).unwrap();
-            let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
-                panic!("VLESS mux runtime expected");
-            };
-            registry.drain_session_pools();
-            assert!(mux.is_retired());
-
-            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-            let runtime = registry.get(&node.id).unwrap();
-            let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
-                panic!("VLESS mux runtime expected");
-            };
-            registry.shutdown().await;
-            assert!(mux.is_retired());
-        }
-    }
-
-    #[test]
-    fn vless_mux_runtime_reuse_is_mode_exact() {
-        use honk_config::node::WireMode;
-        let node = vless_node("vless-cool", WireMode::MuxCool);
-        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let (unchanged, reused) =
-            OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 64, Some(&first))
-                .unwrap();
-        assert_eq!(reused, HashSet::from([node.id]));
-        assert!(Arc::ptr_eq(
-            &first.get(&node.id).unwrap(),
-            &unchanged.get(&node.id).unwrap()
-        ));
-
-        let mut changed = node.clone();
-        changed.vless_mut().unwrap().mode = WireMode::H2mux;
-        let (changed_registry, reused) = OutboundRuntimeRegistry::build_reusing(
-            std::slice::from_ref(&changed),
-            64,
-            Some(&first),
-        )
-        .unwrap();
-        assert!(reused.is_empty());
-        assert!(!Arc::ptr_eq(
-            &first.get(&node.id).unwrap(),
-            &changed_registry.get(&node.id).unwrap()
-        ));
-        assert!(matches!(
-            changed_registry.get(&node.id).unwrap().runtime,
-            ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_))
-        ));
-    }
-
-    #[test]
-    fn build_reusing_ignores_parse_timestamps() {
-        let mut parsed = node("trojan", NodeProtocol::Trojan);
-        parsed.tls_mut().unwrap().sni = Some("example.com".to_string());
-        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&parsed)).unwrap();
-        let mut reparsed = parsed.clone();
-        reparsed.created_at = chrono::Utc::now();
-        reparsed.updated_at = chrono::Utc::now();
-        let (second, _) = OutboundRuntimeRegistry::build_reusing(
-            std::slice::from_ref(&reparsed),
-            64,
-            Some(&first),
-        )
-        .unwrap();
-        assert!(Arc::ptr_eq(
-            &first.get(&parsed.id).unwrap(),
-            &second.get(&parsed.id).unwrap()
-        ));
-    }
-
-    #[tokio::test]
-    async fn speculative_quic_publish_keeps_a_concurrent_incumbent() {
-        let runtime = QuicRuntime::new();
-        let incumbent: Arc<FakeQuicClient> = runtime
-            .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
-            .await
-            .unwrap();
-        let detached = Arc::new(FakeQuicClient::default());
-        let detached_weak = Arc::downgrade(&detached);
-
-        runtime.publish_client(detached).await.unwrap();
-
-        assert!(detached_weak.upgrade().is_none());
-        let selected: Arc<FakeQuicClient> = runtime
-            .client(|| async { panic!("occupied slot must not rebuild") })
-            .await
-            .unwrap();
-        assert!(Arc::ptr_eq(&selected, &incumbent));
-        assert!(!incumbent.warm_released.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn cancelled_quic_publish_before_slot_lock_changes_nothing() {
-        let runtime = Arc::new(QuicRuntime::new());
-        let state_guard = runtime.state.lock().await;
-        let detached = Arc::new(FakeQuicClient::default());
-        let detached_weak = Arc::downgrade(&detached);
-        let publish = tokio::spawn({
-            let runtime = Arc::clone(&runtime);
-            async move { runtime.publish_client(detached).await }
-        });
-        tokio::task::yield_now().await;
-
-        publish.abort();
-        let _ = publish.await;
-        drop(state_guard);
-
-        assert_eq!(runtime.client_count(), Some(0));
-        assert!(detached_weak.upgrade().is_none());
-    }
-
-    #[tokio::test]
-    async fn cancelled_last_quic_release_still_clears_the_client_slot() {
-        let node = node("tuic-release", NodeProtocol::Tuic);
-        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let runtime = registry.get(&node.id).unwrap();
-        let client: Arc<FakeQuicClient> = runtime
-            .quic_client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
-            .await
-            .unwrap();
-        runtime.retain_warm(WarmRetention::Selector).await.commit();
-        let quic = match &runtime.runtime {
-            ProtocolRuntime::Quic(quic) => quic,
-            _ => panic!("TUIC node must own a QUIC runtime"),
-        };
-        let state_guard = quic.state.lock().await;
-        let release = tokio::spawn({
-            let runtime = Arc::clone(&runtime);
-            async move { runtime.release_warm(WarmRetention::Selector).await }
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if runtime.warm_retention.try_lock().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached cleanup must hold the retention lock while blocked");
-        release.abort();
-        let _ = release.await;
-        drop(state_guard);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if quic.client_count() == Some(0) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached cleanup must clear the QUIC client slot");
-        assert!(client.warm_released.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn quic_runtime_close_covers_client_and_rejects_new_builds() {
-        let runtime = QuicRuntime::new();
-        let client: Arc<FakeQuicClient> = runtime
-            .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
-            .await
-            .unwrap();
-        runtime.force_close().await;
-        assert!(client.force_closed.load(Ordering::Acquire));
-        assert!(
-            runtime
-                .client::<FakeQuicClient, _, _>(|| async {
-                    Ok(Arc::new(FakeQuicClient::default()))
-                })
-                .await
-                .is_err(),
-            "a closed QUIC runtime rejects new client builds"
-        );
-    }
-
-    #[tokio::test]
-    async fn retirement_is_terminal_and_shutdown_remains_idempotent() {
-        let anytls = node("anytls", NodeProtocol::AnyTLS);
-        let registry = OutboundRuntimeRegistry::build(&[anytls]).unwrap();
-        assert!(!registry.is_shutdown());
-        registry.begin_retirement();
-        assert!(registry.is_shutdown());
-        registry.shutdown().await;
-        registry.shutdown().await;
-        assert!(
-            registry.is_shutdown(),
-            "retirement and force shutdown remain terminal and idempotent"
-        );
-    }
-}
+mod tests;

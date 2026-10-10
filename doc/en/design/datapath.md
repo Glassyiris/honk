@@ -1,6 +1,6 @@
 # eBPF kernel datapath
 
-This document covers kernel-side interception; the userspace path is described in [Control plane](./control-plane.md), and held-first-packet UDP is described in [NFQUEUE](./nfqueue.md).
+The kernel datapath intercepts traffic. [Control plane](./control-plane.md) describes the userspace path; [NFQUEUE](./nfqueue.md) describes held-first-packet UDP.
 
 ## Namespace and hook architecture
 
@@ -10,9 +10,9 @@ The ordinary proxy path redirects packets through an isolated network namespace 
 flowchart LR
   LAN[LAN traffic] --> LI[lan_ingress]
   LOCAL[Host-originated traffic] --> WE[wan_egress]
-  LI -->|direct offload| HOST[Host routing]
-  LI -->|proxy| DAE0[dae0]
-  WE -->|proxy| DAE0
+  LI -->|local/special or native direct| HOST[Host routing]
+  LI -->|proxy, non-must DNS, or raw DNS group must| DAE0[dae0]
+  WE -->|proxy, non-must DNS, or raw DNS group must| DAE0
   DAE0 --> PEER[dae0peer in daens]
   PEER --> ASSIGN[dae0peer_ingress / sk_lookup]
   ASSIGN --> SOCK[LISTEN_SOCKET_MAP]
@@ -27,7 +27,7 @@ flowchart LR
 
 A throwaway thread calls `unshare(CLONE_NEWNET)`, opens `/proc/thread-self/ns/net`, and hands the resulting `OwnedFd` to the process. That FD pins `daens` for the process lifetime. `/var/run/netns/daens` is only a best-effort compatibility bind mount; the engine does not use it as the namespace owner.
 
-Rtnetlink creates `dae0`/`dae0peer` as an L2 netkit pair when the kernel supports it, otherwise as a veth pair. It moves `dae0peer` by namespace FD and configures links, addresses, neighbors, policy rules, and routes. Current addressing is:
+Rtnetlink creates `dae0`/`dae0peer` as an L2 netkit pair when the kernel supports it, otherwise as a veth pair. It moves `dae0peer` by namespace FD and configures links, addresses, neighbors, policy rules, and routes. The addresses are:
 
 | Side | IPv4 | IPv6 |
 | --- | --- | --- |
@@ -54,18 +54,18 @@ Ethernet interfaces use the `_l2` programs; interfaces without an Ethernet heade
 
 `auto` resolves to the current default-route interface. If no default route exists, the entry stays unattached rather than falling back to loopback. `IfaceWatcher` subscribes to rtnetlink link, IPv4/IPv6 address, and IPv4/IPv6 route groups; a 60-second reconciliation tick backs up event delivery. Reconciliation re-resolves `auto`, detects interface recreation by ifindex, recalculates single- versus dual-homed roles, and attaches or forgets process-owned hooks.
 
-A changed link/address/route/interface role also republishes generated `direct(must)` rules for every address on configured LAN/WAN interfaces. It clears health-check cooldowns and triggers fresh probes. Dead UDP and multi-leaf outbounds remain fail-closed until a fresh probe succeeds; a sole TCP leaf with no `final` remains a userspace last resort.
+A changed link/address/route/interface role updates topology observations, clears health-check cooldowns, and triggers fresh probes. Interface addresses also remain available for ECS; no startup, reload, or network event synthesizes `direct(must)` routing rules or a hidden kernel replacement allowlist. Dead UDP and multi-leaf outbounds remain fail-closed until a fresh probe succeeds; a sole TCP leaf with no `final` remains a userspace last resort.
 
 ## Program inventory
 
 | Program | Hook | Kernel responsibility |
 | --- | --- | --- |
-| `lan_ingress_l2`, `lan_ingress_l3` | TC ingress on LAN | Admission check, special/local traffic bypass, port-53 fast path, routing, connection state, direct offload, proxy redirect, TX accounting, and optional ambiguous-UDP staging. |
+| `lan_ingress_l2`, `lan_ingress_l3` | TC ingress on LAN | Admission check, special/control-plane and non-DNS local bypass, ordered routing including port-53 ownership, connection state, direct offload, proxy redirect, TX accounting, and optional ambiguous-UDP staging. |
 | `wan_ingress_l2`, `wan_ingress_l3` | TC ingress on WAN | Refresh reverse-direction connection state; not attached in a single-homed topology. |
-| `lan_egress_l2`, `lan_egress_l3` | TC egress on LAN | Refresh reverse connection state and suppress locally generated ICMPv6 Redirect packets; skipped on the shared interface in a single-homed topology. |
+| `lan_egress_l2`, `lan_egress_l3` | TC egress on LAN | Refresh reverse connection state, except that a UDP packet arriving from `dae0` only refreshes an existing entry and never creates one, and suppress locally generated ICMPv6 Redirect packets; skipped on the shared interface in a single-homed topology. |
 | `wan_egress_l2`, `wan_egress_l3` | TC egress on WAN | Route host-originated TCP/UDP, apply process-name and control-plane bypass data, check outbound connectivity, cache decisions, and redirect proxy traffic. |
-| `dae0_ingress` | TC ingress on host `dae0` | Reverse `REDIRECT_TRACK`, restore original MAC/interface delivery, and count RX traffic. |
-| `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Validate redirected packets, apply `TPROXY_MARK`, and use `bpf_sk_assign` for UDP and new TCP listener delivery. |
+| `dae0_ingress` | TC ingress on host `dae0` | Reverse `REDIRECT_TRACK`, restore original MAC/interface delivery, and count RX traffic. A UDP reply with no exact record falls back to its client's `CLIENT_REPLY_TRACK` framing, uncounted. |
+| `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Validate redirected packets, restore per-packet UDP53 route/generation marks across link scrub, apply `TPROXY_MARK` to ordinary redirects, and use `bpf_sk_assign` for UDP and new TCP listener delivery. |
 | `tproxy_sk_lookup` | `sk_lookup` in `daens` | Override ordinary socket lookup with a transparent listener from `LISTEN_SOCKET_MAP`. |
 | `tproxy_wan_cg_sock_create`, `tproxy_wan_cg_sock_release` | cgroup `sock_create`, `sock_release` | Create/refresh or remove socket-cookie to PID/`comm` entries. |
 | `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | Refresh cookie-to-process metadata for connected sockets. |
@@ -73,22 +73,32 @@ A changed link/address/route/interface role also republishes generated `direct(m
 
 `LISTEN_SOCKET_MAP` keys are fixed: `0` TCP4, `1` TCP6, `2..=5` UDP4, and `6..=9` UDP6. UDP chooses one of four listeners per family with a flow-stable hash. The IPv4 and IPv6 key readers in `tproxy_sk_lookup` remain separate `#[inline(never)]` subprograms. At optimization level 2, inlining lets LLVM turn the family branch into a computed-offset read from the lookup context; the verifier rejects that as a dereference of a modified context pointer.
 
-TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` functions taking `*mut __sk_buff`. They do not use Aya's `#[tc]` macro because its structured argument shape triggers a verifier rejection on kernels at or above 7.0. Program bodies return `Verdict = Result<c_long, c_long>`: `Ok` denotes the normal path and `Err` an early exit, but both carry a real `TC_ACT_*` value and `flatten` reduces either variant to the kernel `i32` verdict. Internal sentinel values are not TC verdicts.
+- TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` functions taking `*mut __sk_buff`, not Aya's `#[tc]`, whose structured argument shape triggers a verifier rejection on kernels ≥7.0. Bodies return `Verdict = Result<c_long, c_long>` (`action::Verdict`): `Ok` normal, `Err` early exit; both carry real `TC_ACT_*` values, reduced to kernel `i32` by `flatten` (`action::flatten`). `src/action.rs` owns `TC_ACT_*`. Keep parser and helper sentinels (for example `transport::ERR_FALLBACK`, `ERR_FRAGMENT`, and `PASS_UNSUPPORTED`) separate from verdicts; the `bpf_loop` callback's continuation values are separate as well.
+  `src/sk.rs`: `sk_assign_by_index` is TC's counterpart to aya `SockMap::redirect_sk_lookup` (which accepts only `SkLookupContext`); `probe_udp_socket` looks up non-DNS local UDP sockets. All helpers release implicit lookup references. Programs:
+    - `lan_ingress_l2/l3` — LAN classify/route/redirect, ordered-policy DNS ownership, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous non-DNS UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
+    - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped single-homed).
+    - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`) — reverse conn state; locally-originated traffic routing (pname via `COOKIE_PID_MAP`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane). Live non-DNS WAN UDP entries take a lookup-only cached-route path; misses route once and then publish complete conntrack metadata.
+    - `dae0_ingress` — reply path: rx stats from `RedirectEntry.outbound`, MAC rewrite, redirect to original LAN iface. UDP replies from a peer the client never contacted use the client-only record and are not attributed to an outbound; replies from honk's own link addresses never do.
+    - LAN egress suppresses only locally originated ICMPv6 Redirects, using the parser's ICMPv6 header after extension traversal; forwarded Redirects and other ICMPv6 remain pass-through. `honk-core/tests/ebpf_datapath_test.rs` checks L2 through `BPF_PROG_TEST_RUN` and L3 on isolated TUN interfaces, alongside exact-tuple RX accounting and cached-route policy.
+    - `dae0peer_ingress` — mandatory restoration of UDP53 route/generation provenance and `bpf_sk_assign` of the TPROXY listener via `LISTEN_SOCKET_MAP` inside `daens`.
+    - `tproxy_sk_lookup` (`src/sk_lookup.rs`) — transparent listeners: keys 0/1 TCP4/TCP6, 2..5 UDP4, 6..9 UDP6. Keep v4/v6 UDP listener-key reads in `#[inline(never)]` subprograms. At opt-level=2, LLVM if-converts family branches to a load through computed ctx offset, rejected as "dereference of modified ctx ptr". New branch-selected ctx reads must preserve this shape.
+    - cgroup sock_create/sock_release/connect4/6/sendmsg4/6 (`src/cgroup.rs`) — cookie → `PIDName{pid, pname}` for process-name rules + control-plane bypass; `pname` is the 15-byte `argv[0]` executable basename read through runtime kernel-BTF offsets, with thread `comm` as the unavailable/read-failure fallback.
 
 ## Map inventory
+
+`crates/honk-ebpf/src/maps.rs` declares these maps:
 
 | Map | Shape and role |
 | --- | --- |
 | `CONN_STATE_MAP` | Non-preallocated plain hash, maximum 524,288 entries. Stores per-flow TCP/UDP state and published routing metadata; userspace owns pressure eviction. |
-| `REDIRECT_TRACK` | Non-preallocated 65,536-entry hash. Maps a directional five-tuple to original MAC/interface, outbound, timestamp, and decision identity for reply restoration. |
-| `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry hash. Carries tuple-keyed route metadata to userspace. |
-| `ROUTING_MAP` | 256-entry array: two banks of 128 `MatchSet` rules. Userspace fills the inactive bank before switching generations. |
-| `ROUTING_META_MAP` | 35-entry array containing the active generation selector plus each generation's rule count and four flow-group bitmaps. The selector is the commit point. |
-| `ROUTING_GROUP_META_MAP` | Eight packed entries: two generations × TCP4/TCP6/UDP4/UDP6, each with a rule count and 128-bit bitmap. |
-| `DEST_LPM_ROUTING_MAP`, `SOURCE_LPM_ROUTING_MAP`, `MAC_LPM_ROUTING_MAP` | LPM tries, each capped at 65,536 entries, for destination CIDR, source CIDR, and MAC prefixes. |
-| `DOMAIN_ROUTING_MAP` | Non-preallocated 65,536-entry IP-to-domain-rule bitmap hash populated from DNS outcomes. |
+| `REDIRECT_TRACK` | Non-preallocated 65,536-entry token-bound hash. Maps a directional five-tuple to original MAC/interface, outbound, timestamp, and decision identity for reply restoration; staged entries carry the decision token. |
+| `CLIENT_REPLY_TRACK` | 16,384-entry LRU hash. Maps a non-DNS UDP client address and port (destination zeroed) to the same framing record as `REDIRECT_TRACK`, with the token cleared, so a reply from an uncontacted peer reaches its client without crossing host forwarding. Kernel LRU eviction is approximate: near capacity, and sooner on hosts with many CPUs, a client that has not sent recently can be evicted before the map is full. That client then falls back to host forwarding for such replies; no flow is misrouted, and no userspace sweep owns the map. |
+| `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry hash. TCP SYN handoffs include the committed routing generation; staged UDP carries the decision token. Raw-must UDP53 publishes no tuple handoff: ownership uses per-packet marks. Non-must UDP53 retains facts for malformed-payload fallback. |
+| `ROUTING_POLICY_ROOT` | One-entry map-in-map selecting an immutable policy descriptor and one of two synchronous generated-function slots. Successful root replacement supplies the old non-sleepable readers' grace period. |
+| Generation-owned IP/MAC indexes | Separate destination/source IPv4 and IPv6 LPM maps plus a MAC LPM map. Values are full per-generation predicate bitmaps, with ancestor bits inherited into more-specific prefixes. |
+| Generation-owned domain map | Non-preallocated IP-to-domain-predicate bitmap hash. DNS/sniff facts include positive and negated predicates; a present zero bitmap is known-false. The descriptor exposes its map ID for diagnostics. |
 | `OUTBOUND_CONNECTIVITY_MAP` | 1,536-entry array. Six liveness slots per outbound cover TCP/UDP class and IPv4/IPv6; an absent slot is treated as alive. |
-| `OUTBOUND_STATS` | 256-entry per-CPU array indexed directly by outbound. Each 32-byte value packs `tx_packets`, `tx_bytes`, `rx_packets`, and `rx_bytes`; the current ABI does not use `outbound * 4 + counter` indexing. |
+| `OUTBOUND_STATS` | 256-entry (`MAX_OUTBOUNDS`) per-CPU array indexed directly by the `u8` outbound index. Each packed 32-byte `OutboundStatsCounters` value contains `tx_packets`, `tx_bytes`, `rx_packets`, and `rx_bytes`; the current ABI does not use `outbound * 4 + counter` indexing. |
 | `LISTEN_SOCKET_MAP` | 16-slot `SockMap`; keys `0..=9` hold the two TCP and eight UDP transparent listeners. |
 | `DATAPATH_STATE_MAP` | One-slot admission array. Zero passes traffic untouched; nonzero enables classification and redirect. |
 | `DATAPATH_FLAGS_MAP` | One-slot runtime policy word: Rule/Direct offload properties plus `global.nfqueue_enable` and NFQUEUE ready fencing. New-flow classification reads it; established direct offload uses cached metadata. |
@@ -96,34 +106,55 @@ TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifie
 | `CONN_STATE_OCCUPANCY` | Two-slot per-CPU cumulative insert/eBPF-delete counters used with userspace delete accounting to estimate occupancy. |
 | `BPF_STATS_MAP` | Five counters for UDP/TCP conn-state overflow and redirect, handoff, and cookie-map insertion failures. |
 | `EVENT_RINGBUF` | 262,144-byte ring buffer for fixed-layout blocked, conntrack-overflow, and UDP-token-exhaustion events. |
-| `UDP_DECISION_SEQUENCE` | One-slot pinned allocator state for NFQUEUE decision identities; protocol details live in [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_EPOCH` | One-slot grace-period selector for NFQUEUE decision work; see [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_INFLIGHT` | Two-slot per-CPU reader counts for NFQUEUE decision work; see [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_RETIRE_FENCE` | 65,536-entry tuple fence map used during NFQUEUE retirement; see [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_SEQUENCE` | Persistent one-slot pinned, spin-locked allocator state for NFQUEUE decision identities; protocol details live in [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_EPOCH` | One-slot grace-period selector for NFQUEUE decisions and WAN UDP ownership; see [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_INFLIGHT` | Two-slot per-CPU reader counts for those decision paths; see [NFQUEUE](./nfqueue.md). |
+| `UDP_DECISION_RETIRE_FENCE` | 65,536-entry tuple fence map used during NFQUEUE and WAN userspace UDP retirement; see [NFQUEUE](./nfqueue.md). |
 
 Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in shared flow structures are IPv4-mapped IPv6 values in network byte order.
+
+`RoutingHandoffEntry` appends `routing_generation: u64` and is 56 bytes; `result` remains at offset 8 and the UDP decision token at offset 44. The generated-slot `RoutingInput`, `ConnState`, and `UDP_DECISION_SEQUENCE` ABIs are unchanged. Old explicit BPF objects and incompatible pinned handoff layouts are rejected before raw reads; `honk-tool` validates the layout too. Use matching core/tool/object versions, not a compatibility shim.
+
+`RoutingMeta` bit 58 explicitly marks WAN UDP userspace ownership without changing its layout. Marked WAN direct decisions need a userspace socket even with `must`; the bit distinguishes their retirement from native LAN direct/must and offloaded state. Unmarked native WAN UDP direct decisions instead carry bit 57 (`OFFLOAD`), preserving them against stale endpoint callbacks without changing forwarding. WAN UDP cached readers and conn/handoff/redirect writers participate in the shared reader epoch and reject a fenced tuple before touching its state.
+
+`crates/honk-ebpf-common/src/lib.rs` — shared marks and NFQUEUE token packing, `OutboundIndex`, `RoutingMeta`, `DaeParam`, and `OutboundStatsCounters`/map constants.
+`crates/honk-ebpf-common/src/routing_policy.rs` — fixed `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI (128/24/24 bytes), feature bits, and process-name normalization limits. `RoutingDecision` includes a direct-mark index (`u32::MAX` when absent); the loader rejects older external objects by checking the slot's BTF output layout.
+`crates/honk-ebpf-common/src/redirect_need.rs` — `TuplesKey`, `Tuples`, token-carrying `RoutingResult`/`RoutingHandoffEntry`, 256-bit `DomainRouting`, and `PIDName`.
+`crates/honk-ebpf-common/src/conn.rs` — `ConnState` (including `UdpDecisionState` and `decision_token`), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, and `TcpState`.
+`crates/honk-ebpf/src/maps.rs` — static TC map declarations and their kernel-side capacities.
+`crates/honk-ebpf/src/route.rs` — static root/slot facade and fixed-ABI dispatch; generated policy code is loaded by userspace.
+`crates/honk-ebpf-common/src/event.rs`: fixed-layout ring events including conntrack overflow and UDP decision-token exhaustion. `crates/honk-ebpf-common/src/dae_ip.rs`: `In6Addr` union and v4-mapped helpers.
+`crates/honk-core/src/routing/ir.rs` — canonical `CompiledPredicate` and userspace `PortRange`; `crates/honk-core/src/control/routing_matcher.rs` lowers them into the generated function ABI.
 
 ## Marks and mark ownership
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
 | `TPROXY_MARK` | `0x08000000` | Selects the `daens` table-100 local-delivery route and tags redirected packets for listener delivery. `global.tproxy_mark` must equal this compiled value. |
-| `DAE_BYPASS_MARK` | `0x00000100` | Marks honk's own dials, probes, DNS upstreams, QUIC sockets, and transparent listeners so WAN egress does not intercept them. |
+| `DAE_BYPASS_MARK` | `0x00000100` | Default when `global.so_mark_from_dae` is zero; otherwise honk sockets and listener recognition use the configured value exactly. |
 | `CLASSIFIED_MARK` | `0x40000000` | Prevents a packet attached at both bridge master and slave from being classified twice; also marks final direct verdicts. |
 | `NFQUEUE_PENDING_MARK` | `0x80000000` | Identifies traffic that must be held before conntrack/NAT; a valid staged mark also carries `CLASSIFIED_MARK` and a nonzero token. |
 | `NFQUEUE_TOKEN_MASK` | `0x3fffffff` | Selects the low 30 skb-mark bits that carry a decision token on NFQUEUE-staged packets. |
 
 `SKB_MARK_RESERVED_MASK` is `0xc0000000`, the union of `CLASSIFIED_MARK` and `NFQUEUE_PENDING_MARK`. Configuration validation rejects `global.so_mark_from_dae` and routing-rule marks that overlap those bits. NFQUEUE direct completion repeats the same check before accepting a rule mark.
 
-Local-socket probing must distinguish honk's own transparent listeners from ordinary local services. `bpf_sock_is_dae_socket` compares the full socket mark with `PARAM.dae_socket_mark`, which userspace sets to `DAE_BYPASS_MARK`. Equality means “honk listener,” so the probe continues the transparent path; an ordinary unmarked listener may claim the destination. Host-namespace `dns.bind` sockets are deliberately unmarked ordinary listeners.
+Final marked direct packets carry `rule_mark | CLASSIFIED_MARK`, including native LAN, NFQUEUE acceptance and userspace TCP/UDP sockets. Match only user-owned bits in Linux policy rules: `fwmark 0x200/0x3fffffff`. WAN egress bypasses the exact nonzero configured socket mark or a classified mark without `NFQUEUE_PENDING_MARK`; merely containing bit `0x100` is not a bypass. Host-originated nonzero direct marks are sent through userspace, since changing an skb mark at WAN TC is too late for the original Linux route lookup.
+
+Real transparent UDP53 uses `SO_RCVMARK` and per-packet `SOL_SOCKET`/`SO_MARK` ancillary data for DNS/raw ownership. The same skb carries the route code and nonwrapping 20-bit committed routing generation through `cb[2]` across link scrub; mandatory `dae0peer` TC restores it. The signature mask is `0xc8000000` and variable carrier bits are `0x37ffffff`. Bit `0x100` selects an immutable direct-mark index instead of an outbound code; the 8-bit index resolves through the active Router's sorted mark table. Owned `daens` fwmark routing ignores these variable bits. User mark reservations and `UDP_DECISION_SEQUENCE` remain unchanged. Raw direct/group ownership never takes authority from a mutable tuple handoff.
+
+For non-DNS traffic, local-socket probing distinguishes honk's transparent listeners from ordinary local services by comparing the full socket mark with `PARAM.dae_socket_mark`. Host-namespace `dns.bind` sockets are ordinary unmarked listeners, but their presence does not bypass LAN port-53 policy.
 
 ## Packet behavior and invariants
 
 ### DNS and local-listener precedence
 
-LAN TCP and UDP with destination port `53` bypass the routing loop and go directly to the control plane. Port `53` is also exempt from LAN outbound-health drops so userspace DNS can apply its own fallback.
+After existing ingress and control-plane exclusions, LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered policy once, not a separate must-only scan. [Traffic-rule ownership](../reference/routing.md#outbound-targets-and-must) determines native, drop, raw, or controller handling. An exact or wildcard local `:53` listener does not override that policy. Port `53` remains exempt from LAN outbound-health drops, not from the selected user `must` result.
 
-The local-socket probe runs before this fast path and is transport-specific. A specifically bound UDP socket, or a TCP socket in `LISTEN` state, wins for its transport. A wildcard match wins only when a full FIB lookup returns `NOT_FWDED`; socket lookup alone also matches forwarded destinations. The listener-mark check excludes honk's own transparent listener from this precedence rule. Thus a local `dns.bind` listener can own host-local `:53` while remote resolver traffic still follows transparent DNS.
+The local-socket probe remains before traffic routing only for non-DNS traffic. It uses the packet's current network namespace (negative netns ID), not relative namespace ID `0`. A matching non-honk socket may receive locally; wildcard matches additionally require full FIB `NOT_FWDED`. The existing TCP pure-SYN probe skip remains. For parsed destination `53`, an exact nonzero control-plane bypass mark preserves native request delivery; ordinary requests continue to routing instead of probing a local listener. Backend replies remain subject to existing non-53 policy. There is no unconditional gateway-management reachability guarantee; configure [explicit user rules](../reference/routing.md#explicit-local-rules) when needed.
+
+Native direct is subject to external firewall/NAT; see [DNS source boundaries](./dns.md#ingress-paths) for its distinction from `asis` and client-facing anyfrom replies.
+
+UDP53 stays outside ordinary UDP conn-state and decision-token allocation. Fragmented LAN queries requiring controller/raw delivery use [native reassembly and NFQUEUE](./nfqueue.md#fragmented-lan-dns); unfragmented queries retain TC redirection. A pinned routing-generation counter fences queued metadata across restart without adding a fragment cache or configuration key.
 
 ### Special and internal traffic
 
@@ -137,19 +168,19 @@ This keeps DHCP, mDNS, SSDP, LLMNR, and similar link traffic out of the proxy. T
 
 ### Outbound liveness
 
-Userspace publishes group-OR health into `OUTBOUND_CONNECTIVITY_MAP`. A new LAN flow routed to a slot explicitly marked dead is dropped with `TC_ACT_SHOT`; this is deliberately fail-closed. One narrow exception keeps the slot open for a TCP group with exactly one unique leaf and no `final`, allowing a real dial through that same proxy to prove recovery without an implicit `direct` fallback. UDP and all-dead multi-leaf groups remain fail-closed. TCP and UDP destination port `53` are exempt on LAN ingress. Generated must-direct rules for every current gateway interface address run through the same routing publication path and keep local administration reachable even when proxy outbounds are dead.
+Userspace publishes group-OR health into `OUTBOUND_CONNECTIVITY_MAP`. A new LAN flow routed to a slot explicitly marked dead is dropped with `TC_ACT_SHOT`; this is deliberately fail-closed. One narrow exception keeps the slot open for a TCP group with exactly one unique leaf and no `final`, allowing a real dial through that same proxy to prove recovery without an implicit `direct` fallback. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. TCP and UDP destination port `53` are exempt from LAN health drops, subject to the DNS ownership rules above. Gateway-native routing requires user-authored rules rather than generated interface-address rules.
 
 ### Route-time direct offload
 
-The decision to keep a non-`must` flow in kernel direct routing is made once and cached in `RoutingMeta` bit 57. Established packets test the cached bit instead of rereading `DATAPATH_FLAGS_MAP`.
+For non-DNS traffic, the decision to keep a non-`must` flow in kernel direct routing is made once and cached in `RoutingMeta` bit 57. Established packets test the cached bit instead of rereading `DATAPATH_FLAGS_MAP`. Direct-mode offload cannot take ownership from non-`must` DNS.
 
 | Effective mode | Route-time policy |
 | --- | --- |
-| `Rule` (also no Clash mode override) | A non-`must` `direct` result is offloaded only when SNI cannot change it: no domain-class reevaluation is possible, or DNS learning supplied the flow's domain bitmap. Otherwise userspace re-routes after sniffing. |
-| `Direct` | Every non-final, non-`block` flow is normalized to `direct` and offloaded because userspace would choose direct anyway. |
+| `Rule` (also no Clash mode override) | A non-`must` `direct` result is offloaded only when SNI cannot change it: no domain-class reevaluation is possible, DNS learning supplied the flow's domain bitmap, or the matching direct action has no live domain predicate in its rule prefix including itself. Domain rules after that first match do not prevent offload; earlier or current unresolved domain predicates remain conservative. |
+| `Direct` | LAN ingress, WAN TCP and WAN UDP normalize every non-`must`, non-`block` flow to `direct` and offload it; no proxy health gate applies. A rule mark is kept only when the rule itself routed `direct`. Unlike the userspace override, SNI is not consulted, so a `block` or `must` rule reachable only through a sniffed domain does not apply. |
 | `Global` | An exact global selection of `direct` uses the same all-direct policy. Other global selections keep non-final flows in userspace for the selected outbound. |
 
-`direct(must)` always stays direct and needs no bit-57 flag. `block` remains final. Full rule evaluation and mode semantics are documented in [Routing](./routing.md).
+`direct(must)` always stays direct and needs no bit-57 flag. Ordinary non-DNS `block` and `block(must)` remain final; non-`must` DNS instead retains controller ownership. Full rule evaluation and mode semantics are documented in [Routing](./routing.md).
 
 ### Host-originated WAN UDP
 
@@ -165,12 +196,17 @@ Shutdown fences new NFQUEUE staging where applicable, closes `DATAPATH_STATE_MAP
 
 `BpfJanitor` wakes every two seconds. Accepted TCP relays pin their `CONN_STATE_MAP` and `REDIRECT_TRACK` entries for the relay lifetime. Unpinned TCP closing state expires after 10 seconds; unpinned active TCP and UDP state use a 120-second backstop.
 
-Conn-state sweeps normally run every 60 seconds. At 70% occupancy the interval falls to 15 seconds; at 85% it enters pressure mode and sweeps every two-second tick. Growth in kernel overflow counters also activates pressure mode as the fail-closed last resort. `CONN_STATE_OCCUPANCY` combines per-CPU kernel inserts/deletes with userspace delete accounting and exact sweep recalibration. Bounded auxiliary-map scans use the aggressive 8-second cleanup cadence when the latest scan is incomplete or covers at least 85% of the 65,536-entry map.
+Conn-state sweeps normally run every 60 seconds. At 70% occupancy the interval falls to 15 seconds; at 85% it enters pressure mode and sweeps every two-second tick. Growth in kernel overflow counters also activates pressure mode as the fail-closed last resort. `CONN_STATE_OCCUPANCY` combines per-CPU kernel inserts/deletes with userspace delete accounting and exact sweep recalibration. Bounded auxiliary-map scans (`REDIRECT_TRACK`, `COOKIE_PID_MAP`, `ROUTING_HANDOFF_MAP`) use the aggressive 8-second cleanup cadence when the latest scan is incomplete or covers at least 85% of the 65,536-entry map.
 
-Per-outbound traffic counters are per CPU. TX packets and bytes are counted at `lan_ingress` when the route lands, for both redirect and direct-offload outcomes. RX packets and bytes are counted at `dae0_ingress` after `REDIRECT_TRACK` identifies the returning outbound. Unclassified pass-through traffic and drops have no outbound counter.
+Per-outbound traffic counters are per CPU. TX packets and bytes are counted at `lan_ingress` when the route lands, for both redirect and direct-offload outcomes. RX packets and bytes are counted at `dae0_ingress` after `REDIRECT_TRACK` identifies the returning outbound; a reply delivered from `CLIENT_REPLY_TRACK` has no returning outbound and is not counted. Unclassified pass-through traffic and drops have no outbound counter.
+
+The backend API uses `TuplesKey`/`ConnState`, bounded map scans, and conditional retirement. Legacy `ConnTuple` CRUD, string IP/domain routes, cached parameter setters, and backend statistics adapters are removed. Load-time `DaeParam` globals, generation-owned IP/MAC/domain fact maps, `StatsManager`, and pinned `OUTBOUND_STATS` remain the authoritative paths.
+
+`just test-netns` includes production TC packet regressions: exact reverse-tuple RX accounting, cached-route health/readiness, and locally generated ICMPv6 Redirect suppression. L2 cases use `BPF_PROG_TEST_RUN`; L3 uses actual TUN interfaces in an isolated network namespace, including forwarded and hook-detached controls.
 
 ## Related docs
 
 - [Routing design](./routing.md)
 - [NFQUEUE held-packet path](./nfqueue.md)
 - [Control plane](./control-plane.md)
+

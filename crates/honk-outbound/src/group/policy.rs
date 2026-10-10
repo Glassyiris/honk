@@ -7,6 +7,64 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl GroupManager {
+    /// Resolve the configured member, or an automatic group's pin, before
+    /// health filtering, so an unavailable choice cannot redirect traffic to
+    /// a sibling member.
+    pub(super) fn selector_member<'a>(
+        &'a self,
+        group: &'a Group,
+        network: SelectionNetwork,
+    ) -> Option<GroupMember<'a>> {
+        self.selector_member_in(group, network, &self.selector_choice.read())
+    }
+
+    pub(super) fn selector_member_in<'a>(
+        &'a self,
+        group: &'a Group,
+        network: SelectionNetwork,
+        state: &SelectorState,
+    ) -> Option<GroupMember<'a>> {
+        if group.policy != GroupPolicy::Selector {
+            return state
+                .overrides
+                .get(&group.name)
+                .and_then(|pins| pins[network.slot()].as_ref())
+                .and_then(|identity| self.member_by_identity(group, identity));
+        }
+        state
+            .choices
+            .get(&group.name)
+            .and_then(|choices| choices[network.slot()].as_ref())
+            .and_then(|identity| self.member_by_identity(group, identity))
+            .or_else(|| {
+                group
+                    .default
+                    .as_deref()
+                    .and_then(|tag| self.members(group).find(|member| member.tag() == tag))
+            })
+            .or_else(|| self.members(group).next())
+    }
+
+    pub(super) fn member_by_identity<'a>(
+        &'a self,
+        group: &'a Group,
+        identity: &SelectorMember,
+    ) -> Option<GroupMember<'a>> {
+        self.members(group).find(|member| match (identity, member) {
+            (SelectorMember::Node(id), GroupMember::Node(node)) => *id == node.id,
+            (SelectorMember::Group(name), GroupMember::Group(group)) => *name == group.name,
+            _ => false,
+        })
+    }
+
+    pub(super) fn same_member(left: GroupMember<'_>, right: GroupMember<'_>) -> bool {
+        match (left, right) {
+            (GroupMember::Node(left), GroupMember::Node(right)) => left.id == right.id,
+            (GroupMember::Group(left), GroupMember::Group(right)) => left.name == right.name,
+            _ => false,
+        }
+    }
+
     /// Allocation-free selector fast path for a group with direct members
     /// only. It preserves selector precedence and liveness/custom-URL
     /// eligibility while the recursive path retains nested cycle guards.
@@ -16,69 +74,73 @@ impl GroupManager {
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<&'a Node> {
-        let selectable = |node: &&Node| {
-            if domain == ProbeDomain::Tcp
-                && let Some(url) = group.check_url.as_deref()
-                && let Some(alive) = &self.alive_set
-            {
-                alive.is_alive_for_url(&node.name, url)
-            } else {
-                self.is_node_selectable_for_domain(node.id, domain, ipver)
-            }
+        let GroupMember::Node(node) =
+            self.selector_member(group, SelectionNetwork::from_probe_domain(domain))?
+        else {
+            return None;
         };
-        let find = |tag: &str| {
-            group
-                .nodes
-                .iter()
-                .filter_map(|id| self.nodes.get(id))
-                .find(|node| node.name == tag && selectable(node))
+        let selectable = if domain == ProbeDomain::Tcp
+            && let Some(url) = group.check_url.as_deref()
+            && let Some(alive) = &self.alive_set
+        {
+            alive.is_alive_for_url(&node.name, url)
+        } else {
+            self.is_node_selectable_for_domain(node.id, domain, ipver)
         };
-        if let Some(choice) = self.selector_choice.read().get(&group.name)
-            && let Some(node) = find(choice)
-        {
-            return Some(node);
-        }
-        if let Some(default) = group.default.as_deref()
-            && let Some(node) = find(default)
-        {
-            return Some(node);
-        }
-        group
-            .nodes
-            .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .find(selectable)
+        selectable.then_some(node)
     }
 
-    /// Selector policy: runtime choice, then `group.default`, then first
-    /// alive candidate. Choices match member TAGS — a choice may name a
-    /// direct member node or a nested sub-group (sing-box nested-selector
-    /// behavior: picking a sub-group defers to that group's own pick,
-    /// which flattening already resolved to its leaf).
+    /// Require the configured member's candidate; a nested choice delegates
+    /// to that group's own policy without escaping its membership.
     pub(super) fn pick_selector<'a>(
-        &self,
         candidates: &[Candidate<'a>],
-        group: &Group,
-    ) -> Candidate<'a> {
-        if let Some(choice) = self.selector_choice.read().get(&group.name)
-            && let Some(c) = candidates.iter().find(|c| c.tag == choice.as_str())
-        {
-            return c.clone();
-        }
-        if let Some(default_name) = &group.default
-            && let Some(c) = candidates.iter().find(|c| c.tag == default_name.as_str())
-        {
-            return c.clone();
-        }
-        candidates[0].clone()
+        member: GroupMember<'a>,
+    ) -> Option<Candidate<'a>> {
+        candidates
+            .iter()
+            .find(|candidate| Self::same_member(member, candidate.member()))
+            .cloned()
     }
+
+    /// Rate-limited warning when every candidate was health-filtered and
+    /// the sole TCP leaf is served as a last resort: traffic still flows,
+    /// but every health signal voted no.
+    pub(super) fn warn_selector_last_resort(
+        &self,
+        group: &Group,
+        picked: &str,
+        effects: SelectionEffects,
+    ) {
+        if !effects.applies() {
+            return;
+        }
+        const LOG_COOLDOWN: Duration = Duration::from_secs(60);
+        let now = Instant::now();
+        let mut last = self.last_resort_log.write();
+        if last
+            .get(&group.name)
+            .is_some_and(|previous| now.duration_since(*previous) < LOG_COOLDOWN)
+        {
+            return;
+        }
+        last.insert(group.name.clone(), now);
+        drop(last);
+        tracing::warn!(
+            group = %group.name,
+            picked = %picked,
+            "no alive member for this network; serving the sole TCP leaf as last resort"
+        );
+    }
+
     pub(super) fn pick_score<'a>(
         &self,
-        candidates: &[Candidate<'a>],
+        view: ScoreView<'_, 'a>,
         group: &Group,
         context: &ScoreSelectionContext,
         effects: SelectionEffects,
-    ) -> Candidate<'a> {
+        allow_trials: bool,
+    ) -> Option<Candidate<'a>> {
+        let candidates = view.origins;
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if !unique
@@ -89,13 +151,27 @@ impl GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        let index = if effects.applies() {
-            self.score_state
-                .rank(&self.score_authority, &group.name, context, &nodes)
+        let (index, work) = if effects.prepares_score() {
+            self.score_state.rank(
+                &self.score_authority,
+                &group.name,
+                context,
+                &nodes,
+                view,
+                allow_trials,
+            )?
         } else {
-            self.score_state.peek_rank(&group.name, context, &nodes)
+            (
+                self.score_state
+                    .peek_rank(&group.name, context, &nodes, view)?,
+                None,
+            )
         };
-        unique[index].clone()
+        let mut candidate = unique[index].clone();
+        if let Some(work) = work {
+            candidate.score_work.push(work);
+        }
+        Some(candidate)
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based
@@ -114,26 +190,37 @@ impl GroupManager {
         effects: SelectionEffects,
     ) -> Candidate<'a> {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
+        observation::metric("sorting_latency", Some(tolerance.as_secs_f64() * 1000.0));
+        observation::reason("lowest_latency");
 
-        // UDP selection with no UDP-specific measurement data mirrors the
-        // TCP selection (sing-box `Now()` fallback semantics): with nothing
-        // to rank UDP paths by, keep UDP flows on the TCP-chosen member.
+        // Without real UDP ranking evidence, keep the TCP-chosen member.
+        // Synthetic dial failures alone must not disable this mirror.
         if network == SelectionNetwork::Udp
-            && !candidates
-                .iter()
-                .any(|c| self.udp_specific_latency(c.node, ipver).is_some())
+            && !self.alive_set.as_ref().is_some_and(|alive| {
+                candidates.iter().any(|c| {
+                    alive
+                        .get_moving_average(c.node.id, ProbeDomain::DataUdp, ipver)
+                        .is_some()
+                        || alive
+                            .get_moving_average(c.node.id, ProbeDomain::DnsUdp, ipver)
+                            .is_some()
+                })
+            })
         {
             let tcp_entry = {
                 let cache = self.urltest_cache.read();
                 cache.get(&group.name).and_then(|sel| sel.tcp.clone())
             };
             if let Some(entry) = tcp_entry
-                && let Some(c) = candidates.iter().find(|c| c.tag == entry.tag)
+                && let Some(c) = candidates.iter().find(|c| c.tag() == entry.tag)
             {
+                observation::reason("udp_tcp_mirror");
+                observation::metric("tcp_selection", None);
+                observation::previous_tag(self, group, &entry.tag);
                 if effects.applies()
                     && self.cache_urltest_selection(group, network, c, entry.latency)
                 {
-                    self.maybe_interrupt(&group.name);
+                    self.maybe_interrupt(&group.name, network);
                 }
                 return c.clone();
             }
@@ -145,15 +232,18 @@ impl GroupManager {
 
         {
             let cache = self.urltest_cache.read();
-            if let Some(current) = cache.get(&group.name).and_then(|sel| sel.get(network))
-                && let Some(pos) = candidates.iter().position(|c| c.tag == current.tag)
+            if let Some(current) = cache
+                .get(&group.name)
+                .and_then(|sel| sel.get(network))
+                .inspect(|current| observation::previous_tag(self, group, &current.tag))
+                && let Some(pos) = candidates.iter().position(|c| c.tag() == current.tag)
             {
                 let best_latency = self.node_latency(
                     best.node,
                     network,
                     ipver,
                     group.check_url.as_deref(),
-                    best.tag,
+                    best.tag(),
                 );
                 // Hysteresis baseline is the incumbent's *current* measured
                 // latency, not the latency recorded when it was selected
@@ -167,7 +257,7 @@ impl GroupManager {
                     network,
                     ipver,
                     group.check_url.as_deref(),
-                    candidates[pos].tag,
+                    candidates[pos].tag(),
                 );
                 if current_latency != Duration::MAX
                     && !self.failure_demoted(
@@ -178,6 +268,7 @@ impl GroupManager {
                     )
                     && best_latency.saturating_add(tolerance) >= current_latency
                 {
+                    observation::reason("tolerance_held");
                     return candidates[pos].clone();
                 }
             }
@@ -188,10 +279,10 @@ impl GroupManager {
             network,
             ipver,
             group.check_url.as_deref(),
-            best.tag,
+            best.tag(),
         );
         if effects.applies() && self.cache_urltest_selection(group, network, &best, latency) {
-            self.maybe_interrupt(&group.name);
+            self.maybe_interrupt(&group.name, network);
         }
 
         best
@@ -206,26 +297,28 @@ impl GroupManager {
     /// tracked connection of the group (that would defeat load balancing).
     /// Connections to a node that actually dies are reaped by the alive
     /// set's traffic-failure reporting instead.
-    pub(super) fn pick_load_balance<'a>(
+    pub(super) fn pick_load_balance(
         &self,
-        candidates: &[Candidate<'a>],
+        candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> Candidate<'a> {
+    ) -> usize {
+        observation::reason("round_robin");
         let Some(counter) = self
             .lb_counters
             .get(&group.name)
             .map(|counters| &counters[network.slot()])
         else {
-            return candidates[0].clone();
+            observation::reason("first_member");
+            return 0;
         };
         let cursor = if effects.applies() {
             counter.fetch_add(1, Ordering::Relaxed)
         } else {
             counter.load(Ordering::Relaxed)
         };
-        candidates[cursor % candidates.len()].clone()
+        cursor % candidates.len()
     }
 
     /// Fallback policy: first alive candidate in member order, pinned.
@@ -237,28 +330,30 @@ impl GroupManager {
     /// flapping (a marginally-preferred member oscillating alive/dead
     /// would yank every connection twice) costs more than staying on a
     /// working lower-preference member until it actually fails.
-    pub(super) fn pick_fallback<'a>(
+    pub(super) fn pick_fallback(
         &self,
-        candidates: &[Candidate<'a>],
+        candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> Candidate<'a> {
+    ) -> usize {
+        observation::reason("first_alive");
         {
             let cache = self.fallback_cache.read();
             if let Some(pinned) = cache
                 .get(&group.name)
                 .and_then(|pins| pins[network.slot()].as_deref())
-                && let Some(c) = candidates.iter().find(|c| c.tag == pinned)
+                .inspect(|pinned| observation::previous_tag(self, group, pinned))
+                && let Some(index) = candidates.iter().position(|c| c.tag() == pinned)
             {
-                return c.clone();
+                observation::reason("pinned_alive");
+                return index;
             }
         }
-        let first = candidates[0].clone();
-        if effects.applies() && self.cache_fallback_selection(group, network, &first) {
-            self.maybe_interrupt(&group.name);
+        if effects.applies() && self.cache_fallback_selection(group, network, &candidates[0]) {
+            self.maybe_interrupt(&group.name, network);
         }
-        first
+        0
     }
 
     /// Pick the candidate with the lowest probe latency from alive_set.
@@ -277,9 +372,12 @@ impl GroupManager {
         candidates
             .iter()
             .min_by_key(|c| {
+                let demoted =
+                    self.failure_demoted(c.node, network, ipver, group.check_url.as_deref());
+                observation::latency_tier(c, demoted);
                 (
-                    self.failure_demoted(c.node, network, ipver, group.check_url.as_deref()),
-                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag),
+                    demoted,
+                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag()),
                 )
             })
             .cloned()
@@ -354,17 +452,9 @@ impl GroupManager {
                         .and_then(|a| a.get_moving_average(node.id, ProbeDomain::DnsUdp, ipver))
                 }),
         };
-        latency.unwrap_or(Duration::MAX)
-    }
-
-    /// UDP-specific probe latency only: DataUDP first, then DNS-UDP (no
-    /// TCP fallback). Used to decide whether the UDP selection has any
-    /// measurement of its own to rank by.
-    fn udp_specific_latency(&self, node: &Node, ipver: IpVersion) -> Option<Duration> {
-        let alive = self.alive_set.as_ref()?;
-        alive
-            .get_last_latency(node.id, ProbeDomain::DataUdp, ipver)
-            .or_else(|| alive.get_last_latency(node.id, ProbeDomain::DnsUdp, ipver))
+        let latency = latency.unwrap_or(Duration::MAX);
+        observation::latency(node.id, tag, latency);
+        latency
     }
 
     /// Order candidates by (network-aware) latency, lowest first.
@@ -375,7 +465,8 @@ impl GroupManager {
         ipver: IpVersion,
         check_url: Option<&str>,
     ) -> Vec<Candidate<'a>> {
-        candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag));
+        candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag()));
+        observation::ordered(&candidates);
         candidates
     }
 }

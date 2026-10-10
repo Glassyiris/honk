@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "run_id": 90,
+  "run_attempt": 1,
+  "lane": "smoke",
+  "matrix": {
+    "target": "x86_64-unknown-linux-gnu",
+    "toolchain": "pinned-stable",
+    "profile": "release"
+  },
+  "measured_sha": "346e667d",
+  "baseline_sha": null,
+  "units": {
+    "smoke_memory": "MiB",
+    "smoke_cpu": "seconds",
+    "binary_size": "bytes",
+    "toolchain": "rustc-cache"
+  },
+  "values": {
+    "smoke_memory": {"value": 20, "unit": "MiB", "available": true},
+    "smoke_cpu": {"value": 0.04, "unit": "seconds", "available": true},
+    "binary_size": {"value": 19922944, "unit": "bytes", "available": true},
+    "toolchain": {"value": {"rustc": "1.98.1", "cache_hit": false}, "unit": "rustc-cache", "available": true}
+  },
+  "signals": [],
+  "failure": null
+}

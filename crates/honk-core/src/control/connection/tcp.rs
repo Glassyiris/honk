@@ -1,17 +1,69 @@
+use super::overall_dial_timeout;
 use super::routing::{build_connection_info, connection_chains};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
-use honk_config::types::NodeProtocol;
 
+use futures::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+
+use crate::connection_tracker::{
+    CloseAction, CloseCompletion, CloseSignal, ConnectionOwner, captured_groups,
+};
+
+async fn wait_for_close(close: Option<&CloseCompletion>) {
+    match close {
+        Some(close) => close.0.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+use super::observation::ConnectionObservation;
+#[cfg(feature = "native-api")]
+use crate::observe::catalog::CatalogIdentity;
+
+mod dial;
+
+fn tcp_relay_score_outcome(error: &anyhow::Error) -> crate::group::ScoreOutcome {
+    if error.is::<relay::ClientIoError>() {
+        crate::group::ScoreOutcome::Cancelled
+    } else {
+        crate::group::ScoreOutcome::from_error(error)
+    }
+}
+
+async fn write_sniff_prefix(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin + ?Sized),
+    mut buffered: &[u8],
+    mut on_write: impl FnMut(usize),
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    while !buffered.is_empty() {
+        let written = stream.write(buffered).await?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        on_write(written);
+        buffered = &buffered[written..];
+    }
+    Ok(())
+}
 
 type UnpackedTcpScorePlan = (
     Vec<Node>,
     SelectionPlanMode,
-    HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
+    HashMap<uuid::Uuid, crate::group::ScoreAttempt>,
+    HashMap<uuid::Uuid, Vec<String>>,
     HashMap<uuid::Uuid, Vec<String>>,
     IpVersion,
 );
+
+struct TcpDnsRoute {
+    decision: super::routing::RoutingDecision,
+    config: Arc<Config>,
+    group_manager: Arc<honk_outbound::group::GroupManager>,
+    runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    #[cfg(feature = "native-api")]
+    native: Option<(u64, Arc<CatalogIdentity>)>,
+}
 
 fn tcp_score_context(
     target: SocketAddr,
@@ -40,11 +92,13 @@ fn unpack_tcp_score_plan(plan: crate::control::reload::ResolvedScorePlan) -> Unp
     let mut nodes = Vec::with_capacity(plan.nodes.len());
     let mut feedback = HashMap::new();
     let mut selection_chains = HashMap::new();
-    for ((node, value), selection_chain) in plan
+    let mut final_owners = HashMap::new();
+    for (((node, value), selection_chain), used_final_owners) in plan
         .nodes
         .into_iter()
         .zip(plan.feedback)
         .zip(plan.selection_chains)
+        .zip(plan.final_owners)
     {
         if !seen.insert(node.id) {
             continue;
@@ -53,6 +107,9 @@ fn unpack_tcp_score_plan(plan: crate::control::reload::ResolvedScorePlan) -> Unp
             feedback.insert(node.id, value);
         }
         selection_chains.insert(node.id, selection_chain);
+        if !used_final_owners.is_empty() {
+            final_owners.insert(node.id, used_final_owners);
+        }
         nodes.push(node);
     }
     (
@@ -60,6 +117,7 @@ fn unpack_tcp_score_plan(plan: crate::control::reload::ResolvedScorePlan) -> Unp
         plan.mode,
         feedback,
         selection_chains,
+        final_owners,
         plan.health_family,
     )
 }
@@ -83,14 +141,103 @@ const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);
 
 /// Wait until this candidate's absolute cold-URLTest release offset. The
 /// first candidate starts immediately; sleeping candidates have not acquired
-/// a dial permit and are cancelled with their enclosing `JoinSet`.
+/// a dial permit and are dropped with their accepted connection owner.
 async fn wait_for_cold_urltest_release(index: usize) {
     if index != 0 {
         tokio::time::sleep(COLD_URLTEST_STAGGER.saturating_mul(index as u32)).await;
     }
 }
 
+/// How an observed TCP connection ended.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy)]
+enum TcpTerminal {
+    DnsInterceptCompleted,
+    NoAvailableNodes,
+    PolicyBlock,
+    DialFailed,
+    IntentionalRetirement,
+    PrefixWriteFailed,
+    RelayClosed,
+    RelayFailed,
+    ConnectionFailed,
+}
+
+#[cfg(feature = "native-api")]
+impl TcpTerminal {
+    fn outcome(self) -> (crate::observe::vocab::ConnectionState, &'static str) {
+        use crate::observe::vocab::ConnectionState::{Blocked, Closed, Failed};
+        match self {
+            Self::DnsInterceptCompleted => (Closed, "dns_intercept_completed"),
+            Self::NoAvailableNodes => (Failed, "no_available_nodes"),
+            Self::PolicyBlock => (Blocked, "policy_block"),
+            Self::DialFailed => (Failed, "dial_failed"),
+            Self::IntentionalRetirement => (Closed, "intentional_retirement"),
+            Self::PrefixWriteFailed => (Failed, "prefix_write_failed"),
+            Self::RelayClosed => (Closed, "relay_closed"),
+            Self::RelayFailed => (Failed, "relay_failed"),
+            Self::ConnectionFailed => (Failed, "connection_failed"),
+        }
+    }
+}
+
+/// Block nodes "dial" by failing and the dial path reports no other signal,
+/// so a failure where every tried node is a block node is the policy's doing.
+pub(super) fn only_block_nodes<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> bool {
+    nodes
+        .into_iter()
+        .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block)
+}
+
 impl ControlPlaneHandle {
+    async fn pin_tcp_dns_route(
+        &self,
+        handoff: &super::handoff::HandoffResult,
+    ) -> anyhow::Result<TcpDnsRoute> {
+        let config = self.config.read().await;
+        let backend = self.ebpf.read().await;
+        anyhow::ensure!(
+            handoff.routing_generation != 0
+                && handoff.routing_generation == backend.routing_policy_generation(),
+            "TCP DNS routing generation is stale"
+        );
+        let outbound = if handoff.outbound == OutboundIndex::Direct as u8 {
+            "direct".to_owned()
+        } else {
+            handoff
+                .outbound
+                .checked_sub(OutboundIndex::UserBase as u8)
+                .filter(|_| handoff.outbound < OutboundIndex::MustRules as u8)
+                .and_then(|index| config.groups.get(index as usize))
+                .ok_or_else(|| anyhow::anyhow!("invalid terminal TCP DNS outbound"))?
+                .name
+                .clone()
+        };
+        let decision = super::routing::RoutingDecision {
+            outbound,
+            must: true,
+            mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
+            matched_rule: None,
+            reroute_by_sniffed_domain: false,
+            #[cfg(feature = "native-api")]
+            native_route: None,
+        };
+        drop(backend);
+        Ok(TcpDnsRoute {
+            decision,
+            config: Arc::clone(&config),
+            group_manager: self.group_manager.read().clone(),
+            runtime: self.runtime_registry.read().clone(),
+            #[cfg(feature = "native-api")]
+            native: self.native.as_ref().map(|native| {
+                (
+                    self.diagnostics.read().generation,
+                    native.catalog.snapshot(),
+                )
+            }),
+        })
+    }
+
     pub(in crate::control) async fn serve_connection(
         &self,
         stream: TcpStream,
@@ -114,7 +261,7 @@ impl ControlPlaneHandle {
                         d
                     }
                     Err(le) => {
-                        warn!(
+                        debug!(
                             "Failed to get original destination for {}: {}; local_addr also failed: {}",
                             client_addr, e, le
                         );
@@ -129,1162 +276,845 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-        let tuples = build_tuples_key(
-            original_dst.ip(),
-            original_dst.port(),
-            client_addr.ip(),
-            client_addr.port(),
-            6, // TCP
-        );
-        let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
-
-        if let Ok(true) = self
-            .dns_controller
-            .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
-            .await
-        {
-            return Ok(());
-        }
-
-        let (dial_mode, connect_timeout, dns_resolve_timeout, overall_dial_timeout) = {
-            let config = self.config.read().await;
-            let connect_timeout_ms = config.global.connect_timeout_ms;
-            (
-                config
-                    .global
-                    .dial_mode
-                    .parse::<DialMode>()
-                    .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?,
-                Duration::from_millis(connect_timeout_ms),
-                Duration::from_millis(config.global.dns_resolve_timeout_ms),
-                Duration::from_millis((connect_timeout_ms.max(1000) * 4).max(10000)),
-            )
-        };
-
-        // Skip sniffing when the datapath already made a final decision.
-        // In ip mode we always dial by original_dst.
-        let mut skip_sniff = matches!(dial_mode, DialMode::Ip);
-        if let Some(ref ho) = handoff {
-            let final_handoff = matches!(
-                ho.outbound,
-                x if x == OutboundIndex::Direct as u8
-                    || x == OutboundIndex::Block as u8
-                    || x == OutboundIndex::MustRules as u8
-            ) || (ho.must != 0
-                && ho.outbound != OutboundIndex::ControlPlaneRouting as u8);
-            if !skip_sniff && final_handoff {
-                debug!(
-                    "Skip TCP sniffing by final eBPF handoff for {} (outbound={})",
-                    original_dst, ho.outbound
-                );
-                skip_sniff = true;
-            }
-            let cache_key = (original_dst, ho.outbound);
-            let now = std::time::Instant::now();
-            if !skip_sniff && self.tcp_sniff_neg_cache.should_skip_sniff(&cache_key, now) {
-                debug!("Skip TCP sniffing by negative cache for {}", original_dst);
-                skip_sniff = true;
-            }
-        }
-
-        let sniff_result = if skip_sniff {
-            sniffing::SniffResult::unknown()
-        } else {
-            sniffing::sniff_tcp(flow.stream_mut()).await
-        };
-        let sniffed_domain = sniff_result.domain.clone();
-        if let Some(ref domain) = sniffed_domain {
-            debug!("SNI sniffed domain: {}", domain);
-        }
-        let (domain, domain_verified) = self
-            .apply_domain_reality_check(
-                dial_mode,
-                sniffed_domain,
-                original_dst.ip(),
-                client_addr.ip(),
-            )
-            .await;
-
-        if !skip_sniff && let Some(ref ho) = handoff {
-            let cache_key = (original_dst, ho.outbound);
-            let now = std::time::Instant::now();
-            if domain.is_some() {
-                self.tcp_sniff_neg_cache.clear_sniff_negative(&cache_key);
-            } else {
-                self.tcp_sniff_neg_cache.note_sniff_failure(cache_key, now);
-            }
-        }
-
-        let conn_info = build_connection_info(
-            domain.clone(),
-            original_dst,
+        let mut observation = ConnectionObservation::begin(
+            self.native.as_deref(),
+            crate::observe::vocab::Network::Tcp,
             client_addr,
-            "tcp",
-            handoff.as_ref(),
+            original_dst,
         );
-        let route = self
-            .prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
-            .await;
-        let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
-        let matched_rule = route.matched_rule;
-        let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
-
-        // For userspace-routed flows with a sniffed domain, write the resolved
-        // IP back into eBPF DOMAIN_ROUTING_MAP so the next connection to the
-        // same IP can be fast-pathed by eBPF domain rules instead of being
-        // sniffed again.
-        if let Some(domain) = &domain
-            && Self::should_write_sniffed_domain_bitmap(handoff.as_ref(), reroute_by_sniffed_domain)
-        {
-            self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
-                .await;
-        }
-
-        self.stats.record_connection(&outbound_name);
-        // If eBPF already decided this flow should go direct (not just punted
-        // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
-        // For ControlPlaneRouting handoffs we must relay in userspace even if
-        // the final routing decision is direct, because eBPF has not installed
-        // the flow state needed to forward the accepted socket.
-        let ebpf_offload = outbound_name == "direct"
-            && handoff
-                .as_ref()
-                .map(|ho| {
-                    ho.outbound == OutboundIndex::Direct as u8
-                        && ho.mark != 0
-                        && ho.outbound != OutboundIndex::ControlPlaneRouting as u8
-                })
-                .unwrap_or(false);
-        if ebpf_offload {
-            info!(
-                network = "tcp",
-                outbound = %outbound_name,
-                ip = %original_dst,
-                src = %client_addr,
-                ebpf_offload = true,
-                "TCP offloaded to eBPF: {} -> {}",
-                client_addr,
-                original_dst,
-            );
-            self.stats.record_close(&outbound_name);
-            return Ok(());
-        }
-
-        let ipver = if original_dst.is_ipv6() {
-            IpVersion::V6
-        } else {
-            IpVersion::V4
-        };
-        // Hold the config read guard while cloning the group/runtime handles:
-        // reload publishes all three under their write guards, so this is one
-        // coherent generation rather than three individually-current values.
-        let generation_config_guard = self.config.read().await;
-        let generation_config = Arc::clone(&generation_config_guard);
-        let generation_group_manager = self.group_manager.read().clone();
-        let runtime_generation = self.runtime_registry.read().clone();
-        drop(generation_config_guard);
-        let (
-            mut candidates,
-            mut selection_mode,
-            mut score_feedback,
-            mut selection_chains,
-            health_ipver,
-        ) = {
-            let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
-            let plan = crate::control::reload::resolve_outbound_plan_for_target(
-                &generation_config,
-                &generation_group_manager,
-                &outbound_name,
-                &context,
-            );
-            unpack_tcp_score_plan(plan)
-        };
-        // Only an unmeasured URLTest group is allowed to speculate. Its
-        // candidate set is bounded before spawning so a large group cannot
-        // turn one client flow into an unbounded dial storm.
-        if selection_mode == SelectionPlanMode::ColdUrlTest {
-            candidates.truncate(3);
-        } else {
-            candidates.truncate(1);
-        }
-
-        if candidates.is_empty() {
-            warn!(
-                "No available candidate nodes for outbound '{}' ({})",
-                outbound_name, client_addr
-            );
-            // Trigger emergency probes to recover dead nodes (leaf
-            // expansion: sub-group tags carry no probe state).
-            let group_manager = self.group_manager.read().clone();
-            for node in group_manager.leaf_nodes_in_group(&outbound_name) {
-                self.alive_set.notify_check_tcp(node.id);
-            }
-            self.stats.record_error(&outbound_name);
-            self.stats.record_close(&outbound_name);
-            return Ok(());
-        }
-
-        // Domain targets are meaningful only for non-reserved proxy
-        // outbounds. Direct and block always use the original IP.
-        let domain_target_allowed = !matches!(
-            outbound_name.as_str(),
-            "direct" | "block" | "must_rules" | "control_plane_routing"
-        );
-        let all_domain_capable = candidates.iter().all(|node| {
-            matches!(
-                node.protocol(),
-                NodeProtocol::Direct
-                    | NodeProtocol::Block
-                    | NodeProtocol::Socks5
-                    | NodeProtocol::Trojan
-                    | NodeProtocol::SS
-                    | NodeProtocol::AnyTLS
-            )
+        #[cfg(feature = "native-api")]
+        let native_observer = observation.flow().and_then(|flow| {
+            flow.observer(self.diagnostics.read().generation, None, "dial_target")
         });
-
-        // Resolve the target IP for dialing. Domain-capable proxies receive
-        // the sniffed name; other proxy paths resolve it locally.
-        let (resolved_target, target_domain) = if domain_target_allowed {
-            if let Some(ref domain) = domain {
-                if all_domain_capable {
-                    debug!(
-                        "Skipping DNS for {} (domain-capable proxy, {} candidates)",
-                        domain,
-                        candidates.len()
-                    );
-                    (original_dst, Some(domain.clone()))
-                } else {
-                    let is_v6 = original_dst.is_ipv6();
-                    match tokio::time::timeout(
-                        dns_resolve_timeout,
-                        self.dns_resolver
-                            .resolve_for_source(domain, client_addr.ip()),
+        #[cfg(feature = "native-api")]
+        let mut terminal = None;
+        let close = self
+            .connection_tracker
+            .is_enabled()
+            .then(|| CloseCompletion(CloseSignal::new()));
+        let result = {
+            let operation = async {
+                let tuples = build_tuples_key(
+                    original_dst.ip(),
+                    original_dst.port(),
+                    client_addr.ip(),
+                    client_addr.port(),
+                    6, // TCP
+                );
+                let (mut flow, handoff) = self
+                    .adopt_tcp_flow(
+                        stream,
+                        tuples,
+                        #[cfg(feature = "native-api")]
+                        &observation,
                     )
-                    .await
-                    {
-                        Ok(Ok(resolved)) => {
-                            let preferred_ip = if is_v6 {
-                                resolved
-                                    .ipv6
-                                    .first()
-                                    .or_else(|| resolved.ipv4.first())
-                                    .copied()
-                            } else {
-                                resolved
-                                    .ipv4
-                                    .first()
-                                    .or_else(|| resolved.ipv6.first())
-                                    .copied()
-                            };
-                            match preferred_ip {
-                                Some(ip) => {
-                                    let resolved_addr = SocketAddr::new(ip, original_dst.port());
-                                    debug!(
-                                        "DNS resolved {} -> {} ({})",
-                                        domain,
-                                        resolved_addr,
-                                        if is_v6 { "v6-prefer" } else { "v4-prefer" }
-                                    );
-                                    (resolved_addr, Some(domain.clone()))
-                                }
-                                None => {
-                                    debug!(
-                                        "DNS returned no IPs for {}, using original dst",
-                                        domain
-                                    );
-                                    (original_dst, Some(domain.clone()))
-                                }
-                            }
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            debug!("DNS timed out or failed for {}, using original dst", domain);
-                            (original_dst, Some(domain.clone()))
-                        }
-                    }
-                }
-            } else {
-                (original_dst, None)
-            }
-        } else {
-            (original_dst, None)
-        };
-        if (resolved_target.is_ipv6() && ipver == IpVersion::V4)
-            || (resolved_target.is_ipv4() && ipver == IpVersion::V6)
-        {
-            // Local DNS fell back across address families. The preliminary
-            // plan was needed to decide whether local resolution was required,
-            // but no dial (and therefore no reporter) has started yet. Replace
-            // it with a plan keyed by the address that will actually be dialed
-            // while retaining the proxy-health family already selected.
-            let context =
-                tcp_score_context(resolved_target, target_domain.as_deref(), health_ipver);
-            let plan = crate::control::reload::resolve_outbound_plan_for_target(
-                &generation_config,
-                &generation_group_manager,
-                &outbound_name,
-                &context,
-            );
-            let (nodes, mode, feedback, chains, _) = unpack_tcp_score_plan(plan);
-            candidates = nodes;
-            selection_mode = mode;
-            score_feedback = feedback;
-            selection_chains = chains;
-            if selection_mode == SelectionPlanMode::ColdUrlTest {
-                candidates.truncate(3);
-            } else {
-                candidates.truncate(1);
-            }
-        }
+                    .await?;
+                observation.handoff(handoff.as_ref(), true);
+                observation.routing_started();
 
-        let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
-        let candidate_refs: Vec<&Node> = candidates.iter().collect();
-        let raced = self
-            .race_candidates(
-                &candidate_refs,
-                resolved_target,
-                target_domain.clone(),
-                &outbound_name,
-                connect_timeout,
-                overall_dial_timeout,
-                Arc::clone(&runtime_generation),
-                health_ipver,
-                &score_feedback,
-                cold_urltest,
-            )
-            .await;
-        let (mut proxy_stream, node, score_reporter) = match raced {
-            Some(pair) => pair,
-            None => {
-                // Retry once only when a failed authoritative pick can produce
-                // a different plan. URLTest may race its alternates; Score
-                // re-scores the exact target and retries only a replacement.
-                let mut retried: Option<(
-                    crate::proxy::ProxyStream,
-                    Node,
-                    Option<crate::group::ScoreReporter>,
-                )> = None;
-                if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
-                    {
-                        let group_manager = Arc::clone(&generation_group_manager);
-                        let context = tcp_score_context(
-                            resolved_target,
-                            target_domain.as_deref(),
-                            health_ipver,
-                        );
-                        let mut plan =
-                            crate::control::reload::resolve_urltest_retry_plan_for_target(
-                                &group_manager,
-                                &outbound_name,
-                                &context,
-                            );
-                        if plan.nodes.is_empty() {
-                            plan = crate::control::reload::resolve_outbound_plan_for_target(
-                                &generation_config,
-                                &group_manager,
-                                &outbound_name,
-                                &context,
-                            );
-                        }
-                        let (
-                            retry_nodes,
-                            _,
-                            retry_feedback,
-                            retry_selection_chains,
-                            retry_health_ipver,
-                        ) = unpack_tcp_score_plan(plan);
-                        if retry_nodes.len() > 1
-                            || retry_nodes
-                                .first()
-                                .is_some_and(|node| node.id != candidates[0].id)
+                let pinned_dns_route = if original_dst.port() == 53 {
+                    let handoff = handoff.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("transparent TCP DNS has no routing handoff")
+                    })?;
+                    if handoff.outbound == OutboundIndex::Block as u8 {
+                        None
+                    } else if handoff.must != 0 {
+                        Some(self.pin_tcp_dns_route(handoff).await?)
+                    } else {
+                        self.dns_controller
+                            .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
+                            .await?;
+                        #[cfg(feature = "native-api")]
                         {
-                            let nodes: Vec<_> = retry_nodes.iter().take(3).collect();
-                            let retry = self
-                                .race_candidates(
-                                    &nodes,
-                                    resolved_target,
-                                    target_domain.clone(),
-                                    &outbound_name,
-                                    connect_timeout,
-                                    overall_dial_timeout,
-                                    Arc::clone(&runtime_generation),
-                                    retry_health_ipver,
-                                    &retry_feedback,
-                                    false,
-                                )
-                                .await;
-                            if retry.is_some() {
-                                selection_chains = retry_selection_chains;
-                            }
-                            retried = retry;
+                            terminal = Some(TcpTerminal::DnsInterceptCompleted);
                         }
-                    }
-                }
-                match retried {
-                    Some(pair) => pair,
-                    None => {
-                        self.stats.record_close(&outbound_name);
                         return Ok(());
                     }
+                } else {
+                    None
+                };
+
+                let (dial_mode, connect_timeout, overall_dial_timeout) = {
+                    let current_config;
+                    let config = if let Some(snapshot) = &pinned_dns_route {
+                        &snapshot.config
+                    } else {
+                        current_config = self.config.read().await;
+                        &*current_config
+                    };
+                    #[cfg(feature = "native-api")]
+                    {
+                        observation.pin_dial_mode(if let Some(snapshot) = &pinned_dns_route {
+                            snapshot.native.as_ref().map(|(generation, _)| *generation)
+                        } else {
+                            observation
+                                .is_recording()
+                                .then(|| self.diagnostics.read().generation)
+                        });
+                    }
+                    let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
+                    (
+                        config
+                            .global
+                            .dial_mode
+                            .parse::<DialMode>()
+                            .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?,
+                        connect_timeout,
+                        overall_dial_timeout(connect_timeout),
+                    )
+                };
+
+                // Skip sniffing when the datapath already made a final decision.
+                // In ip mode we always dial by original_dst.
+                let mut skip_sniff = matches!(dial_mode, DialMode::Ip);
+                if let Some(ref ho) = handoff {
+                    let final_handoff = matches!(
+                        ho.outbound,
+                        x if x == OutboundIndex::Direct as u8
+                            || x == OutboundIndex::Block as u8
+                            || x == OutboundIndex::MustRules as u8
+                    ) || (ho.must != 0
+                        && ho.outbound != OutboundIndex::ControlPlaneRouting as u8);
+                    if !skip_sniff && final_handoff {
+                        debug!(
+                            "Skip TCP sniffing by final eBPF handoff for {} (outbound={})",
+                            original_dst, ho.outbound
+                        );
+                        skip_sniff = true;
+                    }
+                    let cache_key = (original_dst, ho.outbound);
+                    let now = std::time::Instant::now();
+                    if !skip_sniff && self.tcp_sniff_neg_cache.should_skip_sniff(&cache_key, now) {
+                        debug!("Skip TCP sniffing by negative cache for {}", original_dst);
+                        skip_sniff = true;
+                    }
                 }
-            }
-        };
 
-        let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
-
-        let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        if let Some(conn_id) = flow.track_if_enabled(|| {
-            let id = uuid::Uuid::new_v4().to_string();
-            let (rule, rule_payload) =
-                matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-            crate::connection_tracker::ConnectionEntry {
-                id,
-                source: client_addr.to_string(),
-                destination: resolved_target.to_string(),
-                proxy: node.name.clone(),
-                rule,
-                rule_payload,
-                chains: connection_chains(
-                    selection_chains.remove(&node.id).unwrap_or_default(),
-                    &node.name,
-                ),
-                upload: conn_upload.clone(),
-                download: conn_download.clone(),
-                start_time: std::time::Instant::now(),
-                domain: target_domain.clone(),
-                network: "tcp".to_string(),
-                process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path: None,
-            }
-        }) {
-            self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
-        }
-
-        info!(
-            network = "tcp",
-            outbound = %outbound_name,
-            dialer = %node.name,
-            sniffed = target_domain.as_deref().unwrap_or(""),
-            ip = %resolved_target,
-            dscp = dscp_val,
-            src = %client_addr,
-            "TCP connection: {} <-> {}", client_addr, resolved_target,
-        );
-
-        if !sniff_result.buffered.is_empty() {
-            use tokio::io::AsyncWriteExt;
-            if let Err(e) = proxy_stream.stream.write_all(&sniff_result.buffered).await {
-                warn!("Failed to write sniffed bytes to proxy: {}", e);
-                self.stats.record_error(&outbound_name);
-                self.stats.record_close(&outbound_name);
-                if let Some(reporter) = &score_reporter {
-                    reporter.finish(crate::group::ScoreOutcome::Io(e.kind()));
+                let sniff_result = if skip_sniff {
+                    sniffing::SniffResult::unknown()
+                } else {
+                    sniffing::sniff_tcp(flow.stream_mut()).await
+                };
+                let sniffed_domain = sniff_result.domain.clone();
+                if let Some(ref domain) = sniffed_domain {
+                    debug!("SNI sniffed domain: {}", domain);
                 }
-                return Ok(());
-            }
-        }
-        if let Some(reporter) = &score_reporter {
-            reporter.tx(sniff_result.buffered.len() as u64);
-        }
+                observation.tcp_sniffed(&sniff_result, handoff.as_ref());
+                let (domain, domain_verified, domain_verification) = self
+                    .apply_domain_reality_check(
+                        dial_mode,
+                        sniffed_domain,
+                        original_dst.ip(),
+                        client_addr,
+                    )
+                    .await;
 
-        // Zero-copy fast path: a direct dial yields plain `TcpStream`s on
-        // both ends, so relay through `splice(2)` (with automatic lossless
-        // fallback to the copy relay when the kernel rejects it). TLS- or
-        // protocol-wrapped proxy streams keep the userspace copy relay.
-        // Both paths update the connection's live byte counters as data flows.
-        let first_response = score_reporter.as_ref().map(|reporter| {
-            let reporter = reporter.clone();
-            std::sync::Arc::new(move || reporter.first_response())
-                as std::sync::Arc<dyn Fn() + Send + Sync>
-        });
-        let conn_progress = relay::RelayProgress {
-            upload: conn_upload.clone(),
-            download: conn_download.clone(),
-            first_response,
-        };
-        let relay_result = match proxy_stream.into_tcp_stream() {
-            Ok(upstream) => {
-                relay::splice::relay_splice(
-                    flow.stream_mut(),
-                    upstream,
-                    client_addr,
-                    resolved_target,
-                    Some(conn_progress.clone()),
-                )
-                .await
-            }
-            Err(proxy_stream) => {
-                relay::splice::relay_auto(
-                    flow.stream_mut(),
-                    proxy_stream.stream,
-                    client_addr,
-                    resolved_target,
-                    Some(conn_progress),
-                )
-                .await
-            }
-        };
-        if let Some(reporter) = &score_reporter {
-            let upload = conn_upload.load(std::sync::atomic::Ordering::Relaxed);
-            let download = conn_download.load(std::sync::atomic::Ordering::Relaxed);
-            reporter.tx(upload);
-            reporter.rx(download);
-            if download > 0 {
-                reporter.first_response();
-            }
-        }
-        flow.retire().await;
+                if !skip_sniff && let Some(ref ho) = handoff {
+                    let cache_key = (original_dst, ho.outbound);
+                    let now = std::time::Instant::now();
+                    if domain.is_some() {
+                        self.tcp_sniff_neg_cache.clear_sniff_negative(&cache_key);
+                    } else {
+                        self.tcp_sniff_neg_cache.note_sniff_failure(cache_key, now);
+                    }
+                }
 
-        match relay_result {
-            Ok(relay_stats) => {
-                self.stats.record_bytes(
-                    &outbound_name,
-                    relay_stats.client_to_proxy,
-                    relay_stats.proxy_to_client,
+                let conn_info = build_connection_info(
+                    domain.clone(),
+                    original_dst,
+                    client_addr,
+                    "tcp",
+                    handoff.as_ref(),
                 );
-                if let Some(reporter) = &score_reporter {
-                    reporter.finish(crate::group::ScoreOutcome::Success);
-                }
-                self.stats.record_close(&outbound_name);
+                #[cfg(feature = "native-api")]
+                let mut pinned_native = pinned_dns_route
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.native.clone());
+                let (mut route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
+                    (
+                        snapshot.decision,
+                        Some((snapshot.config, snapshot.group_manager, snapshot.runtime)),
+                    )
+                } else {
+                    (
+                        self.prepare_routing(
+                            dial_mode,
+                            &conn_info,
+                            domain_verified,
+                            handoff.as_ref(),
+                            #[cfg(feature = "native-api")]
+                            observation.is_recording(),
+                        )
+                        .await,
+                        None,
+                    )
+                };
+                observation.routed(&mut route);
+                let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
+                let matched_rule = route.matched_rule.take();
+                let mode_decision = self.apply_mode_override(&mut route).await;
+                let outbound_name = mode_decision.name;
+                let mode_constraint = mode_decision.constraint;
+                observation.mode_applied(&outbound_name);
 
-                // Deposit a fresh connection for future reuse. Ready-capable
-                // handlers get a fully-dialed, target-bound stream (handshake
-                // paid here, off the critical path); others get a bare TCP
-                // to the proxy server.
-                if outbound_name != "direct" && outbound_name != "block" {
-                    let node = node.clone();
-                    let node_addr = format!("{}:{}", node.host(), node.port);
-                    let pool = self.connection_pool.clone();
-                    let registry = self.proxy_registry.clone();
-                    let target_domain = target_domain.clone();
-                    let generation = Arc::clone(&runtime_generation);
-                    let pool_feedback = score_reporter.as_ref().map(|reporter| reporter.feedback());
-                    let pool_health_family = health_ipver;
-                    tokio::spawn(async move {
-                        let (ready_capable, bare_capable) = registry
-                            .find(node.protocol())
-                            .map(|entry| {
+                // Seed current predicate facts so later flows need not repeat sniffing.
+                if let Some(domain) = &domain
+                    && Self::should_write_sniffed_domain_bitmap(
+                        handoff.as_ref(),
+                        reroute_by_sniffed_domain,
+                    )
+                {
+                    self.push_sniffed_domain_bitmap(domain, original_dst.ip())
+                        .await;
+                }
+
+                let ipver = if original_dst.is_ipv6() {
+                    IpVersion::V6
+                } else {
+                    IpVersion::V4
+                };
+                let (generation_config, generation_group_manager, runtime_generation) =
+                    if let Some(snapshot) = pinned_generation {
+                        snapshot
+                    } else {
+                        // Config's publication guard pins the group and runtime handles.
+                        let config = self.config.read().await;
+                        #[cfg(feature = "native-api")]
+                        if observation.is_recording()
+                            || close.is_some()
+                            || mode_decision.group_id.is_some()
+                        {
+                            pinned_native = self.native.as_ref().map(|native| {
                                 (
-                                    (entry.descriptor.pool_ready_streams)(&node),
-                                    (entry.descriptor.pool_bare_tcp)(&node),
+                                    self.diagnostics.read().generation,
+                                    native.catalog.snapshot(),
                                 )
-                            })
-                            .unwrap_or((false, false));
-                        if ready_capable {
-                            let key = ConnectionPool::ready_key(
-                                &node_addr,
-                                resolved_target,
+                            });
+                        }
+                        (
+                            Arc::clone(&config),
+                            self.group_manager.read().clone(),
+                            self.runtime_registry.read().clone(),
+                        )
+                    };
+                #[cfg(feature = "native-api")]
+                let mode_constraint = if mode_decision.group_id.as_ref().is_some_and(|expected| {
+                    pinned_native
+                        .as_ref()
+                        .and_then(|(_, catalog)| catalog.groups.get(&outbound_name))
+                        != Some(expected)
+                }) {
+                    crate::control::reload::OutboundConstraint::Unavailable
+                } else {
+                    mode_constraint
+                };
+                let outbound_kind =
+                    crate::stats::OutboundKind::routed(&generation_group_manager, &outbound_name);
+                let outbound_guard = self.stats.track_connection(&outbound_name, outbound_kind);
+                #[cfg(feature = "native-api")]
+                let close_catalog = pinned_native
+                    .as_ref()
+                    .map(|(_, catalog)| Arc::clone(catalog));
+                #[cfg(feature = "native-api")]
+                if let Some((generation, catalog)) = &pinned_native {
+                    observation.pin_selection(*generation, catalog, &generation_config);
+                }
+                #[cfg(feature = "native-api")]
+                let selection_observer = pinned_native.as_ref().and_then(|(generation, _)| {
+                    observation.observer(|| *generation, "dial_target")
+                });
+                let (
+                    mut candidates,
+                    selection_mode,
+                    mut score_feedback,
+                    mut selection_chains,
+                    final_owners,
+                    health_ipver,
+                ) = {
+                    let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
+                    let select = || {
+                        crate::control::reload::resolve_outbound_plan_for_target(
+                            &generation_config,
+                            &generation_group_manager,
+                            &outbound_name,
+                            &context,
+                            mode_constraint,
+                        )
+                    };
+                    #[cfg(feature = "native-api")]
+                    let plan = match &selection_observer {
+                        Some(observer) => observer.sync_scope(select),
+                        None => select(),
+                    };
+                    #[cfg(not(feature = "native-api"))]
+                    let plan = select();
+                    #[cfg(feature = "native-api")]
+                    observation.selection_observed(plan.observation.as_ref(), plan.health_family);
+                    unpack_tcp_score_plan(plan)
+                };
+                // Only an unmeasured URLTest group is allowed to speculate. Its
+                // candidate set is bounded before spawning so a large group cannot
+                // turn one client flow into an unbounded dial storm.
+                if selection_mode == SelectionPlanMode::ColdUrlTest {
+                    candidates.truncate(3);
+                } else {
+                    candidates.truncate(1);
+                }
+                score_feedback.retain(|id, _| candidates.iter().any(|node| node.id == *id));
+
+                if candidates.is_empty() {
+                    observation.tcp_dial_mode(
+                        dial_mode,
+                        &sniff_result,
+                        domain_verification,
+                        &candidates,
+                        None,
+                    );
+                    debug!(
+                        "No available candidate nodes for outbound '{}' ({})",
+                        outbound_name, client_addr
+                    );
+                    // Trigger emergency probes to recover dead nodes (leaf
+                    // expansion: sub-group tags carry no probe state).
+                    let group_manager = self.group_manager.read().clone();
+                    for node in group_manager.leaf_nodes_in_group(&outbound_name) {
+                        self.alive_set.notify_check_tcp(node.id);
+                    }
+                    self.stats.record_error(&outbound_name, outbound_kind);
+                    drop(outbound_guard);
+                    #[cfg(feature = "native-api")]
+                    {
+                        terminal = Some(TcpTerminal::NoAvailableNodes);
+                    }
+                    return Ok(());
+                }
+                // Domain targets are meaningful only for non-reserved proxy
+                // outbounds. Direct and block always use the original IP.
+                let target_domain = if matches!(
+                    outbound_name.as_str(),
+                    "direct" | "block" | "must_rules" | "control_plane_routing"
+                ) {
+                    None
+                } else {
+                    domain.clone()
+                };
+                observation.tcp_dial_mode(
+                    dial_mode,
+                    &sniff_result,
+                    domain_verification,
+                    &candidates,
+                    target_domain.as_deref(),
+                );
+
+                let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
+                let candidate_refs: Vec<&Node> = candidates.iter().collect();
+                if let Some(flow) = observation.flow() {
+                    flow.transition(
+                        crate::observe::vocab::ConnectionState::Dialing,
+                        "tcp_dial_started",
+                        crate::observe::vocab::ConnectionMilestone::Unknown,
+                        Some(false),
+                    );
+                }
+                let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
+                let raced = self
+                    .race_candidates(
+                        &candidate_refs,
+                        original_dst,
+                        target_domain.clone(),
+                        &outbound_name,
+                        outbound_kind,
+                        route.mark,
+                        connect_timeout,
+                        dial_deadline,
+                        Arc::clone(&runtime_generation),
+                        health_ipver,
+                        &score_feedback,
+                        cold_urltest,
+                        #[cfg(feature = "native-api")]
+                        &selection_chains,
+                        #[cfg(feature = "native-api")]
+                        &observation,
+                    )
+                    .await;
+                let original = if matches!(&raced, Ok(None))
+                    && selection_mode == SelectionPlanMode::Authoritative
+                    && candidates.len() == 1
+                    && !runtime_generation.is_shutdown()
+                {
+                    // A deadline can expire before the primary begins any work.
+                    score_feedback
+                        .get(&candidates[0].id)
+                        .and_then(|attempt| attempt.continuation().ok())
+                } else {
+                    None
+                };
+                drop(score_feedback);
+                let winner = match raced {
+                    Ok(Some(pair)) => pair,
+                    Err(error) => {
+                        drop(outbound_guard);
+                        return Err(error);
+                    }
+                    Ok(None) => {
+                        let mut retried = None;
+                        if selection_mode == SelectionPlanMode::Authoritative
+                            && candidates.len() == 1
+                            && matches!(
+                                mode_constraint,
+                                crate::control::reload::OutboundConstraint::Any
+                            )
+                            && !runtime_generation.is_shutdown()
+                        {
+                            let failed_node = candidates[0].id;
+                            let context = tcp_score_context(
+                                original_dst,
                                 target_domain.as_deref(),
+                                health_ipver,
                             );
-                            // Only hot targets earn a speculative ready
-                            // dial; a one-off flow gets none.
-                            if !pool.note_target(&key) {
-                                return;
-                            }
-                            let pool_reporter =
-                                pool_feedback.as_ref().map(|feedback| feedback.start());
-                            match registry
-                                .dial_runtime(
-                                    Arc::clone(&generation),
-                                    node.id,
-                                    resolved_target,
-                                    target_domain.as_deref(),
-                                    connect_timeout,
+                            let select = || {
+                                crate::control::reload::resolve_urltest_retry_plan_for_target(
+                                    &generation_group_manager,
+                                    &outbound_name,
+                                    &context,
+                                    original.as_ref(),
                                 )
-                                .await
+                            };
+                            #[cfg(feature = "native-api")]
+                            let mut plan = match &selection_observer {
+                                Some(observer) => observer.sync_scope(select),
+                                None => select(),
+                            };
+                            #[cfg(not(feature = "native-api"))]
+                            let mut plan = select();
+                            #[cfg(feature = "native-api")]
+                            observation
+                                .selection_observed(plan.observation.as_ref(), plan.health_family);
+                            // URLTest retains its existing fresh retry-round budget.
+                            let mut retry_deadline =
+                                tokio::time::Instant::now() + overall_dial_timeout;
+                            if plan.nodes.is_empty()
+                                && let Some(original) = original.as_ref()
+                                && tokio::time::Instant::now() < dial_deadline
                             {
-                                Ok(stream) => {
-                                    if generation.is_shutdown() {
-                                        if let Some(reporter) = &pool_reporter {
-                                            reporter.finish(crate::group::ScoreOutcome::Shutdown);
-                                        }
-                                        return;
-                                    }
-                                    if let Some(reporter) = &pool_reporter {
-                                        reporter.setup_succeeded();
-                                        reporter.finish_setup_only();
-                                    }
-                                    pool.deposit_ready(&key, stream).await;
+                                let select = || {
+                                    crate::control::reload::resolve_score_retry_plan_for_target(
+                                        &generation_group_manager,
+                                        &outbound_name,
+                                        &context,
+                                        failed_node,
+                                        final_owners
+                                            .get(&failed_node)
+                                            .map(Vec::as_slice)
+                                            .unwrap_or_default(),
+                                        original,
+                                    )
+                                };
+                                #[cfg(feature = "native-api")]
+                                {
+                                    plan = match &selection_observer {
+                                        Some(observer) => observer.sync_scope(select),
+                                        None => select(),
+                                    };
                                 }
-                                Err(e) => {
-                                    if let Some(reporter) = &pool_reporter {
-                                        reporter
-                                            .setup_failed(score_runtime_outcome(&generation, &e));
+                                #[cfg(not(feature = "native-api"))]
+                                {
+                                    plan = select();
+                                }
+                                #[cfg(feature = "native-api")]
+                                observation.selection_observed(
+                                    plan.observation.as_ref(),
+                                    plan.health_family,
+                                );
+                                retry_deadline = dial_deadline;
+                            }
+                            let (
+                                retry_nodes,
+                                _,
+                                mut retry_feedback,
+                                retry_chains,
+                                _,
+                                retry_health_ipver,
+                            ) = unpack_tcp_score_plan(plan);
+                            if retry_nodes.len() > 1
+                                || retry_nodes
+                                    .first()
+                                    .is_some_and(|node| node.id != failed_node)
+                            {
+                                let nodes: Vec<_> = retry_nodes.iter().take(3).collect();
+                                retry_feedback
+                                    .retain(|id, _| nodes.iter().any(|node| node.id == *id));
+                                retried = match self
+                                    .race_candidates(
+                                        &nodes,
+                                        original_dst,
+                                        target_domain.clone(),
+                                        &outbound_name,
+                                        outbound_kind,
+                                        route.mark,
+                                        connect_timeout,
+                                        retry_deadline,
+                                        Arc::clone(&runtime_generation),
+                                        retry_health_ipver,
+                                        &retry_feedback,
+                                        false,
+                                        #[cfg(feature = "native-api")]
+                                        &retry_chains,
+                                        #[cfg(feature = "native-api")]
+                                        &observation,
+                                    )
+                                    .await
+                                {
+                                    Ok(retry) => retry,
+                                    Err(error) => {
+                                        drop(outbound_guard);
+                                        return Err(error);
                                     }
-                                    debug!(
-                                        "Pool deposit: ready dial to {} via {} failed: {}",
-                                        resolved_target, node_addr, e
+                                };
+                                #[cfg(feature = "native-api")]
+                                if retried.is_none() && only_block_nodes(nodes.iter().copied()) {
+                                    terminal = Some(TcpTerminal::PolicyBlock);
+                                }
+                                if retried.is_some() {
+                                    selection_chains = retry_chains;
+                                }
+                            }
+                        }
+                        match retried {
+                            Some(pair) => pair,
+                            None => {
+                                drop(outbound_guard);
+                                #[cfg(feature = "native-api")]
+                                if terminal.is_none() {
+                                    terminal = Some(
+                                        if outbound_name == "block" || only_block_nodes(&candidates)
+                                        {
+                                            TcpTerminal::PolicyBlock
+                                        } else {
+                                            TcpTerminal::DialFailed
+                                        },
                                     );
                                 }
-                            }
-                            return;
-                        }
-                        if !bare_capable {
-                            // Multiplexed protocols pool whole sessions
-                            // instead; a bare TCP is useless to them.
-                            return;
-                        }
-                        let pool_reporter = pool_feedback.as_ref().map(|feedback| {
-                            feedback
-                                .clone()
-                                .with_context(crate::group::ScoreSelectionContext::aggregate(
-                                    SelectionNetwork::Tcp,
-                                    ProbeDomain::Tcp,
-                                    pool_health_family,
-                                ))
-                                .start()
-                        });
-                        match generation
-                            .scope_dials(honk_outbound::util::connect_outbound(
-                                &node_addr,
-                                connect_timeout,
-                            ))
-                            .await
-                        {
-                            Ok(stream) => {
-                                if generation.is_shutdown() {
-                                    if let Some(reporter) = &pool_reporter {
-                                        reporter.finish(crate::group::ScoreOutcome::Shutdown);
-                                    }
-                                    return;
-                                }
-                                if is_tcp_stream_alive(&stream) {
-                                    if let Some(reporter) = &pool_reporter {
-                                        reporter.setup_succeeded();
-                                        reporter.finish_setup_only();
-                                    }
-                                    pool.deposit_tcp(&node_addr, stream).await;
-                                } else {
-                                    if let Some(reporter) = &pool_reporter {
-                                        reporter.setup_failed(crate::group::ScoreOutcome::Io(
-                                            std::io::ErrorKind::ConnectionReset,
-                                        ));
-                                    }
-                                    debug!("Pool deposit: stream to {} is dead", node_addr);
-                                }
-                            }
-                            Err(e) => {
-                                if let Some(reporter) = &pool_reporter {
-                                    reporter.setup_failed(if generation.is_shutdown() {
-                                        crate::group::ScoreOutcome::Shutdown
-                                    } else {
-                                        crate::group::ScoreOutcome::Io(e.kind())
-                                    });
-                                }
-                                debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
+                                return Ok(());
                             }
                         }
-                    });
-                }
-            }
-            Err(e) => {
-                // The relay updates these atomics as every read/splice completes.
-                // Preserve bytes moved before an I/O failure rather than turning
-                // the whole flow into a synthetic zero-byte success.
-                self.stats.record_bytes(
-                    &outbound_name,
-                    conn_upload.load(std::sync::atomic::Ordering::Relaxed),
-                    conn_download.load(std::sync::atomic::Ordering::Relaxed),
-                );
-                let io_err = e.downcast_ref::<std::io::Error>();
-                if let Some(io_err) = io_err {
-                    if relay::is_ignorable_connection_error(io_err) {
-                        debug!(
-                            "TCP relay closed for {} -> {}: {}",
-                            client_addr, resolved_target, io_err
-                        );
-                    } else {
-                        warn!(
-                            "Relay error for {} -> {}: {}",
-                            client_addr, resolved_target, e
-                        );
-                    }
-                } else {
-                    warn!(
-                        "Relay error for {} -> {}: {}",
-                        client_addr, resolved_target, e
-                    );
-                }
-                self.stats.record_error(&outbound_name);
-                self.stats.record_close(&outbound_name);
-                if let Some(reporter) = &score_reporter {
-                    reporter.finish(crate::group::ScoreOutcome::from_error(&e));
-                }
-            }
-        }
-
-        if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
-            && (ho.outbound >= OutboundIndex::UserBase as u8
-                || ho.outbound == OutboundIndex::Direct as u8)
-        {
-            let mut ebpf = self.ebpf.write().await;
-            let ob = if ho.outbound == OutboundIndex::Direct as u8 {
-                OutboundIndex::Direct
-            } else {
-                OutboundIndex::from_user(ho.outbound as u32)
-            };
-            if let Err(e) = ebpf.add_domain_route(domain, ob) {
-                debug!("Failed to add domain route for {}: {}", domain, e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Race the candidate dials: the first success wins, losers are
-    /// cancelled, and fresh connections for losers are deposited into the
-    /// pool (≤2 per race, off the critical path). Failures are reported via
-    /// traffic-based thresholds to avoid killing a node from a single
-    /// transient failure. Returns the winning stream and its already-owned
-    /// node; `None` means every candidate failed (already logged) — close
-    /// accounting stays with the caller.
-    #[allow(clippy::too_many_arguments)]
-    async fn race_candidates(
-        &self,
-        candidates: &[&Node],
-        resolved_target: SocketAddr,
-        target_domain: Option<String>,
-        outbound_name: &str,
-        connect_timeout: Duration,
-        overall_dial_timeout: Duration,
-        runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-        ipver: IpVersion,
-        feedback: &HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
-        cold_urltest: bool,
-    ) -> Option<(
-        crate::proxy::ProxyStream,
-        Node,
-        Option<crate::group::ScoreReporter>,
-    )> {
-        let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
-        let ctx = self.clone();
-        let target = resolved_target;
-        let outbound = outbound_name.to_string();
-        let feedback = feedback.clone();
-
-        let mut set = tokio::task::JoinSet::new();
-        let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        for (idx, node) in candidates.iter().enumerate() {
-            let ctx = ctx.clone();
-            let node = (*node).clone();
-            let target_domain = target_domain.clone();
-            let generation = Arc::clone(&runtime_generation);
-            let feedback = feedback.clone();
-            let started_reporters = Arc::clone(&started_reporters);
-            set.spawn(async move {
-                if cold_urltest {
-                    // Absolute releases make only candidate zero immediate;
-                    // unreleased work has no dial permit and abort_all()
-                    // cancels it before it can start.
-                    wait_for_cold_urltest_release(idx).await;
-                }
-                let reporter = Arc::new(parking_lot::Mutex::new(None));
-                let on_start = {
-                    let feedback = feedback.get(&node.id).cloned();
-                    let reporter = Arc::clone(&reporter);
-                    move || {
-                        let started = feedback.map(|feedback| feedback.start());
-                        if let Some(reporter) = &started {
-                            started_reporters.lock().push(reporter.clone());
-                        }
-                        *reporter.lock() = started;
                     }
                 };
-                let start = std::time::Instant::now();
-                let per_dial_timeout = connect_timeout * 3;
-                let result = tokio::time::timeout(
-                    per_dial_timeout,
-                    Self::dial_pooled(
-                        &ctx.proxy_registry,
-                        &ctx.connection_pool,
-                        &generation,
+                let mut proxy_stream = winner.stream;
+                let node = winner.node;
+                let score_reporter = winner.reporter;
+                #[cfg(feature = "native-api")]
+                let attempt_id = winner.attempt_id;
+                #[cfg(feature = "native-api")]
+                let winner_observer = winner.observer;
+                #[cfg(feature = "native-api")]
+                {
+                    if let Some(flow) = observation.flow()
+                        && let Some(attempt_id) = attempt_id
+                    {
+                        flow.select_attempt(&attempt_id.to_string());
+                    }
+                    observation.tcp_connected(
+                        selection_chains
+                            .get(&node.id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
                         &node,
-                        (target, target_domain.as_deref()),
-                        connect_timeout,
-                        on_start,
-                    ),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(anyhow::Error::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("dial timed out after {per_dial_timeout:?}"),
-                    )))
-                });
-                let elapsed = start.elapsed();
-                let reporter = reporter.lock().clone();
-                match &result {
-                    Ok(_) => {
-                        if let Some(reporter) = &reporter {
-                            reporter.setup_succeeded();
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(reporter) = &reporter {
-                            reporter.setup_failed(score_runtime_outcome(&generation, error));
-                        }
-                    }
-                }
-                (result, idx, elapsed, node, reporter)
-            });
-        }
-
-        let mut last_err: Option<(String, String)> = None;
-        let mut first_err: Option<(String, String)> = None;
-        let mut timeout_count: usize = 0;
-        let mut winner: Option<(
-            crate::proxy::ProxyStream,
-            usize,
-            Node,
-            Option<crate::group::ScoreReporter>,
-        )> = None;
-        let mut remaining = set.len();
-
-        loop {
-            if remaining == 0 {
-                break;
-            }
-            remaining -= 1;
-            match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
-                Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed, node, reporter)) => {
-                        ctx.alive_set
-                            .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
-                        // Real-traffic degradation fast path: a fresh
-                        // network dial far above the node's own EMA
-                        // counts toward strike demotion (3 in a row);
-                        // the emergency probe verifies the suspicion.
-                        if fresh
-                            && ctx.alive_set.report_dial_latency(
-                                node.id,
-                                ProbeDomain::Tcp,
-                                ipver,
-                                elapsed,
-                            )
-                        {
-                            ctx.alive_set.notify_check_tcp(node.id);
-                        }
-                        winner = Some((stream, idx, node, reporter));
-                        set.abort_all();
-                        break;
-                    }
-                    Ok((Err(e), _idx, _elapsed, node, _reporter)) => {
-                        debug!("Parallel dial to {} failed: {}", node.name, e);
-                        ctx.stats.record_error(&outbound);
-                        report_dial_failure_if_current(
-                            &runtime_generation,
-                            &ctx.alive_set,
-                            node.id,
-                            ProbeDomain::Tcp,
-                            ipver,
-                        );
-                        let msg = e.to_string();
-                        if msg.starts_with("dial timed out after") {
-                            timeout_count += 1;
-                        }
-                        if first_err.is_none() {
-                            first_err = Some((msg.clone(), node.name.clone()));
-                        }
-                        if remaining == 0 {
-                            last_err = Some((msg, node.name.clone()));
-                        }
-                    }
-                    Err(_join_err) => {}
-                },
-                Ok(None) => break,
-                Err(_elapsed) => {
-                    timeout_started_score_reporters(&started_reporters);
-                    set.abort_all();
-                    warn!(
-                        "Overall dial deadline reached for outbound '{}' ({} candidates, {} remaining)",
-                        outbound_name,
-                        candidates.len(),
-                        remaining
                     );
-                    break;
+                    observation.release_selection();
                 }
-            }
-        }
 
-        // Drain any remaining aborted tasks to avoid JoinSet drop panic.
-        while (set.join_next().await).is_some() {}
+                let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
-        // so the pool stays warm after a parallel-dial race. Limit to 2 deposits
-        // per race to avoid thundering herd on the proxy servers.
-        // Ready-capable handlers get a fully-dialed stream (handshake
-        // included, paid off the critical path); others get a bare TCP.
-        if outbound_name != "direct"
-            && outbound_name != "block"
-            && let Some((_, winning_idx, ..)) = &winner
-        {
-            let mut deposit_count = 0u32;
-            for (idx, node) in candidates.iter().enumerate() {
-                if idx == *winning_idx {
-                    continue;
-                }
-                if deposit_count >= 2 {
-                    break;
-                }
-                let node = (*node).clone();
-                let node_addr = format!("{}:{}", node.host(), node.port);
-                let pool = ctx.connection_pool.clone();
-                let registry = ctx.proxy_registry.clone();
-                let target_domain = target_domain.clone();
-                let generation = Arc::clone(&runtime_generation);
-                let pool_feedback = feedback.get(&node.id).cloned();
-                let pool_health_family = ipver;
-                deposit_count += 1;
-                tokio::spawn(async move {
-                    let (ready_capable, bare_capable) = registry
-                        .find(node.protocol())
-                        .map(|entry| {
-                            (
-                                (entry.descriptor.pool_ready_streams)(&node),
-                                (entry.descriptor.pool_bare_tcp)(&node),
-                            )
-                        })
-                        .unwrap_or((false, false));
-                    if ready_capable {
-                        let key =
-                            ConnectionPool::ready_key(&node_addr, target, target_domain.as_deref());
-                        // Only hot targets earn a speculative ready
-                        // dial; a one-off flow gets none.
-                        let Some(_warm_guard) = pool.try_begin_warm(&key) else {
-                            return;
-                        };
-                        let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
-                        match registry
-                            .dial_runtime(
-                                Arc::clone(&generation),
-                                node.id,
-                                target,
-                                target_domain.as_deref(),
-                                connect_timeout,
-                            )
-                            .await
+                let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let (outbound_upload, outbound_download) =
+                    self.stats.byte_counters(&outbound_name, outbound_kind);
+                if let Some(close) = &close {
+                    let groups = captured_groups(
+                        selection_chains
+                            .get(&node.id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        &node.name,
+                        &generation_config,
                         {
-                            Ok(stream) => {
-                                if generation.is_shutdown() {
-                                    if let Some(reporter) = &pool_reporter {
-                                        reporter.finish(crate::group::ScoreOutcome::Shutdown);
-                                    }
-                                    return;
-                                }
-                                if let Some(reporter) = &pool_reporter {
-                                    reporter.setup_succeeded();
-                                    reporter.finish_setup_only();
-                                }
-                                pool.deposit_ready(&key, stream).await;
+                            #[cfg(feature = "native-api")]
+                            {
+                                close_catalog.as_ref().map(|catalog| &catalog.groups)
                             }
-                            Err(e) => {
-                                if let Some(reporter) = &pool_reporter {
-                                    reporter.setup_failed(score_runtime_outcome(&generation, &e));
-                                }
+                            #[cfg(not(feature = "native-api"))]
+                            {
+                                None
+                            }
+                        },
+                    );
+                    if let Some(conn_id) = flow.track_if_enabled(
+                        || {
+                            let id = uuid::Uuid::new_v4().to_string();
+                            let (rule, rule_payload) = matched_rule
+                                .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+                            crate::connection_tracker::ConnectionEntry {
+                                id,
+                                source: client_addr.to_string(),
+                                destination: original_dst.to_string(),
+                                proxy: node.name.clone(),
+                                #[cfg(feature = "native-api")]
+                                routed_outbound: self
+                                    .connection_tracker
+                                    .native_enabled()
+                                    .then(|| outbound_name.clone()),
+                                #[cfg(feature = "native-api")]
+                                native_flow_id: observation.flow().map(|flow| flow.id().to_owned()),
+                                rule,
+                                rule_payload,
+                                chains: connection_chains(
+                                    selection_chains.remove(&node.id).unwrap_or_default(),
+                                    &node.name,
+                                ),
+                                upload: conn_upload.clone(),
+                                download: conn_download.clone(),
+                                start_time: std::time::Instant::now(),
+                                domain: target_domain.clone(),
+                                network: "tcp".to_string(),
+                                process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                                process_path: None,
+                            }
+                        },
+                        ConnectionOwner {
+                            signal: Arc::clone(&close.0),
+                            action: CloseAction::Tcp,
+                            groups,
+                        },
+                    ) {
+                        if let Some(native) = observation.flow() {
+                            native.attach_connection(&conn_id);
+                        }
+                        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
+                    }
+                }
+
+                debug!(
+                    network = "tcp",
+                    outbound = %outbound_name,
+                    dialer = %node.name,
+                    sniffed = target_domain.as_deref().unwrap_or(""),
+                    ip = %original_dst,
+                    dscp = dscp_val,
+                    src = %client_addr,
+                    "TCP connection: {} <-> {}", client_addr, original_dst,
+                );
+
+                let mut intentionally_closed = false;
+                let prefix_result = {
+                    let operation = async {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_close(close.as_ref()) => {
+                                intentionally_closed = true;
+                                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "connection closed"))
+                            }
+                            result = write_sniff_prefix(
+                                &mut *proxy_stream.stream, &sniff_result.buffered, |bytes| {
+                                    conn_upload.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                                    outbound_upload.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                                    #[cfg(feature = "native-api")]
+                                    if let Some(flow) = observation.flow() {
+                                        flow.accepted_send();
+                                    }
+                                    if let Some(reporter) = &score_reporter {
+                                        reporter.tx(bytes as u64);
+                                    }
+                                },
+                            ) => result,
+                        }
+                    };
+                    #[cfg(feature = "native-api")]
+                    let operation = async {
+                        match &winner_observer {
+                            Some(observer) => observer.scope(operation).await,
+                            None => operation.await,
+                        }
+                    };
+                    operation.await
+                };
+                match prefix_result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        #[cfg(feature = "native-api")]
+                        {
+                            terminal = Some(if intentionally_closed {
+                                TcpTerminal::IntentionalRetirement
+                            } else {
+                                TcpTerminal::PrefixWriteFailed
+                            });
+                        }
+                        if !intentionally_closed {
+                            debug!("Failed to write sniffed bytes to proxy: {}", error);
+                            self.stats.record_error(&outbound_name, outbound_kind);
+                        }
+                        drop(outbound_guard);
+                        if let Some(reporter) = &score_reporter {
+                            reporter.finish(if intentionally_closed {
+                                crate::group::ScoreOutcome::Cancelled
+                            } else {
+                                crate::group::ScoreOutcome::from_io_error(&error)
+                            });
+                        }
+                        drop(proxy_stream);
+                        anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                        return Ok(());
+                    }
+                };
+
+                let first_response = score_reporter.as_ref().map(|reporter| {
+                    let reporter = reporter.clone();
+                    std::sync::Arc::new(move || reporter.first_response())
+                        as std::sync::Arc<dyn Fn() + Send + Sync>
+                });
+                let first_response = observation.first_response(first_response);
+                let on_transfer = score_reporter.as_ref().map(|reporter| {
+                    let reporter = reporter.clone();
+                    std::sync::Arc::new(move |upload, download| {
+                        if upload != 0 {
+                            reporter.tx(upload);
+                        }
+                        if download != 0 {
+                            reporter.rx(download);
+                        }
+                    }) as std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
+                });
+                let on_transfer = match observation.flow() {
+                    Some(flow) => {
+                        let flow = Arc::clone(flow);
+                        Some(Arc::new(move |upload, download| {
+                            if let Some(callback) = &on_transfer {
+                                callback(upload, download);
+                            }
+                            if upload != 0 {
+                                flow.accepted_send();
+                            }
+                        })
+                            as Arc<dyn Fn(u64, u64) + Send + Sync>)
+                    }
+                    None => on_transfer,
+                };
+                let conn_progress = relay::RelayProgress {
+                    upload: conn_upload.clone(),
+                    download: conn_download.clone(),
+                    outbound_upload: Some(outbound_upload),
+                    outbound_download: Some(outbound_download),
+                    first_response,
+                    on_transfer,
+                };
+                let relay_result = {
+                    let operation = async {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_close(close.as_ref()) => None,
+                            result = relay::relay_proxy(
+                                flow.stream_mut(), proxy_stream, client_addr, original_dst, conn_progress,
+                            ) => Some(result),
+                        }
+                    };
+                    #[cfg(feature = "native-api")]
+                    let operation = async {
+                        match &winner_observer {
+                            Some(observer) => observer.scope(operation).await,
+                            None => operation.await,
+                        }
+                    };
+                    operation.await
+                };
+                let Some(relay_result) = relay_result else {
+                    if let Some(reporter) = &score_reporter {
+                        reporter.finish(crate::group::ScoreOutcome::Cancelled);
+                    }
+                    #[cfg(feature = "native-api")]
+                    {
+                        terminal = Some(TcpTerminal::IntentionalRetirement);
+                    }
+                    anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                    return Ok(());
+                };
+                #[cfg(feature = "native-api")]
+                {
+                    terminal = Some(if relay_result.is_ok() {
+                        TcpTerminal::RelayClosed
+                    } else {
+                        TcpTerminal::RelayFailed
+                    });
+                }
+                let relay_succeeded = relay_result.is_ok();
+                match relay_result {
+                    Ok(_) => {
+                        if let Some(reporter) = &score_reporter {
+                            reporter.finish(crate::group::ScoreOutcome::Success);
+                        }
+                    }
+                    Err(e) => {
+                        let io_err = e.downcast_ref::<std::io::Error>();
+                        if let Some(io_err) = io_err {
+                            if relay::is_ignorable_connection_error(io_err) {
                                 debug!(
-                                    "Post-race pool deposit: ready dial to {} via {} failed: {}",
-                                    target, node_addr, e
+                                    "TCP relay closed for {} -> {}: {}",
+                                    client_addr, original_dst, io_err
+                                );
+                            } else {
+                                debug!(
+                                    "Relay error for {} -> {}: {}",
+                                    client_addr, original_dst, e
                                 );
                             }
+                        } else {
+                            debug!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                         }
-                        return;
-                    }
-                    if !bare_capable {
-                        // Multiplexed protocols pool whole sessions
-                        // instead; a bare TCP is useless to them.
-                        return;
-                    }
-                    let pool_reporter = pool_feedback.as_ref().map(|feedback| {
-                        feedback
-                            .clone()
-                            .with_context(crate::group::ScoreSelectionContext::aggregate(
-                                SelectionNetwork::Tcp,
-                                ProbeDomain::Tcp,
-                                pool_health_family,
-                            ))
-                            .start()
-                    });
-                    match generation
-                        .scope_dials(honk_outbound::util::connect_outbound(
-                            &node_addr,
-                            connect_timeout,
-                        ))
-                        .await
-                    {
-                        Ok(stream) => {
-                            if generation.is_shutdown() {
-                                if let Some(reporter) = &pool_reporter {
-                                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
-                                }
-                                return;
-                            }
-                            if is_tcp_stream_alive(&stream) {
-                                if let Some(reporter) = &pool_reporter {
-                                    reporter.setup_succeeded();
-                                    reporter.finish_setup_only();
-                                }
-                                pool.deposit_tcp(&node_addr, stream).await;
-                            } else {
-                                if let Some(reporter) = &pool_reporter {
-                                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
-                                        std::io::ErrorKind::ConnectionReset,
-                                    ));
-                                }
-                                debug!("Post-race pool deposit: stream to {} is dead", node_addr);
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(reporter) = &pool_reporter {
-                                reporter.setup_failed(if generation.is_shutdown() {
-                                    crate::group::ScoreOutcome::Shutdown
-                                } else {
-                                    crate::group::ScoreOutcome::Io(e.kind())
-                                });
-                            }
-                            debug!(
-                                "Post-race pool deposit: connect to {} failed: {}",
-                                node_addr, e
-                            );
+                        self.stats.record_error(&outbound_name, outbound_kind);
+                        if let Some(reporter) = &score_reporter {
+                            reporter.finish(tcp_relay_score_outcome(&e));
                         }
                     }
-                });
-            }
-        }
-
-        match winner {
-            Some((stream, _, node, reporter)) => Some((stream, node, reporter)),
-            None => {
-                if let Some((last_msg, last_name)) = last_err {
-                    let (first_msg, first_name) =
-                        first_err.unwrap_or_else(|| (last_msg.clone(), last_name.clone()));
-                    if outbound_name == "direct" || outbound_name == "block" {
-                        debug!(
-                            "Direct/block dial to {} failed ({}): {}",
-                            resolved_target, last_name, last_msg
-                        );
-                    } else {
-                        warn!(
-                            "All {} candidate(s) failed to dial {} ({} timed out; first error from '{}': {}; last error from '{}': {})",
-                            candidates.len(),
-                            resolved_target,
-                            timeout_count,
-                            first_name,
-                            first_msg,
-                            last_name,
-                            last_msg
-                        );
-                    }
                 }
-                None
-            }
-        }
-    }
+                anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                drop(outbound_guard);
 
-    /// Dial through a node using the TCP connection pool.
-    ///
-    /// Acquisition order:
-    /// 1. a pooled *ready* stream (full handshake already completed for
-    ///    this exact node+target) — skips both the TCP connect and the
-    ///    protocol handshake;
-    /// 2. a pooled raw `TcpStream` to the proxy server — skips the TCP
-    ///    connect, protocol handshake still runs via `dial_with_tcp()`;
-    /// 3. a fresh full `dial()`.
-    ///
-    /// Set `HONK_POOL_DISABLE=1` to bypass both pools entirely (fresh dial
-    /// every time) — an A/B switch for diagnosing pool-related stalls.
-    ///
-    /// Returns the stream plus `fresh_network`: false ONLY on a ready-pool
-    /// acquire (local pool pop, no network round trip); bare-pool
-    /// handshakes, warm logical streams, and fresh dials all perform ≥1
-    /// round trip through the node and report true.
-    async fn dial_pooled(
-        registry: &ProxyRegistry,
-        pool: &ConnectionPool,
-        generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-        node: &Node,
-        target: (SocketAddr, Option<&str>),
-        connect_timeout: Duration,
-        on_start: impl FnOnce() + Send + 'static,
-    ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
-        let (target, target_domain) = target;
-        static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let pool_disabled = *POOL_DISABLED.get_or_init(|| {
-            std::env::var("HONK_POOL_DISABLE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
-        });
-        let on_start = Arc::new(parking_lot::Mutex::new(Some(on_start)));
-
-        let addr = format!("{}:{}", node.host(), node.port);
-        let protocol = node.protocol();
-        let entry = registry
-            .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
-
-        if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
-            let key = ConnectionPool::ready_key(&addr, target, target_domain);
-            if let Some(stream) = pool.acquire_ready(&key).await {
-                tracing::debug!(
-                    "Pooled ready stream via {} acquired for {} (handshake skipped)",
-                    addr,
-                    target
-                );
-                if let Some(on_start) = on_start.lock().take() {
-                    on_start();
-                }
-                return Ok((stream, false));
-            }
-        }
-
-        let dial = async {
-            // A raw pooled TCP still needs its protocol handshake. Multiplexed
-            // protocols opt out because their node runtime owns the transport.
-            if !pool_disabled
-                && (entry.descriptor.pool_bare_tcp)(node)
-                && let Some(tcp) = pool.acquire_tcp(&addr).await
-            {
-                if let Some(on_start) = on_start.lock().take() {
-                    on_start();
-                }
-                tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-                return entry
-                    .tcp
-                    .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                    .await
-                    .map(|stream| (stream, true));
-            }
-
-            // Pool miss (or pools disabled) — fresh connect through the
-            // flow's pinned generation. A candidate absent from the generation
-            // (e.g. a hand-built test config without the built-in nodes
-            // injected) falls back to the stateless node-based dial.
-            tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
-            if generation.get(&node.id).is_some() {
-                registry
-                    .dial_runtime(
-                        Arc::clone(generation),
-                        node.id,
-                        target,
-                        target_domain,
+                if relay_succeeded && outbound_name != "direct" && outbound_name != "block" {
+                    self.replenish_tcp_pool(
+                        node,
+                        (original_dst, target_domain),
+                        &runtime_generation,
                         connect_timeout,
-                    )
-                    .await
-                    .map(|stream| (stream, true))
-            } else {
-                entry
-                    .tcp
-                    .dial(node, target, target_domain, connect_timeout)
-                    .await
-                    .map(|stream| (stream, true))
-            }
-        };
-        let on_start = Arc::clone(&on_start);
-        generation
-            .scope_dials_with_start(dial, move || {
-                if let Some(on_start) = on_start.lock().take() {
-                    on_start();
+                        score_reporter,
+                        health_ipver,
+                    );
                 }
-            })
-            .await
+
+                Ok(())
+            };
+            #[cfg(feature = "native-api")]
+            {
+                let operation = std::pin::pin!(operation);
+                match &native_observer {
+                    Some(observer) => observer.scope(operation).await,
+                    None => operation.await,
+                }
+            }
+            #[cfg(not(feature = "native-api"))]
+            operation.await
+        };
+        if let Some(close) = &close {
+            close.0.finish(result.is_ok());
+        }
+        #[cfg(feature = "native-api")]
+        if let Some(terminal) = if result.is_err() {
+            Some(TcpTerminal::ConnectionFailed)
+        } else {
+            terminal
+        } {
+            let (state, reason) = terminal.outcome();
+            observation.finish(state, reason);
+        }
+        result
     }
 }
 
@@ -1292,10 +1122,359 @@ impl ControlPlaneHandle {
 mod score_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn relay_outcome_is_settled_once_even_when_retirement_fails() -> anyhow::Result<()> {
+        use crate::control::tests::support::{canonical_socks5, test_dns_forwarder};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for relay_fails in [false, true] {
+                for retirement_fails in [false, true] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                    let destination = listener.local_addr()?;
+                    let proxies = [
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+                    ];
+                    let nodes = [
+                        canonical_socks5(
+                            "seed",
+                            "127.0.0.1",
+                            proxies[0].local_addr()?.port(),
+                            None,
+                        ),
+                        canonical_socks5(
+                            "relay",
+                            "127.0.0.1",
+                            proxies[1].local_addr()?.port(),
+                            None,
+                        ),
+                    ];
+                    let mut config = Config::default();
+                    config.ensure_builtin_nodes();
+                    config.nodes.extend(nodes.iter().cloned());
+                    config.groups = vec![Group {
+                        name: "score".into(),
+                        policy: GroupPolicy::Score,
+                        nodes: nodes.iter().map(|node| node.id).collect(),
+                        ..Default::default()
+                    }];
+                    config.routing.default_outbound = "score".into();
+                    config.global.dial_mode = "ip".into();
+                    let router = Router::from_config(&config.routing)?;
+                    let plane = ControlPlane::new(
+                        config,
+                        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+                        router,
+                        Arc::new(ProxyRegistry::default_resolver()?),
+                        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+                        test_dns_forwarder(),
+                    )?;
+                    let handle = plane.spawn_handle();
+                    let manager = handle.group_manager.read().clone();
+                    let seed = manager
+                        .feedback_for_node(
+                            nodes[0].id,
+                            crate::group::ScoreSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                IpVersion::V4,
+                            ),
+                        )
+                        .unwrap()
+                        .start();
+                    seed.setup_succeeded();
+                    seed.tx(1);
+                    seed.rx(1);
+                    seed.finish(crate::group::ScoreOutcome::Success);
+                    let mut client = TcpStream::connect(destination).await?;
+                    let (accepted, source) = listener.accept().await?;
+                    crate::control::tests::store_active_tcp_flow(&handle, destination, source)
+                        .await?;
+                    let worker = handle.clone();
+                    let serving =
+                        tokio::spawn(
+                            async move { worker.serve_connection(accepted, source).await },
+                        );
+                    let (mut upstream, _) = tokio::select! {
+                        accepted = proxies[0].accept() => accepted?,
+                        accepted = proxies[1].accept() => accepted?,
+                    };
+                    let mut greeting = [0; 3];
+                    upstream.read_exact(&mut greeting).await?;
+                    upstream.write_all(&[5, 0]).await?;
+                    let mut request = [0; 10];
+                    upstream.read_exact(&mut request).await?;
+                    upstream
+                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                        .await?;
+                    client.write_all(b"q").await?;
+                    assert_eq!(upstream.read_u8().await?, b'q');
+                    upstream.write_all(b"r").await?;
+                    assert_eq!(client.read_u8().await?, b'r');
+                    if retirement_fails {
+                        let key = handle.tcp_flow_pins.snapshot().into_iter().next().unwrap();
+                        assert_eq!(handle.tcp_flow_pins.release_for_test(key), Some(true));
+                    }
+                    if relay_fails {
+                        socket2::SockRef::from(&upstream).set_linger(Some(Duration::ZERO))?;
+                        drop(upstream);
+                    } else {
+                        upstream.shutdown().await?;
+                        client.shutdown().await?;
+                    }
+                    let result = serving.await?;
+                    assert_eq!(result.is_err(), retirement_fails);
+                    let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+                    assert_eq!(counters.spent, 1, "fixture must execute a scored trial");
+                    assert_eq!(
+                        (
+                            counters.trial_success,
+                            counters.trial_failure,
+                            counters.trial_cancelled
+                        ),
+                        (u64::from(!relay_fails), u64::from(relay_fails), 0),
+                    );
+                    assert_eq!(
+                        handle.stats.snapshot()["score"].errors,
+                        u32::from(relay_fails)
+                    );
+                    if retirement_fails {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), async {
+                                tokio::select! {
+                                    accepted = proxies[0].accept() => accepted,
+                                    accepted = proxies[1].accept() => accepted,
+                                }
+                            })
+                            .await
+                            .is_err(),
+                            "failed retirement must not replenish the pool"
+                        );
+                    }
+                    let runtime = handle.runtime_registry.read().clone();
+                    runtime.shutdown().await;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
     #[test]
-    fn tcp_score_context_uses_resolved_target_family_not_health_family() {
-        let resolved: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let context = tcp_score_context(resolved, Some("example.com"), IpVersion::V6);
+    fn pending_warm_refill_refunds_trial_without_starting_business() {
+        let nodes = [
+            Node::from_share_link("socks5://127.0.0.1:1080#a").unwrap(),
+            Node::from_share_link("socks5://127.0.0.1:1081#b").unwrap(),
+        ];
+        let group = honk_config::group::Group {
+            name: "score".into(),
+            policy: honk_config::group::GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = crate::group::GroupManager::new(&[group], &nodes);
+        // Trials only serve challengers trailing the selection's completions.
+        let seed = manager
+            .feedback_for_node(
+                nodes[0].id,
+                crate::group::ScoreSelectionContext::aggregate(
+                    SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .unwrap()
+            .start();
+        seed.setup_succeeded();
+        seed.tx(1);
+        seed.rx(1);
+        seed.finish(crate::group::ScoreOutcome::Success);
+        let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
+        let mut plan = manager.selection_plan_for_target("score", &context);
+        let attempt = plan.entries[0].feedback.take().unwrap();
+        drop(plan);
+        assert!(attempt.continuation().is_err());
+        assert_eq!(
+            manager
+                .score_budget_counters("score", SelectionNetwork::Tcp)
+                .reserved,
+            1
+        );
+        let warm = attempt.start_warmup(context.clone());
+        warm.setup_succeeded();
+        warm.tx(1);
+        warm.rx(1);
+        warm.finish(crate::group::ScoreOutcome::Success);
+        let refill = warm.start_warmup(context);
+        refill.setup_succeeded();
+        refill.finish_setup_only();
+        let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            (
+                counters.business_starts,
+                counters.spent,
+                counters.reserved,
+                counters.refunded
+            ),
+            (0, 0, 0, 1)
+        );
+        assert_eq!(counters.cold_available, counters.cold_allowance);
+        assert_eq!(manager.score_state().root_business_starts(), 0);
+    }
+
+    #[tokio::test]
+    async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_target() {
+        use crate::group::{ScoreOutcome, ScoreVerificationState};
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn pair() -> (TcpStream, TcpStream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, server) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept(),
+            );
+            (client.unwrap(), server.unwrap().0)
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for client_reset in [true, false] {
+                let node = Node::from_share_link("socks5://127.0.0.1:1080#relay").unwrap();
+                let group = honk_config::group::Group {
+                    name: "score".into(),
+                    policy: honk_config::group::GroupPolicy::Score,
+                    nodes: vec![node.id],
+                    ..Default::default()
+                };
+                let manager =
+                    crate::group::GroupManager::new(&[group], std::slice::from_ref(&node));
+                let address = "127.0.0.1:443".parse().unwrap();
+                let context = tcp_score_context(address, None, IpVersion::V4);
+                let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
+                feedback.start().finish(ScoreOutcome::Timeout);
+                for _ in 0..4 {
+                    let seed = feedback.start();
+                    seed.setup_succeeded();
+                    seed.tx(1);
+                    seed.rx(1);
+                    seed.finish(ScoreOutcome::Cancelled);
+                }
+                let snapshot = || {
+                    manager
+                        .score_verification_for_network("score", SelectionNetwork::Tcp)
+                        .unwrap()
+                        .1
+                };
+                let before = snapshot();
+                assert_eq!(before.state, ScoreVerificationState::ObservedUsable);
+                drop(manager.selection_plan_for_target("score", &context));
+                let before_counts =
+                    manager.score_verification_counters("score", SelectionNetwork::Tcp);
+                assert_eq!(
+                    (
+                        before_counts.usable_selections,
+                        before_counts.provisional_selections
+                    ),
+                    (1, 0)
+                );
+                let reporter = feedback.start();
+                reporter.setup_succeeded();
+                let progress = relay::RelayProgress {
+                    upload: Arc::new(AtomicU64::new(0)),
+                    download: Arc::new(AtomicU64::new(0)),
+                    outbound_upload: None,
+                    outbound_download: None,
+                    first_response: Some(Arc::new({
+                        let reporter = reporter.clone();
+                        move || reporter.first_response()
+                    })),
+                    on_transfer: Some(Arc::new({
+                        let reporter = reporter.clone();
+                        move |up, down| {
+                            reporter.tx(up);
+                            reporter.rx(down);
+                        }
+                    })),
+                };
+                let (mut client, relay_client) = pair().await;
+                let (relay_upstream, mut upstream) = pair().await;
+                let running = tokio::spawn(relay::splice::relay_auto(
+                    relay_client,
+                    relay_upstream,
+                    address,
+                    address,
+                    Some(progress),
+                ));
+                client.write_all(b"q").await.unwrap();
+                assert_eq!(upstream.read_u8().await.unwrap(), b'q');
+                upstream.write_all(b"r").await.unwrap();
+                assert_eq!(client.read_u8().await.unwrap(), b'r');
+                let reset = if client_reset { client } else { upstream };
+                socket2::SockRef::from(&reset)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(reset);
+                let error = running.await.unwrap().unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::ECONNRESET)
+                );
+                let outcome = tcp_relay_score_outcome(&error);
+                assert_eq!(
+                    outcome,
+                    if client_reset {
+                        ScoreOutcome::Cancelled
+                    } else {
+                        ScoreOutcome::Io(std::io::ErrorKind::ConnectionReset)
+                    }
+                );
+                reporter.finish(outcome);
+                let after = snapshot();
+                // A target reset cannot erase the node's factual aggregate RX.
+                assert_eq!(after.state, ScoreVerificationState::ObservedUsable);
+                drop(manager.selection_plan_for_target("score", &context));
+                let after_counts =
+                    manager.score_verification_counters("score", SelectionNetwork::Tcp);
+                assert_eq!(
+                    (
+                        after_counts.usable_selections - before_counts.usable_selections,
+                        after_counts.provisional_selections - before_counts.provisional_selections,
+                    ),
+                    if client_reset { (1, 0) } else { (0, 1) },
+                    "only an upstream reset revokes observed usability for the next target flow"
+                );
+            }
+        })
+        .await
+        .expect("reset must terminate the relay without waiting for idle cleanup");
+    }
+
+    #[tokio::test]
+    async fn sniff_prefix_reports_accepted_bytes_before_write_failure() {
+        use tokio::io::AsyncReadExt;
+        let (mut writer, mut reader) = tokio::io::duplex(3);
+        let mut accepted = 0;
+        let (result, ()) = tokio::join!(
+            write_sniff_prefix(&mut writer, b"prefix", |bytes| accepted += bytes),
+            async move {
+                let mut prefix = [0; 3];
+                reader.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, b"pre");
+                drop(reader);
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(accepted, 3);
+    }
+
+    #[test]
+    fn tcp_score_context_uses_target_family_not_health_family() {
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let context = tcp_score_context(target, Some("example.com"), IpVersion::V6);
 
         assert_eq!(context.target_family, Some(IpVersion::V4));
         assert_eq!(context.health_family, IpVersion::V6);
@@ -1321,8 +1500,11 @@ mod score_tests {
                 vec!["outer".into(), "shared".into()],
                 vec!["duplicate".into(), "shared".into()],
             ],
+            final_owners: vec![Vec::new(), Vec::new()],
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
-        let (nodes, mode, feedback, selection_chains, family) = unpack_tcp_score_plan(plan);
+        let (nodes, mode, feedback, selection_chains, _, family) = unpack_tcp_score_plan(plan);
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(mode, SelectionPlanMode::ColdUrlTest);
@@ -1379,3 +1561,37 @@ mod cold_urltest_tests;
 #[cfg(test)]
 #[path = "dial_permit_scope_tests.rs"]
 mod dial_permit_scope_tests;
+
+#[cfg(all(test, feature = "native-api"))]
+#[path = "tcp_native_flow_tests.rs"]
+mod tcp_native_flow_tests;
+
+#[cfg(test)]
+mod native_accounting_tests {
+    use super::write_sniff_prefix;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn native_prefix_partial_failure_keeps_only_written_bytes() {
+        let connection = AtomicU64::new(0);
+        let outbound = AtomicU64::new(7);
+        let (mut writer, mut reader) = tokio::io::duplex(3);
+        let (result, received) = tokio::join!(
+            write_sniff_prefix(&mut writer, b"abcdef", |bytes| {
+                connection.fetch_add(bytes as u64, Ordering::Relaxed);
+                outbound.fetch_add(bytes as u64, Ordering::Relaxed);
+            }),
+            async move {
+                let mut received = [0; 3];
+                reader.read_exact(&mut received).await.unwrap();
+                drop(reader);
+                received
+            }
+        );
+        assert_eq!(&received, b"abc");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(connection.load(Ordering::Relaxed), 3);
+        assert_eq!(outbound.load(Ordering::Relaxed), 10);
+    }
+}

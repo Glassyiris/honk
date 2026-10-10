@@ -8,26 +8,29 @@ pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &st
     selection_chain
 }
 
-#[cfg(any(feature = "ebpf", test))]
-pub(super) fn final_udp_rule_mark(
-    routed_direct: bool,
-    final_outbound: &str,
-    routed_mark: u32,
-) -> u32 {
-    if final_outbound == "direct" && !routed_direct {
-        0
-    } else {
-        routed_mark
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct RoutingDecision {
     pub(super) outbound: String,
     pub(super) must: bool,
-    pub(super) mark: u32,
+    pub(super) mark: Option<honk_outbound::proxy::DirectMark>,
     pub(super) matched_rule: Option<(String, String)>,
     pub(super) reroute_by_sniffed_domain: bool,
+    #[cfg(feature = "native-api")]
+    pub(super) native_route: Option<super::observation::RouteObservation>,
+}
+
+impl RoutingDecision {
+    /// Installs a mode override's replacement outbound, if any. A rule mark
+    /// survives only on a routed `direct` flow that remains `direct`.
+    pub(super) fn apply_final_outbound(&mut self, replacement: Option<String>) {
+        let routed_direct = self.outbound == "direct";
+        if let Some(outbound) = replacement {
+            self.outbound = outbound;
+        }
+        if !routed_direct || self.outbound != "direct" {
+            self.mark = None;
+        }
+    }
 }
 
 pub(super) fn build_connection_info(
@@ -67,33 +70,32 @@ impl ControlPlaneHandle {
         &self,
         domain: &str,
         expected: std::net::IpAddr,
-        source_ip: std::net::IpAddr,
-    ) -> bool {
+        source: std::net::SocketAddr,
+    ) -> RealityOutcome {
         let dns_timeout = std::time::Duration::from_millis(
             self.config.read().await.global.dns_resolve_timeout_ms,
         );
-        match tokio::time::timeout(
-            dns_timeout,
-            self.dns_resolver.resolve_for_source(domain, source_ip),
-        )
-        .await
-        {
+        let resolution = self.dns_resolver.resolve_for_source(domain, source);
+        crate::observe::scope_pin!(resolution);
+        let resolution =
+            crate::observe::flows::dns::scope_purpose("domain_verification", resolution);
+        match tokio::time::timeout(dns_timeout, resolution).await {
             Ok(Ok(resolved)) => {
                 match domain_reality_outcome(expected, &resolved.ipv4, &resolved.ipv6) {
-                    RealityOutcome::ExactMatch => true,
+                    RealityOutcome::ExactMatch => RealityOutcome::ExactMatch,
                     RealityOutcome::OtherFamilyOnly => {
                         debug!(
                             "Domain reality check: {} has no records for {}; other family present — trusting SNI (got v4={:?} v6={:?})",
                             domain, expected, resolved.ipv4, resolved.ipv6
                         );
-                        true
+                        RealityOutcome::OtherFamilyOnly
                     }
                     RealityOutcome::Mismatch => {
                         debug!(
                             "Domain reality check failed: {} does not resolve to {} (got {:?} {:?})",
                             domain, expected, resolved.ipv4, resolved.ipv6
                         );
-                        false
+                        RealityOutcome::Mismatch
                     }
                 }
             }
@@ -102,11 +104,11 @@ impl ControlPlaneHandle {
                     "Domain reality check failed: unable to resolve {}: {}",
                     domain, e
                 );
-                false
+                RealityOutcome::Mismatch
             }
             Err(_) => {
                 debug!("Domain reality check timed out for {}", domain);
-                false
+                RealityOutcome::Mismatch
             }
         }
     }
@@ -116,28 +118,25 @@ impl ControlPlaneHandle {
         dial_mode: DialMode,
         domain: Option<String>,
         original_dst: std::net::IpAddr,
-        client_addr: std::net::IpAddr,
-    ) -> (Option<String>, bool) {
-        let domain = match (dial_mode, domain) {
+        client_addr: std::net::SocketAddr,
+    ) -> (Option<String>, bool, &'static str) {
+        match (dial_mode, domain) {
             (DialMode::Domain, Some(domain)) => {
-                if self
+                match self
                     .verify_domain_reality(&domain, original_dst, client_addr)
                     .await
                 {
-                    Some(domain)
-                } else {
-                    debug!(
-                        domain = %domain,
-                        destination = %original_dst,
-                        "sniffed domain failed reality check; falling back to IP"
-                    );
-                    None
+                    RealityOutcome::ExactMatch => (Some(domain), true, "matched"),
+                    RealityOutcome::OtherFamilyOnly => (Some(domain), true, "other_family_trusted"),
+                    RealityOutcome::Mismatch => {
+                        debug!(domain = %domain, destination = %original_dst,
+                            "sniffed domain failed reality check; falling back to IP");
+                        (None, false, "failed")
+                    }
                 }
             }
-            (_, domain) => domain,
-        };
-        let verified = matches!(dial_mode, DialMode::Domain) && domain.is_some();
-        (domain, verified)
+            (_, domain) => (domain, false, "not_required"),
+        }
     }
 
     /// Whether a sniffed domain should participate in userspace routing.
@@ -193,6 +192,7 @@ impl ControlPlaneHandle {
         conn_info: &ConnectionInfo,
         domain_verified: bool,
         handoff: Option<&HandoffResult>,
+        #[cfg(feature = "native-api")] record_route: bool,
     ) -> RoutingDecision {
         let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
             dial_mode,
@@ -200,6 +200,21 @@ impl ControlPlaneHandle {
             domain_verified,
             handoff,
         );
+        if let Some(handoff) = handoff
+            && handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
+            && !reroute_by_sniffed_domain
+            && !self.connection_tracker.needs_rule_details()
+        {
+            return RoutingDecision {
+                outbound: self.outbound_index_to_name(handoff.outbound).await,
+                must: handoff.must != 0,
+                mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
+                matched_rule: None,
+                reroute_by_sniffed_domain: false,
+                #[cfg(feature = "native-api")]
+                native_route: record_route.then(super::observation::RouteObservation::kernel),
+            };
+        }
         let route_with_domain = Self::should_route_with_sniffed_domain(
             dial_mode,
             conn_info.domain.as_deref(),
@@ -211,17 +226,56 @@ impl ControlPlaneHandle {
         if !route_with_domain {
             routing_conn_info.domain = None;
         }
+        #[cfg(feature = "native-api")]
+        let mut native_route = (record_route
+            && handoff.is_some_and(|handoff| {
+                handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
+                    && !reroute_by_sniffed_domain
+            }))
+        .then(super::observation::RouteObservation::kernel);
         let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
             let router = self.router.read().await;
-            match router.route_full(&routing_conn_info) {
-                Some(route) => (
-                    route.outbound_name.to_string(),
-                    route.must,
-                    route.mark,
-                    Some((route.rule_type.to_string(), route.rule_payload.to_string())),
-                ),
-                None => (router.default_outbound().to_string(), false, 0, None),
-            }
+            #[cfg(feature = "native-api")]
+            let matched = if record_route
+                && native_route.is_none()
+                && let Some(native) = &self.native
+            {
+                let _config = self.config.read().await;
+                let generation = self.diagnostics.read().generation;
+                let observed = router.route_full_observed(
+                    &routing_conn_info,
+                    None,
+                    crate::observe::flows::MAX_RULE_VALUES,
+                );
+                let rules = crate::observe::rules::observed_rule_evaluations(
+                    &native.instance_id,
+                    generation,
+                    &router,
+                    &observed.rules,
+                );
+                native_route = Some(super::observation::RouteObservation::userspace(
+                    &native.instance_id,
+                    generation,
+                    &routing_conn_info,
+                    &router,
+                    observed.matched.as_ref(),
+                    rules,
+                    observed.truncated,
+                ));
+                observed.matched
+            } else {
+                router.route_full(&routing_conn_info)
+            };
+            #[cfg(not(feature = "native-api"))]
+            let matched = router.route_full(&routing_conn_info);
+            // First matching rule's action, else the configured fallback action.
+            let action = matched.as_ref().map_or(router.fallback(), |hit| hit.action);
+            (
+                action.outbound.clone(),
+                action.must,
+                action.mark,
+                matched.map(|hit| (hit.rule_type.to_string(), hit.rule_payload.to_string())),
+            )
         };
         let (outbound, must, mark) = match handoff {
             Some(ho) => {
@@ -241,7 +295,7 @@ impl ControlPlaneHandle {
                     (
                         self.outbound_index_to_name(ho.outbound).await,
                         ho.must != 0,
-                        ho.mark,
+                        honk_outbound::proxy::DirectMark::new(ho.mark),
                     )
                 }
             }
@@ -253,64 +307,27 @@ impl ControlPlaneHandle {
             mark,
             matched_rule,
             reroute_by_sniffed_domain,
+            #[cfg(feature = "native-api")]
+            native_route,
         }
     }
 
-    /// Publish the matched sniffed-domain bitmap so later route-time
-    /// decisions can use the learned destination IP. Best-effort: a write
-    /// failure never fails the flow.
-    pub(super) async fn push_sniffed_domain_bitmap(
-        &self,
-        conn_info: &ConnectionInfo,
-        domain: &str,
-        dst_ip: std::net::IpAddr,
-    ) {
-        let (rule_name, bitmaps, bitmap_generation) = {
-            let router = self.router.read().await;
-            match router.route_full(conn_info) {
-                Some(matched) => {
-                    let rule_name = matched.rule_name.to_string();
-                    let (bitmaps, generation) = {
-                        let db = DOMAIN_BITMAPS.read();
-                        let generation = crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        (db.get(&rule_name).cloned().unwrap_or_default(), generation)
-                    };
-                    (rule_name, bitmaps, generation)
-                }
-                None => return,
-            }
-        };
-        if bitmaps.is_empty() {
-            return;
-        }
-        let mut merged = DomainRouting::default();
-        for bm in &bitmaps {
-            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                *word |= value;
-            }
-        }
-        let prefix_len = if dst_ip.is_ipv4() { 32 } else { 128 };
-        let prefix = format!("{dst_ip}/{prefix_len}");
-        let Ok(lpm_key) = cidr_to_lpm_key(&prefix) else {
+    /// Publish all matching domain predicates, independently of the flow's
+    /// non-domain conditions. Publication failure remains health-neutral.
+    pub(super) async fn push_sniffed_domain_bitmap(&self, domain: &str, dst_ip: std::net::IpAddr) {
+        // Keep the same router generation until the backend write completes;
+        // reload acquires these locks in this order before replacing either.
+        let router = self.router.read().await;
+        let Some(bitmap) = router.domain_bitmap(domain) else {
             return;
         };
+        let lpm_key = crate::ebpf::maps::ip_addr_to_lpm_key(dst_ip);
         let mut ebpf = self.ebpf.write().await;
-        if crate::control::routing_matcher::DOMAIN_BITMAPS_GENERATION
-            .load(std::sync::atomic::Ordering::Acquire)
-            != bitmap_generation
-        {
-            return;
-        }
-        match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
-            Ok(()) => debug!(
-                "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
-                dst_ip, domain, rule_name
-            ),
-            Err(error) => warn!(
-                "Failed to update DOMAIN_ROUTING_MAP for {} ({}): {}",
-                dst_ip, domain, error
-            ),
+        match ebpf.add_domain_ip_bitmap(&lpm_key, &bitmap) {
+            Ok(()) => debug!(%domain, %dst_ip, "sniffed domain facts published"),
+            Err(error) => {
+                debug!(%error, %domain, %dst_ip, "failed to publish sniffed domain facts")
+            }
         }
     }
 }
@@ -362,3 +379,42 @@ pub(in crate::control) fn domain_reality_outcome(
 #[cfg(test)]
 #[path = "sniffed_domain_routing_tests.rs"]
 mod sniffed_domain_routing_tests;
+
+#[cfg(all(test, feature = "native-api"))]
+mod native_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_final_handoff_does_not_wait_for_router_evidence() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        let plane = crate::control::tests::support::control_plane(config);
+        let handle = plane.spawn_handle();
+        handle.connection_tracker.disable_api();
+        handle.connection_tracker.enable_native();
+        let handoff = HandoffResult::from(RoutingHandoffEntry {
+            result: RoutingResult {
+                outbound: OutboundIndex::Direct as u8,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let info = build_connection_info(
+            None,
+            "192.0.2.1:443".parse().unwrap(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "tcp",
+            Some(&handoff),
+        );
+        let _router = handle.router.write().await;
+        let decision = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff), false),
+        )
+        .await
+        .expect("native observation must not repeat routing");
+        assert_eq!(decision.outbound, "direct");
+        assert!(decision.matched_rule.is_none());
+        handle.connection_tracker.disable_native();
+    }
+}

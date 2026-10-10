@@ -69,23 +69,68 @@ impl EndpointKey {
 /// after the same bounded admission succeeds.
 pub(in crate::control) struct QueuedDatagram {
     pub(super) data: Bytes,
-    pub(super) _flow_permit: OwnedSemaphorePermit,
-    pub(super) _global_byte_permit: Option<OwnedSemaphorePermit>,
+    accounting: DatagramAccounting,
+}
+
+struct DatagramAccounting {
+    _flow_permit: OwnedSemaphorePermit,
+    global_payload_bytes: Arc<Semaphore>,
+    payload_bytes: u32,
+    enqueued_at: u32,
+}
+
+impl Drop for DatagramAccounting {
+    fn drop(&mut self) {
+        self.global_payload_bytes
+            .add_permits(self.payload_bytes as usize);
+    }
 }
 
 impl QueuedDatagram {
     pub(in crate::control) fn payload(&self) -> &[u8] {
         &self.data
     }
+
+    pub(super) fn expired(&self, max_age: Duration) -> bool {
+        queue_now().wrapping_sub(self.accounting.enqueued_at) >= duration_millis(max_age)
+    }
+
+    #[cfg(test)]
+    pub(super) fn age_for_test(&mut self, age: Duration) {
+        self.accounting.enqueued_at = queue_now().wrapping_sub(duration_millis(age));
+    }
 }
 
-enum DatagramPayload<'a> {
+fn duration_millis(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+pub(in crate::control) fn queue_now() -> u32 {
+    // ponytail: u32 milliseconds wrap every 49 days; queued packets live for seconds.
+    (monotonic_nanos() / 1_000_000) as u32
+}
+
+#[cfg(any(feature = "ebpf", test))]
+fn queue_timestamp(received_at: Instant) -> u32 {
+    queue_now().wrapping_sub(duration_millis(received_at.elapsed()))
+}
+
+#[derive(Clone)]
+pub(in crate::control) enum DatagramPayload<'a> {
     Borrowed(&'a [u8]),
     #[cfg(any(feature = "ebpf", test))]
     Owned(Bytes),
 }
 
 impl DatagramPayload<'_> {
+    pub(in crate::control) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            #[cfg(any(feature = "ebpf", test))]
+            Self::Owned(data) => data,
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Borrowed(data) => data.len(),
@@ -94,11 +139,35 @@ impl DatagramPayload<'_> {
         }
     }
 
-    fn into_bytes(self) -> Bytes {
+    pub(in crate::control) fn into_bytes(self) -> Bytes {
         match self {
             Self::Borrowed(data) => Bytes::copy_from_slice(data),
             #[cfg(any(feature = "ebpf", test))]
             Self::Owned(data) => data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::control) enum RawDnsRoute<S = Arc<str>> {
+    Group(S),
+    Direct(u32),
+}
+
+impl<S: AsRef<str>> RawDnsRoute<S> {
+    pub(in crate::control) fn as_ref(&self) -> RawDnsRoute<&str> {
+        match self {
+            Self::Group(name) => RawDnsRoute::Group(name.as_ref()),
+            Self::Direct(mark) => RawDnsRoute::Direct(*mark),
+        }
+    }
+}
+
+impl RawDnsRoute<&str> {
+    pub(in crate::control) fn into_owned(self) -> RawDnsRoute {
+        match self {
+            Self::Group(name) => RawDnsRoute::Group(Arc::from(name)),
+            Self::Direct(mark) => RawDnsRoute::Direct(mark),
         }
     }
 }
@@ -111,19 +180,20 @@ enum PacketAdmissionError {
 pub(super) struct InitializingEndpoint {
     pub(super) decision_token: u32,
     pub(super) generation: u64,
+    pub(super) epoch: u64,
+    pub(super) raw_dns_route: Option<RawDnsRoute>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
     pub(super) flow_slots: Arc<Semaphore>,
     pub(super) endpoint_permit: Mutex<Option<OwnedSemaphorePermit>>,
-    /// A tracker registered after route selection but before the Ready
-    /// transition. It must be removed if this initialization is cancelled.
-    pub(super) tracker_id: Mutex<Option<String>>,
     /// Finalized transport winner for this generation. Bound only after
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
     pub(super) selected_node: Mutex<Option<uuid::Uuid>>,
     pub(super) cancelled: AtomicBool,
     pub(super) cancel_notify: Notify,
+    #[cfg(feature = "native-api")]
+    pub(super) native_terminal: std::sync::OnceLock<observation::SharedTerminal>,
 }
 
 impl InitializingEndpoint {
@@ -133,19 +203,6 @@ impl InitializingEndpoint {
 
     pub(super) fn take_endpoint_permit(&self) -> Option<OwnedSemaphorePermit> {
         self.endpoint_permit.lock().take()
-    }
-
-    pub(super) fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let mut current = self.tracker_id.lock();
-        if current.is_some() {
-            return false;
-        }
-        *current = Some(tracker_id);
-        true
-    }
-
-    pub(super) fn take_tracker_id(&self) -> Option<String> {
-        self.tracker_id.lock().take()
     }
 
     pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) {
@@ -180,10 +237,11 @@ impl InitializingEndpoint {
 pub(super) struct ReadyEndpoint {
     pub(super) decision_token: u32,
     pub(super) generation: u64,
+    pub(super) raw_dns_route: Option<RawDnsRoute>,
     pub(super) endpoint: Arc<UdpEndpoint>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) flow_slots: Arc<Semaphore>,
-    pub(super) _endpoint_permit: OwnedSemaphorePermit,
+    pub(super) _endpoint_permit: Option<OwnedSemaphorePermit>,
     pub(super) _connection_guard: Option<ActiveConnectionGuard>,
     pub(super) alive: AtomicBool,
 }
@@ -191,7 +249,13 @@ pub(super) struct ReadyEndpoint {
 pub(super) enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
-    Retiring { generation: u64, token: u32 },
+    Retiring {
+        generation: u64,
+        token: u32,
+        io: Option<Arc<RetirementIo>>,
+        #[cfg(feature = "native-api")]
+        native_terminal: Option<observation::SharedTerminal>,
+    },
 }
 
 impl EndpointEntry {
@@ -217,7 +281,7 @@ impl EndpointEntry {
 
     pub(super) fn retire(&self) -> Option<String> {
         match self {
-            Self::Initializing(entry) => entry.take_tracker_id(),
+            Self::Initializing(_) => None,
             Self::Ready(entry) => {
                 entry.alive.store(false, Ordering::Release);
                 entry.endpoint.kill();
@@ -259,23 +323,91 @@ pub(in crate::control) struct UdpInitLease {
     pub(super) key: EndpointKey,
     generation: u64,
     decision_token: u32,
-    /// Cancellation epoch captured while publishing this Initializing entry.
-    /// `commit_ready` compares it under the pool's shared epoch gate, so a
-    /// cancellation that linearizes first can never publish Ready afterwards.
-    epoch: u64,
     first: Option<QueuedDatagram>,
     _slow_permit: OwnedSemaphorePermit,
     cancellation: watch::Receiver<u64>,
     initializer: Arc<InitializingEndpoint>,
     _initializer_guard: UdpInitializerGuard,
     connection_guard: Option<ActiveConnectionGuard>,
-    /// The DNS controller already examined this first datagram before the
-    /// lease was created. A continuation must not invoke it a second time.
-    dns_checked: bool,
     committed: bool,
+    #[cfg(feature = "native-api")]
+    packet_route: Option<crate::control::udp_ingress::PacketRoute>,
+    #[cfg(feature = "native-api")]
+    packet_trace_id: Option<u32>,
 }
 
 impl UdpInitLease {
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_packet_trace_id(&mut self, trace_id: Option<u32>) {
+        self.packet_trace_id =
+            trace_id.filter(|id| *id != 0 && *id != honk_ebpf_common::ROUTE_TRACE_LOST);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn packet_trace_id(&self) -> Option<u32> {
+        self.packet_trace_id
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_packet_route(
+        &mut self,
+        capture: Option<crate::control::udp_ingress::PacketRoute>,
+    ) {
+        self.packet_route = capture;
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn take_packet_route(
+        &mut self,
+    ) -> Option<crate::control::udp_ingress::PacketRoute> {
+        self.packet_route.take()
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_native_flow(
+        &self,
+        flow: Option<Arc<crate::observe::flows::FlowGuard>>,
+    ) -> Option<observation::SharedTerminal> {
+        let flow = flow?;
+        let terminal = Arc::clone(
+            self.initializer
+                .native_terminal
+                .get_or_init(|| observation::NativeUdpTerminal::new(Arc::clone(&flow), false)),
+        );
+        if let Some(mut entry) = self.pool.endpoints.get_mut(&self.key) {
+            if let EndpointEntry::Retiring {
+                generation,
+                token,
+                native_terminal,
+                ..
+            } = entry.value_mut()
+                && *generation == self.generation
+                && *token == self.decision_token
+            {
+                *native_terminal = Some(Arc::clone(&terminal));
+            }
+        } else {
+            flow.mark_gap(honk_outbound::runtime::flow_observation::GapReason::RetirementOwnerLost);
+        }
+        Some(terminal)
+    }
+
+    #[cfg(not(feature = "native-api"))]
+    #[inline]
+    pub(in crate::control) fn set_native_flow(
+        &self,
+        _flow: Option<Arc<crate::observe::flows::FlowGuard>>,
+    ) -> Option<observation::SharedTerminal> {
+        None
+    }
+
+    pub(in crate::control) fn native_terminal(&self) -> Option<observation::SharedTerminal> {
+        #[cfg(feature = "native-api")]
+        return self.initializer.native_terminal.get().cloned();
+        #[cfg(not(feature = "native-api"))]
+        None
+    }
+
     pub(in crate::control) fn client_addr(&self) -> SocketAddr {
         SocketAddr::new(self.key.client_ip(), self.key.client_port)
     }
@@ -290,6 +422,10 @@ impl UdpInitLease {
 
     pub(in crate::control) fn decision_token(&self) -> u32 {
         self.decision_token
+    }
+
+    pub(in crate::control) fn raw_dns_route(&self) -> Option<RawDnsRoute> {
+        self.initializer.raw_dns_route.clone()
     }
 
     #[cfg(test)]
@@ -315,37 +451,12 @@ impl UdpInitLease {
         self.connection_guard = Some(guard);
     }
 
-    pub(in crate::control) fn mark_dns_checked(&mut self) {
-        self.dns_checked = true;
-    }
-
-    pub(in crate::control) fn dns_checked(&self) -> bool {
-        self.dns_checked
-    }
-
-    /// Associate a tracker created after route selection with this exact
-    /// Initializing incarnation. If commit never happens, `Drop` transfers it
-    /// to the removal sink; Ready cleanup continues to use `UdpEndpoint`.
-    pub(in crate::control) fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let Some(entry) = self.pool.endpoints.get(&self.key) else {
-            return false;
-        };
-        match entry.value() {
-            EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token =>
-            {
-                initializing.set_tracker_id(tracker_id)
-            }
-            _ => false,
-        }
-    }
-
     /// Bind the finalized transport winner (NodeId) to this Initializing
     /// generation after speculative preparation drains and before endpoint
     /// setup. Returns false when a newer generation or death/cancel path
     /// retired this entry.
     pub(in crate::control) fn bind_selected_node(&self, node_id: uuid::Uuid) -> bool {
+        let _binding_gate = self.pool.node_binding_gate.lock();
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
         };
@@ -427,7 +538,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
-        if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
             return false;
         }
         let initializing = match occupied.get() {
@@ -442,6 +553,14 @@ impl UdpInitLease {
         let Some(endpoint_permit) = initializing.take_endpoint_permit() else {
             return false;
         };
+        let endpoint_permit = if endpoint.is_source() {
+            if !endpoint.commit_source_binding(endpoint_permit) {
+                return false;
+            }
+            None
+        } else {
+            Some(endpoint_permit)
+        };
         occupied.insert(EndpointEntry::Ready(Arc::new(ReadyEndpoint {
             generation: self.generation,
             decision_token: self.decision_token,
@@ -451,6 +570,7 @@ impl UdpInitLease {
             _endpoint_permit: endpoint_permit,
             _connection_guard: self.connection_guard.take(),
             alive: AtomicBool::new(true),
+            raw_dns_route: initializing.raw_dns_route.clone(),
         })));
         self.committed = true;
         true
@@ -466,7 +586,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
-        if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
             return false;
         }
         if !matches!(
@@ -481,6 +601,9 @@ impl UdpInitLease {
         let entry = occupied.insert(EndpointEntry::Retiring {
             generation: self.generation,
             token: self.decision_token,
+            io: None,
+            #[cfg(feature = "native-api")]
+            native_terminal: self.initializer.native_terminal.get().cloned(),
         });
         drop(occupied);
         let conn_id = entry.retire();
@@ -521,6 +644,28 @@ pub(super) struct ReservationPublicationHook {
     pub(super) published: Arc<std::sync::Barrier>,
     pub(super) resume: Arc<std::sync::Barrier>,
 }
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct ReservationGateHook {
+    pub(super) entered: Arc<std::sync::Barrier>,
+    pub(super) resume: Arc<std::sync::Barrier>,
+}
+
+impl UdpEndpointPool {
+    #[cfg(test)]
+    fn pause_before_reservation_gate(&self) {
+        let hook = self.reservation_gate_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook.entered.wait();
+            hook.resume.wait();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_reservation_gate_hook(&self, hook: Option<Arc<ReservationGateHook>>) {
+        *self.reservation_gate_hook.lock() = hook;
+    }
+}
 
 impl UdpInitializerGuard {
     fn new(pool: Arc<UdpEndpointPool>) -> Self {
@@ -555,89 +700,120 @@ impl UdpEndpointPool {
         }
     }
 
-    fn packet_permits(
+    fn packet_accounting(
         &self,
         len: usize,
         flow_slots: &Arc<Semaphore>,
-    ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), PacketAdmissionError> {
+        enqueued_at: u32,
+    ) -> Result<DatagramAccounting, PacketAdmissionError> {
         let flow_permit = flow_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| PacketAdmissionError::FlowQueueFull)?;
-        let global_byte_permit = if len == 0 {
-            None
-        } else {
-            let byte_count =
-                u32::try_from(len).map_err(|_| PacketAdmissionError::GlobalPayloadFull)?;
-            Some(
-                self.global_payload_bytes
-                    .clone()
-                    .try_acquire_many_owned(byte_count)
-                    .map_err(|_| PacketAdmissionError::GlobalPayloadFull)?,
-            )
-        };
-        Ok((flow_permit, global_byte_permit))
-    }
-
-    fn make_packet(
-        &self,
-        data: DatagramPayload<'_>,
-        flow_slots: &Arc<Semaphore>,
-    ) -> Result<QueuedDatagram, PacketAdmissionError> {
-        let (flow_permit, global_byte_permit) = self.packet_permits(data.len(), flow_slots)?;
-        Ok(QueuedDatagram {
-            data: data.into_bytes(),
+        let payload_bytes =
+            u32::try_from(len).map_err(|_| PacketAdmissionError::GlobalPayloadFull)?;
+        let global_payload_bytes = Arc::clone(&self.global_payload_bytes);
+        if payload_bytes != 0 {
+            let permit = global_payload_bytes
+                .try_acquire_many(payload_bytes)
+                .map_err(|_| PacketAdmissionError::GlobalPayloadFull)?;
+            permit.forget();
+        }
+        Ok(DatagramAccounting {
             _flow_permit: flow_permit,
-            _global_byte_permit: global_byte_permit,
+            global_payload_bytes,
+            payload_bytes,
+            enqueued_at,
         })
     }
 
-    fn enqueue(
+    fn make_packet_at(
+        &self,
+        data: DatagramPayload<'_>,
+        flow_slots: &Arc<Semaphore>,
+        enqueued_at: u32,
+    ) -> Result<QueuedDatagram, PacketAdmissionError> {
+        let accounting = self.packet_accounting(data.len(), flow_slots, enqueued_at)?;
+        Ok(QueuedDatagram {
+            data: data.into_bytes(),
+            accounting,
+        })
+    }
+
+    fn enqueue_at(
         &self,
         sender: &mpsc::Sender<QueuedDatagram>,
         flow_slots: &Arc<Semaphore>,
         data: DatagramPayload<'_>,
+        enqueued_at: u32,
         stats: &StatsManager,
+        #[cfg(feature = "native-api")] native_terminal: Option<&observation::SharedTerminal>,
     ) -> EndpointReservation {
-        if sender.is_closed() {
-            stats.record_udp_queue_closed();
-            return EndpointReservation::QueueClosed;
-        }
-        let packet = match self.make_packet(data, flow_slots) {
-            Ok(packet) => packet,
-            Err(PacketAdmissionError::FlowQueueFull) => {
-                stats.record_udp_flow_queue_full();
-                return EndpointReservation::QueueFull;
-            }
-            Err(PacketAdmissionError::GlobalPayloadFull) => {
-                stats.record_udp_global_payload_full();
-                return EndpointReservation::QueueFull;
-            }
-        };
-        match sender.try_send(packet) {
-            Ok(()) => {
-                stats.record_udp_queue_accepted();
-                EndpointReservation::Enqueued
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                stats.record_udp_flow_queue_full();
-                EndpointReservation::QueueFull
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+        let result = (|| {
+            if sender.is_closed() {
                 stats.record_udp_queue_closed();
-                EndpointReservation::QueueClosed
+                return EndpointReservation::QueueClosed;
+            }
+            let packet = match self.make_packet_at(data, flow_slots, enqueued_at) {
+                Ok(packet) => packet,
+                Err(PacketAdmissionError::FlowQueueFull) => {
+                    stats.record_udp_flow_queue_full();
+                    return EndpointReservation::QueueFull;
+                }
+                Err(PacketAdmissionError::GlobalPayloadFull) => {
+                    stats.record_udp_global_payload_full();
+                    return EndpointReservation::QueueFull;
+                }
+            };
+            match sender.try_send(packet) {
+                Ok(()) => {
+                    stats.record_udp_queue_accepted();
+                    EndpointReservation::Enqueued
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stats.record_udp_flow_queue_full();
+                    EndpointReservation::QueueFull
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    stats.record_udp_queue_closed();
+                    EndpointReservation::QueueClosed
+                }
+            }
+        })();
+        #[cfg(feature = "native-api")]
+        if let Some(terminal) = native_terminal {
+            match &result {
+                EndpointReservation::QueueFull => terminal.packet_drop("queue_capacity"),
+                EndpointReservation::QueueClosed => terminal.packet_drop("queue_closed"),
+                _ => {}
             }
         }
+        result
     }
 
-    fn reserve_new(
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_new_at(
         self: &Arc<Self>,
         vacant: dashmap::mapref::entry::VacantEntry<'_, EndpointKey, EndpointEntry>,
         data: DatagramPayload<'_>,
         decision_token: u32,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
+        expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
+        enqueued_at: u32,
         stats: &StatsManager,
     ) -> EndpointReservation {
+        let reservation_epoch = expected_epoch;
+        #[cfg(test)]
+        self.pause_before_reservation_gate();
+        let epoch_gate = self.initialization_epoch.lock();
+        if self.terminal.load(Ordering::Acquire) || reservation_epoch != *epoch_gate {
+            stats.record_udp_queue_closed();
+            return EndpointReservation::QueueClosed;
+        }
+        let cancellation = self.cancel_epoch.subscribe();
+        let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
+        drop(epoch_gate);
         let endpoint_permit = match self.endpoint_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -646,7 +822,7 @@ impl UdpEndpointPool {
             }
         };
         let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
-        let first = match self.make_packet(data, &flow_slots) {
+        let first = match self.make_packet_at(data, &flow_slots, enqueued_at) {
             Ok(packet) => packet,
             Err(PacketAdmissionError::FlowQueueFull) => {
                 stats.record_udp_flow_queue_full();
@@ -657,27 +833,29 @@ impl UdpEndpointPool {
                 return EndpointReservation::QueueFull;
             }
         };
+        let raw_dns_route = raw_dns_route.map(RawDnsRoute::into_owned);
         let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let epoch_gate = self.initialization_epoch.lock();
-        if self.terminal.load(Ordering::Acquire) {
+        if self.terminal.load(Ordering::Acquire) || reservation_epoch != *epoch_gate {
             stats.record_udp_queue_closed();
             return EndpointReservation::QueueClosed;
         }
         let epoch = *epoch_gate;
-        let cancellation = self.cancel_epoch.subscribe();
-        let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
         let initializer = Arc::new(InitializingEndpoint {
             decision_token,
             generation,
+            epoch,
+            raw_dns_route,
             queue_tx,
             queue_rx: Mutex::new(Some(queue_rx)),
             flow_slots,
             endpoint_permit: Mutex::new(Some(endpoint_permit)),
-            tracker_id: Mutex::new(None),
             selected_node: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),
+            #[cfg(feature = "native-api")]
+            native_terminal: std::sync::OnceLock::new(),
         });
         let key = *vacant.key();
         vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
@@ -689,17 +867,20 @@ impl UdpEndpointPool {
             key,
             generation,
             decision_token,
-            epoch,
             first: Some(first),
             _slow_permit: slow_permit,
             cancellation,
             initializer,
             _initializer_guard: initializer_guard,
             connection_guard: None,
-            dns_checked: decision_token != 0,
+            #[cfg(feature = "native-api")]
+            packet_route: None,
+            #[cfg(feature = "native-api")]
+            packet_trace_id: None,
             committed: false,
         })
     }
+    #[cfg(test)]
     /// Atomically reserve a cold tuple or synchronously enqueue onto its
     /// existing Initializing/Ready incarnation. No map or std-mutex guard is
     /// held across await because this entire operation is synchronous.
@@ -709,6 +890,55 @@ impl UdpEndpointPool {
         dst: SocketAddr,
         data: &[u8],
         slow_permit: OwnedSemaphorePermit,
+        stats: &StatsManager,
+    ) -> EndpointReservation {
+        let expected_epoch = self.initialization_epoch();
+        self.reserve_or_enqueue_at(
+            client,
+            dst,
+            data,
+            None,
+            expected_epoch,
+            slow_permit,
+            queue_now(),
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::control) fn reserve_or_enqueue_at(
+        self: &Arc<Self>,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: &[u8],
+        raw_dns_route: Option<RawDnsRoute<&str>>,
+        expected_epoch: u64,
+        slow_permit: OwnedSemaphorePermit,
+        enqueued_at: u32,
+        stats: &StatsManager,
+    ) -> EndpointReservation {
+        self.reserve_payload_or_enqueue_at(
+            client,
+            dst,
+            DatagramPayload::Borrowed(data),
+            raw_dns_route,
+            expected_epoch,
+            slow_permit,
+            enqueued_at,
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::control) fn reserve_payload_or_enqueue_at(
+        self: &Arc<Self>,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: DatagramPayload<'_>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
+        expected_epoch: u64,
+        slow_permit: OwnedSemaphorePermit,
+        enqueued_at: u32,
         stats: &StatsManager,
     ) -> EndpointReservation {
         let key = EndpointKey::new(client, dst);
@@ -721,11 +951,26 @@ impl UdpEndpointPool {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
                     let (stale_token, stale_generation) = match occupied.get() {
                         EndpointEntry::Initializing(initializing) => {
-                            match self.enqueue(
+                            if initializing.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
+                                != raw_dns_route
+                            {
+                                return EndpointReservation::IdentityMismatch;
+                            }
+                            let epoch_gate = self.initialization_epoch.lock();
+                            if initializing.epoch != expected_epoch || *epoch_gate != expected_epoch
+                            {
+                                stats.record_udp_queue_closed();
+                                return EndpointReservation::QueueClosed;
+                            }
+                            drop(epoch_gate);
+                            match self.enqueue_at(
                                 &initializing.queue_tx,
                                 &initializing.flow_slots,
-                                DatagramPayload::Borrowed(data),
+                                data.clone(),
+                                enqueued_at,
                                 stats,
+                                #[cfg(feature = "native-api")]
+                                initializing.native_terminal.get(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (initializing.decision_token, initializing.generation)
@@ -737,11 +982,19 @@ impl UdpEndpointPool {
                             if ready.alive.load(Ordering::Acquire)
                                 && !ready.endpoint.dead.load(Ordering::Acquire) =>
                         {
-                            match self.enqueue(
+                            if ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
+                                != raw_dns_route
+                            {
+                                return EndpointReservation::IdentityMismatch;
+                            }
+                            match self.enqueue_at(
                                 &ready.queue_tx,
                                 &ready.flow_slots,
-                                DatagramPayload::Borrowed(data),
+                                data.clone(),
+                                enqueued_at,
                                 stats,
+                                #[cfg(feature = "native-api")]
+                                ready.endpoint.native.terminal(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (ready.decision_token, ready.generation)
@@ -759,11 +1012,14 @@ impl UdpEndpointPool {
                     self.retire_if_same(key, stale_token, stale_generation);
                 }
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                    return self.reserve_new(
+                    return self.reserve_new_at(
                         vacant,
-                        DatagramPayload::Borrowed(data),
+                        data,
                         0,
+                        raw_dns_route,
+                        expected_epoch,
                         slow_permit,
+                        enqueued_at,
                         stats,
                     );
                 }
@@ -773,7 +1029,7 @@ impl UdpEndpointPool {
 
     /// Admit a retained NFQUEUE allocation without duplicating its payload.
     /// A fresh call uses `None`; followers name the exact published generation.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn reserve_owned_or_enqueue(
         self: &Arc<Self>,
@@ -785,6 +1041,32 @@ impl UdpEndpointPool {
         slow_permit: OwnedSemaphorePermit,
         stats: &StatsManager,
     ) -> EndpointReservation {
+        self.reserve_owned_or_enqueue_at(
+            client,
+            dst,
+            data,
+            decision_token,
+            expected_generation,
+            slow_permit,
+            std::time::Instant::now(),
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(any(feature = "ebpf", test))]
+    pub(in crate::control) fn reserve_owned_or_enqueue_at(
+        self: &Arc<Self>,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: Bytes,
+        decision_token: u32,
+        expected_generation: Option<u64>,
+        slow_permit: OwnedSemaphorePermit,
+        enqueued_at: std::time::Instant,
+        stats: &StatsManager,
+    ) -> EndpointReservation {
+        let enqueued_at = queue_timestamp(enqueued_at);
         if self.terminal.load(Ordering::Acquire) {
             stats.record_udp_queue_closed();
             return EndpointReservation::QueueClosed;
@@ -807,21 +1089,27 @@ impl UdpEndpointPool {
                     return EndpointReservation::IdentityMismatch;
                 }
                 match occupied.get() {
-                    EndpointEntry::Initializing(initializing) => self.enqueue(
+                    EndpointEntry::Initializing(initializing) => self.enqueue_at(
                         &initializing.queue_tx,
                         &initializing.flow_slots,
                         DatagramPayload::Owned(data),
+                        enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
                     ),
                     EndpointEntry::Ready(ready)
                         if ready.alive.load(Ordering::Acquire)
                             && !ready.endpoint.dead.load(Ordering::Acquire) =>
                     {
-                        self.enqueue(
+                        self.enqueue_at(
                             &ready.queue_tx,
                             &ready.flow_slots,
                             DatagramPayload::Owned(data),
+                            enqueued_at,
                             stats,
+                            #[cfg(feature = "native-api")]
+                            ready.endpoint.native.terminal(),
                         )
                     }
                     EndpointEntry::Ready(_) | EndpointEntry::Retiring { .. } => {
@@ -834,11 +1122,14 @@ impl UdpEndpointPool {
                 if expected_generation.is_some() {
                     return EndpointReservation::IdentityMismatch;
                 }
-                self.reserve_new(
+                self.reserve_new_at(
                     vacant,
                     DatagramPayload::Owned(data),
                     decision_token,
+                    None,
+                    self.initialization_epoch(),
                     slow_permit,
+                    enqueued_at,
                     stats,
                 )
             }
@@ -847,7 +1138,7 @@ impl UdpEndpointPool {
 
     /// Reconstruct an expired terminal Proxy cell from the same-token live
     /// initializer or Ready entry and return its generation with the enqueue.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(test)]
     pub(in crate::control) fn enqueue_owned_by_token(
         &self,
         client: SocketAddr,
@@ -856,6 +1147,28 @@ impl UdpEndpointPool {
         decision_token: u32,
         stats: &StatsManager,
     ) -> Result<u64, OwnedEnqueueError> {
+        self.enqueue_owned_by_token_at(
+            client,
+            dst,
+            data,
+            decision_token,
+            std::time::Instant::now(),
+            stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(any(feature = "ebpf", test))]
+    pub(in crate::control) fn enqueue_owned_by_token_at(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: Bytes,
+        decision_token: u32,
+        enqueued_at: std::time::Instant,
+        stats: &StatsManager,
+    ) -> Result<u64, OwnedEnqueueError> {
+        let enqueued_at = queue_timestamp(enqueued_at);
         if decision_token == 0 {
             return Err(OwnedEnqueueError::IdentityMismatch);
         }
@@ -872,11 +1185,14 @@ impl UdpEndpointPool {
             {
                 (
                     initializing.generation,
-                    self.enqueue(
+                    self.enqueue_at(
                         &initializing.queue_tx,
                         &initializing.flow_slots,
                         DatagramPayload::Owned(data),
+                        enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
                     ),
                 )
             }
@@ -887,11 +1203,14 @@ impl UdpEndpointPool {
             {
                 (
                     ready.generation,
-                    self.enqueue(
+                    self.enqueue_at(
                         &ready.queue_tx,
                         &ready.flow_slots,
                         DatagramPayload::Owned(data),
+                        enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        ready.endpoint.native.terminal(),
                     ),
                 )
             }
@@ -920,11 +1239,24 @@ impl UdpEndpointPool {
     /// the tuple remains fenced until the removal worker acknowledges cleanup.
     /// Terminal shutdown returns `QueueClosed` directly
     /// so the listener drops the datagram instead of attempting slow admission.
+    #[cfg(test)]
     pub(in crate::control) fn fast_path_enqueue(
         &self,
         client: SocketAddr,
         dst: SocketAddr,
         data: &[u8],
+        stats: &StatsManager,
+    ) -> Option<EndpointReservation> {
+        self.fast_path_enqueue_at(client, dst, data, None, queue_now(), stats)
+    }
+
+    pub(in crate::control) fn fast_path_enqueue_at(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: &[u8],
+        raw_dns_route: Option<RawDnsRoute<&str>>,
+        enqueued_at: u32,
         stats: &StatsManager,
     ) -> Option<EndpointReservation> {
         if self.terminal.load(Ordering::Acquire) {
@@ -939,12 +1271,18 @@ impl UdpEndpointPool {
                 if ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
+                if ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref) != raw_dns_route {
+                    return Some(EndpointReservation::IdentityMismatch);
+                }
                 (
-                    self.enqueue(
+                    self.enqueue_at(
                         &ready.queue_tx,
                         &ready.flow_slots,
                         DatagramPayload::Borrowed(data),
+                        enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        ready.endpoint.native.terminal(),
                     ),
                     (ready.decision_token, ready.generation),
                 )
@@ -981,6 +1319,14 @@ impl UdpEndpointPool {
             }
             _ => None,
         }
+    }
+
+    pub(in crate::control) fn initialization_epoch(&self) -> u64 {
+        *self.initialization_epoch.lock()
+    }
+
+    pub(in crate::control) fn initialization_epoch_is(&self, expected: u64) -> bool {
+        !self.terminal.load(Ordering::Acquire) && *self.initialization_epoch.lock() == expected
     }
 
     pub(super) fn advance_initialization_epoch(&self, terminal: bool) {

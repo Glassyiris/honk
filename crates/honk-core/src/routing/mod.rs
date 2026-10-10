@@ -1,13 +1,25 @@
 //! Routing engine: compiles rules and determines outbound for connections.
 
-use honk_config::routing::RoutingRule;
+use honk_config::routing::{RoutingConfig, RoutingRule};
+use honk_ebpf_common::{DomainRouting, ROUTING_FACT_CAPACITY};
+use honk_outbound::proxy::DirectMark;
 use regex::Regex;
 use std::{net::IpAddr, sync::Arc};
 
+mod fingerprint;
 mod geo;
+mod ir;
+#[cfg(any(feature = "ebpf", test))]
+mod lan_protection;
 mod lpm;
 
+#[cfg(feature = "native-api")]
+pub(crate) mod native;
+#[cfg(feature = "native-api")]
+pub(crate) use geo::GeoAssetSnapshot;
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
+pub(crate) use ir::SharedMatchers;
+pub use ir::{CompiledCondition, CompiledPredicate, IpMatcher, PortRange};
 pub(crate) use lpm::BinaryLpmTrie;
 
 // Read-only dat scan API consumed by honk-tool (`geosite`/`geoip`
@@ -24,81 +36,44 @@ fn normalize_process_matcher(name: &str) -> String {
     String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAction {
+    pub outbound: String,
+    pub must: bool,
+    pub mark: Option<DirectMark>,
+    pub direct_mark_index: Option<u8>,
+}
+
+impl RouteAction {
+    pub fn is_terminal_direct_mark(&self) -> bool {
+        self.must && self.outbound == "direct" && self.mark.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
+    pub id: u32,
     pub name: String,
-    /// Clash-style matched-rule type and payload (`clash_rule_parts`),
-    /// e.g. ("GeoIP", "telegram") — the rule's own payload, not the
-    /// connection's domain/IP.
+    /// Clash-style matched-rule type and payload (`clash_rule_parts`).
     pub rule_type: String,
     pub rule_payload: String,
     pub priority: u32,
-    pub domain_patterns: Vec<Regex>,
-    pub domain_suffixes: Vec<String>,
-    pub domain_keywords: Vec<String>,
-    pub ip_nets: Vec<ipnet::IpNet>,
-    /// Pre-built LPM trie for fast IP matching (derived from ip_nets).
-    pub(crate) ip_trie: BinaryLpmTrie,
-    pub source_ip_nets: Vec<ipnet::IpNet>,
-    /// Pre-built LPM trie for fast source IP matching.
-    pub(crate) source_ip_trie: BinaryLpmTrie,
-    pub ports: Vec<PortRange>,
-    pub source_ports: Vec<PortRange>,
-    pub protocols: Vec<String>,
-    pub process_names: Vec<String>,
-    pub mac_addresses: Vec<String>,
-    pub(crate) geosite_domains: Vec<GeositeDomain>,
-    /// Pre-built hash/automaton matcher derived from `geosite_domains`.
-    ///
-    /// The naive representation costs O(domains) string operations (with
-    /// per-candidate lowercase allocations) for every connection that falls
-    /// back to userspace routing — with geosite:cn (~117k entries) that alone
-    /// can saturate a core. This matcher reduces lookup to one lowercase pass
-    /// plus hash/automaton probes.
-    pub(crate) geosite_matcher: GeositeMatcher,
-    pub ip_versions: Vec<u8>,
-    pub dscp_values: Vec<u8>,
-    /// Negated matchers (dae `!matcher(...)`): any hit vetoes the rule.
-    /// Mirrors the positive fields above; `not_geo_ip` is expanded through
-    /// GeoAssets into `not_ip_nets` exactly like the positive side.
-    pub not_domain_patterns: Vec<Regex>,
-    pub not_domain_suffixes: Vec<String>,
-    pub not_domain_keywords: Vec<String>,
-    pub not_ip_nets: Vec<ipnet::IpNet>,
-    pub(crate) not_ip_trie: BinaryLpmTrie,
-    pub not_source_ip_nets: Vec<ipnet::IpNet>,
-    pub(crate) not_source_ip_trie: BinaryLpmTrie,
-    pub not_ports: Vec<PortRange>,
-    pub not_source_ports: Vec<PortRange>,
-    pub not_protocols: Vec<String>,
-    pub not_process_names: Vec<String>,
-    pub not_mac_addresses: Vec<String>,
-    pub(crate) not_geosite_domains: Vec<GeositeDomain>,
-    pub(crate) not_geosite_matcher: GeositeMatcher,
-    pub not_ip_versions: Vec<u8>,
-    pub not_dscp_values: Vec<u8>,
-    pub outbound: String,
-    /// When true, matching this rule sets must=true on the result, which
-    /// tells the control plane to skip TLS/HTTP sniffing.
-    pub must: bool,
-    pub mark: u32,
+    pub conditions: Vec<CompiledCondition>,
+    pub action: RouteAction,
+    /// The configured conditions as dae text, bounded; rendered once here so
+    /// every API projection shows the same spelling without touching matchers.
+    pub expression: String,
+    /// Source-spelled conditions in compiled order; never expanded GeoIP networks.
+    #[cfg(feature = "native-api")]
+    pub condition_expressions: Vec<String>,
 }
 
 impl CompiledRoute {
-    /// Whether the rule references any domain-class matcher (suffix, keyword,
-    /// geosite, regex; negated or not).  While any such rule exists, a
-    /// kernel routing decision made without the destination domain is not
-    /// final — userspace SNI sniffing could re-route the flow — so the
-    /// datapath's Rule-mode direct offload stays constrained.
+    /// Whether the rule references any domain-class matcher, positive or negated.
     pub fn has_domain_conditions(&self) -> bool {
-        !self.domain_suffixes.is_empty()
-            || !self.domain_keywords.is_empty()
-            || !self.geosite_domains.is_empty()
-            || !self.domain_patterns.is_empty()
-            || !self.not_domain_suffixes.is_empty()
-            || !self.not_domain_keywords.is_empty()
-            || !self.not_geosite_domains.is_empty()
-            || !self.not_domain_patterns.is_empty()
+        self.conditions
+            .iter()
+            .any(|condition| matches!(condition.predicate, CompiledPredicate::Domain(_)))
     }
 }
 
@@ -152,13 +127,21 @@ impl GeositeMatcher {
     }
 
     pub(crate) fn matches(&self, domain: &str) -> bool {
-        let lower = domain.to_lowercase();
-        if self.full.contains(lower.as_str()) {
+        self.matches_bounded::<false>(domain, &lowercase(domain), None)
+    }
+
+    fn matches_bounded<const BOUNDED: bool>(
+        &self,
+        domain: &str,
+        lower: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
+        if self.full.contains(lower) {
             return true;
         }
         // Dot-boundary suffix walk: check the host itself, then each parent.
         if !self.suffix.is_empty() {
-            let mut d = lower.as_str();
+            let mut d = lower;
             loop {
                 if self.suffix.contains(d) {
                     return true;
@@ -174,19 +157,141 @@ impl GeositeMatcher {
         {
             return true;
         }
-        self.regex.iter().any(|re| re.is_match(domain))
+        bounded_any::<BOUNDED, _>(&self.regex, deadline, |re| re.is_match(domain))
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PortRange {
-    pub start: u16,
-    pub end: u16,
+type DomainMatcherKey = Vec<(u8, String)>;
+
+/// One `domain(...)` call. Every entry, including expanded geosite codes, is
+/// an alternative: dae ORs the arguments of a single call.
+#[derive(Debug, Clone)]
+struct DomainMatcher {
+    patterns: Vec<Regex>,
+    suffixes: Vec<String>,
+    keywords: Vec<String>,
+    /// One matcher per configured selector, matched as their union.
+    geosite: Vec<Arc<GeositeMatcher>>,
 }
 
-impl PortRange {
-    pub fn contains(&self, port: u16) -> bool {
-        port >= self.start && port <= self.end
+impl DomainMatcher {
+    fn new(
+        domains: &[String],
+        suffixes: &[String],
+        keywords: &[String],
+        regexes: &[String],
+        geosite: &[GeositeDomain],
+        matchers: Vec<Arc<GeositeMatcher>>,
+    ) -> anyhow::Result<(DomainMatcherKey, Self)> {
+        let mut patterns = Vec::with_capacity(regexes.len() + domains.len());
+        for pattern in regexes {
+            patterns.push(
+                Regex::new(pattern)
+                    .map_err(|error| anyhow::anyhow!("Invalid regex '{}': {}", pattern, error))?,
+            );
+        }
+        for wildcard in domains {
+            patterns.push(
+                Regex::new(&glob_to_regex(wildcard)).map_err(|error| {
+                    anyhow::anyhow!("Invalid pattern '{}': {}", wildcard, error)
+                })?,
+            );
+        }
+        let mut key = patterns
+            .iter()
+            .map(|pattern| (0, pattern.as_str().to_owned()))
+            .chain(suffixes.iter().cloned().map(|value| (1, value)))
+            .chain(keywords.iter().cloned().map(|value| (2, value)))
+            .chain(geosite.iter().map(|domain| match domain {
+                GeositeDomain::Full(value) => (3, value.to_lowercase()),
+                GeositeDomain::Domain(value) => (4, value.to_lowercase()),
+                GeositeDomain::Keyword(value) => (5, value.clone()),
+                GeositeDomain::Regex(value) => (6, value.as_str().to_owned()),
+            }))
+            .collect::<Vec<_>>();
+        key.sort();
+        key.dedup();
+        Ok((
+            key,
+            Self {
+                patterns,
+                suffixes: suffixes.to_vec(),
+                keywords: keywords.to_vec(),
+                geosite: matchers,
+            },
+        ))
+    }
+
+    fn matches(&self, domain: &str) -> bool {
+        self.matches_bounded::<false>(domain, None)
+    }
+
+    fn matches_bounded<const BOUNDED: bool>(
+        &self,
+        domain: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
+        bounded_any::<BOUNDED, _>(&self.patterns, deadline, |pattern| pattern.is_match(domain))
+            || bounded_any::<BOUNDED, _>(&self.suffixes, deadline, |suffix| {
+                domain.ends_with(suffix)
+            })
+            || bounded_any::<BOUNDED, _>(&self.keywords, deadline, |keyword| {
+                domain.contains(keyword)
+            })
+            || (!self.geosite.is_empty() && {
+                let lower = lowercase(domain);
+                bounded_any::<BOUNDED, _>(&self.geosite, deadline, |matcher| {
+                    matcher.matches_bounded::<BOUNDED>(domain, &lower, deadline)
+                })
+            })
+    }
+}
+
+// The untimed production specialization has no clock reads or per-alternative budget branch.
+fn bounded_any<const BOUNDED: bool, T>(
+    values: &[T],
+    deadline: Option<std::time::Instant>,
+    mut matches: impl FnMut(&T) -> bool,
+) -> bool {
+    values
+        .iter()
+        .take_while(|_| !BOUNDED || deadline.is_some_and(|end| std::time::Instant::now() < end))
+        .any(&mut matches)
+}
+
+/// Geosite sets are stored lowercased; query names almost always already are.
+fn lowercase(domain: &str) -> std::borrow::Cow<'_, str> {
+    if domain
+        .bytes()
+        .any(|b| b.is_ascii_uppercase() || !b.is_ascii())
+    {
+        std::borrow::Cow::Owned(domain.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(domain)
+    }
+}
+
+/// Keys copy each matcher's whole expansion and are read only by interning and
+/// the policy fingerprint, so the built router keeps just `matchers`.
+#[derive(Debug, Default)]
+struct DomainRegistry {
+    keys: Vec<DomainMatcherKey>,
+    matchers: Vec<DomainMatcher>,
+}
+
+impl DomainRegistry {
+    fn intern(&mut self, (key, matcher): (DomainMatcherKey, DomainMatcher)) -> anyhow::Result<u32> {
+        if let Some(id) = self.keys.iter().position(|candidate| *candidate == key) {
+            return Ok(id as u32);
+        }
+        anyhow::ensure!(
+            self.matchers.len() < ROUTING_FACT_CAPACITY,
+            "routing policy has more than {ROUTING_FACT_CAPACITY} domain predicates"
+        );
+        let id = self.matchers.len() as u32;
+        self.keys.push(key);
+        self.matchers.push(matcher);
+        Ok(id)
     }
 }
 
@@ -201,6 +306,19 @@ pub struct ConnectionInfo {
     pub process_name: Option<String>,
     pub mac: Option<String>,
     pub dscp: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PredicateInput<'a> {
+    pub(crate) domain: Option<&'a str>,
+    pub(crate) dst_ip: Option<IpAddr>,
+    pub(crate) dst_port: Option<u16>,
+    pub(crate) src_ip: Option<IpAddr>,
+    pub(crate) src_port: Option<u16>,
+    pub(crate) protocol: &'a str,
+    pub(crate) process_name: Option<&'a str>,
+    pub(crate) mac: Option<&'a str>,
+    pub(crate) dscp: Option<u8>,
 }
 
 /// Human-readable connection identity for routing debug logs.
@@ -223,18 +341,23 @@ struct CompiledRoutes {
     routes: Arc<[CompiledRoute]>,
     geo_fingerprint: [u8; 32],
     geo_requirements: GeoRequirements,
+    #[cfg(feature = "native-api")]
+    geo_assets: Arc<[GeoAssetSnapshot]>,
 }
 
 impl CompiledRoutes {
     fn new(
         routes: Vec<CompiledRoute>,
         geo_fingerprint: [u8; 32],
+        #[cfg(feature = "native-api")] geo_assets: Vec<GeoAssetSnapshot>,
         geo_requirements: GeoRequirements,
     ) -> Self {
         Self {
             routes: routes.into(),
             geo_fingerprint,
             geo_requirements,
+            #[cfg(feature = "native-api")]
+            geo_assets: geo_assets.into(),
         }
     }
 }
@@ -243,7 +366,13 @@ impl From<Vec<CompiledRoute>> for CompiledRoutes {
     fn from(routes: Vec<CompiledRoute>) -> Self {
         let requirements = GeoRequirements::default();
         let sources = GeoSourceSet::load(&requirements);
-        Self::new(routes, sources.fingerprint(), requirements)
+        Self::new(
+            routes,
+            sources.fingerprint(),
+            #[cfg(feature = "native-api")]
+            Vec::new(),
+            requirements,
+        )
     }
 }
 
@@ -264,520 +393,388 @@ impl AsRef<[CompiledRoute]> for CompiledRoutes {
 #[derive(Debug, Clone)]
 pub struct Router {
     routes: CompiledRoutes,
-    default_outbound: Arc<str>,
+    fallback: RouteAction,
+    domain_matchers: Arc<[DomainMatcher]>,
+    direct_marks: Arc<[u32]>,
+    policy_fingerprint: [u8; 32],
 }
 
 impl Router {
-    pub fn new(rules: &[RoutingRule], default_outbound: &str) -> anyhow::Result<Self> {
-        let requirements = GeoRequirements::for_traffic(rules);
-        let sources = GeoSourceSet::load(&requirements);
-        Self::new_with_geo_sources(rules, default_outbound, &sources)
+    /// Ad-hoc rule set; its fallback carries no configured `must` or mark.
+    pub fn new(rules: &[RoutingRule], plain_fallback: &str) -> anyhow::Result<Self> {
+        let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(rules));
+        Self::build(
+            rules,
+            RouteAction {
+                outbound: plain_fallback.to_owned(),
+                must: false,
+                mark: None,
+                direct_mark_index: None,
+            },
+            &sources,
+            &mut SharedMatchers::default(),
+        )
     }
 
-    pub(crate) fn new_with_geo_sources(
-        rules: &[RoutingRule],
-        default_outbound: &str,
+    pub fn from_config(routing: &RoutingConfig) -> anyhow::Result<Self> {
+        let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(&routing.rules));
+        Self::from_config_with_geo_sources(routing, &sources)
+    }
+
+    pub(crate) fn from_config_with_geo_sources(
+        routing: &RoutingConfig,
         geo_sources: &GeoSourceSet,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_sharing(routing, geo_sources, &mut SharedMatchers::default())
+    }
+
+    /// Builds with matchers shared with the other router of the same build.
+    pub(crate) fn from_config_sharing(
+        routing: &RoutingConfig,
+        geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
+    ) -> anyhow::Result<Self> {
+        let fallback = RouteAction {
+            outbound: routing.default_outbound.clone(),
+            must: routing.default_must,
+            mark: DirectMark::new(routing.default_mark),
+            direct_mark_index: None,
+        };
+        Self::build(&routing.rules, fallback, geo_sources, shared)
+    }
+
+    fn build(
+        rules: &[RoutingRule],
+        mut fallback: RouteAction,
+        geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let requirements = GeoRequirements::for_traffic(rules);
         let assets = GeoAssets::from_sources(&requirements, geo_sources);
         let geo_fingerprint = geo_sources.fingerprint_for(&requirements);
-        let mut compiled = Vec::new();
-        for rule in rules {
-            let mut domain_patterns = Vec::new();
-            for pattern in &rule.condition.domain_regex {
-                domain_patterns.push(
-                    Regex::new(pattern)
-                        .map_err(|e| anyhow::anyhow!("Invalid regex '{}': {}", pattern, e))?,
-                );
-            }
-            for wildcard in &rule.condition.domain {
-                let regex_str = glob_to_regex(wildcard);
-                domain_patterns.push(
-                    Regex::new(&regex_str)
-                        .map_err(|e| anyhow::anyhow!("Invalid pattern '{}': {}", wildcard, e))?,
-                );
+        let mut registry = DomainRegistry::default();
+        let mut compiled = Vec::with_capacity(rules.len());
+
+        for (source_index, rule) in rules.iter().enumerate() {
+            let mut conditions = Vec::new();
+            for not in [false, true] {
+                append_conditions(&mut conditions, not, rule, &assets, &mut registry, shared)?;
             }
 
-            let mut ip_nets: Vec<ipnet::IpNet> = rule
-                .condition
-                .ip
-                .iter()
-                .filter_map(|c| parse_ip_net_str(c))
-                .collect();
-            ip_nets.extend(assets.geoip_nets(&rule.condition.geo_ip));
-
-            let source_ip_nets: Vec<ipnet::IpNet> = rule
-                .condition
-                .source_ip
-                .iter()
-                .filter_map(|c| parse_ip_net_str(c))
-                .collect();
-
-            let ports = parse_port_ranges(&rule.condition.port)?;
-            let source_ports = parse_port_ranges(&rule.condition.source_port)?;
-
-            let mac_addresses: Vec<String> = rule
-                .condition
-                .mac
-                .iter()
-                .filter_map(|m| normalize_mac(m))
-                .collect();
-
-            let geosite_domains = assets.geosite_domains(&rule.condition.geosite);
-            let geosite_matcher = GeositeMatcher::build(&geosite_domains);
-
-            let ip_versions: Vec<u8> = rule
-                .condition
-                .ip_version
-                .iter()
-                .filter_map(|s| parse_ip_version(s))
-                .collect();
-
-            let dscp_values: Vec<u8> = rule
-                .condition
-                .dscp
-                .iter()
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
-
-            let ip_trie = BinaryLpmTrie::from_nets(&ip_nets);
-            let source_ip_trie = BinaryLpmTrie::from_nets(&source_ip_nets);
-
-            let not = &rule.condition.not;
-            let mut not_domain_patterns = Vec::new();
-            for pattern in &not.domain_regex {
-                not_domain_patterns.push(
-                    Regex::new(pattern)
-                        .map_err(|e| anyhow::anyhow!("Invalid regex '{}': {}", pattern, e))?,
-                );
-            }
-            for wildcard in &not.domain {
-                let regex_str = glob_to_regex(wildcard);
-                not_domain_patterns.push(
-                    Regex::new(&regex_str)
-                        .map_err(|e| anyhow::anyhow!("Invalid pattern '{}': {}", wildcard, e))?,
-                );
-            }
-            let mut not_ip_nets: Vec<ipnet::IpNet> =
-                not.ip.iter().filter_map(|c| parse_ip_net_str(c)).collect();
-            not_ip_nets.extend(assets.geoip_nets(&not.geo_ip));
-            let not_source_ip_nets: Vec<ipnet::IpNet> = not
-                .source_ip
-                .iter()
-                .filter_map(|c| parse_ip_net_str(c))
-                .collect();
-            let not_ports = parse_port_ranges(&not.port)?;
-            let not_source_ports = parse_port_ranges(&not.source_port)?;
-            let not_mac_addresses: Vec<String> =
-                not.mac.iter().filter_map(|m| normalize_mac(m)).collect();
-            let not_geosite_domains = assets.geosite_domains(&not.geosite);
-            let not_geosite_matcher = GeositeMatcher::build(&not_geosite_domains);
-            let not_ip_versions: Vec<u8> = not
-                .ip_version
-                .iter()
-                .filter_map(|s| parse_ip_version(s))
-                .collect();
-            let not_dscp_values: Vec<u8> = not
-                .dscp
-                .iter()
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
-            let not_ip_trie = BinaryLpmTrie::from_nets(&not_ip_nets);
-            let not_source_ip_trie = BinaryLpmTrie::from_nets(&not_source_ip_nets);
-
-            let (outbound, outbound_must) = parse_outbound(rule.outbound.as_str());
-
+            let outbound = rule.outbound.as_str().to_owned();
             let (rule_type, rule_payload) = rule
                 .condition
                 .clash_rule_parts()
-                .map(|(t, p)| (t.to_string(), p))
-                .unwrap_or_else(|| ("Match".to_string(), String::new()));
-
+                .map(|(kind, payload)| (kind.to_owned(), payload))
+                .unwrap_or_else(|| ("Match".to_owned(), String::new()));
             compiled.push(CompiledRoute {
+                id: source_index as u32,
                 name: rule.name.clone(),
                 rule_type,
                 rule_payload,
                 priority: rule.priority,
-                domain_patterns,
-                domain_suffixes: rule.condition.domain_suffix.clone(),
-                domain_keywords: rule.condition.domain_keyword.clone(),
-                ip_nets,
-                ip_trie,
-                source_ip_nets,
-                source_ip_trie,
-                ports,
-                source_ports,
-                protocols: rule.condition.protocol.clone(),
-                process_names: rule
-                    .condition
-                    .process_name
-                    .iter()
-                    .map(|name| normalize_process_matcher(name))
-                    .collect(),
-                mac_addresses,
-                geosite_domains,
-                geosite_matcher,
-                ip_versions,
-                dscp_values,
-                not_domain_patterns,
-                not_domain_suffixes: not.domain_suffix.clone(),
-                not_domain_keywords: not.domain_keyword.clone(),
-                not_ip_nets,
-                not_ip_trie,
-                not_source_ip_nets,
-                not_source_ip_trie,
-                not_ports,
-                not_source_ports,
-                not_protocols: not.protocol.clone(),
-                not_process_names: not
-                    .process_name
-                    .iter()
-                    .map(|name| normalize_process_matcher(name))
-                    .collect(),
-
-                not_mac_addresses,
-                not_geosite_domains,
-                not_geosite_matcher,
-                not_ip_versions,
-                not_dscp_values,
-                outbound,
-                must: rule.must || outbound_must,
-                mark: rule.mark,
+                conditions,
+                action: RouteAction {
+                    outbound,
+                    must: rule.must,
+                    mark: DirectMark::new(rule.mark),
+                    direct_mark_index: None,
+                },
+                expression: String::new(),
+                #[cfg(feature = "native-api")]
+                condition_expressions: Vec::new(),
             });
         }
+        #[cfg(feature = "native-api")]
+        for route in &mut compiled {
+            route.condition_expressions = route
+                .conditions
+                .iter()
+                .map(|condition| {
+                    native::bounded_expression(native::condition_display(
+                        condition,
+                        &rules[route.id as usize].condition,
+                    ))
+                })
+                .collect();
+            route.expression = native::join_expressions(route.condition_expressions.iter());
+        }
 
-        compiled.sort_by_key(|r| r.priority);
+        // `sort_by_key` is stable, so equal priorities retain source order.
+        compiled.sort_by_key(|route| route.priority);
+        for (id, route) in compiled.iter_mut().enumerate() {
+            route.id = id as u32;
+        }
+        let mut direct_marks: Vec<u32> = compiled
+            .iter()
+            .map(|route| &route.action)
+            .chain(std::iter::once(&fallback))
+            .filter(|action| action.is_terminal_direct_mark())
+            .filter_map(|action| action.mark.map(DirectMark::get))
+            .collect();
+        direct_marks.sort_unstable();
+        direct_marks.dedup();
+        anyhow::ensure!(
+            direct_marks.len() <= 256,
+            "terminal direct mark capacity exceeded ({} > 256 distinct nonzero marks)",
+            direct_marks.len()
+        );
+        let index_for = |action: &mut RouteAction| {
+            if action.is_terminal_direct_mark() {
+                action.direct_mark_index = Some(
+                    direct_marks
+                        .binary_search(&action.mark.unwrap().get())
+                        .unwrap() as u8,
+                );
+            }
+        };
+        for route in &mut compiled {
+            index_for(&mut route.action);
+        }
+        index_for(&mut fallback);
 
-        let (default_outbound, _default_must) = parse_outbound(default_outbound);
-
+        let policy_fingerprint =
+            fingerprint::policy(&compiled, &registry.keys, &fallback, geo_fingerprint);
         Ok(Self {
-            routes: CompiledRoutes::new(compiled, geo_fingerprint, requirements),
-            default_outbound: default_outbound.into(),
+            routes: CompiledRoutes::new(
+                compiled,
+                geo_fingerprint,
+                #[cfg(feature = "native-api")]
+                geo_sources.snapshots(&requirements),
+                requirements,
+            ),
+            fallback,
+            domain_matchers: registry.matchers.into(),
+            direct_marks: direct_marks.into(),
+            policy_fingerprint,
         })
     }
 
-    pub fn default_outbound(&self) -> &str {
-        self.default_outbound.as_ref()
+    pub fn fallback(&self) -> &RouteAction {
+        &self.fallback
+    }
+
+    /// Resolve a terminal direct packet's mark index in this immutable generation.
+    pub fn direct_mark(&self, index: u8) -> Option<u32> {
+        self.direct_marks.get(usize::from(index)).copied()
+    }
+
+    pub fn has_direct_marks(&self) -> bool {
+        self.fallback.outbound == "direct" && self.fallback.mark.is_some()
+            || self
+                .routes
+                .iter()
+                .any(|route| route.action.outbound == "direct" && route.action.mark.is_some())
+    }
+
+    /// Whether any rule has a `pname()` condition, positive or negated.
+    pub(crate) fn uses_process_name(&self) -> bool {
+        self.routes.iter().any(|route| {
+            route
+                .conditions
+                .iter()
+                .any(|condition| matches!(condition.predicate, CompiledPredicate::ProcessName(_)))
+        })
     }
 
     pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
         self.routes.geo_fingerprint
     }
 
+    #[cfg(feature = "native-api")]
+    pub(crate) fn geo_assets(&self) -> &[GeoAssetSnapshot] {
+        &self.routes.geo_assets
+    }
+
     pub(crate) fn geo_requirements(&self) -> &GeoRequirements {
         &self.routes.geo_requirements
     }
 
+    pub fn policy_fingerprint(&self) -> [u8; 32] {
+        self.policy_fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn geosite_matchers(&self) -> Vec<&Arc<GeositeMatcher>> {
+        self.domain_matchers
+            .iter()
+            .flat_map(|matcher| &matcher.geosite)
+            .collect()
+    }
+
+    pub fn domain_predicate_count(&self) -> usize {
+        self.domain_matchers.len()
+    }
+
+    pub fn domain_bitmap(&self, domain: &str) -> Option<DomainRouting> {
+        if self.domain_matchers.is_empty() {
+            return None;
+        }
+        let mut bitmap = DomainRouting::default();
+        for (id, matcher) in self.domain_matchers.iter().enumerate() {
+            if matcher.matches(domain) {
+                bitmap.bitmap[id / 32] |= 1 << (id % 32);
+            }
+        }
+        Some(bitmap)
+    }
+
     pub fn route(&self, conn: &ConnectionInfo) -> &str {
+        let (action, matched) = self.route_action(conn);
+        if matched.is_none() {
+            tracing::debug!(
+                "Connection {} → default outbound '{}'",
+                conn_log_id(conn),
+                action.outbound
+            );
+        }
+        &action.outbound
+    }
+
+    /// First matching rule's action, else the configured fallback action.
+    pub fn route_action<'a>(
+        &'a self,
+        conn: &ConnectionInfo,
+    ) -> (&'a RouteAction, Option<RouteMatch<'a>>) {
         match self.route_full(conn) {
-            Some(r) => r.outbound_name,
-            None => {
-                tracing::debug!(
-                    "Connection {} → default outbound '{}'",
-                    conn_log_id(conn),
-                    self.default_outbound
-                );
-                self.default_outbound.as_ref()
-            }
+            Some(hit) => (hit.action, Some(hit)),
+            None => (self.fallback(), None),
         }
     }
 
-    /// Route and report whether the decision came from a `(must)` rule.
-    /// The default-outbound fallback never carries `must`.
-    pub fn route_with_must(&self, conn: &ConnectionInfo) -> (&str, bool) {
-        match self.route_full(conn) {
-            Some(r) => (r.outbound_name, r.must),
-            None => (self.default_outbound(), false),
-        }
-    }
-
-    /// Route with full metadata. Returns `None` if no rule matched (caller
-    /// should use default outbound). A `(must)` rule is terminal and tells
-    /// the control plane to skip TLS/HTTP sniffing.
     pub fn route_full<'a>(&'a self, conn: &ConnectionInfo) -> Option<RouteMatch<'a>> {
-        for route in self.routes.iter() {
-            if self.match_route(route, conn) {
-                tracing::debug!(
-                    "Connection {} matched rule '{}' → '{}' (must={}, mark={})",
-                    conn_log_id(conn),
-                    route.name,
-                    route.outbound,
-                    route.must,
-                    route.mark
-                );
-                return Some(RouteMatch {
-                    outbound_name: &route.outbound,
-                    rule_name: &route.name,
-                    rule_type: &route.rule_type,
-                    rule_payload: &route.rule_payload,
-                    must: route.must,
-                    mark: route.mark,
-                });
-            }
-        }
-
-        None
+        self.route_full_with_domain_bitmap(conn, None)
     }
 
-    /// Domain-only lookup used by DNS snooping / DOMAIN_ROUTING_MAP updates.
-    ///
-    /// Only rules that carry a domain / geosite condition are considered.
-    /// Pure IP/port/process/mac rules are skipped so an unspecified
-    /// `0.0.0.0:0` probe cannot spuriously match `dip(geoip:…)` or
-    /// `dport(…)` and produce a misleading "Connection 0.0.0.0:0 → …" log.
-    ///
-    /// Returns `None` when no domain rule matches — the real connection will
-    /// re-evaluate with a full 5-tuple (and must not receive a DOMAIN_ROUTING
-    /// fast-path entry for this domain).
-    pub fn route_domain<'a>(&'a self, domain: &str) -> Option<RouteMatch<'a>> {
-        let conn = ConnectionInfo {
-            domain: Some(domain.to_string()),
-            // Unspecified 5-tuple: domain/geosite conditions still match;
-            // IP/port/process conditions fail closed (see match_route).
-            dst_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            dst_port: 0,
-            src_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            src_port: 0,
-            // Domain rules rarely pin l4proto; "tcp" is the common case and
-            // does not affect pure domain/geosite matches.
-            protocol: "tcp",
-            process_name: None,
-            mac: None,
-            dscp: None,
+    pub fn route_full_with_domain_bitmap<'a>(
+        &'a self,
+        conn: &ConnectionInfo,
+        domain_bitmap: Option<&DomainRouting>,
+    ) -> Option<RouteMatch<'a>> {
+        self.route_full_with_observer(conn, domain_bitmap, |_, _, _| {})
+    }
+
+    #[inline]
+    fn route_full_with_observer<'a>(
+        &'a self,
+        conn: &ConnectionInfo,
+        domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, Option<usize>, bool),
+    ) -> Option<RouteMatch<'a>> {
+        self.routes.iter().enumerate().find_map(|(index, route)| {
+            let matched = self.matches_route(route, conn, domain_bitmap, |condition, matched| {
+                observe(index, Some(condition), matched);
+            });
+            observe(index, None, matched);
+            if !matched {
+                return None;
+            }
+            tracing::debug!(
+                "Connection {} matched rule '{}' → '{}' (must={}, mark={})",
+                conn_log_id(conn),
+                route.name,
+                route.action.outbound,
+                route.action.must,
+                route.action.mark.map_or(0, DirectMark::get)
+            );
+            Some(RouteMatch {
+                rule_id: route.id,
+                action: &route.action,
+                rule_name: &route.name,
+                rule_type: &route.rule_type,
+                rule_payload: &route.rule_payload,
+            })
+        })
+    }
+
+    fn matches_route(
+        &self,
+        route: &CompiledRoute,
+        conn: &ConnectionInfo,
+        domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, bool),
+    ) -> bool {
+        let input = PredicateInput {
+            domain: conn.domain.as_deref(),
+            dst_ip: Some(conn.dst_ip),
+            dst_port: Some(conn.dst_port),
+            src_ip: Some(conn.src_ip),
+            src_port: Some(conn.src_port),
+            protocol: conn.protocol,
+            process_name: conn.process_name.as_deref(),
+            mac: conn.mac.as_deref(),
+            dscp: conn.dscp,
         };
-
-        for route in self.routes.iter() {
-            if !route_has_domain_condition(route) {
-                continue;
-            }
-            if self.match_route(route, &conn) {
-                tracing::debug!(
-                    "Domain '{}' matched rule '{}' → '{}' (must={}, mark={})",
-                    domain,
-                    route.name,
-                    route.outbound,
-                    route.must,
-                    route.mark
-                );
-                return Some(RouteMatch {
-                    outbound_name: &route.outbound,
-                    rule_name: &route.name,
-                    rule_type: &route.rule_type,
-                    rule_payload: &route.rule_payload,
-                    must: route.must,
-                    mark: route.mark,
-                });
-            }
-        }
-
-        tracing::trace!(
-            "Domain '{}' matched no domain rule (defer to connection-time routing; default would be '{}')",
-            domain,
-            self.default_outbound
-        );
-        None
-    }
-
-    /// Check if a connection matches a compiled route (all groups AND, within-group OR).
-    fn match_route(&self, route: &CompiledRoute, conn: &ConnectionInfo) -> bool {
-        let has_conditions = !route.domain_patterns.is_empty()
-            || !route.domain_suffixes.is_empty()
-            || !route.domain_keywords.is_empty()
-            || !route.ip_nets.is_empty()
-            || !route.source_ip_nets.is_empty()
-            || !route.ports.is_empty()
-            || !route.source_ports.is_empty()
-            || !route.protocols.is_empty()
-            || !route.process_names.is_empty()
-            || !route.mac_addresses.is_empty()
-            || !route.geosite_domains.is_empty()
-            || !route.ip_versions.is_empty()
-            || !route.dscp_values.is_empty()
-            || Self::has_negated_conditions(route);
-        if !has_conditions {
-            return false;
-        }
-
-        if !route.domain_patterns.is_empty()
-            || !route.domain_suffixes.is_empty()
-            || !route.domain_keywords.is_empty()
-        {
-            match conn.domain {
-                Some(ref domain) => {
-                    let dm = route.domain_patterns.iter().any(|re| re.is_match(domain))
-                        || route.domain_suffixes.iter().any(|s| domain.ends_with(s))
-                        || route.domain_keywords.iter().any(|k| domain.contains(k));
-                    if !dm {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
-        // IP matching (uses pre-built LPM trie for O(key_bits) lookup)
-        if !route.ip_nets.is_empty() && !route.ip_trie.matches(&conn.dst_ip) {
-            return false;
-        }
-
-        // Source IP matching (uses pre-built LPM trie)
-        if !route.source_ip_nets.is_empty() && !route.source_ip_trie.matches(&conn.src_ip) {
-            return false;
-        }
-
-        if !route.ports.is_empty() && !route.ports.iter().any(|r| r.contains(conn.dst_port)) {
-            return false;
-        }
-
-        if !route.source_ports.is_empty()
-            && !route.source_ports.iter().any(|r| r.contains(conn.src_port))
-        {
-            return false;
-        }
-
-        if !route.protocols.is_empty()
-            && !route
-                .protocols
+        !route.conditions.is_empty()
+            && route
+                .conditions
                 .iter()
-                .any(|p| p.eq_ignore_ascii_case(conn.protocol))
-        {
-            return false;
-        }
-
-        if !route.process_names.is_empty() {
-            match conn.process_name {
-                Some(ref proc) => {
-                    if !route.process_names.iter().any(|p| proc.contains(p)) {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
-        if !route.mac_addresses.is_empty() {
-            match conn.mac {
-                Some(ref mac) => match normalize_mac(mac) {
-                    Some(ref canonical) if route.mac_addresses.contains(canonical) => {}
-                    _ => return false,
-                },
-                None => return false,
-            }
-        }
-
-        if !route.geosite_domains.is_empty() {
-            match conn.domain {
-                Some(ref domain) => {
-                    if !route.geosite_matcher.matches(domain) {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
-        if !route.ip_versions.is_empty() {
-            let version = if conn.dst_ip.is_ipv4() { 4 } else { 6 };
-            if !route.ip_versions.contains(&version) {
-                return false;
-            }
-        }
-
-        if !route.dscp_values.is_empty() {
-            match conn.dscp {
-                Some(dscp) => {
-                    if !route.dscp_values.contains(&dscp) {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
-        !Self::negated_hit(route, conn)
+                .enumerate()
+                .all(|(index, condition)| {
+                    // Production absence is a miss before negation; simulations retain unknown.
+                    let matched = self
+                        .evaluate_predicate::<false>(
+                            &condition.predicate,
+                            input,
+                            domain_bitmap,
+                            None,
+                        )
+                        .unwrap_or(false);
+                    let matched = if condition.not { !matched } else { matched };
+                    observe(index, matched);
+                    matched
+                })
     }
 
-    fn has_negated_conditions(route: &CompiledRoute) -> bool {
-        !route.not_domain_patterns.is_empty()
-            || !route.not_domain_suffixes.is_empty()
-            || !route.not_domain_keywords.is_empty()
-            || !route.not_ip_nets.is_empty()
-            || !route.not_source_ip_nets.is_empty()
-            || !route.not_ports.is_empty()
-            || !route.not_source_ports.is_empty()
-            || !route.not_protocols.is_empty()
-            || !route.not_process_names.is_empty()
-            || !route.not_mac_addresses.is_empty()
-            || !route.not_geosite_domains.is_empty()
-            || !route.not_ip_versions.is_empty()
-            || !route.not_dscp_values.is_empty()
-    }
-
-    /// True when any negated matcher hits and therefore vetoes the rule.
-    /// An absent domain cannot prove a negated domain/geosite matcher, so it
-    /// never vetoes — "cannot prove it is x" counts as "is not x" (dae).
-    fn negated_hit(route: &CompiledRoute, conn: &ConnectionInfo) -> bool {
-        if let Some(ref domain) = conn.domain
-            && (route
-                .not_domain_patterns
-                .iter()
-                .any(|re| re.is_match(domain))
-                || route
-                    .not_domain_suffixes
-                    .iter()
-                    .any(|s| domain.ends_with(s))
-                || route.not_domain_keywords.iter().any(|k| domain.contains(k))
-                || route.not_geosite_matcher.matches(domain))
-        {
-            return true;
-        }
-        if !route.not_ip_nets.is_empty() && route.not_ip_trie.matches(&conn.dst_ip) {
-            return true;
-        }
-        if !route.not_source_ip_nets.is_empty() && route.not_source_ip_trie.matches(&conn.src_ip) {
-            return true;
-        }
-        if route.not_ports.iter().any(|r| r.contains(conn.dst_port)) {
-            return true;
-        }
-        if route
-            .not_source_ports
-            .iter()
-            .any(|r| r.contains(conn.src_port))
-        {
-            return true;
-        }
-        if route
-            .not_protocols
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(conn.protocol))
-        {
-            return true;
-        }
-        if let Some(ref proc) = conn.process_name
-            && route.not_process_names.iter().any(|p| proc.contains(p))
-        {
-            return true;
-        }
-        if let Some(ref mac) = conn.mac
-            && let Some(canonical) = normalize_mac(mac)
-            && route.not_mac_addresses.contains(&canonical)
-        {
-            return true;
-        }
-        if !route.not_ip_versions.is_empty() {
-            let version = if conn.dst_ip.is_ipv4() { 4 } else { 6 };
-            if route.not_ip_versions.contains(&version) {
-                return true;
+    fn evaluate_predicate<const BOUNDED: bool>(
+        &self,
+        predicate: &CompiledPredicate,
+        input: PredicateInput<'_>,
+        domain_bitmap: Option<&DomainRouting>,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<bool> {
+        match predicate {
+            CompiledPredicate::Domain(id) => domain_bitmap
+                .map(|bitmap| {
+                    let id = *id as usize;
+                    id < ROUTING_FACT_CAPACITY && bitmap.bitmap[id / 32] & (1 << (id % 32)) != 0
+                })
+                .or_else(|| {
+                    input.domain.map(|domain| {
+                        self.domain_matchers
+                            .get(*id as usize)
+                            .is_some_and(|matcher| {
+                                matcher.matches_bounded::<BOUNDED>(domain, deadline)
+                            })
+                    })
+                }),
+            CompiledPredicate::DestinationIp(matcher) => {
+                input.dst_ip.map(|ip| matcher.matches(&ip))
             }
+            CompiledPredicate::SourceIp(matcher) => input.src_ip.map(|ip| matcher.matches(&ip)),
+            CompiledPredicate::DestinationPort(ranges) => input.dst_port.map(|port| {
+                bounded_any::<BOUNDED, _>(ranges, deadline, |range| range.contains(port))
+            }),
+            CompiledPredicate::SourcePort(ranges) => input.src_port.map(|port| {
+                bounded_any::<BOUNDED, _>(ranges, deadline, |range| range.contains(port))
+            }),
+            CompiledPredicate::Protocol(mask) => Some(protocol_value(input.protocol) & *mask != 0),
+            CompiledPredicate::IpVersion(mask) => input.dst_ip.map(|ip| {
+                let version = if ip.is_ipv4() { 1 } else { 2 };
+                *mask & version != 0
+            }),
+            CompiledPredicate::Dscp(values) => input
+                .dscp
+                .map(|dscp| bounded_any::<BOUNDED, _>(values, deadline, |value| *value == dscp)),
+            CompiledPredicate::ProcessName(patterns) => input.process_name.map(|name| {
+                bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| name.contains(pattern))
+            }),
+            CompiledPredicate::Mac(macs) => input.mac.map(|mac| {
+                normalize_mac_bytes(mac).is_some_and(|mac| {
+                    bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)
+                })
+            }),
         }
-        if let Some(dscp) = conn.dscp
-            && route.not_dscp_values.contains(&dscp)
-        {
-            return true;
-        }
-        false
     }
 
     pub fn route_count(&self) -> usize {
@@ -787,26 +784,196 @@ impl Router {
     pub fn compiled_routes(&self) -> &[CompiledRoute] {
         self.routes.as_ref()
     }
+
+    pub(crate) fn ip_matchers(&self) -> impl Iterator<Item = &Arc<IpMatcher>> {
+        self.compiled_routes()
+            .iter()
+            .flat_map(|route| &route.conditions)
+            .filter_map(|condition| match &condition.predicate {
+                CompiledPredicate::DestinationIp(matcher)
+                | CompiledPredicate::SourceIp(matcher) => Some(matcher),
+                _ => None,
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RouteMatch<'a> {
-    pub outbound_name: &'a str,
+    pub rule_id: u32,
+    pub action: &'a RouteAction,
     pub rule_name: &'a str,
-    /// Clash-style matched-rule type and payload.
     pub rule_type: &'a str,
     pub rule_payload: &'a str,
-    pub must: bool,
-    pub mark: u32,
 }
 
-/// True when the compiled rule can match on domain identity alone
-/// (suffix / keyword / regex / geosite). Used by [`Router::route_domain`].
-fn route_has_domain_condition(route: &CompiledRoute) -> bool {
-    !route.domain_patterns.is_empty()
-        || !route.domain_suffixes.is_empty()
-        || !route.domain_keywords.is_empty()
-        || !route.geosite_domains.is_empty()
+fn append_conditions(
+    conditions: &mut Vec<CompiledCondition>,
+    not: bool,
+    rule: &RoutingRule,
+    assets: &GeoAssets,
+    registry: &mut DomainRegistry,
+    shared: &mut SharedMatchers,
+) -> anyhow::Result<()> {
+    macro_rules! field {
+        ($name:ident) => {
+            if not {
+                &rule.condition.not.$name
+            } else {
+                &rule.condition.$name
+            }
+        };
+    }
+    let domains = field!(domain);
+    let domain_suffixes = field!(domain_suffix);
+    let domain_keywords = field!(domain_keyword);
+    let domain_regex = field!(domain_regex);
+    let ips = field!(ip);
+    let source_ips = field!(source_ip);
+    let ports = field!(port);
+    let source_ports = field!(source_port);
+    let protocols = field!(protocol);
+    let process_names = field!(process_name);
+    let macs = field!(mac);
+    let geo_ips = field!(geo_ip);
+    let geosites = field!(geosite);
+    let ip_versions = field!(ip_version);
+    let dscps = field!(dscp);
+    if !domains.is_empty()
+        || !domain_suffixes.is_empty()
+        || !domain_keywords.is_empty()
+        || !domain_regex.is_empty()
+        || !geosites.is_empty()
+    {
+        let (mut geosite_domains, mut matchers) = (Vec::new(), Vec::new());
+        for code in geosites {
+            let selected = assets.geosite_domains(std::slice::from_ref(code));
+            matchers.push(shared.geosite(code, &selected));
+            geosite_domains.extend(selected);
+        }
+        let id = registry.intern(DomainMatcher::new(
+            domains,
+            domain_suffixes,
+            domain_keywords,
+            domain_regex,
+            &geosite_domains,
+            matchers,
+        )?)?;
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::Domain(id),
+        });
+    }
+    if !ips.is_empty() || !geo_ips.is_empty() {
+        let mut nets: Vec<_> = ips
+            .iter()
+            .filter_map(|value| parse_ip_net_str(value))
+            .collect();
+        nets.extend(assets.geoip_nets(geo_ips));
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::DestinationIp(shared.ip(nets)),
+        });
+    }
+    if !source_ips.is_empty() {
+        let nets = source_ips
+            .iter()
+            .filter_map(|value| parse_ip_net_str(value))
+            .collect();
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::SourceIp(shared.ip(nets)),
+        });
+    }
+    if !ports.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::DestinationPort(parse_port_ranges(ports)?),
+        });
+    }
+    if !source_ports.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::SourcePort(parse_port_ranges(source_ports)?),
+        });
+    }
+    if !protocols.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::Protocol(protocol_mask(protocols)),
+        });
+    }
+    if !process_names.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::ProcessName(
+                process_names
+                    .iter()
+                    .map(|name| normalize_process_matcher(name))
+                    .collect(),
+            ),
+        });
+    }
+    if !macs.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::Mac(
+                macs.iter()
+                    .filter_map(|mac| normalize_mac_bytes(mac))
+                    .collect(),
+            ),
+        });
+    }
+    if !ip_versions.is_empty() {
+        let mask = ip_versions
+            .iter()
+            .filter_map(|value| parse_ip_version(value))
+            .fold(0, |mask, version| mask | if version == 4 { 1 } else { 2 });
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::IpVersion(mask),
+        });
+    }
+    if !dscps.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::Dscp(
+                dscps
+                    .iter()
+                    .filter_map(|value| {
+                        let value = value.trim();
+                        value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                            .map_or_else(|| value.parse(), |hex| u8::from_str_radix(hex, 16))
+                            .ok()
+                    })
+                    .collect(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn protocol_mask(protocols: &[String]) -> u8 {
+    protocols.iter().fold(0, |mask, protocol| {
+        mask | if protocol.eq_ignore_ascii_case("tcp") {
+            1
+        } else if protocol.eq_ignore_ascii_case("udp") {
+            2
+        } else {
+            0
+        }
+    })
+}
+
+fn protocol_value(protocol: &str) -> u8 {
+    if protocol.eq_ignore_ascii_case("tcp") {
+        1
+    } else if protocol.eq_ignore_ascii_case("udp") {
+        2
+    } else {
+        0
+    }
 }
 
 /// Normalize MAC to canonical `aa:bb:cc:dd:ee:ff` form.
@@ -832,13 +999,13 @@ fn normalize_mac(s: &str) -> Option<String> {
     )
 }
 
-/// Strip `(must)` suffix from outbound name, returning (name, must_flag).
-fn parse_outbound(outbound: &str) -> (String, bool) {
-    if let Some(stripped) = outbound.strip_suffix("(must)") {
-        (stripped.to_string(), true)
-    } else {
-        (outbound.to_string(), false)
+fn normalize_mac_bytes(s: &str) -> Option<[u8; 6]> {
+    let canonical = normalize_mac(s)?;
+    let mut bytes = [0_u8; 6];
+    for (index, value) in canonical.split(':').enumerate() {
+        bytes[index] = u8::from_str_radix(value, 16).ok()?;
     }
+    Some(bytes)
 }
 
 fn parse_ip_version(s: &str) -> Option<u8> {
@@ -849,19 +1016,9 @@ fn parse_ip_version(s: &str) -> Option<u8> {
     }
 }
 
-/// Parse a dae `dip`/`sip` argument into an `IpNet`. `ipnet`'s `FromStr`
-/// rejects bare addresses, but dae configs write them freely — a bare IP is
-/// a host route (/32 or /128). Silently dropping it would silently drop the
-/// whole matcher.
+/// Decode a dae IP host or CIDR using the shared configuration conversion.
 pub(crate) fn parse_ip_net_str(s: &str) -> Option<ipnet::IpNet> {
-    let trimmed = s.trim();
-    if trimmed.contains('/') {
-        return trimmed.parse().ok();
-    }
-    if trimmed.contains(':') {
-        return format!("{trimmed}/128").parse().ok();
-    }
-    format!("{trimmed}/32").parse().ok()
+    honk_config::dns::decode_ip_or_cidr(s).map(|decoded| decoded.network)
 }
 
 fn parse_port_ranges(ports: &[String]) -> anyhow::Result<Vec<PortRange>> {
@@ -906,3 +1063,6 @@ fn glob_to_regex(pattern: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod golden;

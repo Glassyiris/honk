@@ -1,16 +1,76 @@
-use serde::de::Error as _;
-use serde::ser::SerializeStruct as _;
+use serde::de::{DeserializeSeed, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::validation::{ValidationFailure, semantic_error};
+use super::xhttp::deserialize_xhttp;
+use crate::diagnostic::{
+    DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, SourceRef,
+    report_detailed_diagnostics,
+};
+use crate::options::vocab::{coalesce_equal, optional_flow, packet_network};
 use crate::types::NodeProtocol;
 
 use super::{
     AnyTlsConfig, Hysteria2Config, JuicityConfig, Node, OutboundConfig, QuicOptions,
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
-    VlessConfig, VmessConfig, WireMode,
+    VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RawVlessMode {
+    #[default]
+    Missing,
+    Null,
+    Legacy,
+    Incompatible,
+}
+
+impl<'de> Deserialize<'de> for RawVlessMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'value> serde::de::Visitor<'value> for Visitor {
+            type Value = RawVlessMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy VLESS mode string or null")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "legacy" => Ok(RawVlessMode::Legacy),
+                    "auto" | "native" | "uot-v2" | "h2mux" | "h2mux-padded" | "xudp"
+                    | "mux-cool" => Ok(RawVlessMode::Incompatible),
+                    _ => Err(E::unknown_variant(
+                        value,
+                        &[
+                            "legacy",
+                            "auto",
+                            "native",
+                            "uot-v2",
+                            "h2mux",
+                            "h2mux-padded",
+                            "xudp",
+                            "mux-cool",
+                        ],
+                    )),
+                }
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawVlessMode::Null)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawVlessMode::Null)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FlatNode {
     #[serde(default)]
     id: uuid::Uuid,
@@ -27,17 +87,25 @@ struct FlatNode {
     #[serde(default)]
     encryption: Option<String>,
     #[serde(default)]
-    vless_mode: WireMode,
+    vless_mode: RawVlessMode,
+    #[serde(default)]
+    packet_encoding: Option<VlessUdpEncoding>,
+    #[serde(default)]
+    multiplex: Option<VlessMultiplex>,
     #[serde(default)]
     plugin: Option<String>,
     #[serde(default)]
     plugin_opts: Option<String>,
     #[serde(default = "super::default_transport")]
     transport: String,
+    #[serde(default, deserialize_with = "deserialize_xhttp")]
+    xhttp: Option<super::XhttpOptions>,
     #[serde(default)]
     tls: bool,
     #[serde(default)]
     sni: Option<String>,
+    #[serde(default)]
+    tls_alpn: Vec<String>,
     #[serde(default)]
     skip_cert_verify: bool,
     #[serde(default)]
@@ -123,7 +191,61 @@ struct FlatNode {
 }
 
 impl FlatNode {
-    fn strip_protocol_incompatible_fields(&mut self) {
+    fn resolve_credential_aliases(&mut self) -> Result<(), ValidationFailure> {
+        fn resolve(
+            field: &'static str,
+            dedicated: Option<String>,
+            generic: Option<String>,
+        ) -> Result<Option<String>, ValidationFailure> {
+            coalesce_equal(
+                [Ok(dedicated), Ok(generic)],
+                "credential aliases must agree",
+            )
+            .map_err(|message| ValidationFailure::new(Some(field), message))
+        }
+
+        match self.protocol {
+            NodeProtocol::Hysteria2 => {
+                self.hy2_auth = resolve("hy2_auth", self.hy2_auth.take(), self.password.take())?;
+            }
+            NodeProtocol::Tuic => {
+                self.tuic_uuid = resolve("tuic_uuid", self.tuic_uuid.take(), self.username.take())?;
+                self.tuic_password = resolve(
+                    "tuic_password",
+                    self.tuic_password.take(),
+                    self.password.take(),
+                )?;
+            }
+            NodeProtocol::Juicity => {
+                self.juicity_uuid = resolve(
+                    "juicity_uuid",
+                    self.juicity_uuid.take(),
+                    self.username.take(),
+                )?;
+                self.juicity_password = resolve(
+                    "juicity_password",
+                    self.juicity_password.take(),
+                    self.password.take(),
+                )?;
+            }
+            NodeProtocol::AnyTLS => {
+                self.anytls_password = resolve(
+                    "anytls_password",
+                    self.anytls_password.take(),
+                    self.password.take(),
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn strip_protocol_incompatible_fields(
+        &mut self,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        source: &SourceRef,
+        setting: &SettingPath,
+    ) {
         let stream = matches!(
             self.protocol,
             NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
@@ -211,8 +333,22 @@ impl FlatNode {
             encryption
         );
         strip!(
-            self.vless_mode != WireMode::Legacy && self.protocol != NodeProtocol::VLess,
+            self.vless_mode == RawVlessMode::Incompatible && self.protocol != NodeProtocol::VLess,
             vless_mode
+        );
+        strip!(
+            self.protocol != NodeProtocol::VLess
+                && self
+                    .packet_encoding
+                    .is_some_and(|encoding| encoding != VlessUdpEncoding::Auto),
+            packet_encoding
+        );
+        strip!(
+            self.protocol != NodeProtocol::VLess
+                && self
+                    .multiplex
+                    .is_some_and(|multiplex| multiplex != VlessMultiplex::Off),
+            multiplex
         );
         strip!(
             self.plugin.is_some() && self.protocol != NodeProtocol::SS,
@@ -324,23 +460,17 @@ impl FlatNode {
         );
 
         if !dropped.is_empty() {
-            if let Some(credential) = unused_username_credential {
-                tracing::warn!(
-                    node = %self.name,
-                    protocol = %self.protocol.as_str(),
-                    fields = %dropped.join(", "),
-                    "credential field '{}' is empty; 'username' is not used by {}",
-                    credential,
-                    self.protocol.as_str()
-                );
-            } else {
-                tracing::warn!(
-                    node = %self.name,
-                    protocol = %self.protocol.as_str(),
-                    fields = %dropped.join(", "),
+            diagnostics.push(DetailedDiagnostic::warning(
+                "incompatible-node-fields",
+                source.clone(),
+                setting.clone(),
+                SafeValue::Fields(dropped),
+                if unused_username_credential.is_some() {
+                    "credential field is empty; username is not used by this protocol"
+                } else {
                     "ignoring protocol-incompatible fields"
-                );
-            }
+                },
+            ));
         }
     }
 
@@ -356,6 +486,7 @@ impl FlatNode {
             reality_short_id: self.reality_short_id.take(),
             reality_spider_x: self.reality_spider_x.take(),
             pin_sha256: self.tls_pin_sha256.take(),
+            alpn: std::mem::take(&mut self.tls_alpn),
         }
     }
 
@@ -365,15 +496,82 @@ impl FlatNode {
             ws_path: self.ws_path.take(),
             ws_host: self.ws_host.take(),
             grpc_service: self.grpc_service.take(),
+            xhttp: self.xhttp.take(),
         }
     }
 }
 
-impl TryFrom<FlatNode> for Node {
-    type Error = crate::ConfigError;
-
-    fn try_from(mut flat: FlatNode) -> Result<Self, Self::Error> {
-        flat.strip_protocol_incompatible_fields();
+impl FlatNode {
+    fn into_node(
+        mut self,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        source: &SourceRef,
+        setting: &SettingPath,
+    ) -> Result<Node, crate::error::DetailedConfigError> {
+        self.resolve_credential_aliases()
+            .map_err(|error| error.into_detailed(source.clone(), setting.clone()))?;
+        if self.protocol == NodeProtocol::VLess && self.vless_mode != RawVlessMode::Missing {
+            return Err(crate::error::DetailedConfigError::new(
+                crate::error::ErrorCategory::Validation,
+                "removed-vless-mode",
+                source.clone(),
+                setting.clone().field("vless_mode"),
+                "VLESS vless_mode was removed; use packet_encoding and multiplex",
+            ));
+        }
+        if (self.xhttp.is_some()
+            || crate::options::vocab::xhttp_stream_transport(&self.transport) == Ok("xhttp"))
+            && !matches!(
+                self.protocol,
+                NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
+            )
+        {
+            return Err(semantic_error(
+                source,
+                setting.clone().field("xhttp"),
+                "XHTTP options require a stream protocol",
+            ));
+        }
+        self.strip_protocol_incompatible_fields(diagnostics, source, setting);
+        if self.protocol == NodeProtocol::VMess {
+            self.encryption = crate::options::vocab::vmess_cipher(self.encryption.as_deref())
+                .map_err(|_| {
+                    semantic_error(
+                        source,
+                        setting.clone().field("encryption"),
+                        "VMess cipher must be auto or aes-128-gcm; aliases must agree",
+                    )
+                })?
+                .map(str::to_owned);
+        }
+        if let Some(value) = self.network.as_deref()
+            && packet_network(value)
+                .map_err(|_| {
+                    semantic_error(
+                        source,
+                        setting.clone().field("network"),
+                        "packet network must contain only tcp or udp tokens",
+                    )
+                })?
+                .is_none()
+        {
+            self.network = None;
+        }
+        if self.protocol == NodeProtocol::VLess
+            && optional_flow(self.flow.as_deref())
+                .map_err(|_| {
+                    semantic_error(
+                        source,
+                        setting.clone().field("flow"),
+                        "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
+                    )
+                })?
+                .is_none()
+        {
+            self.flow = None;
+        }
+        self.sni = self.sni.take().filter(|value| !value.trim().is_empty());
+        let mut flat = self;
         let outbound = match flat.protocol {
             NodeProtocol::SS => OutboundConfig::Shadowsocks(ShadowsocksConfig {
                 password: flat.password.take(),
@@ -408,7 +606,8 @@ impl TryFrom<FlatNode> for Node {
                 OutboundConfig::Vless(VlessConfig {
                     uuid: flat.password.take(),
                     encryption: flat.encryption.take(),
-                    mode: flat.vless_mode,
+                    udp_encoding: flat.packet_encoding.take().unwrap_or_default(),
+                    multiplex: flat.multiplex.take().unwrap_or_default(),
                     flow: flat.flow.take(),
                     network: flat.network.take(),
                     transport,
@@ -422,7 +621,7 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Hysteria2 => {
                 let tls = flat.take_tls();
                 OutboundConfig::Hysteria2(Hysteria2Config {
-                    auth: flat.hy2_auth.take().or_else(|| flat.password.take()),
+                    auth: flat.hy2_auth.take(),
                     obfs: flat.hy2_obfs.take(),
                     up_mbps: flat.hy2_up_mbps,
                     down_mbps: flat.hy2_down_mbps,
@@ -440,8 +639,8 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Tuic => {
                 let tls = flat.take_tls();
                 OutboundConfig::Tuic(TuicConfig {
-                    uuid: flat.tuic_uuid.take().or_else(|| flat.username.take()),
-                    password: flat.tuic_password.take().or_else(|| flat.password.take()),
+                    uuid: flat.tuic_uuid.take(),
+                    password: flat.tuic_password.take(),
                     congestion: flat.tuic_congestion.take(),
                     alpn: flat.tuic_alpn.take(),
                     init_stream_recv_window: flat.tuic_init_stream_recv_window,
@@ -455,11 +654,8 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Juicity => {
                 let tls = flat.take_tls();
                 OutboundConfig::Juicity(JuicityConfig {
-                    uuid: flat.juicity_uuid.take().or_else(|| flat.username.take()),
-                    password: flat
-                        .juicity_password
-                        .take()
-                        .or_else(|| flat.password.take()),
+                    uuid: flat.juicity_uuid.take(),
+                    password: flat.juicity_password.take(),
                     quic: QuicOptions {
                         tls,
                         mtu: flat.quic_mtu,
@@ -469,7 +665,7 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::AnyTLS => {
                 let tls = flat.take_tls();
                 OutboundConfig::AnyTls(AnyTlsConfig {
-                    password: flat.password.take().or_else(|| flat.anytls_password.take()),
+                    password: flat.anytls_password.take(),
                     network: flat.network.take(),
                     min_idle_session: flat.anytls_min_idle_session,
                     idle_session_check_interval: flat.anytls_idle_session_check_interval,
@@ -480,7 +676,14 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
         };
-        Ok(Node {
+        if !flat.tls_alpn.is_empty() {
+            return Err(semantic_error(
+                source,
+                setting.clone().field("tls_alpn"),
+                "TLS ALPN requires a TLS-capable protocol",
+            ));
+        }
+        let mut node = Node {
             id: flat.id,
             name: flat.name,
             address: flat.address,
@@ -493,21 +696,44 @@ impl TryFrom<FlatNode> for Node {
             group_id: flat.group_id,
             created_at: flat.created_at,
             updated_at: flat.updated_at,
-        })
+        };
+        node.normalize_stream_transport()
+            .map_err(|message| semantic_error(source, setting.clone().field("xhttp"), message))?;
+        node.validate_detailed_at(source, setting)?;
+        if let Some(config) = node.vless_mut() {
+            config.normalize();
+        }
+        Ok(node)
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
+#[serde(rename = "Node")]
 struct WireOptions<'a> {
+    id: uuid::Uuid,
+    name: &'a str,
+    protocol: NodeProtocol,
+    address: &'a str,
+    host: &'a str,
+    port: u16,
     username: Option<&'a str>,
     password: Option<&'a str>,
     encryption: Option<&'a str>,
-    vless_mode: WireMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vless_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packet_encoding: Option<VlessUdpEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multiplex: Option<&'a VlessMultiplex>,
     plugin: Option<&'a str>,
     plugin_opts: Option<&'a str>,
     transport: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xhttp: Option<&'a super::XhttpOptions>,
     tls: bool,
     sni: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_alpn: Option<&'a [String]>,
     skip_cert_verify: bool,
     ech_enabled: bool,
     ech_config: Option<&'a str>,
@@ -543,12 +769,19 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    mark: Option<u32>,
+    tags: &'a [String],
+    subscription_id: Option<uuid::Uuid>,
+    group_id: Option<uuid::Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl<'a> WireOptions<'a> {
     fn set_tls(&mut self, tls: &'a TlsOptions) {
         self.tls = tls.enabled;
         self.sni = tls.sni.as_deref();
+        self.tls_alpn = (!tls.alpn.is_empty()).then_some(tls.alpn.as_slice());
         self.skip_cert_verify = tls.skip_cert_verify;
         self.ech_enabled = tls.ech_enabled;
         self.ech_config = tls.ech_config.as_deref();
@@ -564,11 +797,25 @@ impl<'a> WireOptions<'a> {
         self.ws_path = transport.ws_path.as_deref();
         self.ws_host = transport.ws_host.as_deref();
         self.grpc_service = transport.grpc_service.as_deref();
+        self.xhttp = transport.xhttp.as_ref();
     }
 
     fn from_node(node: &'a Node) -> Self {
         let mut wire = Self {
+            id: node.id,
+            name: &node.name,
+            protocol: node.protocol(),
+            address: &node.address,
+            host: &node.host,
+            port: node.port,
+            vless_mode: (node.protocol() != NodeProtocol::VLess).then_some("legacy"),
             transport: "tcp",
+            mark: node.mark,
+            tags: &node.tags,
+            subscription_id: node.subscription_id,
+            group_id: node.group_id,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
             ..Self::default()
         };
         match &node.outbound {
@@ -596,8 +843,9 @@ impl<'a> WireOptions<'a> {
                 wire.username = config.uuid.as_deref();
                 wire.password = config.uuid.as_deref();
                 wire.encryption = config.encryption.as_deref();
-                wire.vless_mode = config.mode;
-                wire.flow = config.flow.as_deref();
+                wire.packet_encoding = Some(config.udp_encoding);
+                wire.multiplex = Some(&config.multiplex);
+                wire.flow = config.wire_flow();
                 wire.network = config.network.as_deref();
                 wire.set_transport(&config.transport);
                 wire.set_tls(&config.tls);
@@ -662,80 +910,7 @@ impl Serialize for Node {
     where
         S: Serializer,
     {
-        let wire = WireOptions::from_node(self);
-        let mut state = serializer.serialize_struct("Node", 56)?;
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("protocol", &self.protocol())?;
-        state.serialize_field("address", &self.address)?;
-        state.serialize_field("host", &self.host)?;
-        state.serialize_field("port", &self.port)?;
-        state.serialize_field("username", &wire.username)?;
-        state.serialize_field("password", &wire.password)?;
-        state.serialize_field("encryption", &wire.encryption)?;
-        state.serialize_field("vless_mode", &wire.vless_mode)?;
-        state.serialize_field("plugin", &wire.plugin)?;
-        state.serialize_field("plugin_opts", &wire.plugin_opts)?;
-        state.serialize_field("transport", wire.transport)?;
-        state.serialize_field("tls", &wire.tls)?;
-        state.serialize_field("sni", &wire.sni)?;
-        state.serialize_field("skip_cert_verify", &wire.skip_cert_verify)?;
-        state.serialize_field("ech_enabled", &wire.ech_enabled)?;
-        state.serialize_field("ech_config", &wire.ech_config)?;
-        state.serialize_field("ech_config_path", &wire.ech_config_path)?;
-        state.serialize_field("reality_public_key", &wire.reality_public_key)?;
-        state.serialize_field("reality_short_id", &wire.reality_short_id)?;
-        state.serialize_field("reality_spider_x", &wire.reality_spider_x)?;
-        state.serialize_field("flow", &wire.flow)?;
-        state.serialize_field("network", &wire.network)?;
-        state.serialize_field("ws_path", &wire.ws_path)?;
-        state.serialize_field("ws_host", &wire.ws_host)?;
-        state.serialize_field("grpc_service", &wire.grpc_service)?;
-        state.serialize_field("hy2_auth", &wire.hy2_auth)?;
-        state.serialize_field("hy2_obfs", &wire.hy2_obfs)?;
-        state.serialize_field("hy2_up_mbps", &wire.hy2_up_mbps)?;
-        state.serialize_field("hy2_down_mbps", &wire.hy2_down_mbps)?;
-        state.serialize_field("hy2_port_hopping", &wire.hy2_port_hopping)?;
-        state.serialize_field("hy2_hop_interval", &wire.hy2_hop_interval)?;
-        state.serialize_field("tls_pin_sha256", &wire.tls_pin_sha256)?;
-        state.serialize_field(
-            "hy2_init_stream_recv_window",
-            &wire.hy2_init_stream_recv_window,
-        )?;
-        state.serialize_field("hy2_init_conn_recv_window", &wire.hy2_init_conn_recv_window)?;
-        state.serialize_field("hy2_disable_mtu_discovery", &wire.hy2_disable_mtu_discovery)?;
-        state.serialize_field("quic_mtu", &wire.quic_mtu)?;
-        state.serialize_field("tuic_uuid", &wire.tuic_uuid)?;
-        state.serialize_field("tuic_password", &wire.tuic_password)?;
-        state.serialize_field("tuic_congestion", &wire.tuic_congestion)?;
-        state.serialize_field("tuic_alpn", &wire.tuic_alpn)?;
-        state.serialize_field(
-            "tuic_init_stream_recv_window",
-            &wire.tuic_init_stream_recv_window,
-        )?;
-        state.serialize_field(
-            "tuic_init_conn_recv_window",
-            &wire.tuic_init_conn_recv_window,
-        )?;
-        state.serialize_field("juicity_uuid", &wire.juicity_uuid)?;
-        state.serialize_field("juicity_password", &wire.juicity_password)?;
-        state.serialize_field("anytls_password", &wire.anytls_password)?;
-        state.serialize_field("anytls_min_idle_session", &wire.anytls_min_idle_session)?;
-        state.serialize_field(
-            "anytls_idle_session_check_interval",
-            &wire.anytls_idle_session_check_interval,
-        )?;
-        state.serialize_field(
-            "anytls_idle_session_timeout",
-            &wire.anytls_idle_session_timeout,
-        )?;
-        state.serialize_field("mark", &self.mark)?;
-        state.serialize_field("tags", &self.tags)?;
-        state.serialize_field("subscription_id", &self.subscription_id)?;
-        state.serialize_field("group_id", &self.group_id)?;
-        state.serialize_field("created_at", &self.created_at)?;
-        state.serialize_field("updated_at", &self.updated_at)?;
-        state.end()
+        WireOptions::from_node(self).serialize(serializer)
     }
 }
 
@@ -744,8 +919,72 @@ impl<'de> Deserialize<'de> for Node {
     where
         D: Deserializer<'de>,
     {
-        FlatNode::deserialize(deserializer)?
-            .try_into()
-            .map_err(D::Error::custom)
+        let mut diagnostics = Vec::new();
+        let result = NodeSeed {
+            diagnostics: &mut diagnostics,
+            source: DiagnosticSources::new(None).root(),
+            setting: SettingPath::new("nodes"),
+        }
+        .deserialize(deserializer);
+        report_detailed_diagnostics(&diagnostics);
+        result
+    }
+}
+
+/// Data-only serde adapter; the enclosing Config/Node attempt owns terminal reporting.
+pub struct NodeSeed<'a> {
+    pub diagnostics: &'a mut Vec<DetailedDiagnostic>,
+    pub source: SourceRef,
+    pub setting: SettingPath,
+}
+
+/// Crate-private variant used by the detailed structured loaders. It leaves the
+/// decoder error intact until the format-specific owner has captured location
+/// metadata and replaced the public error with a redacted terminal.
+pub(crate) struct RawNodeSeed<'a> {
+    pub diagnostics: &'a mut Vec<DetailedDiagnostic>,
+    pub source: SourceRef,
+    pub setting: SettingPath,
+    pub record_semantic: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for NodeSeed<'_> {
+    type Value = Node;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Node, D::Error> {
+        RawNodeSeed {
+            diagnostics: self.diagnostics,
+            source: self.source,
+            setting: self.setting,
+            record_semantic: false,
+        }
+        .deserialize(deserializer)
+        .map_err(|_| D::Error::custom("invalid node fields"))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for RawNodeSeed<'_> {
+    type Value = Node;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Node, D::Error> {
+        let RawNodeSeed {
+            diagnostics,
+            source,
+            setting,
+            record_semantic,
+        } = self;
+        let flat = FlatNode::deserialize(deserializer)?;
+        flat.into_node(diagnostics, &source, &setting)
+            .map_err(|mut error| {
+                if record_semantic {
+                    error.diagnostic.entry_index =
+                        setting.0.iter().find_map(|segment| match segment {
+                            crate::diagnostic::SettingSegment::Index(index) => Some(*index),
+                            _ => None,
+                        });
+                    diagnostics.push(*error.diagnostic);
+                }
+                D::Error::custom("invalid node fields")
+            })
     }
 }

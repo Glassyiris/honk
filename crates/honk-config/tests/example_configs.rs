@@ -26,7 +26,7 @@ fn test_config_dae_parses() {
     // One socks5 share-link node plus at least one group. (config.dae is a
     // live example: assert shape, not exact rule counts.)
     assert_eq!(config.nodes.len(), 1);
-    assert_eq!(config.nodes[0].name, "iris");
+    assert_eq!(config.nodes[0].name, "iris-1");
     assert!(!config.groups.is_empty());
     assert_eq!(config.groups[0].name, "iris");
 
@@ -38,11 +38,14 @@ fn test_config_dae_parses() {
     assert_eq!(config.dns.upstream.len(), 2);
 
     // Experimental sections parsed from dae syntax.
-    assert_eq!(
-        config.experimental.clash_api.external_controller,
-        "0.0.0.0:9090"
-    );
-    assert!(config.experimental.cache_file.enabled);
+    let controller = config
+        .experimental
+        .clash_api
+        .external_controller
+        .parse::<std::net::SocketAddr>()
+        .expect("config.dae controller must be a numeric socket address");
+    assert!(controller.ip().is_loopback());
+    assert_eq!(config.experimental.cache_file.enabled, Some(true));
 }
 
 #[test]
@@ -52,11 +55,13 @@ fn test_config_min_dae_parses() {
 
     assert_eq!(config.global.lan_interface, vec!["veth0".to_string()]);
     assert_eq!(config.nodes.len(), 1);
-    assert_eq!(config.nodes[0].name, "iris");
+    assert_eq!(config.nodes[0].name, "iris-1");
     assert_eq!(config.groups.len(), 1);
     assert_eq!(config.groups[0].name, "iris");
     assert_eq!(config.routing.rules.len(), 1);
     assert_eq!(config.routing.default_outbound, "direct");
+    assert!(config.experimental.cache_file.stores_selections());
+    assert!(!config.experimental.cache_file.stores_mode());
 }
 
 #[test]
@@ -80,6 +85,9 @@ fn test_example_dae_parses() {
         config.experimental.clash_api.external_controller,
         "127.0.0.1:9090"
     );
-    assert!(config.experimental.cache_file.enabled);
-    assert_eq!(config.experimental.cache_file.path, "cache.db");
+    assert_eq!(config.experimental.cache_file.enabled, Some(true));
+    assert_eq!(
+        config.experimental.cache_file.legacy_cache_file(),
+        (None, None)
+    );
 }

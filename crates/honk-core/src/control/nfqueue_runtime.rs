@@ -85,6 +85,7 @@ impl NfqueueActorQueue {
     pub(super) fn dequeue(
         &self,
         payload_bytes: usize,
+        ordinary_udp: bool,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let mut state = self.state.lock();
         let entry = state
@@ -95,7 +96,9 @@ impl NfqueueActorQueue {
         state.payload_bytes = state.payload_bytes.saturating_sub(entry.payload_bytes);
         self.publish(&state);
         drop(state);
-        Arc::clone(&self.slow_limit).try_acquire_owned().ok()
+        ordinary_udp
+            .then(|| Arc::clone(&self.slow_limit).try_acquire_owned().ok())
+            .flatten()
     }
 
     fn sample(&self) {
@@ -288,42 +291,81 @@ impl NfqueueRuntime {
         self.pending.wait_empty().await;
     }
 
+    // Handles stay in place while awaited: a timed-out stage leaves them for
+    // `abort_tasks` instead of detaching them.
     async fn stop_observers(&mut self) -> anyhow::Result<()> {
         let _ = self.stop.send(true);
-        if let Some(stats_sampler) = self.stats_sampler.take() {
-            stats_sampler
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE stats sampler: {error}"))?;
+        if let Some(stats_sampler) = self.stats_sampler.as_mut() {
+            let result = stats_sampler.await;
+            self.stats_sampler = None;
+            result.map_err(|error| anyhow::anyhow!("join NFQUEUE stats sampler: {error}"))?;
         }
-        if let Some(watchdog) = self.watchdog.take() {
-            watchdog
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE watchdog: {error}"))?;
+        if let Some(watchdog) = self.watchdog.as_mut() {
+            let result = watchdog.await;
+            self.watchdog = None;
+            result.map_err(|error| anyhow::anyhow!("join NFQUEUE watchdog: {error}"))?;
         }
         Ok(())
     }
 
     pub(super) async fn finish_pending_drain(&mut self) -> anyhow::Result<()> {
         let observer_result = self.stop_observers().await;
-        if let Some(worker) = self.ingest_worker.take() {
-            worker
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
+        if let Some(worker) = self.ingest_worker.as_mut() {
+            let result = worker.await;
+            self.ingest_worker = None;
+            result.map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
         }
         self.pending.cancel_all().await;
         self.pending.wait_empty().await;
         observer_result
     }
 
+    /// Abort and join whatever a timed-out stage left running, so no NFQUEUE
+    /// child outlives the queue into flag/table cleanup.
+    pub(super) async fn abort_tasks(&mut self) {
+        for task in [
+            &mut self.stats_sampler,
+            &mut self.watchdog,
+            &mut self.ingest_worker,
+        ] {
+            if let Some(handle) = task.as_mut() {
+                handle.abort();
+                let _ = handle.await;
+                *task = None;
+            }
+        }
+    }
+
+    /// The observer joins are bounded, but the queue close is not: a blocking
+    /// shutdown cannot be cancelled, and abandoning it would let owned-table
+    /// deletion run before the queue closes. Wait it out; report an overrun.
     pub(super) async fn shutdown_service(&mut self) -> anyhow::Result<()> {
-        let observer_result = self.stop_observers().await;
+        let observer_result = match tokio::time::timeout(
+            super::lifecycle::STAGE_TIMEOUT,
+            self.stop_observers(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "NFQUEUE observers exceeded their stop deadline"
+            )),
+        };
         let service_result = async {
             let service = self
                 .service
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("NFQUEUE service already stopped"))?;
-            tokio::task::spawn_blocking(move || service.shutdown())
-                .await
+            let mut shutdown = tokio::task::spawn_blocking(move || service.shutdown());
+            let joined =
+                match tokio::time::timeout(super::lifecycle::STAGE_TIMEOUT, &mut shutdown).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        let _ = shutdown.await;
+                        anyhow::bail!("NFQUEUE shutdown exceeded its stop deadline");
+                    }
+                };
+            joined
                 .map_err(|error| anyhow::anyhow!("join NFQUEUE shutdown: {error}"))?
                 .map_err(|error| anyhow::anyhow!("shutdown NFQUEUE: {error}"))
         }
@@ -415,7 +457,10 @@ impl ControlPlane {
         &self,
         runtime: &mut NfqueueRuntime,
     ) -> anyhow::Result<()> {
-        if runtime.sequence_ready {
+        // Only the call that fences open staging starts the outage; startup
+        // reports an already-fenced queue itself.
+        let fenced_now = runtime.sequence_ready;
+        if fenced_now {
             let flags = self
                 .datapath_flags
                 .as_ref()
@@ -430,7 +475,10 @@ impl ControlPlane {
         }
         if !self.rotate_udp_decision_generation().await? {
             runtime.defer_token_retry();
-            warn!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
+            crate::logging::warn_on_entry!(
+                fenced_now,
+                "all UDP decision token generations remain live; NFQUEUE staging stays fenced"
+            );
             return Ok(());
         }
         runtime
@@ -471,13 +519,31 @@ impl ControlPlane {
         let pending = Arc::new(pending);
         self.pending_udp_verdicts = Some(Arc::clone(&pending));
 
-        type IngestRequest = (honk_nfqueue::QueuedPacket, honk_nfqueue::VerdictGuard);
+        type IngestRequest = (
+            honk_nfqueue::QueuedPacket,
+            honk_nfqueue::VerdictGuard,
+            Option<u64>,
+        );
         let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestRequest>(NFQUEUE_INGEST_QUEUE_LEN);
         let slow_limit = Arc::clone(&self.udp_concurrency_limit);
         let actor_queue = Arc::new(NfqueueActorQueue::new(Arc::clone(&self.stats), slow_limit));
         let callback_pending = Arc::clone(&pending);
         let callback_queue = Arc::clone(&actor_queue);
-        let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
+        let callback: honk_nfqueue::PacketCallback = Arc::new(move |event, guard| {
+            let packet = match event {
+                honk_nfqueue::PacketEvent::Datagram(packet) => packet,
+                honk_nfqueue::PacketEvent::Rejected {
+                    tuple,
+                    mark,
+                    received_at,
+                    error,
+                } => {
+                    debug!(%error, "Dropping rejected NFQUEUE UDP packet");
+                    callback_pending.reject_packet(tuple, mark, received_at, guard);
+                    return;
+                }
+            };
+            let epoch = callback_pending.admission_epoch();
             let Ok(slot) = ingest_tx.try_reserve() else {
                 callback_pending.reject_actor_queue(packet, guard);
                 return;
@@ -486,7 +552,7 @@ impl ControlPlane {
                 callback_pending.reject_actor_queue(packet, guard);
                 return;
             }
-            slot.send((packet, guard));
+            slot.send((packet, guard, epoch));
         });
         let (service, listener_fatal) = match honk_nfqueue::NfqueueService::start(callback) {
             Ok(runtime) => runtime,
@@ -499,9 +565,18 @@ impl ControlPlane {
         let initializer = self.spawn_handle();
         let drain = Arc::clone(&self.drain_tracker);
         let ingest_queue = Arc::clone(&actor_queue);
+        let dns_ingress = super::udp_ingress::UdpLoopState::new(self, true);
+        let initializer_tasks = Arc::clone(&self.udp_pool);
         let ingest_worker = tokio::spawn(async move {
-            while let Some((packet, guard)) = ingest_rx.recv().await {
-                let permit = ingest_queue.dequeue(packet.payload.len());
+            while let Some((packet, guard, epoch)) = ingest_rx.recv().await {
+                let dns = packet.tuple.destination.port() == 53;
+                let permit = ingest_queue.dequeue(packet.payload.len(), !dns);
+                if dns {
+                    actor_pending
+                        .ingest_dns_wait(&dns_ingress, packet, guard, epoch)
+                        .await;
+                    continue;
+                }
                 let nfqueue::NfqueueIngest::Initialize { lease, identity } =
                     actor_pending.ingest_wait(packet, guard, permit).await
                 else {
@@ -510,7 +585,7 @@ impl ControlPlane {
                 let initializer = initializer.clone();
                 let pending = Arc::clone(&actor_pending);
                 let drain = Arc::clone(&drain);
-                tokio::spawn(async move {
+                initializer_tasks.spawn_slow_path(async move {
                     let _guard = ConnectionGuard::new(drain);
                     match std::panic::AssertUnwindSafe(initializer.serve_udp_connection(lease))
                         .catch_unwind()
@@ -518,7 +593,7 @@ impl ControlPlane {
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            warn!(%error, "NFQUEUE UDP initializer failed");
+                            debug!(%error, "NFQUEUE UDP initializer failed");
                             let _ = pending.cancel(identity).await;
                         }
                         Err(_) => {

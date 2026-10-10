@@ -1,6 +1,6 @@
 # Global configuration reference
 
-This page defines the current `global { ... }` configuration fields and their runtime effect.
+`global { ... }` configures process-wide settings. The fields and their runtime effects are listed below.
 
 ## Fields
 
@@ -11,31 +11,31 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `tproxy_port` | `tproxy_port` | `12345` | TCP and UDP transparent-listener port programmed into the userspace listeners and eBPF datapath. A change requires restart. |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | Compatibility switch intended to prevent re-interception of the transparent port. The current runtime does not read it. |
 | `pprof_port` | `pprof_port` | `0` | Compatibility pprof HTTP port; `0` means disabled. honk currently starts no pprof server and does not read this field. |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0` | Compatibility socket-mark value. Validation rejects overlap with datapath-reserved mark bits, but the current runtime does not apply it to sockets. |
-| `log_level` | `log_level` | `"info"` | Startup log filter. `--debug` takes precedence, followed by `RUST_LOG`, then this value. A SIGHUP change is restart-required. |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0` (effective `0x100`) | Process-wide `SO_MARK` for honk-originated sockets and exact datapath bypass. A nonzero value replaces `0x100`, not ORs with it; changing the setting requires restart. Bits `0xc8000000` are reserved and rejected. See [Socket marks](#socket-marks). |
+| `log_level` | `log_level` | `"info"` | Startup log filter. A valid `RUST_LOG` takes precedence, followed by `--debug`, then this value. A SIGHUP change is restart-required; a native API `log.level` PATCH replaces the filter until the next activation. `info` covers runtime state (startup, reloads, health, subscriptions); the per-connection routing lines (`TCP connection`, `UDP connection`, eBPF offload) are `debug`, so a router's syslog is not flooded by traffic. To audit routing decisions, run with `debug` or read `/logs?level=debug` from the API. |
 | `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled. SIGHUP requires restart only when the resolved effective destination changes; `--log-file` shadows this value. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. That setup pins `net.ipv6.conf.all.forwarding=1` and therefore also writes `net.ipv6.conf.<wan>.accept_ra=2` on every resolved WAN interface (including late-attached ones), so an SLAAC/RA-learned IPv6 default route survives the forwarding pin. Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in the WAN `.network` file. |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | Hold ambiguous LAN-forwarded UDP originals in NFQUEUE until userspace reaches a terminal decision. The setting requires the real eBPF backend; after the singleton instance handoff, an unavailable fixed queue or a pre-admission queue/rules/health failure logs a warning and disables it for the process without rewriting the config. Persistent token-generation recovery failures remain fatal. Installation reclaims the reserved nftables table. Changing it requires restart. New configurations should use this key; the deprecated `experimental.udp_nfqueue.enabled` spelling is accepted with a migration warning, but this canonical key wins when both are present. |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively; each candidate must pass a private create-new/remove probe. An unusable candidate falls back to the equally probed working directory. A change requires restart. |
-| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `data_dir/.sub` for startup and reload recovery. A change requires restart. |
-| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The current health loop uses the first value; an empty list falls back to a plain TCP check. |
+| `data_dir` | `data_dir` | `"/var/lib/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively; each candidate must pass a private create-new/remove probe. An unusable candidate falls back to the equally probed working directory. Existing artifacts under the legacy `/var/share/honk` (`LEGACY_DATA_DIR`) root remain usable through the path-specific fallback rules below; honk does not automatically relocate them; writable state remains active in place. A change requires restart. |
+| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body in the state db, `data_dir/state/honk.db`, for startup recovery only; reload carries active nodes without reading stored bodies. A change requires restart. |
+| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The health loop uses the first value; an empty list falls back to a plain TCP check. URI parsing separates userinfo, bracketed IPv6, port, path, query and fragment. Userinfo adds no authorization header; path/query are sent without the fragment, including `/?query` for a slashless query. Explicit HTTP/HTTPS default to 80/443; schemeless health targets use HTTP/80. URLTest defaults schemeless targets to HTTPS/443 and sends HEAD to the decoded path/query. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method sent by the URL health check. An empty value is treated as `HEAD`. |
-| `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | Comma-separated DNS targets for UDP health checks; a missing port defaults to `53`. |
-| `check_interval` | `check_interval_secs` | `30s` | Global health-check interval. The UDP warm coordinator also uses it, with an effective minimum of 10 seconds. |
-| `check_tolerance` | `check_tolerance_ms` | `50ms` | Latency improvement required before URLTest changes its selected member. |
+| `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | Comma-separated DNS targets for UDP health checks. Bare IPv4/IPv6, `[IPv6]`, and hostnames default to port `53`; explicit ports must be numeric and in `1..65535`. Malformed brackets or ports fail validation with a located diagnostic. The first literal wins over domain entries; otherwise the first domain is resolved. Resolution and Score use the same decoded host/port, retaining domain identity after resolution. |
+| `check_interval` | `check_interval_secs` | `30s` | Global health-check interval. Must be positive; a value that fails to parse becomes zero and is rejected at validation. The UDP warm coordinator also uses it, with an effective minimum of 10 seconds. |
+| `check_tolerance` | `check_tolerance_ms` | `50ms` | Latency improvement required before URLTest changes its selected member. Accepts bare milliseconds, `ms`, or `s`; anything else keeps this default and logs a warning. |
 | `dial_mode` | `dial_mode` | `"domain"` | Destination-domain discovery and routing mode: `ip`, `domain`, `domain+`, or `domain++`. See [Dial modes](#dial-modes). |
 | `allow_insecure` | `allow_insecure` | `false` | Compatibility global TLS-verification fallback. Current TLS connectors do not read it; certificate skipping is configured per node in its share link. |
-| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | Compatibility sniffing timeout. The dae parser stores the duration, but the current control plane does not read it. |
-| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` uses the regular BoringSSL client profile; `utls` enables honk's real Chrome ClientHello profile. |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Fingerprint profile requested with `utls`. Only `chrome*` is implemented; other values warn and still use Chrome. |
+| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | Compatibility sniffing timeout, currently unused by the control plane. Duration syntax and invalid-value handling match `check_tolerance`. |
+| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` uses the regular BoringSSL client profile; `utls` enables honk's Chrome-oriented ClientHello emulation, not exact browser identity. |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Compatibility fingerprint request. The `utls` mode uses one Chrome-oriented profile; this value does not switch profiles. |
 | `tls_fragment` | `tls_fragment` | `false` | Compatibility TLS ClientHello-fragmentation switch. The current TLS connector does not read it. |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Compatibility fragmentation-length range. The current TLS connector does not read it. |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Compatibility fragmentation-interval range. The current TLS connector does not read it. |
 | `mptcp` | `mptcp` | `false` | Compatibility MPTCP switch. The current dial path does not read it. |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | Resolver used for node hostnames and control-plane dials, avoiding recursive interception through honk. Empty uses the ordinary bootstrap behavior. |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | Marked UDP/TCP resolver for node hostnames and control-plane dials. Empty or failed bootstrap resolution uses `/etc/hosts`, then marked DNS to the first numeric `/etc/resolv.conf` nameserver; no libc NSS or search suffixes. |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | Compatibility fallback-resolver value. The current runtime does not read it. |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | Compatibility transmit-bandwidth hint, such as `'200 mbps'`. The current runtime does not read it. |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | Compatibility receive-bandwidth hint. The current runtime does not read it. |
@@ -44,9 +44,59 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | Requested generation-local cap on physical proxied connects and protocol handshakes; runtime resource budgeting may clamp it. |
 | — (not settable in dae syntax) | `tproxy_mark` | `0x08000000` | Fixed fwmark shared by userspace policy routing and the compiled eBPF datapath. |
 | — (not settable in dae syntax) | `udphop_interval_secs` | `30s` | Legacy global UDP-hop interval. Current dialers do not read it; protocol-specific hopping uses node fields. |
-| — (not settable in dae syntax) | `connect_timeout_ms` | `3000ms` | Timeout used by proxy connects, protocol preparation, preconnect, health probes, and control-plane dials. |
+| — (not settable in dae syntax) | `connect_timeout_ms` | `3000ms` | Stage timeout used by proxy connects, protocol preparation, preconnect, health probes, and control-plane dials. Transparent TCP candidate races and UDP transport preparation additionally share an absolute budget of `max(10s, 4 × connect_timeout)`; this adds no configuration key. |
 | — (not settable in dae syntax) | `dns_resolve_timeout_ms` | `2000ms` | Timeout for control-plane DNS resolution, including targets that must be converted to an IP before dialing. |
 | — (not settable in dae syntax) | `relay_idle_timeout_secs` | `300s` | Legacy relay-idle timeout field. The current relay path does not read it. |
+
+`nfqueue_enable` also controls [fragmented LAN UDP/53 delivery](../design/nfqueue.md#fragmented-lan-dns): controller/raw-group fragments require ready NFQUEUE and otherwise drop, without bypassing DNS policy. Native `direct(must)` and unfragmented DNS are unchanged.
+
+HTTP health checks and URLTest send a credential-free authority in `Host`: IPv6 stays bracketed, and non-default ports are retained. Connection and TLS server-name handling use the unbracketed host.
+
+The configured request path and query retain their original dot segments and percent-encoding. URLs with surplus authority slashes, backslashes, or embedded ASCII whitespace/control characters are rejected before building a request; rejected URLs are not echoed in the health-check warning.
+
+## Socket marks
+
+`so_mark_from_dae: 0` (or omission) retains the historical effective mark `0x100`.
+A nonzero value is applied exactly before connect/send, including proxy carriers,
+bootstrap/DNS traffic, health checks, subscriptions and UI downloads. The datapath
+bypass compares this exact configured value: merely containing bit `0x100` is not
+an exemption. Transparent listeners use the same mark for socket recognition;
+accepted TCP client sockets have it cleared. Standalone `dns.bind` ingress stays
+an ordinary unmarked local service.
+
+The dae global scalar keeps honk's existing hexadecimal-first lexical behavior:
+`10` and `0x10` both mean 16; malformed or overflowing text emits a diagnostic and
+falls back to raw `0`, hence effective `0x100`. Prefer explicit `0x` notation.
+This differs from [direct rule marks](./routing.md#policy-routing-marks), where
+unprefixed values are decimal and malformed values reject the configuration.
+Both global and rule marks reject reserved bits `0xc0000000` at validation; the global mark also rejects the TPROXY bit `0x08000000`, which daens routes to its local listeners.
+
+The setting is captured before startup network I/O and is process-scoped; use a
+restart, not SIGHUP, to change it. A nonzero direct-rule mark replaces the global
+mark for that direct flow's policy-routing payload, while proxy carriers and
+bootstrap traffic keep the global value. Direct traffic also carries internal
+classification metadata; use the masked IPv4/IPv6 `ip rule` examples in the
+[routing reference](./routing.md#policy-routing-marks). honk does not install your
+WAN policy tables, routes, source-address rules or NAT configuration.
+
+## Reloading health checks and TLS mode
+
+These inputs are captured at startup. A reload that changes their effective values is rejected, preserving the active configuration and installed probes:
+
+- `check_interval`.
+- The first `tcp_check_url`, including its fallback, path, and query text. A missing or empty first value disables HTTP probing; later values do not affect this comparison.
+- `tcp_check_http_method` while HTTP probing is enabled. Empty and `HEAD` are equivalent.
+- The selected `udp_check_dns` target: trim and ignore empty entries, prefer the first IP literal anywhere in the list, otherwise use the first domain, otherwise `8.8.8.8:53`. Admission compares configured address/domain and port, without resolving DNS. Changes to unselected entries remain admissible.
+- Switching `tls_implementation` between native TLS and uTLS. The `utls` comparison is case-insensitive.
+
+DAE `check_tolerance` still updates URLTest group tolerances on reload. Group-specific check URLs and direct checks retain their existing live-update paths. Reloading `utls_imitate` stores the compatibility value but does not change the fingerprint.
+
+UDP DNS target initialization is attempted at startup within the health-check
+timeout. A local refusal or initialization timeout leaves the configured target
+pending for a later health cycle, without a default substitution or node-health
+penalty; independent QUIC checks can continue. The first successfully resolved
+address remains pinned. Deferred resolution and the DNS exchange share one probe
+deadline; ordinary resolution failures retain the existing default fallback.
 
 ## Interface semantics
 
@@ -54,7 +104,9 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 `auto` resolves to the interface owning the lowest-metric IPv4 default route. If no such route exists, that entry is omitted from the desired hook set and remains pending. Traffic on the unresolved interface stays fail-open because no hook is attached; explicitly named interfaces in the same list continue to work.
 
-`IfaceWatcher` subscribes to link, address, and IPv4 route events and also performs a 60-second reconciliation. It attaches, detaches, or rebinds the required LAN/WAN hooks as interfaces and default routes change, including LAN bridge/bond members and WAN bond slaves. A changed topology refreshes generated gateway-address `direct(must)` rules and immediately wakes health-backed outbound probing. Interface-list configuration changes themselves require restart.
+`IfaceWatcher` subscribes to link, address, and IPv4 route events and also performs a 60-second reconciliation. It attaches, detaches, or rebinds the required LAN/WAN hooks as interfaces and default routes change, including LAN bridge/bond members and WAN bond slaves. A changed topology immediately wakes health-backed outbound probing. Interface addresses remain observed for topology/ECS/health events, but startup, reload, and network events never synthesize gateway-address routing rules. Configure [explicit local rules](./routing.md#explicit-local-rules) when needed. Interface-list configuration changes themselves require restart.
+
+Real LAN bindings also receive an advisory [self-protection coverage check](./routing.md#explicit-local-rules). An unconfirmed result warns without rejecting startup/reload or inserting routing rules.
 
 ## Dial modes
 
@@ -69,24 +121,26 @@ Direct, block, `must`, and other reserved handoffs remain final and keep the ori
 
 ## Data directory and asset paths
 
-`data_dir` defaults to `/var/share/honk`, must be an absolute non-empty path, and is installed once for the process. At startup honk recursively creates it and verifies it with a private random create-new/remove probe. An unusable candidate falls back only to a process working directory that passes the same probe; startup fails and reports both causes when neither is usable. Absolute child paths remain unchanged.
+`data_dir` defaults to `/var/lib/honk`, must be an absolute non-empty path, and is installed once for the process. At startup honk recursively creates it and verifies it with a private random create-new/remove probe. An unusable candidate falls back only to a process working directory that passes the same probe; startup fails and reports both causes when neither is usable. The legacy root is `/var/share/honk` (`LEGACY_DATA_DIR`), used to retain existing artifacts without automatic migration. Reused writable caches and subscription stores continue to be updated in place. For a custom `data_dir`, the same fallback order applies. Absolute child paths remain unchanged.
 
-`geoip.dat` and `geosite.dat` use the first existing file in this exact order:
+`geoip.dat` and `geosite.dat` use the first existing regular file in this exact order:
 
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
-3. `./<name>` in the process working directory
-4. `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`
+3. `/var/share/honk/<name>` (`LEGACY_DATA_DIR`)
+4. `./<name>` in the process working directory
+5. `/usr/local/share/honk/<name>`, then `/usr/share/honk/<name>`
+6. `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`
 
-Other relative runtime paths preserve legacy installations as follows:
+Other relative runtime paths preserve legacy installations as follows. Except for logs, each lookup checks the existing configured-data-directory copy first, then an existing `/var/share/honk` copy, then the existing per-caller legacy candidate. If none exists, the path below `data_dir` is returned for creation. Absolute paths remain explicit.
 
 | Path | Resolution and legacy fallback |
 | ---- | ------------------------------ |
-| Node `ech_config_path` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative path. If neither exists, resolve to `<data_dir>/<path>` so the read error names the intended location. |
-| `global.log_file` | Relative paths resolve to `<data_dir>/<path>`; parent directories are created at startup. Absolute paths remain explicit. On Linux, new logs are mode `0600`; symlinks and non-regular destinations are rejected, while permissions on an existing regular file are preserved. honk appends without rotation; use the platform log-rotation facility when needed. |
-| `experimental.cache_file.path` | Prefer an existing `<data_dir>/<path>`, then an existing path relative to the original configuration directory. New databases are created below `data_dir`. |
-| `experimental.clash_api.external_ui` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative directory. If neither exists, use `<data_dir>/<path>` for the dashboard download. |
-| Subscription store | Use `<data_dir>/.sub`; retain an existing legacy `./.sub` until it is moved. |
+| Node `ech_config_path` | Prefer an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then an existing working-directory-relative path. If none exists, resolve to `<data_dir>/<path>` so the read error names the intended location. |
+| `global.log_file` | Relative paths always resolve to `<data_dir>/<path>` via the creation-only path helper; parent directories are created at startup. Existing `/var/share/honk` logs are not read or migrated. Absolute paths remain explicit. On Linux, new logs are mode `0600`; symlinks and non-regular destinations are rejected, while permissions on an existing regular file are preserved. honk appends and rotates at 10 MiB: the file is renamed to `<name>.1`, replacing an older copy, and a new file is opened with the same checks, so the log takes at most 20 MiB. When two instances share the file during a restart handoff, only the one whose file is still at the path renames it; the other switches to the new file, so neither overwrites the other's copy. If a rotation fails, for example because the new file cannot be opened, honk stops rotating, keeps writing to the file it has up to 20 MiB, then drops log lines with one warning on stderr until restart. Timestamps on the console and in the file are the machine's local time with its UTC offset (`2026-09-12T02:30:15.123456+10:00`). |
+| `experimental.cache_file.path` | No longer a storage location; state is kept in `<data_dir>/state/honk.db`. The first start reads it once, with the old resolution order, to import a legacy `cache.db` ([upgrade notes](./experimental.md#upgrading-from-cachedb)). |
+| `experimental.clash_api.external_ui` | Prefer an existing `<data_dir>/<path>`, then an existing `/var/share/honk/<path>`, then an existing working-directory-relative directory. If none exists, use `<data_dir>/<path>` for the dashboard download. |
+| Subscription store | Bodies live in `<data_dir>/state/honk.db`. Each start imports the enabled bodies from the first private legacy `.sub` found in `<data_dir>/.sub`, `/var/share/honk/.sub`, `./.sub`, and removes the copied files ([subscription reference](./subscription.md#fetch-persistence-and-recovery)). |
 
 ## Warm-up and dial budget
 
@@ -103,7 +157,7 @@ global {
     tproxy_port: 12345
     log_level: info
     log_file: 'honk.log'
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     store_subscribe: true
     nfqueue_enable: true
 

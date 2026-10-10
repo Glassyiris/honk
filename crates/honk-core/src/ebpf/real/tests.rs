@@ -34,6 +34,91 @@ fn cgroup_attached_prog_count(cgroup_fd: RawFd) -> u32 {
     total
 }
 
+#[test]
+#[ignore = "requires root; run via just test-netns"]
+fn missing_dae0peer_attach_failure_is_propagated() {
+    std::thread::spawn(|| {
+        // Lazy daens creation may add compatibility mounts; confine them to
+        // this thread's disposable mount namespace.
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
+            .expect("create test mount namespace");
+        nix::mount::mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .expect("make test mounts private");
+        nix::mount::mount(
+            Some("tmpfs"),
+            "/run",
+            Some("tmpfs"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .expect("isolate test runtime directory");
+
+        crate::daens_fd().expect("create test daens namespace");
+        let dae0peer_ifindex = || {
+            crate::with_daens_netns("inspect test daens", || {
+                let mut netlink = crate::netlink::NlSock::new()?;
+                netlink.get_link("lo")?;
+                match netlink.get_link("dae0peer") {
+                    Ok((ifindex, _)) => Ok(Some(ifindex)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .expect("inspect test daens namespace")
+        };
+        assert!(
+            dae0peer_ifindex().is_none(),
+            "test daens already contains dae0peer; refusing to remove an unowned link"
+        );
+
+        let mut backend = RealEbpfBackend::load_routing_test_fixture(
+            crate::DEFAULT_BPF_OBJECT,
+            DaeParam::default(),
+        )
+        .expect("load embedded production object");
+        let program: &mut aya::programs::SchedClassifier = backend
+            .bpf_mut()
+            .unwrap()
+            .program_mut("dae0peer_ingress")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        program
+            .load()
+            .expect("load valid peer program before attach");
+        let caller_netns =
+            std::fs::read_link("/proc/thread-self/ns/net").expect("read caller network namespace");
+        let links_before = held_bpf_link_count();
+
+        backend
+            .attach_dae0peer_ingress()
+            .expect_err("missing dae0peer attach must fail");
+        assert_eq!(
+            std::fs::read_link("/proc/thread-self/ns/net")
+                .expect("read restored caller network namespace"),
+            caller_netns,
+            "failed attach stranded its caller in daens"
+        );
+        assert_eq!(
+            held_bpf_link_count(),
+            links_before,
+            "failed attach leaked a BPF link"
+        );
+        assert!(
+            dae0peer_ifindex().is_none(),
+            "failed attach created or retained dae0peer"
+        );
+    })
+    .join()
+    .expect("peer attach regression thread");
+}
+
 /// Regression test: every link aya hands us (TC, cgroup sock/sock_addr)
 /// stays owned by the backend until its interface is forgotten or global
 /// shutdown. Forgetting a startup WAN must release its TCX links so the
@@ -55,7 +140,6 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
-        0x0800_0000,
         None,
         "lo",
         false,
@@ -157,13 +241,104 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         "detach_hooks must detach the cgroup programs"
     );
     backend.cleanup().await.expect("cleanup");
-    assert!(
-        pin_root.join(UDP_DECISION_SEQUENCE_MAP).exists(),
-        "ordinary cleanup must preserve the token allocator pin"
-    );
-    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("remove test allocator pin");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        assert!(
+            pin_root.join(name).exists(),
+            "ordinary cleanup must preserve {name}"
+        );
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
+    use std::os::fd::AsRawFd;
+
+    let links_before = held_bpf_link_count();
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-pin-ownership-test-{}", std::process::id()));
+    std::fs::create_dir_all(&pin_root).expect("pin root");
+    let foreign = pin_root.join("FOREIGN_MAP");
+    aya::maps::Array::<_, u32>::create(1, 0)
+        .expect("create foreign map")
+        .pin(&foreign)
+        .expect("pin foreign map");
+    let foreign_id = aya::maps::MapInfo::from_pin(&foreign)
+        .expect("foreign map info")
+        .id();
+
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        None,
+        "lo",
+        false,
+    )
+    .await
+    .expect("backend load");
+    backend.detach_hooks().expect("detach hooks");
+    let trace = backend
+        .receive_trace()
+        .expect("attach real receive fallback");
+    let trace_owner = std::sync::Arc::downgrade(&trace);
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut registration = trace.register(receiver.as_raw_fd()).unwrap();
+    assert!(registration.begin(receiver.as_raw_fd()));
+    sender
+        .send_to(b"trace", receiver.local_addr().unwrap())
+        .unwrap();
+    let mut bytes = [0u8; 8];
+    assert_eq!(receiver.recv(&mut bytes).unwrap(), 5);
+    let packets = registration.finish(1).expect("fallback receive evidence");
+    assert_eq!(
+        packets[0].valid,
+        honk_ebpf_common::receive_trace::RECEIVE_TRACE_VALID
+    );
+    assert_eq!(packets[0].length, 5);
+    drop(registration);
+    drop(trace);
+    backend.cleanup().await.expect("cleanup");
+    assert!(
+        trace_owner.upgrade().is_none(),
+        "cleanup retained receive trace while backend lives"
+    );
+    assert_eq!(
+        held_bpf_link_count(),
+        links_before,
+        "cleanup retained BPF links"
+    );
+
+    assert_eq!(
+        aya::maps::MapInfo::from_pin(&foreign)
+            .expect("cleanup removed a pin this instance did not create")
+            .id(),
+        foreign_id
+    );
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        assert!(
+            pin_root
+                .join(name)
+                .try_exists()
+                .expect("allocator pin readable"),
+            "cleanup removed {name}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&pin_root);
 }
 
 #[tokio::test]
@@ -175,7 +350,6 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
-        0x0800_0000,
         None,
         "lo",
         false,
@@ -201,7 +375,6 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
-        0x0800_0000,
         None,
         "lo",
         false,
@@ -264,9 +437,52 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     assert_eq!(reset.exhausted, 0);
     reloaded.detach_hooks().expect("detach hooks after reload");
     reloaded.cleanup().await.expect("reload cleanup");
-    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("remove test allocator pin");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn invalid_routing_sequence_pin_is_never_reset() {
+    use aya::maps::IterableMap;
+
+    let pin_root = Path::new("/sys/fs/bpf").join(format!(
+        "honk-routing-sequence-invalid-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&pin_root).unwrap();
+    let pin = pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP);
+    for (entries, flags, value) in [
+        (2, 0, 17),
+        (1, 1 << 7, 17),
+        (1, 0, DNS_ROUTE_GENERATION_MAX + 1),
+    ] {
+        let mut sequence = AyaArray::<_, u64>::create(entries, flags).unwrap();
+        sequence.set(0, value, 0).unwrap();
+        sequence.map().pin(&pin).unwrap();
+        let id = sequence.map().info().unwrap().id();
+        assert!(
+            RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                None,
+                "lo",
+                false
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(aya::maps::MapInfo::from_pin(&pin).unwrap().id(), id);
+        assert_eq!(sequence.get(&0, 0).unwrap(), value);
+        std::fs::remove_file(&pin).unwrap();
+    }
+    std::fs::remove_dir(pin_root).unwrap();
 }
 
 #[tokio::test]
@@ -280,7 +496,6 @@ async fn pname_is_ready_before_first_packet() {
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
-        TPROXY_MARK,
         Some("lo"),
         "lo",
         true,
@@ -353,8 +568,12 @@ async fn pname_is_ready_before_first_packet() {
         .cleanup()
         .await
         .expect("clean up pname test backend");
-    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("remove pname test allocator pin");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove pname test allocator pin");
+    }
     std::fs::remove_dir(&pin_root).expect("remove pname test pin root");
 }
 
@@ -372,4 +591,164 @@ fn test_event_ip() {
         event_ip(&v6),
         std::net::IpAddr::V6("::1".parse::<std::net::Ipv6Addr>().unwrap())
     );
+}
+
+#[test]
+fn routing_handoff_layout_validation_rejects_legacy_value_size() {
+    let key = core::mem::size_of::<TuplesKey>() as u32;
+    let current = core::mem::size_of::<RoutingHandoffEntry>() as u32;
+    assert!(validate_routing_handoff_sizes(key, current).is_ok());
+    assert!(validate_routing_handoff_sizes(key, 48).is_err());
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn datapath_observation_crosschecks_program_hook_root_and_admission() {
+    use crate::ebpf::{DatapathCheck, DatapathObservationError};
+    use aya::maps::{ArrayOfMaps, IterableMap};
+
+    std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+        let mut netlink = crate::netlink::NlSock::new().unwrap();
+        let (loopback, _) = netlink.get_link("lo").unwrap();
+        netlink.set_link_up(loopback, true).unwrap();
+        let mut backend = RealEbpfBackend::load_routing_test_fixture(
+            crate::DEFAULT_BPF_OBJECT,
+            DaeParam::default(),
+        )
+        .unwrap();
+        let before = backend.observe_datapath();
+        assert_eq!(before.programs, DatapathCheck::Absent);
+        assert_eq!(before.hooks, DatapathCheck::Absent);
+        assert_eq!(before.routing, DatapathCheck::Absent);
+        assert_eq!(before.admission, Some(false));
+
+        backend.attach_lan("lo", false).unwrap();
+        let router = crate::routing::Router::new(&[], "direct").unwrap();
+        let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+            &router,
+            &std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
+            honk_config::types::DialMode::Ip,
+        )
+        .unwrap();
+        backend.publish_routing_plan(&plan, &[]).unwrap();
+        let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        backend
+            .publish_listener_sockets(
+                tcp4.as_raw_fd(),
+                tcp6.as_raw_fd(),
+                &[udp4.as_raw_fd(); 4],
+                &[udp6.as_raw_fd(); 4],
+            )
+            .unwrap();
+        backend.set_datapath_ready(true).unwrap();
+        let checked = backend.observe_datapath();
+        assert_eq!(checked.programs, DatapathCheck::Verified);
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(backend.listeners_published);
+        assert_eq!(checked.routing, DatapathCheck::Verified);
+        assert_eq!(
+            checked.routing_generation,
+            Some(backend.routing_policy_generation())
+        );
+        assert_eq!(checked.admission, Some(true));
+        assert_eq!(checked.listeners_published, Some(true));
+        // Both lo hooks are verified, but the fixture's required dae0 and
+        // daens hooks are not, so no attached claim is made.
+        assert_eq!(checked.hooks, DatapathCheck::Unknown);
+        assert_eq!(checked.attachments.len(), 2);
+        assert!(checked.attachments.iter().all(|attachment| {
+            attachment.interface == "lo" && attachment.state == DatapathCheck::Verified
+        }));
+        let capacity = backend
+            .hash_map::<TuplesKey, ConnState>("CONN_STATE_MAP")
+            .unwrap()
+            .map()
+            .info()
+            .unwrap()
+            .max_entries();
+        assert_eq!(checked.conn_state_capacity, Some(capacity));
+        assert!(checked.errors.is_empty());
+
+        let root = backend
+            .bpf()
+            .unwrap()
+            .map(ROUTING_POLICY_ROOT_NAME)
+            .unwrap();
+        let root = ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
+            .unwrap();
+        let old_descriptor = root.get(&0, 0).unwrap();
+        let mut foreign_descriptor = AyaArray::<_, RoutingPolicyDescriptor>::create(1, 0).unwrap();
+        foreign_descriptor
+            .set(0, old_descriptor.get(&0, 0).unwrap(), 0)
+            .unwrap();
+        let root = backend
+            .bpf_mut()
+            .unwrap()
+            .map_mut(ROUTING_POLICY_ROOT_NAME)
+            .unwrap();
+        ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
+            .unwrap()
+            .set(0, &foreign_descriptor, 0)
+            .unwrap();
+        let mismatch = backend.observe_datapath();
+        assert_eq!(mismatch.routing, DatapathCheck::Error);
+        assert_eq!(mismatch.routing_generation, None);
+        assert!(mismatch.errors.contains(&DatapathObservationError::Routing));
+        assert_eq!(mismatch.admission, Some(true));
+        assert_eq!(
+            backend.array_get::<u32>("DATAPATH_STATE_MAP", 0).unwrap(),
+            Some(1)
+        );
+
+        backend.set_datapath_ready(false).unwrap();
+        backend.clear_listener_sockets().unwrap();
+        assert!(!backend.listeners_published);
+        assert!(backend.set_datapath_ready(true).is_err());
+        {
+            let map = backend
+                .bpf_mut()
+                .unwrap()
+                .map_mut("LISTEN_SOCKET_MAP")
+                .unwrap();
+            let mut sockets = AyaSockMap::try_from(map).unwrap();
+            for key in 0..10 {
+                assert!(RealEbpfBackend::sockmap_slot_is_empty(
+                    &sockets.clear_index(&key).unwrap_err()
+                ));
+            }
+        }
+        backend
+            .publish_listener_sockets(
+                tcp4.as_raw_fd(),
+                tcp6.as_raw_fd(),
+                &[udp4.as_raw_fd(); 4],
+                &[],
+            )
+            .unwrap();
+        {
+            let map = backend
+                .bpf_mut()
+                .unwrap()
+                .map_mut("LISTEN_SOCKET_MAP")
+                .unwrap();
+            let mut sockets = AyaSockMap::try_from(map).unwrap();
+            for key in 6..10 {
+                assert!(RealEbpfBackend::sockmap_slot_is_empty(
+                    &sockets.clear_index(&key).unwrap_err()
+                ));
+            }
+        }
+        backend.clear_listener_sockets().unwrap();
+        backend.detach_hooks().unwrap();
+        let detached = backend.observe_datapath();
+        assert_eq!(detached.admission, Some(false));
+        assert_eq!(detached.hooks, DatapathCheck::Absent);
+        assert!(detached.attachments.is_empty());
+    })
+    .join()
+    .unwrap();
 }

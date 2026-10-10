@@ -1,25 +1,44 @@
 use std::future::Future;
 
+fn should_retry(error: &anyhow::Error) -> bool {
+    !honk_outbound::proxy::is_packet_rejection(error)
+        && !error.chain().any(|cause| {
+            cause.is::<super::doh_message::DeterministicResponse>()
+                || cause.is::<super::body::DnsMessageTooLarge>()
+        })
+}
+
 pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
     label: &'static str,
     raw_query: &[u8],
     once: Once,
     reset: Reset,
-    feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
 ) -> anyhow::Result<Vec<u8>>
 where
     Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<u8>>>,
-    Reset: FnOnce() -> ResetFut,
+    Reset: FnOnce(&anyhow::Error) -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
-    let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
-    let result = match once(reporter.clone()).await {
+    let reporter = feedback.map(honk_outbound::group::ScoreBusinessGuard::start);
+    let first_result = {
+        let exchange = once(reporter.clone());
+        crate::observe::scope_pin!(exchange);
+        let exchange = crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
+        exchange.await
+    };
+    let result = match first_result {
         Ok(response) => Ok(response),
+        Err(first) if !should_retry(&first) => Err(first),
         Err(first) => {
             record_reset(label);
-            reset().await;
-            once(reporter.clone()).await.map_err(|error| {
+            reset(&first).await;
+            let exchange = once(reporter.clone());
+            crate::observe::scope_pin!(exchange);
+            let exchange =
+                crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
+            exchange.await.map_err(|error| {
                 let detail = error.to_string();
                 error.context(format!(
                     "{label} failed after retry: {detail} (first: {first})"
@@ -100,7 +119,7 @@ mod tests {
                 }
                 Ok(vec![1, 2, 3])
             },
-            || async {
+            |_| async {
                 resets.fetch_add(1, Ordering::SeqCst);
             },
             None,
@@ -158,10 +177,9 @@ mod tests {
 
         let plan = manager.selection_plan_for_target("score", &context);
         let incumbent = plan.entries[0].node.id;
-        let feedback = plan.entries[0]
-            .feedback
-            .clone()
-            .expect("Score candidate feedback");
+        let feedback = manager
+            .feedback_for_group_node("score", incumbent, context.clone())
+            .unwrap();
         let calls = AtomicUsize::new(0);
         let query = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
@@ -190,8 +208,8 @@ mod tests {
                     reporter.rx(1);
                     Ok(response.clone())
                 },
-                || async {},
-                Some(&feedback),
+                |_| async {},
+                Some(feedback.business().begin().unwrap()),
             )
             .await
             .expect("retry succeeds");
@@ -201,5 +219,73 @@ mod tests {
             .node
             .id;
         assert_eq!(selected, incumbent);
+    }
+
+    #[tokio::test]
+    async fn deterministic_answer_does_not_reset_or_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+        let reset_count = Arc::clone(&resets);
+
+        let error = super::exchange_with_retry(
+            "test",
+            &[0; 12],
+            move |_| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<Vec<u8>, _>(
+                        crate::dns::transport::doh_message::DeterministicResponse {
+                            transport: "DoH",
+                            reason: "HTTP status 400".into(),
+                        }
+                        .into(),
+                    )
+                }
+            },
+            move |_| {
+                reset_count.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<super::super::doh_message::DeterministicResponse>())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn packet_rejection_does_not_reset_or_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+        let reset_count = Arc::clone(&resets);
+
+        let error = super::exchange_with_retry(
+            "test",
+            &[0; 12],
+            move |_| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                async { Err::<Vec<u8>, _>(honk_outbound::proxy::PacketRejection::Policy.into()) }
+            },
+            move |_| {
+                reset_count.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(honk_outbound::proxy::is_packet_rejection(&error));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
     }
 }

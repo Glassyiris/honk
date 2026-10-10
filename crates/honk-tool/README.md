@@ -70,9 +70,10 @@ the resolver returns no AAAA. Override them with
 - proxied latency via `urltest_node` (default target:
   `https://www.gstatic.com/generate_204`),
 - UDP liveness: a minimal DNS A query **and** a real QUIC handshake (h3,
-  certificates skipped) through a node's packet handler. VMess, legacy VLESS,
-  and nodes whose `network` excludes UDP report `n/a`; every non-legacy VLESS
-  mode otherwise runs both probes through its mode-specific packet transport.
+  certificates skipped) through the node's selected packet path. Protocols
+  without a packet handler, nodes whose packet network disables UDP, and a
+  target rejected by VLESS UDP/443 policy report `n/a`; H2MUX, Xray mux, and
+  fallback encodings are exercised according to the normalized node.
 
 Ends with alive-per-family counts and the median latency.
 
@@ -80,13 +81,23 @@ Ends with alive-per-family counts and the median latency.
 explicit target. Pass dae-style targets to skip DNS:
 `--v4-target 1.1.1.1:443 --v6-target '[2606:4700:4700::1111]:443'`.
 
-VLESS output uses only the node display name and a normalized shape such as
-`vless/reality/tcp/vision` or `vless/tls/tcp/h2mux-padded`. Invalid and intentionally unsupported feed entries
-remain visible with fixed codes (`invalid-uuid`, `invalid-reality`,
-`unsupported-transport`, `unsupported-flow`, `vision-without-tls`, or
-`vision-non-tcp`) but perform no network work. Network failures are limited to
-`resolve`, `timeout`, `exchange`, and `handler`; raw errors, proxy endpoints,
-SNI, UUIDs, REALITY keys, and URL query data are never printed.
+VLESS output uses only the display name and this normalized redacted shape:
+
+```text
+vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
+```
+
+`udp-fallback=` remains visible when a mux owns the current UDP target;
+`udp=disabled` means packet dialing is forbidden. Xray `TCP` is the per-carrier
+TCP logical-child concurrency; `UDP` is `protocol`, `shared`, or a separate
+pool's per-carrier logical-child concurrency. `POLICY` is `reject`, `skip`,
+or `allow`. Invalid and intentionally unsupported entries remain visible with
+fixed eligibility codes but perform no network work. Local carrier-capacity
+refusal is an attempted `FAIL(...)`, not `n/a`, and is neutral to remote
+endpoint health. Failure codes are `resolve`, `timeout`, `exchange`, `handler`,
+and `admission`; raw errors, proxy endpoints, SNI, UUIDs, REALITY keys, and URL
+query data are never printed. See the [CLI reference](../../doc/en/reference/cli.md#sub)
+for the complete eligibility list and shape semantics.
 
 ```text
 $ honk-tool sub https://example.com/sub --limit 3
@@ -125,8 +136,11 @@ tx/rx counters.
 ### `diagnose` — one-shot health check
 
 ```bash
-honk-tool diagnose [--api http://127.0.0.1:9090] [--pin-root PATH] [--tproxy-mark 0x8000000]
+honk-tool diagnose [--api http://127.0.0.1:9090] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark 0x8000000]
 ```
+
+For an authenticated Clash API, supply `--secret TOKEN` or set `HONK_API_SECRET`.
+The flag takes precedence; the token is sent as `Authorization: Bearer`.
 
 Read-only checks, each printed as `[ok]` / `[FAIL]`:
 
@@ -136,9 +150,11 @@ Read-only checks, each printed as `[ok]` / `[FAIL]`:
 4. required pinned maps present (`CONN_STATE_MAP`, `REDIRECT_TRACK`,
    `ROUTING_HANDOFF_MAP`, `CONN_STATE_OCCUPANCY`),
 5. conn-state occupancy + overflow counters readable,
-6. clash API reachable (`/version`).
+6. clash API returns a 2xx status (`/version`), printing the response body;
+   a non-2xx status prints `[FAIL]` with the status text.
 
-Exits with `all checks passed` or `N issue(s) found`.
+Standard output ends with `diagnose: all checks passed` (exit status `0`) or
+`diagnose: N issue(s) found` (exit status `1`, with the count in the error message).
 
 ## Design notes
 

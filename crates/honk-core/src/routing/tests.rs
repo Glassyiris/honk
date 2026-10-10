@@ -2,17 +2,6 @@ use super::*;
 use honk_config::routing::{RoutingCondition, RoutingOutbound};
 
 #[test]
-fn router_clone_shares_compiled_state() {
-    let router = Router::new(&[], "direct").unwrap();
-    let clone = router.clone();
-    assert!(Arc::ptr_eq(&router.routes, &clone.routes));
-    assert!(Arc::ptr_eq(
-        &router.default_outbound,
-        &clone.default_outbound
-    ));
-}
-
-#[test]
 fn test_trie_empty() {
     let trie = BinaryLpmTrie::from_nets(&[]);
     assert!(!trie.matches(&"1.2.3.4".parse().unwrap()));
@@ -314,8 +303,25 @@ fn test_priority_ordering() {
     assert_eq!(router.route(&conn), "proxy2");
 }
 
+/// Both geosite route tests need `geosite.dat`. This override lived inside
+/// `test_geosite_route`, so on a checkout where the asset is reachable only
+/// through it, `test_geosite_cn_route` passed or failed by whichever ran
+/// first in the process.
+#[allow(clippy::let_unit_value)]
+fn use_repo_geo_assets() {
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    let _ = unsafe {
+        std::env::set_var(
+            "DAE_LOCATION_ASSET",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+        )
+    };
+}
+
 #[test]
 fn test_geosite_cn_route() {
+    use_repo_geo_assets();
+
     let rules = vec![RoutingRule {
         name: "geosite-cn-direct".into(),
         condition: RoutingCondition {
@@ -442,32 +448,6 @@ fn test_process_name_route_matching() {
     assert_eq!(router.route(&make_conn(Some("curl"), None)), "proxy");
     assert_eq!(router.route(&make_conn(Some("wget"), None)), "direct");
     assert_eq!(router.route(&make_conn(None, None)), "direct");
-}
-
-#[test]
-fn test_process_name_route_matching_uses_kernel_comm_limit() {
-    let rules = vec![RoutingRule {
-        name: "resolved-direct".into(),
-        condition: RoutingCondition {
-            process_name: vec!["systemd-resolved".into()],
-            ..Default::default()
-        },
-        outbound: RoutingOutbound::Simple("direct".into()),
-        priority: 0,
-        must: true,
-        mark: 0,
-    }];
-
-    let router = Router::new(&rules, "proxy").unwrap();
-
-    assert_eq!(
-        router.route(&make_conn(Some("systemd-resolve"), None)),
-        "direct"
-    );
-    assert_eq!(
-        router.compiled_routes()[0].process_names,
-        vec!["systemd-resolve"]
-    );
 }
 
 #[test]
@@ -790,15 +770,83 @@ fn test_geoip_private_route() {
 }
 
 #[test]
-#[allow(clippy::let_unit_value)]
-fn test_geosite_route() {
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    let _ = unsafe {
-        std::env::set_var(
-            "DAE_LOCATION_ASSET",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
-        )
+fn equal_ip_networks_share_one_matcher_across_routing_and_dns() {
+    use crate::dns::routing::DnsRouter;
+
+    use_repo_geo_assets();
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n u: 'udp://127.0.0.1:53'\n }\n routing { response {\n\
+         ip(geoip:private) -> accept\n !ip(198.18.0.0/15, geoip:private) -> reject\n\
+         fallback: u\n } } }\n\
+         routing {\n dip(geoip:private) && dport(443) -> block\n dip(geoip:private) -> direct\n\
+         dip(198.18.0.0/15, geoip:private) -> proxy\n !dip(geoip:private) && dport(53) -> alt\n\
+         fallback: fb\n }",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let sources = GeoSourceSet::load(&requirements);
+    let mut shared = SharedMatchers::default();
+    let router = Router::from_config_sharing(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_sharing(&config.dns, &sources, &mut shared).unwrap();
+    drop(shared);
+    let unshared_router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+    let unshared_dns = DnsRouter::new_with_geo_sources(&config.dns, &sources).unwrap();
+
+    let routed: Vec<_> = router
+        .compiled_routes()
+        .iter()
+        .flat_map(|route| &route.conditions)
+        .filter_map(|condition| match &condition.predicate {
+            CompiledPredicate::DestinationIp(matcher) => Some(matcher),
+            _ => None,
+        })
+        .collect();
+    let answered = dns.answer_ip_tries();
+    let [geo, geo_again, literal, negated] = routed[..] else {
+        panic!("expected four destination IP conditions");
     };
+    assert!(Arc::ptr_eq(geo, geo_again) && Arc::ptr_eq(geo, negated));
+    assert!(Arc::ptr_eq(geo.trie(), answered[0]) && Arc::ptr_eq(literal.trie(), answered[1]));
+    assert!(!Arc::ptr_eq(geo, literal));
+    assert_eq!(
+        router.policy_fingerprint(),
+        unshared_router.policy_fingerprint()
+    );
+
+    let mut conn = make_conn(None, None);
+    for ip in [
+        "10.0.0.1",
+        "8.8.8.8",
+        "198.18.0.1",
+        "fd00::1",
+        "2001:4860::1",
+    ] {
+        conn.dst_ip = ip.parse().unwrap();
+        for port in [53, 80, 443] {
+            conn.dst_port = port;
+            assert_eq!(router.route(&conn), unshared_router.route(&conn), "{ip}");
+        }
+        let response = |dns: &DnsRouter| dns.select_response("a.test", 1, &[conn.dst_ip], "u");
+        assert_eq!(response(&dns), response(&unshared_dns), "{ip}");
+    }
+
+    let (matcher, trie) = (Arc::downgrade(geo), Arc::downgrade(geo.trie()));
+    drop(router);
+    assert!(
+        matcher.upgrade().is_none(),
+        "DNS must keep only the trie, not the network list"
+    );
+    drop(dns);
+    assert!(
+        trie.upgrade().is_none(),
+        "the build must not outlive its routers"
+    );
+}
+
+#[test]
+fn test_geosite_route() {
+    use_repo_geo_assets();
 
     let rules = vec![RoutingRule {
         name: "geosite-cn".into(),
@@ -823,25 +871,76 @@ fn test_geosite_route() {
 }
 
 #[test]
-fn test_must_flag_on_outbound() {
-    let rules = vec![RoutingRule {
-        name: "must-direct".into(),
-        condition: RoutingCondition {
-            ip: vec!["10.0.0.0/8".into()],
-            ..Default::default()
-        },
-        outbound: RoutingOutbound::Simple("direct(must)".into()),
-        priority: 0,
-        must: false,
-        mark: 0,
-    }];
+fn geosite_selectors_share_one_matcher_across_routing_and_dns() {
+    use crate::dns::routing::DnsRouter;
 
-    let router = Router::new(&rules, "proxy").unwrap();
+    use_repo_geo_assets();
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n u: 'udp://127.0.0.1:53'\n }\n routing {\n\
+         request {\n qname(geosite:category-games@CN) -> reject\n qname(geosite:CN) -> u\n\
+         fallback: asis\n }\n response {\n qname(geosite:category-games) -> reject\n\
+         fallback: accept\n } } }\n\
+         routing {\n domain(geosite:cn, geosite:category-games@cn) -> direct\n\
+         domain(geosite:category-games) -> games\n !domain(geosite:private) && dport(53) -> alt\n\
+         fallback: fb\n }",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules)
+        .union(&DnsRouter::geo_requirements(&config.dns));
+    let sources = GeoSourceSet::load(&requirements);
+    let mut shared = SharedMatchers::default();
+    let router = Router::from_config_sharing(&config.routing, &sources, &mut shared).unwrap();
+    let dns = DnsRouter::new_sharing(&config.dns, &sources, &mut shared).unwrap();
+    drop(shared);
+    let unshared_router = Router::from_config_with_geo_sources(&config.routing, &sources).unwrap();
+    let unshared_dns = DnsRouter::new_with_geo_sources(&config.dns, &sources).unwrap();
+
+    let [cn, games_cn, games, private] = router.geosite_matchers()[..] else {
+        panic!("expected four routing geosite selectors");
+    };
+    let [dns_games_cn, dns_cn, dns_games] = dns.geosite_matchers()[..] else {
+        panic!("expected three DNS geosite selectors");
+    };
+    assert!(Arc::ptr_eq(cn, dns_cn) && Arc::ptr_eq(games_cn, dns_games_cn));
+    assert!(Arc::ptr_eq(games, dns_games));
+    assert!(!Arc::ptr_eq(games, games_cn) && !Arc::ptr_eq(cn, private));
+    assert_eq!(
+        router.policy_fingerprint(),
+        unshared_router.policy_fingerprint()
+    );
+
     let mut conn = make_conn(None, None);
-    conn.dst_ip = "10.0.0.1".parse().unwrap();
-    let result = router.route_full(&conn).unwrap();
-    assert_eq!(result.outbound_name, "direct");
-    assert!(result.must);
+    for domain in [
+        "www.baidu.com",
+        "WWW.QQ.com",
+        "store.steampowered.com",
+        "www.steamchina.com",
+        "localhost",
+        "example.org",
+    ] {
+        conn.domain = Some(domain.into());
+        for port in [53, 443] {
+            conn.dst_port = port;
+            let route = router.route(&conn);
+            assert_eq!(route, unshared_router.route(&conn), "{domain}");
+        }
+        let lower = domain.to_ascii_lowercase();
+        assert_eq!(
+            dns.select_request(&lower, 1),
+            unshared_dns.select_request(&lower, 1)
+        );
+        assert_eq!(
+            dns.select_response(&lower, 1, &[], "u"),
+            unshared_dns.select_response(&lower, 1, &[], "u")
+        );
+    }
+
+    let old = Arc::downgrade(cn);
+    drop((router, dns));
+    assert!(
+        old.upgrade().is_none(),
+        "the build must not outlive its routers"
+    );
 }
 
 #[test]
@@ -862,12 +961,12 @@ fn test_must_flag_on_rule() {
     let mut conn = make_conn(None, None);
     conn.dst_ip = "10.0.0.1".parse().unwrap();
     let result = router.route_full(&conn).unwrap();
-    assert_eq!(result.outbound_name, "direct");
-    assert!(result.must);
+    assert_eq!(result.action.outbound, "direct");
+    assert!(result.action.must);
 }
 
 #[test]
-fn test_route_with_must() {
+fn test_route_action_must() {
     let rules = vec![
         RoutingRule {
             name: "must-direct".into(),
@@ -875,9 +974,9 @@ fn test_route_with_must() {
                 ip: vec!["10.0.0.0/8".into()],
                 ..Default::default()
             },
-            outbound: RoutingOutbound::Simple("direct(must)".into()),
+            outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
-            must: false,
+            must: true,
             mark: 0,
         },
         RoutingRule {
@@ -895,17 +994,20 @@ fn test_route_with_must() {
     let router = Router::new(&rules, "proxy").unwrap();
     let mut conn = make_conn(None, None);
 
-    // (must) rule match → flag set.
+    // Must rule match → flag set.
     conn.dst_ip = "10.0.0.1".parse().unwrap();
-    assert_eq!(router.route_with_must(&conn), ("direct", true));
+    let (action, _) = router.route_action(&conn);
+    assert_eq!((&*action.outbound, action.must), ("direct", true));
 
     // Plain rule match → flag clear.
     conn.dst_ip = "192.168.1.1".parse().unwrap();
-    assert_eq!(router.route_with_must(&conn), ("proxy", false));
+    let (action, _) = router.route_action(&conn);
+    assert_eq!((&*action.outbound, action.must), ("proxy", false));
 
     // Default-outbound fallback never carries must.
     conn.dst_ip = "8.8.8.8".parse().unwrap();
-    assert_eq!(router.route_with_must(&conn), ("proxy", false));
+    let (action, _) = router.route_action(&conn);
+    assert_eq!((&*action.outbound, action.must), ("proxy", false));
 }
 
 #[test]
@@ -926,8 +1028,126 @@ fn test_mark_propagation() {
     let mut conn = make_conn(None, None);
     conn.dst_port = 443;
     let result = router.route_full(&conn).unwrap();
-    assert_eq!(result.outbound_name, "proxy");
-    assert_eq!(result.mark, 42);
+    assert_eq!(result.action.outbound, "proxy");
+    assert_eq!(result.action.mark.map(DirectMark::get), Some(42));
+}
+
+#[test]
+fn terminal_direct_mark_indexes_are_deduplicated_and_generation_owned() {
+    let config = honk_config::parser::parse_dae_config(
+        "routing {\n dport(53) -> direct(must, mark: 0x3fffffff)\n dport(80) -> direct(must, mark: 512)\n dport(443) -> direct(must, mark: 512)\n dport(22) -> direct(mark: 1024)\n dport(25) -> direct(must, mark: 0)\n}",
+    )
+    .unwrap();
+    let router = Router::new(&config.routing.rules, "direct").unwrap();
+    assert_eq!(router.direct_mark(0), Some(512));
+    assert_eq!(router.direct_mark(1), Some(0x3fff_ffff));
+    assert_eq!(router.direct_mark(2), None);
+    assert_eq!(
+        router.compiled_routes()[0].action.direct_mark_index,
+        Some(1)
+    );
+    assert_eq!(
+        router.compiled_routes()[1].action.direct_mark_index,
+        Some(0)
+    );
+    assert_eq!(router.compiled_routes()[3].action.direct_mark_index, None);
+    assert_eq!(router.compiled_routes()[4].action.direct_mark_index, None);
+    assert!(router.has_direct_marks());
+    let ordinary_only = config.routing.rules[3].clone();
+    assert!(
+        Router::new(&[ordinary_only], "direct")
+            .unwrap()
+            .has_direct_marks()
+    );
+
+    let mut changed = config.routing.rules;
+    changed[0].mark = 1;
+    let replacement = Router::new(&changed, "direct").unwrap();
+    assert_eq!(replacement.direct_mark(0), Some(1));
+    assert_eq!(router.direct_mark(0), Some(512));
+    assert_eq!(router.clone().direct_mark(1), Some(0x3fff_ffff));
+}
+
+#[test]
+fn terminal_direct_mark_capacity_counts_distinct_terminal_marks_only() {
+    let mut rules: Vec<_> = (0..256)
+        .map(|index| RoutingRule {
+            name: format!("marked-{index}"),
+            condition: RoutingCondition {
+                port: vec!["53".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: index,
+            must: true,
+            mark: 0x3fff_ff00 + index,
+        })
+        .collect();
+    let duplicate = rules[0].clone();
+    rules.push(duplicate);
+    for index in 1..=257 {
+        let mut ordinary = rules[0].clone();
+        ordinary.must = false;
+        ordinary.mark = index;
+        rules.push(ordinary);
+        let mut proxy = rules[0].clone();
+        proxy.outbound = RoutingOutbound::Simple("proxy".into());
+        proxy.mark = index;
+        rules.push(proxy);
+    }
+    let router = Router::new(&rules, "direct").unwrap();
+    let ids = std::collections::HashMap::from([("direct".into(), 0), ("proxy".into(), 2)]);
+    let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+        &router,
+        &ids,
+        honk_config::types::DialMode::Ip,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.rules
+            .iter()
+            .find(|rule| rule.action.mark == 0x3fff_ffff)
+            .unwrap()
+            .action
+            .direct_mark_index,
+        Some(255)
+    );
+    assert_eq!(router.direct_mark(0), Some(0x3fff_ff00));
+    assert_eq!(router.direct_mark(255), Some(0x3fff_ffff));
+    let mut excess = rules[0].clone();
+    excess.mark = 1;
+    rules.push(excess);
+    assert!(Router::new(&rules, "direct").is_err());
+}
+
+#[test]
+fn parsed_marked_fallback_routes_unmatched_ipv4_and_ipv6() {
+    let config = honk_config::parser::parse_dae_config(
+        "routing {\n fallback: direct(must, mark: 0x200)\n dport(443) -> block\n}",
+    )
+    .unwrap();
+    let router = Router::from_config(&config.routing).unwrap();
+    assert_eq!(router.fallback().direct_mark_index, Some(0));
+    for address in ["192.0.2.1", "2001:db8::1"] {
+        for protocol in ["tcp", "udp"] {
+            let mut connection = make_conn(None, None);
+            connection.dst_ip = address.parse().unwrap();
+            connection.protocol = protocol;
+            connection.dst_port = 80;
+            let (action, matched) = router.route_action(&connection);
+            assert_eq!(
+                (
+                    action.outbound.as_str(),
+                    action.must,
+                    action.mark.map(DirectMark::get)
+                ),
+                ("direct", true, Some(512))
+            );
+            assert!(matched.is_none());
+            connection.dst_port = 443;
+            assert_eq!(router.route_action(&connection).0.outbound, "block");
+        }
+    }
 }
 
 #[test]
@@ -1000,60 +1220,68 @@ fn test_geosite_matcher_semantics() {
 }
 
 #[test]
-fn test_route_domain_matches_suffix_and_skips_ip_port_only() {
-    let rules = vec![
-        // Pure IP rule — must NOT match a domain-only probe even if
-        // 0.0.0.0 happens to sit inside a broad CIDR.
-        RoutingRule {
-            name: "ip-private".into(),
-            condition: RoutingCondition {
-                ip: vec!["0.0.0.0/0".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("direct".into()),
-            priority: 0,
-            must: false,
-            mark: 0,
-        },
-        // Pure port rule — domain-only probes have port 0, but even if
-        // they did match, route_domain skips non-domain rules.
-        RoutingRule {
-            name: "port-proxy".into(),
-            condition: RoutingCondition {
-                port: vec!["443".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("proxy".into()),
-            priority: 1,
-            must: false,
-            mark: 0,
-        },
-        RoutingRule {
-            name: "suffix-google".into(),
-            condition: RoutingCondition {
-                domain_suffix: vec!["google.com".into()],
-                ..Default::default()
-            },
-            outbound: RoutingOutbound::Simple("google-group".into()),
-            priority: 2,
-            must: false,
-            mark: 0,
-        },
-    ];
-
-    let router = Router::new(&rules, "final-group").unwrap();
-
-    let m = router.route_domain("www.google.com").expect("suffix match");
-    assert_eq!(m.rule_name, "suffix-google");
-    assert_eq!(m.outbound_name, "google-group");
-
-    // No domain rule → None (do NOT fall through to default / IP / port).
-    assert!(router.route_domain("www.example.com").is_none());
-    assert!(router.route_domain("analytics.tiktok.com").is_none());
+fn geosite_matchers_intern_on_exact_expansions() {
+    use GeositeDomain::{Domain, Full, Keyword};
+    let mut registry = DomainRegistry::default();
+    let mut intern = |domains: Vec<GeositeDomain>| {
+        registry
+            .intern(DomainMatcher::new(&[], &[], &[], &[], &domains, Vec::new()).unwrap())
+            .unwrap()
+    };
+    let base = intern(vec![Domain("Example.COM".into()), Keyword("Tube".into())]);
+    let normalized = intern(vec![
+        Keyword("Tube".into()),
+        Domain("example.com".into()),
+        Domain("EXAMPLE.com".into()),
+    ]);
+    let kind = intern(vec![Full("example.com".into()), Keyword("Tube".into())]);
+    let keyword_case = intern(vec![Domain("example.com".into()), Keyword("tube".into())]);
+    assert_eq!(base, normalized);
+    assert_ne!(base, kind);
+    assert_ne!(base, keyword_case);
+    assert_ne!(kind, keyword_case);
 }
 
 #[test]
-fn test_route_domain_does_not_claim_default_as_match() {
+fn geosite_policy_fingerprint_covers_the_exact_expansion() {
+    use_repo_geo_assets();
+    let rules = vec![RoutingRule {
+        name: "geosite-cn-direct".into(),
+        condition: RoutingCondition {
+            geosite: vec!["cn".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "proxy").unwrap();
+    let requirements = GeoRequirements::for_traffic(&rules);
+    let sources = GeoSourceSet::load(&requirements);
+    let (exact, _) = DomainMatcher::new(
+        &[],
+        &[],
+        &[],
+        &[],
+        &GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(!exact.is_empty());
+    assert_eq!(
+        router.policy_fingerprint(),
+        fingerprint::policy(
+            &router.routes.routes,
+            std::slice::from_ref(&exact),
+            &router.fallback,
+            router.routes.geo_fingerprint,
+        )
+    );
+}
+
+#[test]
+fn test_domain_bitmap_does_not_claim_default_as_match() {
     let rules = vec![RoutingRule {
         name: "cn-suffix".into(),
         condition: RoutingCondition {
@@ -1066,19 +1294,72 @@ fn test_route_domain_does_not_claim_default_as_match() {
         mark: 0,
     }];
     let router = Router::new(&rules, "🍥 final").unwrap();
+    assert_eq!(router.domain_predicate_count(), 1);
 
+    let mut conn = make_conn(None, None);
+    conn.domain = Some("baidu.cn".into());
+    let bitmap = router.domain_bitmap("baidu.cn").expect("domain facts");
     assert_eq!(
-        router.route_domain("baidu.cn").map(|m| m.outbound_name),
+        router
+            .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+            .map(|matched| matched.action.outbound.as_str()),
         Some("direct")
     );
-    // Unmatched domain must not pretend to match the default outbound.
-    assert!(router.route_domain("example.org").is_none());
-    // Real connection-time routing still returns the default via route().
-    let mut conn = make_conn(None, None);
+
     conn.domain = Some("example.org".into());
-    conn.dst_ip = "1.2.3.4".parse().unwrap();
-    conn.dst_port = 443;
+    let bitmap = router
+        .domain_bitmap("example.org")
+        .expect("known domain facts");
+    assert_eq!(bitmap.bitmap[0], 0);
+    assert!(
+        router
+            .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+            .is_none()
+    );
     assert_eq!(router.route(&conn), "🍥 final");
+}
+
+#[test]
+fn domain_bitmap_covers_full_regex_and_negative_compound_conditions() {
+    let rules = vec![RoutingRule {
+        name: "compound-domain".into(),
+        condition: RoutingCondition {
+            domain: vec!["exact.test".into(), "*.blocked.test".into()],
+            domain_regex: vec![r"^regex\.test$".into()],
+            not: honk_config::routing::RoutingNotCondition {
+                domain_suffix: vec!["blocked.test".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("proxy".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "direct").unwrap();
+    assert_eq!(router.domain_predicate_count(), 2);
+
+    let mut conn = make_conn(None, None);
+    for domain in ["exact.test", "regex.test"] {
+        conn.domain = Some(domain.into());
+        let bitmap = router.domain_bitmap(domain).unwrap();
+        assert_eq!(
+            router
+                .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+                .map(|matched| matched.action.outbound.as_str()),
+            Some("proxy")
+        );
+    }
+    conn.domain = Some("exact.blocked.test".into());
+    let bitmap = router
+        .domain_bitmap(conn.domain.as_deref().unwrap())
+        .unwrap();
+    assert!(
+        router
+            .route_full_with_domain_bitmap(&conn, Some(&bitmap))
+            .is_none()
+    );
 }
 
 mod negation {
@@ -1274,35 +1555,6 @@ mod negation {
     }
 
     #[test]
-    fn test_negated_geosite_matcher() {
-        // Build the base route without geo assets; then swap in a synthetic
-        // negated geosite matcher (the dat-backed positive side is covered
-        // by test_geosite_route above).
-        let router =
-            Router::new(&[rule("neg", not(&[("port", "53")]), "proxy")], "direct").unwrap();
-        let route = &router.compiled_routes()[0];
-        let domains = vec![GeositeDomain::Domain("x.com".into())];
-        let route = CompiledRoute {
-            not_ports: Vec::new(),
-            not_geosite_domains: domains.clone(),
-            not_geosite_matcher: GeositeMatcher::build(&domains),
-            ..route.clone()
-        };
-        let router = Router {
-            routes: vec![route].into(),
-            default_outbound: "direct".into(),
-        };
-        let mut veto = conn();
-        veto.domain = Some("www.x.com".into());
-        assert_eq!(router.route(&veto), "direct");
-        let mut hit = conn();
-        hit.domain = Some("y.com".into());
-        assert_eq!(router.route(&hit), "proxy");
-        // Unknown domain never vetoes a negated geosite matcher.
-        assert_eq!(router.route(&conn()), "proxy");
-    }
-
-    #[test]
     fn test_production_rule_sip_and_not_dport() {
         let rules = vec![
             RoutingRule {
@@ -1342,7 +1594,7 @@ mod negation {
         web_flow.dst_port = 80;
         let m = router.route_full(&web_flow).unwrap();
         assert_eq!(m.rule_name, "host24-not-dns");
-        assert!(m.must);
+        assert!(m.action.must);
     }
 
     #[test]
@@ -1394,4 +1646,14 @@ fn bare_ip_in_dip_sip_parses_as_host_route() {
     assert_eq!(hit("10.9.9.9", "192.168.222.2"), "direct");
     assert_eq!(hit("10.9.9.8", "192.168.222.2"), "proxy");
     assert_eq!(hit("10.9.9.9", "192.168.222.3"), "proxy");
+}
+
+#[test]
+fn lowercase_copies_only_names_that_change() {
+    assert!(matches!(
+        lowercase("www.example.com"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    assert_eq!(lowercase("WWW.Example.com"), "www.example.com");
+    assert_eq!(lowercase("É.example"), "é.example");
 }

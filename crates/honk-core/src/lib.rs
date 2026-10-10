@@ -9,20 +9,30 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
-pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
+pub mod config_diagnostics;
+pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
+pub(crate) mod degradations;
 pub mod dns;
+pub(crate) mod download_route;
 pub mod ebpf;
+mod logging;
+mod marked_http;
 pub mod mode;
+#[cfg(feature = "native-api")]
+pub mod native_api;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;
+#[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
+pub(crate) mod observe;
 pub mod pool;
 pub mod relay;
 pub mod routing;
 pub mod sniffing;
+pub mod state;
 pub mod stats;
 pub mod subscription;
 
@@ -30,11 +40,27 @@ pub use honk_outbound::alive as outbound;
 pub use honk_outbound::group;
 pub use honk_outbound::proxy;
 
+/// Build-time release tag or Git description; package version without Git metadata.
+pub const VERSION: &str = env!("HONK_VERSION");
+/// The commit this binary was built from; empty when the build had no Git checkout.
+pub const REVISION: &str = env!("HONK_REVISION");
+/// The target triple this binary was built for.
+pub const TARGET: &str = env!("HONK_TARGET");
+
 use clap::Parser;
 use honk_config::Config;
-use honk_ebpf_common::ParamKey;
+use honk_config::diagnostic::{
+    DetailedDiagnostic, DiagnosticSources, SettingPath, finish_attempt, report_detailed_diagnostics,
+};
+use honk_config::error::{DetailedConfigError, ErrorCategory};
+use logging::{
+    LOG_FILE_LIMIT, LocalTime, QUIET_LOG_TARGETS, RotatingLogFile, console_ansi, console_log_layer,
+    resolved_log_file_path,
+};
+use state::startup::{claim_state, open_state_db};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 /// Raise the soft descriptor limit toward the hard maximum, then return the
 /// one startup snapshot used to size every control-plane descriptor owner.
@@ -165,10 +191,44 @@ pub enum ClashCommand {
     },
     /// Ask the running instance to reload its configured file
     Reload,
+    /// Read the configuration db
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+    /// Manage the password-mode administrator
+    Admin {
+        #[command(subcommand)]
+        action: AdminCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Delete the administrator record so that setup opens again; refused while honk-core runs
+    Reset,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write the active revision as one dae file, listener secrets included
+    Export {
+        /// New file to write; an existing one is refused
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Leave the listener secrets out
+        #[arg(long)]
+        without_secrets: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None, disable_version_flag = true)]
+#[command(arg(clap::Arg::new("version")
+    .short('v')
+    .long("version")
+    .action(clap::ArgAction::Version)
+    .help("Print version")))]
 pub struct Cli {
     /// Subcommand (reload, mode, proxy, delay)
     #[command(subcommand)]
@@ -195,23 +255,86 @@ pub struct Cli {
     #[arg(short, long)]
     pub debug: bool,
 
+    /// Omit timestamps from console log lines, for journald or another
+    /// logger that stamps them itself. The log file keeps its timestamps.
+    #[arg(long)]
+    pub disable_timestamp: bool,
+
     /// Use mock eBPF backend (for testing without kernel support)
     #[arg(long)]
     pub mock_ebpf: bool,
+
+    /// Where the administered configuration lives: the `-c` file tree, or the
+    /// revisions in `<data-dir>/state/honk.db`
+    #[arg(long, value_enum, default_value = "file")]
+    pub store: ConfigStore,
+
+    /// Runtime data directory holding the state db; must equal `global.data_dir`
+    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR, global = true)]
+    pub data_dir: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigStore {
+    File,
+    Db,
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
-    use std::net::ToSocketAddrs;
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
+    let read_config = || -> anyhow::Result<Config> {
+        match cli.store {
+            ConfigStore::File => Ok(Config::from_file(cli.config.to_str().unwrap())?),
+            #[cfg(feature = "native-api")]
+            ConfigStore::Db => {
+                let text = native_api::store::db::export(&cli.data_dir, true)
+                    .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+                Ok(honk_config::parser::parse_dae_config(&text)?)
+            }
+            #[cfg(not(feature = "native-api"))]
+            ConfigStore::Db => anyhow::bail!("--store db needs the native-api feature"),
+        }
+    };
 
     match cmd {
+        #[cfg(feature = "native-api")]
+        ClashCommand::Config {
+            action:
+                ConfigCommand::Export {
+                    out,
+                    without_secrets,
+                },
+        } => {
+            native_api::store::db::export_to(&cli.data_dir, out, !without_secrets)?;
+            println!(
+                "Exported the active configuration revision to {}",
+                out.display()
+            );
+        }
+        #[cfg(not(feature = "native-api"))]
+        ClashCommand::Config { .. } => anyhow::bail!("config export needs the native-api feature"),
+        ClashCommand::Admin {
+            action: AdminCommand::Reset,
+        } => {
+            let deleted = state::reset_admin(&cli.data_dir)
+                .map_err(|error| anyhow::anyhow!("admin reset: {error}"))?;
+            if deleted {
+                println!("Deleted the administrator; setup is open again");
+            } else {
+                println!("No administrator was set up");
+            }
+        }
         ClashCommand::Reload => {
             let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
             println!("Reload requested for honk-core process {pid}");
         }
         ClashCommand::Mode { mode } => {
+            anyhow::ensure!(
+                cli.store == ConfigStore::File,
+                "mode edits the -c file; with --store db, change default_mode through the native API"
+            );
             let valid_modes = ["rule", "global", "direct"];
             if !valid_modes.contains(&mode.as_str()) {
                 anyhow::bail!(
@@ -228,7 +351,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Mode set to {}", mode);
         }
         ClashCommand::Proxy { group, node } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let group_exists = config.groups.iter().any(|g| g.name == *group);
             if !group_exists {
                 anyhow::bail!("Group '{}' not found in configuration", group);
@@ -240,7 +363,14 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Proxy group '{}' set to '{}'", group, node);
         }
         ClashCommand::Delay { node, url } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
+            config.validate()?;
+            honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+            honk_outbound::bootstrap::set_global(
+                honk_outbound::bootstrap::BootstrapResolver::parse(
+                    &config.global.bootstrap_resolver,
+                ),
+            );
             let target_node = config
                 .nodes
                 .iter()
@@ -255,11 +385,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
 
             let start = std::time::Instant::now();
             let timeout = Duration::from_secs(5);
-            let socket_addrs: Vec<_> = addr.to_socket_addrs()?.collect();
-            if socket_addrs.is_empty() {
-                anyhow::bail!("Could not resolve address: {}", addr);
-            }
-            match std::net::TcpStream::connect_timeout(&socket_addrs[0], timeout) {
+            match honk_outbound::util::connect_outbound(&addr, timeout).await {
                 Ok(stream) => {
                     let elapsed = start.elapsed();
                     drop(stream);
@@ -344,20 +470,24 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
 /// under it — the restart race that hung the lab for a day). Waits up
 /// to 240s for the previous instance to exit (busy gateways can take
 /// well over 90s to drain), then fails loudly.
+///
+/// It is taken before the configuration or the state db is opened, so a
+/// successor that fails to take it leaves nothing behind.
 fn acquire_instance_lock(
-    _bpf_pin_root: &std::path::Path,
+    path: &std::path::Path,
+    wait: std::time::Duration,
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
-    // /run (not the bpffs pin root, which rejects regular files).
-    let path = std::path::PathBuf::from(INSTANCE_LOCK_PATH);
     let mut file = std::fs::File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let deadline = std::time::Instant::now() + wait;
+    let holder =
+        || running_instance_pid(path).map_or_else(|_| String::new(), |pid| format!(" (PID {pid})"));
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -368,9 +498,12 @@ fn acquire_instance_lock(
             Err((f, _)) if std::time::Instant::now() < deadline => {
                 file = f; // the failed lock hands the file back for the retry
                 if !logged {
-                    info!(
-                        "another honk-core instance is shutting down; \
-                         waiting for the datapath lock at {}",
+                    // Logging is not set up yet.
+                    eprintln!(
+                        "honk-core: another honk-core instance{} is shutting down; \
+                         waiting up to {}s for the datapath lock at {}",
+                        holder(),
+                        wait.as_secs(),
                         path.display()
                     );
                     logged = true;
@@ -379,13 +512,40 @@ fn acquire_instance_lock(
             }
             Err((_, e)) => {
                 anyhow::bail!(
-                    "another honk-core instance holds {} ({}); refusing to start",
+                    "another honk-core instance{} did not release {} within {}s ({}); \
+                     refusing to start",
+                    holder(),
                     path.display(),
+                    wait.as_secs(),
                     e
                 )
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSTANCE_LOCK: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Only the real datapath owns fixed dae0/daens/TC resources. Mock mode must
+/// remain usable without access to the process-global /run lock.
+fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    #[cfg(test)]
+    if let Some(path) = TEST_INSTANCE_LOCK.with(|path| path.borrow().clone()) {
+        return acquire_instance_lock(&path, std::time::Duration::ZERO).map(Some);
+    }
+    if mock_mode {
+        return Ok(None);
+    }
+    // /run, not the bpffs pin root, which rejects regular files.
+    acquire_instance_lock(
+        std::path::Path::new(INSTANCE_LOCK_PATH),
+        std::time::Duration::from_secs(240),
+    )
+    .map(Some)
 }
 
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
@@ -472,101 +632,295 @@ fn prepare_runtime_data_dir(
     prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
 }
 
-fn resolved_log_file_path(
-    config: &Config,
-    cli_override: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    cli_override
-        .map(honk_config::paths::resolve_artifact_path)
-        .or_else(|| match config.global.log_file.trim() {
-            "" => None,
-            path => Some(honk_config::paths::resolve_artifact_path(path)),
-        })
+/// A valid cached Clash mode, else `default_mode`, else `Rule`.
+#[cfg(feature = "clash-api")]
+fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &str) -> String {
+    mode_db
+        .and_then(|db| db.load_clash_mode())
+        .and_then(|mode| mode::ModeState::normalize(&mode))
+        .or_else(|| mode::ModeState::normalize(default_mode))
+        .unwrap_or_else(|| "Rule".to_owned())
 }
 
-fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            anyhow::anyhow!("create log directory {}: {error}", parent.display())
-        })?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "log destination is not a regular file: {}",
-        path.display()
+fn load_operator_config(
+    path: &str,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
+    let start = diagnostics.len();
+    // The file loader already owns parse failures; only validation finishes here.
+    let config = Config::from_file_with_detailed_diagnostics(path, diagnostics)?;
+    let source = diagnostics.get(start).map_or_else(
+        || DiagnosticSources::new(Some(path.into())).root(),
+        |diagnostic| diagnostic.source.sources().root(),
     );
-    Ok(file)
+    admit_operator_config(config, source, diagnostics)
+}
+
+fn admit_operator_config(
+    config: Config,
+    source: honk_config::diagnostic::SourceRef,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
+    config.append_diagnostics(source.clone(), diagnostics);
+    let result = config.validate_detailed().and_then(|()| {
+        subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
+            DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-subscription-id",
+                source.clone(),
+                SettingPath::new("subscriptions").field("id"),
+                "subscription IDs must be non-nil and unique",
+            )
+        })
+    });
+    let result = result.map_err(|mut error| {
+        error.diagnostic.source = source;
+        error
+    });
+    finish_attempt(result.map(|()| config), diagnostics)
+}
+
+#[cfg(feature = "native-api")]
+fn load_operator_config_captured(
+    path: &std::path::Path,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<(Config, Option<configuration::SourceUpdate>), DetailedConfigError> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dae"))
+    {
+        return load_operator_config(path.to_str().unwrap_or(""), diagnostics)
+            .map(|config| (config, None));
+    }
+    let start = diagnostics.len();
+    let loaded = match Config::from_dae_file_with_sources(
+        path,
+        &std::collections::HashMap::new(),
+        honk_config::parser::SourceLimits::default(),
+        diagnostics,
+    ) {
+        Ok(loaded) => loaded,
+        Err(captured_error) => {
+            diagnostics.truncate(start);
+            let config = load_operator_config(path.to_str().unwrap_or(""), diagnostics)?;
+            if config.experimental.native_api.config_write {
+                return Err(captured_error);
+            }
+            return Ok((config, None));
+        }
+    };
+    let source = loaded.sources[0].source.clone();
+    let config = admit_operator_config(loaded.config, source, diagnostics)?;
+    Ok((
+        config,
+        Some(configuration::SourceUpdate {
+            sources: loaded.sources,
+            dependencies: Vec::new(),
+            geo_sources: None,
+        }),
+    ))
+}
+
+fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
+    for diagnostic in diagnostics.iter().filter(|diagnostic| !diagnostic.terminal) {
+        eprintln!(
+            "{:?} code={} setting={} value={}: {}",
+            diagnostic.severity,
+            diagnostic.code,
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message,
+        );
+    }
+}
+
+/// Render one runtime admission rejection at the process reporting boundary.
+pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
+    let diagnostic = error.diagnostic.as_ref();
+    tracing::warn!(
+        code = diagnostic.code,
+        setting = %diagnostic.setting,
+        value = %diagnostic.value,
+        "runtime configuration rejected: {}",
+        diagnostic.message
+    );
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    #[cfg(feature = "native-api")]
+    let started_at = std::time::SystemTime::now();
+    #[cfg(feature = "native-api")]
+    let started = std::time::Instant::now();
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
-    let mut config = Config::from_file(cli.config.to_str().unwrap())?;
-    config.validate()?;
-    let requested_data_dir = PathBuf::from(&config.global.data_dir);
-    let (runtime_data_dir, data_dir_creation_error) =
-        prepare_runtime_data_dir(&requested_data_dir)?;
-    honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
-        anyhow::anyhow!(
-            "runtime data directory is already {}; cannot switch to {}",
-            honk_config::paths::data_dir().display(),
-            requested.display()
-        )
-    })?;
-    // Make `direct`/`block` usable as group members without declaring them
-    // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
-    config.ensure_builtin_nodes();
-    // Traffic to the gateway's own addresses always goes direct (must),
-    // keeping admin/API access alive even when every node is down.
-    config.ensure_local_direct_rules();
+    let mut diagnostics = Vec::new();
+    #[cfg(feature = "native-api")]
+    let mut native_sources = None;
+    #[cfg(feature = "native-api")]
+    let mut database = None;
+    #[cfg(not(feature = "native-api"))]
+    anyhow::ensure!(
+        cli.store == ConfigStore::File,
+        "--store db needs the native-api feature"
+    );
+    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    // Everything else in `run` drops before it.
+    let _instance_lock = instance_lock(mock_mode)?;
+    let startup = (|| -> anyhow::Result<_> {
+        #[cfg(feature = "native-api")]
+        let mut config = if cli.store == ConfigStore::Db {
+            std::fs::create_dir_all(&cli.data_dir)?;
+            // DbStore needs an absolute, lexically normal entry; a missing -c
+            // is fine once the db holds a revision.
+            let entry =
+                std::fs::canonicalize(&cli.config).or_else(|_| std::path::absolute(&cli.config))?;
+            let startup =
+                native_api::store::DatabaseStartup::open(&entry, &cli.data_dir, &mut diagnostics)?;
+            native_sources = Some(startup.sources.clone());
+            let config = startup.config.clone();
+            database = Some(startup);
+            config
+        } else {
+            let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
+            anyhow::ensure!(
+                sources.is_some() || !config.experimental.native_api.config_write,
+                "native configuration administration requires a dae source file"
+            );
+            native_sources = sources;
+            config
+        };
+        #[cfg(not(feature = "native-api"))]
+        let mut config = load_operator_config(cli.config.to_str().unwrap(), &mut diagnostics)?;
+        #[cfg(not(feature = "native-api"))]
+        anyhow::ensure!(
+            !config.experimental.native_api.enabled,
+            "native-api feature is required"
+        );
+        let requested_data_dir = PathBuf::from(&config.global.data_dir);
+        let (runtime_data_dir, data_dir_creation_error) =
+            prepare_runtime_data_dir(&requested_data_dir)?;
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            cli.store == ConfigStore::File || runtime_data_dir == requested_data_dir,
+            "the configuration db needs its data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            !(config.experimental.native_api.enabled
+                && config.experimental.native_api.password_auth
+                && runtime_data_dir != requested_data_dir),
+            "native API password login needs its configured data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
+        honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
+            anyhow::anyhow!(
+                "runtime data directory is already {}; cannot switch to {}",
+                honk_config::paths::data_dir().display(),
+                requested.display()
+            )
+        })?;
+        // Make `direct`/`block` usable as group members without declaring them
+        // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
+        config.ensure_builtin_nodes();
 
-    // Effective log level: --debug flag > RUST_LOG env > config log_level >
-    // "info".
-    let config_level = match config.global.log_level.trim() {
-        "" => "info",
-        other => other,
-    };
-    let default_level = if cli.debug { "debug" } else { config_level };
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+        // Effective log level: --debug flag > RUST_LOG env > config log_level >
+        // "info".
+        let config_level = match config.global.log_level.trim() {
+            "" => "info",
+            other => other,
+        };
+        let default_level = if cli.debug { "debug" } else { config_level };
+        let env_filter =
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(format!("{default_level},{QUIET_LOG_TARGETS}"))
+            });
 
-    let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
-    let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-        let file = open_log_file(path)?;
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .with_filter(env_filter.clone()),
-        )
-    } else {
-        None
+        let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
+        let (log_file_layer, log_file_level) = if let Some(path) = log_file_path.as_ref() {
+            let file = RotatingLogFile::open(path, LOG_FILE_LIMIT)?;
+            let (filter, level) = tracing_subscriber::reload::Layer::new(env_filter.clone());
+            (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(LocalTime)
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file))
+                        .with_filter(filter),
+                ),
+                Some(level),
+            )
+        } else {
+            (None, None)
+        };
+        Ok((
+            config,
+            requested_data_dir,
+            data_dir_creation_error,
+            log_file_path,
+            log_file_layer,
+            log_file_level,
+            env_filter,
+        ))
+    })();
+    let (
+        mut config,
+        requested_data_dir,
+        data_dir_creation_error,
+        log_file_path,
+        log_file_layer,
+        log_file_level,
+        env_filter,
+    ) = match startup {
+        Ok(startup) => startup,
+        Err(error) => {
+            report_startup_failure(&diagnostics);
+            return Err(error);
+        }
     };
 
     // Console, optional file, and Clash API output use independent layers.
     // With no `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
     let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
+    #[cfg(feature = "native-api")]
+    let (native_log_layer, native_log_binding) = native_api::logs::tracing_layer();
 
     use tracing_subscriber::prelude::*;
+    let (console_filter, console_level) =
+        tracing_subscriber::reload::Layer::new(env_filter.clone());
     let registry = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(console_log_layer(
+            cli.disable_timestamp,
+            console_ansi(
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ),
+            std::io::stdout,
+            console_filter,
+        ))
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
+    #[cfg(feature = "native-api")]
+    let registry = registry.with(native_log_layer);
     registry.init();
+    #[cfg(feature = "native-api")]
+    let engine_level = {
+        let mut engine = native_api::logs::EngineLevel::default();
+        engine.push(console_level, env_filter.clone());
+        if let Some(level) = log_file_level {
+            engine.push(level, env_filter);
+        }
+        engine
+    };
+    #[cfg(not(feature = "native-api"))]
+    let _ = (console_level, log_file_level, env_filter);
 
-    info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
+    info!("honk-core {} starting", VERSION);
     info!("Config: {}", cli.config.display());
     if let Some(error) = data_dir_creation_error {
         warn!(
@@ -576,7 +930,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "Runtime data directory is unusable; using process working directory"
         );
     }
+    report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    let degradations = Arc::new(degradations::Degradations::default());
+    let (state_db, state_reset) =
+        open_state_db(&cli, &config, honk_config::paths::data_dir(), &degradations)?;
+    #[cfg(feature = "native-api")]
+    let state_db = database
+        .as_ref()
+        .map(|database| database.store.state())
+        .or(state_db);
+    let legacy_cache = {
+        let (path, cache_id) = config.experimental.cache_file.legacy_cache_file();
+        let config_dir = cli.config.parent();
+        #[cfg(feature = "native-api")]
+        let config_dir = database
+            .as_ref()
+            .map_or(config_dir, |database| database.store.entry().parent());
+        state::import::LegacyCache::locate(path, cache_id, config_dir)
+    };
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
     }
@@ -599,6 +971,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
+    honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular
     // DNS path — without it a restart can deadlock: nodes are unreachable
@@ -611,127 +985,30 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
+    #[cfg(feature = "native-api")]
+    if let Some(database) = database.as_mut() {
+        database.record()?;
+    }
+    let claimed = claim_state(
+        state_db,
+        state_reset,
+        &config,
+        honk_config::paths::data_dir(),
+        subscription::legacy_store_roots(),
+        &degradations,
+    );
+    let state_db = claimed.state_db;
+
     // A valid stored body makes network refresh non-blocking for startup.
     // Missing subscriptions still get the bounded first-fetch grace period;
     // every fetch continues in the background after the control plane starts.
-    let subscription_store = if config.global.store_subscribe {
-        match subscription::SubscriptionStore::in_data_dir() {
-            Ok(store) => {
-                info!(directory = %store.root().display(), "Subscription store ready");
-                Some(store)
-            }
-            Err(error) => {
-                warn!(%error, "Subscription store unavailable; continuing without persistence");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut sub_manager: Option<std::sync::Arc<subscription::SubscriptionManager>> = None;
-    let mut late_sub_rx = None;
-    let subscriptions: Vec<_> = config
-        .subscriptions
-        .iter()
-        .filter(|sub| sub.enabled)
-        .cloned()
-        .collect();
-    if !subscriptions.is_empty() {
-        let manager = std::sync::Arc::new(subscription::SubscriptionManager::new()?);
-        let sub_count = subscriptions.len();
-        let mut requires_network = std::collections::HashSet::new();
-
-        for (index, sub) in subscriptions.iter().enumerate() {
-            let Some(store) = subscription_store.as_ref() else {
-                requires_network.insert(index);
-                continue;
-            };
-            match store.load_nodes(sub).await {
-                Ok(Some(nodes)) => {
-                    info!(
-                        subscription = %sub.name,
-                        nodes = nodes.len(),
-                        "Restored subscription"
-                    );
-                    config
-                        .nodes
-                        .retain(|node| node.subscription_id != Some(sub.id));
-                    config.nodes.extend(nodes);
-                }
-                Ok(None) => {
-                    requires_network.insert(index);
-                }
-                Err(error) => {
-                    warn!(
-                        subscription = %sub.name,
-                        %error,
-                        "Failed to restore subscription"
-                    );
-                    requires_network.insert(index);
-                }
-            }
-        }
-
-        let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
-        for (index, sub) in subscriptions.iter().cloned().enumerate() {
-            let manager = manager.clone();
-            let store = subscription_store.clone();
-            let tx = results_tx.clone();
-            tokio::spawn(async move {
-                let result = manager.fetch_and_store(&sub, store.as_ref()).await;
-                let _ = tx.send((index, sub, result));
-            });
-        }
-        drop(results_tx);
-
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
-        tokio::pin!(deadline);
-
-        let mut received = 0usize;
-        while !requires_network.is_empty() {
-            tokio::select! {
-                result = results_rx.recv() => {
-                    match result {
-                        Some((index, sub, Ok(nodes))) => {
-                            info!(
-                                subscription = %sub.name,
-                                nodes = nodes.len(),
-                                "Subscription fetched"
-                            );
-                            config
-                                .nodes
-                                .retain(|node| node.subscription_id != Some(sub.id));
-                            config.nodes.extend(nodes);
-                            requires_network.remove(&index);
-                        }
-                        Some((index, sub, Err(error))) => {
-                            warn!(subscription = %sub.name, %error, "Failed to fetch subscription");
-                            requires_network.remove(&index);
-                        }
-                        None => break,
-                    }
-                    received += 1;
-                }
-                _ = &mut deadline => {
-                    info!(
-                        received,
-                        total = sub_count,
-                        "Subscription fetch deadline reached; starting control plane"
-                    );
-                    break;
-                }
-            }
-        }
-
-        if received < sub_count {
-            info!(
-                pending = sub_count - received,
-                "Subscriptions still refreshing in background"
-            );
-            late_sub_rx = Some(results_rx);
-        }
-        sub_manager = Some(manager);
-    }
+    let mut subscription_supervisor = subscription::SubscriptionSupervisor::prepare(
+        &mut config,
+        claimed.subscriptions,
+        diagnostics,
+    )
+    .await?;
+    let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
     // Resolve group filters into concrete node IDs. This must run for every
     // config — not just when subscriptions delivered nodes — because groups
@@ -743,6 +1020,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config.nodes,
         &config.subscriptions,
     );
+    config
+        .validate_assembled()
+        .map_err(|error| anyhow::anyhow!("invalid assembled configuration: {error}"))?;
     for group in &config.groups {
         info!(
             "Group '{}' resolved {} node(s)",
@@ -758,7 +1038,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
     #[cfg(feature = "ebpf")]
@@ -775,14 +1054,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "default route unavailable; auto interface binding is pending until a network route appears"
         );
     }
-
-    // Only the real datapath owns fixed dae0/daens/TC resources. Mock mode
-    // must remain usable without access to the process-global /run lock.
-    let _instance_lock = if mock_mode {
-        None
-    } else {
-        Some(acquire_instance_lock(&cli.bpf_pin_root)?)
-    };
 
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
@@ -834,7 +1105,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "ebpf")]
     let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
-    let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
+    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
     } else {
@@ -861,20 +1132,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
-                config.global.tproxy_mark,
                 primary_lan,
                 primary_wan,
                 single_homed,
             )
             .await?;
 
-            let ifindex_of = |name: &str| -> Option<u32> {
-                std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-            };
             if let Some(primary_lan) = primary_lan
-                && let Some(i) = ifindex_of(primary_lan)
+                && let Ok(i) = netlink::ifindex_of(primary_lan)
             {
                 attached_ifaces.insert(
                     primary_lan.to_string(),
@@ -894,7 +1159,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !single_homed
                 && !primary_wan.is_empty()
-                && let Some(i) = ifindex_of(primary_wan)
+                && let Ok(i) = netlink::ifindex_of(primary_wan)
             {
                 attached_ifaces.insert(
                     primary_wan.to_string(),
@@ -911,7 +1176,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             for extra_lan in lan_ifnames.iter().skip(1) {
                 match backend.attach_lan(extra_lan, single_homed) {
                     Ok(hooks) => {
-                        if let Some(i) = ifindex_of(extra_lan) {
+                        if let Ok(i) = netlink::ifindex_of(extra_lan) {
                             attached_ifaces.insert(
                                 extra_lan.clone(),
                                 ebpf::real::AttachedInterface {
@@ -943,7 +1208,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     egress: egress.is_ok(),
                 };
                 if (hooks.ingress || hooks.egress)
-                    && let Some(i) = ifindex_of(extra_wan)
+                    && let Ok(i) = netlink::ifindex_of(extra_wan)
                 {
                     attached_ifaces.insert(
                         extra_wan.clone(),
@@ -964,24 +1229,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             Box::new(ebpf::mock::MockEbpfBackend::new())
         }
     };
-
-    let bpf_params = ebpf::BpfLoadParams {
-        tproxy_port: config.global.tproxy_port,
-        tproxy_mark: config.global.tproxy_mark,
-        so_mark: 0,
-        control_plane_pid: std::process::id(),
-        ..Default::default()
-    };
-    ebpf_backend.inject(&bpf_params)?;
-    info!(
-        "eBPF backend initialized with tproxy_port={}",
-        config.global.tproxy_port
-    );
-
-    // BigEndianTproxyPort is already configured by ebpf_backend.inject() above.
-    ebpf_backend.set_param(ParamKey::SoMarkFromDae, 0)?;
-    ebpf_backend.set_param(ParamKey::ControlPlanePid, std::process::id())?;
-    info!("eBPF parameters set");
+    #[cfg(feature = "ebpf")]
+    let mut ebpf_backend = ebpf_backend;
 
     if !mock_mode {
         #[cfg(feature = "ebpf")]
@@ -1048,12 +1297,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
-    let router = routing::Router::new_with_geo_sources(
-        &config.routing.rules,
-        &config.routing.default_outbound,
-        &geo_sources,
-    )?;
+    let mut shared = routing::SharedMatchers::default();
+    let router = routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
+    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1064,10 +1311,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_cache = std::sync::Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(
         config.dns.cache.max_size,
     )));
-    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_with_geo_sources(
+    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_sharing(
         &config.dns,
         &geo_sources,
+        &mut shared,
     )?);
+    drop((geo_sources, shared));
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
@@ -1105,6 +1354,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_cache,
             dns_router,
         )
+        .with_configured_upstreams(&config.dns)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),
@@ -1112,11 +1362,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .with_strategy(config.dns.strategy)
         .with_cache_enabled(config.dns.cache.enabled)
         .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
+        .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
         .with_policy_id(dns_policy)
         .with_hosts_snapshot(hosts_snapshot),
     );
     info!("DNS forwarder ready");
 
+    #[cfg(feature = "native-api")]
+    let native_enabled = config.experimental.native_api.enabled;
     let mut control_plane = control::ControlPlane::new_with_upstream_pool_and_budget(
         config,
         ebpf_backend,
@@ -1125,9 +1378,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_forwarder,
         dns_upstream_pool.clone(),
         resource_budget,
+        Arc::clone(&degradations),
     )?;
+    #[cfg(feature = "native-api")]
+    let native_observation = if native_enabled {
+        Some(native_api::observation::NativeObservation::attach(&mut control_plane).await)
+    } else {
+        None
+    };
+    control_plane
+        .install_startup_diagnostics(startup_diagnostics)
+        .await;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
-
     #[cfg(feature = "ebpf")]
     let iface_watcher = if !cli.mock_ebpf {
         ebpf::real::IfaceWatcher::spawn(
@@ -1135,6 +1397,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.config_handle(),
             control_plane.command_sender(),
             attached_ifaces,
+            Arc::clone(&degradations),
         )
     } else {
         None
@@ -1146,11 +1409,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
     dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
     info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
+    // The initial runtime owns the pool now; keeping this handle would pin the
+    // startup traffic router snapshot after that runtime retires.
+    drop(dns_upstream_pool);
 
-    // Persistent cache (selector choices, clash mode): opens cache.db when
-    // `experimental.cache_file` is enabled, restores Selector choices, and
-    // wires change persistence into the group manager.
-    control_plane.init_cache_db(cli.config.parent()).await;
+    // Runtime state (selector choices, clash mode): with
+    // `experimental.cache_file` enabled, imports a legacy cache.db, restores
+    // Selector choices, and wires change persistence into the group manager.
+    control_plane
+        .init_cache_db(state_db.clone(), Some(legacy_cache))
+        .await;
 
     #[cfg(feature = "clash-api")]
     let clash_cfg = control_plane
@@ -1160,42 +1428,68 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .experimental
         .clash_api
         .clone();
-    let cache_db = control_plane.cache_db();
-    #[cfg(feature = "clash-api")]
-    let mode = cache_db
-        .as_ref()
-        .and_then(|db| db.load_clash_mode())
-        .and_then(|mode| mode::ModeState::normalize(&mode))
-        .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
-        .unwrap_or_else(|| "Rule".to_string());
-    #[cfg(not(feature = "clash-api"))]
-    let mode = "Rule".to_string();
-    let (default_selection, valid_global_selections) = {
-        let config = control_plane.config_handle();
-        let config = config.read().await;
-        let selections = config
-            .groups
-            .iter()
-            .map(|group| group.name.clone())
-            .chain(config.nodes.iter().map(|node| node.name.clone()))
-            .collect::<Vec<_>>();
-        let default = selections.first().cloned().unwrap_or_default();
-        (default, selections)
+    let native_mode = cfg!(feature = "native-api")
+        && control_plane
+            .config_handle()
+            .read()
+            .await
+            .experimental
+            .native_api
+            .enabled;
+    let mode_value = match native_mode {
+        #[cfg(feature = "native-api")]
+        true => mode::ModeState::native(),
+        #[cfg(not(feature = "native-api"))]
+        true => unreachable!("native mode needs the native-api feature"),
+        false => {
+            let mode_db = control_plane.mode_db();
+            #[cfg(feature = "clash-api")]
+            let mode = startup_clash_mode(mode_db.as_deref(), &clash_cfg.default_mode);
+            #[cfg(not(feature = "clash-api"))]
+            let mode = "Rule".to_owned();
+            let (default_selection, valid_global_selections) = {
+                let config = control_plane.config_handle();
+                let config = config.read().await;
+                let selections = config
+                    .groups
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .chain(config.nodes.iter().map(|node| node.name.clone()))
+                    .collect::<Vec<_>>();
+                (selections.first().cloned().unwrap_or_default(), selections)
+            };
+            let global_selection = mode_db
+                .as_ref()
+                .and_then(|db| db.load_clash_global())
+                .filter(|selection| {
+                    valid_global_selections
+                        .iter()
+                        .any(|valid| valid == selection)
+                })
+                .unwrap_or(default_selection);
+            mode::ModeState::new(&mode, global_selection)
+        }
     };
-    let global_selection = cache_db
-        .as_ref()
-        .and_then(|db| db.load_selector_choice("GLOBAL"))
-        .filter(|selection| {
-            valid_global_selections
-                .iter()
-                .any(|valid| valid == selection)
-        })
-        .unwrap_or(default_selection);
-    let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
-        mode::ModeState::new(&mode, global_selection),
-    ));
+    let mode_state: mode::SharedModeState =
+        std::sync::Arc::new(parking_lot::RwLock::new(mode_value));
     control_plane.set_mode_state(mode_state.clone());
     control_plane.start_datapath_flags_coordinator()?;
+
+    #[cfg(feature = "native-api")]
+    let mut native = match native_observation {
+        Some(observation) => Some(
+            native_api::NativeRuntime::start(
+                &mut control_plane,
+                observation,
+                started_at,
+                started,
+                engine_level,
+                &native_log_binding,
+            )
+            .await?,
+        ),
+        None => None,
+    };
 
     // Starts only when external_controller is configured; bind/parse
     // failures are logged and never abort startup.
@@ -1208,7 +1502,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .to_string_lossy()
                 .into_owned()
         };
-        // Accept "host:port"; a bare ":port" listens on all interfaces.
+        // A bare ":port" listens on all IPv4 interfaces.
         let listen_str = if clash_cfg.external_controller.starts_with(':') {
             format!("0.0.0.0{}", clash_cfg.external_controller)
         } else {
@@ -1219,6 +1513,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
                 let connection_tracker = control_plane.connection_tracker();
                 let state = std::sync::Arc::new(clash_api::ClashState {
+                    diagnostics: control_plane.diagnostics_handle(),
                     config: control_plane.config_handle(),
                     stats: control_plane.stats_handle(),
                     alive_set: control_plane.alive_set(),
@@ -1231,6 +1526,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     datapath_flags: control_plane
                         .datapath_flags_handle()
                         .expect("datapath flags writer started above"),
+                    control: Some(control_plane.control_client()),
+                    ui_download: control_plane.ui_download_handle(),
                     secret: clash_cfg.secret.clone(),
                     connection_pool: control_plane.connection_pool(),
                     external_ui,
@@ -1254,92 +1551,40 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
-    // Late startup fetches and periodic refreshes both persist validated raw
-    // bodies before delivering nodes through the serialized rebuild path.
-    // Subscription nodes are never written back to the config file.
-    let mut sub_tasks = Vec::new();
-    if let Some(mut rx) = late_sub_rx {
-        let merge_tx = cmd_tx.clone();
-        sub_tasks.push(tokio::spawn(async move {
-            while let Some((_index, sub, result)) = rx.recv().await {
-                match result {
-                    Ok(nodes) => {
-                        info!(
-                            "Background subscription '{}' fetched {} nodes; merging",
-                            sub.name,
-                            nodes.len()
-                        );
-                        if merge_tx
-                            .send(control::ControlCommand::MergeSubscription {
-                                subscription_id: sub.id,
-                                name: sub.name.clone(),
-                                nodes,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Background subscription '{}' fetch failed: {}", sub.name, e);
-                    }
-                }
-            }
-        }));
-    }
-    // Periodic refresh: each enabled subscription with a non-zero
-    // update_interval is re-fetched on that cadence and merged through the
-    // same path. A failed refresh keeps the previously merged nodes.
-    if let Some(manager) = sub_manager {
-        for sub in subscriptions
-            .iter()
-            .filter(|s| s.enabled && s.update_interval > 0)
-        {
-            let sub = sub.clone();
-            let manager = manager.clone();
-            let merge_tx = cmd_tx.clone();
-            let store = subscription_store.clone();
-            sub_tasks.push(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(sub.update_interval)).await;
-                    match manager.fetch_and_store(&sub, store.as_ref()).await {
-                        Ok(nodes) => {
-                            info!(
-                                "Subscription '{}' refreshed: {} nodes",
-                                sub.name,
-                                nodes.len()
-                            );
-                            if merge_tx
-                                .send(control::ControlCommand::MergeSubscription {
-                                    subscription_id: sub.id,
-                                    name: sub.name.clone(),
-                                    nodes,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Subscription '{}' refresh failed; keeping existing nodes: {}",
-                                sub.name, e
-                            );
-                        }
-                    }
-                }
-            }));
-        }
-    }
+    subscription_supervisor.route_through(download_route::SharedOutbounds {
+        router: control_plane.traffic_router(),
+        config: control_plane.config_handle(),
+        group_manager: control_plane.group_manager(),
+        proxy_registry: control_plane.proxy_registry(),
+        runtime_registry: control_plane.runtime_registry(),
+    });
+    subscription_supervisor.start(cmd_tx.clone());
+    #[cfg(feature = "native-api")]
+    control_plane.attach_subscriptions(subscription_supervisor.handle());
+    let reload_subscription_supervisor = subscription_supervisor.handle();
+    #[cfg(feature = "native-api")]
+    let native_configuration = match native.as_mut() {
+        Some(native) => Some(
+            native
+                .start_configuration(
+                    &mut control_plane,
+                    database.take(),
+                    native_sources,
+                    &cli.config,
+                    cmd_tx.clone(),
+                    reload_subscription_supervisor.clone(),
+                )
+                .await,
+        ),
+        None => None,
+    };
 
     // SIGHUP handler: reload configuration from disk and push it to the
     // control plane without interrupting established connections.
     let config_path = cli.config.clone();
     let reload_tx = cmd_tx.clone();
-    let config_handle = control_plane.config_handle();
-    let reload_subscription_store = subscription_store.clone();
+    let mut activation =
+        configuration::Activation::new(reload_tx.clone(), reload_subscription_supervisor);
     let sighup_handle = tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -1354,147 +1599,58 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             sighup.recv().await;
             request_id = request_id.wrapping_add(1).max(1);
             info!("SIGHUP reload request {request_id} received");
-            match Config::from_file(config_path.to_str().unwrap_or("/etc/honk/config.dae")) {
+            #[cfg(feature = "native-api")]
+            if let Some(service) = &native_configuration {
+                if service.request_sighup().is_err() {
+                    warn!("SIGHUP reload coordinator is unavailable or busy");
+                }
+                continue;
+            }
+            let mut diagnostics = Vec::new();
+            let result = load_operator_config(
+                config_path.to_str().unwrap_or("/etc/honk/config.dae"),
+                &mut diagnostics,
+            );
+            report_detailed_diagnostics(&diagnostics);
+            match result {
                 Ok(mut new_config) => {
-                    if let Err(e) = new_config.validate() {
-                        warn!("SIGHUP reload request {request_id} rejected: invalid config: {e}");
-                        continue;
-                    }
                     new_config.ensure_builtin_nodes();
-                    new_config.ensure_local_direct_rules();
-                    // The on-disk config contains no subscription nodes (they
-                    // exist only in memory), so a naive reload would empty
-                    // every subscription-fed group until the next periodic
-                    // refresh. Stabilize subscription IDs by URL and carry
-                    // the running subscription nodes over; then kick off an
-                    // immediate background refresh for fresh data.
-                    let refresh_subs: Vec<_> = {
-                        let current = config_handle.read().await;
-                        let mut matched_previous = std::collections::HashSet::new();
-                        for sub in &mut new_config.subscriptions {
-                            if let Some(old) = current.subscriptions.iter().find(|old| {
-                                old.url == sub.url && !matched_previous.contains(&old.id)
-                            }) {
-                                matched_previous.insert(old.id);
-                                sub.id = old.id;
-                            }
-                        }
-                        let known: std::collections::HashSet<uuid::Uuid> = new_config
-                            .subscriptions
-                            .iter()
-                            .filter(|sub| sub.enabled)
-                            .map(|sub| sub.id)
-                            .collect();
-                        let carried: Vec<_> = current
-                            .nodes
-                            .iter()
-                            .filter(|n| n.subscription_id.is_some_and(|id| known.contains(&id)))
-                            .cloned()
-                            .collect();
-                        if !carried.is_empty() {
-                            info!(
-                                "Preserving {} subscription node(s) across reload",
-                                carried.len()
-                            );
-                            new_config.nodes.extend(carried);
-                        }
-                        new_config
-                            .subscriptions
-                            .iter()
-                            .filter(|s| s.enabled)
-                            .cloned()
-                            .collect()
-                    };
-                    if new_config.global.store_subscribe
-                        && let Some(store) = reload_subscription_store.as_ref()
-                    {
-                        for sub in &refresh_subs {
-                            if new_config
-                                .nodes
-                                .iter()
-                                .any(|node| node.subscription_id == Some(sub.id))
-                            {
-                                continue;
-                            }
-                            match store.load_nodes(sub).await {
-                                Ok(Some(nodes)) => {
-                                    info!(
-                                        subscription = %sub.name,
-                                        nodes = nodes.len(),
-                                        "Restored subscription during reload"
-                                    );
-                                    new_config.nodes.extend(nodes);
-                                }
-                                Ok(None) => {}
-                                Err(error) => warn!(
-                                    subscription = %sub.name,
-                                    %error,
-                                    "Failed to restore subscription during reload"
-                                ),
-                            }
-                        }
-                    }
-                    // Resolve group filters into concrete node IDs, same as
-                    // startup — otherwise filter-based groups keep stale
-                    // (or empty) member lists in the rebuilt GroupManager.
-                    honk_config::parser::resolve_group_filters(
-                        &mut new_config.groups,
-                        &new_config.nodes,
-                        &new_config.subscriptions,
-                    );
-                    if let Err(e) = reload_tx
-                        .send(control::ControlCommand::ReloadConfig {
-                            request_id,
-                            config: Box::new(new_config),
+                    match activation
+                        .activate(configuration::ActivationRequest {
+                            candidate: new_config,
+                            diagnostics,
+                            #[cfg(feature = "native-api")]
+                            sources: None,
+                            #[cfg(feature = "native-api")]
+                            expected_group_revision: None,
+                            #[cfg(feature = "native-api")]
+                            deferred_provider: None,
                         })
                         .await
                     {
-                        warn!(
-                            "SIGHUP reload request {request_id} rejected: command send failed: {e}"
-                        );
-                        break;
-                    }
-                    // Immediately re-fetch enabled subscriptions in the
-                    // background so nodes don't stay at their startup
-                    // snapshot for up to `update_interval`.
-                    if !refresh_subs.is_empty() {
-                        let tx = reload_tx.clone();
-                        let store = reload_subscription_store.clone();
-                        tokio::spawn(async move {
-                            let manager = match crate::subscription::SubscriptionManager::new() {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    warn!("subscription manager init failed: {}", e);
-                                    return;
-                                }
-                            };
-                            for sub in refresh_subs {
-                                match manager.fetch_and_store(&sub, store.as_ref()).await {
-                                    Ok(nodes) => {
-                                        let _ = tx
-                                            .send(control::ControlCommand::MergeSubscription {
-                                                subscription_id: sub.id,
-                                                name: sub.name.clone(),
-                                                nodes,
-                                            })
-                                            .await;
-                                    }
-                                    Err(e) => warn!(
-                                        "post-reload subscription refresh failed for '{}': {}",
-                                        sub.name, e
-                                    ),
-                                }
-                            }
-                        });
+                        Ok(_) | Err(configuration::ActivationFailure::Rejected) => {}
+                        Err(configuration::ActivationFailure::Degraded(generation)) => {
+                            warn!(generation, "SIGHUP reload committed with degraded datapath");
+                        }
+                        Err(configuration::ActivationFailure::Reconciliation(generation)) => {
+                            error!(generation, "SIGHUP reload worker reconciliation failed");
+                            break;
+                        }
+                        Err(failure) => {
+                            error!(?failure, "SIGHUP reload request {request_id} failed");
+                            let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!("SIGHUP reload request {request_id} rejected: config load failed: {e}")
+                Err(error) => {
+                    warn!("SIGHUP reload request {request_id} rejected: {error}")
                 }
             }
         }
     });
 
+    let shutdown_intent = control_plane.shutdown_intent();
     let sig_handle = tokio::spawn(async move {
         // The shell may start us with SIGINT/SIGTERM ignored (e.g. background
         // job). Reset them to the default disposition so tokio can install its
@@ -1517,11 +1673,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
+        shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 
-    info!("honk-core is running. Press Ctrl+C to stop.");
+    // Under a service manager nobody is at a terminal to press it.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        info!("honk-core is running. Press Ctrl+C to stop.");
+    } else {
+        info!("honk-core is running.");
+    }
     let control_result = control_plane.run().await;
+    #[cfg(feature = "native-api")]
+    native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -1529,12 +1695,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     sig_handle.abort();
     sighup_handle.abort();
-    for handle in sub_tasks {
-        handle.abort();
-    }
+    let _ = sig_handle.await;
+    let _ = sighup_handle.await;
+    let subscription_result = subscription_supervisor.shutdown().await;
     info!("honk-core stopped");
 
-    control_result
+    control_result?;
+    anyhow::ensure!(
+        subscription_result? == 0,
+        "subscription tasks remained after shutdown"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "ebpf")]
@@ -1682,7 +1853,12 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
 
         // fwmark → table 100 with a local default route (v4 + v6 mirror):
         // marked packets are delivered to daens-local sockets.
-        n.add_rule_fwmark(FAM_V4, tproxy_mark, 100)?;
+        n.add_rule_fwmark(
+            FAM_V4,
+            tproxy_mark,
+            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
+            100,
+        )?;
         n.add_route(
             FAM_V4,
             100,
@@ -1693,7 +1869,12 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
             None,
             Some(lo),
         )?;
-        n.add_rule_fwmark(FAM_V6, tproxy_mark, 100)?;
+        n.add_rule_fwmark(
+            FAM_V6,
+            tproxy_mark,
+            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
+            100,
+        )?;
         n.add_route(
             FAM_V6,
             100,
@@ -2043,16 +2224,27 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     // Policy-routing rules for daens live inside the daens namespace and
     // disappear with it; these are only a safety net for stale
     // host-namespace rules.
-    let _ = nl.del_rule_fwmark(netlink::FAM_V4, honk_ebpf_common::TPROXY_MARK, 100);
-    let _ = nl.del_rule_fwmark(netlink::FAM_V6, honk_ebpf_common::TPROXY_MARK, 100);
+    let _ = nl.del_rule_fwmark(
+        netlink::FAM_V4,
+        honk_ebpf_common::TPROXY_MARK,
+        u32::MAX,
+        100,
+    );
+    let _ = nl.del_rule_fwmark(
+        netlink::FAM_V6,
+        honk_ebpf_common::TPROXY_MARK,
+        u32::MAX,
+        100,
+    );
 }
 
 /// Addressing for the dae0/dae0peer link pair between the host namespace and
 /// the isolated `daens` namespace.  These strings are the canonical values:
 /// the netns setup consumes them (ebpf feature only), while the control
-/// plane's internal-traffic filter (`control::is_honk_internal_addr`) uses
-/// the numeric forms `DAE0_IPV6_PREFIX_HI` / `DAE0_IPV4_NET` below in every
-/// build.  `control` tests assert both forms agree.
+/// plane's internal-traffic filter (`control::is_honk_internal_addr`) and the
+/// kernel datapath use the numeric forms `DAE0_IPV6_PREFIX_HI` /
+/// `DAE0_IPV4_NET` in `honk-ebpf-common` in every build.  `control` tests
+/// assert both forms agree.
 ///
 /// Link-local addresses (169.254.0.0/16) are used instead of a private
 /// subnet so that the kernel treats daens-originated traffic as local — no
@@ -2068,13 +2260,6 @@ pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
 pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
 #[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
-
-/// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the
-/// fd00:686f:6e6b::/64 ULA prefix — as a big-endian u64.
-pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
-/// `DAENS_HOST_IP`/`DAENS_PEER_IP` with the host bits masked off
-/// (169.254.0.0/16), as a big-endian u32.
-pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
 
 pub(crate) fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
@@ -2116,13 +2301,168 @@ fn is_mountpoint(path: &str) -> bool {
         .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
         .unwrap_or(false)
 }
+
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, open_log_file, prepare_nfqueue_startup, prepare_runtime_data_dir,
-        prepare_runtime_data_dir_with_fallback, publish_instance_pid, running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, acquire_instance_lock, load_operator_config,
+        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
+        publish_instance_pid, running_instance_pid,
     };
+    use crate::logging::open_log_file;
     use clap::Parser;
+
+    #[test]
+    fn a_reset_that_cannot_run_leaves_honk_running_without_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(directory.path()).unwrap());
+        let held = crate::state::StateDb::open(directory.path()).unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        assert!(crate::state::startup::reset_non_strict(directory.path(), &degradations).is_none());
+        let issue = degradations
+            .get(crate::degradations::Component::Persistence)
+            .expect("the failed reset is reported");
+        // The reset's own failure is the cause, not the corruption.
+        assert_eq!(issue.reason, "in_use");
+        drop(held);
+    }
+
+    #[test]
+    fn a_failed_reopen_bounds_the_log_to_twice_the_limit() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        log.fail_reopen = true;
+        for _ in 0..20 {
+            log.write_all(format!("{}\n", "x".repeat(59)).as_bytes())
+                .unwrap();
+        }
+        let rotated = std::fs::metadata(directory.path().join("honk.log.1")).unwrap();
+        assert!(
+            rotated.len() <= 200,
+            "{} bytes after a failed reopen",
+            rotated.len()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn two_writers_sharing_the_log_rotate_it_once() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut first = RotatingLogFile::open(&path, 100).unwrap();
+        let mut second = RotatingLogFile::open(&path, 100).unwrap();
+        let line = |text: &str| format!("{}\n", text.repeat(59));
+        first.write_all(line("a").as_bytes()).unwrap();
+        second.write_all(line("b").as_bytes()).unwrap();
+        first.write_all(line("c").as_bytes()).unwrap();
+        second.write_all(line("d").as_bytes()).unwrap();
+        let rotated = std::fs::read_to_string(directory.path().join("honk.log.1")).unwrap();
+        assert_eq!(rotated, format!("{}\n{}\n", "a".repeat(59), "b".repeat(59)));
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(current, format!("{}\n{}\n", "c".repeat(59), "d".repeat(59)));
+    }
+
+    #[test]
+    fn the_log_file_rotates_into_one_private_copy() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let rotated = directory.path().join("honk.log.1");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        for line in ["a", "b", "c", "d"] {
+            log.write_all(line.repeat(59).as_bytes()).unwrap();
+            log.write_all(b"\n").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "d".repeat(59) + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "c".repeat(59) + "\n"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        for file in [&path, &rotated] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_strict_state_db_that_cannot_be_used_leaves_honk_running() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cli = Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.experimental.cache_file.enabled = Some(true);
+
+        let unsafe_dir = tempfile::tempdir().unwrap();
+        let state = unsafe_dir.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state).unwrap();
+        // Only a writable directory is still refused; readable ones are tightened.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let reason = |degradations: &crate::degradations::Degradations| {
+            degradations
+                .get(crate::degradations::Component::Persistence)
+                .map(|issue| issue.reason)
+        };
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &degradations).unwrap();
+        assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("unsafe"));
+        let entry = degradations.snapshot().pop().unwrap();
+        assert_eq!(entry.rule, Some("group_or_other_bits"));
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::open(locked_dir.path().join(crate::state::STATE_DIR)).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, locked_dir.path(), &degradations).unwrap();
+        assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("locked"));
+        drop(held);
+
+        // Password mode makes the db strict: the same unsafe directory refuses startup.
+        config.experimental.native_api.password_auth = true;
+        assert!(
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &Default::default()).is_err()
+        );
+
+        // A newer schema refuses startup either way.
+        config.experimental.native_api.password_auth = false;
+        let newer_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(newer_dir.path()).unwrap());
+        rusqlite::Connection::open(
+            newer_dir
+                .path()
+                .join(crate::state::STATE_DIR)
+                .join(crate::state::DB_FILE),
+        )
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA user_version = {}",
+            crate::state::SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        assert!(
+            super::open_state_db(&cli, &config, newer_dir.path(), &Default::default()).is_err()
+        );
+    }
 
     #[test]
     fn nfqueue_requested_with_mock_backend_falls_back_to_disabled() {
@@ -2286,5 +2626,39 @@ mod startup_lifecycle_tests {
         );
         drop(lock);
         assert!(running_instance_pid(&path).is_err());
+    }
+
+    #[test]
+    fn a_refused_instance_lock_names_the_holder_and_the_wait() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("honk-core.lock");
+        let wait = std::time::Duration::ZERO;
+        let _held = acquire_instance_lock(&path, wait).expect("take instance lock");
+        let error = acquire_instance_lock(&path, wait).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("PID {}", std::process::id())),
+            "{error}"
+        );
+        assert!(error.contains("within 0s"), "{error}");
+    }
+
+    #[test]
+    fn startup_load_reports_duplicate_node_identity() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "node {\n a: 'socks5://127.0.0.1:1080'\n b: 'socks5://127.0.0.1:1080'\n}\n",
+        )
+        .unwrap();
+
+        let mut diagnostics = Vec::new();
+        let error = load_operator_config(file.path().to_str().unwrap(), &mut diagnostics)
+            .expect_err("duplicate node IDs must reject startup");
+        assert_eq!(error.diagnostic.code, "duplicate-node-id");
+        assert_eq!(error.diagnostic.setting.to_string(), "nodes[2]");
+        assert_eq!(error.diagnostic.related_indices, [1]);
+        let rendered = error.to_string();
+        assert!(rendered.contains("node ID duplicates another node"));
+        assert!(!rendered.contains("configuration validation failed"));
     }
 }

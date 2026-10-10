@@ -4,10 +4,10 @@
 //! that a sole TCP leaf with no `final` remains a last resort.
 //! Modeled after sing-box outbound groups.
 //!
-//! UDP candidate filtering is per-node: a node with both UDP probe domains
-//! (DataUDP + DnsUDP) explicitly dead is excluded from UDP selection even
-//! when its TCP is alive; nodes never probed for UDP inherit TCP liveness
-//! (see `filter_alive_candidates`).
+//! UDP forwarding candidates need protocol/configuration capability before health
+//! filtering. A capable node with both UDP probe domains explicitly dead remains
+//! excluded even when TCP is alive; capable unprobed nodes inherit TCP liveness.
+//! Built-in block remains a terminal action, not a forwarding capability.
 //!
 //! Groups nest (sing-box style): `Group.groups` lists sub-group tags whose
 //! own current selection contributes one member candidate each (the leaf
@@ -20,7 +20,7 @@
 //! `GroupManager` is the facade: it owns the group/node tables and the
 //! selection pipeline entry points below. The internals are split by
 //! responsibility — `resolver` (group-graph expansion and member/leaf
-//! introspection), `filter` (liveness filtering), `policy` (per-policy
+//! introspection), `filter` (capability and liveness), `policy` (per-policy
 //! picks and latency ranking), `state` (selection caches and callbacks).
 
 use honk_config::group::{Group, GroupPolicy};
@@ -33,25 +33,33 @@ use std::time::{Duration, Instant};
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
-use state::UrlTestSelections;
+use state::{SelectorState, UrlTestSelections};
 
+#[cfg(feature = "flow-observation")]
+pub use resolver::GroupSelection;
 pub use score::{
-    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReasonCounters,
-    ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext, ScoreTarget,
+    ScoreAttempt, ScoreAttribution, ScoreBudgetCounters, ScoreBusinessGuard, ScoreCacheSnapshot,
+    ScoreChallenger, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceQuestion, ScoreFeedback,
+    ScoreOutcome, ScorePolicyState, ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreRelation,
+    ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget, ScoreTrialSource,
+    ScoreValidationAction, ScoreVerificationCounters, ScoreVerificationSnapshot,
+    ScoreVerificationState, ScoreWaitReason,
 };
-pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
+#[cfg(test)]
+pub use state::SelectorChoices;
+pub use state::{
+    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorError, SelectorMember,
+    SelectorNetworks, SelectorUpdate,
+};
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-
 /// time cycle breaking keeps the group graph acyclic; this bound (plus the
 /// per-resolution visited set) is defense in depth against pathological
 /// configs.
 pub const MAX_GROUP_DEPTH: usize = 8;
+const _: () = assert!(MAX_GROUP_DEPTH <= u8::BITS as usize);
 
-/// Network dimension for per-network group selections.
-///
-/// sing-box keeps `selectedOutboundTCP` and `selectedOutboundUDP` apart;
-/// honk does the same for URLTest groups so a node with fast TCP but
-/// broken UDP does not drag UDP flows down (and vice versa).
+/// Network dimension for independent group selections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectionNetwork {
     Tcp,
@@ -100,8 +108,11 @@ pub struct SelectionPlan<'a> {
 #[derive(Clone)]
 pub struct ScoreSelectionEntry<'a> {
     pub node: &'a Node,
-    pub feedback: Option<ScoreFeedback>,
+    pub feedback: Option<ScoreAttempt>,
     pub selection_chain: Vec<String>,
+    /// Owners of group-valued final edges traversed by this entry, valid only
+    /// with the manager that produced the plan. Display chains are not authority.
+    pub final_owners: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -109,6 +120,7 @@ pub struct ScoreSelectionPlan<'a> {
     pub mode: SelectionPlanMode,
     pub health_family: IpVersion,
     pub entries: Vec<ScoreSelectionEntry<'a>>,
+    pub observation: Option<Arc<observation::SelectionObservation>>,
 }
 
 /// Whether resolving a selection may update group state or must only observe
@@ -118,11 +130,34 @@ pub struct ScoreSelectionPlan<'a> {
 enum SelectionEffects {
     Apply,
     Peek,
+    ApplyWithHealthFallback,
+    PeekWithHealthFallback,
+    /// Internal full-view preflight; derive Score membership without committing it.
+    Preview,
 }
 
 impl SelectionEffects {
     fn applies(self) -> bool {
-        self == Self::Apply
+        matches!(self, Self::Apply | Self::ApplyWithHealthFallback)
+    }
+
+    fn prepares_score(self) -> bool {
+        self.applies() || self == Self::Preview
+    }
+
+    fn peek(self) -> Self {
+        match self {
+            Self::Preview => Self::Preview,
+            _ if self.health_fallback() => Self::PeekWithHealthFallback,
+            _ => Self::Peek,
+        }
+    }
+
+    fn health_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::ApplyWithHealthFallback | Self::PeekWithHealthFallback
+        )
     }
 }
 
@@ -135,22 +170,84 @@ impl SelectionEffects {
 /// keeps the hot path cheap.
 pub type SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>;
 
-/// A dialable candidate of a group: a leaf node plus the member tag that
-/// selected it. Direct members use their node name; nested candidates use
-/// the sub-group tag while retaining the leaf chosen by that sub-group.
+/// Display tags may be shared by distinct nodes; retain the concrete member.
+#[derive(Clone, Copy)]
+pub enum GroupMember<'a> {
+    Node(&'a Node),
+    Group(&'a Group),
+}
+
+impl<'a> GroupMember<'a> {
+    fn tag(self) -> &'a str {
+        match self {
+            Self::Node(node) => &node.name,
+            Self::Group(group) => &group.name,
+        }
+    }
+
+    fn identity(self) -> SelectorMember {
+        match self {
+            Self::Node(node) => SelectorMember::Node(node.id),
+            Self::Group(group) => SelectorMember::Group(group.name.clone()),
+        }
+    }
+}
+
+/// A leaf and its immediate member path, independent of display-name collisions.
 #[derive(Debug, Clone)]
 struct Candidate<'a> {
-    /// Display tag: node name for direct members, sub-group tag for nested.
-    tag: &'a str,
+    /// `None` is a direct member; a subgroup may resolve to the same physical leaf.
+    via: Option<&'a Group>,
     /// Leaf node that would actually be dialed.
     node: &'a Node,
     attribution: Vec<&'a str>,
+    /// Pool obligations aligned with `attribution`, excluding each owner's explicit final or pin.
+    pool_bound: u8,
     selection_chain: Vec<&'a str>,
+    final_owners: Vec<&'a str>,
+    score_work: Vec<Arc<score::budget::Work>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScoreView<'a, 'node> {
+    origins: &'a [Candidate<'node>],
+    health_filtered: Option<&'a UniqueCandidateIds>,
+    withdrawn: &'a [&'a str],
+    preview: bool,
+}
+
+impl<'a> Candidate<'a> {
+    fn member(&self) -> GroupMember<'a> {
+        match self.via {
+            Some(group) => GroupMember::Group(group),
+            None => GroupMember::Node(self.node),
+        }
+    }
+
+    fn tag(&self) -> &'a str {
+        self.member().tag()
+    }
 }
 
 enum UniqueCandidateIds {
     Single(uuid::Uuid),
     Multiple(HashSet<uuid::Uuid>),
+}
+
+impl UniqueCandidateIds {
+    fn contains(&self, node: uuid::Uuid) -> bool {
+        match self {
+            Self::Single(id) => *id == node,
+            Self::Multiple(ids) => ids.contains(&node),
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Single(_) => 1,
+            Self::Multiple(ids) => ids.len() as u64,
+        }
+    }
 }
 
 fn unique_candidate_ids(candidates: &[Candidate<'_>]) -> Option<UniqueCandidateIds> {
@@ -168,24 +265,33 @@ fn unique_candidate_ids(candidates: &[Candidate<'_>]) -> Option<UniqueCandidateI
     })
 }
 
-fn removed_unique_candidate_count(mut before: UniqueCandidateIds, after: &[Candidate<'_>]) -> u64 {
+fn removed_unique_candidates(
+    mut before: UniqueCandidateIds,
+    after: &[Candidate<'_>],
+) -> Option<UniqueCandidateIds> {
     match &mut before {
         UniqueCandidateIds::Single(id) => {
-            u64::from(!after.iter().any(|candidate| candidate.node.id == *id))
+            if after.iter().any(|candidate| candidate.node.id == *id) {
+                return None;
+            }
         }
         UniqueCandidateIds::Multiple(ids) => {
             for candidate in after {
                 ids.remove(&candidate.node.id);
             }
-            u64::try_from(ids.len()).unwrap_or(u64::MAX)
+            if ids.is_empty() {
+                return None;
+            }
         }
     }
+    Some(before)
 }
 
 pub struct GroupManager {
     groups: HashMap<String, Group>,
     /// Node lookup by UUID.
     nodes: HashMap<uuid::Uuid, Node>,
+    node_order: Vec<uuid::Uuid>,
     /// Alive / health tracking (may be None in tests).
     alive_set: Option<Arc<AliveDialerSet>>,
     /// Per-group URLTest selection cache, split by network (TCP/UDP).
@@ -194,11 +300,10 @@ pub struct GroupManager {
     lb_counters: HashMap<String, [AtomicUsize; 2]>,
     /// Per-group TCP/UDP Fallback pins.
     fallback_cache: RwLock<HashMap<String, [Option<String>; 2]>>,
-    /// Per-group last-used timestamp for idle timeout.
-    last_used: RwLock<HashMap<String, Instant>>,
-    /// Per-group selector choice (set via API, persisted by caller).
-    /// group_name → selected node name.
-    selector_choice: RwLock<HashMap<String, String>>,
+    /// One publication barrier for both Selector networks and their revision.
+    selector_choice: RwLock<SelectorState>,
+    /// Per-group rate limiter for the sole TCP leaf's last-resort warning.
+    last_resort_log: RwLock<HashMap<String, Instant>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
     persist_callback: RwLock<Option<PersistCallback>>,
     /// Wakes the generation-owned selector warm coordinator.
@@ -207,6 +312,7 @@ pub struct GroupManager {
     interrupt_callback: RwLock<Option<InterruptCallback>>,
     score_state: Arc<ScorePolicyState>,
     score_authority: Arc<score::ScoreAuthority>,
+    transport_quality: RwLock<Vec<score::TransportQualitySource>>,
 }
 
 impl GroupManager {
@@ -219,6 +325,10 @@ impl GroupManager {
             .collect();
         group_names.sort_unstable();
         self.score_state.reason_snapshot(group_names)
+    }
+
+    pub fn score_cache_snapshot(&self) -> ScoreCacheSnapshot {
+        self.score_state.cache_snapshot()
     }
 
     pub fn new(groups: &[Group], nodes: &[Node]) -> Self {
@@ -242,24 +352,6 @@ impl GroupManager {
         alive_set: Option<Arc<AliveDialerSet>>,
         score_state: Arc<ScorePolicyState>,
     ) -> Self {
-        Self::build(groups, nodes, alive_set, score_state)
-    }
-
-    fn build(
-        groups: &[Group],
-        nodes: &[Node],
-        alive_set: Option<Arc<AliveDialerSet>>,
-        score_state: Arc<ScorePolicyState>,
-    ) -> Self {
-        Self::build_inner(groups, nodes, alive_set, score_state)
-    }
-
-    fn build_inner(
-        groups: &[Group],
-        nodes: &[Node],
-        alive_set: Option<Arc<AliveDialerSet>>,
-        score_state: Arc<ScorePolicyState>,
-    ) -> Self {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
         resolver::break_group_cycles(&mut group_map);
@@ -274,6 +366,7 @@ impl GroupManager {
         Self {
             groups: group_map,
             nodes: nodes.iter().map(|n| (n.id, n.clone())).collect(),
+            node_order: nodes.iter().map(|node| node.id).collect(),
             alive_set,
             urltest_cache: RwLock::new(HashMap::new()),
             lb_counters: groups
@@ -286,13 +379,14 @@ impl GroupManager {
                 })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
-            last_used: RwLock::new(HashMap::new()),
-            selector_choice: RwLock::new(HashMap::new()),
+            selector_choice: RwLock::new(SelectorState::default()),
+            last_resort_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
             score_state,
             score_authority: Arc::new(score::ScoreAuthority),
+            transport_quality: RwLock::new(Vec::new()),
         }
     }
 
@@ -313,10 +407,13 @@ impl GroupManager {
         // The overwhelmingly common selector has only direct members. Avoid
         // constructing its transient candidate/visited vectors; nested
         // groups still take the guarded recursive path below.
-        if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
+        if group.policy == GroupPolicy::Selector
+            && group.groups.is_empty()
+            && group.final_outbound.is_none()
+        {
             return self
                 .pick_direct_selector(group, domain, ipver)
-                .or_else(|| self.last_resort_tcp_leaf(group, domain));
+                .or_else(|| self.last_resort_tcp_leaf(group, domain, SelectionEffects::Apply));
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
         self.pick_in_group(
@@ -326,43 +423,6 @@ impl GroupManager {
             &mut visited,
             0,
             SelectionEffects::Apply,
-        )
-    }
-
-    /// Select a single alive node, excluding one by name (for failover retry).
-    pub fn select_node_excluded(
-        &self,
-        name: &str,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-        excluded_node_name: &str,
-    ) -> Option<&Node> {
-        let group = self.groups.get(name)?;
-        let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(
-            group,
-            domain,
-            ipver,
-            &mut visited,
-            0,
-            SelectionEffects::Apply,
-        );
-        let candidates: Vec<Candidate> = self
-            .filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref())
-            .into_iter()
-            .filter(|c| c.node.name != excluded_node_name)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        Some(
-            self.pick_best_by_latency(
-                &candidates,
-                group,
-                SelectionNetwork::from_probe_domain(domain),
-                ipver,
-            )
-            .node,
         )
     }
 
@@ -421,55 +481,6 @@ impl GroupManager {
         )
     }
 
-    /// Retry candidates after an authoritative single-candidate dial
-    /// failure: unique URLTest leaves in latency order (≤3). Within the race
-    /// order is irrelevant — a just-failed incumbent that still measures
-    /// fastest re-races alongside its alternates and loses by failing
-    /// again; a strike-demoted one is re-raced too, since the race itself
-    /// is the verdict. Non-URLTest groups yield no candidates (pins are
-    /// not retried).
-    pub fn urltest_retry_candidates(
-        &self,
-        group_name: &str,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-    ) -> Vec<&Node> {
-        let Some(group) = self.groups.get(group_name) else {
-            return Vec::new();
-        };
-        if group.policy != GroupPolicy::URLTest {
-            return Vec::new();
-        }
-        let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(
-            group,
-            domain,
-            ipver,
-            &mut visited,
-            0,
-            SelectionEffects::Peek,
-        );
-        let candidates =
-            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
-        let network = SelectionNetwork::from_probe_domain(domain);
-        let mut retry = Vec::with_capacity(3);
-        for candidate in
-            self.order_by_latency(candidates, network, ipver, group.check_url.as_deref())
-        {
-            if retry
-                .iter()
-                .any(|node: &&Node| node.id == candidate.node.id)
-            {
-                continue;
-            }
-            retry.push(candidate.node);
-            if retry.len() == 3 {
-                break;
-            }
-        }
-        retry
-    }
-
     fn selection_plan_for_domain_with_effects(
         &self,
         group_name: &str,
@@ -486,113 +497,41 @@ impl GroupManager {
         if effects.applies() {
             self.mark_used(group_name);
         }
-        if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
+        if group.policy == GroupPolicy::Selector
+            && group.groups.is_empty()
+            && group.final_outbound.is_none()
+        {
             return SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: self
                     .pick_direct_selector(group, domain, ipver)
-                    .or_else(|| self.last_resort_tcp_leaf(group, domain))
+                    .or_else(|| self.last_resort_tcp_leaf(group, domain, effects))
                     .into_iter()
                     .collect(),
             };
         }
-        let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0, effects);
-        let before_filter = (effects.applies()
-            && group.policy == GroupPolicy::Score
-            && self.score_state.is_current_authority(&self.score_authority))
-        .then(|| unique_candidate_ids(&candidates))
-        .flatten();
-        let candidates =
-            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
-        let network = SelectionNetwork::from_probe_domain(domain);
-        if let Some(before_filter) = before_filter {
-            self.score_state.record_dead_filtered(
-                &self.score_authority,
-                score::SelectionReasonKey::new(&group.name, network),
-                removed_unique_candidate_count(before_filter, &candidates),
-            );
-        }
-        // Measurements on UDP-dead nodes cannot make the surviving plan warm:
-        // determine URLTest provenance only from eligible candidates. A cold
-        // group stays cold with one (or zero) survivor.
-        let urltest_has_data = group.policy == GroupPolicy::URLTest
-            && candidates.iter().any(|c| {
-                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
-                    != Duration::MAX
-            });
-        if candidates.is_empty() {
-            if let Some(node) = self.last_resort_tcp_leaf(group, domain) {
-                return SelectionPlan {
-                    mode: SelectionPlanMode::Authoritative,
-                    nodes: vec![node],
-                };
-            }
-            return SelectionPlan {
-                mode: if group.policy == GroupPolicy::URLTest && !urltest_has_data {
-                    SelectionPlanMode::ColdUrlTest
-                } else {
-                    SelectionPlanMode::Authoritative
-                },
-                nodes: vec![],
-            };
-        }
-        match group.policy {
-            GroupPolicy::Selector => SelectionPlan {
-                mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_selector(&candidates, group).node],
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::from_probe_domain(domain),
+            domain,
+            ipver,
+        );
+        let (mode, candidates) = self.selection_candidates_for_target(
+            group,
+            &context,
+            &mut Vec::new(),
+            0,
+            effects,
+            score::selection::ScoreSelectionRules {
+                cold_urltest: true,
+                ..Default::default()
             },
-            GroupPolicy::URLTest => {
-                if urltest_has_data {
-                    SelectionPlan {
-                        mode: SelectionPlanMode::Authoritative,
-                        nodes: vec![
-                            self.pick_urltest(&candidates, group, network, ipver, effects)
-                                .node,
-                        ],
-                    }
-                } else {
-                    SelectionPlan {
-                        mode: SelectionPlanMode::ColdUrlTest,
-                        nodes: self
-                            .order_by_latency(
-                                candidates,
-                                network,
-                                ipver,
-                                group.check_url.as_deref(),
-                            )
-                            .into_iter()
-                            .map(|c| c.node)
-                            .collect(),
-                    }
-                }
-            }
-            GroupPolicy::LoadBalance => SelectionPlan {
-                mode: SelectionPlanMode::Authoritative,
-                nodes: vec![
-                    self.pick_load_balance(&candidates, group, network, effects)
-                        .node,
-                ],
-            },
-            GroupPolicy::Fallback => SelectionPlan {
-                mode: SelectionPlanMode::Authoritative,
-                nodes: vec![
-                    self.pick_fallback(&candidates, group, network, effects)
-                        .node,
-                ],
-            },
-            GroupPolicy::Score => SelectionPlan {
-                mode: SelectionPlanMode::Authoritative,
-                nodes: vec![
-                    self.pick_score(
-                        &candidates,
-                        group,
-                        &ScoreSelectionContext::aggregate(network, domain, ipver),
-                        effects,
-                    )
-                    .node,
-                ],
-            },
+        );
+        SelectionPlan {
+            mode,
+            nodes: candidates
+                .into_iter()
+                .map(|candidate| candidate.node)
+                .collect(),
         }
     }
 
@@ -608,10 +547,13 @@ impl GroupManager {
             .and_then(|g| g.final_outbound.clone())
     }
 
-    /// Look up a node by display name (dashboard/API boundary — the hot
-    /// paths key on NodeId). Sub-group tags and unknown names yield `None`.
+    /// First declared node with this display name; finals and API lookups agree
+    /// with config order. Sub-group tags and unknown names yield `None`.
     pub fn node_by_name(&self, name: &str) -> Option<&Node> {
-        self.nodes.values().find(|n| n.name == name)
+        self.node_order
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .find(|node| node.name == name)
     }
 
     /// Wrap this manager into a [`SharedGroupManager`] cell (see the type's
@@ -636,13 +578,26 @@ impl GroupManager {
         let Some(group) = self.groups.get(group_name) else {
             return Vec::new();
         };
-        let mut visited = Vec::new();
+        self.ranked_udp_leaves_in_group(group, ipver, limit, &mut Vec::new(), 0)
+    }
+
+    fn ranked_udp_leaves_in_group<'a>(
+        &'a self,
+        group: &'a Group,
+        ipver: IpVersion,
+        limit: usize,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+    ) -> Vec<&'a Node> {
+        if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
+            return Vec::new();
+        }
         let candidates = self.flatten_candidates(
             group,
             ProbeDomain::DataUdp,
             ipver,
-            &mut visited,
-            0,
+            visited,
+            depth,
             SelectionEffects::Peek,
         );
         let candidates = self.filter_alive_candidates(
@@ -651,6 +606,28 @@ impl GroupManager {
             ipver,
             group.check_url.as_deref(),
         );
+        if candidates.is_empty() {
+            return match self.final_member(group) {
+                Some(GroupMember::Node(node)) => self
+                    .is_node_selectable_for_domain(node.id, ProbeDomain::DataUdp, ipver)
+                    .then_some(node)
+                    .into_iter()
+                    .collect(),
+                Some(GroupMember::Group(final_group)) => {
+                    visited.push(group.name.as_str());
+                    let leaves = self.ranked_udp_leaves_in_group(
+                        final_group,
+                        ipver,
+                        limit,
+                        visited,
+                        depth + 1,
+                    );
+                    visited.pop();
+                    leaves
+                }
+                None => Vec::new(),
+            };
+        }
         let ordered = self.order_by_latency(
             candidates,
             SelectionNetwork::Udp,
@@ -670,6 +647,7 @@ impl GroupManager {
 }
 
 mod filter;
+pub mod observation;
 mod policy;
 mod resolver;
 mod score;
@@ -677,5 +655,3 @@ mod state;
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod udp_selection_repro_tests;

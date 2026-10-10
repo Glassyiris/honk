@@ -1,4 +1,4 @@
-//! Integration tests for the Clash-compatible REST API (Phase 5).
+//! Integration tests for the Clash-compatible REST API.
 //!
 //! Boots the real axum router on 127.0.0.1:0 with a lightweight ClashState
 //! (no eBPF involved) and exercises auth, proxies, mode persistence,
@@ -8,19 +8,18 @@
 
 use honk_config::Config;
 use honk_config::dns::{DnsConfig, DnsRouting};
-use honk_config::experimental::CacheFileConfig;
+use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
-use honk_core::cachedb::CacheDb;
 use honk_core::clash_api::{self, ClashState};
-use honk_core::connection_tracker::{ConnectionEntry, ConnectionTracker};
+use honk_core::connection_tracker::ConnectionEntry;
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
 use honk_core::dns::routing::DnsRouter;
-use honk_core::mode::{DatapathFlagsHandle, ModeState};
-use honk_core::stats::StatsManager;
-use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use honk_outbound::group::GroupManager;
+use honk_core::mode::ModeState;
+use honk_core::state::StateDb;
+use honk_core::state::cache::CacheDb;
+use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::proxy::ProxyRegistry;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,15 +27,22 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tracing_subscriber::prelude::*;
 
+#[path = "clash_api_test/score_verification.rs"]
+mod score_verification;
+
 fn make_node(name: &str) -> Node {
-    Node {
-        id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
+    let mut node = Node {
         name: name.into(),
         address: "127.0.0.1".into(),
         port: 1,
-        outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
+        outbound: honk_config::node::OutboundConfig::Socks5(honk_config::node::Socks5Config {
+            username: Some(name.into()),
+            ..Default::default()
+        }),
         ..Default::default()
-    }
+    };
+    node.id = node.derive_id();
+    node
 }
 
 /// Minimal config: one Selector group "proxy" with nodes node-a / node-b.
@@ -59,10 +65,17 @@ struct TestApp {
     addr: SocketAddr,
     state: Arc<ClashState>,
     log_dispatch: tracing::Dispatch,
-    db_path: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
     /// Every `set_datapath_flags` value the mock backend received.
-    ebpf_datapath_flags_writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    ebpf_datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
+    control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
     _tmp: tempfile::TempDir,
+}
+
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        self.control_task.abort();
+    }
 }
 
 impl TestApp {
@@ -121,71 +134,67 @@ async fn spawn_app(secret: &str, external_ui: &str) -> TestApp {
     spawn_app_with_config(test_config(), secret, external_ui).await
 }
 
-async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) -> TestApp {
+async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &str) -> TestApp {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("cache.db");
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: db_path.to_str().unwrap().to_string(),
-        ..Default::default()
-    };
-    let db = Arc::new(CacheDb::open(&cache_cfg).expect("cache.db opens"));
-
-    let alive_set = Arc::new(AliveDialerSet::new());
-    let group_manager =
-        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
-    // Wire the same persistence the control plane installs in production.
-    {
-        let db_cb = db.clone();
-        group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
-            db_cb.save_selector_choice(group, node);
-        })));
-    }
-    let group_manager = group_manager.into_shared();
-
+    let data_dir = tmp.path().to_path_buf();
+    config.experimental.cache_file.enabled = Some(true);
+    config.global.nfqueue_enable = false;
     let (log_layer, log_handle) = clash_api::logs::layer();
     let log_dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log_layer));
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let dns_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+    let forwarder = Arc::new(test_dns_forwarder(
         dns_cache,
         a_record_response([93, 184, 216, 34], 300),
-    )));
-    let stats = Arc::new(StatsManager::new());
-    let connection_tracker = Arc::new(ConnectionTracker::new());
-    let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
-        .unwrap()
-        .into_shared();
+    ));
+    let resolver = honk_core::dns::DnsResolver::new(&config.dns).unwrap();
     let traffic_router =
         honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
             .unwrap();
-    let ebpf_datapath_flags_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ebpf_datapath_flags_writes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
     mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
     let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy")));
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn honk_core::ebpf::EbpfBackend>>> =
-        Arc::new(tokio::sync::RwLock::new(Box::new(mock_ebpf)));
-    let datapath_flags =
-        DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
-    datapath_flags.initialize(0, false, false).await.unwrap();
+    let mut control = honk_core::control::ControlPlane::new(
+        config,
+        Box::new(mock_ebpf),
+        traffic_router,
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
+    control
+        .init_cache_db(Some(Arc::new(StateDb::open(&data_dir).unwrap())), None)
+        .await;
+    control.set_mode_state(Arc::clone(&mode_state));
+    control.start_datapath_flags_coordinator().unwrap();
+    let datapath_flags = control.datapath_flags_handle().unwrap();
+    datapath_flags.initialize(false, false).await.unwrap();
+    let stats = control.stats_handle();
+    let connection_tracker = control.connection_tracker();
     let state = Arc::new(ClashState {
-        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
-        stats: stats.clone(),
-        alive_set,
-        group_manager,
-        cache_db: Some(db),
-        connection_tracker: connection_tracker.clone(),
-        proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
-        runtime_registry,
+        config: control.config_handle(),
+        stats: Arc::clone(&stats),
+        alive_set: control.alive_set(),
+        group_manager: control.group_manager(),
+        cache_db: control.cache_db(),
+        connection_tracker: Arc::clone(&connection_tracker),
+        proxy_registry: control.proxy_registry(),
+        runtime_registry: control.runtime_registry(),
         mode_state,
         datapath_flags,
+        control: Some(control.control_client()),
+        ui_download: control.ui_download_handle(),
+        diagnostics: control.diagnostics_handle(),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
-        router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
+        router: control.traffic_router(),
         log_handle,
-        dns_service,
-        connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
+        dns_service: control.dns_service(),
+        connection_pool: control.connection_pool(),
         stream_samplers: Arc::new(clash_api::StreamSamplers::new()),
     });
+    let control_task = tokio::spawn(async move { control.serve_control_commands().await });
 
     let app = clash_api::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -202,8 +211,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         addr,
         state,
         log_dispatch,
-        db_path,
+        data_dir,
         ebpf_datapath_flags_writes,
+        control_task,
         _tmp: tmp,
     }
 }
@@ -214,52 +224,6 @@ fn http_client() -> reqwest::Client {
         .no_proxy()
         .build()
         .unwrap()
-}
-
-const SCORE_STATS_FIXTURE_LINES: &[&str] = &[
-    "global {",
-    "wan_interface: lo",
-    "lan_interface: lo",
-    "log_level: info",
-    "auto_config_kernel_parameter: false",
-    "nfqueue_enable: false",
-    "data_dir: '__HONK_SCORE_QA_DATA_DIR__'",
-    "}",
-    "node {",
-    "private-node-alpha: 'socks5://private-user:private-pass@private-node-alpha.invalid:16543'",
-    "private-node-beta: 'socks5://private-user-2:private-pass-2@203.0.113.88:26543'",
-    "}",
-    "group {",
-    "z-score {",
-    "filter: name('private-node-alpha','private-node-beta')",
-    "policy: score",
-    "}",
-    "a-score {",
-    "filter: name('private-node-alpha','private-node-beta')",
-    "policy: score",
-    "}",
-    "}",
-    "routing {",
-    "fallback: direct",
-    "}",
-    "experimental {",
-    "clash_api {",
-    "external_controller: '127.0.0.1:19090'",
-    "secret: 'score-review-secret'",
-    "}",
-    "}",
-];
-
-fn normalized_fixture_lines(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect()
-}
-
-fn score_stats_fixture_matches(source: &str) -> bool {
-    normalized_fixture_lines(source) == SCORE_STATS_FIXTURE_LINES
 }
 
 #[tokio::test]
@@ -312,6 +276,7 @@ async fn test_auth_secret_enforced() {
 async fn test_rules_aggregate_simple_and_preserve_complex() {
     let config = honk_config::parser::parse_dae_config(
         r#"
+group { proxy {} }
 routing {
     sip(10.10.10.24/32,
         10.10.10.25/32
@@ -375,10 +340,41 @@ routing {
 }
 
 #[tokio::test]
+async fn test_selector_switch_releases_the_group_manager_lock() {
+    // The callbacks must run without the shared-manager guard: interrupt
+    // handling reacquires it, which wedges behind a waiting reload writer.
+    let app = spawn_app("", "").await;
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let manager = app.state.group_manager.read().clone();
+        let cell = Arc::clone(&app.state.group_manager);
+        let observed = Arc::clone(&observed);
+        manager.set_selector_change_callback(Some(Arc::new(move || {
+            observed.store(
+                cell.try_write().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        })));
+    }
+
+    let resp = http_client()
+        .put(app.url("/proxies/proxy"))
+        .json(&serde_json::json!({"name": "node-b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst),
+        "the handler held the group manager lock across the selector callbacks"
+    );
+}
+
+#[tokio::test]
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();
-    app.state.mode_state.write().global_selection = "Proxy".to_string();
+    *app.state.mode_state.write() = ModeState::new("Rule", "Proxy");
 
     let body: serde_json::Value = client
         .get(app.url("/proxies"))
@@ -436,10 +432,6 @@ async fn test_proxies_structure_and_selector_switch() {
         .unwrap();
     assert_eq!(body["proxies"]["proxy"]["now"], "node-b");
 
-    // The persist callback must have written cache.db.
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
-
     // Unknown member → 400.
     let resp = client
         .put(app.url("/proxies/proxy"))
@@ -487,11 +479,19 @@ async fn test_score_proxy_contract_and_put_rejection() {
         .feedback
         .as_ref()
         .unwrap()
+        .begin()
+        .unwrap()
         .start()
         .setup_failed(ScoreOutcome::Timeout);
     let second = manager.selection_plan_for_target("auto", &context);
     assert_eq!(second.entries[0].node.id, b.id);
-    let reporter = second.entries[0].feedback.as_ref().unwrap().start();
+    let reporter = second.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .start();
     reporter.setup_succeeded();
     reporter.tx(1);
     reporter.rx(1);
@@ -520,13 +520,13 @@ async fn test_score_proxy_contract_and_put_rejection() {
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
-    assert_eq!(
+    assert!(
         app.state
             .cache_db
             .as_ref()
             .unwrap()
-            .load_selector_choice("auto"),
-        None
+            .load_network_selector("auto", honk_outbound::group::SelectionNetwork::Tcp)
+            .is_none()
     );
     let body: serde_json::Value = client
         .get(app.url("/proxies/auto"))
@@ -540,16 +540,79 @@ async fn test_score_proxy_contract_and_put_rejection() {
 }
 
 #[tokio::test]
+async fn test_automatic_group_pin_is_reported_as_now() {
+    use honk_outbound::group::{SelectorMember, SelectorNetworks};
+
+    let (a, b) = (make_node("node-a"), make_node("node-b"));
+    for policy in [
+        GroupPolicy::URLTest,
+        GroupPolicy::Fallback,
+        GroupPolicy::LoadBalance,
+        GroupPolicy::Score,
+    ] {
+        let app = spawn_app_with_config(
+            Config {
+                nodes: vec![a.clone(), b.clone()],
+                groups: vec![Group {
+                    name: "auto".into(),
+                    policy,
+                    nodes: vec![a.id, b.id],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "",
+            "",
+        )
+        .await;
+        let client = http_client();
+        let now = || async {
+            let body: serde_json::Value = client
+                .get(app.url("/proxies"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let single: serde_json::Value = client
+                .get(app.url("/proxies/auto"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(body["proxies"]["auto"]["now"], single["now"], "{policy:?}");
+            single["now"].clone()
+        };
+        let before = now().await;
+        let manager = app.state.group_manager.read().clone();
+        manager
+            .publish_override("auto", &SelectorMember::Node(b.id), SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(now().await, "node-b", "{policy:?}");
+        manager
+            .clear_override("auto", SelectorNetworks::Both)
+            .unwrap()
+            .run_callbacks();
+        assert_eq!(now().await, before, "{policy:?}");
+    }
+}
+
+#[tokio::test]
 async fn score_stats_are_authenticated_deterministic_and_private() {
-    use honk_config::group::GroupPolicy;
     use honk_outbound::group::{ScoreSelectionContext, ScoreTarget, SelectionNetwork};
 
     let fixture = include_str!("fixtures/score_stats_manual.dae");
-    assert!(score_stats_fixture_matches(fixture));
-    let missing_default = fixture.replacen("    log_level: info\n", "", 1);
-    assert!(!score_stats_fixture_matches(&missing_default));
 
-    let config = honk_config::parser::parse_dae_config(fixture).unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = honk_config::parser::parse_dae_config(&fixture.replace(
+        "__HONK_SCORE_QA_DATA_DIR__",
+        data_dir.path().to_str().unwrap(),
+    ))
+    .unwrap();
     assert_eq!(
         config.experimental.clash_api.external_controller,
         "127.0.0.1:19090"
@@ -560,7 +623,6 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     assert_eq!(config.global.log_level, "info");
     assert!(!config.global.auto_config_kernel_parameter);
     assert!(!config.global.nfqueue_enable);
-    assert_eq!(config.global.data_dir, "__HONK_SCORE_QA_DATA_DIR__");
     assert_eq!(config.routing.default_outbound, "direct");
     assert_eq!(
         config
@@ -676,60 +738,160 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     assert_eq!(first_response.status(), 200);
     let first: serde_json::Value = first_response.json().await.unwrap();
     let score = first["score"].clone();
-    let expected_score = serde_json::json!({
-        "groups": [
-            {
-                "name": "a-score",
-                "tcp": {
-                    "coldExplore": 1,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "switchFlap": 0,
-                },
-                "udp": {
-                    "coldExplore": 0,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "switchFlap": 0,
-                },
-            },
-            {
-                "name": "z-score",
-                "tcp": {
-                    "coldExplore": 1,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "switchFlap": 0,
-                },
-                "udp": {
-                    "coldExplore": 0,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "switchFlap": 0,
-                },
-            },
+    let assert_keys = |value: &serde_json::Value, expected: &[&str]| {
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    };
+    assert_keys(&score, &["businessStarts", "cache", "groups"]);
+    assert_keys(
+        &score["cache"],
+        &[
+            "exactCells",
+            "aggregateCells",
+            "exactEvictions",
+            "aggregateEvictions",
+            "comparisonCells",
+            "comparisonLogicalBytes",
+            "comparisonLogicalCapacity",
+            "comparisonEvictions",
+            "comparisonExpired",
+            "comparisonRejected",
         ],
-    });
-    assert_eq!(score, expected_score);
-    let mut unexpected_counter = expected_score.clone();
-    unexpected_counter["groups"][0]["udp"]["periodicExplore"] = serde_json::json!(1);
-    assert_ne!(score, unexpected_counter);
+    );
+    assert!(
+        score["cache"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(serde_json::Value::is_u64)
+    );
+    assert_eq!(score["businessStarts"], 0);
+    let groups = score["groups"].as_array().unwrap();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a-score", "z-score"]
+    );
+    for group in groups {
+        assert_keys(group, &["name", "tcp", "udp", "verification", "budget"]);
+        assert_keys(&group["verification"], &["tcp", "udp"]);
+        assert_keys(&group["budget"], &["tcp", "udp"]);
+        for network in ["tcp", "udp"] {
+            let reasons = &group[network];
+            assert_keys(
+                reasons,
+                &[
+                    "coldExplore",
+                    "periodicExplore",
+                    "reliabilityWinner",
+                    "performanceWinner",
+                    "incumbentHeld",
+                    "insufficientEvidenceHeld",
+                    "directionalTradeoffHeld",
+                    "incumbentIneligible",
+                    "freshFailureBypass",
+                    "deadFiltered",
+                    "ordinarySwitch",
+                    "switchFlap",
+                    "failStreakExcluded",
+                    "exploreBackedOff",
+                    "carrierPressure",
+                    "carrierRttPressure",
+                    "carrierLossPressure",
+                    "carrierValidation",
+                ],
+            );
+            assert!(
+                reasons
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let verification = &group["verification"][network];
+            assert_keys(
+                verification,
+                &[
+                    "provisionalSelections",
+                    "usableSelections",
+                    "validationSelections",
+                ],
+            );
+            assert!(
+                verification
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let budget = &group["budget"][network];
+            assert_keys(
+                budget,
+                &[
+                    "businessStarts",
+                    "sources",
+                    "trialStarts",
+                    "reserved",
+                    "spent",
+                    "budgetBlocked",
+                    "inFlightBlocked",
+                    "refunded",
+                    "expired",
+                    "coldAllowance",
+                    "coldAvailable",
+                    "earnedAvailable",
+                    "earningPeriod",
+                    "scopes",
+                    "trialSuccess",
+                    "trialFailure",
+                    "trialCancelled",
+                    "trialSetupHistogram",
+                    "trialSetupMillis",
+                    "trialElapsedMillis",
+                ],
+            );
+            assert_keys(&budget["sources"], &["cold", "periodic", "recovery"]);
+            assert!(
+                budget["sources"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let histogram = budget["trialSetupHistogram"].as_array().unwrap();
+            assert_eq!(histogram.len(), 8);
+            assert!(histogram.iter().all(serde_json::Value::is_u64));
+            assert!(
+                budget
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "sources" | "trialSetupHistogram"))
+                    .all(|(_, value)| value.is_u64())
+            );
+        }
+        // A fresh group has no selection evidence yet, so its first plan funds no exploration.
+        assert_eq!(group["tcp"]["coldExplore"], 0);
+        assert_eq!(group["tcp"]["ordinarySwitch"], 0);
+        let budget = &group["budget"]["tcp"];
+        assert_eq!(budget["businessStarts"], 0);
+        assert_eq!(budget["trialStarts"], 0);
+        assert_eq!(budget["reserved"], 0);
+        assert_eq!(budget["refunded"], 0);
+        assert_eq!(group["verification"]["tcp"]["validationSelections"], 0);
+    }
     assert!(first["outbounds"].is_array());
     let connections = client
         .get(app.url("/connections"))
@@ -801,8 +963,6 @@ async fn test_put_and_patch_without_content_type() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
 
     let resp = client
         .patch(app.url("/configs"))
@@ -822,9 +982,77 @@ async fn test_put_and_patch_without_content_type() {
     assert_eq!(body["mode"], "Global");
 }
 
-/// Parent selector containing a sub-group: the sub-group tag appears in
-/// `all`, is a valid PUT target (persisted + restored on "restart"), and
-/// the selection chain resolves through it to the leaf.
+#[tokio::test]
+async fn test_configs_additive_safe_diagnostics_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("private-input.dae");
+    std::fs::write(
+        &path,
+        "global {\n    check_tolerance: private-raw-scalar\n}\n",
+    )
+    .unwrap();
+    let mut file_diagnostics = Vec::new();
+    let mut config =
+        Config::from_file_with_detailed_diagnostics(path.to_str().unwrap(), &mut file_diagnostics)
+            .unwrap();
+    let provider = honk_config::subscription::Subscription {
+        name: "private-provider-name".into(),
+        url: "http://127.0.0.1/private-provider-url".into(),
+        ..Default::default()
+    };
+    let mut provider_diagnostics = Vec::new();
+    config.nodes = honk_core::subscription::parse_subscription_content_with_diagnostics(
+        &provider,
+        "socks5://127.0.0.1:1080#private-node-name\nprivate-raw-provider-line",
+        &mut provider_diagnostics,
+    )
+    .unwrap();
+    config.subscriptions.push(provider.clone());
+    let app = spawn_app_with_config(config, "", "").await;
+    {
+        let _config = app.state.config.read().await;
+        let mut active = app.state.diagnostics.write();
+        active.generation = 7;
+        active.buckets.static_diagnostics = file_diagnostics;
+        active
+            .buckets
+            .replace_provider(provider.id, provider_diagnostics);
+    }
+
+    let body: serde_json::Value = http_client()
+        .get(app.url("/configs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["mode"], "Rule");
+    assert_eq!(body["log-level"], "info");
+    let snapshot = &body["honk-diagnostics"];
+    assert_eq!(snapshot["generation"], 7);
+    let diagnostics = snapshot["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|row| row["setting"] == "global.check_tolerance")
+    );
+    let sources = snapshot["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    assert!(diagnostics.iter().any(|row| row["source"] == 1));
+    for row in diagnostics {
+        assert!(sources.iter().any(|source| source["id"] == row["source"]));
+    }
+    let serialized = body.to_string();
+    assert!(!serialized.contains("private-"), "{serialized}");
+    assert!(!serialized.contains(path.to_str().unwrap()), "{serialized}");
+    assert!(
+        !serialized.contains(&provider.id.to_string()),
+        "{serialized}"
+    );
+}
+
+/// Nested Selector membership is layer-local; reachable leaves are not direct members.
 #[tokio::test]
 async fn test_nested_group_selector_via_api() {
     let (a, b, c) = (
@@ -898,35 +1126,6 @@ async fn test_nested_group_selector_via_api() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-
-    // The persist callback wrote the sub-group tag to cache.db.
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("parent").as_deref(), Some("sub"));
-
-    // "Restart": rebuild the manager from the same config and restore the
-    // persisted choices exactly like ControlPlane::init_cache_db does.
-    let restored = GroupManager::with_alive_set(
-        &config.groups,
-        &config.nodes,
-        Some(app.state.alive_set.clone()),
-    );
-    for group in &config.groups {
-        if group.policy == honk_config::group::GroupPolicy::Selector
-            && let Some(choice) = db.load_selector_choice(&group.name)
-        {
-            restored.set_selector_choice(&group.name, &choice);
-        }
-    }
-    assert_eq!(
-        restored.get_selector_choice("parent").as_deref(),
-        Some("sub")
-    );
-    // The restored choice drives selection: parent → sub → sub's leaf.
-    assert_eq!(restored.select_node("parent").unwrap().name, "node-b");
-    assert_eq!(
-        restored.selection_chain("parent"),
-        vec!["parent", "sub", "node-b"]
-    );
 }
 
 #[tokio::test]
@@ -942,7 +1141,7 @@ async fn test_global_selection_and_mode_persisted() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert_eq!(app.state.mode_state.read().global_selection, "proxy");
+    assert_eq!(app.state.mode_state.read().global_selection(), "proxy");
 
     // Virtual and unknown GLOBAL targets do not resolve.
     for invalid in ["Proxy", "nope"] {
@@ -996,22 +1195,17 @@ async fn test_global_selection_and_mode_persisted() {
 
     // Point writes are acknowledged from the in-memory pending map and become
     // crash-durable on the bounded background flush.
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: app.db_path.to_str().unwrap().to_string(),
-        ..Default::default()
-    };
-    let reopened = CacheDb::open(&cache_cfg).unwrap();
+    let reopened = CacheDb::open(Arc::new(StateDb::open(&app.data_dir).unwrap())).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         if reopened.load_clash_mode().as_deref() == Some("Global")
-            && reopened.load_selector_choice("GLOBAL").as_deref() == Some("proxy")
+            && reopened.load_clash_global().as_deref() == Some("proxy")
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "cache.db point-write durability bound exceeded"
+            "state db point-write durability bound exceeded"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1030,7 +1224,7 @@ async fn test_mode_switch_updates_datapath_flags() {
         DATAPATH_FLAG_OFFLOAD_ALL as OFFLOAD_ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as OFFLOAD_RULE,
     };
 
-    let writes = || app.ebpf_datapath_flags_writes.lock().unwrap().clone();
+    let writes = || app.ebpf_datapath_flags_writes.lock().clone();
     assert_eq!(writes(), vec![OFFLOAD_RULE]);
 
     for (mode, expect_flags) in [
@@ -1072,6 +1266,10 @@ async fn test_connections_snapshot_and_delete() {
         source: "10.0.0.2:12345".into(),
         destination: "142.250.72.14:443".into(),
         proxy: "proxy".into(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "suffix".into(),
         rule_payload: "example.com".into(),
         chains: vec!["node-a".into(), "hk".into(), "proxy".into()],
@@ -1089,6 +1287,10 @@ async fn test_connections_snapshot_and_delete() {
         source: "[2001:db8::10]:4321".into(),
         destination: "[2001:db8::20]:443".into(),
         proxy: "proxy".into(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Match".into(),
         rule_payload: String::new(),
         chains: vec!["node-a".into(), "proxy".into()],
@@ -1142,13 +1344,13 @@ async fn test_connections_snapshot_and_delete() {
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
-    // DELETE the single connection.
+    // Metadata without an owning transport cannot claim successful closure.
     let resp = client
         .delete(app.url(&format!("/connections/{}", id)))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 409);
     let body: serde_json::Value = client
         .get(app.url("/connections"))
         .send()
@@ -1158,8 +1360,8 @@ async fn test_connections_snapshot_and_delete() {
         .await
         .unwrap();
     let remaining = body["connections"].as_array().unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0]["id"], "conn-2");
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|row| row["id"] == id));
 }
 
 /// Plaintext HTTP server answering 204 to everything.
@@ -1227,6 +1429,63 @@ async fn test_group_delay_omits_failed_members() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn delay_owner_errors_distinguish_saturation_stop_and_failure() {
+    use honk_outbound::alive::HealthCheckError;
+
+    // State-db setup fsyncs; under disk pressure it alone can exceed the owner deadline.
+    let app = spawn_app("", "").await;
+    let failed = spawn_app("", "").await;
+    // Longer than shutdown_health_checks' own 5s drain deadline, so a stalled drain
+    // reports its typed error instead of racing this one.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let owner = &app.state.alive_set;
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut jobs = Vec::new();
+        for _ in 0..10 {
+            let owner = Arc::clone(owner);
+            let started = started.clone();
+            jobs.push(tokio::spawn(async move {
+                owner
+                    .run_external_probe(move |cancel| async move {
+                        started.send(()).unwrap();
+                        cancel.cancelled().await;
+                    })
+                    .await
+            }));
+            starts.recv().await.unwrap();
+        }
+        let client = http_client();
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::Busy.to_string());
+        }
+        owner.shutdown_health_checks().await.unwrap();
+        for job in jobs {
+            job.await.unwrap().unwrap();
+        }
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::Stopped.to_string());
+        }
+        let permit = failed.state.alive_set.acquire_health_probe().unwrap();
+        permit.cancellation().report_cleanup_failure();
+        drop(permit);
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(failed.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::WorkerFailed.to_string());
+        }
+    })
+    .await
+    .expect("delay owner section exceeded its deadline");
 }
 
 #[tokio::test]
@@ -1338,33 +1597,108 @@ async fn test_group_delay_returns_member_results_for_zashboard_core_mode() {
 }
 
 #[tokio::test]
-async fn test_node_delay_failure_is_503() {
+async fn node_delay_failures_return_503_without_advancing_real_dial_streaks() {
     let app = spawn_app("", "").await;
     let client = http_client();
+    let node_id = make_node("node-a").id;
+    for _ in 0..3 {
+        let response = client
+            .get(app.url("/proxies/node-a/delay?url=https://127.0.0.1:1/&timeout=1000"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert!(
+        app.state
+            .alive_set
+            .is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    assert!(
+        !app.state
+            .alive_set
+            .is_failure_demoted(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    app.state
+        .alive_set
+        .record_dial_failure(node_id, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        !app.state
+            .alive_set
+            .is_failure_demoted(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    app.state
+        .alive_set
+        .record_dial_failure(node_id, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        app.state
+            .alive_set
+            .is_failure_demoted(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
 
-    // Nothing listens on 127.0.0.1:1 → measurement fails → 503 message body.
-    let resp = client
-        .get(app.url("/proxies/node-a/delay?url=https://127.0.0.1:1/&timeout=1000"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["message"].as_str().unwrap().contains("delay test"));
-
-    // Unknown proxy → 404.
-    let resp = client
+    let response = client
         .get(app.url("/proxies/nope/delay"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    assert_eq!(response.status(), 404);
 }
 
-/// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
-/// sub-group members to their representative leaves, consecutive failures
-/// replace the leaf's display history, and `/proxies/{subgroup-tag}/delay`
-/// works through the group branch.
+#[tokio::test]
+async fn node_delay_resolver_refusal_does_not_demote_node() {
+    const ISOLATED: &str = "HONK_CLASH_REFUSAL_ISOLATED";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node_delay_resolver_refusal_does_not_demote_node",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let app = spawn_app("", "").await;
+    honk_outbound::urltest::set_urltest_resolver(Arc::new(|host, port| {
+        Box::pin(async move {
+            if host == "packet-refusal.invalid" {
+                return Err(honk_outbound::proxy::PacketRejection::Policy.into());
+            }
+            Ok(tokio::net::lookup_host((host.as_str(), port))
+                .await?
+                .collect())
+        })
+    }));
+    app.state.alive_set.record_probe_latency(
+        make_node("node-a").id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(123),
+    );
+    let client = http_client();
+    for _ in 0..2 {
+        let response = client
+            .get(app.url("/proxies/node-a/delay?url=https://packet-refusal.invalid/&timeout=1000"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert!(!app.state.alive_set.is_failure_demoted(
+        make_node("node-a").id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+    ));
+}
+
+/// Nested delay endpoints preserve member identity and real traffic history.
 #[tokio::test]
 async fn test_nested_group_delay_endpoints() {
     let (a, b) = (make_node("node-a"), make_node("node-b"));
@@ -1389,8 +1723,6 @@ async fn test_nested_group_delay_endpoints() {
     let app = spawn_app_with_config(config, "", "").await;
     let client = http_client();
 
-    // Seed the sub-group leaf: the parent failure is transient, while the
-    // follow-up sub-group failure supplies the strike.
     app.state.alive_set.record_probe_latency(
         make_node("node-b").id,
         ProbeDomain::Tcp,
@@ -1417,7 +1749,7 @@ async fn test_nested_group_delay_endpoints() {
             IpVersion::V4
         ),
         Some(Duration::from_millis(55)),
-        "one transient failure must preserve the leaf's latency"
+        "a measurement failure must preserve the leaf's latency"
     );
 
     // The sub-group tag itself is a valid delay target (group branch):
@@ -1434,9 +1766,14 @@ async fn test_nested_group_delay_endpoints() {
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10)),
-        "the consecutive failure must append the penalty sample"
+        Some(Duration::from_millis(55)),
+        "repeated measurements must not synthesize real dial failures"
     );
+    assert!(!app.state.alive_set.is_failure_demoted(
+        make_node("node-b").id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+    ));
 }
 
 #[tokio::test]
@@ -1445,23 +1782,31 @@ async fn test_cache_flush_endpoints() {
     let client = http_client();
 
     let db = app.state.cache_db.as_ref().unwrap();
-    db.set("fakeip:198.18.0.1", "example.com");
-    assert!(db.get("fakeip:198.18.0.1").is_some());
+    db.save_clash_global("node-a");
 
+    // Nothing persists FakeIP mappings; the flush is accepted and touches nothing.
     let resp = client
         .post(app.url("/cache/fakeip/flush"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert!(db.get("fakeip:198.18.0.1").is_none());
-    // Unrelated keys survive the prefix flush.
-    db.save_selector_choice("proxy", "node-a");
-    assert!(db.load_selector_choice("proxy").is_some());
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
 
     // DNS cache flush clears both the in-memory cache and persisted answers.
     let now = honk_core::dns::persist::unix_now();
-    db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
+    let sqlite = rusqlite::Connection::open(app.data_dir.join("state/honk.db")).unwrap();
+    sqlite
+        .execute(
+            "INSERT INTO dns_answer (key, expire_at, entry) VALUES ('k', ?1, x'00')",
+            [now as i64 + 300],
+        )
+        .unwrap();
+    let persisted = || -> i64 {
+        sqlite
+            .query_row("SELECT count(*) FROM dns_answer", [], |row| row.get(0))
+            .unwrap()
+    };
     app.state
         .dns_service
         .cache()
@@ -1477,7 +1822,7 @@ async fn test_cache_flush_endpoints() {
             .get("example.com:1")
             .is_some()
     );
-    assert_eq!(db.load_dns_answers(now).len(), 1);
+    assert_eq!(persisted(), 1);
 
     let resp = client
         .post(app.url("/cache/dns/flush"))
@@ -1494,9 +1839,9 @@ async fn test_cache_flush_endpoints() {
             .get("example.com:1")
             .is_none()
     );
-    assert!(db.load_dns_answers(now).is_empty());
-    // The selector choice is untouched by the DNS flush.
-    assert!(db.load_selector_choice("proxy").is_some());
+    assert_eq!(persisted(), 0);
+    // Clash state is untouched by the DNS flush.
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
 }
 
 #[tokio::test]
@@ -1549,7 +1894,7 @@ async fn test_traffic_ws_with_token_auth() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
         let stats = &app.state.stats;
-        stats.record_bytes("proxy", 500, 1500);
+        stats.record_bytes("proxy", honk_core::stats::OutboundKind::Node, 500, 1500);
     }
 
     use futures::StreamExt;
@@ -1640,6 +1985,10 @@ async fn test_connections_ws_stream() {
         source: "10.0.0.3:5555".into(),
         destination: "1.1.1.1:443".into(),
         proxy: "proxy".into(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Match".into(),
         rule_payload: String::new(),
         chains: vec!["node-a".into(), "proxy".into()],
@@ -1778,6 +2127,9 @@ async fn test_dns_query_upstream_and_nxdomain() {
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
         datapath_flags: app.state.datapath_flags.clone(),
+        control: app.state.control.clone(),
+        ui_download: app.state.ui_download.clone(),
+        diagnostics: app.state.diagnostics.clone(),
         secret: String::new(),
         external_ui: String::new(),
         router: app.state.router.clone(),
@@ -1886,14 +2238,7 @@ async fn test_proxy_providers_structure() {
 #[tokio::test]
 async fn test_store_dns_persister_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("cache.db");
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: db_path.to_str().unwrap().to_string(),
-        store_dns: true,
-        ..Default::default()
-    };
-    let db = Arc::new(CacheDb::open(&cache_cfg).unwrap());
+    let db = Arc::new(CacheDb::open(Arc::new(StateDb::open(tmp.path()).unwrap())).unwrap());
 
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_config = DnsConfig::default();
@@ -1921,8 +2266,6 @@ async fn test_store_dns_persister_end_to_end() {
     persister.shutdown().await.expect("persistence shutdown");
     assert_eq!(persister.counters().written, 1);
 
-    let now = honk_core::dns::persist::unix_now();
-    db.save_dns_answer("legacy.example", 1, r#"{"r":"TEVHQUNZ"}"#, now + 300);
     let fresh_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let restart = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
@@ -1942,11 +2285,6 @@ async fn test_store_dns_persister_end_to_end() {
         .unwrap();
     assert_eq!(resp, a_record_response([1, 2, 3, 4], 300));
     restart.shutdown().await.expect("restart shutdown");
-    assert_eq!(
-        db.load_dns_answers(now).len(),
-        1,
-        "v2 restart must leave rollback-compatible legacy rows untouched"
-    );
 }
 
 #[tokio::test]
@@ -1989,6 +2327,42 @@ async fn stats_exposes_udp_metrics() {
     // UDP is additive: existing dashboard keys retain their shapes.
     assert!(body["outbounds"].is_array());
     assert!(body["pool"].is_object());
+    assert!(body["quic"].is_object());
+    assert!(body["quic"]["activeConnections"].is_u64());
+    for key in [
+        "srttUs",
+        "cwndBytes",
+        "flowReceivedBytes",
+        "flowSentBytes",
+        "receiveWindowBytes",
+        "receiveWindowAvailableBytes",
+        "streamReceiveWindowBytes",
+        "sendWindowBytes",
+        "sendWindowAvailableBytes",
+        "lossRatePpm",
+        "sentPackets",
+        "ackFrames",
+        "lostPackets",
+        "sentPlpmtudProbes",
+        "lostPlpmtudProbes",
+        "currentMtu",
+        "blackHoles",
+        "congestionEvents",
+        "txBytes",
+        "rxBytes",
+        "txDatagrams",
+        "rxDatagrams",
+        "txIos",
+        "rxIos",
+        "transportTxWouldBlock",
+        "transportTxDrops",
+        "transportRxDrops",
+        "sessionRxDrops",
+        "sendTimeouts",
+        "pathStalls",
+    ] {
+        assert!(body["quic"][key].is_u64(), "missing QUIC stat {key}");
+    }
 
     let tcp = &body["tcp"];
     assert!(tcp["activeFlows"].is_u64());

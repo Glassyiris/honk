@@ -584,6 +584,82 @@ async fn test_salamander_receives_quic_go_initial_size() {
     assert_eq!(&output[..payload.len()], payload);
 }
 
+#[tokio::test]
+async fn test_salamander_receive_compacts_and_bounds_invalid_packets() {
+    let password: Arc<[u8]> = Arc::from(&b"obfs-password"[..]);
+    let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    std_socket.set_nonblocking(true).unwrap();
+    let socket = Arc::new(Hy2UdpSocket::from_socket(
+        tokio::net::UdpSocket::from_std(std_socket).unwrap(),
+        Some(Arc::clone(&password)),
+        None,
+    ));
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = socket.local_addr().unwrap();
+    let source = sender.local_addr().unwrap();
+
+    sender
+        .send_to(&[0; SALAMANDER_SALT_LEN], destination)
+        .await
+        .unwrap();
+    sender
+        .send_to(&salamander_seal(&password, b"valid"), destination)
+        .await
+        .unwrap();
+
+    let mut first = [0u8; 64];
+    let mut second = [0u8; 64];
+    let mut meta = [quinn::udp::RecvMeta::default(); 2];
+    let count = {
+        let mut bufs = [
+            std::io::IoSliceMut::new(&mut first),
+            std::io::IoSliceMut::new(&mut second),
+        ];
+        std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap()
+    };
+    assert_eq!(count, 1);
+    assert_eq!(meta[0].addr, source);
+    assert_eq!(meta[0].len, 5);
+    assert_eq!(meta[0].stride, 5);
+    assert_eq!(&first[..5], b"valid");
+
+    for _ in 0..2 {
+        sender
+            .send_to(&[0; SALAMANDER_SALT_LEN], destination)
+            .await
+            .unwrap();
+    }
+    sender
+        .send_to(&salamander_seal(&password, b"next"), destination)
+        .await
+        .unwrap();
+
+    let count = {
+        let mut bufs = [
+            std::io::IoSliceMut::new(&mut first),
+            std::io::IoSliceMut::new(&mut second),
+        ];
+        std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap()
+    };
+    assert_eq!(count, 0, "one poll must inspect at most the provided slots");
+
+    let count = {
+        let mut bufs = [std::io::IoSliceMut::new(&mut first)];
+        std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta[..1]))
+            .await
+            .unwrap()
+    };
+    assert_eq!(count, 1);
+    assert_eq!(meta[0].addr, source);
+    assert_eq!(meta[0].len, 4);
+    assert_eq!(meta[0].stride, 4);
+    assert_eq!(&first[..4], b"next");
+}
+
 #[test]
 fn test_udp_message_codec_roundtrip() {
     let pkt = encode_udp_message(0xdead_beef, 42, 0, 1, "8.8.8.8:53", b"payload");
@@ -604,7 +680,7 @@ fn test_fragmentation_and_defrag() {
     assert_eq!(frags.len(), 3);
     assert!(frags.iter().all(|f| f.len() <= 1200));
     // Every fragment repeats the full header (sing parity).
-    let mut defrag = Defragmenter::new();
+    let mut defrag = Defragmenter::new(MAX_UDP_SIZE);
     let mut out = None;
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(pkt).unwrap();
@@ -633,7 +709,7 @@ fn test_udp_message_rejects_invalid_fragments() {
 async fn test_short_salamander_password_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
     node.hysteria2_mut().unwrap().obfs = Some("abc".to_string());
-    let result = Hysteria2Handler::new().build_client(&node).await;
+    let result = Hysteria2Handler::new().build_client(&node, None).await;
     let error = match result {
         Ok(_) => panic!("short Salamander password must be rejected"),
         Err(error) => error,
@@ -644,19 +720,24 @@ async fn test_short_salamander_password_rejected_before_dial() {
 #[tokio::test]
 async fn test_invalid_port_hopping_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
-    node.hysteria2_mut().unwrap().port_hopping = Some("0-10".to_string());
-    let error = match Hysteria2Handler::new().build_client(&node).await {
-        Ok(_) => panic!("invalid port hopping list must be rejected"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("invalid port hopping list"));
+    for spec in ["0-10", "443,443", "443-445,445-446"] {
+        node.hysteria2_mut().unwrap().port_hopping = Some(spec.to_string());
+        let error = match Hysteria2Handler::new().build_client(&node, None).await {
+            Ok(_) => panic!("invalid port hopping list must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid port hopping list"));
+    }
 }
 
 #[tokio::test]
 async fn test_downlink_mbps_is_serialized_as_bytes_per_second() {
     let mut node = test_node(443, TEST_PASSWORD);
     node.hysteria2_mut().unwrap().down_mbps = Some(1);
-    let client = Hysteria2Handler::new().build_client(&node).await.unwrap();
+    let client = Hysteria2Handler::new()
+        .build_client(&node, None)
+        .await
+        .unwrap();
     let frame = auth_request_frame(TEST_PASSWORD, client.rx_bytes_per_second);
     let mut offset = 0;
     assert_eq!(parse_varint(&frame, &mut offset), Some(H3_FRAME_HEADERS));
@@ -689,20 +770,6 @@ fn test_tcp_request_frame_shape() {
     assert_eq!(req.len(), 18 + pad_len_bytes + pad_len);
 }
 
-#[test]
-fn test_resolve_password() {
-    let node = Node {
-        outbound: honk_config::node::OutboundConfig::Hysteria2(
-            honk_config::node::Hysteria2Config {
-                auth: Some("hy2-secret".to_string()),
-                ..Default::default()
-            },
-        ),
-        ..Default::default()
-    };
-    assert_eq!(Hysteria2Handler::resolve_password(&node), "hy2-secret");
-}
-
 #[tokio::test]
 async fn test_dial_tcp_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;
@@ -725,14 +792,17 @@ async fn test_dial_tcp_echo() {
 
 #[tokio::test]
 async fn test_dial_tcp_does_not_wait_for_response() {
-    let server_addr =
-        start_server_with_response(TEST_PASSWORD, Duration::from_millis(200), 0).await;
+    // The server answers the TCP request only after a long delay; the dial
+    // must return well before that, otherwise it waited for the response. The
+    // margins are wide because the QUIC handshake alone can take tens of
+    // milliseconds on a loaded CI runner.
+    let server_addr = start_server_with_response(TEST_PASSWORD, Duration::from_secs(2), 0).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
     let handler = Hysteria2Handler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
     let stream = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(1),
         handler.dial(&node, target, None, Duration::from_secs(5)),
     )
     .await
@@ -743,7 +813,7 @@ async fn test_dial_tcp_does_not_wait_for_response() {
     stream.stream.write_all(b"fast open").await.unwrap();
     let mut output = [0u8; 9];
     tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         stream.stream.read_exact(&mut output),
     )
     .await
@@ -767,6 +837,78 @@ async fn test_first_read_sends_tcp_request_and_reports_response_error() {
         .expect("first read did not send the Hysteria2 TCP request")
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::TargetFailure
+    );
+}
+
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn observed_target_requires_deferred_request_and_positive_response() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    for status in [0, 1] {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observer = FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            {
+                let events = Arc::clone(&events);
+                Arc::new(move |_, event| events.lock().push(event))
+            },
+        );
+        let address = start_server_with_response(TEST_PASSWORD, Duration::ZERO, status).await;
+        let node = test_node(address.port(), TEST_PASSWORD);
+        let mut stream = observer
+            .scope(Hysteria2Handler::new().dial(
+                &node,
+                "93.184.216.34:80".parse().unwrap(),
+                None,
+                Duration::from_secs(2),
+            ))
+            .await
+            .unwrap();
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            FlowEvent::Milestone {
+                milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
+                    | crate::runtime::flow_observation::Milestone::TargetConfirmed
+            }
+        )));
+        // I/O is deliberately outside the dial scope: the exclusive stream owns its evidence.
+        stream.stream.write_all(b"x").await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), stream.stream.read_u8())
+            .await
+            .unwrap();
+        if status == 0 {
+            assert_eq!(reply.unwrap(), b'x');
+        } else {
+            assert_eq!(reply.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+        }
+        let milestones: Vec<_> = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::Milestone { milestone } if milestone.as_str().starts_with("target_") => {
+                    Some(milestone.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            milestones,
+            if status == 0 {
+                vec!["target_request_sent", "target_confirmed"]
+            } else {
+                vec!["target_request_sent"]
+            }
+        );
+    }
 }
 
 #[tokio::test]
@@ -797,6 +939,7 @@ async fn test_wrong_password_rejected() {
         .dial(&node, target, None, Duration::from_secs(5))
         .await;
     let err = result.expect_err("bad password must fail the dial");
+    assert!(!crate::proxy::target_failure(&err));
     assert!(
         format!("{err:#}").contains("authentication failed, status code: 404"),
         "unexpected error: {err:#}"
@@ -842,7 +985,48 @@ async fn test_udp_transport_datagram_echo() {
 }
 
 #[tokio::test]
-async fn test_udp_transport_fragmented_echo() {
+async fn udp_carrier_close_is_node_failure() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let client = handler.build_client(&node, None).await.unwrap();
+    let timeout = Duration::from_secs(5);
+    let transport = handler
+        .udp_transport_via_client(
+            Arc::clone(&client),
+            "192.0.2.53:53".parse().unwrap(),
+            None,
+            timeout,
+        )
+        .await
+        .unwrap();
+    let endpoint =
+        crate::quic::packet_transport_endpoint(Arc::clone(&transport), transport.relay_addr())
+            .unwrap();
+    let (conn, _) = client.connection(timeout).await.unwrap();
+    conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
+    let error = transport.send_packet(b"query").await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let error = tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(error) = endpoint.terminal_error() {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    endpoint.close(Duration::ZERO).await;
+}
+
+#[tokio::test]
+async fn test_udp_transport_size_rejection_preserves_fragmented_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
     let handler = Hysteria2Handler::new();
@@ -852,6 +1036,19 @@ async fn test_udp_transport_fragmented_echo() {
         .dial_udp_transport(&node, target, None, Duration::from_secs(5))
         .await
         .expect("dial_udp_transport should succeed");
+    let oversized = vec![0; MAX_UDP_SIZE + 1];
+    let error = futures_util::FutureExt::now_or_never(transport.send_packet(&oversized))
+        .expect("local refusal must not wait for I/O")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        crate::proxy::io_packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::InvalidSize)
+    );
+    assert_eq!(
+        crate::proxy::packet_error_class(&error),
+        crate::proxy::PacketErrorClass::Rejected
+    );
     // Exercise the protocol's inclusive maximum across multiple fragments.
     let payload = vec![0x5au8; MAX_UDP_SIZE];
     transport.send_packet(&payload).await.unwrap();
@@ -862,30 +1059,6 @@ async fn test_udp_transport_fragmented_echo() {
         .unwrap();
     assert_eq!(src, target);
     assert_eq!(&buf[..n], payload.as_slice());
-}
-
-#[tokio::test]
-async fn test_connection_reuse_across_dials() {
-    let server_addr = start_server(TEST_PASSWORD).await;
-    let node = test_node(server_addr.port(), TEST_PASSWORD);
-    let handler = Hysteria2Handler::new();
-    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-
-    for i in 0..3 {
-        let mut stream = handler
-            .dial(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial should succeed");
-        let payload = format!("req{i}");
-        stream.stream.write_all(payload.as_bytes()).await.unwrap();
-        let mut buf = [0u8; 16];
-        stream
-            .stream
-            .read_exact(&mut buf[..payload.len()])
-            .await
-            .unwrap();
-        assert_eq!(&buf[..payload.len()], payload.as_bytes());
-    }
 }
 
 #[tokio::test]
@@ -901,9 +1074,12 @@ async fn test_salamander_obfs_tcp_udp_echo() {
         .await
         .expect("dial through salamander obfs should succeed");
     stream.stream.write_all(b"obfs hello").await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.stream.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"obfs hello");
+    let mut buf = [0u8; b"obfs hello".len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.stream.read_exact(&mut buf))
+        .await
+        .expect("TCP echo timed out")
+        .unwrap();
+    assert_eq!(&buf, b"obfs hello");
 
     let udp_target: SocketAddr = "8.8.8.8:53".parse().unwrap();
     let transport = handler
@@ -1312,6 +1488,36 @@ fn test_parse_port_hopping() {
     assert_eq!(parse_port_hopping("9000-8000"), None);
     assert_eq!(parse_port_hopping("0"), None);
     assert_eq!(parse_port_hopping("0-10"), None);
+}
+
+#[test]
+fn test_embedded_hop_spec_parity_with_share_link_parser() {
+    for spec in [
+        "123,5000-6000",
+        "8080, 9000-9001",
+        "5000-5000",
+        " 443 , 5000 ",
+    ] {
+        let link = format!("hysteria2://pass@example.com:{spec}/");
+        assert!(Node::from_share_link(&link).is_ok(), "{spec}");
+        assert!(parse_port_hopping(spec).is_some(), "{spec}");
+    }
+    for spec in [
+        "0-10",
+        "9000-8000",
+        "abc-def",
+        "443,-500",
+        "0,6000",
+        "65536-65537",
+    ] {
+        let link = format!("hysteria2://pass@example.com:{spec}/");
+        assert!(Node::from_share_link(&link).is_err(), "{spec}");
+        assert!(parse_port_hopping(spec).is_none(), "{spec}");
+    }
+    // Empty segments are intentionally stricter at parse time than at dial.
+    let link = "hysteria2://pass@example.com:443,/";
+    assert!(Node::from_share_link(link).is_err());
+    assert!(parse_port_hopping("443,").is_some());
 }
 
 #[test]

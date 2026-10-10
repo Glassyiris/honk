@@ -1,6 +1,6 @@
 # NFQUEUE held-first-packet UDP
 
-This document explains the fail-closed path that holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision.
+The NFQUEUE path holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision. It fails closed.
 
 ## Activation and scope
 
@@ -20,9 +20,9 @@ The hook is deliberately narrow:
 | --- | --- |
 | New, ambiguous LAN-forwarded UDP after LAN TC | Stage a unique token and hold the original skb in NFQUEUE when enabled and ready |
 | Host-originated WAN UDP | Keep the canonical TPROXY path; host egress does not cross this `inet prerouting` hook |
-| UDP port `53` | Keep the dedicated DNS fast path; never stage |
+| UDP port `53` | Follow [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must); fragmented LAN queries needing controller/raw handling use the complete-datagram path below, never ordinary conn-state or decision tokens |
 | Internal/special or reverse-direction traffic | Never stage |
-| A `must` or `block` routing result | Treat as final; never stage |
+| A non-DNS `must` or `block` routing result | Treat as final; never stage |
 | A direct result already safe at route time | Pass through the kernel direct path; never stage |
 | Staging candidate while enabled but not ready | Drop the new flow; unrelated, non-staged UDP keeps its normal path |
 
@@ -48,9 +48,29 @@ flowchart LR
 | Verdict ownership | A non-`Clone`, exactly-once `VerdictGuard`; dropping an uncommitted guard sends `NF_DROP` |
 | Ingest ownership | One actor bounded to `256` entries and `8 MiB` of queued payload; a UDP slow-path permit is attempted only when the actor dequeues an entry |
 | nftables ownership | One atomic transaction owns exact `inet honk_nfqueue` / `udp_decision`, an `inet prerouting` filter chain at priority `-250`; only UDP carrying the pending signature reaches the queue |
-| Failure policy | No queue bypass, fanout, or fail-open flag. Malformed or truncated input, `ENOBUFS`, unexpected listener exit, and verdict-socket failure are fatal |
+| Failure policy | No queue bypass, fanout, or fail-open flag. Identifiable bad/truncated UDP payloads and invalid checksums receive `NF_DROP`; malformed queue metadata, unidentifiable headers, `ENOBUFS`, listener exit and verdict-socket failure remain fatal |
 
 The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
+
+`honk-core` uses this Linux mechanism only with the `ebpf` feature.
+Parsing uses one exact-sized datagram allocation. The core sampler and `StatsManager` separate current-instance
+depth from process-wide drops accumulated across hard rebinds, report latest
+kernel-read availability/errors, and always refresh held-guard/effective-buffer gauges.
+Each sample opens procfs in the calling thread's queue namespace before reading
+asynchronously through that namespace-bound descriptor; neither the process leader
+nor a blocking worker selects the queue being sampled.
+
+## Fragmented LAN DNS
+
+TC evaluates the offset-zero UDP/53 fragment with the ordinary traffic policy. Native `direct(must)`, `block(must)` and trusted exact control-plane marks retain their actions. Queries requiring the DNS controller or a raw must group keep their route/generation carrier in the host skb mark instead of crossing into `daens`; later fragments also stay in the host. Kernel IPv4/IPv6 defragmentation runs at priority `-400`, before the existing queue at `-250` and conntrack at `-200`. No userspace fragment buffer or fragment-ID map is used.
+
+The actor distinguishes these complete DNS datagrams from ordinary token-owned flows before success, overflow or rejection handling. It validates the carrier, current generation and admission epoch, confirms `NF_DROP` on the original, then publishes into the same bounded DNS/raw pipeline used by transparent socket ingress. Existing redirect metadata restores replies from the original destination. UDP checksums are verified before dispatch, allowing IPv4's zero checksum and honoring kernel checksum-partial metadata; IPv6 zero checksums without that metadata are rejected.
+
+Queue-disabled or unready controller/raw fragments drop rather than bypassing DNS policy. Unfragmented DNS keeps its TC fast path. This path does not add TCP-fragment support. It traverses host raw hooks, unlike a TC redirect; an earlier firewall drop or mark rewrite can prevent admission. Copy truncation drops the identified packet rather than forwarding an incomplete DNS query.
+
+Ethernet first fragments requiring this path must be addressed to the host (`PACKET_HOST`); pure L2-transit candidates fail closed instead of assuming bridge-to-inet hooks are enabled. LAN and WAN egress also drop an unconsumed DNS queue carrier, including while admission is closed. No bridge firewall sysctl is changed. A bridge/slave MAC mismatch may conservatively reject fragmented queries; unfragmented DNS and native direct-must keep their existing behavior.
+
+`ROUTING_GENERATION_SEQUENCE` is a core-owned, pinned one-entry counter. Reserve a nonwrapping 20-bit value before each routing publication or NFQUEUE fence; a fence replaces only the immutable descriptor and retains the compiled policy/maps. Ordinary cleanup/restart preserves the counter, so an old first fragment cannot authorize a new process's group index. Exhaustion or a failed fence keeps NFQUEUE readiness closed; restarting does not reset it. Preserve this pin, like `UDP_DECISION_SEQUENCE`, while the host namespace can retain packets; reboot clears both host reassembly and bpffs state.
 
 ## Decision-token protocol
 
@@ -74,7 +94,7 @@ A token is ownership, not merely correlation metadata. It must agree across the 
 | Block | Commit token-bound `Block` → drop every original skb → retire the initializer as a kernel handoff |
 | Cancel or expiry | Abort only the matching pending incarnation → drop every original skb and retire its lease identity |
 
-Direct creates no userspace UDP socket, payload copy or replay, endpoint, or `/connections` entry. Its final verdict mark retains classification and removes the pending/token carrier. If another packet for the flow arrives after Arm, the correlator appends only its verdict guard, discards its payload and slow permit, and returns to the FIFO accept loop before activation.
+Direct creates no userspace UDP socket, payload copy or replay, `Ready` endpoint, or `/connections` entry. Its final verdict mark retains classification and removes the pending/token carrier. If another packet for the flow arrives after Arm, the correlator appends only its verdict guard, discards its payload and slow permit, and returns to the FIFO accept loop before activation.
 
 Proxy does not create a second routing path. It reuses the same `UdpInitLease` and `UdpEndpointPool` initializer used by ordinary transparent UDP. Publishing final kernel state before dial/send prevents a reply race; transferring only the retained payload and dropping the originals gives one send, with no replay fallback.
 
@@ -100,6 +120,8 @@ Failure or ambiguity in listener, queue, watchdog, cleanup, verdict, or retireme
 ### Exact tuple retirement
 
 Retirement inserts `UDP_DECISION_RETIRE_FENCE[tuple] = token` with `BPF_NOEXIST`, so a concurrent newer owner cannot replace the fence. It then flips the epoch, waits out pre-fence readers, and revalidates conn state, token, handoff, and redirect track. Only matching auxiliaries and conn state are deleted; the exact fence is released afterward. A mismatch retains the newer tuple incarnation and fails closed.
+
+WAN userspace UDP shares this fence even with token zero: its explicit `RoutingMeta` ownership bit permits retiring a marked direct/must endpoint without deleting native direct state. Both auxiliary tokens must still be zero before any deletion; missing or superseded conn state preserves all auxiliaries. Legacy LAN token-zero retirement remains conn-state-only.
 
 ## Sequence exhaustion and rotation
 

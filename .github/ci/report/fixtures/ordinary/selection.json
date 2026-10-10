@@ -1,0 +1,21 @@
+{
+  "event": "pull_request",
+  "inputs": {},
+  "labels": [],
+  "filters": {
+    "code": "true",
+    "docs": "true",
+    "ebpf": "false",
+    "parser": "true"
+  },
+  "filter_outcome": "success",
+  "intended_lanes": [
+    "changes",
+    "test",
+    "parser",
+    "smoke",
+    "docs"
+  ],
+  "run_id": 101,
+  "run_attempt": 1
+}

@@ -10,6 +10,7 @@
 
 pub mod doh;
 pub mod logs;
+mod score;
 pub mod ui;
 
 use axum::{
@@ -29,7 +30,7 @@ use honk_config::Config;
 use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
-use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use honk_outbound::alive::{AliveDialerSet, HealthCheckError, IpVersion, ProbeDomain};
 use honk_outbound::group::SelectionNetwork;
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 use honk_outbound::urltest::{
@@ -76,12 +77,14 @@ use crate::mode::{DatapathFlagsHandle, ModeState, SharedModeState};
 
 pub struct ClashState {
     pub config: Arc<tokio::sync::RwLock<Arc<Config>>>,
+    /// Access only while holding `config`; reload publishes both under that lock.
+    pub diagnostics: crate::config_diagnostics::SharedDiagnostics,
     pub stats: Arc<crate::stats::StatsManager>,
     pub alive_set: Arc<AliveDialerSet>,
     /// Hot-swappable group manager cell; a config reload swaps the inner
     /// manager and this API sees the new groups on the next request.
     pub group_manager: SharedGroupManager,
-    pub cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    pub cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     pub connection_tracker: Arc<crate::connection_tracker::ConnectionTracker>,
     pub proxy_registry: Arc<honk_outbound::proxy::ProxyRegistry>,
     /// Hot-swappable runtime generation cell; delay measurements resolve
@@ -93,6 +96,8 @@ pub struct ClashState {
     pub mode_state: SharedModeState,
     /// Sole writer for mode/global persistence and datapath policy flags.
     pub datapath_flags: DatapathFlagsHandle,
+    pub control: Option<crate::control::ControlClient>,
+    pub ui_download: Arc<tokio::sync::Mutex<Option<ui::UiDownloadTask>>>,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
     /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
@@ -147,14 +152,18 @@ pub fn router(state: Arc<ClashState>) -> Router {
         // background when the directory is missing/empty; ServeDir keeps
         // returning 404 until the files land (never blocks startup). The
         // fetch follows the traffic routing decision (direct/block/proxy).
-        ui::spawn_ui_download_if_needed(ui::UiDownloadContext {
-            external_ui: state.external_ui.clone(),
-            router: state.router.clone(),
-            config: state.config.clone(),
-            group_manager: state.group_manager.clone(),
-            proxy_registry: state.proxy_registry.clone(),
-            runtime_registry: state.runtime_registry.clone(),
-        });
+        if let Ok(mut owner) = state.ui_download.try_lock()
+            && owner.is_none()
+        {
+            *owner = Some(ui::spawn_ui_download_if_needed(ui::UiDownloadContext {
+                external_ui: state.external_ui.clone(),
+                router: state.router.clone(),
+                config: state.config.clone(),
+                group_manager: state.group_manager.clone(),
+                proxy_registry: state.proxy_registry.clone(),
+                runtime_registry: state.runtime_registry.clone(),
+            }));
+        }
         app = app
             // 301 Moved Permanently, matching sing-box's RedirectHandler.
             .route(
@@ -320,7 +329,7 @@ async fn hello(State(s): State<Arc<ClashState>>, headers: HeaderMap) -> Response
 /// GET /version — version info enabling premium/meta features in dashboards.
 async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": concat!("honk ", env!("CARGO_PKG_VERSION")),
+        "version": concat!("honk ", env!("HONK_VERSION")),
         "premium": true,
         "meta": true,
     }))
@@ -328,8 +337,10 @@ async fn version() -> Json<serde_json::Value> {
 
 /// GET /configs — current configuration snapshot in Clash-compatible format.
 async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
-    let mode = s.mode_state.read().mode.clone();
+    // Reload publishes settings and diagnostic provenance under this lock.
     let config = s.config.read().await;
+    let mode = s.mode_state.read().mode.clone();
+    let diagnostics = s.diagnostics.read().snapshot(&config.subscriptions);
     Json(serde_json::json!({
         "mode": mode,
         "mode-list": ["Rule", "Global", "Direct"],
@@ -341,6 +352,7 @@ async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
         "bind-address": "*",
         "log-level": config.global.log_level,
         "tun": {"enable": false},
+        "honk-diagnostics": diagnostics,
     }))
 }
 
@@ -350,7 +362,7 @@ async fn put_configs() -> StatusCode {
 }
 
 /// PATCH /configs — update specific fields; `{mode}` switches the clash
-/// mode (Rule/Global/Direct, case-insensitive) and persists it to cache.db.
+/// mode (Rule/Global/Direct, case-insensitive) and persists it to the state db.
 /// The body is parsed regardless of Content-Type (dashboard parity).
 async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
     let body: serde_json::Value = match serde_json::from_slice(&body) {
@@ -364,6 +376,22 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
                 "invalid mode (expected Rule/Global/Direct)",
             );
         };
+        #[cfg(feature = "native-api")]
+        if s.datapath_flags.snapshot().is_native() {
+            let Some(control) = &s.control else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "control owner is unavailable",
+                );
+            };
+            return match control
+                .mode(crate::control::client::ModeRequest::ClashMode(mode))
+                .await
+            {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "mode transition failed"),
+            };
+        }
         if let Err(error) = s.datapath_flags.set_mode(&mode).await {
             tracing::error!(%error, mode = %mode, "failed to update clash mode");
             return error_response(
@@ -411,24 +439,35 @@ fn build_group_proxy_info(
     alive_set: &AliveDialerSet,
 ) -> serde_json::Value {
     let node_names = group_manager.node_names_in_group(&group.name);
-    let now = match group.policy {
-        GroupPolicy::Selector => group_manager
-            .get_selector_choice(&group.name)
-            .or_else(|| group.default.clone())
+    let verification = (group.policy == GroupPolicy::Score)
+        .then(|| score::verification(group_manager, &group.name));
+    // An explicit Selector choice or an automatic group's pin wins.
+    let now = match (
+        group.policy,
+        group_manager.get_selector_choice(&group.name, SelectionNetwork::Tcp),
+    ) {
+        (_, Some(choice)) => choice,
+        (GroupPolicy::Selector, None) => group
+            .default
+            .clone()
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
-        GroupPolicy::URLTest => group_manager
+        (GroupPolicy::URLTest, None) => group_manager
             .get_urltest_selection(&group.name)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
         // Round-robin has no stable selection to display; show the first.
-        GroupPolicy::LoadBalance => node_names.first().cloned().unwrap_or_default(),
-        GroupPolicy::Fallback => group_manager
+        (GroupPolicy::LoadBalance, None) => node_names.first().cloned().unwrap_or_default(),
+        (GroupPolicy::Fallback, None) => group_manager
             .get_fallback_selection(&group.name)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
-        GroupPolicy::Score => group_manager
-            .get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
+        (GroupPolicy::Score, None) => verification
+            .as_ref()
+            .and_then(|(selected, _)| selected.clone())
+            .or_else(|| {
+                group_manager.get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
+            })
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
     };
@@ -444,13 +483,17 @@ fn build_group_proxy_info(
         }
     }
 
-    serde_json::json!({
+    let mut info = serde_json::json!({
         "name": group.name,
         "type": clash_group_type(group.policy),
         "all": node_names,
         "now": now,
         "history": history,
-    })
+    });
+    if let Some((_, verification)) = verification {
+        info["scoreVerification"] = verification;
+    }
+    info
 }
 
 /// Build a proxy info object for an individual node.
@@ -513,7 +556,7 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
 
 async fn get_proxies(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let config = s.config.read().await;
-    let global_selection = s.mode_state.read().global_selection.clone();
+    let global_selection = s.mode_state.read().global_selection().to_owned();
     let group_manager = s.group_manager.read().clone();
     let mut proxies = serde_json::Map::new();
 
@@ -544,7 +587,7 @@ async fn get_proxy(State(s): State<Arc<ClashState>>, Path(name): Path<String>) -
     let group_manager = s.group_manager.read().clone();
 
     if name == "GLOBAL" {
-        let global_selection = s.mode_state.read().global_selection.clone();
+        let global_selection = s.mode_state.read().global_selection().to_owned();
         return Json(build_global_proxy_info(&config, &global_selection)).into_response();
     }
 
@@ -579,6 +622,30 @@ async fn put_proxy(
     };
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
+        #[cfg(feature = "native-api")]
+        if s.datapath_flags.snapshot().is_native() {
+            let Some(control) = &s.control else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "control owner is unavailable",
+                );
+            };
+            return match control
+                .mode(crate::control::client::ModeRequest::ClashSelection(
+                    body.name,
+                ))
+                .await
+            {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::control::client::ControlError::Unsupported) => {
+                    error_response(StatusCode::BAD_REQUEST, "unknown proxy name")
+                }
+                Err(_) => error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "GLOBAL selection transition could not be confirmed",
+                ),
+            };
+        }
         let config = s.config.read().await;
         let valid = config.groups.iter().any(|g| g.name == body.name)
             || config.nodes.iter().any(|n| n.name == body.name);
@@ -600,33 +667,31 @@ async fn put_proxy(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let config = s.config.read().await;
-    let Some(group) = config.groups.iter().find(|g| g.name == group_name) else {
-        return error_response(StatusCode::NOT_FOUND, "group not found");
+    let Some(control) = &s.control else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control owner is unavailable",
+        );
     };
-    if group.policy != GroupPolicy::Selector {
-        return error_response(StatusCode::BAD_REQUEST, "must be a Selector group");
+    match control
+        .select(crate::control::client::SelectionRequest::Name {
+            group: group_name,
+            member: body.name,
+        })
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::control::client::ControlError::NotFound) => {
+            error_response(StatusCode::NOT_FOUND, "group not found")
+        }
+        Err(crate::control::client::ControlError::Unsupported) => {
+            error_response(StatusCode::BAD_REQUEST, "selection is unsupported")
+        }
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "selection transition could not be confirmed",
+        ),
     }
-    // Members are member TAGS (node names + nested sub-group tags): picking
-    // a sub-group defers to its own selection (sing-box drill-down). A leaf
-    // inside a sub-group is not a direct member and is rejected here.
-    let is_member = {
-        let gm = s.group_manager.read();
-        gm.node_names_in_group(&group_name)
-            .iter()
-            .any(|t| t == &body.name)
-    };
-    drop(config);
-    if !is_member {
-        return error_response(StatusCode::BAD_REQUEST, "node is not a member of the group");
-    }
-
-    // cache.db persistence runs through the group manager's persist
-    // callback, wired by ControlPlane::init_cache_db.
-    s.group_manager
-        .read()
-        .set_selector_choice(&group_name, &body.name);
-    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Query params for delay endpoints: `?url=<url>&timeout=<ms>`.
@@ -652,14 +717,30 @@ fn delay_ms(d: Duration) -> u64 {
     (d.as_millis() as u64).min(u16::MAX as u64)
 }
 
+fn health_probe_error(error: HealthCheckError) -> Response {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+}
+
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
-/// history; failures return 503, but only the second consecutive failure
-/// adds a synthetic penalty and demotes the node.
+/// history; errors return 503 without changing real dial failure streaks.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
     Query(query): Query<DelayQuery>,
+) -> Response {
+    let owner = Arc::clone(&s.alive_set);
+    owner
+        .run_external_probe(move |cancel| async move { proxy_delay(s, name, query, cancel).await })
+        .await
+        .unwrap_or_else(health_probe_error)
+}
+
+async fn proxy_delay(
+    s: Arc<ClashState>,
+    name: String,
+    query: DelayQuery,
+    cancel: honk_outbound::alive::ProbeCancellation,
 ) -> Response {
     let config = s.config.read().await;
 
@@ -684,6 +765,7 @@ async fn get_proxy_delay(
                 &query.url,
                 query.timeout(),
                 &group_manager,
+                cancel.clone(),
             )
             .await
         };
@@ -693,17 +775,10 @@ async fn get_proxy_delay(
                     .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
-            Err(e) => {
-                // A lone failure leaves history unchanged; a second
-                // consecutive failure adds the synthetic penalty and
-                // demotes the node.
-                s.alive_set
-                    .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &format!("An error occurred in the delay test: {e}"),
-                )
-            }
+            Err(e) => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("An error occurred in the delay test: {e}"),
+            ),
         };
     }
 
@@ -729,9 +804,13 @@ async fn get_proxy_delay(
                 &query.url,
                 query.timeout(),
                 group_manager,
+                cancel.clone(),
             )
             .await
         };
+        if cancel.is_cancelled() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "delay test was cancelled");
+        }
         // sing-box performUpdateCheck: an explicit delay test immediately
         // re-evaluates the URLTest selection with the fresh measurements
         // (tolerance hysteresis applies). Without this the group's `now`
@@ -746,7 +825,7 @@ async fn get_proxy_delay(
         // tag); its delay is the measurement of that member's leaf.
         let current = {
             let gm = s.group_manager.read();
-            gm.get_selector_choice(&name)
+            gm.get_selector_choice(&name, SelectionNetwork::Tcp)
                 .or_else(|| gm.get_urltest_selection(&name))
                 .or_else(|| gm.get_score_selection_for_network(&name, SelectionNetwork::Tcp))
         }
@@ -776,6 +855,19 @@ async fn get_group_delay(
     Path(name): Path<String>,
     Query(query): Query<DelayQuery>,
 ) -> Response {
+    let owner = Arc::clone(&s.alive_set);
+    owner
+        .run_external_probe(move |cancel| async move { group_delay(s, name, query, cancel).await })
+        .await
+        .unwrap_or_else(health_probe_error)
+}
+
+async fn group_delay(
+    s: Arc<ClashState>,
+    name: String,
+    query: DelayQuery,
+    cancel: honk_outbound::alive::ProbeCancellation,
+) -> Response {
     let exists = {
         let config = s.config.read().await;
         config.groups.iter().any(|group| group.name == name)
@@ -800,9 +892,13 @@ async fn get_group_delay(
             &query.url,
             query.timeout(),
             group_manager,
+            cancel.clone(),
         )
         .await
     };
+    if cancel.is_cancelled() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "delay test was cancelled");
+    }
     // sing-box performUpdateCheck: re-evaluate the URLTest selection with
     // the fresh measurements (see get_proxy_delay's group branch).
     {
@@ -855,11 +951,10 @@ fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> 
 /// standard; handy for headless ops.
 async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let snap = s.stats.snapshot();
-    let score_groups = {
-        let group_manager = s.group_manager.read();
-        group_manager.score_reason_snapshot()
-    };
-    let score_groups: Vec<_> = score_groups
+    let group_manager = s.group_manager.read().clone();
+    let score_cache = group_manager.score_cache_snapshot();
+    let score_groups: Vec<_> = group_manager
+        .score_reason_snapshot()
         .into_iter()
         .map(|group| {
             let counters = |counters: honk_outbound::group::ScoreReasonCounters| {
@@ -869,15 +964,33 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                     "reliabilityWinner": counters.reliability_winner,
                     "performanceWinner": counters.performance_winner,
                     "incumbentHeld": counters.incumbent_held,
+                    "insufficientEvidenceHeld": counters.insufficient_evidence_held,
+                    "directionalTradeoffHeld": counters.directional_tradeoff_held,
+                    "incumbentIneligible": counters.incumbent_ineligible,
                     "freshFailureBypass": counters.fresh_failure_bypass,
                     "deadFiltered": counters.dead_filtered,
+                    "ordinarySwitch": counters.ordinary_switch,
                     "switchFlap": counters.switch_flap,
+                    "failStreakExcluded": counters.fail_streak_excluded,
+                    "exploreBackedOff": counters.explore_backed_off,
+                    "carrierPressure": counters.carrier_pressure,
+                    "carrierRttPressure": counters.carrier_rtt_pressure,
+                    "carrierLossPressure": counters.carrier_loss_pressure,
+                    "carrierValidation": counters.carrier_validation,
                 })
             };
             serde_json::json!({
                 "name": group.name,
                 "tcp": counters(group.tcp),
                 "udp": counters(group.udp),
+                "verification": {
+                    "tcp": score::counters(group_manager.score_verification_counters(&group.name, SelectionNetwork::Tcp)),
+                    "udp": score::counters(group_manager.score_verification_counters(&group.name, SelectionNetwork::Udp)),
+                },
+                "budget": {
+                    "tcp": score::budget(group_manager.score_budget_counters(&group.name, SelectionNetwork::Tcp)),
+                    "udp": score::budget(group_manager.score_budget_counters(&group.name, SelectionNetwork::Udp)),
+                },
             })
         })
         .collect();
@@ -900,13 +1013,62 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
     let warm = s
         .stats
         .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
+    let quic = honk_outbound::quic::quic_stats_snapshot();
     Json(serde_json::json!({
         "outbounds": per_outbound,
-        "score": { "groups": score_groups },
+        "score": {
+            "groups": score_groups,
+            "businessStarts": group_manager.score_state().root_business_starts(),
+            "cache": {
+                "exactCells": score_cache.exact_cells,
+                "aggregateCells": score_cache.aggregate_cells,
+                "exactEvictions": score_cache.exact_evictions,
+                "aggregateEvictions": score_cache.aggregate_evictions,
+                "comparisonCells": score_cache.comparison_cells,
+                "comparisonLogicalBytes": score_cache.comparison_logical_bytes,
+                "comparisonLogicalCapacity": score_cache.comparison_logical_capacity,
+                "comparisonEvictions": score_cache.comparison_evictions,
+                "comparisonExpired": score_cache.comparison_expired,
+                "comparisonRejected": score_cache.comparison_rejected,
+            },
+        },
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,
             "entries": pool.entries,
+        },
+        "quic": {
+            "activeConnections": quic.active_connections,
+            "srttUs": quic.srtt_us,
+            "cwndBytes": quic.cwnd_bytes,
+            "flowReceivedBytes": quic.flow_received_bytes,
+            "flowSentBytes": quic.flow_sent_bytes,
+            "receiveWindowBytes": quic.receive_window_bytes,
+            "receiveWindowAvailableBytes": quic.receive_window_available_bytes,
+            "streamReceiveWindowBytes": quic.stream_receive_window_bytes,
+            "sendWindowBytes": quic.send_window_bytes,
+            "sendWindowAvailableBytes": quic.send_window_available_bytes,
+            "lossRatePpm": quic.loss_rate_ppm,
+            "sentPackets": quic.sent_packets,
+            "ackFrames": quic.ack_frames,
+            "lostPackets": quic.lost_packets,
+            "sentPlpmtudProbes": quic.sent_plpmtud_probes,
+            "lostPlpmtudProbes": quic.lost_plpmtud_probes,
+            "currentMtu": quic.current_mtu,
+            "blackHoles": quic.black_holes,
+            "congestionEvents": quic.congestion_events,
+            "txBytes": quic.tx_bytes,
+            "rxBytes": quic.rx_bytes,
+            "txDatagrams": quic.tx_datagrams,
+            "rxDatagrams": quic.rx_datagrams,
+            "txIos": quic.tx_ios,
+            "rxIos": quic.rx_ios,
+            "transportTxWouldBlock": quic.transport_tx_would_block,
+            "transportTxDrops": quic.transport_tx_drops,
+            "transportRxDrops": quic.transport_rx_drops,
+            "sessionRxDrops": quic.session_rx_drops,
+            "sendTimeouts": quic.send_timeouts,
+            "pathStalls": quic.path_stalls,
         },
         "warm": {
             "nodes": {
@@ -1204,15 +1366,25 @@ fn spawn_connection_sampler(
 }
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
-    for snap in s.connection_tracker.snapshot() {
-        s.connection_tracker.remove(&snap.id);
+    let summary = s
+        .connection_tracker
+        .close_matching(None, None, usize::MAX)
+        .await
+        .expect("all current tracked entries fit usize");
+    if summary.failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::NO_CONTENT
     }
-    StatusCode::NO_CONTENT
 }
 
 async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<String>) -> StatusCode {
-    s.connection_tracker.remove(&id);
-    StatusCode::NO_CONTENT
+    match s.connection_tracker.close_id(&id).await {
+        crate::connection_tracker::CloseOutcome::Closed
+        | crate::connection_tracker::CloseOutcome::Gone => StatusCode::NO_CONTENT,
+        crate::connection_tracker::CloseOutcome::NotClosable => StatusCode::CONFLICT,
+        crate::connection_tracker::CloseOutcome::Failed => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 async fn traffic_totals(s: &ClashState) -> (u64, u64) {
@@ -1513,26 +1685,25 @@ async fn get_dns_query(
     }
 }
 
-async fn flush_fakeip(State(s): State<Arc<ClashState>>) -> StatusCode {
-    if let Some(ref db) = s.cache_db {
-        db.flush_prefix("fakeip:");
-    }
+/// Nothing persists FakeIP mappings, so there is nothing to flush.
+async fn flush_fakeip() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
 async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
     match s.dns_service.flush_cache().await {
-        Ok(true) => {}
+        Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => {
-            if let Some(ref db) = s.cache_db {
-                db.flush_dns();
+            let Some(db) = s.cache_db.clone() else {
+                return StatusCode::NO_CONTENT;
+            };
+            match tokio::task::spawn_blocking(move || db.flush_dns()).await {
+                Ok(Ok(())) => StatusCode::NO_CONTENT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
             }
         }
-        Err(error) => {
-            tracing::warn!(%error, "DNS persistence flush command failed");
-        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
-    StatusCode::NO_CONTENT
 }
 
 /// Each group is exposed as a proxy provider holding its members — the

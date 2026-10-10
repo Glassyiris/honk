@@ -1,6 +1,8 @@
 # honk — eBPF transparent proxy engine
 # https://github.com/Glassyiris/honk
 
+ebpf_toolchain := `sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/honk-ebpf/rust-toolchain.toml`
+
 # ── Default ──────────────────────────────────────────────
 default: build
 
@@ -27,15 +29,23 @@ build-core-ebpf:
 # triple spelling, so the wrappers strip them and re-anchor on the zig triple.
 # link-self-contained=no lets zig supply the CRT (Rust's self-contained
 # rcrt1.o + zig's crt1.o both define _start). Requires zig (0.14+) in PATH.
-build-musl:
+build-musl features="ebpf,native-api":
     ZIGCC_TARGET=x86_64-linux-musl \
     CC_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcc \
     CXX_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcxx \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER={{justfile_directory()}}/ci/zigcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
     BINDGEN_EXTRA_CLANG_ARGS="$({{justfile_directory()}}/ci/zig-bindgen-env x86_64-linux-musl)" \
-    cargo build --release -p honk-core --features "ebpf" --target x86_64-unknown-linux-musl
+    cargo build --release -p honk-core --features "{{features}}" --target x86_64-unknown-linux-musl
     @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
+
+# build-musl with the pinned doona UI embedded (native-ui implies native-api);
+# fetches it unless HONK_DOONA_DIR is set
+build-musl-embedded-ui:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    doona="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}"
+    HONK_DOONA_DIR="$doona" {{just_executable()}} build-musl "ebpf,native-ui"
 
 # Build eBPF object standalone (optional; honk-core build.rs auto-builds it)
 # NOTE: an environment RUSTFLAGS overrides crates/honk-ebpf/.cargo/config.toml
@@ -43,7 +53,7 @@ build-musl:
 # section and aya refuses to load it ("no BTF parsed for object").
 build-ebpf:
     @test -z "${RUSTFLAGS:-}" || echo "warning: RUSTFLAGS is set and overrides crates/honk-ebpf/.cargo/config.toml (--btf) — the object may lack .BTF"
-    cd crates/honk-ebpf && cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+    cd crates/honk-ebpf && cargo +{{ebpf_toolchain}} build --release -Zbuild-std=core --target bpfel-unknown-none
     @readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF' \
         || (echo "error: eBPF object has no .BTF section (see RUSTFLAGS note above)" && exit 1)
 
@@ -56,13 +66,17 @@ build-all: build-core
 check:
     cargo check
 
-# Clippy lint all
+# Clippy lint all (fetches the pinned doona for native-ui unless HONK_DOONA_DIR is set)
 lint:
-    cargo clippy --all -- -D warnings
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo clippy --all --all-targets --features honk-core/native-ui -- -D warnings
 
 # Format all
 fmt:
     cargo fmt --all
+
+# Check formatting
+fmt-check:
+    cargo fmt --all -- --check
 
 # ── Test ─────────────────────────────────────────────────
 
@@ -70,27 +84,63 @@ fmt:
 test:
     cargo test --all
 
-# CI-equivalent gate: full suite minus the known pre-existing routing failure.
+# Workspace CI gate (requires cargo-nextest).
 test-ci:
-    cargo test --workspace --no-fail-fast -- --skip test_routing_with_config_dae
+    # Without nextest: cargo test --workspace --features honk-core/native-ui --no-fail-fast
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo nextest run --workspace --features honk-core/native-ui --profile ci
 
 # Run core + outbound tests
 test-core:
-    cargo test -p honk-core -p honk-outbound --lib
+    cargo test -p honk-core -p honk-outbound
 
-# Run config parser tests
+# Run config unit and integration tests
 test-config:
-    cargo test -p honk-config --lib
+    cargo test -p honk-config
+
+
+# Compare with the pinned dae parser (Go 1.26+, Python 3.11+, network).
+parser-ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    (cd tools/dae-parse && go build -o "$work/dae-parse" .)
+    python3 tools/dae-parse/fetch.py "$work/conformance-src"
+    DAE_PARSE_BIN="$work/dae-parse" CONFORMANCE_SRC="$work/conformance-src" \
+      cargo test -p honk-config --features conformance --test conformance -- --nocapture
+    just fuzz-replay
+
+# Replay saved inputs with stable Rust; no Go or nightly required.
+fuzz-replay:
+    env -u DAE_PARSE_BIN cargo test -p honk-config --features fuzz-checks --test fuzz_replay -- --nocapture
+
+# Fuzz one parser target for a while (needs the eBPF nightly and cargo-fuzz);
+# grown inputs go under fuzz/target, the committed seeds stay seeds.
+fuzz target seconds="60":
+    mkdir -p fuzz/target/grown/{{target}}
+    cd fuzz && cargo +{{ebpf_toolchain}} fuzz run {{target}} target/grown/{{target}} corpus/{{target}} -- -max_total_time={{seconds}} -timeout=10
 
 # Run eBPF common tests
 test-ebpf:
     cargo test -p honk-ebpf-common
 
+
+# Real generated-policy goldens and atomic publication failures (Linux 6.12+, root).
+test-routing:
+    cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +{{ebpf_toolchain}} build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test
+    HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::routing::tests -- --ignored --test-threads=1
 # Root-gated netlink/netns integration tests (NFQUEUE + netkit/veth/route/rule roundtrip)
-test-netns:
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
+test-netns: test-routing
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib netns -- --ignored --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --list --format terse)" = "ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib ebpf::real::tests -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --test ebpf_datapath_test -- --ignored --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --list --format terse)" = "control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf,native-api --lib control::connection::tcp::dial_permit_scope_tests::direct_race_preserves_per_flow_marks -- --ignored --exact --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-outbound --lib proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation -- --ignored --exact --list --format terse)" = "proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-outbound --lib proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_direct_flow_isolation -- --ignored --exact --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:
@@ -104,7 +154,7 @@ outbound-ci-e2e:
 dns-ci:
     ci/dns-ci.sh
 
-# Unprivileged actual-process DNS listener smoke (UDP + persistent TCP + SIGHUP)
+# Unprivileged actual-process DNS listener smoke on the release honk-core (UDP + persistent TCP + SIGHUP)
 dns-smoke:
     python3 ci/dns-smoke.py
 
@@ -120,7 +170,7 @@ run-debug:
     @pkill honk-core 2>/dev/null || true
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
-    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE -delete 2>/dev/null || true
+    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE ! -name ROUTING_GENERATION_SEQUENCE -delete 2>/dev/null || true
     sleep 1
     RUST_LOG=info ./target/release/honk-core \
         --config config.dae \
@@ -167,7 +217,7 @@ clean:
     cargo clean
 
 # Clean transient honk-core state while preserving the boot-lifetime UDP
-# decision sequence pin. The MASQUERADE/table-2023 lines remove only legacy
+# decision and routing generation sequence pins. The MASQUERADE/table-2023 lines remove only legacy
 # leftovers; no iptables rules are installed by the live engine.
 clean-all:
     @echo "=== Stopping honk-core ==="
@@ -176,8 +226,8 @@ clean-all:
     @echo "=== Removing link + netns ==="
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
-    @echo "=== Cleaning ephemeral BPF maps (preserving UDP_DECISION_SEQUENCE) ==="
-    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE -delete 2>/dev/null || true
+    @echo "=== Cleaning ephemeral BPF maps (preserving UDP_DECISION_SEQUENCE and ROUTING_GENERATION_SEQUENCE) ==="
+    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE ! -name ROUTING_GENERATION_SEQUENCE -delete 2>/dev/null || true
     @echo "=== Cleaning policy routes (live: table 100) ==="
     @ip rule del fwmark 0x8000000/0x8000000 table 100 2>/dev/null || true
     @ip route flush table 100 2>/dev/null || true

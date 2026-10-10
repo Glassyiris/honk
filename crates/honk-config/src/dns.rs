@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -7,6 +8,29 @@ use thiserror::Error;
 use url::Host;
 
 use crate::types::DnsProtocol;
+
+mod validation;
+
+/// A canonical network plus the information needed for an admission warning.
+pub struct DecodedNetwork {
+    pub network: ipnet::IpNet,
+    pub truncated: bool,
+}
+
+/// Decode a CIDR or bare IPv4/IPv6 host without allocating or resolving names.
+pub fn decode_ip_or_cidr(value: &str) -> Option<DecodedNetwork> {
+    let value = value.trim();
+    let network: ipnet::IpNet = if value.contains('/') {
+        value.parse().ok()?
+    } else {
+        value.parse::<IpAddr>().ok()?.into()
+    };
+    let canonical = network.trunc();
+    Some(DecodedNetwork {
+        network: canonical,
+        truncated: canonical != network,
+    })
+}
 
 /// Transports served by a standalone DNS bind endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,9 +372,9 @@ pub struct DnsUpstream {
 
 /// DNS routing configuration.
 ///
-/// Supports both the new request/response rules and the legacy flat
-/// `rules` + `fallback` format. When `request.rules` is empty (e.g.
-/// after serde from old JSON), `DnsRouter::new` converts legacy rules.
+/// Supports request/response rules and the legacy flat `rules` + `fallback`
+/// format. [`Self::effective_request`] applies their shared compatibility
+/// precedence for routing and policy identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRouting {
     /// New-style request routing rules.
@@ -359,8 +383,8 @@ pub struct DnsRouting {
     /// New-style response routing rules.
     #[serde(default, skip_serializing_if = "DnsResponseRouting::is_default")]
     pub response: DnsResponseRouting,
-    /// LEGACY flat rules for old JSON/tests — converted in `DnsRouter::new`
-    /// when `request.rules` is empty.
+    /// Legacy flat rules; [`Self::effective_request`] selects them only when
+    /// new-style request rules are absent.
     #[serde(default)]
     pub rules: Vec<DnsRule>,
     /// Legacy fallback upstream name.
@@ -616,7 +640,34 @@ impl<'de> Deserialize<'de> for DnsResponseRouting {
     }
 }
 
+enum RequestSource {
+    Current,
+    Legacy,
+}
+
 impl DnsRouting {
+    /// Select request routing with legacy compatibility precedence.
+    pub fn effective_request(&self) -> Cow<'_, DnsRequestRouting> {
+        match self.request_source() {
+            RequestSource::Current => Cow::Borrowed(&self.request),
+            RequestSource::Legacy => Cow::Owned(self.convert_legacy_rules()),
+        }
+    }
+
+    fn request_source(&self) -> RequestSource {
+        if !self.request.rules.is_empty() {
+            return RequestSource::Current;
+        }
+        if !self.rules.is_empty()
+            || (matches!(&self.request.fallback, DnsRequestAction::Upstream(name) if name == "default")
+                && !matches!(self.fallback.as_str(), "" | "upstream" | "default"))
+        {
+            RequestSource::Legacy
+        } else {
+            RequestSource::Current
+        }
+    }
+
     /// Convert legacy rules into request rules.
     pub fn convert_legacy_rules(&self) -> DnsRequestRouting {
         let mut rules = Vec::with_capacity(self.rules.len());
@@ -719,6 +770,9 @@ pub struct DnsCacheConfig {
     /// Cache TTL in seconds
     #[serde(default = "default_cache_ttl")]
     pub ttl: u64,
+    /// Served-stale reply TTL in seconds; zero preserves cached wire TTLs.
+    #[serde(default = "default_stale_reply_ttl")]
+    pub stale_reply_ttl: u32,
     /// Maximum cache entries
     #[serde(default = "default_cache_size")]
     pub max_size: usize,
@@ -726,6 +780,10 @@ pub struct DnsCacheConfig {
 
 fn default_cache_ttl() -> u64 {
     600
+}
+
+fn default_stale_reply_ttl() -> u32 {
+    30
 }
 
 fn default_cache_size() -> usize {
@@ -737,6 +795,7 @@ impl Default for DnsCacheConfig {
         Self {
             enabled: crate::types::default_true(),
             ttl: default_cache_ttl(),
+            stale_reply_ttl: default_stale_reply_ttl(),
             max_size: default_cache_size(),
         }
     }
@@ -761,6 +820,7 @@ impl Default for DnsConfig {
             cache: DnsCacheConfig {
                 enabled: true,
                 ttl: 600,
+                stale_reply_ttl: 30,
                 max_size: 10000,
             },
             fixed_domain_ttl: HashMap::new(),

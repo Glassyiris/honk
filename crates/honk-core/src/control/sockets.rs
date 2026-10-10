@@ -1,8 +1,28 @@
 use super::*;
-use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
 
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+const SO_RCVPRIORITY_OPT: libc::c_int = 82;
+
+#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+pub(super) fn set_so_recvpriority(socket: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let status = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_RCVPRIORITY_OPT,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as _,
+        )
+    };
+    if status < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 #[cfg(target_os = "linux")]
 fn set_ip_transparent(socket: &Socket, is_v6: bool) -> io::Result<()> {
     if is_v6 {
@@ -35,8 +55,13 @@ pub(super) fn bind_tproxy_tcp(
 /// tests stay entirely in the host netns), so this flag is the switch
 /// between "bind inside daens" and "bind here".
 #[cfg(target_os = "linux")]
-fn daens_netns_exists() -> bool {
+pub(super) fn daens_netns_exists() -> bool {
     crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn daens_netns_exists() -> bool {
+    false
 }
 
 fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::net::TcpListener> {
@@ -49,6 +74,7 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     socket.set_nonblocking(true)?;
     socket.set_cloexec(true)?;
     socket.set_reuse_address(true)?;
+    set_client_keepalive(&socket)?;
     if domain == Domain::IPV6 {
         // Keep the v6 listener v6-only so it does not conflict with the v4 listener.
         socket.set_only_v6(true)?;
@@ -58,7 +84,7 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     if transparent {
         set_ip_transparent(&socket, addr.is_ipv6())?;
         // Accepted sockets inherit the listener mark; the accept loop clears it.
-        set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+        set_so_mark(&socket, honk_outbound::util::bypass_mark())?;
     }
     #[cfg(not(target_os = "linux"))]
     let _ = transparent;
@@ -67,6 +93,25 @@ fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::
     socket.listen(128)?;
 
     Ok(socket.into())
+}
+
+// A dead client is reaped after IDLE + INTERVAL * RETRIES = about an hour of silence.
+const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(3600);
+#[cfg(target_os = "linux")]
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(target_os = "linux")]
+const CLIENT_KEEPALIVE_RETRIES: u32 = 4;
+
+/// Accepted sockets inherit these. A client that vanishes without FIN/RST
+/// otherwise pins its relay and both sockets until the upstream closes; a
+/// live idle client answers the probes, so long connections are untouched.
+fn set_client_keepalive(socket: &Socket) -> io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new().with_time(CLIENT_KEEPALIVE_IDLE);
+    #[cfg(target_os = "linux")]
+    let keepalive = keepalive
+        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
+        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+    socket.set_tcp_keepalive(&keepalive)
 }
 
 /// Clear the inherited bypass mark on an accepted transparent socket.
@@ -78,10 +123,7 @@ pub(super) fn set_so_mark_zero(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
     set_so_mark(fd, 0)
 }
 
-/// Set SO_MARK on a socket. TPROXY listeners carry `DAE_BYPASS_MARK` so the
-/// eBPF NAT-loopback probe (`bpf_sock_is_dae_socket`, which compares against
-/// `PARAM.dae_socket_mark`) recognizes them as proxy-engine sockets instead
-/// of misreading them as local services to pass through.
+/// Set SO_MARK, including the configured bypass identity on TPROXY listeners.
 #[cfg(target_os = "linux")]
 pub(super) fn set_so_mark(fd: &impl std::os::fd::AsFd, mark: u32) -> io::Result<()> {
     nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &mark)
@@ -128,6 +170,25 @@ pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::R
     }
     Ok(socket)
 }
+#[cfg(target_os = "linux")]
+pub(super) fn set_so_recvmark(socket: &Socket) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    // SAFETY: the option payload points to a live native integer for this call.
+    let status = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVMARK,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
 
 fn build_tproxy_udp(
     addr: SocketAddr,
@@ -152,6 +213,7 @@ fn build_tproxy_udp(
     {
         if transparent {
             set_ip_transparent(&socket, addr.is_ipv6())?;
+            set_so_recvmark(&socket)?;
             if addr.is_ipv4() {
                 nix::sys::socket::setsockopt(
                     &socket,
@@ -167,7 +229,7 @@ fn build_tproxy_udp(
                 )
                 .map_err(io::Error::from)?;
             }
-            set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+            set_so_mark(&socket, honk_outbound::util::bypass_mark())?;
         }
         if addr.is_ipv4() {
             nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
@@ -206,6 +268,12 @@ pub(super) async fn send_udp_reply_from_orig_dst(
     if original_dst.port() == 53 {
         match send_dns_reply_cached(data, client_addr, original_dst).await {
             Some(Ok(n)) => {
+                let fallback = &DNS_REPLY_FALLBACK[usize::from(original_dst.is_ipv6())];
+                if fallback.load(std::sync::atomic::Ordering::Relaxed)
+                    && fallback.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    info!("cached DNS reply socket recovered");
+                }
                 debug!(
                     "UDP reply sent to {} from {} ({} bytes)",
                     client_addr, original_dst, n
@@ -213,7 +281,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
                 return Ok(n);
             }
             Some(Err(e)) => {
-                warn!(
+                debug!(
                     "UDP reply to {} from {} failed: {}",
                     client_addr, original_dst, e
                 );
@@ -233,7 +301,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
             Ok(n)
         }
         Err(e) => {
-            warn!(
+            debug!(
                 "UDP reply to {} from {} failed: {}",
                 client_addr, original_dst, e
             );
@@ -316,6 +384,14 @@ fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
 static DNS_REPLY_SOCK_V4: Mutex<Option<Arc<UdpSocket>>> = Mutex::new(None);
 #[cfg(target_os = "linux")]
 static DNS_REPLY_SOCK_V6: Mutex<Option<Arc<UdpSocket>>> = Mutex::new(None);
+
+/// Per-family flag set while cached DNS replies fall back to one-shot
+/// sockets, so a persistent failure warns once per episode, not per reply.
+#[cfg(target_os = "linux")]
+static DNS_REPLY_FALLBACK: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
 
 /// Source port every DNS reply is sent from (the port clients send queries to).
 #[cfg(target_os = "linux")]
@@ -413,12 +489,33 @@ fn replace_dns_reply_socket(is_v6: bool, old: &Arc<UdpSocket>) -> io::Result<Arc
     Ok(new_sock)
 }
 
+/// Whether a reply send error is about this destination (no route, the
+/// client refused, the datagram is too large) rather than the socket. A
+/// destination error is reported as is: rebuilding the socket would not
+/// change it, and the family's other clients keep the socket they share.
+#[cfg(target_os = "linux")]
+fn send_error_is_destination_specific(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::ECONNREFUSED
+                | libc::EMSGSIZE
+                | libc::EACCES
+                | libc::EPERM
+                | libc::ENOBUFS
+        )
+    )
+}
+
 /// Try to send a DNS reply through the cached per-family transparent socket.
 ///
 /// Returns `None` when the cached path is unavailable (socket creation
-/// failed) and the caller should fall back to a one-shot socket. On a send
-/// failure the cached socket is rebuilt once and the send retried once
-/// before the error is reported.
+/// failed) and the caller should fall back to a one-shot socket. On a
+/// socket-level send failure the cached socket is rebuilt once and the send
+/// retried once before the error is reported; a destination-specific
+/// failure is reported without touching the shared socket.
 #[cfg(target_os = "linux")]
 async fn send_dns_reply_cached(
     data: &[u8],
@@ -429,7 +526,9 @@ async fn send_dns_reply_cached(
     let sock = match get_dns_reply_socket(is_v6) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
+            crate::logging::warn_on_entry!(
+                !DNS_REPLY_FALLBACK[usize::from(is_v6)]
+                    .swap(true, std::sync::atomic::Ordering::Relaxed),
                 "cached DNS reply socket unavailable ({}); falling back to one-shot",
                 e
             );
@@ -443,6 +542,10 @@ async fn send_dns_reply_cached(
         .await;
     match first {
         Ok(n) => return Some(Ok(n)),
+        Err(e) if send_error_is_destination_specific(&e) => {
+            debug!("DNS reply to {} failed ({}); socket kept", client_addr, e);
+            return Some(Err(e));
+        }
         Err(e) => {
             debug!(
                 "cached DNS reply socket send failed ({}); rebuilding once",
@@ -453,7 +556,9 @@ async fn send_dns_reply_cached(
     let sock = match replace_dns_reply_socket(is_v6, &sock) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
+            crate::logging::warn_on_entry!(
+                !DNS_REPLY_FALLBACK[usize::from(is_v6)]
+                    .swap(true, std::sync::atomic::Ordering::Relaxed),
                 "cached DNS reply socket rebuild failed ({}); falling back to one-shot",
                 e
             );
@@ -552,11 +657,14 @@ pub(super) async fn send_to_with_src(
         .await
 }
 
-// Accommodate two IPv6-sized ancillary records (ORIGDST + PKTINFO). Capacity
-// is validated before scalar receives and when each reusable batch is built.
+// Accommodate IPv6 ORIGDST, PKTINFO, packet mark and optional priority records.
+// Capacity is validated before scalar receives and when each batch is built.
 const CMSG_CONTROL_CAPACITY: usize = 256;
 const UDP_RECV_BATCH_SIZE: usize = 8;
 const UDP_RECV_PACKET_CAPACITY: usize = 64 * 1024;
+// The receive trace rejects batches beyond its kernel record.
+const _: () =
+    assert!(UDP_RECV_BATCH_SIZE == honk_ebpf_common::receive_trace::RECEIVE_TRACE_BATCH_SIZE);
 
 /// Raw recvmsg control storage whose first byte is naturally aligned for a
 /// `cmsghdr`. The zero-length field carries `cmsghdr`'s ABI alignment without
@@ -587,20 +695,25 @@ fn cmsg_space(data_len: usize) -> usize {
 pub(super) fn cmsg_control_capacity_is_sufficient() -> bool {
     let Some(required) = cmsg_space(std::mem::size_of::<libc::sockaddr_in6>())
         .checked_add(cmsg_space(std::mem::size_of::<libc::in6_pktinfo>()))
+        .and_then(|required| required.checked_add(cmsg_space(std::mem::size_of::<u32>())))
+        .and_then(|required| required.checked_add(cmsg_space(std::mem::size_of::<u32>())))
     else {
         return false;
     };
     CMSG_CONTROL_CAPACITY >= required
 }
 
-/// Provenance captured for one UDP datagram before any destination is
-/// selected.  The listener's address is deliberately retained separately: a
+/// Metadata captured for one UDP datagram before any destination or owner is
+/// selected. The listener's address is deliberately retained separately: a
 /// wildcard bind is not an original destination and must not become one.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UdpRecvMeta {
     pub(super) original_dst_cmsg: Option<SocketAddr>,
     pub(super) packet_dst_ip: Option<std::net::IpAddr>,
     pub(super) packet_ifindex: Option<u32>,
+    pub(super) packet_mark: Option<u32>,
+    #[cfg(any(feature = "native-api", test))]
+    pub(super) packet_priority: Option<u32>,
     pub(super) local_addr: SocketAddr,
 }
 
@@ -633,6 +746,8 @@ pub(super) struct UdpRecvBatch {
     results: [Option<io::Result<UdpRecvPacket>>; UDP_RECV_BATCH_SIZE],
     received: usize,
     limit: usize,
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    trace: Option<crate::ebpf::real::receive_trace::ReceiveRegistration>,
 }
 
 impl UdpRecvBatch {
@@ -649,7 +764,7 @@ impl UdpRecvBatch {
         if !cmsg_control_capacity_is_sufficient() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "recvmmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
+                "recvmmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, mark and priority",
             ));
         }
         let slots = std::array::from_fn(|_| UdpRecvStorage::new(packet_capacity));
@@ -667,7 +782,32 @@ impl UdpRecvBatch {
             results: std::array::from_fn(|_| None),
             received: 0,
             limit: UDP_RECV_BATCH_SIZE,
+            #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+            trace: None,
         })
+    }
+
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    pub(super) fn enable_trace(
+        &mut self,
+        socket: &UdpSocket,
+        trace: Option<Arc<crate::ebpf::real::receive_trace::ReceiveTrace>>,
+    ) -> io::Result<()> {
+        if set_so_recvpriority(socket).is_ok() {
+            return Ok(());
+        }
+        let trace = trace.ok_or_else(|| io::Error::other("UDP receive trace unavailable"))?;
+        self.register_trace(socket, &trace)
+    }
+
+    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    fn register_trace(
+        &mut self,
+        socket: &UdpSocket,
+        trace: &Arc<crate::ebpf::real::receive_trace::ReceiveTrace>,
+    ) -> io::Result<()> {
+        self.trace = Some(trace.register(socket.as_raw_fd())?);
+        Ok(())
     }
 
     pub(super) fn len(&self) -> usize {
@@ -711,6 +851,9 @@ impl UdpRecvBatch {
             message.msg_controllen = CMSG_CONTROL_CAPACITY as _;
         }
 
+        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+        let trace_armed = self.trace.as_mut().is_some_and(|trace| trace.begin(fd));
+
         // SAFETY: every mmsghdr points to live, disjoint storage above and the
         // kernel writes at most UDP_RECV_BATCH_SIZE entries synchronously.
         let count = unsafe {
@@ -722,8 +865,30 @@ impl UdpRecvBatch {
                 std::ptr::null_mut(),
             )
         };
-        if count < 0 {
-            let error = io::Error::last_os_error();
+        let receive_error = (count < 0).then(io::Error::last_os_error);
+        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+        let trace_packets = self
+            .trace
+            .as_mut()
+            // Nothing was consumed, so the armed batch stays valid for the next receive.
+            .filter(|_| {
+                !receive_error
+                    .as_ref()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            })
+            .and_then(|trace| {
+                let packets = trace.finish(count.max(0) as usize);
+                trace_armed.then_some(packets).flatten()
+            })
+            .filter(|packets| {
+                messages[..count.max(0) as usize]
+                    .iter()
+                    .enumerate()
+                    .all(|(index, message)| {
+                        packets[index].valid == 0 || packets[index].length == message.msg_len
+                    })
+            });
+        if let Some(error) = receive_error {
             if error.kind() == io::ErrorKind::WouldBlock {
                 self.limit = 1;
             }
@@ -758,19 +923,28 @@ impl UdpRecvBatch {
                 #[cfg(not(target_env = "musl"))]
                 let returned_control_len = message.msg_hdr.msg_controllen;
                 let control_len = returned_control_len.min(slot.control.bytes.len());
-                let (original_dst_cmsg, packet_dst_ip, packet_ifindex) = parse_cmsg_control(
+                let meta = parse_cmsg_control(
                     &slot.control.bytes[..control_len],
                     message.msg_hdr.msg_flags,
+                    local_addr,
                 )?;
+                #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+                let meta = if let Some(packets) = trace_packets {
+                    UdpRecvMeta {
+                        packet_priority: crate::ebpf::real::receive_trace::packet_priority(
+                            packets[index],
+                            message.msg_len,
+                            meta.packet_mark,
+                        ),
+                        ..meta
+                    }
+                } else {
+                    meta
+                };
                 Ok(UdpRecvPacket {
                     length,
                     source,
-                    meta: UdpRecvMeta {
-                        original_dst_cmsg,
-                        packet_dst_ip,
-                        packet_ifindex,
-                        local_addr,
-                    },
+                    meta,
                 })
             })());
         }
@@ -819,12 +993,11 @@ fn recvmsg_origdst(
     if !cmsg_control_capacity_is_sufficient() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "recvmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
+            "recvmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, mark and priority",
         ));
     }
-    // CmsgStorage makes this pointer naturally aligned for libc's cmsghdr
-    // access; CMSG_SPACE capacity above ensures neither IPv6 record crowds
-    // the other out.
+    // CmsgStorage is naturally aligned and the checked CMSG_SPACE total keeps
+    // the IPv6 provenance records and packet mark from crowding each other out.
     let mut cmsg_buf = CmsgStorage::new();
     if !(cmsg_buf.bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<libc::cmsghdr>()) {
         return Err(io::Error::new(
@@ -860,30 +1033,21 @@ fn recvmsg_origdst(
     // Only kernel-returned bytes are trusted. A larger value can never make
     // the parser read past our actual allocation.
     let control_len = returned_control_len.min(cmsg_buf.bytes.len());
-    let (original_dst_cmsg, packet_dst_ip, packet_ifindex) =
-        parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags)?;
+    let meta = parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags, local_addr)?;
 
-    Ok((
-        n as usize,
-        src,
-        UdpRecvMeta {
-            original_dst_cmsg,
-            packet_dst_ip,
-            packet_ifindex,
-            local_addr,
-        },
-    ))
+    Ok((n as usize, src, meta))
 }
 
 /// Parse the returned ancillary byte range without looking past
-/// `msg_controllen`. Every recognized record must be complete and decodable;
-/// malformed provenance is an InvalidData error, never a missing-metadata
-/// fallback. The production buffer is cmsghdr-aligned, while unaligned reads
-/// here keep this validator safe for any slice used by focused tests.
+/// `msg_controllen`. Malformed routing metadata remains an InvalidData error;
+/// optional priority metadata only loses trace evidence.
+/// The production buffer is cmsghdr-aligned, while unaligned reads here keep
+/// this validator safe for any slice used by focused tests.
 pub(super) fn parse_cmsg_control(
     control: &[u8],
     msg_flags: libc::c_int,
-) -> io::Result<(Option<SocketAddr>, Option<std::net::IpAddr>, Option<u32>)> {
+    local_addr: SocketAddr,
+) -> io::Result<UdpRecvMeta> {
     if msg_flags & libc::MSG_CTRUNC != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -896,6 +1060,11 @@ pub(super) fn parse_cmsg_control(
     let mut original_dst_cmsg = None;
     let mut packet_dst_ip = None;
     let mut packet_ifindex = None;
+    let mut packet_mark = None;
+    #[cfg(any(feature = "native-api", test))]
+    let mut packet_priority = None;
+    #[cfg(any(feature = "native-api", test))]
+    let mut priority_seen = false;
     while offset < control.len() {
         if control.len() - offset < header_len {
             return Err(io::Error::new(
@@ -962,6 +1131,31 @@ pub(super) fn parse_cmsg_control(
                 })?;
             packet_dst_ip = Some(packet_dst);
             packet_ifindex = Some(ifindex);
+        } else if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SO_MARK {
+            if packet_mark.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate SO_MARK cmsg",
+                ));
+            }
+            if data.len() != std::mem::size_of::<u32>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed SO_MARK cmsg",
+                ));
+            }
+            // SAFETY: the exact native-u32 payload length was checked above.
+            packet_mark = Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<u32>()) });
+        } else if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SO_PRIORITY {
+            #[cfg(any(feature = "native-api", test))]
+            {
+                packet_priority = if priority_seen {
+                    None
+                } else {
+                    <[u8; 4]>::try_from(data).ok().map(u32::from_ne_bytes)
+                };
+                priority_seen = true;
+            }
         }
 
         let next = offset
@@ -981,7 +1175,15 @@ pub(super) fn parse_cmsg_control(
         offset = next;
     }
 
-    Ok((original_dst_cmsg, packet_dst_ip, packet_ifindex))
+    Ok(UdpRecvMeta {
+        original_dst_cmsg,
+        packet_dst_ip,
+        packet_ifindex,
+        packet_mark,
+        #[cfg(any(feature = "native-api", test))]
+        packet_priority,
+        local_addr,
+    })
 }
 
 fn original_dst_from_cmsg(
@@ -1061,43 +1263,6 @@ pub(super) fn packet_dst_ip_from_cmsg(
     packet_info_from_cmsg(cmsg_level, cmsg_type, data).map(|(ip, _)| ip)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct UdpOriginalDst {
-    pub(super) address: SocketAddr,
-    pub(super) validated_dns: Option<ValidatedDnsQuery>,
-}
-
-/// Select a real original destination without inventing one from UDP payload
-/// shape. An ORIGDST cmsg is authoritative; PKTINFO can only supply an IP for
-/// a validated DNS query on port 53; a specifically bound listener is the
-/// final fallback. Wildcard listeners with no valid metadata fail closed.
-pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOriginalDst> {
-    // A present ORIGDST cmsg is authoritative. An unspecified ORIGDST is
-    // invalid provenance, so do not downgrade it to pktinfo/local fallback.
-    if let Some(original_dst) = meta.original_dst_cmsg {
-        return (!original_dst.ip().is_unspecified()).then_some(UdpOriginalDst {
-            address: original_dst,
-            validated_dns: None,
-        });
-    }
-
-    let validated_dns = validate_exact_dns_query(data);
-    if let Some(validated_dns) = validated_dns
-        && let Some(packet_dst_ip) = meta.packet_dst_ip
-        && !packet_dst_ip.is_unspecified()
-    {
-        return Some(UdpOriginalDst {
-            address: SocketAddr::new(packet_dst_ip, 53),
-            validated_dns: Some(validated_dns),
-        });
-    }
-
-    (!meta.local_addr.ip().is_unspecified()).then_some(UdpOriginalDst {
-        address: meta.local_addr,
-        validated_dns,
-    })
-}
-
 fn sockaddr_to_std(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Result<SocketAddr> {
     if len < std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short sockaddr"));
@@ -1162,69 +1327,5 @@ pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr>
     }
 }
 
-/// UDP datapath fast path: classify/drop and, for a live Ready endpoint,
-/// perform a bounded synchronous `try_enqueue` in the accept loop.
-///
-/// Runs on the reusable receive buffer with no task spawn, no QUIC sniffer,
-/// and no slow-path concurrency permit. Ready hits may copy into the
-/// bounded per-flow queue (permits first). Returns `true` when the datagram
-/// was fully handled (enqueued, drop-newest, or dropped by pre-checks) and
-/// the accept loop can move on; `false` when it must take the slow path:
-/// Initializing followers, new-flow setup, or a possible DNS query.
-///
-/// This function is the sole production owner of endpoint hit/miss
-/// accounting. Skipping the QUIC sniffer on Ready hits is safe because
-/// routing for this flow was already decided when its first packet took the
-/// slow path.
-pub(super) async fn udp_fast_path(
-    udp_pool: &UdpEndpointPool,
-    stats: &StatsManager,
-    data: &[u8],
-    client_addr: SocketAddr,
-    original_dst: SocketAddr,
-    validated_dns: Option<ValidatedDnsQuery>,
-) -> bool {
-    // Same drop pre-checks as serve_udp_connection: honk-internal subnet and
-    // broadcast/multicast traffic must never be proxied.
-    if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
-        trace!(
-            "Skipping honk-internal UDP {} -> {}",
-            client_addr, original_dst
-        );
-        return true;
-    }
-    if is_broadcast_or_multicast(&original_dst.ip()) {
-        trace!(
-            "Skipping broadcast/multicast UDP {} -> {}",
-            client_addr, original_dst
-        );
-        return true;
-    }
-
-    // A carried proof keeps strict validation out of the Ready hot path.
-    if original_dst.port() == 53 && validated_dns.is_some() {
-        return false;
-    }
-
-    // The receive loop only performs a synchronous bounded enqueue. Transport
-    // I/O belongs exclusively to the per-endpoint driver, so a blocked send
-    // on one flow cannot delay classification of another datagram.
-    let Some(result) = udp_pool.fast_path_enqueue(client_addr, original_dst, data, stats) else {
-        stats.record_udp_endpoint_miss();
-        return false;
-    };
-    if matches!(result, EndpointReservation::QueueClosed) {
-        return true;
-    }
-    stats.record_udp_endpoint_hit();
-
-    debug!(
-        "UDP endpoint enqueue for {} -> {}",
-        client_addr, original_dst
-    );
-    debug_assert!(matches!(
-        result,
-        EndpointReservation::Enqueued | EndpointReservation::QueueFull
-    ));
-    true
-}
+#[cfg(test)]
+mod tests;

@@ -5,18 +5,17 @@ use anyhow::Context;
 use bytes::Bytes;
 use tracing::{debug, trace};
 
-use crate::dns::cache::{CacheKey, DnsCacheService, PublicationEpoch};
+use crate::dns::cache::{CacheKey, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, ParsedQuery, PreparedQuery};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use crate::dns::planner::RequestScope;
 use crate::dns::query::{DnsRequestMeta, IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
 use crate::dns::singleflight::FlightKey;
-use honk_ebpf_common::DAE_BYPASS_MARK;
 
 use super::message::{build_dns_query, new_asis_socket_with_mark};
-use super::ttl::{SERVE_STALE_TTL_SECS, patch_txid, rewrite_answer_ttls};
-use super::{DnsForwardError, DnsForwarder, ResolveMode};
+use super::ttl::{patch_txid, rewrite_answer_ttls};
+use super::{CacheAccess, DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
 
 impl DnsForwarder {
     pub(crate) async fn exchange(
@@ -30,7 +29,20 @@ impl DnsForwarder {
                 self.upstream_pool.query(upstream.as_str(), raw_query).await
             }
             RequestScope::AsIs(destination) => {
-                self.query_asis(raw_query, *destination, ingress).await
+                let query = self.query_asis(raw_query, *destination, ingress);
+                let observation = crate::observe::flows::dns::outbound_evidence(
+                    "direct",
+                    crate::observe::vocab::RoutingSource::Builtin,
+                    None,
+                    None,
+                    *destination,
+                    Default::default(),
+                );
+                crate::observe::scope_pin!(query);
+                let query = crate::observe::flows::dns::outbound_scope(observation.as_ref(), query);
+                crate::observe::scope_pin!(query);
+                let query = crate::observe::flows::dns::exchange_scope(raw_query, "asis", query);
+                query.await
             }
         }
     }
@@ -50,7 +62,7 @@ impl DnsForwarder {
         requery_history: Vec<String>,
         mode: ResolveMode,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        self.outcome_from_query(
+        let outcome = self.outcome_from_query(
             engine,
             prepared.query(),
             prepared.domain_arc(),
@@ -63,7 +75,10 @@ impl DnsForwarder {
             final_upstream,
             requery_history,
             mode,
-        )
+        )?;
+        #[cfg(feature = "native-api")]
+        let outcome = outcome.with_route(prepared.request_source());
+        Ok(outcome)
     }
 
     pub(crate) fn local_outcome_from_wire(
@@ -145,60 +160,73 @@ impl DnsForwarder {
         }))
     }
 
-    /// RFC 8767 serve-stale: fall back to a recently-expired cache entry
-    /// when the upstream phase fails. TTLs are rewritten to
-    /// [`SERVE_STALE_TTL_SECS`] so the client re-asks soon, and the txid is
-    /// patched to the caller's query.
+    /// RFC 8767 fallback using the configured reply TTL, or cached TTLs when zero.
     pub(crate) async fn try_serve_stale(
         &self,
         cache_key: &CacheKey,
         raw_query: &[u8],
         mode: ResolveMode,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, u64)> {
         if !self.cache_enabled {
             return None;
         }
         let cache = self.cache_service().await;
-        let entry = cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
+        let (entry, revision) =
+            cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
+        #[cfg(feature = "native-api")]
+        crate::observe::flows::dns::cache_state("stale");
         let mut response = entry.response.to_vec();
-        rewrite_answer_ttls(&mut response, SERVE_STALE_TTL_SECS);
+        if self.stale_reply_ttl != 0 {
+            rewrite_answer_ttls(&mut response, self.stale_reply_ttl);
+        }
         if response.len() >= 2 && raw_query.len() >= 2 {
             response[0..2].copy_from_slice(&raw_query[0..2]);
         }
         debug!("DNS forwarder serving stale cache after upstream failure");
-        Some(response)
+        Some((response, revision))
     }
 
     /// Spawn a deduplicated background refresh for a hot entry nearing
     /// expiry (stale-while-revalidate). The refresh bypasses the cache read
     /// so it always reaches the upstream; the normal pipeline writes the
     /// fresh answer back.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn maybe_spawn_refresh(
         &self,
-        cache: Arc<DnsCacheService>,
         raw_query: &[u8],
         metadata: DnsRequestMeta,
         mode: ResolveMode,
-        flight_key: crate::dns::cache::CacheKey,
+        flight_key: CacheKey,
         publication_epoch: PublicationEpoch,
+        refreshing: u64,
+        options: &ResolveOptions,
     ) {
         let ingress = flight_key.ingress();
         let crate::dns::singleflight::FlightRole::Leader(owner) =
-            cache.singleflight().acquire(FlightKey::Refresh(flight_key))
+            self.singleflight().acquire(FlightKey::Refresh(flight_key))
         else {
             return;
         };
         let this = self.clone();
         let query = raw_query.to_vec();
-        let spawned = cache.spawn_refresh(async move {
+        let options = ResolveOptions {
+            cache: CacheAccess::Refresh,
+            forced_upstream: options.forced_upstream.clone(),
+        };
+        let spawned = self.refresh_tasks.spawn(async move {
             let result = crate::dns::engine::pipeline::resolve_with_owner(
                 &this,
                 &query,
                 metadata,
                 ingress,
-                true,
+                &options,
                 mode,
-                crate::dns::engine::pipeline::ResolveExecution::refresh(owner, publication_epoch),
+                crate::dns::engine::pipeline::ResolveExecution::refresh(
+                    owner,
+                    publication_epoch,
+                    refreshing,
+                ),
+                None,
             )
             .await;
             if result.is_err() {
@@ -222,22 +250,28 @@ impl DnsForwarder {
     ) -> anyhow::Result<Vec<u8>> {
         match ingress {
             IngressProfile::Udp { .. } => {
-                let response = self.query_asis_udp(raw_query, destination).await?;
-                if crate::dns::response::is_truncated(&response) {
-                    debug!(
-                        destination = %destination,
-                        "DNS forwarder: truncated asis UDP response, retrying over TCP"
-                    );
-                    self.query_asis_tcp(raw_query, destination).await
-                } else {
-                    Ok(response)
+                let query = self.query_asis_udp(raw_query, destination);
+                crate::observe::scope_pin!(query);
+                let query = crate::observe::flows::dns::transport_exchange_scope(raw_query, query);
+                let response = query.await?;
+                if !crate::dns::response::is_truncated(&response) {
+                    return Ok(response);
                 }
+                crate::observe::flows::dns::tcp_fallback();
+                debug!(
+                    destination = %destination,
+                    "DNS forwarder: truncated asis UDP response, retrying over TCP"
+                );
             }
-            IngressProfile::Tcp => self.query_asis_tcp(raw_query, destination).await,
+            IngressProfile::Tcp => {}
             IngressProfile::Api | IngressProfile::Internal => {
                 unreachable!("internal/API asis request escaped planning")
             }
         }
+        let query = self.query_asis_tcp(raw_query, destination);
+        crate::observe::scope_pin!(query);
+        let query = crate::observe::flows::dns::transport_exchange_scope(raw_query, query);
+        query.await
     }
 
     async fn query_asis_udp(
@@ -246,22 +280,48 @@ impl DnsForwarder {
         destination: SocketAddr,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis UDP dial");
-        let sock2 = new_asis_socket_with_mark(destination, |socket| {
-            #[cfg(target_os = "linux")]
-            {
-                honk_outbound::util::set_mark_best_effort(socket, DAE_BYPASS_MARK)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = socket;
-                Ok(())
-            }
-        })?;
-        let socket = tokio::net::UdpSocket::from_std(sock2.into()).context("asis UDP from_std")?;
-        socket
-            .connect(destination)
-            .await
-            .context("asis UDP connect")?;
+        crate::observe::flows::dns::transport("udp", "udp");
+        let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
+            Some(destination),
+            honk_outbound::runtime::flow_observation::ResolutionLocation::OriginalIp,
+        );
+        let socket = async {
+            let sock2 = new_asis_socket_with_mark(destination, |socket| {
+                #[cfg(target_os = "linux")]
+                {
+                    honk_outbound::util::set_mark_best_effort(
+                        socket,
+                        honk_outbound::util::bypass_mark(),
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = socket;
+                    Ok(())
+                }
+            })?;
+            let socket =
+                tokio::net::UdpSocket::from_std(sock2.into()).context("asis UDP from_std")?;
+            socket
+                .connect(destination)
+                .await
+                .context("asis UDP connect")?;
+            Ok::<_, anyhow::Error>(socket)
+        }
+        .await;
+        if let Some(observation) = &mut observation {
+            observation.finish(
+                if socket.is_ok() {
+                    honk_outbound::runtime::flow_observation::TransportStatus::Succeeded
+                } else {
+                    honk_outbound::runtime::flow_observation::TransportStatus::Failed
+                },
+                socket.as_ref().err().map(|_| {
+                    honk_outbound::runtime::flow_observation::TransportError::UdpSocketFailed
+                }),
+            );
+        }
+        let socket = socket?;
 
         tokio::time::timeout(self.query_timeout, async {
             socket.send(raw_query).await?;
@@ -281,9 +341,10 @@ impl DnsForwarder {
         destination: SocketAddr,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis TCP dial");
+        crate::observe::flows::dns::transport("tcp", "tcp");
         let mut stream = honk_outbound::util::connect_marked_addr(
             destination,
-            Some(DAE_BYPASS_MARK),
+            Some(honk_outbound::util::bypass_mark()),
             self.dial_timeout,
         )
         .await

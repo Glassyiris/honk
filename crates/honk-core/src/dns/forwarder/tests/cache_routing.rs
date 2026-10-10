@@ -1,3 +1,31 @@
+use super::*;
+#[tokio::test]
+async fn test_fixed_domain_ttl_zero_skips_cache() {
+    use std::collections::HashMap;
+
+    let response = make_a_response([1, 2, 3, 4], 300);
+    let mock = Arc::new(MockUpstream::new(response));
+    let cache = test_cache();
+    let mut ttl = HashMap::new();
+    ttl.insert("example.com".to_string(), 0u32);
+    let router = Arc::new(DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &ttl).unwrap());
+    let forwarder = DnsForwarder::new(
+        mock.clone() as Arc<dyn DnsUpstreamPool>,
+        cache.clone(),
+        router,
+    );
+
+    let query = make_a_query();
+    let _ = forwarder.resolve(&query).await.unwrap();
+    assert!(
+        cache.lock().await.get("example.com:1").is_none(),
+        "fixed_domain_ttl=0 must not cache"
+    );
+    // Second resolve hits upstream again.
+    let _ = forwarder.resolve(&query).await.unwrap();
+    assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
+}
+
 /// RFC 2308 §5: negative TTL = min(SOA TTL, SOA MINIMUM).
 #[test]
 fn test_extract_soa_negative_ttl() {
@@ -28,10 +56,9 @@ fn test_extract_soa_negative_ttl() {
     resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     resp.extend_from_slice(&rdata);
 
-    assert_eq!(extract_soa_negative_ttl(&resp, 60), 60);
-    // No authority section → default.
+    assert_eq!(extract_soa_negative_ttl(&resp), Some(60));
     let plain = make_a_response([1, 1, 1, 1], 300);
-    assert_eq!(extract_soa_negative_ttl(&plain, 42), 42);
+    assert_eq!(extract_soa_negative_ttl(&plain), None);
 }
 
 #[tokio::test]
@@ -177,7 +204,7 @@ impl RoutedScopeUpstream {
 
 #[async_trait]
 impl DnsUpstreamPool for RoutedScopeUpstream {
-    async fn query(&self, upstream_name: &str, _raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         *self
             .calls
             .lock()
@@ -187,7 +214,11 @@ impl DnsUpstreamPool for RoutedScopeUpstream {
         self.entered.add_permits(1);
         self.release.acquire().await?.forget();
         if self.negative {
-            let mut response = nodata_response("example.com", 1);
+            let mut response = if upstream_name == "red" {
+                make_nxdomain_response(raw_query, 1, 1)
+            } else {
+                nodata_response("example.com", 1, None)
+            };
             response[3] = if upstream_name == "red" { 0x83 } else { 0x82 };
             Ok(response)
         } else {
@@ -205,9 +236,7 @@ impl DnsUpstreamPool for RoutedScopeUpstream {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
-    use honk_config::dns::{
-        DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule,
-    };
+    use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
 
     let router = Arc::new(
         DnsRouter::new(&DnsRouting {
@@ -248,7 +277,7 @@ async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
             cache.clone(),
             Arc::clone(&router),
         ));
-        let flights = cache.lock().await.singleflight();
+        let flights = forwarder.singleflight();
         let sources = ["192.0.2.10", "198.51.100.20", "203.0.113.30"];
         let mut tasks = tokio::task::JoinSet::new();
         for source in sources {

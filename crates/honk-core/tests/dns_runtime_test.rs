@@ -10,8 +10,156 @@ use honk_core::proxy::ProxyRegistry;
 use honk_core::routing::Router;
 use tempfile::NamedTempFile;
 
-#[path = "support/dns_surface.rs"]
-mod dns_surface_support;
+mod dns_surface_support {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use honk_core::dns::forwarder::DnsUpstreamPool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+
+    pub struct StaticUpstream {
+        ip: [u8; 4],
+        calls: AtomicUsize,
+    }
+
+    impl StaticUpstream {
+        pub fn new(ip: [u8; 4]) -> Arc<Self> {
+            Arc::new(Self {
+                ip,
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        pub fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for StaticUpstream {
+        async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(a_response(raw_query, self.ip))
+        }
+    }
+
+    pub struct BlockingUpstream {
+        ip: [u8; 4],
+        pub entered: Notify,
+        pub release: Notify,
+    }
+
+    impl BlockingUpstream {
+        pub fn new(ip: [u8; 4]) -> Arc<Self> {
+            Arc::new(Self {
+                ip,
+                entered: Notify::new(),
+                release: Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for BlockingUpstream {
+        async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(a_response(raw_query, self.ip))
+        }
+    }
+
+    pub struct LoopbackServer {
+        pub address: SocketAddr,
+        calls: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
+    }
+
+    impl LoopbackServer {
+        pub fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for LoopbackServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    pub async fn spawn_udp_server(ip: [u8; 4]) -> LoopbackServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP");
+        let address = socket.local_addr().expect("UDP address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            while let Ok((length, peer)) = socket.recv_from(&mut buffer).await {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let response = a_response(&buffer[..length], ip);
+                if socket.send_to(&response, peer).await.is_err() {
+                    return;
+                }
+            }
+        });
+        LoopbackServer {
+            address,
+            calls,
+            task,
+        }
+    }
+
+    pub async fn spawn_tcp_server(ip: [u8; 4]) -> LoopbackServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TCP");
+        let address = listener.local_addr().expect("TCP address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let observed = Arc::clone(&observed);
+                tokio::spawn(async move {
+                    let length = match stream.read_u16().await {
+                        Ok(length) => usize::from(length),
+                        Err(_) => return,
+                    };
+                    let mut query = vec![0_u8; length];
+                    if stream.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let response = a_response(&query, ip);
+                    if let Ok(length) = u16::try_from(response.len()) {
+                        let _ = stream.write_u16(length).await;
+                        let _ = stream.write_all(&response).await;
+                    }
+                });
+            }
+        });
+        LoopbackServer {
+            address,
+            calls,
+            task,
+        }
+    }
+
+    pub fn a_response(raw_query: &[u8], ip: [u8; 4]) -> Vec<u8> {
+        a_response_with_ttl(raw_query, ip, 300)
+    }
+
+    pub fn a_response_with_ttl(raw_query: &[u8], ip: [u8; 4], ttl: u32) -> Vec<u8> {
+        let mut response = raw_query.to_vec();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&[0, 4, ip[0], ip[1], ip[2], ip[3]]);
+        response
+    }
+}
 
 use dns_surface_support::{
     BlockingUpstream, StaticUpstream, a_response, a_response_with_ttl, spawn_tcp_server,
@@ -30,6 +178,7 @@ fn test_dns_forwarder(config: &Config, upstream: Arc<dyn DnsUpstreamPool>) -> Ar
         DnsForwarder::new(upstream, cache, router)
             .with_cache_enabled(config.dns.cache.enabled)
             .with_cache_ttl(u32::try_from(config.dns.cache.ttl).expect("test TTL fits u32"))
+            .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
             .with_policy_from_config(&config.dns)
             .expect("DNS policy"),
     )
@@ -64,7 +213,9 @@ fn control_plane(mut config: Config, forwarder: Arc<DnsForwarder>) -> ControlPla
 
 async fn reload_config(control: &ControlPlane, config: Config) {
     assert!(
-        control.reload_runtime_config(config).await,
+        control
+            .reload_runtime_config(config, Default::default())
+            .await,
         "runtime reload should publish"
     );
 }
@@ -76,7 +227,9 @@ async fn reload_current(control: &ControlPlane) {
 
 async fn try_reload_current(control: &ControlPlane) -> bool {
     let config = control.config_handle().read().await.as_ref().clone();
-    control.reload_runtime_config(config).await
+    control
+        .reload_runtime_config(config, Default::default())
+        .await
 }
 
 #[tokio::test]
@@ -87,13 +240,15 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
     let subscription_id = uuid::Uuid::new_v4();
     let mut replacement = Node {
         name: "published-runtime-node".into(),
+        address: "127.0.0.1:1".into(),
+        port: 1,
         subscription_id: Some(subscription_id),
         ..Node::default()
     };
     replacement.id = replacement.derive_id();
 
     control
-        .merge_subscription_nodes(subscription_id, vec![replacement])
+        .merge_subscription_nodes(subscription_id, vec![replacement], Vec::new())
         .await;
 
     let active = control.config_handle();
@@ -182,8 +337,17 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         )
         .await
         .expect("UDP query");
-    assert_eq!(udp_response, a_response(&query, [192, 0, 2, 20]));
-    assert_eq!(udp.calls(), 1, "ingress profiles must not share cache keys");
+    assert_eq!(udp_response, a_response(&query, [192, 0, 2, 10]));
+    assert_eq!(
+        initial.calls(),
+        2,
+        "ingress profiles must not share cache keys"
+    );
+    assert_eq!(
+        udp.calls(),
+        0,
+        "unchanged reload retains the active transport"
+    );
 
     let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.cache.ttl = 301;
@@ -193,7 +357,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         .await
         .expect("changed-policy internal query");
     assert_eq!(changed, a_response_with_ttl(&query, [192, 0, 2, 20], 301));
-    assert_eq!(udp.calls(), 2);
+    assert_eq!(udp.calls(), 1);
 
     let mut candidate = control.config_handle().read().await.as_ref().clone();
     candidate.dns.cache.ttl = 302;
@@ -210,7 +374,7 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         a_response_with_ttl(&tcp_query, [192, 0, 2, 30], 302)
     );
     assert_eq!(tcp.calls(), 1);
-    assert_eq!(initial.calls(), 1);
+    assert_eq!(initial.calls(), 2);
     assert!(control.is_datapath_healthy());
 }
 

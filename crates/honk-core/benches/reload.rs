@@ -34,6 +34,12 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+async fn reload(control_plane: &ControlPlane, config: Config) -> bool {
+    control_plane
+        .reload_runtime_config(config, Default::default())
+        .await
+}
+
 #[derive(Clone, Copy)]
 struct Observation {
     flag_writes: u64,
@@ -77,7 +83,7 @@ struct Fixture {
     runtime: Runtime,
     control_plane: ControlPlane,
     config: Config,
-    flag_writes: Arc<std::sync::Mutex<Vec<u32>>>,
+    flag_writes: Box<dyn Fn() -> u64>,
     #[cfg(feature = "reload-bench-counters")]
     routing_writes: Arc<AtomicU64>,
     #[cfg(feature = "reload-bench-counters")]
@@ -124,7 +130,15 @@ impl Fixture {
         );
 
         let backend = MockEbpfBackend::new();
-        let flag_writes = Arc::clone(&backend.datapath_flags_writes);
+        let flag_writes = {
+            let writes = Arc::clone(&backend.datapath_flags_writes);
+            Box::new(move || {
+                writes
+                    .try_lock()
+                    .expect("reload recorder must be idle between reloads")
+                    .len() as u64
+            }) as Box<dyn Fn() -> u64>
+        };
         #[cfg(feature = "reload-bench-counters")]
         let routing_writes = backend.routing_map_write_counter();
         #[cfg(feature = "reload-bench-counters")]
@@ -145,7 +159,7 @@ impl Fixture {
             )
             .expect("control plane")
         };
-        assert!(runtime.block_on(control_plane.reload_runtime_config(config.clone())));
+        assert!(runtime.block_on(reload(&control_plane, config.clone())));
         Self {
             _directory: directory,
             runtime,
@@ -160,15 +174,12 @@ impl Fixture {
     }
 
     fn reload(&self, config: Config) {
-        assert!(
-            self.runtime
-                .block_on(self.control_plane.reload_runtime_config(config))
-        );
+        assert!(self.runtime.block_on(reload(&self.control_plane, config)));
     }
 
     fn observation(&self) -> Observation {
         Observation {
-            flag_writes: self.flag_writes.lock().unwrap().len() as u64,
+            flag_writes: (self.flag_writes)(),
             #[cfg(feature = "reload-bench-counters")]
             dns_generation: self.control_plane.reload_benchmark_dns_generation(),
             #[cfg(feature = "reload-bench-counters")]
@@ -260,18 +271,27 @@ fn contract_counter_suffix(_: Observation, _: Observation) -> String {
 
 fn large_config(hosts_path: String) -> Config {
     // CI copies this harness into main, so use the wire shape shared by both revisions.
-    let node_template: Node =
-        serde_json::from_str(r#"{"name":"","protocol":"socks5","address":"","port":0}"#)
-            .expect("reload benchmark node template must deserialize");
+    // The template must be a valid node: deserialization now validates it before
+    // the per-node fields below overwrite the name and address.
+    let node_template: Node = serde_json::from_str(
+        r#"{"name":"template","protocol":"socks5","address":"192.0.2.1:10000","port":10000}"#,
+    )
+    .expect("reload benchmark node template must deserialize");
     let nodes = (0..512)
-        .map(|index| Node {
-            id: uuid::Uuid::new_v5(
-                &honk_config::node::NODE_ID_NAMESPACE,
-                format!("reload-bench-{index}").as_bytes(),
-            ),
-            name: format!("node-{index:03}"),
-            address: format!("192.0.2.{}:{}", index % 250 + 1, 10_000 + index),
-            ..node_template.clone()
+        .map(|index| {
+            let host = format!("192.0.2.{}", index % 250 + 1);
+            let port = 10_000 + index as u16;
+            let mut node = Node {
+                name: format!("node-{index:03}"),
+                address: format!("{host}:{port}"),
+                host,
+                port,
+                ..node_template.clone()
+            };
+            // Admission verifies each ID against the node's canonical identity,
+            // so the synthetic ID is derived the same way the loaders derive it.
+            node.id = node.derive_id();
+            node
         })
         .collect::<Vec<_>>();
     let groups = nodes
@@ -451,7 +471,7 @@ fn bench_reload(c: &mut Criterion) {
         bencher.to_async(&fixture.runtime).iter_batched(
             || black_box(fixture.config.clone()),
             |config| async {
-                assert!(fixture.control_plane.reload_runtime_config(config).await);
+                assert!(reload(&fixture.control_plane, config).await);
             },
             BatchSize::SmallInput,
         );

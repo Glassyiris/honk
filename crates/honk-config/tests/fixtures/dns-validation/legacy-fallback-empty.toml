@@ -1,0 +1,14 @@
+[[dns.upstream]]
+name = "default"
+address = "192.0.2.1:53"
+
+[[dns.upstream]]
+name = "alpha"
+address = "192.0.2.2:53"
+
+[dns.routing]
+fallback = ""
+
+[[dns.routing.rules]]
+domain = "example.com"
+upstream = "default"

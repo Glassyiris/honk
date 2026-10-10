@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
-use honk_outbound::group::ScoreFeedback;
+use honk_outbound::group::ScoreBusinessGuard;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -36,11 +36,27 @@ impl PooledTransport {
         }
     }
 
+    fn tasks_failed(&self) -> bool {
+        match self {
+            Self::Doq(transport) => transport.tasks_failed(),
+            Self::Doh3(transport) => transport.tasks_failed(),
+            _ => false,
+        }
+    }
+
     pub(super) async fn exchange(
         &self,
         raw_query: &[u8],
-        feedback: Option<&ScoreFeedback>,
+        feedback: Option<ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
+        let (upstream, carrier) = match self {
+            Self::Tcp(_) => ("tcp", "tcp"),
+            Self::Dot(_) => ("dot", "tcp"),
+            Self::Doh(_) => ("doh", "tcp"),
+            Self::Doq(_) => ("doq", "udp"),
+            Self::Doh3(_) => ("doh3", "udp"),
+        };
+        crate::observe::flows::dns::transport(upstream, carrier);
         match self {
             Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,
             Self::Dot(transport) => transport.exchange(raw_query, feedback).await,
@@ -120,6 +136,7 @@ impl UpstreamPool {
         };
         slot.acquire(|| self.build_transport(entry, proxy_node, target))
             .await
+            .map(|(value, _)| value)
     }
 
     pub fn lifecycle_stats(&self) -> super::TransportLifecycleStats {
@@ -180,10 +197,17 @@ impl UpstreamPool {
             pool.close().await;
         }
         for slot in slots {
-            slot.close(|transport| async move {
+            let failed = Arc::clone(&self.transport_tasks_failed);
+            slot.close(move |transport| async move {
                 transport.close().await;
+                if transport.tasks_failed() {
+                    failed.store(true, Ordering::Release);
+                }
             })
             .await;
+        }
+        if let Some(generation) = self.runtime_generation.get() {
+            generation.shutdown().await;
         }
         close.complete();
     }

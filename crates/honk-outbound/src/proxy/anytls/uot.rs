@@ -11,11 +11,12 @@ use crate::proxy::uot::{
 
 #[cfg(test)]
 use super::{
-    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT,
+    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK, INBOUND_PAYLOAD_BUDGET,
+    InboundPayloadBudget, PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT,
     WRITER_QUEUE_CAP, read_frame, write_frame,
 };
 #[cfg(test)]
-use crate::proxy::addr;
+use crate::proxy::MuxSession as _;
 #[cfg(test)]
 use crate::proxy::uot::V1_ATYP_DOMAIN as UOT_V1_ATYP_DOMAIN;
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub(super) struct UotReceiveState {
     rx: mpsc::Receiver<StreamEvent>,
     mode: Option<UotMode>,
     buffered: bytes::BytesMut,
+    credit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl UotReceiveState {
@@ -65,6 +67,7 @@ impl UotReceiveState {
             rx,
             mode: None,
             buffered: bytes::BytesMut::new(),
+            credit: None,
         }
     }
 }
@@ -74,6 +77,9 @@ impl UotReceiveState {
 const UOT_MAX_V1_HEADER_BYTES: usize = 1 + 1 + u8::MAX as usize + 2 + 2;
 const UOT_MAX_BUFFERED_BYTES: usize =
     UOT_MAX_V1_HEADER_BYTES + u16::MAX as usize + u16::MAX as usize - 1;
+// anytls-go 0.0.13 relays through sing v0.5.1's 16 KiB UDP buffer; a larger
+// UoT packet makes the reference server close the logical stream.
+const UOT_MAX_PACKET_SIZE: usize = 16 * 1024;
 
 impl AnyTlsUotTransport {
     fn detect_uot_mode(&self, data: &[u8]) -> std::io::Result<Option<UotMode>> {
@@ -159,8 +165,8 @@ impl std::fmt::Debug for AnyTlsUotTransport {
 
 impl AnyTlsUotTransport {
     async fn send_packet_inner(&self, data: &[u8], confirmed: bool) -> std::io::Result<()> {
+        let packet = crate::proxy::uot::encode_packet(data, UOT_MAX_PACKET_SIZE)?;
         self.session.ensure_stream_registered(self.sid)?;
-        let packet = crate::proxy::uot::encode_packet(data, u16::MAX as usize - 2)?;
         let mut setup = self.setup.lock().await;
         let Some(request) = setup.as_ref() else {
             drop(setup);
@@ -173,43 +179,28 @@ impl AnyTlsUotTransport {
             };
         };
 
-        let permit = self.session.acquire_data_permit().await?;
+        let permit = self
+            .session
+            .acquire_data_permit(request.len() + packet.len())
+            .await?;
         self.session.ensure_stream_registered(self.sid)?;
-        if request.len() + packet.len() <= u16::MAX as usize {
-            let mut payload = bytes::BytesMut::with_capacity(request.len() + packet.len());
-            payload.extend_from_slice(request);
-            payload.extend_from_slice(&packet);
-            if confirmed {
-                let completed = self.session.enqueue_confirmed_data_with_permit(
-                    self.sid,
-                    payload.freeze(),
-                    permit,
-                )?;
-                setup.take();
-                drop(setup);
-                AnyTlsSession::wait_for_confirmed_data(completed).await
-            } else {
-                self.session
-                    .enqueue_data_with_permit(self.sid, payload.freeze(), permit)?;
-                setup.take();
-                Ok(())
-            }
-        } else {
+        let mut payload = bytes::BytesMut::with_capacity(request.len() + packet.len());
+        payload.extend_from_slice(request);
+        payload.extend_from_slice(&packet);
+        if confirmed {
             let completed = self.session.enqueue_confirmed_data_with_permit(
                 self.sid,
-                request.clone(),
+                payload.freeze(),
                 permit,
             )?;
             setup.take();
             drop(setup);
-            AnyTlsSession::wait_for_confirmed_data(completed).await?;
-            if confirmed {
-                self.session
-                    .write_uot_datagram_confirmed(self.sid, packet)
-                    .await
-            } else {
-                self.session.write_uot_datagram(self.sid, packet).await
-            }
+            self.session.wait_for_confirmed_data(completed).await
+        } else {
+            self.session
+                .enqueue_data_with_permit(self.sid, payload.freeze(), permit)?;
+            setup.take();
+            Ok(())
         }
     }
 }
@@ -232,12 +223,29 @@ impl PacketTransport for AnyTlsUotTransport {
         let mut receive = self.receive.lock().await;
         loop {
             if let Some(frame) = self.next_uot_frame(&mut receive)? {
+                let consumed = frame.frame_end;
                 let payload_len = crate::proxy::uot::copy_frame(&mut receive.buffered, frame, buf)?;
+                let empty = {
+                    let credit = receive
+                        .credit
+                        .as_mut()
+                        .expect("buffered UoT bytes own payload credit");
+                    drop(
+                        credit
+                            .split(consumed)
+                            .expect("UoT credit covers consumed frame"),
+                    );
+                    credit.num_permits() == 0
+                };
+                if empty {
+                    receive.credit = None;
+                }
                 return Ok((payload_len, self.target));
             }
 
             let event = receive.rx.recv().await.ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
+                self.session
+                    .session_error(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
             })?;
             match event {
                 StreamEvent::Data(data) => {
@@ -247,7 +255,13 @@ impl PacketTransport for AnyTlsUotTransport {
                             "UoT stream frame exceeds buffer limit",
                         ));
                     }
+                    let (data, credit) = data.into_parts();
                     receive.buffered.extend_from_slice(&data);
+                    if let Some(held) = receive.credit.as_mut() {
+                        held.merge(credit);
+                    } else {
+                        receive.credit = Some(credit);
+                    }
                 }
                 StreamEvent::Fin => {
                     return Err(std::io::Error::new(
@@ -258,30 +272,11 @@ impl PacketTransport for AnyTlsUotTransport {
                 StreamEvent::Error(error) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionReset,
-                        error.to_string(),
+                        error,
                     ));
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod uot_tests {
-    use super::*;
-
-    #[test]
-    fn test_uot_request_uses_socks5_address_form() {
-        let v4 = addr::encode_address("1.2.3.4:53".parse().unwrap(), None);
-        assert_eq!(v4, vec![0x01, 1, 2, 3, 4, 0, 53]);
-        let v6 = addr::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None);
-        assert_eq!(v6[0], 0x04);
-        assert_eq!(v6.len(), 1 + 16 + 2);
-        let fqdn = addr::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com"));
-        assert_eq!(fqdn[0], 0x03);
-        assert_eq!(fqdn[1], 11);
-        assert_eq!(&fqdn[2..13], b"example.com");
-        assert_eq!(&fqdn[13..], &[1, 187]);
     }
 }
 
@@ -304,49 +299,63 @@ mod uot_transport_tests {
         target: SocketAddr,
         capacity: usize,
     ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
+        uot_test_transport_with_capacity_and_budget(target, capacity, INBOUND_PAYLOAD_BUDGET).await
+    }
+
+    async fn uot_test_transport_with_capacity_and_budget(
+        target: SocketAddr,
+        capacity: usize,
+        inbound_budget: usize,
+    ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
         let addr = "127.0.0.1:2443";
         let (client_end, mut server_end) = tokio::io::duplex(capacity);
         let (read, write) = tokio::io::split(client_end);
+        let padding_state = Arc::new(PaddingState {
+            current: parking_lot::RwLock::new(Arc::new(PaddingScheme::parse(b"stop=0").unwrap())),
+        });
         let session = AnyTlsSession::establish(
             addr,
             Box::new(read),
             Box::new(write),
             TEST_AUTH,
-            TEST_SETTINGS,
+            bytes::Bytes::from_static(TEST_SETTINGS),
+            padding_state,
+            InboundPayloadBudget::new(inbound_budget),
         )
         .await
         .unwrap();
+        session.flush_initial_settings_for_test().unwrap();
 
         let mut auth = vec![0u8; TEST_AUTH.len()];
         server_end.read_exact(&mut auth).await.unwrap();
         assert_eq!(auth, TEST_AUTH);
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SETTINGS);
-        let permit = session.try_reserve().unwrap();
-        let (sid, rx, guard) = session
-            .open_uot_stream(vec![0x01, 0, 0, 0, 0, 0, 0], permit)
+        let transport = Arc::clone(&session)
+            .open_packet(session.try_reserve().unwrap(), target, None)
             .await
-            .unwrap();
-        let permit = guard.commit();
+            .unwrap_or_else(|_| panic!("UoT transport must open"));
 
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SYN);
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_PSH);
-        (
-            Arc::new(AnyTlsUotTransport {
-                session,
-                sid,
-                receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
-                setup: tokio::sync::Mutex::new(Some(
-                    crate::proxy::uot::connect_request(target, None).unwrap(),
-                )),
-                target,
-                target_domain: None,
-                _permit: permit,
-            }),
-            server_end,
-        )
+        (transport, server_end)
+    }
+
+    #[tokio::test]
+    async fn uot_magic_refusal_is_not_a_target_failure() {
+        let (transport, mut server) = uot_test_transport("192.0.2.1:53".parse().unwrap()).await;
+        write_frame(&mut server, CMD_SYNACK, transport.sid, b"UoT unsupported")
+            .await
+            .unwrap();
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), transport.recv_packet(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+        assert!(!transport.session.is_closed());
     }
 
     /// The UoT request and first datagram share one PSH; later datagrams carry
@@ -385,6 +394,31 @@ mod uot_transport_tests {
     }
 
     #[tokio::test]
+    async fn uot_read_releases_pool_payload_credit() {
+        const BUDGET: usize = 8;
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (transport, mut server) =
+            uot_test_transport_with_capacity_and_budget(target, 1 << 20, BUDGET).await;
+        let sid = transport.sid;
+        let mut buf = [0_u8; BUDGET];
+
+        for payload in [b"first!", b"second"] {
+            let mut frame = Vec::with_capacity(BUDGET);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.extend_from_slice(payload);
+            write_frame(&mut server, CMD_PSH, sid, &frame)
+                .await
+                .unwrap();
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(1), transport.recv_packet(&mut buf))
+                    .await
+                    .expect("UoT payload credit was not released")
+                    .unwrap();
+            assert_eq!(&buf[..len], payload);
+        }
+    }
+
+    #[tokio::test]
     async fn confirmed_uot_send_waits_for_physical_flush() {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let request = crate::proxy::uot::connect_request(target, None).unwrap();
@@ -412,25 +446,57 @@ mod uot_transport_tests {
     }
 
     #[tokio::test]
-    async fn oversized_first_uot_datagram_uses_ordered_setup_fallback() {
+    async fn uot_send_enforces_anytls_go_packet_limit_without_poisoning_stream() {
+        use crate::proxy::{
+            PacketErrorClass, PacketRejection, io_packet_rejection, packet_error_class,
+        };
+
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let request = crate::proxy::uot::connect_request(target, None).unwrap();
         let (transport, mut server) = uot_test_transport(target).await;
-        let payload = vec![0x5a; u16::MAX as usize - 2];
+        let payload = vec![0x5a; UOT_MAX_PACKET_SIZE];
+        let oversized = vec![0; UOT_MAX_PACKET_SIZE + 1];
+        let error =
+            futures_util::FutureExt::now_or_never(transport.send_packet_confirmed(&oversized))
+                .expect("local refusal must not wait for I/O")
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            io_packet_rejection(&error),
+            Some(PacketRejection::InvalidSize)
+        );
+        assert_eq!(packet_error_class(&error), PacketErrorClass::Rejected);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), read_frame(&mut server))
+                .await
+                .is_err(),
+            "rejected first datagram must not consume setup or emit a PSH"
+        );
 
         transport.send_packet(&payload).await.unwrap();
-        let (cmd, sid, setup) = read_frame(&mut server).await.unwrap();
-        assert_eq!(
-            (cmd, sid, setup.as_slice()),
-            (CMD_PSH, transport.sid, request.as_ref())
-        );
-        let (cmd, sid, packet) = read_frame(&mut server).await.unwrap();
+        let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
         assert_eq!((cmd, sid), (CMD_PSH, transport.sid));
+        assert_eq!(&data[..request.len()], request.as_ref());
         assert_eq!(
-            u16::from_be_bytes([packet[0], packet[1]]) as usize,
+            u16::from_be_bytes([data[request.len()], data[request.len() + 1]]) as usize,
             payload.len()
         );
-        assert_eq!(&packet[2..], payload);
+        assert_eq!(&data[request.len() + 2..], payload);
+
+        let error = transport.send_packet(&oversized).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            io_packet_rejection(&error),
+            Some(PacketRejection::InvalidSize)
+        );
+        assert_eq!(packet_error_class(&error), PacketErrorClass::Rejected);
+
+        transport.send_packet(b"kept").await.unwrap();
+        let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
+        assert_eq!(
+            (cmd, sid, data.as_slice()),
+            (CMD_PSH, transport.sid, &b"\0\x04kept"[..])
+        );
     }
 
     #[tokio::test]
@@ -467,30 +533,89 @@ mod uot_transport_tests {
         );
     }
 
+    #[tokio::test]
+    async fn retired_uot_waiter_never_queues_payload_after_fin() {
+        for confirmed in [false, true] {
+            let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+            let (transport, mut server) = uot_test_transport(target).await;
+            let sid = transport.sid;
+            transport.send_packet(b"initial").await.unwrap();
+            assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+
+            let capacity = (WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32;
+            let held = Arc::clone(&transport.session.writer_q.data_permits)
+                .acquire_many_owned(capacity)
+                .await
+                .unwrap();
+            let send = async {
+                if confirmed {
+                    transport.send_packet_confirmed(b"retired").await
+                } else {
+                    transport.send_packet(b"retired").await
+                }
+            };
+            tokio::pin!(send);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut send)
+                    .await
+                    .is_err()
+            );
+
+            transport.session.end_uot_stream(sid, true);
+            let (cmd, fin_sid, _) = read_frame(&mut server).await.unwrap();
+            assert_eq!((cmd, fin_sid), (CMD_FIN, sid));
+            drop(held);
+
+            let error = tokio::time::timeout(Duration::from_secs(1), send)
+                .await
+                .expect("retired send must resume")
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), read_frame(&mut server))
+                    .await
+                    .is_err(),
+                "no PSH may follow the stream FIN"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn blocked_anytls_writer_becomes_terminal() {
+    async fn blocked_data_writer_backpressures_without_killing_session() {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let (transport, _server) = uot_test_transport_with_capacity(target, 64).await;
+        let (transport, mut server) = uot_test_transport_with_capacity(target, 64).await;
         let session = Arc::clone(&transport.session);
         let send =
             tokio::spawn(async move { transport.send_packet_confirmed(&vec![0x5a; 256]).await });
         tokio::task::yield_now().await;
-        tokio::time::advance(WRITER_IO_TIMEOUT + Duration::from_millis(1)).await;
-        let error = send.await.unwrap().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        tokio::time::advance(WRITER_IO_TIMEOUT * 10).await;
         tokio::task::yield_now().await;
-        assert!(session.is_closed());
+        assert!(!session.is_closed());
+
+        let mut sink = vec![0u8; 4096];
+        while !send.is_finished() {
+            tokio::task::yield_now().await;
+            let n = tokio::io::AsyncReadExt::read(&mut server, &mut sink)
+                .await
+                .unwrap();
+            assert!(n > 0);
+        }
+        send.await.unwrap().unwrap();
+        assert!(!session.is_closed());
     }
 
-    #[tokio::test]
-    async fn uot_send_rejects_outer_frame_length_overflow() {
+    #[tokio::test(start_paused = true)]
+    async fn blocked_control_write_becomes_terminal() {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let (transport, _server) = uot_test_transport(target).await;
-        let error = transport
-            .send_packet(&vec![0; u16::MAX as usize - 1])
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let (transport, _server) = uot_test_transport_with_capacity(target, 64).await;
+        let session = Arc::clone(&transport.session);
+        session
+            .enqueue_control(CMD_SETTINGS, 0, bytes::Bytes::from(vec![0u8; 4096]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(WRITER_IO_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(session.is_closed());
     }
 
     #[tokio::test]

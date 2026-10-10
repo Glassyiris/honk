@@ -135,16 +135,110 @@ pub fn default_true() -> bool {
 pub fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(v) = s.strip_suffix("ms") {
-        return v.parse::<f64>().ok().map(|v| (v / 1000.0).ceil() as u64);
+        let value = v.parse::<f64>().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        return checked_duration_float((value / 1000.0).ceil());
     }
     if let Some(v) = s.strip_suffix('s') {
         return v.parse().ok();
     }
     if let Some(v) = s.strip_suffix('m') {
-        return v.parse::<u64>().ok().map(|v| v * 60);
+        return v.parse::<u64>().ok().and_then(|v| v.checked_mul(60));
     }
     if let Some(v) = s.strip_suffix('h') {
-        return v.parse::<u64>().ok().map(|v| v * 3600);
+        return v.parse::<u64>().ok().and_then(|v| v.checked_mul(3600));
     }
     s.parse().ok()
+}
+
+/// Parse a millisecond duration like `500ms`, `0.5s` or a bare `500`. The
+/// minute and hour suffixes `parse_duration_secs` accepts are deliberately
+/// not part of this grammar. `as u64` saturates, so a non-finite or negative
+/// value is refused rather than becoming `u64::MAX` or zero.
+pub fn parse_duration_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(v) = s.strip_suffix("ms") {
+        return v.parse().ok();
+    }
+    if let Some(v) = s.strip_suffix('s') {
+        return v
+            .parse::<f64>()
+            .ok()
+            .and_then(|v| checked_duration_float(v * 1000.0));
+    }
+    s.parse::<f64>().ok().and_then(checked_duration_float)
+}
+
+fn checked_duration_float(value: f64) -> Option<u64> {
+    // u64::MAX rounds to 2^64 as f64; equality is already out of range.
+    (value.is_finite() && value >= 0.0 && value < u64::MAX as f64).then_some(value as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration_secs;
+
+    #[test]
+    fn second_durations_reject_overflow_at_the_unit_boundary() {
+        for (suffix, multiplier) in [('m', 60), ('h', 3600)] {
+            let maximum = u64::MAX / multiplier;
+            assert_eq!(
+                parse_duration_secs(&format!("{maximum}{suffix}")),
+                Some(maximum * multiplier)
+            );
+            assert_eq!(
+                parse_duration_secs(&format!("{}{suffix}", maximum + 1)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn c14_float_durations_reject_nonfinite_negative_and_out_of_range() {
+        for text in ["NaNms", "infms", "-1ms", "18446744073709551616000ms"] {
+            assert_eq!(parse_duration_secs(text), None, "{text}");
+        }
+        for text in ["NaN", "-1", "18446744073709551616", "18446744073709552s"] {
+            assert_eq!(super::parse_duration_ms(text), None, "{text}");
+        }
+        assert_eq!(parse_duration_secs("0.5ms"), Some(1));
+        assert_eq!(super::parse_duration_ms("0.0005s"), Some(0));
+        assert_eq!(super::parse_duration_ms("1m"), None);
+    }
+
+    #[test]
+    fn test_node_protocol_parsing() {
+        use super::NodeProtocol;
+        use std::str::FromStr;
+        assert_eq!(NodeProtocol::from_str("ss").unwrap(), NodeProtocol::SS);
+        assert_eq!(NodeProtocol::from_str("SS").unwrap(), NodeProtocol::SS);
+        assert_eq!(
+            NodeProtocol::from_str("shadowsocks").unwrap(),
+            NodeProtocol::SS
+        );
+        assert_eq!(
+            NodeProtocol::from_str("trojan").unwrap(),
+            NodeProtocol::Trojan
+        );
+        assert_eq!(
+            NodeProtocol::from_str("vmess").unwrap(),
+            NodeProtocol::VMess
+        );
+        assert_eq!(
+            NodeProtocol::from_str("hysteria2").unwrap(),
+            NodeProtocol::Hysteria2
+        );
+        assert_eq!(NodeProtocol::from_str("tuic").unwrap(), NodeProtocol::Tuic);
+        assert_eq!(
+            NodeProtocol::from_str("juicity").unwrap(),
+            NodeProtocol::Juicity
+        );
+        assert_eq!(
+            NodeProtocol::from_str("anytls").unwrap(),
+            NodeProtocol::AnyTLS
+        );
+        assert!(NodeProtocol::from_str("unknown").is_err());
+    }
 }

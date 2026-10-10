@@ -22,49 +22,6 @@ pub const UDP_DECISION_RETIRE_FENCE_MAP: &str = "UDP_DECISION_RETIRE_FENCE";
 /// overestimates live occupancy between sweep calibrations.
 pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone)]
-pub struct BpfLoadParams {
-    pub tproxy_port: u16,
-    pub tproxy_mark: u32,
-    pub so_mark: u32,
-    pub control_plane_pid: u32,
-    pub dae0_ifindex: u32,
-    pub lo_ifindex: u32,
-    pub dae_netns_id: u32,
-    pub dae0peer_mac: [u8; 6],
-    pub local_ip: u32,
-}
-
-impl Default for BpfLoadParams {
-    fn default() -> Self {
-        Self {
-            tproxy_port: 12345,
-            tproxy_mark: 0x0800_0000,
-            so_mark: 0,
-            control_plane_pid: 0,
-            dae0_ifindex: 0,
-            lo_ifindex: 0,
-            dae_netns_id: 0,
-            dae0peer_mac: [0u8; 6],
-            local_ip: 0,
-        }
-    }
-}
-
-/// Raw key sets identifying the LPM entries that belong to the current
-/// ruleset generation, consumed by [`EbpfBackend::prune_lpm_entries`].
-/// Keys are the 20-byte raw `LpmKey` encoding produced by
-/// [`maps::lpm_key_bytes`].
-#[derive(Debug, Default, Clone)]
-pub struct LpmKeepSet {
-    /// Keys present in DEST_LPM_ROUTING_MAP for the current generation.
-    pub dest: std::collections::HashSet<[u8; 20]>,
-    /// Keys present in SOURCE_LPM_ROUTING_MAP for the current generation.
-    pub source: std::collections::HashSet<[u8; 20]>,
-    /// Keys present in MAC_LPM_ROUTING_MAP for the current generation.
-    pub mac: std::collections::HashSet<[u8; 20]>,
-}
-
 /// Callback for a bounded janitor scan. Return `false` to stop the scan at a
 /// chunk boundary (used to enforce the janitor time budget).
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> bool + 'a;
@@ -76,12 +33,12 @@ pub type RoutingHandoffChunkVisitor<'a> =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPushPhase {
     DomainRouting,
-    Rules,
     DestinationLpm,
     SourceLpm,
     MacLpm,
-    Meta,
-    PruneLpm,
+    Program,
+    Attach,
+    Root,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +160,10 @@ pub(crate) fn udp_state_is_legacy_userspace_owned(state: &ConnState) -> bool {
     }
     let outbound = (raw & 0xff) as u8;
     let must = ((raw >> 40) & 1) != 0;
-    outbound != OutboundIndex::Block as u8 && !(outbound == OutboundIndex::Direct as u8 && must)
+    outbound != OutboundIndex::Block as u8
+        && (outbound != OutboundIndex::Direct as u8
+            || !must
+            || raw & ROUTING_META_FLAG_WAN_USERSPACE != 0)
 }
 
 #[cfg(test)]
@@ -257,6 +217,105 @@ pub struct DynamicHooks {
     pub egress: bool,
 }
 
+pub const MAX_DATAPATH_PROGRAMS: usize = 64;
+pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathKind {
+    Real,
+    Mock,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathCheck {
+    Verified,
+    Absent,
+    Unknown,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathObservationError {
+    Programs,
+    Hooks,
+    Routing,
+    Admission,
+    Maps,
+    Limit,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatapathProgram {
+    pub name: String,
+    pub id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatapathAttachment {
+    pub program: String,
+    pub interface: String,
+    pub egress: bool,
+    pub state: DatapathCheck,
+}
+
+/// Facts checked during one read of the backend cell, not configuration intent.
+/// Unknown occupancy is deliberate: observation never walks a traffic map.
+#[derive(Debug, Clone)]
+pub struct DatapathObservation {
+    pub kind: DatapathKind,
+    pub checked_at: std::time::SystemTime,
+    pub programs: DatapathCheck,
+    pub loaded_programs: Vec<DatapathProgram>,
+    pub hooks: DatapathCheck,
+    pub routing: DatapathCheck,
+    pub routing_generation: Option<u64>,
+    pub admission: Option<bool>,
+    pub listeners_published: Option<bool>,
+    pub attachments: Vec<DatapathAttachment>,
+    pub conn_state_capacity: Option<u32>,
+    pub errors: Vec<DatapathObservationError>,
+}
+
+impl DatapathObservation {
+    pub fn unknown(kind: DatapathKind) -> Self {
+        Self {
+            kind,
+            checked_at: std::time::SystemTime::now(),
+            programs: DatapathCheck::Unknown,
+            loaded_programs: Vec::new(),
+            hooks: DatapathCheck::Unknown,
+            routing: DatapathCheck::Unknown,
+            routing_generation: None,
+            admission: None,
+            listeners_published: None,
+            attachments: Vec::new(),
+            conn_state_capacity: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn record_error(&mut self, error: DatapathObservationError) {
+        if !self.errors.contains(&error) {
+            self.errors.push(error);
+        }
+    }
+
+    /// Claims hooks only when each of the `required` hooks was checked and found
+    /// attached. A required hook that cannot be checked keeps `hooks` unknown.
+    pub fn verify_required_hooks(&mut self, required: usize) {
+        if required > 0
+            && self.attachments.len() == required
+            && self
+                .attachments
+                .iter()
+                .all(|attachment| attachment.state == DatapathCheck::Verified)
+        {
+            self.hooks = DatapathCheck::Verified;
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DatapathFlagsWriteOrigin {
@@ -276,8 +335,52 @@ pub struct DatapathFlagsWriteTrace {
     pub failed: bool,
 }
 
+/// How far the datapath can match `pname()` rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PnameSupport {
+    #[default]
+    Full,
+    /// Kernel argv capture is unavailable; rules see the thread name.
+    ThreadName,
+    /// The cgroup hooks are not attached; `pname()` never matches and
+    /// `!pname()` always does.
+    Unavailable,
+}
+
+/// Lists `pname_routing` while `router` has a `pname()` rule that `backend` reduces.
+pub(crate) fn record_pname_routing(
+    router: &crate::routing::Router,
+    backend: &dyn EbpfBackend,
+    degradations: &crate::degradations::Degradations,
+) {
+    use crate::degradations::{Component, Issue};
+    let issue = match backend.pname_support() {
+        PnameSupport::Full => None,
+        _ if !router.uses_process_name() => None,
+        PnameSupport::ThreadName => Some(Issue {
+            code: "pname_routing_reduced",
+            message: "Kernel argv capture is unavailable; process-name rules match the thread name.",
+            reason: "comm_fallback",
+        }),
+        PnameSupport::Unavailable => Some(Issue {
+            code: "pname_routing_disabled",
+            message: "cgroup v2 is unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match.",
+            reason: "cgroup_unavailable",
+        }),
+    };
+    match issue {
+        Some(issue) => degradations.set(Component::PnameRouting, issue),
+        None => degradations.clear(Component::PnameRouting),
+    }
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
+    /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
+    fn observe_datapath(&self) -> DatapathObservation {
+        DatapathObservation::unknown(DatapathKind::Unknown)
+    }
+
     fn inject_routing_fault(
         &mut self,
         _phase: RoutingPushPhase,
@@ -314,10 +417,6 @@ pub trait EbpfBackend: Send + Sync {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
-    fn eject(&mut self) {}
-    fn inject(&mut self, _params: &BpfLoadParams) -> anyhow::Result<()> {
-        Ok(())
-    }
     fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -343,6 +442,8 @@ pub trait EbpfBackend: Send + Sync {
     }
     #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, _origin: DatapathFlagsWriteOrigin) {}
+    #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {}
     #[cfg(test)]
     fn datapath_flags_write_log(&self) -> Vec<u32> {
         Vec::new()
@@ -398,6 +499,10 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
+    /// Release all published listener references only after admission is closed
+    /// and the caller has joined ingress. Errors never authorize reopening.
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()>;
+
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 
     /// Attach TC programs to a configured interface that appeared after
@@ -417,83 +522,33 @@ pub trait EbpfBackend: Send + Sync {
     /// was recreated, so its hooks died with it).
     fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
 
-    fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()>;
-    fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>>;
-
-    /// Fill the inactive physical routing-rule bank. The bank is not visible
-    /// to the datapath until `publish_routing_generation` flips its selector.
-    fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()>;
-    /// Return the bank currently selected by the datapath.
-    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+    /// Atomically publish a complete compiled routing plan into an inactive slot.
+    /// Implementations stage every generation-owned fact map and program before
+    /// committing the stable policy root; errors leave the prior root untouched.
+    fn publish_routing_plan(
+        &mut self,
+        plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()>;
+    /// Return the committed compiled-policy generation, not the active slot.
+    fn routing_policy_generation(&self) -> u64;
+    /// Return the slot currently selected by the stable policy root.
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(0)
     }
-    /// Fill the inactive generation's exploded introspection metadata and all
-    /// four packed `RoutingGroupMeta` entries, then atomically activate it by
-    /// writing only the selector slot. Implementations MUST leave the prior
-    /// generation selected until every packed entry is complete.
-    fn publish_routing_generation(
-        &mut self,
-        generation: u32,
-        count: u32,
-        group_bitmaps: &RoutingGroupBitmaps,
-    ) -> anyhow::Result<()>;
-    fn add_domain_route(&mut self, domain: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
-    fn add_domain_routing_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()>;
-    fn add_source_routing_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    fn add_source_lpm_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
-        let _ = key;
-        let _ = bitmap;
-        Ok(())
-    }
-    /// Merge a resolved-IP bitmap into the active routing generation.
+    /// OR a learned domain bitmap into the active generation-owned map.
     fn add_domain_ip_bitmap(
         &mut self,
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let _ = ip_key;
-        let _ = bitmap;
-        Ok(())
-    }
-    /// Replace the active generation's bitmap while retaining the inactive
-    /// half for packets that entered before a routing publication.
+    ) -> anyhow::Result<()>;
+    /// Replace one entry in the active generation-owned domain HASH map.
+    /// A present all-zero value is meaningful and must not be removed.
     fn set_domain_ip_bitmap(
         &mut self,
-        _ip_key: &LpmKey,
-        _bitmap: &DomainRouting,
-    ) -> Result<(), DomainRouteWriteError> {
-        Ok(())
-    }
-
-    /// Overwrite a bounded batch of DOMAIN_ROUTING_MAP entries. The default
-    /// keeps every backend correct; native backends may replace it with one
-    /// batch syscall without changing projection reconciliation semantics.
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), DomainRouteWriteError>;
     fn set_domain_ip_bitmap_batch(
         &mut self,
         entries: &[(LpmKey, DomainRouting)],
@@ -504,15 +559,8 @@ pub trait EbpfBackend: Send + Sync {
         }
         Ok(())
     }
-    /// Remove the DOMAIN_ROUTING_MAP entry for `ip_key` (16-byte IP key).
-    /// Used by the domain-route rebuild for learned IPs whose domain no
-    /// longer matches any domain rule under the current ruleset.
-    fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> Result<(), DomainRouteWriteError> {
-        Ok(())
-    }
-
-    /// Remove a bounded batch of DOMAIN_ROUTING_MAP entries. The returned
-    /// index identifies the first entry not known to have been applied.
+    /// Remove an entry from the active generation-owned domain HASH map.
+    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> Result<(), DomainRouteWriteError>;
     fn remove_domain_ip_bitmap_batch(
         &mut self,
         keys: &[LpmKey],
@@ -524,44 +572,12 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
-    /// Populate the inactive generation for every learned domain route before
-    /// publishing its matching rule bank.
-    fn stage_domain_routing_generation(
-        &mut self,
-        generation: u32,
-        entries: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()>;
-    fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
-    /// Fully reset all routing-related maps (MatchSets, routing metadata,
-    /// domain routing, and LPM tries). NOT used by the routing push path:
-    /// clearing the active bank and metadata makes the eBPF datapath fail
-    /// closed until a complete generation is published. Kept for tests and
-    /// full-reset scenarios only.
-    fn clear_routes(&mut self) -> anyhow::Result<()>;
-    /// Delete dest/source/MAC LPM entries whose raw key is not in `keep`.
-    ///
-    /// Post-commit cleanup for the two-phase routing push.  This replaces
-    /// the former `clear_stale_lpm_entries` (zero-bitmap deletion): LPM
-    /// values are now overwritten per key during the push, so stale state
-    /// is exactly the set of keys the new ruleset no longer references.
-    fn prune_lpm_entries(&mut self, _keep: &LpmKeepSet) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     fn tcp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     fn tcp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
     fn tcp_conn_state_remove(&mut self, key: &TuplesKey) -> anyhow::Result<()>;
     fn udp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     fn udp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
     fn udp_conn_state_remove(&mut self, key: &TuplesKey) -> anyhow::Result<()>;
-    /// Remove a bounded batch of UDP conntrack entries. Backends may override
-    /// this to amortize map access; the default preserves single-delete errors.
-    fn udp_conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<usize> {
-        for key in keys {
-            self.udp_conn_state_remove(key)?;
-        }
-        Ok(keys.len())
-    }
 
     /// Publish one token-bound UDP decision transition. The caller holds the
     /// backend write lock; implementations validate the state incarnation and
@@ -581,9 +597,9 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<UdpDecisionCommitResult>;
 
     /// Retire a userspace-owned flow. Nonzero tokens remove only the matching
-    /// staged/proxy incarnation and auxiliaries; zero removes only a legacy
-    /// published, non-offloaded forward state. Kernel handoffs and superseding
-    /// tuple incarnations are retained.
+    /// staged/proxy incarnation and auxiliaries. Zero removes a legacy published,
+    /// non-offloaded state and, for explicit WAN userspace ownership, its matching
+    /// auxiliaries. Native kernel decisions and superseding incarnations survive.
     fn remove_udp_flow(
         &mut self,
         key: &TuplesKey,
@@ -621,8 +637,8 @@ pub trait EbpfBackend: Send + Sync {
     /// syscall (kernel 4.20+) and falls back to lookup+delete on kernels
     /// without it.  The fallback is not atomic: the eBPF datapath may
     /// re-insert the key between the two syscalls, in which case the fresh
-    /// entry is dropped and the flow is re-routed in userspace — harmless
-    /// for a best-effort handoff hint.
+    /// entry can be dropped. Ordinary flows may re-route in userspace;
+    /// transparent TCP DNS rejects a missing handoff instead.
     ///
     /// Takes `&self` so the per-connection hot path only needs a read lock
     /// on the backend: individual bpf() map operations are serialized by
@@ -631,9 +647,40 @@ pub trait EbpfBackend: Send + Sync {
     /// `cleanup()`, which takes the write lock.
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>>;
 
+    fn routing_handoff_take_observed(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
+        Ok(self.routing_handoff_take(key)?.map(|entry| (entry, true)))
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        _key: &TuplesKey,
+        _reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
+        Err("kernel_trace_unsupported")
+    }
+
+    #[cfg(all(feature = "ebpf", feature = "native-api"))]
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
+        None
+    }
+
+    fn pname_support(&self) -> PnameSupport {
+        PnameSupport::Full
+    }
+
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
     fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;
-    fn cookie_pid_remove(&mut self, cookie: &u64) -> anyhow::Result<()>;
 
     fn set_outbound_alive(
         &mut self,
@@ -644,8 +691,6 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<()>;
     fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool>;
 
-    fn get_outbound_stats(&self, outbound: OutboundIndex) -> anyhow::Result<OutboundStats>;
-    fn clear_outbound_stats(&mut self, outbound: OutboundIndex) -> anyhow::Result<()>;
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>>;
 
     // CONN_STATE_MAP is a plain hash: the datapath expires entries lazily on
@@ -653,12 +698,9 @@ pub trait EbpfBackend: Send + Sync {
     // (mirroring the datapath's own expiry rules).  The kernel never evicts
     // on its own — silent LRU eviction could re-route or break live flows.
 
-    /// Snapshot all (key, entry) pairs from CONN_STATE_MAP.
-    /// Same consistency notes as [`Self::redirect_track_snapshot`].
+    /// Snapshot all (key, entry) pairs from CONN_STATE_MAP for janitor scans.
+    /// Implementations may use bounded batch reads internally.
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()>;
-
-    /// Remove multiple CONN_STATE_MAP entries (batched when supported).
-    fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
 
     /// Visit CONN_STATE_MAP entries in bounded chunks without accumulating
     /// the whole map (524K entries would otherwise spike memory on every
@@ -689,65 +731,25 @@ pub trait EbpfBackend: Send + Sync {
         Ok((0, 0))
     }
 
-    fn redirect_track_snapshot(
-        &self,
-        out: &mut Vec<(RedirectTuple, RedirectEntry)>,
-    ) -> anyhow::Result<()>;
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()>;
-    fn routing_handoff_snapshot(
-        &self,
-        out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
-    ) -> anyhow::Result<()>;
-    fn redirect_track_remove_batch(&mut self, keys: &[RedirectTuple]) -> anyhow::Result<()>;
-    fn cookie_pid_remove_batch(&mut self, cookies: &[u64]) -> anyhow::Result<()>;
-    fn routing_handoff_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
-
     /// Stream REDIRECT_TRACK in bounded chunks. The callback can stop at a
     /// chunk boundary so callers can retain a wall-clock budget.
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut RedirectTrackChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.redirect_track_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     fn cookie_pid_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut CookiePidChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.cookie_pid_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut RoutingHandoffChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.routing_handoff_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     /// Re-check candidates before deleting them. A key reused or transitioned
     /// after the scan is retained unless its current timestamp and TCP state
@@ -773,8 +775,4 @@ pub trait EbpfBackend: Send + Sync {
         entries: &[(TuplesKey, RoutingHandoffEntry)],
         expired_before_ns: u64,
     ) -> anyhow::Result<u64>;
-
-    fn conn_track_lookup(&self, tuple: &ConnTuple) -> anyhow::Result<Option<u32>>;
-    fn conn_track_store(&mut self, tuple: &ConnTuple, outbound_idx: u32) -> anyhow::Result<()>;
-    fn conn_track_remove(&mut self, tuple: &ConnTuple) -> anyhow::Result<()>;
 }

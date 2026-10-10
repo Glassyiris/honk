@@ -8,23 +8,24 @@ mod compiler {
         DnsCond, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
         DnsResponseRouting,
     };
-    use tracing::warn;
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
-    use crate::routing::{
-        BinaryLpmTrie, GeoAssets, GeoRequirements, GeositeMatcher, parse_ip_net_str,
-    };
+    use crate::routing::{GeoAssets, GeoRequirements, SharedMatchers, parse_ip_net_str};
 
     #[derive(Clone)]
     pub(super) struct CompiledRequestRule {
         pub(super) conditions: Vec<CompiledCond>,
         pub(super) action: DnsRequestAction,
+        #[cfg(feature = "native-api")]
+        pub(super) source_conditions: Vec<honk_config::dns::DnsCond>,
     }
 
     #[derive(Clone)]
     pub(super) struct CompiledResponseRule {
         pub(super) conditions: Vec<CompiledCond>,
         pub(super) action: DnsResponseAction,
+        #[cfg(feature = "native-api")]
+        pub(super) source_conditions: Vec<honk_config::dns::DnsCond>,
     }
 
     pub(super) struct CompiledRouting {
@@ -52,14 +53,17 @@ mod compiler {
         request: &DnsRequestRouting,
         response: &DnsResponseRouting,
         assets: &GeoAssets,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<CompiledRouting> {
         let request_rules = request
             .rules
             .iter()
             .map(|rule| {
                 Ok(CompiledRequestRule {
-                    conditions: compile_conditions(&rule.conditions, assets, true)?,
+                    conditions: compile_conditions(&rule.conditions, assets, shared, true)?,
                     action: rule.action.clone(),
+                    #[cfg(feature = "native-api")]
+                    source_conditions: rule.conditions.clone(),
                 })
             })
             .collect::<anyhow::Result<_>>()?;
@@ -68,8 +72,10 @@ mod compiler {
             .iter()
             .map(|rule| {
                 Ok(CompiledResponseRule {
-                    conditions: compile_conditions(&rule.conditions, assets, false)?,
+                    conditions: compile_conditions(&rule.conditions, assets, shared, false)?,
                     action: rule.action.clone(),
+                    #[cfg(feature = "native-api")]
+                    source_conditions: rule.conditions.clone(),
                 })
             })
             .collect::<anyhow::Result<_>>()?;
@@ -102,6 +108,7 @@ mod compiler {
     fn compile_conditions(
         conditions: &[DnsCond],
         assets: &GeoAssets,
+        shared: &mut SharedMatchers,
         allow_sip: bool,
     ) -> anyhow::Result<Vec<CompiledCond>> {
         conditions
@@ -111,7 +118,7 @@ mod compiler {
                     not: *not,
                     matchers: matchers
                         .iter()
-                        .map(|matcher| compile_domain_matcher(matcher, assets))
+                        .map(|matcher| compile_domain_matcher(matcher, assets, shared))
                         .collect::<anyhow::Result<_>>()?,
                 }),
                 DnsCond::Qtype { not, types } => Ok(CompiledCond::Qtype {
@@ -128,9 +135,8 @@ mod compiler {
                     let nets = cidrs
                         .iter()
                         .map(|value| {
-                            parse_ip_net_str(value).ok_or_else(|| {
-                                anyhow::anyhow!("Invalid DNS source IP or CIDR '{value}'")
-                            })
+                            parse_ip_net_str(value)
+                                .ok_or_else(|| anyhow::anyhow!("invalid DNS source IP or CIDR"))
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     Ok(CompiledCond::Sip { not: *not, nets })
@@ -140,12 +146,17 @@ mod compiler {
                     names: names.clone(),
                 }),
                 DnsCond::Ip { not, cidrs, geoip } => {
-                    let mut nets: Vec<ipnet::IpNet> =
-                        cidrs.iter().filter_map(|cidr| cidr.parse().ok()).collect();
+                    let mut nets = cidrs
+                        .iter()
+                        .map(|value| {
+                            parse_ip_net_str(value)
+                                .ok_or_else(|| anyhow::anyhow!("invalid DNS response IP or CIDR"))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
                     nets.extend(assets.geoip_nets(geoip));
                     Ok(CompiledCond::Ip {
                         not: *not,
-                        trie: BinaryLpmTrie::from_nets(&nets),
+                        trie: shared.trie(nets),
                     })
                 }
             })
@@ -155,6 +166,7 @@ mod compiler {
     fn compile_domain_matcher(
         matcher: &DnsDomainMatcher,
         assets: &GeoAssets,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<CompiledDomainMatcher> {
         Ok(match matcher {
             DnsDomainMatcher::Full(value) => CompiledDomainMatcher::Full(value.to_lowercase()),
@@ -168,20 +180,15 @@ mod compiler {
                 })?)
             }
             DnsDomainMatcher::Geosite(code) => {
+                // `geosite_domains` already warns when a code expands to nothing.
                 let domains = assets.geosite_domains(std::slice::from_ref(code));
-                if domains.is_empty() {
-                    warn!(
-                        "geosite code '{}' expanded to 0 domains; matcher will never match",
-                        code
-                    );
-                }
-                CompiledDomainMatcher::Geosite(GeositeMatcher::build(&domains))
+                CompiledDomainMatcher::Geosite(shared.geosite(code, &domains))
             }
         })
     }
 }
 mod config {
-    use honk_config::dns::{DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsRouting};
+    use honk_config::dns::{DnsRequestAction, DnsResponseAction};
 
     pub(super) fn request_upstream(action: &DnsRequestAction) -> Option<&str> {
         match action {
@@ -196,27 +203,10 @@ mod config {
             DnsResponseAction::Upstream(name) => Some(name),
         }
     }
-
-    pub(super) fn resolve_request_routing(config: &DnsRouting) -> DnsRequestRouting {
-        if !config.request.rules.is_empty() {
-            return config.request.clone();
-        }
-        if !config.rules.is_empty() {
-            return config.convert_legacy_rules();
-        }
-        let mut request = config.request.clone();
-        let uses_default = matches!(
-            &request.fallback,
-            DnsRequestAction::Upstream(name) if name == "default"
-        );
-        if uses_default && !matches!(config.fallback.as_str(), "" | "upstream" | "default") {
-            request.fallback = DnsRequestAction::Upstream(config.fallback.clone());
-        }
-        request
-    }
 }
 mod matcher {
     use std::net::IpAddr;
+    use std::sync::Arc;
 
     use crate::routing::{BinaryLpmTrie, GeositeMatcher};
 
@@ -226,7 +216,7 @@ mod matcher {
         Suffix(String),
         Keyword(String),
         Regex(regex::Regex),
-        Geosite(GeositeMatcher),
+        Geosite(Arc<GeositeMatcher>),
     }
 
     impl CompiledDomainMatcher {
@@ -269,7 +259,7 @@ mod matcher {
         },
         Ip {
             not: bool,
-            trie: BinaryLpmTrie,
+            trie: Arc<BinaryLpmTrie>,
         },
     }
 
@@ -309,7 +299,15 @@ mod matcher {
     }
 
     pub(super) fn eval_conditions(conditions: &[CompiledCond], value: &Evaluation<'_>) -> bool {
-        conditions.iter().all(|condition| {
+        eval_conditions_observed(conditions, value, |_, _| {})
+    }
+
+    pub(super) fn eval_conditions_observed(
+        conditions: &[CompiledCond],
+        value: &Evaluation<'_>,
+        mut observe: impl FnMut(usize, bool),
+    ) -> bool {
+        conditions.iter().enumerate().all(|(index, condition)| {
             let (matched, negated) = match condition {
                 CompiledCond::Qname { not, matchers } => (
                     matchers.iter().any(|matcher| matcher.matches(value.domain)),
@@ -318,6 +316,7 @@ mod matcher {
                 CompiledCond::Qtype { not, types } => (types.contains(&value.qtype), *not),
                 CompiledCond::Sip { not, nets } => {
                     let Some(source_ip) = value.source_ip else {
+                        observe(index, false);
                         return false;
                     };
                     (nets.iter().any(|net| net.contains(&source_ip)), *not)
@@ -329,7 +328,9 @@ mod matcher {
                     (value.answer_ips.iter().any(|ip| trie.matches(ip)), *not)
                 }
             };
-            matched != negated
+            let result = matched != negated;
+            observe(index, result);
+            result
         })
     }
 }
@@ -346,9 +347,9 @@ use honk_config::dns::{
 use tracing::debug;
 
 use self::compiler::{CompiledRequestRule, CompiledResponseRule, compile, requirements};
-use self::config::{request_upstream, resolve_request_routing, response_upstream};
+use self::config::{request_upstream, response_upstream};
 use self::matcher::{Evaluation, ResponseContext, eval_conditions};
-use crate::routing::{GeoAssets, GeoRequirements, GeoSourceSet};
+use crate::routing::{GeoAssets, GeoRequirements, GeoSourceSet, SharedMatchers};
 
 /// Output of request routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +378,8 @@ pub struct DnsRouter {
     rule_count: usize,
     geo_fingerprint: [u8; 32],
     geo_requirements: GeoRequirements,
+    #[cfg(feature = "native-api")]
+    geo_assets: std::sync::Arc<[crate::routing::GeoAssetSnapshot]>,
 }
 
 impl DnsRouter {
@@ -388,7 +391,7 @@ impl DnsRouter {
         config: &DnsRouting,
         fixed_domain_ttl: &HashMap<String, u32>,
     ) -> anyhow::Result<Self> {
-        let request = resolve_request_routing(config);
+        let request = config.effective_request();
         let requirements = requirements(&request, &config.response);
         let sources = GeoSourceSet::load(&requirements);
         Self::build(
@@ -397,11 +400,12 @@ impl DnsRouter {
             fixed_domain_ttl,
             &requirements,
             &sources,
+            &mut SharedMatchers::default(),
         )
     }
 
     pub fn new_from_dns_config(dns_config: &DnsConfig) -> anyhow::Result<Self> {
-        let request = resolve_request_routing(&dns_config.routing);
+        let request = dns_config.routing.effective_request();
         let requirements = requirements(&request, &dns_config.routing.response);
         let sources = GeoSourceSet::load(&requirements);
         Self::build(
@@ -410,11 +414,12 @@ impl DnsRouter {
             &dns_config.fixed_domain_ttl,
             &requirements,
             &sources,
+            &mut SharedMatchers::default(),
         )
     }
 
     pub(crate) fn geo_requirements(dns_config: &DnsConfig) -> GeoRequirements {
-        let request = resolve_request_routing(&dns_config.routing);
+        let request = dns_config.routing.effective_request();
         requirements(&request, &dns_config.routing.response)
     }
 
@@ -422,7 +427,16 @@ impl DnsRouter {
         dns_config: &DnsConfig,
         geo_sources: &GeoSourceSet,
     ) -> anyhow::Result<Self> {
-        let request = resolve_request_routing(&dns_config.routing);
+        Self::new_sharing(dns_config, geo_sources, &mut SharedMatchers::default())
+    }
+
+    /// Builds with matchers shared with the traffic router of the same build.
+    pub(crate) fn new_sharing(
+        dns_config: &DnsConfig,
+        geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
+    ) -> anyhow::Result<Self> {
+        let request = dns_config.routing.effective_request();
         let requirements = requirements(&request, &dns_config.routing.response);
         Self::build(
             &request,
@@ -430,6 +444,7 @@ impl DnsRouter {
             &dns_config.fixed_domain_ttl,
             &requirements,
             geo_sources,
+            shared,
         )
     }
 
@@ -439,9 +454,10 @@ impl DnsRouter {
         fixed_domain_ttl: &HashMap<String, u32>,
         requirements: &GeoRequirements,
         geo_sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
     ) -> anyhow::Result<Self> {
         let assets = GeoAssets::from_sources(requirements, geo_sources);
-        let compiled = compile(request, response, &assets)?;
+        let compiled = compile(request, response, &assets, shared)?;
         Ok(Self {
             rule_count: compiled.request_rules.len() + compiled.response_rules.len(),
             request_rules: compiled.request_rules,
@@ -451,6 +467,8 @@ impl DnsRouter {
             fixed_domain_ttl: fixed_domain_ttl.clone(),
             geo_fingerprint: geo_sources.fingerprint_for(requirements),
             geo_requirements: requirements.clone(),
+            #[cfg(feature = "native-api")]
+            geo_assets: geo_sources.snapshots(requirements).into(),
         })
     }
 
@@ -462,15 +480,59 @@ impl DnsRouter {
         qtype: u16,
         source_ip: Option<IpAddr>,
     ) -> DnsRequestDecision {
+        self.select_request_with_source(domain, qtype, source_ip).0
+    }
+
+    #[cfg_attr(not(feature = "native-api"), allow(clippy::unused_enumerate_index))]
+    pub(crate) fn select_request_with_source(
+        &self,
+        domain: &str,
+        qtype: u16,
+        source_ip: Option<IpAddr>,
+    ) -> (DnsRequestDecision, crate::dns::outcome::RouteSource) {
         let evaluation = Evaluation::request(domain, qtype, source_ip);
-        for rule in &self.request_rules {
-            if eval_conditions(&rule.conditions, &evaluation) {
+        let mut capture =
+            crate::observe::flows::dns::RuleCapture::request(domain, qtype, source_ip);
+        for (_index, rule) in self.request_rules.iter().enumerate() {
+            #[cfg(feature = "native-api")]
+            if let Some(capture) = &mut capture {
+                capture.begin_rule(Some(_index), &rule.source_conditions);
+            }
+            let matched = matcher::eval_conditions_observed(
+                &rule.conditions,
+                &evaluation,
+                |index, matched| {
+                    if let Some(capture) = &mut capture {
+                        capture.condition(index, matched);
+                    }
+                },
+            );
+            if let Some(capture) = &mut capture {
+                capture.rule_result(matched);
+            }
+            if matched {
+                if let Some(capture) = capture {
+                    let (action, upstream) = request_evidence(&rule.action);
+                    capture.finish(action, upstream);
+                }
                 debug!(qtype, action = ?rule.action, "DNS request route selected");
-                return map_request_action(&rule.action);
+                return (
+                    map_request_action(&rule.action),
+                    crate::dns::outcome::RouteSource::Routing,
+                );
             }
         }
+        if let Some(mut capture) = capture {
+            capture.begin_rule(None, &[]);
+            capture.rule_result(true);
+            let (action, upstream) = request_evidence(&self.request_fallback);
+            capture.finish(action, upstream);
+        }
         debug!(qtype, action = ?self.request_fallback, fallback = true, "DNS request route selected");
-        map_request_action(&self.request_fallback)
+        (
+            map_request_action(&self.request_fallback),
+            crate::dns::outcome::RouteSource::Default,
+        )
     }
 
     pub fn select_request(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
@@ -479,6 +541,7 @@ impl DnsRouter {
 
     /// Select a response route for a domain that has already been normalized
     /// to ASCII lowercase by the DNS query parser.
+    #[cfg_attr(not(feature = "native-api"), allow(clippy::unused_enumerate_index))]
     pub(crate) fn select_response_normalized(
         &self,
         domain: &str,
@@ -494,11 +557,43 @@ impl DnsRouter {
                 from_upstream,
             },
         );
-        for rule in &self.response_rules {
-            if eval_conditions(&rule.conditions, &evaluation) {
+        let mut capture = crate::observe::flows::dns::RuleCapture::response(
+            domain,
+            qtype,
+            answer_ips,
+            from_upstream,
+        );
+        for (_index, rule) in self.response_rules.iter().enumerate() {
+            #[cfg(feature = "native-api")]
+            if let Some(capture) = &mut capture {
+                capture.begin_rule(Some(_index), &rule.source_conditions);
+            }
+            let matched = matcher::eval_conditions_observed(
+                &rule.conditions,
+                &evaluation,
+                |index, matched| {
+                    if let Some(capture) = &mut capture {
+                        capture.condition(index, matched);
+                    }
+                },
+            );
+            if let Some(capture) = &mut capture {
+                capture.rule_result(matched);
+            }
+            if matched {
+                if let Some(capture) = capture {
+                    let (action, upstream) = response_evidence(&rule.action);
+                    capture.finish(action, upstream);
+                }
                 debug!(qtype, upstream = from_upstream, action = ?rule.action, "DNS response route selected");
                 return map_response_action(&rule.action);
             }
+        }
+        if let Some(mut capture) = capture {
+            capture.begin_rule(None, &[]);
+            capture.rule_result(true);
+            let (action, upstream) = response_evidence(&self.response_fallback);
+            capture.finish(action, upstream);
         }
         debug!(qtype, action = ?self.response_fallback, fallback = true, "DNS response route selected");
         map_response_action(&self.response_fallback)
@@ -549,8 +644,42 @@ impl DnsRouter {
         self.geo_fingerprint
     }
 
+    #[cfg(feature = "native-api")]
+    pub(crate) fn geo_assets(&self) -> &[crate::routing::GeoAssetSnapshot] {
+        &self.geo_assets
+    }
+
     pub(crate) fn geo_requirements_snapshot(&self) -> &GeoRequirements {
         &self.geo_requirements
+    }
+    #[cfg(test)]
+    pub(crate) fn geosite_matchers(&self) -> Vec<&std::sync::Arc<crate::routing::GeositeMatcher>> {
+        self.request_rules
+            .iter()
+            .flat_map(|rule| &rule.conditions)
+            .chain(self.response_rules.iter().flat_map(|rule| &rule.conditions))
+            .filter_map(|condition| match condition {
+                matcher::CompiledCond::Qname { matchers, .. } => Some(matchers),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|matcher| match matcher {
+                matcher::CompiledDomainMatcher::Geosite(matcher) => Some(matcher),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn answer_ip_tries(&self) -> Vec<&std::sync::Arc<crate::routing::BinaryLpmTrie>> {
+        self.response_rules
+            .iter()
+            .flat_map(|rule| &rule.conditions)
+            .filter_map(|condition| match condition {
+                matcher::CompiledCond::Ip { trie, .. } => Some(trie),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn select_upstream_normalized(&self, domain: &str) -> &str {
@@ -598,5 +727,21 @@ fn request_action_name(action: &DnsRequestAction, fallback: bool) -> &str {
             debug!(action = "asis", fallback, "DNS request route selected");
             "asis"
         }
+    }
+}
+
+fn request_evidence(action: &DnsRequestAction) -> (&'static str, Option<&str>) {
+    match action {
+        DnsRequestAction::Reject => ("reject", None),
+        DnsRequestAction::AsIs => ("asis", None),
+        DnsRequestAction::Upstream(name) => ("upstream", Some(name)),
+    }
+}
+
+fn response_evidence(action: &DnsResponseAction) -> (&'static str, Option<&str>) {
+    match action {
+        DnsResponseAction::Accept => ("accept", None),
+        DnsResponseAction::Reject => ("reject", None),
+        DnsResponseAction::Upstream(name) => ("requery", Some(name)),
     }
 }

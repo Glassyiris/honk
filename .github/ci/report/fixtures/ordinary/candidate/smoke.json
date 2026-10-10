@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "run_id": 101,
+  "run_attempt": 1,
+  "lane": "smoke",
+  "matrix": {
+    "target": "x86_64-unknown-linux-gnu",
+    "toolchain": "pinned-stable",
+    "profile": "release"
+  },
+  "measured_sha": "776f2f0f",
+  "baseline_sha": null,
+  "units": {
+    "dns_smoke": "queries-and-names",
+    "smoke_memory": "MiB",
+    "smoke_cpu": "seconds",
+    "binary_size": "bytes",
+    "toolchain": "rustc-cache"
+  },
+  "values": {
+    "dns_smoke": {"value": {"queries": 4, "upstream_names": ["udp.smoke.test.", "tcp-one.smoke.test.", "tcp-two.smoke.test.", "reload.smoke.test."]}, "unit": "queries-and-names", "available": true},
+    "smoke_memory": {"value": 41, "unit": "MiB", "available": true},
+    "smoke_cpu": {"value": 0.05, "unit": "seconds", "available": true},
+    "binary_size": {"value": 20447232, "unit": "bytes", "available": true},
+    "toolchain": {"value": {"rustc": "1.98.1", "cache_hit": true}, "unit": "rustc-cache", "available": true}
+  },
+  "signals": [],
+  "failure": null
+}

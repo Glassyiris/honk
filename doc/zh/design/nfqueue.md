@@ -1,6 +1,6 @@
 # NFQUEUE 持有首包的 UDP 路径
 
-本文说明 fail-closed 路径：它持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户空间得到 direct、proxy 或 block 终态决策。
+NFQUEUE 以 fail-closed 方式持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户态得到 direct、proxy 或 block 终态决策。
 
 ## 启用与范围
 
@@ -20,25 +20,25 @@ global {
 | --- | --- |
 | 经过 LAN TC 后语义尚不明确的新 LAN 转发 UDP | 启用且 ready 时，暂存唯一 token 并在 NFQUEUE 中持有原始 skb |
 | 主机发起的 WAN UDP | 保持规范 TPROXY 路径；主机 egress 不经过这个 `inet prerouting` hook |
-| UDP 端口 `53` | 保持专用 DNS fast path；绝不暂存 |
+| UDP 端口 `53` | 遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；需要控制器/原始组处理的 LAN 分片查询走下述完整数据报路径，不创建普通 conn-state 或 decision token |
 | 内部/特殊或反向流量 | 绝不暂存 |
-| `must` 或 `block` 路由结果 | 视为终态；绝不暂存 |
+| 非 DNS 的 `must` 或 `block` 路由结果 | 视为终态；绝不暂存 |
 | 路由时已经确定安全的 direct 结果 | 走内核 direct 路径；绝不暂存 |
 | 已启用但尚未 ready 时的暂存候选 | 丢弃新流；无关的非暂存 UDP 保持正常路径 |
 
-“语义尚不明确”是指初步路由仍可能在用户空间路由、模式/组选择或域名/QUIC 检查后改变。该路径避免仅因初步结果不完整就靠猜测把数据包重定向到用户空间 relay。
+语义尚不明确是指初步路由仍可能在用户态路由、模式/组选择或域名/QUIC 检查后改变。该路径不会仅因初步结果不完整，就将数据包重定向到用户态 relay。
 
 ## 持包机制
 
 ```mermaid
 flowchart LR
-  TC[LAN TC] -->|Pending mark + token| NFT[inet honk_nfqueue<br/>udp_decision，优先级 -250]
+  TC[LAN TC] -->|Pending mark + token| NFT[inet honk_nfqueue<br/>udp_decision, priority -250]
   NFT --> Q[NFQUEUE 320]
-  Q --> A[有界 ingest actor]
-  A --> C[Token correlator + 规范 UDP initializer]
-  C -->|Direct| ACCEPT[带 mark 的 NF_ACCEPT]
-  C -->|Proxy| PROXY[丢弃原始包；拨号/发送一次]
-  C -->|Block 或 cancel| DROP[NF_DROP]
+  Q --> A[Bounded ingest actor]
+  A --> C[Token correlator + canonical UDP initializer]
+  C -->|Direct| ACCEPT[Marked NF_ACCEPT]
+  C -->|Proxy| PROXY[Drop originals; dial/send once]
+  C -->|Block or cancel| DROP[NF_DROP]
 ```
 
 | 机制 | 当前契约 |
@@ -48,9 +48,25 @@ flowchart LR
 | Verdict 所有权 | 不可 `Clone`、恰好一次的 `VerdictGuard`；未提交的 guard 在 drop 时发送 `NF_DROP` |
 | Ingest 所有权 | 单 actor，队列上限为 `256` 项和 `8 MiB` payload；仅当 actor dequeue 时才尝试取得 UDP slow-path permit |
 | nftables 所有权 | 单个原子事务独占精确的 `inet honk_nfqueue` / `udp_decision`，即优先级 `-250` 的 `inet prerouting` filter chain；只有携带 Pending 签名的 UDP 才进入队列 |
-| 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。输入畸形或截断、`ENOBUFS`、listener 意外退出以及 verdict socket 失败均为 fatal |
+| 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。可识别的坏包、UDP payload 截断和校验和错误发送 `NF_DROP`；畸形队列元数据、无法识别的报文头、`ENOBUFS`、listener 退出和 verdict socket 失败仍为 fatal |
 
 服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
+
+此 Linux 机制仅用于 `honk-core` 的 `ebpf` feature。解析只分配一份与数据报大小相等的缓冲区。core 采样器与 `StatsManager` 区分当前实例队列深度与跨 hard rebind 累积的进程级丢包数，报告最近一次内核读取的可用性与错误，并始终刷新 held-guard/effective-buffer gauge。
+
+每次内核统计采样先在调用线程所在的队列网络命名空间中打开 procfs 文件，再通过已绑定该命名空间的文件描述符异步读取；采样对象不由进程主线程或阻塞工作线程的命名空间决定。
+
+## LAN DNS 分片
+
+TC 按普通流量策略判定 offset-zero 的 UDP/53 首片。原生 `direct(must)`、`block(must)` 和可信的精确控制平面 mark 保留原动作。需要 DNS 控制器或原始 must 组的查询不再进入 `daens`，而在 host skb mark 中携带路由/代际；后续片同样留在 host。内核 IPv4/IPv6 重组在优先级 `-400` 执行，早于现有队列 `-250` 和 conntrack `-200`。不增加用户态分片缓冲或 fragment-ID map。
+
+Actor 在成功、饱和和拒绝路径均先区分完整 DNS 数据报与普通 token 流；验证 carrier、当前代际和准入 epoch，对原包确认 `NF_DROP` 后，才发布到透明 socket 共用的有界 DNS/原始 UDP 管线。回复沿用现有 redirect 元数据恢复原目的地址。分发前验证 UDP 校验和，允许 IPv4 零校验和并识别内核 checksum-partial 元数据；没有该元数据的 IPv6 零校验和被拒绝。
+
+队列关闭或未 ready 时，需要控制器/原始组处理的分片丢弃，不能回退原生绕过 DNS 策略。未分片 DNS 保留 TC 快路径；本路径不增加 TCP 分片支持。与 TC redirect 不同，它经过 host raw hook，前置防火墙丢包或改写 mark 可以阻止准入。复制截断时丢弃已识别报文，不转发不完整查询。
+
+需要该路径的以太网首片必须发给本机（`PACKET_HOST`）；纯二层转发候选 fail-closed，不假设 bridge-to-inet hook 已启用。LAN 和 WAN egress 还会丢弃未被消费的 DNS queue carrier，准入关闭时也不例外。不改写桥接防火墙 sysctl。桥与 slave MAC 不同的情况下，分片查询可能被保守拒绝；未分片 DNS 和原生 direct-must 保持既有行为。
+
+`ROUTING_GENERATION_SEQUENCE` 是 core 持有并 pin 的单项计数器。在每次路由发布或 NFQUEUE fence 前预留不回绕的 20 位值；fence 只替换不可变 descriptor，保留编译策略和 maps。普通清理/重启保留计数器，旧首片不能授权新进程的组索引。耗尽或 fence 失败保持 NFQUEUE readiness 关闭，重启不重置计数器。只要 host 命名空间仍可能保留报文，就必须像 `UDP_DECISION_SEQUENCE` 一样保留该 pin；重启系统同时清除重组队列和 bpffs 状态。
 
 ## 决策 token 协议
 
@@ -74,13 +90,13 @@ Token 表示所有权，而不只是相关性元数据。它必须在 skb mark�
 | Block | 提交 token-bound `Block` → 丢弃所有原始 skb → 以 kernel handoff 方式退役 initializer |
 | Cancel 或过期 | 只 abort 匹配的 Pending incarnation → 丢弃所有原始 skb，并退役其 lease identity |
 
-Direct 不创建用户空间 UDP 套接字、payload copy 或 replay、endpoint 或 `/connections` 条目。其最终 verdict mark 保留 classified 状态，并移除 Pending/token carrier。如果流的另一个包在 Arm 后到达，correlator 只追加其 verdict guard，丢弃 payload 和 slow permit，并在 activation 前返回 FIFO accept 循环。
+Direct 不创建用户空间 UDP 套接字、payload copy 或 replay、`Ready` endpoint 或 `/connections` 条目。其最终 verdict mark 保留 classified 状态，并移除 Pending/token carrier。如果流的另一个包在 Arm 后到达，correlator 只追加其 verdict guard，丢弃 payload 和 slow permit，并在 activation 前返回 FIFO accept 循环。
 
 Proxy 不会创建第二条路由路径。它复用普通透明 UDP 使用的同一个 `UdpInitLease` 和 `UdpEndpointPool` initializer。在拨号/发送前发布最终内核状态可以防止 reply race；只转移保留的 payload 并丢弃原始包，可确保只发送一次且没有 replay fallback。
 
 ## 截止时间与 fatal 策略
 
-每个包只有一个绝对 3 秒截止时间，从 raw-netlink listener 收包时开始计算。Actor 延迟和每一次后端锁等待都消耗同一预算，包括 Direct Arm 与 Activate 之间的第二次取锁。队列、correlator、slow path 或截止时间饱和时都 fail closed 丢包，而不会延长所有权或内存增长。
+每个包只有一个绝对 3 秒截止时间，从 raw-netlink listener 收包时开始计算。Actor 延迟和每一次后端锁等待都消耗同一预算，包括 Direct Arm 与 Activate 之间的第二次取锁。队列、correlator 或 slow path 饱和，或截止时间到期时，均按 fail-closed 丢包，不延长所有权，也不继续增加内存占用。
 
 Watchdog 独立检查被持有的 cell，并强制执行硬持有上限。Token、endpoint generation 或后端状态不匹配时会丢包，且不会修改更新的 incarnation。Verdict 失败或 Direct 已 Arm 后的任何失败都会使进程 fatal，因为用户空间已无法安全判断内核接受了哪些原始包。
 
@@ -100,6 +116,8 @@ Listener、queue、watchdog、cleanup、verdict 或 retirement 生命周期中�
 ### 精确 tuple 退役
 
 Retirement 以 `BPF_NOEXIST` 插入 `UDP_DECISION_RETIRE_FENCE[tuple] = token`，因此并发的新 owner 无法替换该 fence。随后翻转 epoch，等待 pre-fence reader 退出，并重新验证 conn state、token、handoff 和 redirect track。只删除匹配的辅助项与 conn state；之后释放精确 fence。不匹配时保留更新的 tuple incarnation 并 fail closed。
+
+WAN 用户态 UDP 即使 token 为零也使用同一 fence：显式 `RoutingMeta` 所有权 bit 允许退役带 mark 的 direct/must endpoint，而不删除原生直连状态。任何删除前都必须确认两类辅助项的 token 仍为零；conn state 缺失或已被替代时保留全部辅助项。旧 LAN token-zero 退役仍只清理 conn state。
 
 ## Sequence 耗尽与 generation 轮转
 
@@ -122,7 +140,7 @@ Retirement 以 `BPF_NOEXIST` 插入 `UDP_DECISION_RETIRE_FENCE[tuple] = token`�
 | 单个 flow cell | `64` 个被持有的 verdict guard，包括首包 |
 | UDP slow path | 启动时有效预算上限为 `256`；仅在 actor dequeue 时获取 permit |
 
-有效的 slow-path、endpoint、dial 和文件描述符预算来自进程启动时的 `RLIMIT_NOFILE` 规划，因此 `256` 是 ceiling，而不是保证可用的 permit 数。预算推导与所有权见[控制平面](./control-plane.md)。
+有效的 slow-path、endpoint、dial 和文件描述符预算来自进程启动时的 `RLIMIT_NOFILE` 规划，因此 `256` 是上限，而不是保证可用的 permit 数。预算推导与所有权见[控制平面](./control-plane.md)。
 
 ## 可观测性
 

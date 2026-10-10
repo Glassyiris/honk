@@ -30,27 +30,36 @@ pub(super) fn test_controller(
 
 pub(super) fn controller_with_limit(
     upstream: Arc<dyn DnsUpstreamPool>,
-    max_concurrent_queries: usize,
+    udp_query_limit: usize,
 ) -> Arc<DnsController> {
-    let mut controller = controller_for_upstream(upstream);
-    controller.concurrency_limit = Arc::new(Semaphore::new(max_concurrent_queries));
-    Arc::new(controller)
+    Arc::new(controller_for_upstream_and_config(
+        upstream,
+        &honk_config::dns::DnsConfig::default(),
+        udp_query_limit,
+    ))
+}
+
+pub(super) fn hold_query_slots(controller: &DnsController) -> Vec<super::super::AdmittedDnsQuery> {
+    (0..2047)
+        .map(|_| controller.try_admit_query(false).expect("test query slot"))
+        .collect()
 }
 
 pub(super) fn controller_with_dns_config(
     upstream: Arc<dyn DnsUpstreamPool>,
     config: &honk_config::dns::DnsConfig,
 ) -> Arc<DnsController> {
-    Arc::new(controller_for_upstream_and_config(upstream, config))
+    Arc::new(controller_for_upstream_and_config(upstream, config, 256))
 }
 
 fn controller_for_upstream(upstream: Arc<dyn DnsUpstreamPool>) -> DnsController {
-    controller_for_upstream_and_config(upstream, &honk_config::dns::DnsConfig::default())
+    controller_for_upstream_and_config(upstream, &honk_config::dns::DnsConfig::default(), 256)
 }
 
 fn controller_for_upstream_and_config(
     upstream: Arc<dyn DnsUpstreamPool>,
     config: &honk_config::dns::DnsConfig,
+    udp_query_limit: usize,
 ) -> DnsController {
     let forwarder = Arc::new(DnsForwarder::new(
         upstream,
@@ -67,7 +76,57 @@ fn controller_for_upstream_and_config(
         Arc::new(RwLock::new(
             Router::new(&[], "direct").expect("test router"),
         )),
+        udp_query_limit,
     )
+}
+
+pub(super) fn projection_controller(
+    forwarder: Arc<DnsForwarder>,
+) -> (DnsController, Arc<RwLock<Box<dyn EbpfBackend>>>) {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    let router = Arc::new(
+        Router::new(
+            &[RoutingRule {
+                name: "dns".into(),
+                condition: RoutingCondition {
+                    domain: vec!["example.com".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("direct".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            }],
+            "direct",
+        )
+        .unwrap(),
+    );
+    let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+        &router,
+        &std::collections::HashMap::from([("direct".to_owned(), 0)]),
+        honk_config::types::DialMode::Domain,
+    )
+    .unwrap();
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.publish_routing_plan(&plan, &[]).unwrap();
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::EbpfBackend>>> =
+        Arc::new(RwLock::new(Box::new(backend)));
+    let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
+        generation: crate::dns::runtime::RuntimeGeneration::new(1),
+        forwarder,
+        routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+            1, router,
+        )),
+        outbound_runtime: None,
+        transport: Arc::new(NoopRuntimeTransport),
+        udp_query_limit: 16,
+    });
+    let controller = DnsController::new_with_runtime(
+        Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
+        Arc::clone(&ebpf),
+    );
+    (controller, ebpf)
 }
 
 pub(super) fn query_with_txid(domain: &str, txid: u16) -> Vec<u8> {
@@ -142,6 +201,7 @@ pub(super) fn snapshot_controller(forwarder: Arc<DnsForwarder>) -> Arc<DnsContro
         Arc::new(RwLock::new(
             Router::new(&[], "direct").expect("test router"),
         )),
+        1,
     ))
 }
 
@@ -150,15 +210,16 @@ pub(super) async fn publish_snapshot_forwarder(
     forwarder: Arc<DnsForwarder>,
 ) {
     let provider = controller.runtime_provider();
-    let current = provider.acquire();
+    let current = provider.current();
     let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
         generation: crate::dns::runtime::RuntimeGeneration::new(
-            current.runtime().generation().get().saturating_add(1),
+            current.generation().get().saturating_add(1),
         ),
         forwarder: Arc::clone(&forwarder),
-        routing_projection: Arc::clone(current.runtime().routing_projection()),
+        routing_projection: Arc::clone(current.routing_projection()),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
+        udp_query_limit: 256,
     });
     drop(current);
     provider.publish(runtime);

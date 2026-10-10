@@ -1,41 +1,41 @@
 # 全局配置参考
 
-本文定义当前 `global { ... }` 配置字段及其运行时效果。
+`global { ... }` 配置进程级设置。下表列出字段及其运行时效果。
 
 ## 字段
 
-仅兼容字段会被 dae 解析器接受并存入 `GlobalConfig`，但当前运行时不会使用它们。下表均已明确标注。
+仅用于兼容的字段会被 dae 解析器接受并存入 `GlobalConfig`，但当前运行时不会使用它们。下表均已明确标注。
 
 | dae 键 | 内部字段 | 默认值 | 含义 |
 | ------- | -------- | ------ | ---- |
 | `tproxy_port` | `tproxy_port` | `12345` | 同时写入用户态监听器和 eBPF 数据路径的 TCP/UDP 透明监听端口；修改后需重启。 |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关；当前运行时不读取该字段。 |
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0` | 套接字 mark 兼容值。校验会拒绝与数据路径保留 mark 位重叠的值，但当前运行时不会将其应用到套接字。 |
-| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为 `--debug`、`RUST_LOG`、该值。通过 SIGHUP 修改需重启。 |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
+| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启；原生 API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
 | `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。 |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此向每个已解析的 WAN 接口（含运行期晚挂载的）写入 `net.ipv6.conf.<wan>.accept_ra=2`，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录；修改后需重启。 |
-| `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
-| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。当前健康检查循环使用第一个值；空列表退回普通 TCP 检查。 |
+| `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。修改后需重启。 |
+| `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到状态数据库 `data_dir/state/honk.db`，仅供启动恢复；重载沿用活动节点而不读取已存正文。修改后需重启。 |
+| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。健康检查循环使用第一个值；空列表退回普通 TCP 检查。URI 解析分别处理用户信息、带方括号的 IPv6、端口、路径、查询和片段。用户信息不会生成授权头；请求保留路径和查询，不发送片段，无斜杠的查询以 `/?query` 发送。HTTP/HTTPS 默认端口为 80/443；无协议的健康检查目标使用 HTTP/80。URLTest 的无协议目标使用 HTTPS/443，并向解码后的路径和查询串发送 HEAD。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
-| `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔；省略端口时默认为 `53`。 |
-| `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。UDP 预热 coordinator 也使用该值，但实际下限为 10 秒。 |
-| `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。 |
+| `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔。裸 IPv4/IPv6、`[IPv6]` 和域名默认使用端口 `53`；显式端口必须为 `1..65535` 内的整数。无效括号或端口会使校验失败，并产生带位置的诊断。优先选择第一个 IP 字面量，否则解析第一个域名。解析与 Score 共用解码后的主机和端口，解析完成后仍保留域名身份。 |
+| `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。必须为正；解析失败的值会变成零并在校验时被拒绝。UDP 预热 coordinator 也使用该值，但实际下限为 10 秒。 |
+| `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。接受裸毫秒数、`ms` 或 `s`，其余写法沿用此默认值并记录一条警告。 |
 | `dial_mode` | `dial_mode` | `"domain"` | 目的域名发现和路由模式：`ip`、`domain`、`domain+` 或 `domain++`。参见[拨号模式](#拨号模式)。 |
 | `allow_insecure` | `allow_insecure` | `false` | 全局 TLS 校验回退兼容字段。当前 TLS connector 不读取该字段；跳过证书校验需在节点分享链接中按节点配置。 |
-| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段。dae 解析器会保存该时长，但当前控制面不读取它。 |
-| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` 使用常规 BoringSSL 客户端 profile；`utls` 启用 honk 的真实 Chrome ClientHello profile。 |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 使用 `utls` 时请求的指纹 profile。当前只实现 `chrome*`；其他值会告警并仍使用 Chrome。 |
+| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段；当前控制面不读取它。解析规则同 `check_tolerance`，无效值产生警告并保留默认的 `30ms`。 |
+| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` 使用常规 BoringSSL 客户端 profile；`utls` 启用 honk 的 Chrome-oriented ClientHello 模拟，不承诺精确浏览器身份。 |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 兼容指纹配置。`utls` 模式使用唯一的 Chrome-oriented profile；此值不会切换实现。 |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello 分片兼容开关；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | 分片长度范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | 分片间隔范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `mptcp` | `mptcp` | `false` | MPTCP 兼容开关；当前拨号路径不读取该字段。 |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 解析节点主机名和控制面拨号目标的 resolver，用于避免经 honk 递归拦截。空值使用普通 bootstrap 行为。 |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 使用带 mark 的 UDP/TCP 解析节点主机名和控制面拨号目标。为空或查询失败时先查 `/etc/hosts`，再向 `/etc/resolv.conf` 第一个数字 nameserver 发送带 mark 的 DNS；不调用 libc NSS 或追加搜索后缀。 |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | 回退 resolver 兼容值；当前运行时不读取该字段。 |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | 发送带宽提示兼容值，例如 `'200 mbps'`；当前运行时不读取该字段。 |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | 接收带宽提示兼容值；当前运行时不读取该字段。 |
@@ -44,17 +44,63 @@
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | 物理代理连接和协议握手的 generation 局部请求上限；运行时资源预算可能进一步收紧。 |
 | —（dae 语法中不可配置） | `tproxy_mark` | `0x08000000` | 用户态策略路由与编译后的 eBPF 数据路径共享的固定 fwmark。 |
 | —（dae 语法中不可配置） | `udphop_interval_secs` | `30s` | 旧全局 UDP hop 间隔字段。当前拨号器不读取它；协议特定的端口跳跃使用节点字段。 |
-| —（dae 语法中不可配置） | `connect_timeout_ms` | `3000ms` | 代理连接、协议准备、预连接、健康检查和控制面拨号使用的超时。 |
+| —（dae 语法中不可配置） | `connect_timeout_ms` | `3000ms` | 代理连接、协议准备、预连接、健康检查和控制面拨号使用的阶段超时。透明 TCP 候选竞速与 UDP transport preparation 还使用绝对总预算 `max(10s, 4 × connect_timeout)`；不新增配置键。 |
 | —（dae 语法中不可配置） | `dns_resolve_timeout_ms` | `2000ms` | 控制面 DNS 解析超时，包括拨号前必须转换为 IP 的目标。 |
 | —（dae 语法中不可配置） | `relay_idle_timeout_secs` | `300s` | 旧 relay 空闲超时字段；当前 relay 路径不读取它。 |
 
+`nfqueue_enable` 同时控制 [LAN UDP/53 分片交付](../design/nfqueue.md#lan-dns-分片)：控制器/原始组分片要求 NFQUEUE ready，否则丢弃，不能绕过 DNS 策略。原生 `direct(must)` 和未分片 DNS 不变。
+
+HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：IPv6 保留方括号，非默认端口不会省略。建立连接和处理 TLS 服务端名称时仍使用不带方括号的主机。
+
+请求路径和查询字符串保留配置中的原始点路径段和百分号编码。在构造请求前拒绝 authority 含多余斜杠、包含反斜杠或内嵌 ASCII 空白／控制字符的 URL；健康检查警告不回显被拒绝的 URL。
+
+## 套接字 mark
+
+`so_mark_from_dae: 0` 或省略该项时，保留历史实际 mark `0x100`。
+非零值会在 connect/send 之前原样应用，包括代理承载连接、bootstrap/DNS、
+健康检查、订阅与 UI 下载。数据路径按配置值精确匹配旁路；仅含有 `0x100`
+这一位并不能免于拦截。透明监听套接字使用相同 mark 供内核识别；
+accept 得到的 TCP 客户端套接字会清除此 mark。独立 `dns.bind` 入口仍是
+普通的无 mark 本地服务。
+
+dae 全局标量保留 honk 既有的十六进制优先规则：`10` 与 `0x10` 都表示 16；
+格式错误或溢出文本会产生诊断，并回退到原始值 `0`，即实际 `0x100`。
+建议显式写 `0x`。这与[直连规则 mark](./routing.md#策略路由-mark) 不同：
+后者无前缀时按十进制解析，错误值直接拒绝配置。
+全局与规则 mark 校验均拒绝保留位 `0xc0000000`；全局 mark 还拒绝 TPROXY 位 `0x08000000`，daens 会把该位路由到其本地监听器。
+
+该值在启动网络 I/O 前确定，作用于整个进程；修改需要重启，不能通过 SIGHUP
+切换。非零直连规则 mark 会替换该直连流的全局策略路由有效位，而代理承载连接
+与 bootstrap 仍使用全局值。直连流还携带内部分类元数据；请使用
+[路由参考](./routing.md#策略路由-mark) 中带掩码的 IPv4/IPv6 `ip rule` 示例。
+honk 不负责安装用户的 WAN 策略路由表、路由、源地址规则或 NAT 配置。
+
+## 重载健康检查与 TLS 模式
+
+以下参数在启动时确定。重载若改变生效值，会被拒绝；当前配置与已安装的探测器保持不变：
+
+- `check_interval`。
+- 第一个 `tcp_check_url`，包括回退地址、路径和查询字符串。缺失或空的首项均关闭 HTTP 探测；后续项不参与比较。
+- HTTP 探测启用时的 `tcp_check_http_method`。空值与 `HEAD` 等价。
+- `udp_check_dns` 选中的目标：去除首尾空白并忽略空项，优先选择列表中的第一个 IP 字面量，否则选择第一个域名，再无可用项则使用 `8.8.8.8:53`。重载检查只比较配置中的地址或域名及端口，不解析 DNS。未选中项的变化仍可重载。
+- `tls_implementation` 在原生 TLS 与 uTLS 之间的切换。比较 `utls` 时不区分大小写。
+
+dae 配置中的 `check_tolerance` 仍可通过重载更新 URLTest 组的容差。组级检查 URL 与直接连接探测仍沿现有路径动态更新。重载 `utls_imitate` 只保存兼容配置值，不改变指纹。
+
+UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或初始化超时会使
+配置目标保持待定，留给后续健康检查周期重试，不替换默认目标，也不降低节点
+健康状态；独立 QUIC 检查仍可继续。首次成功解析的地址随后保持固定。
+延后的解析与 DNS 交换共用一次探测的绝对期限；普通解析失败保留原有默认回退。
+
 ## 网卡语义
 
-`lan_interface` 为空具有字面含义：honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机发起 TCP/UDP 仍会被代理，但不会增加任何合成的 LAN 拦截。
+`lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。
 
 `auto` 解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项会从期望 hook 集合中省略并保持待定。由于没有挂载 hook，未解析网卡上的流量保持 fail-open；同一列表中显式命名的网卡继续工作。
 
-`IfaceWatcher` 订阅 link、address 和 IPv4 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化挂载、卸载或重新绑定所需的 LAN/WAN hook，也覆盖 LAN bridge/bond 成员与 WAN bond slave。拓扑变化会刷新生成的网关地址 `direct(must)` 规则，并立即唤醒受健康状态控制的出站探测。网卡列表配置本身发生变化仍需重启。
+`IfaceWatcher` 订阅 link、address 和 IPv4 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化挂载、卸载或重新绑定所需的 LAN/WAN hook，也覆盖 LAN bridge/bond 成员与 WAN bond slave。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
+
+真实 LAN 绑定还会执行提示性的[自保覆盖检查](./routing.md#显式本地路由)。无法确认时仅告警，不拒绝启动或重载，也不插入路由规则。
 
 ## 拨号模式
 
@@ -69,24 +115,26 @@
 
 ## 数据目录与资源路径
 
-`data_dir` 默认为 `/var/share/honk`，必须是非空绝对路径，并在进程内只设置一次。启动时 honk 会递归创建目录，并以私有随机文件执行 create-new/remove 探测。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者都不可用时，启动失败并报告两项原因。子项使用绝对路径时保持不变。
+`data_dir` 默认为 `/var/lib/honk`，必须是非空绝对路径，并在进程内只设置一次。启动时 honk 会递归创建目录，并以私有随机文件执行 create-new/remove 探测。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者都不可用时，启动失败并报告两项原因。旧根目录是 `/var/share/honk`（`LEGACY_DATA_DIR`），用于复用已有资源，不会自动迁移。复用的可写缓存和订阅存储仍会在原位置正常更新。即使使用自定义 `data_dir`，也遵循相同的回退顺序。子项使用绝对路径时保持不变。
 
-`geoip.dat` 和 `geosite.dat` 严格使用以下顺序中第一个存在的文件：
+`geoip.dat` 和 `geosite.dat` 严格使用以下顺序中第一个已存在的普通文件：
 
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
-3. 进程工作目录中的 `./<name>`
-4. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然后 `/etc/dae/<name>`
+3. `/var/share/honk/<name>`（`LEGACY_DATA_DIR`）
+4. 进程工作目录中的 `./<name>`
+5. `/usr/local/share/honk/<name>`，然后 `/usr/share/honk/<name>`
+6. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然后 `/etc/dae/<name>`
 
-其他相对运行时路径按下表保留旧安装：
+其他相对运行时路径按下表保留旧安装。除日志外，每次查找先检查实际生效数据目录中已有的副本，再检查 `/var/share/honk` 中已有的副本，最后检查各调用方的已有旧候选路径。都不存在时，返回 `data_dir` 下的路径用于创建；绝对路径保持原样。
 
 | 路径 | 解析与旧路径回退 |
 | ---- | ---------------- |
-| 节点 `ech_config_path` | 优先使用已存在的 `<data_dir>/<path>`，其次使用已存在的工作目录相对路径。两者都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
-| `global.log_file` | 相对路径解析为 `<data_dir>/<path>`，启动时创建父目录；绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。 |
-| `experimental.cache_file.path` | 优先使用已存在的 `<data_dir>/<path>`，其次使用相对于原始配置目录且已存在的路径。新数据库在 `data_dir` 下创建。 |
-| `experimental.clash_api.external_ui` | 优先使用已存在的 `<data_dir>/<path>`，其次使用已存在的工作目录相对目录。两者都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
-| 订阅存储 | 使用 `<data_dir>/.sub`；已有旧 `./.sub` 会继续使用，直至迁移。 |
+| 节点 `ech_config_path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对路径。都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
+| `global.log_file` | 相对路径始终通过仅用于创建的路径 helper 解析为 `<data_dir>/<path>`，启动时创建父目录；不会读取或迁移 `/var/share/honk` 中已有的日志。绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 追加写入，文件达到 10 MiB 时轮转：当前文件改名为 `<name>.1` 并覆盖旧副本，再按相同检查打开新文件，因此日志最多占用 20 MiB。重启交接期间两个实例共用该文件时，只有文件仍在原路径上的实例执行改名，另一个实例直接切换到新文件，因此不会互相覆盖轮转副本。轮转失败（例如新文件无法打开）时，honk 不再尝试轮转，继续写入当前文件直到 20 MiB，之后丢弃日志行，并在 stderr 输出一次警告，直到重启。控制台与文件里的时间戳都是本机本地时间并带 UTC 偏移（`2026-09-12T02:30:15.123456+10:00`）。 |
+| `experimental.cache_file.path` | 不再决定存储位置，状态保存在 `<data_dir>/state/honk.db`。首次启动时按旧的解析顺序读取一次，用于导入旧 `cache.db`（见[升级说明](./experimental.md#从-cachedb-升级)）。 |
+| `experimental.clash_api.external_ui` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对目录。都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
+| 订阅存储 | 正文保存在 `<data_dir>/state/honk.db` 中。每次启动时，honk 依次在 `<data_dir>/.sub`、`/var/share/honk/.sub`、`./.sub` 中查找第一个私有的旧存储，导入已启用订阅的正文，然后删除已复制的文件（见[订阅参考](./subscription.md#拉取持久化与恢复)）。 |
 
 ## 预热与拨号预算
 
@@ -103,7 +151,7 @@ global {
     tproxy_port: 12345
     log_level: info
     log_file: 'honk.log'
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     store_subscribe: true
     nfqueue_enable: true
 

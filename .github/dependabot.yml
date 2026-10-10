@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /crates/honk-ebpf
+    schedule:
+      interval: monthly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch

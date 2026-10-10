@@ -15,21 +15,21 @@
 //! direction drains until its own EOF — bounded by [`DRAIN_DEADLINE`] so a
 //! silent peer cannot pin the relay forever.
 //!
-//! The first splice of each direction doubles as a capability probe: a
-//! failed `splice(2)` moves no bytes, so if it returns EINVAL/ENOSYS/EXDEV
-//! the whole connection falls back to the userspace copy relay without
-//! losing data, and a global flag skips probing for future connections.
+//! Capability probes that find unsupported or policy-denied `splice(2)`
+//! before staging any bytes permit lossless copy fallback and disable
+//! future probes. Pipe creation failure permits the same fallback for
+//! the current connection only.
 //!
 //! Go ref: `tcp_copy_linux.go` (340L), `tcp_copy_engine.go` (118L)
 
-use super::{RelayStats, is_ignorable_connection_error, relay_tcp};
+use super::{RelayStats, relay_tcp};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::Interest;
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Upper bound requested for one active splice direction. A live pipe owns
 /// two FDs and at most this many kernel-buffer bytes; a full-duplex relay is
@@ -57,27 +57,45 @@ pub fn splice_available() -> bool {
 fn is_unsupported_errno(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EXDEV)
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EXDEV) | Some(libc::EPERM)
     )
 }
 
 /// Outcome of a failed splice operation.
 #[derive(Debug)]
-enum SpliceError {
-    /// `splice(2)` is unsupported for these fds (EINVAL/ENOSYS/EXDEV on the
-    /// capability probe, before any byte was moved).
+pub(super) enum SpliceError {
+    /// `splice(2)` is unavailable for these fds or denied by policy, before
+    /// any byte was moved.
     Unsupported,
+    /// The pipes could not be created, before any byte was moved; unlike
+    /// `Unsupported` this says nothing about later connections.
+    NoPipe(io::Error),
     /// A regular I/O error.
-    Io(io::Error),
+    Io(super::RelayError),
 }
 
 impl SpliceError {
-    fn classify(err: io::Error) -> Self {
+    fn classify(err: io::Error, client_side: bool) -> Self {
         if is_unsupported_errno(&err) {
             SpliceError::Unsupported
         } else {
-            SpliceError::Io(err)
+            SpliceError::Io(super::RelayError::new(err, client_side))
         }
+    }
+
+    /// Verdicts reached before any byte moved leave both streams intact, so
+    /// the caller resumes on the copy relay. Only `Unsupported` disables
+    /// splice for later connections.
+    pub(super) fn into_fallback(self) -> Result<(), super::RelayError> {
+        match self {
+            SpliceError::Unsupported => {
+                SPLICE_UNSUPPORTED.store(true, Ordering::Relaxed);
+                debug!("splice(2) unsupported on this host; falling back to copy relay");
+            }
+            SpliceError::NoPipe(error) => debug!("splice pipes unavailable ({error}); copying"),
+            SpliceError::Io(error) => return Err(error),
+        }
+        Ok(())
     }
 }
 
@@ -112,6 +130,10 @@ struct Pipe {
 
 impl Pipe {
     fn new() -> io::Result<Self> {
+        #[cfg(test)]
+        if test_hook::pipes_fail() {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
         let (read, write) =
             nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC)
                 .map_err(io::Error::from)?;
@@ -145,15 +167,18 @@ fn shutdown_write(stream: &TcpStream) {
 ///
 /// Returns the number of bytes staged in the pipe (0 when the source had no
 /// data ready or is already at EOF; the pump re-reads either way).
-fn probe(src: &TcpStream, pipe: &Pipe) -> Result<usize, SpliceError> {
+fn probe(src: &TcpStream, pipe: &Pipe, client_side: bool) -> Result<usize, SpliceError> {
     #[cfg(test)]
-    if let Some(errno) = test_hook::forced_probe_errno() {
-        return Err(SpliceError::classify(io::Error::from_raw_os_error(errno)));
+    if let Some(errno) = test_hook::forced_probe_errno(src.as_raw_fd()) {
+        return Err(SpliceError::classify(
+            io::Error::from_raw_os_error(errno),
+            client_side,
+        ));
     }
     match raw_splice(src, &pipe.write, pipe.capacity) {
         Ok(n) => Ok(n),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
-        Err(e) => Err(SpliceError::classify(e)),
+        Err(e) => Err(SpliceError::classify(e, client_side)),
     }
 }
 
@@ -170,10 +195,25 @@ async fn pump(
     dst: &TcpStream,
     pipe: &Pipe,
     mut staged: usize,
-    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    mut on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-) -> io::Result<u64> {
+    progress: &super::RelayProgress,
+    upload: bool,
+) -> Result<u64, super::RelayError> {
     let mut total = 0u64;
+    let counter = if upload {
+        &progress.upload
+    } else {
+        &progress.download
+    };
+    let aggregate = if upload {
+        &progress.outbound_upload
+    } else {
+        &progress.outbound_download
+    };
+    let mut first_response = if upload {
+        None
+    } else {
+        progress.first_response.as_ref()
+    };
 
     loop {
         if staged == 0 {
@@ -181,31 +221,51 @@ async fn pump(
                 .async_io(Interest::READABLE, || {
                     raw_splice(src, &pipe.write, pipe.capacity)
                 })
-                .await?;
+                .await
+                .map_err(|error| super::RelayError::new(error, upload))?;
             if staged == 0 {
                 // Source reached EOF: propagate the half-close.
                 shutdown_write(dst);
                 return Ok(total);
             }
         } else {
+            if let Some(callback) = first_response.take() {
+                callback();
+            }
             let n = dst
-                .async_io(Interest::WRITABLE, || raw_splice(&pipe.read, dst, staged))
-                .await?;
+                .async_io(Interest::WRITABLE, || {
+                    #[cfg(test)]
+                    let staged = test_hook::write_limit(dst.as_raw_fd(), staged)?;
+                    let n = raw_splice(&pipe.read, dst, staged)?;
+                    #[cfg(test)]
+                    test_hook::wrote(dst.as_raw_fd(), n);
+                    Ok(n)
+                })
+                .await
+                .map_err(|error| super::RelayError::new(error, !upload))?;
             if n == 0 {
                 // A non-empty pipe must always make progress; bail out
                 // instead of spinning.
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "splice pipe→socket made no progress",
+                return Err(super::RelayError::new(
+                    io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "splice pipe→socket made no progress",
+                    ),
+                    !upload,
                 ));
             }
             staged -= n;
             total += n as u64;
-            if let Some(counter) = &progress {
+            counter.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some(counter) = aggregate {
                 counter.fetch_add(n as u64, Ordering::Relaxed);
             }
-            if let Some(callback) = on_progress.take() {
-                callback();
+            if let Some(callback) = &progress.on_transfer {
+                if upload {
+                    callback(n as u64, 0);
+                } else {
+                    callback(0, n as u64);
+                }
             }
         }
     }
@@ -222,28 +282,26 @@ pub(crate) const DRAIN_DEADLINE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(30)
 };
 
-/// Shared engine behind [`splice_bidirectional`] and [`relay_splice`].
-async fn run(
+/// Shared engine for plain TCP relays and lent Vision sockets.
+pub(super) async fn run(
     client: &TcpStream,
     upstream: &TcpStream,
     progress: super::OptionalRelayProgress,
 ) -> Result<(u64, u64), SpliceError> {
-    let pipe_c2p = Pipe::new().map_err(SpliceError::Io)?;
-    let pipe_p2c = Pipe::new().map_err(SpliceError::Io)?;
+    let pipe_c2p = Pipe::new().map_err(SpliceError::NoPipe)?;
+    let pipe_p2c = Pipe::new().map_err(SpliceError::NoPipe)?;
 
-    // The probes run before any byte reaches a destination socket, so an
-    // `Unsupported` verdict here still allows a lossless copy fallback.
-    let staged_c2p = probe(client, &pipe_c2p)?;
-    let staged_p2c = match probe(upstream, &pipe_p2c) {
+    // Fallback is safe only when neither probe removed bytes from a socket.
+    let staged_c2p = probe(client, &pipe_c2p, true)?;
+    let staged_p2c = match probe(upstream, &pipe_p2c, false) {
         Ok(n) => n,
         Err(SpliceError::Unsupported) if staged_c2p == 0 => return Err(SpliceError::Unsupported),
         Err(SpliceError::Unsupported) => {
-            // Unreachable in practice (the first probe already succeeded on
-            // the same kind of fds), but bytes have left the client socket,
-            // so a copy fallback would lose them. Fail instead of silently
-            // corrupting the stream.
-            return Err(SpliceError::Io(io::Error::other(
-                "splice probe failed after staging bytes",
+            // The first probe already removed bytes from the client socket,
+            // so a copy fallback would lose them.
+            return Err(SpliceError::Io(super::RelayError::new(
+                io::Error::other("splice probe failed after staging bytes"),
+                false,
             )));
         }
         Err(e) => return Err(e),
@@ -251,31 +309,25 @@ async fn run(
 
     // Byte counters double as final stats when the drain deadline cancels
     // the surviving pump before it can return its own total.
-    let (cnt_c2p, cnt_p2c) = match &progress {
-        Some(progress) => (progress.upload.clone(), progress.download.clone()),
-        None => (
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        ),
-    };
-    let c2p = pump(
-        client,
-        upstream,
-        &pipe_c2p,
-        staged_c2p,
-        Some(cnt_c2p.clone()),
-        None,
+    let mut progress = progress.unwrap_or_else(|| super::RelayProgress {
+        upload: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        download: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outbound_upload: None,
+        outbound_download: None,
+        first_response: None,
+        on_transfer: None,
+    });
+    let baseline = (
+        progress.upload.load(Ordering::Relaxed),
+        progress.download.load(Ordering::Relaxed),
     );
-    let p2c = pump(
-        upstream,
-        client,
-        &pipe_p2c,
-        staged_p2c,
-        Some(cnt_p2c.clone()),
-        progress
-            .as_ref()
-            .and_then(|progress| progress.first_response.clone()),
-    );
+    if staged_p2c > 0
+        && let Some(callback) = progress.first_response.take()
+    {
+        callback();
+    }
+    let c2p = pump(client, upstream, &pipe_c2p, staged_c2p, &progress, true);
+    let p2c = pump(upstream, client, &pipe_p2c, staged_p2c, &progress, false);
     tokio::pin!(c2p);
     tokio::pin!(p2c);
 
@@ -292,17 +344,17 @@ async fn run(
         Err(e) => return Err(SpliceError::Io(e)),
     };
     let (survivor, survivor_cnt) = if c2p_first {
-        (&mut p2c, &cnt_p2c)
+        (&mut p2c, &progress.download)
     } else {
-        (&mut c2p, &cnt_c2p)
+        (&mut c2p, &progress.upload)
     };
     match super::drain_wait(survivor, survivor_cnt).await {
         Ok(_) => {}
         Err(e) => return Err(SpliceError::Io(e)),
     }
     Ok((
-        cnt_c2p.load(Ordering::Relaxed),
-        cnt_p2c.load(Ordering::Relaxed),
+        progress.upload.load(Ordering::Relaxed) - baseline.0,
+        progress.download.load(Ordering::Relaxed) - baseline.1,
     ))
 }
 
@@ -334,17 +386,17 @@ pub async fn splice_bidirectional(
             io::ErrorKind::Unsupported,
             "splice(2) not supported for these sockets",
         )),
-        Err(SpliceError::Io(e)) => Err(e),
+        Err(SpliceError::NoPipe(error)) => Err(error),
+        Err(SpliceError::Io(e)) => Err(e.error),
     }
 }
 
 /// Relay two plain TCP sockets, using zero-copy `splice(2)` when the kernel
 /// supports it and falling back to the userspace copy relay otherwise.
 ///
-/// Produces the exact same [`RelayStats`] accounting as [`relay_tcp`]; the
-/// fallback is lossless because the capability probe runs before any byte
-/// is moved, and it is latched process-wide so later connections go
-/// straight to the copy path.
+/// Produces the exact same [`RelayStats`] accounting as [`relay_tcp`].
+/// Unavailable capability probes fall back only before staging bytes and
+/// disable future probes; pipe setup failures fall back without that latch.
 pub async fn relay_splice(
     client: &mut TcpStream,
     upstream: TcpStream,
@@ -353,7 +405,7 @@ pub async fn relay_splice(
     progress: super::OptionalRelayProgress,
 ) -> anyhow::Result<RelayStats> {
     if !splice_available() {
-        return relay_tcp_counted(client, upstream, client_addr, target_addr, progress).await;
+        return relay_auto(client, upstream, client_addr, target_addr, progress).await;
     }
 
     let start = tokio::time::Instant::now();
@@ -380,50 +432,14 @@ pub async fn relay_splice(
             );
             Ok(stats)
         }
-        Err(SpliceError::Unsupported) => {
-            SPLICE_UNSUPPORTED.store(true, Ordering::Relaxed);
-            debug!(
-                "splice(2) unsupported on this host; falling back to copy relay for {} → {}",
-                client_addr, target_addr
-            );
-            relay_tcp_counted(client, upstream, client_addr, target_addr, progress).await
-        }
-        Err(SpliceError::Io(e)) => {
-            shutdown_write(client);
-            shutdown_write(&upstream);
-            if !is_ignorable_connection_error(&e) {
-                warn!(
-                    "TCP splice relay error for {} → {}: {}",
-                    client_addr, target_addr, e
-                );
+        Err(error) => match error.into_fallback() {
+            Ok(()) => relay_auto(client, upstream, client_addr, target_addr, progress).await,
+            Err(e) => {
+                shutdown_write(client);
+                shutdown_write(&upstream);
+                Err(e.into_anyhow())
             }
-            Err(e.into())
-        }
-    }
-}
-
-/// `relay_tcp` with optional live progress counters: when provided, each
-/// side is wrapped in a [`super::ReadCounter`] so byte totals update as data
-/// flows, not only at close.
-async fn relay_tcp_counted(
-    client: &mut TcpStream,
-    upstream: TcpStream,
-    client_addr: SocketAddr,
-    target_addr: SocketAddr,
-    progress: super::OptionalRelayProgress,
-) -> anyhow::Result<RelayStats> {
-    match progress {
-        Some(progress) => {
-            let first_response = progress.first_response.clone();
-            relay_tcp(
-                super::ReadCounter::wrap(client, progress.upload, None),
-                super::ReadCounter::wrap(upstream, progress.download, first_response),
-                client_addr,
-                target_addr,
-            )
-            .await
-        }
-        None => relay_tcp(client, upstream, client_addr, target_addr).await,
+        },
     }
 }
 
@@ -447,33 +463,84 @@ where
 {
     match progress {
         Some(progress) => {
-            let first_response = progress.first_response.clone();
-            super::relay_tcp(
-                super::ReadCounter::wrap(client, progress.upload, None),
-                super::ReadCounter::wrap(proxy, progress.download, first_response),
-                client_addr,
-                target_addr,
-            )
-            .await
+            let (client, proxy) = super::relay_io_pair(client, proxy, &progress);
+            relay_tcp(client, proxy, client_addr, target_addr).await
         }
-        None => super::relay_tcp(client, proxy, client_addr, target_addr).await,
+        None => relay_tcp(client, proxy, client_addr, target_addr).await,
     }
 }
 
-/// Test-only hooks to exercise the capability-probe fallback without a
-/// kernel that actually rejects `splice(2)`.
+/// Deterministic capability and partial-write failures around real splice I/O.
 #[cfg(test)]
-mod test_hook {
-    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+pub(super) mod test_hook {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
+
+    /// The hooks are process-global, so every test driving `run()` holds
+    /// this lock.
+    pub static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Resets global splice state even when a test panics.
+    pub struct StateGuard;
+
+    impl StateGuard {
+        pub fn new() -> Self {
+            reset();
+            StateGuard
+        }
+    }
+
+    impl Drop for StateGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
 
     /// When non-zero, `probe()` fails with this errno instead of splicing.
     static FORCED_PROBE_ERRNO: AtomicI32 = AtomicI32::new(0);
+    static FORCED_PROBE_FD: AtomicI32 = AtomicI32::new(-1);
     /// Number of `probe()` calls, to assert the probe is skipped once the
     /// global "unsupported" flag is latched.
     static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static WRITE_REMAINING: AtomicIsize = AtomicIsize::new(-1);
+    static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+    static PIPES_FAIL: AtomicBool = AtomicBool::new(false);
 
-    pub fn forced_probe_errno() -> Option<i32> {
+    pub fn fail_pipes() {
+        PIPES_FAIL.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pipes_fail() -> bool {
+        PIPES_FAIL.load(Ordering::Relaxed)
+    }
+
+    pub fn fail_write_after(fd: i32, bytes: isize) {
+        WRITE_REMAINING.store(bytes, Ordering::Relaxed);
+        WRITE_FD.store(fd, Ordering::Relaxed);
+    }
+
+    pub fn write_limit(fd: i32, requested: usize) -> std::io::Result<usize> {
+        if WRITE_FD.load(Ordering::Relaxed) != fd {
+            return Ok(requested);
+        }
+        match WRITE_REMAINING.load(Ordering::Relaxed) {
+            -1 => Ok(requested),
+            0 => Err(std::io::Error::from_raw_os_error(libc::EPIPE)),
+            remaining => Ok(requested.min(remaining as usize).min(3)),
+        }
+    }
+
+    pub fn wrote(fd: i32, bytes: usize) {
+        if WRITE_FD.load(Ordering::Relaxed) == fd {
+            WRITE_REMAINING.fetch_sub(bytes as isize, Ordering::Relaxed);
+        }
+    }
+
+    pub fn forced_probe_errno(fd: i32) -> Option<i32> {
         PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+        let target = FORCED_PROBE_FD.load(Ordering::Relaxed);
+        if target != -1 && target != fd {
+            return None;
+        }
         match FORCED_PROBE_ERRNO.load(Ordering::Relaxed) {
             0 => None,
             e => Some(e),
@@ -484,469 +551,21 @@ mod test_hook {
         PROBE_CALLS.load(Ordering::Relaxed)
     }
 
-    pub fn set_forced_errno(errno: i32) {
+    pub fn set_forced_errno(errno: i32, fd: i32) {
         FORCED_PROBE_ERRNO.store(errno, Ordering::Relaxed);
+        FORCED_PROBE_FD.store(fd, Ordering::Relaxed);
     }
 
     pub fn reset() {
         FORCED_PROBE_ERRNO.store(0, Ordering::Relaxed);
+        FORCED_PROBE_FD.store(-1, Ordering::Relaxed);
         PROBE_CALLS.store(0, Ordering::Relaxed);
+        WRITE_REMAINING.store(-1, Ordering::Relaxed);
+        WRITE_FD.store(-1, Ordering::Relaxed);
+        PIPES_FAIL.store(false, Ordering::Relaxed);
         super::SPLICE_UNSUPPORTED.store(false, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    /// The probe fallback mutates process-global state, so all tests that
-    /// go through `run()` serialize on this lock.
-    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Reset global splice state even when a test panics.
-    struct StateGuard;
-    impl StateGuard {
-        fn new() -> Self {
-            test_hook::reset();
-            StateGuard
-        }
-    }
-    impl Drop for StateGuard {
-        fn drop(&mut self) {
-            test_hook::reset();
-        }
-    }
-
-    fn pattern(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8).collect()
-    }
-
-    /// Start a TCP echo server (writes back everything it reads, closes on
-    /// EOF) and return its address.
-    async fn spawn_echo() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if stream.write_all(&buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        addr
-    }
-
-    /// Start a server that reads until EOF, then sends `trailer` and
-    /// closes. Used to verify half-close propagation.
-    async fn spawn_read_then_trailer(trailer: &'static [u8]) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut sink = Vec::new();
-                    let _ = stream.read_to_end(&mut sink).await;
-                    let _ = stream.write_all(trailer).await;
-                    // Dropping the stream closes the socket (FIN).
-                });
-            }
-        });
-        addr
-    }
-
-    /// Accept one connection on a fresh listener, dial `backend`, and relay
-    /// between them with [`splice_bidirectional`].
-    async fn spawn_splice_front(
-        backend: SocketAddr,
-    ) -> (SocketAddr, tokio::task::JoinHandle<io::Result<(u64, u64)>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front = listener.local_addr().unwrap();
-        let relay = tokio::spawn(async move {
-            let (client, _) = listener.accept().await.unwrap();
-            let upstream = TcpStream::connect(backend).await.unwrap();
-            splice_bidirectional(client, upstream).await
-        });
-        (front, relay)
-    }
-
-    #[test]
-    fn test_is_unsupported_errno() {
-        assert!(is_unsupported_errno(&io::Error::from_raw_os_error(
-            libc::EINVAL
-        )));
-        assert!(is_unsupported_errno(&io::Error::from_raw_os_error(
-            libc::ENOSYS
-        )));
-        assert!(is_unsupported_errno(&io::Error::from_raw_os_error(
-            libc::EXDEV
-        )));
-        assert!(!is_unsupported_errno(&io::Error::from_raw_os_error(
-            libc::ECONNRESET
-        )));
-        assert!(!is_unsupported_errno(&io::Error::from_raw_os_error(
-            libc::EAGAIN
-        )));
-        assert!(!is_unsupported_errno(&io::Error::other("synthetic")));
-    }
-
-    /// Two active directions are bounded to four private FDs and 128 KiB of
-    /// requested pipe pages per full-duplex connection, down from the prior
-    /// 512 KiB request. Pipes are never shared, so closing a connection
-    /// cannot expose staged bytes to another one.
-    #[test]
-    fn test_full_duplex_pipe_resource_bound() {
-        let client_to_upstream = Pipe::new().expect("create client pipe");
-        let upstream_to_client = Pipe::new().expect("create upstream pipe");
-        assert_ne!(
-            client_to_upstream.read.as_raw_fd(),
-            client_to_upstream.write.as_raw_fd()
-        );
-        assert_ne!(
-            upstream_to_client.read.as_raw_fd(),
-            upstream_to_client.write.as_raw_fd()
-        );
-        assert!(
-            client_to_upstream.capacity <= PIPE_SIZE && upstream_to_client.capacity <= PIPE_SIZE,
-            "kernel pipe capacity must remain within the requested per-direction bound"
-        );
-        assert!(
-            client_to_upstream.capacity + upstream_to_client.capacity <= 2 * PIPE_SIZE,
-            "full-duplex splice relay exceeds its 128 KiB pipe-page bound"
-        );
-    }
-
-    /// Bidirectional transfer larger than any pipe capacity, with data
-    /// integrity and per-direction byte counts verified.
-    #[tokio::test]
-    async fn test_splice_bidirectional_large_transfer() {
-        let _lock = TEST_LOCK.lock().await;
-        let _state = StateGuard::new();
-
-        let echo = spawn_echo().await;
-        let (front, relay) = spawn_splice_front(echo).await;
-
-        let client = TcpStream::connect(front).await.unwrap();
-        let data = pattern(4 * 1024 * 1024);
-        let expected = data.clone();
-        let (mut rd, mut wr) = client.into_split();
-
-        let writer = tokio::spawn(async move {
-            wr.write_all(&data).await.unwrap();
-            // Half-close: the echo server sees EOF, closes, and the relay
-            // must complete on its own.
-            wr.shutdown().await.unwrap();
-        });
-
-        let mut received = Vec::with_capacity(expected.len());
-        tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            rd.read_to_end(&mut received),
-        )
-        .await
-        .expect("client read hung")
-        .unwrap();
-        writer.await.unwrap();
-
-        assert_eq!(received.len(), expected.len());
-        assert!(received == expected, "echoed data corrupted");
-
-        let (c2p, p2c) = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay task hung")
-            .unwrap()
-            .unwrap();
-        assert_eq!(c2p, expected.len() as u64);
-        assert_eq!(p2c, expected.len() as u64);
-    }
-
-    /// The client FINs its upload first; data already in flight from the
-    /// server (sent after it sees EOF) must still be delivered — the
-    /// reverse direction must survive the forward direction's EOF.
-    #[tokio::test]
-    async fn test_splice_half_close_propagation() {
-        let _lock = TEST_LOCK.lock().await;
-        let _state = StateGuard::new();
-
-        let trailer: &'static [u8] = b"server trailer after client EOF";
-        let backend = spawn_read_then_trailer(trailer).await;
-        let (front, relay) = spawn_splice_front(backend).await;
-
-        let mut client = TcpStream::connect(front).await.unwrap();
-        let upload = pattern(1024 * 1024);
-        client.write_all(&upload).await.unwrap();
-        // Client half-closes; the trailer must still arrive.
-        client.shutdown().await.unwrap();
-
-        let mut received = Vec::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client.read_to_end(&mut received),
-        )
-        .await
-        .expect("client read hung — half-close not propagated")
-        .unwrap();
-        assert_eq!(received, trailer);
-
-        let (c2p, p2c) = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay task hung")
-            .unwrap()
-            .unwrap();
-        assert_eq!(c2p, upload.len() as u64);
-        assert_eq!(p2c, trailer.len() as u64);
-    }
-
-    /// A silent peer must not pin the relay forever: after the client
-    /// EOFs, the surviving direction is cut at the drain deadline.
-    #[tokio::test]
-    async fn test_splice_drain_deadline_reaps_silent_peer() {
-        let _lock = TEST_LOCK.lock().await;
-        let _state = StateGuard::new();
-
-        // Blackhole: accept and hold the socket, never read or write.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                std::mem::forget(stream);
-            }
-        });
-        let (front, relay) = spawn_splice_front(backend).await;
-
-        let mut client = TcpStream::connect(front).await.unwrap();
-        let payload = pattern(64 * 1024);
-        client.write_all(&payload).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let (c2p, _p2c) = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay pinned by silent peer")
-            .unwrap()
-            .unwrap();
-        assert_eq!(c2p, payload.len() as u64);
-    }
-
-    /// `relay_splice` produces the same `RelayStats` shape as the copy path.
-    #[tokio::test]
-    async fn test_relay_splice_stats_match_copy_semantics() {
-        let _lock = TEST_LOCK.lock().await;
-        let _state = StateGuard::new();
-        assert!(splice_available());
-
-        let echo = spawn_echo().await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front = listener.local_addr().unwrap();
-        let relay = tokio::spawn(async move {
-            let (mut client, client_addr) = listener.accept().await.unwrap();
-            let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(&mut client, upstream, client_addr, echo, None)
-                .await
-                .unwrap()
-        });
-
-        let mut client = TcpStream::connect(front).await.unwrap();
-        let payload = b"stats accounting roundtrip";
-        client.write_all(payload).await.unwrap();
-        let mut buf = vec![0u8; payload.len()];
-        client.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, payload);
-        client.shutdown().await.unwrap();
-
-        let stats = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay task hung")
-            .unwrap();
-        assert_eq!(stats.client_to_proxy, payload.len() as u64);
-        assert_eq!(stats.proxy_to_client, payload.len() as u64);
-        assert_eq!(stats.total_bytes, 2 * payload.len() as u64);
-        assert!(splice_available());
-    }
-
-    /// Live progress counters are incremented as data flows and end up equal
-    /// to the final RelayStats (splice path).
-    #[tokio::test]
-    async fn test_relay_splice_live_progress_matches_stats() {
-        let _lock = TEST_LOCK.lock().await;
-        let _state = StateGuard::new();
-        assert!(splice_available());
-
-        let echo = spawn_echo().await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front = listener.local_addr().unwrap();
-        let up = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let down = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (up2, down2) = (up.clone(), down.clone());
-        let relay = tokio::spawn(async move {
-            let (mut client, client_addr) = listener.accept().await.unwrap();
-            let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(
-                &mut client,
-                upstream,
-                client_addr,
-                echo,
-                Some(crate::relay::RelayProgress {
-                    upload: up2,
-                    download: down2,
-                    first_response: None,
-                }),
-            )
-            .await
-        });
-
-        let mut client = TcpStream::connect(front).await.unwrap();
-        let payload = pattern(512 * 1024);
-        client.write_all(&payload).await.unwrap();
-        let mut received = vec![0u8; payload.len()];
-        client.read_exact(&mut received).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let stats = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay task hung")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            up.load(Ordering::Relaxed),
-            stats.client_to_proxy,
-            "live upload counter must match final stats"
-        );
-        assert_eq!(
-            down.load(Ordering::Relaxed),
-            stats.proxy_to_client,
-            "live download counter must match final stats"
-        );
-        assert!(stats.client_to_proxy > 0);
-    }
-
-    /// Live progress counters work the same through the copy relay
-    /// (`relay_auto` with wrapped streams).
-    #[tokio::test]
-    async fn test_relay_auto_live_progress_matches_stats() {
-        let echo = spawn_echo().await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front = listener.local_addr().unwrap();
-        let up = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let down = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (up2, down2) = (up.clone(), down.clone());
-        let relay = tokio::spawn(async move {
-            let (client, client_addr) = listener.accept().await.unwrap();
-            let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_auto(
-                client,
-                upstream,
-                client_addr,
-                echo,
-                Some(crate::relay::RelayProgress {
-                    upload: up2,
-                    download: down2,
-                    first_response: None,
-                }),
-            )
-            .await
-        });
-
-        let mut client = TcpStream::connect(front).await.unwrap();
-        let payload = pattern(256 * 1024);
-        client.write_all(&payload).await.unwrap();
-        let mut received = vec![0u8; payload.len()];
-        client.read_exact(&mut received).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let stats = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay task hung")
-            .unwrap()
-            .unwrap();
-        assert_eq!(up.load(Ordering::Relaxed), stats.client_to_proxy);
-        assert_eq!(down.load(Ordering::Relaxed), stats.proxy_to_client);
-        assert!(stats.client_to_proxy > 0);
-    }
-
-    /// A probe that fails with an unsupported errno must fall back to the
-    /// copy relay without losing a single byte, latch the global flag, and
-    /// skip probing for the next connection.
-    #[tokio::test]
-    async fn test_probe_failure_falls_back_to_copy() {
-        let _lock = TEST_LOCK.lock().await;
-        let _state = StateGuard::new();
-
-        let echo = spawn_echo().await;
-
-        // Arm the probe hook: the first connection's probes fail with EINVAL.
-        test_hook::set_forced_errno(libc::EINVAL);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front = listener.local_addr().unwrap();
-        let relay = tokio::spawn(async move {
-            let (mut client, client_addr) = listener.accept().await.unwrap();
-            let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(&mut client, upstream, client_addr, echo, None)
-                .await
-                .unwrap()
-        });
-
-        let mut client = TcpStream::connect(front).await.unwrap();
-        let payload = b"fallback keeps every byte";
-        client.write_all(payload).await.unwrap();
-        let mut buf = vec![0u8; payload.len()];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client.read_exact(&mut buf),
-        )
-        .await
-        .expect("fallback copy hung")
-        .unwrap();
-        assert_eq!(&buf, payload);
-        // The failed probe latched the process-wide flag.
-        assert!(!splice_available());
-        client.shutdown().await.unwrap();
-
-        let stats = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-            .await
-            .expect("relay task hung")
-            .unwrap();
-        assert_eq!(stats.client_to_proxy, payload.len() as u64);
-        assert_eq!(stats.proxy_to_client, payload.len() as u64);
-
-        // Second connection: the latched flag skips the probe entirely and
-        // goes straight to the copy relay (hook still armed).
-        let probes_before = test_hook::probe_calls();
-        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front2 = listener2.local_addr().unwrap();
-        let relay2 = tokio::spawn(async move {
-            let (mut client, client_addr) = listener2.accept().await.unwrap();
-            let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(&mut client, upstream, client_addr, echo, None)
-                .await
-                .unwrap()
-        });
-        let mut client2 = TcpStream::connect(front2).await.unwrap();
-        client2.write_all(payload).await.unwrap();
-        let mut buf2 = vec![0u8; payload.len()];
-        client2.read_exact(&mut buf2).await.unwrap();
-        assert_eq!(&buf2, payload);
-        client2.shutdown().await.unwrap();
-        let stats2 = tokio::time::timeout(std::time::Duration::from_secs(5), relay2)
-            .await
-            .expect("relay task hung")
-            .unwrap();
-        assert_eq!(stats2.total_bytes, 2 * payload.len() as u64);
-        assert_eq!(
-            test_hook::probe_calls(),
-            probes_before,
-            "probe must be skipped once splice is known unsupported"
-        );
-    }
-}
+mod tests;

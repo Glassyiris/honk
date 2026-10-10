@@ -1,9 +1,7 @@
-//! BoringSSL TLS client — real Chrome fingerprint (uTLS-grade) + ECH.
+//! BoringSSL TLS client with native and Chrome-oriented profiles plus ECH.
 //!
-//! Why: a rustls ClientHello is trivially fingerprinted by DPI. BoringSSL is
-//! what Chrome itself ships, so a properly configured BoringSSL ClientHello
-//! matches Chrome's: GREASE, permuted extensions, the X25519MLKEM768 hybrid
-//! key share, ALPS, brotli certificate compression, and ECH GREASE.
+//! The emulation configures GREASE, permuted extensions, hybrid key shares,
+//! ALPS and certificate compression; it does not promise exact browser identity.
 //!
 //! ECH: when a node carries an ECHConfigList (`ech_config` / `ech_config_path`)
 //! the connector offers real ECH via `SSL_set1_ech_config_list`; `ech_enabled`
@@ -44,11 +42,15 @@ pub type TlsStream<S> = tokio_boring::SslStream<S>;
 #[derive(Debug)]
 pub struct BatchRead<S> {
     inner: S,
+    pending_error: Option<io::Error>,
 }
 
 impl<S> BatchRead<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            pending_error: None,
+        }
     }
 }
 
@@ -64,6 +66,9 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BatchRead<S> {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
+            if let Some(error) = self.pending_error.take() {
+                return Poll::Ready(Err(error));
+            }
             let before = buf.filled().len();
             match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
                 Poll::Ready(Ok(())) => {
@@ -71,12 +76,12 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BatchRead<S> {
                         return Poll::Ready(Ok(())); // EOF: deliver what we have
                     }
                 }
-                Poll::Ready(Err(e)) => {
-                    return if buf.filled().len() > start {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Ready(Err(e))
-                    };
+                Poll::Ready(Err(error)) => {
+                    if buf.filled().len() > start {
+                        self.pending_error = Some(error);
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Ready(Err(error));
                 }
                 Poll::Pending => {
                     return if buf.filled().len() > start {
@@ -191,7 +196,7 @@ impl TlsConnector {
         let mut cfg = self.connector.configure()?;
         if self.chrome {
             cfg.set_permute_extensions(true);
-            set_chrome_key_shares(&mut cfg)?;
+            set_chrome_key_shares_ssl_ref(&cfg)?;
             if self.alps {
                 add_chrome_alps(&mut cfg)?;
             }
@@ -237,7 +242,7 @@ impl TlsConnector {
                     && let Some(ssl) = e.ssl()
                     && ssl.get_ech_retry_configs().is_some()
                 {
-                    tracing::info!(
+                    tracing::debug!(
                         sni = domain,
                         "ECH rejected; server offered retry ECH configs (not persisted)"
                     );
@@ -246,26 +251,11 @@ impl TlsConnector {
             }
         }
     }
-
-    /// Underlying BoringSSL connector (for QUIC-side reuse of the ctx).
-    pub fn boring_connector(&self) -> &SslConnector {
-        &self.connector
-    }
 }
 
-/// Chrome sends two key shares: X25519MLKEM768 and X25519, in that order.
-/// boring exposes this only via FFI.
-fn set_chrome_key_shares(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
-    let ssl: &boring::ssl::SslRef = cfg;
-    set_chrome_key_shares_ssl_ref(ssl)
-}
-
-/// Same as [`set_chrome_key_shares`] for a bare `Ssl` (QUIC path).
-pub(crate) fn set_chrome_key_shares_ssl(ssl: &boring::ssl::Ssl) -> anyhow::Result<()> {
-    set_chrome_key_shares_ssl_ref(ssl)
-}
-
-fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
+/// Chrome sends X25519MLKEM768 and X25519 key shares, in that order.
+/// BoringSSL exposes this only through FFI.
+pub(crate) fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
     let shares = [SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519];
     let ok = unsafe {
         boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
@@ -276,10 +266,8 @@ fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()
     Ok(())
 }
 
-/// Chrome sends ALPS for h2 with an empty settings payload whenever ALPN
-/// offers h2. boring exposes this only via FFI. Chrome uses the old ALPS
-/// codepoint (0x4469) on TCP+h2; BoringSSL defaults to the new one (0x44cd),
-/// which is JA4-distinguishable from real Chrome.
+/// Add h2 ALPS using the historical 0x4469 codepoint. The current uTLS
+/// Chrome_133 profile uses 0x44cd; this compatibility choice is not parity.
 pub(crate) fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
     let ssl: &boring::ssl::SslRef = cfg;
     let ok = unsafe {
@@ -343,6 +331,19 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
 /// `ech_config_path`. `ech_enabled` without configs is handled separately at
 /// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
+    load_ech_config_list_with_reader(node, |path| read_dependency(node, path))
+}
+
+fn read_dependency(node: &Node, path: &str) -> anyhow::Result<String> {
+    let path = honk_config::paths::resolve_dependency_path(path);
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("node {}: read {}", node.name, path.display()))
+}
+
+fn load_ech_config_list_with_reader(
+    node: &Node,
+    read: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(tls) = node.tls() else {
         return Ok(None);
     };
@@ -352,9 +353,7 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
             .with_context(|| format!("node {}: ech_config", node.name));
     }
     if let Some(path) = &tls.ech_config_path {
-        let path = honk_config::paths::resolve_dependency_path(path);
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("node {}: read {}", node.name, path.display()))?;
+        let contents = read(path)?;
         return decode_ech_config_list(&contents)
             .map(Some)
             .with_context(|| format!("node {}: ech_config_path", node.name));
@@ -365,7 +364,19 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
 /// root store. Runtime registries use this before publication; connectors are
 /// built lazily when a node first enters the active working set.
 pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
-    load_ech_config_list(node)?;
+    validate_connector_config_with_ech_reader(node, |path| read_dependency(node, path))
+}
+
+/// Validate the same TLS inputs using caller-authorized, captured ECH bytes.
+/// Inline ECH takes precedence; this never performs discovery or constructs a connector.
+pub fn validate_connector_config_with_ech_reader(
+    node: &Node,
+    read: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    if node.tls().is_some_and(|tls| !tls.alpn.is_empty()) {
+        node.validate_protocol()?;
+    }
+    load_ech_config_list_with_reader(node, read)?;
     if let Some(pin) = node.tls().and_then(|tls| tls.pin_sha256.as_deref())
         && parse_pin_sha256(pin).is_none()
     {
@@ -456,19 +467,59 @@ pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
     config
 }
 
-/// Build the TLS connector for a node: BoringSSL with webpki roots,
-/// optional real Chrome fingerprint, optional ECH.
+/// Build the shared BoringSSL trust and protocol defaults.
+///
+/// `SslConnector::builder` parses the OS CA bundle into the context's own
+/// cert store (~0.8 MiB of C heap) and `set_verify_cert_store` would only
+/// override it for verification, leaving that copy resident. Replacing the
+/// store itself frees the copy and shares the process-wide one.
 fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnectorBuilder> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-    if skip_cert_verify {
-        builder.set_verify(SslVerifyMode::NONE);
+    builder.set_cert_store(root_store()?);
+    builder.set_verify(if skip_cert_verify {
+        SslVerifyMode::NONE
     } else {
-        builder.set_verify(SslVerifyMode::PEER);
-        builder.set_verify_cert_store(root_store()?)?;
-    }
+        SslVerifyMode::PEER
+    });
     Ok(builder)
+}
+
+/// Everything that shapes an `SslConnector` context. Building one costs the
+/// OS CA bundle parse (several ms of CPU, transient C heap), so dials share
+/// contexts per shape instead of building one per connection.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ConnectorKey {
+    reality: bool,
+    skip_verify: bool,
+    pin: Option<[u8; 32]>,
+    alpn: Option<Vec<u8>>,
+    chrome: bool,
+}
+
+/// Shapes only multiply with distinct pins or ALPN overrides; past this the
+/// cache restarts empty. Handshakes in flight keep their own context clone.
+// ponytail: restart-on-full instead of an LRU; add one if pinned fleets thrash it.
+const MAX_SHARED_CONNECTORS: usize = 128;
+
+fn shared_connector(
+    key: ConnectorKey,
+    build: impl FnOnce() -> anyhow::Result<SslConnector>,
+) -> anyhow::Result<SslConnector> {
+    static CACHE: LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<ConnectorKey, SslConnector>>,
+    > = LazyLock::new(Default::default);
+    let mut cache = CACHE.lock();
+    if let Some(connector) = cache.get(&key) {
+        return Ok(connector.clone());
+    }
+    let connector = build()?;
+    if cache.len() >= MAX_SHARED_CONNECTORS {
+        cache.clear();
+    }
+    cache.insert(key, connector.clone());
+    Ok(connector)
 }
 
 /// Parse a `pinSHA256` value (hex, optionally colon-separated) into 32 bytes.
@@ -539,31 +590,65 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         })?),
         None => None,
     };
-    let mut builder = base_builder(tls.skip_cert_verify || pin.is_some())?;
-    if let Some(pin) = pin {
-        builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
-    }
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-        builder.set_alpn_protos(
-            if node
-                .transport()
-                .is_some_and(|transport| transport.transport == "ws")
-            {
-                HTTP11_ALPN_WIRE
-            } else {
-                CHROME_ALPN_WIRE
-            },
-        )?;
-    }
+    let custom_alpn = if tls.alpn.is_empty() {
+        None
+    } else {
+        node.validate_protocol()?;
+        let mut wire = Vec::with_capacity(tls.alpn.iter().map(|proto| 1 + proto.len()).sum());
+        for proto in &tls.alpn {
+            wire.push(proto.len() as u8);
+            wire.extend_from_slice(proto.as_bytes());
+        }
+        Some(wire)
+    };
+    let websocket = node
+        .transport()
+        .is_some_and(|transport| transport.transport == "ws");
+    let alps = chrome
+        && if tls.alpn.is_empty() {
+            !websocket
+        } else {
+            tls.alpn.iter().any(|protocol| protocol == "h2")
+        };
+    let default_alpn = if node
+        .transport()
+        .is_some_and(|transport| matches!(transport.transport.as_str(), "grpc" | "xhttp"))
+    {
+        Some(b"\x02h2".as_slice())
+    } else {
+        chrome.then_some(if websocket {
+            HTTP11_ALPN_WIRE
+        } else {
+            CHROME_ALPN_WIRE
+        })
+    };
+    let alpn_wire = custom_alpn.as_deref().or(default_alpn);
+    let skip_verify = tls.skip_cert_verify || pin.is_some();
+    let key = ConnectorKey {
+        reality: false,
+        skip_verify,
+        pin,
+        alpn: alpn_wire.map(<[u8]>::to_vec),
+        chrome,
+    };
+    let connector = shared_connector(key, || {
+        let mut builder = base_builder(skip_verify)?;
+        if let Some(pin) = pin {
+            builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
+        }
+        if chrome {
+            apply_chrome_ctx(&mut builder)?;
+        }
+        if let Some(alpn_wire) = alpn_wire {
+            builder.set_alpn_protos(alpn_wire)?;
+        }
+        Ok(builder.build())
+    })?;
 
     Ok(TlsConnector {
-        connector: builder.build(),
+        connector,
         chrome,
-        alps: chrome
-            && !node
-                .transport()
-                .is_some_and(|transport| transport.transport == "ws"),
+        alps,
         ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
@@ -603,533 +688,35 @@ pub fn build_http_probe_connector(skip_cert_verify: bool) -> anyhow::Result<TlsC
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use boring::pkey::PKey;
-
-    #[test]
-    fn root_store_clones_share_one_store() {
-        use foreign_types::ForeignType;
-        let a = root_store().unwrap();
-        let b = root_store().unwrap();
-        assert_eq!(a.as_ptr(), b.as_ptr());
-    }
-    use boring::ssl::{SslAcceptor, SslStream};
-    use std::io::Read;
-    use std::net::TcpListener;
-    use std::thread;
-
-    /// rcgen self-signed server cert (PEM) for loopback handshakes.
-    fn server_cert() -> (String, String) {
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        (cert.pem(), key.serialize_pem())
-    }
-
-    fn spawn_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {
-        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-        acceptor
-            .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
-            .unwrap();
-        acceptor
-            .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
-            .unwrap();
-        let acceptor = acceptor.build();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut tls: SslStream<_> = acceptor.accept(stream).unwrap();
-            let mut buf = Vec::new();
-            tls.read_to_end(&mut buf).ok();
-            buf
-        });
-        (port, handle)
-    }
-
-    async fn loopback_connect(
-        node: &Node,
-        chrome: bool,
-        port: u16,
-    ) -> anyhow::Result<TlsStream<tokio::net::TcpStream>> {
-        set_tls_mode(if chrome { "utls" } else { "tls" });
-        let connector = build_connector(node)?;
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-        connector.connect("localhost", tcp).await
-    }
-
-    fn test_node() -> Node {
-        Node {
-            outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
-                tls: honk_config::node::TlsOptions {
-                    skip_cert_verify: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn handshake_standard_and_chrome() {
-        for chrome in [false, true] {
-            let (cert, key) = server_cert();
-            let (port, server) = spawn_server(&cert, &key);
-            let mut stream = loopback_connect(&test_node(), chrome, port)
-                .await
-                .unwrap_or_else(|e| panic!("chrome={chrome}: {e:?}"));
-            use tokio::io::AsyncWriteExt;
-            stream.write_all(b"ping").await.unwrap();
-            stream.shutdown().await.unwrap();
-            let received = server.join().unwrap();
-            assert_eq!(received, b"ping", "chrome={chrome}");
-        }
-    }
-
-    #[tokio::test]
-    async fn ech_grease_does_not_break_handshake() {
-        // Chrome mode with no ECH config sends ECH GREASE; servers must ignore it.
-        let (cert, key) = server_cert();
-        let (port, server) = spawn_server(&cert, &key);
-        let mut stream = loopback_connect(&test_node(), true, port).await.unwrap();
-        use tokio::io::AsyncWriteExt;
-        stream.write_all(b"ok").await.unwrap();
-        stream.shutdown().await.unwrap();
-        assert_eq!(server.join().unwrap(), b"ok");
-    }
-
-    /// Spawn a server holding real ECH keys (boring test fixtures:
-    /// public_name ech.com, DHKEM-P256-SHA256).
-    fn spawn_ech_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {
-        use boring::hpke::HpkeKey;
-        use boring::ssl::SslEchKeys;
-
-        static ECH_CONFIG: &[u8] = include_bytes!("../tests/fixtures/echconfig");
-        static ECH_KEY: &[u8] = include_bytes!("../tests/fixtures/echkey");
-
-        // NB: boring's mozilla_intermediate/_modern set NO_TLSV1_3; ECH needs
-        // TLS 1.3, so use the v5 profile (1.2+1.3) and pin 1.3.
-        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-        acceptor
-            .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
-            .unwrap();
-        acceptor
-            .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
-            .unwrap();
-
-        let key = HpkeKey::dhkem_p256_sha256(ECH_KEY).unwrap();
-        let mut ech_keys = SslEchKeys::builder().unwrap();
-        ech_keys.add_key(true, ECH_CONFIG, key).unwrap();
-        acceptor.set_ech_keys(&ech_keys.build()).unwrap();
-
-        acceptor
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .unwrap();
-        acceptor
-            .set_max_proto_version(Some(SslVersion::TLS1_3))
-            .unwrap();
-
-        let acceptor = acceptor.build();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut tls: SslStream<_> = acceptor.accept(stream).unwrap();
-            let mut buf = Vec::new();
-            tls.read_to_end(&mut buf).ok();
-            buf
-        });
-        (port, handle)
-    }
-
-    /// Full ECH round-trip: client offers real ECH, server decrypts it,
-    /// `ech_accepted()` must report true.
-    #[tokio::test]
-    async fn ech_accepted_end_to_end() {
-        static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
-        let mut node = test_node();
-        let tls = node.tls_mut().unwrap();
-        tls.ech_enabled = true;
-        tls.ech_config = Some(general_purpose::STANDARD.encode(ECH_CONFIG_LIST));
-        let (cert, key) = server_cert();
-        let (port, server) = spawn_ech_server(&cert, &key);
-        let mut stream = loopback_connect(&node, true, port).await.unwrap();
-        assert!(stream.ssl().ech_accepted(), "ECH must be accepted");
-        use tokio::io::AsyncWriteExt;
-        stream.write_all(b"ok").await.unwrap();
-        stream.shutdown().await.unwrap();
-        assert_eq!(server.join().unwrap(), b"ok");
-    }
-
-    /// Real ECH against a server with NO ECH keys fails closed
-    /// (`ECH_REJECTED`): BoringSSL refuses to complete a handshake whose ECH
-    /// offer was not confirmed, per RFC anti-downgrade rules. Proves the
-    /// config list is actually parsed and offered.
-    #[tokio::test]
-    async fn ech_rejected_when_server_lacks_keys() {
-        static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
-        let mut node = test_node();
-        let tls = node.tls_mut().unwrap();
-        tls.ech_enabled = true;
-        tls.ech_config = Some(general_purpose::STANDARD.encode(ECH_CONFIG_LIST));
-        let (cert, key) = server_cert();
-        let (port, _server) = spawn_server(&cert, &key);
-        let err = loopback_connect(&node, true, port)
-            .await
-            .expect_err("handshake must fail when ECH is not accepted");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("ECH_REJECTED"), "unexpected error: {msg}");
-    }
-
-    /// The urltest probe connector offers `h2,http/1.1` and honors the
-    /// server's pick in both directions (the probe handles either).
-    #[tokio::test]
-    async fn probe_connector_negotiates_h2_and_http1() {
-        use boring::ssl::AlpnError;
-
-        fn spawn_alpn_server(cert_pem: &str, key_pem: &str, prefer_h2: bool) -> u16 {
-            let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-            acceptor
-                .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
-                .unwrap();
-            acceptor
-                .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
-                .unwrap();
-            acceptor.set_alpn_select_callback(move |_ssl, protos| {
-                let mut i = 0;
-                let (mut h2, mut http11) = (None, None);
-                while i < protos.len() {
-                    let n = protos[i] as usize;
-                    let p = &protos[i + 1..i + 1 + n];
-                    if p == b"h2" {
-                        h2 = Some(p);
-                    }
-                    if p == b"http/1.1" {
-                        http11 = Some(p);
-                    }
-                    i += 1 + n;
-                }
-                if prefer_h2 {
-                    h2.or(http11).ok_or(AlpnError::NOACK)
-                } else {
-                    // h1-only server: refuses anything else.
-                    http11.ok_or(AlpnError::NOACK)
-                }
-            });
-            let acceptor = acceptor.build();
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
-                let mut tls: SslStream<_> = acceptor.accept(stream).unwrap();
-                let mut buf = Vec::new();
-                tls.read_to_end(&mut buf).ok();
-                buf
-            });
-            port
-        }
-
-        for chrome in [false, true] {
-            set_tls_mode(if chrome { "utls" } else { "tls" });
-
-            // h2-preferring server: probe must negotiate h2.
-            let (cert, key) = server_cert();
-            let port = spawn_alpn_server(&cert, &key, true);
-            let connector = build_http_probe_connector(true).unwrap();
-            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let stream = connector.connect("localhost", tcp).await.unwrap();
-            assert_eq!(
-                stream.ssl().selected_alpn_protocol(),
-                Some(b"h2".as_slice()),
-                "chrome={chrome}: probe must take h2 when the server prefers it"
-            );
-
-            // h1-only server: probe must fall back to http/1.1.
-            let (cert, key) = server_cert();
-            let port = spawn_alpn_server(&cert, &key, false);
-            let connector = build_http_probe_connector(true).unwrap();
-            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let stream = connector.connect("localhost", tcp).await.unwrap();
-            assert_eq!(
-                stream.ssl().selected_alpn_protocol(),
-                Some(b"http/1.1".as_slice()),
-                "chrome={chrome}: probe must fall back to http/1.1"
-            );
-        }
-    }
-
-    #[test]
-    fn decode_ech_base64_variants() {
-        let raw = b"\xff\x00abc";
-        for encoded in [
-            general_purpose::STANDARD.encode(raw),
-            general_purpose::URL_SAFE.encode(raw),
-            general_purpose::URL_SAFE_NO_PAD.encode(raw),
-        ] {
-            assert_eq!(decode_ech_config_list(&encoded).unwrap(), raw);
-        }
-        assert!(decode_ech_config_list("!!!not-base64!!!").is_err());
-    }
-
-    /// DNS response with one HTTPS answer carrying the given ech SvcParam
-    /// (`None` → NODATA), for the discovery stub server.
-    fn https_response(query: &[u8], ech: Option<&[u8]>, ttl: u32) -> Vec<u8> {
-        let mut resp = query.to_vec();
-        resp[2] = 0x81;
-        resp[3] = 0x80;
-        let Some(ech) = ech else {
-            resp[6] = 0;
-            resp[7] = 0;
-            return resp;
-        };
-        resp[6] = 0;
-        resp[7] = 1;
-        resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer to question
-        resp.extend_from_slice(&65u16.to_be_bytes()); // TYPE HTTPS
-        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
-        resp.extend_from_slice(&ttl.to_be_bytes());
-        let mut rdata = vec![0, 1, 0]; // ServiceMode priority 1, root target name
-        rdata.extend_from_slice(&5u16.to_be_bytes()); // SvcParam key ech
-        rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
-        rdata.extend_from_slice(ech);
-        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        resp.extend_from_slice(&rdata);
-        resp
-    }
-
-    /// Stub UDP DNS server answering every query with the canned HTTPS
-    /// response, counting queries. Installed via the bootstrap resolver.
-    async fn spawn_https_dns(
-        ech: Option<Vec<u8>>,
-        ttl: u32,
-    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::AtomicUsize;
-        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let count2 = count.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            while let Ok((n, peer)) = server.recv_from(&mut buf).await {
-                count2.fetch_add(1, Ordering::SeqCst);
-                let resp = https_response(&buf[..n], ech.as_deref(), ttl);
-                server.send_to(&resp, peer).await.ok();
-            }
-        });
-        (addr, count)
-    }
-
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn discover_ech_config_caches_positive_and_negative() {
-        use std::sync::atomic::Ordering as AOrd;
-        let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
-
-        // Positive: two lookups for the same name cost one DNS query.
-        let (addr, count) = spawn_https_dns(Some(b"\x00\x01ech-bytes".to_vec()), 120).await;
-        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
-            "udp://{addr}"
-        )));
-        let first = discover_ech_config("ech-pos-unique.test").await;
-        let second = discover_ech_config("ech-pos-unique.test").await;
-        assert_eq!(first.as_deref(), Some(b"\x00\x01ech-bytes".as_slice()));
-        assert_eq!(second, first);
-        assert_eq!(count.load(AOrd::SeqCst), 1, "second lookup must hit cache");
-
-        // Negative: NODATA is cached too.
-        let (addr, count) = spawn_https_dns(None, 120).await;
-        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
-            "udp://{addr}"
-        )));
-        assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
-        assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
-        assert_eq!(
-            count.load(AOrd::SeqCst),
-            1,
-            "negative lookup must hit cache"
-        );
-
-        // IP literals never query.
-        assert_eq!(discover_ech_config("203.0.113.7").await, None);
-        crate::bootstrap::set_global(None);
-    }
-
-    /// End-to-end: `ech_enabled` with no static config discovers the
-    /// ECHConfigList via DNS and completes a real ECH handshake.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn ech_discovery_end_to_end() {
-        static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
-        let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
-
-        let (addr, _count) = spawn_https_dns(Some(ECH_CONFIG_LIST.to_vec()), 300).await;
-        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
-            "udp://{addr}"
-        )));
-        let mut node = test_node();
-        node.tls_mut().unwrap().ech_enabled = true;
-        let (cert, key) = server_cert();
-        let (port, server) = spawn_ech_server(&cert, &key);
-        let mut stream = loopback_connect(&node, true, port).await.unwrap();
-        assert!(
-            stream.ssl().ech_accepted(),
-            "ECH via DNS discovery must be accepted"
-        );
-        use tokio::io::AsyncWriteExt;
-        stream.write_all(b"ok").await.unwrap();
-        stream.shutdown().await.unwrap();
-        assert_eq!(server.join().unwrap(), b"ok");
-        crate::bootstrap::set_global(None);
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod pin_tests {
-    use super::*;
-
-    #[test]
-    fn parse_pin_sha256_variants() {
-        let hex = "a".repeat(64);
-        assert!(parse_pin_sha256(&hex).is_some());
-        let colon = (0..32).map(|_| "ab").collect::<Vec<_>>().join(":");
-        assert!(parse_pin_sha256(&colon).is_some());
-        assert_eq!(parse_pin_sha256(&colon).unwrap(), [0xab; 32]);
-        assert!(parse_pin_sha256("zz").is_none());
-        assert!(parse_pin_sha256("abcd").is_none());
-        // Uppercase hex is valid.
-        assert!(parse_pin_sha256(&"AB".repeat(32)).is_some());
-    }
-
-    /// P0: an unparseable pinSHA256 must fail closed — never silently
-    /// degrade to plain PKI.
-    #[test]
-    fn invalid_pin_fails_closed() {
-        let mut node = Node {
-            name: "pinned".into(),
-            host: "example.com".into(),
-            address: "example.com:443".into(),
-            port: 443,
-            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
-            ..Default::default()
-        };
-        node.tls_mut().unwrap().pin_sha256 = Some("not-a-pin".into());
-        let err = build_connector(&node).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid tls_pin_sha256"),
-            "bad pin must be a hard error: {err}"
-        );
-    }
-
-    #[test]
-    fn non_tls_node_connector_returns_error() {
-        let node = Node {
-            name: "direct".into(),
-            outbound: honk_config::node::OutboundConfig::Direct,
-            ..Default::default()
-        };
-        let error = build_connector(&node).unwrap_err();
-        assert!(error.to_string().contains("has no TLS options"), "{error}");
-    }
-}
+mod pin_tests;
 
 #[cfg(test)]
-mod batch_read_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+mod batch_read_tests;
 
-    #[tokio::test]
-    async fn drains_all_available_in_one_read() {
-        let (mut w, r) = tokio::io::duplex(64);
-        let mut s = BatchRead::new(r);
-        w.write_all(&[1u8; 10]).await.unwrap();
-        w.write_all(&[2u8; 20]).await.unwrap();
-        // One read must coalesce both writes (a plain duplex read would
-        // also return 30 here; the point is the wrapper never truncates
-        // a wakeup's worth of data to the first inner read).
-        let mut buf = [0u8; 64];
-        let n = s.read(&mut buf).await.unwrap();
-        assert_eq!(n, 30);
-        assert_eq!(&buf[..10], &[1u8; 10]);
-        assert_eq!(&buf[10..30], &[2u8; 20]);
-    }
-
-    #[tokio::test]
-    async fn eof_delivers_partial_then_zero() {
-        let (mut w, r) = tokio::io::duplex(64);
-        let mut s = BatchRead::new(r);
-        w.write_all(&[7u8; 10]).await.unwrap();
-        drop(w); // EOF
-        let mut buf = [0u8; 64];
-        let n = s.read(&mut buf).await.unwrap();
-        assert_eq!(n, 10, "buffered data must be delivered before EOF");
-        let n = s.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[tokio::test]
-    async fn read_larger_than_inner_chunks() {
-        // Simulate one-record-per-poll inner reads (TLS): cap each inner
-        // poll at 8 bytes; the wrapper must still fill the big buffer.
-        struct Chunked<R> {
-            inner: R,
-        }
-        impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Chunked<R> {
-            fn poll_read(
-                mut self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
-                let cap = buf.remaining().min(8);
-                let (r, n) = {
-                    let mut small = buf.take(cap);
-                    let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut small);
-                    (r, small.filled().len())
-                };
-                if r.is_ready() {
-                    // SAFETY: `take` views the front of `buf`'s unfilled
-                    // region; bytes it initialized are the front of ours.
-                    unsafe { buf.assume_init(n) };
-                    buf.advance(n);
-                }
-                r
-            }
-        }
-        let (mut w, r) = tokio::io::duplex(64);
-        let mut s = BatchRead::new(Chunked { inner: r });
-        for i in 0..4u8 {
-            w.write_all(&[i; 8]).await.unwrap();
-        }
-        let mut buf = [0u8; 32];
-        let n = s.read(&mut buf).await.unwrap();
-        assert_eq!(n, 32, "four 8-byte records must batch into one read");
-        for i in 0..4usize {
-            assert!(buf[i * 8..(i + 1) * 8].iter().all(|&b| b == i as u8));
-        }
-    }
-}
-
-/// REALITY connector: accept-all certificate verification (the real server
-/// authentication runs post-handshake against the session-id auth key in
-/// `reality::verify_server_certificate`). Chrome mode adds the pieces of
-/// the real Chrome ClientHello the ctx controls: cipher list, ALPN,
-/// OCSP stapling and SCT extensions. Session resumption stays impossible
-/// because nothing ever calls `SSL_set_session` — the empty session_ticket
-/// extension real Chrome sends is just an offer, never a resumption.
+/// REALITY's TLS-1.3-only connector; authentication runs post-handshake in
+/// `reality::verify_server_certificate`. Chrome mode configures the ctx-level
+/// emulation fields. REALITY callers never restore a cached SSL session.
 pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
-    let mut builder = base_builder(true)?;
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-        builder.set_cipher_list(CHROME_CIPHER_LIST)?;
-        builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
-        builder.enable_ocsp_stapling();
-        builder.enable_signed_cert_timestamps();
-    }
-    Ok(builder.build())
+    let key = ConnectorKey {
+        reality: true,
+        skip_verify: true,
+        pin: None,
+        alpn: None,
+        chrome,
+    };
+    shared_connector(key, || {
+        let mut builder = base_builder(true)?;
+        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+        if chrome {
+            apply_chrome_ctx(&mut builder)?;
+            builder.set_cipher_list(CHROME_CIPHER_LIST)?;
+            builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+            builder.enable_ocsp_stapling();
+            builder.enable_signed_cert_timestamps();
+        }
+        Ok(builder.build())
+    })
 }

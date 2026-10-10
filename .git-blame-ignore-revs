@@ -1,0 +1,4 @@
+# One-for-one inline test extraction; test names and feature conditions preserved.
+922e8c9ad650cb9f42a2319a31f7ccfcc2325c29
+# Module ownership moves; executable body deltas limited to imports and paths.
+84de56318131aac668fe8b21497fbb6642dc431e

@@ -1,5 +1,13 @@
 use super::super::endpoint::DnsEndpoint;
 
+/// A response the peer sent that cannot be a DNS answer to this query.
+#[derive(Debug, thiserror::Error)]
+#[error("{transport} {reason}")]
+pub(super) struct DeterministicResponse {
+    pub(super) transport: &'static str,
+    pub(super) reason: String,
+}
+
 /// `host[:port]` authority string (brackets bare IPv6, elides default 443).
 fn authority(host: &str, port: u16) -> String {
     let host_fmt = if host.contains(':') && !host.starts_with('[') {
@@ -44,19 +52,36 @@ pub(super) fn build_doh_request(
         .map_err(|e| anyhow::anyhow!("{label} request build: {e}"))
 }
 
-/// Shared DoH/DoH3 response validation: 2xx status, minimum DNS header size,
-/// then restore the original query ID.
-pub(super) fn finish_doh_response(
-    label: &str,
+/// Judge status before reading the body: 5xx retains the query retry, while
+/// other non-success responses do not justify rebuilding the session.
+pub(super) fn check_doh_status(
+    label: &'static str,
     status: http::StatusCode,
+) -> anyhow::Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_server_error() {
+        anyhow::bail!("{label} HTTP status {status}")
+    } else {
+        Err(DeterministicResponse {
+            transport: label,
+            reason: format!("HTTP status {status}"),
+        }
+        .into())
+    }
+}
+
+pub(super) fn finish_doh_response(
+    label: &'static str,
     mut body: Vec<u8>,
     orig_id: u16,
 ) -> anyhow::Result<Vec<u8>> {
-    if !status.is_success() {
-        anyhow::bail!("{label} HTTP status {status}");
-    }
     if body.len() < 12 {
-        anyhow::bail!("{label} response too short ({} bytes)", body.len());
+        return Err(DeterministicResponse {
+            transport: label,
+            reason: format!("response too short ({} bytes)", body.len()),
+        }
+        .into());
     }
     super::framing::restore_dns_id(&mut body, orig_id);
     Ok(body)

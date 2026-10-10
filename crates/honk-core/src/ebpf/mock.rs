@@ -7,7 +7,7 @@
 #[cfg(test)]
 use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
 use super::{
-    EbpfBackend, LpmKeepSet, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
+    EbpfBackend, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
     UdpDecisionTransition, apply_udp_decision_transition, udp_state_is_legacy_userspace_owned,
     udp_state_is_userspace_owned, validate_udp_decision_transition,
 };
@@ -17,147 +17,48 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockRoutingSnapshot {
-    pub routing_map: Vec<(u32, MockMatchSetSnapshot)>,
-    pub routing_meta: Vec<(u32, u32)>,
-    pub dest_lpm: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
-    pub source_lpm: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
-    pub mac_lpm: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub active_slot: u32,
+    pub descriptor: RoutingPolicyDescriptor,
+    pub plan_fingerprint: [u8; 32],
+    pub rule_count: usize,
+    pub destination_v4: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub destination_v6: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub source_v4: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub source_v6: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub mac: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
     pub domain: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockRoutingPublicationWrite {
-    Exploded(u32),
-    Packed(u32),
-    Selector(u32),
+    FactMaps(u32),
+    Program(u32),
+    Attach(u32),
+    Root(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MockMatchSetSnapshot {
-    pub value: MockMatchValue,
-    pub not: u8,
-    pub match_type: u8,
-    pub outbound: u8,
-    pub must: u8,
-    pub mark: u32,
+#[derive(Debug, Clone)]
+struct MockRoutingGeneration {
+    fingerprint: [u8; 32],
+    rule_count: usize,
+    facts: crate::control::routing_matcher::RoutingFactMaps,
+    domain: HashMap<[u32; 4], DomainRouting>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MockMatchValue {
-    Zero([u8; 16]),
-    PortRange { start: u16, end: u16 },
-    L4Protocol(u8),
-    IpVersion(u8),
-    ProcessName([u32; TASK_COMM_LEN / 4]),
-    Dscp(u8),
-    Index(u32),
-    Unknown,
-}
-
-impl MockMatchSetSnapshot {
-    fn from_match_set(value: &MatchSet) -> Self {
-        let normalized = match MatchType::from_u8(value.match_type) {
-            Some(
-                MatchType::DomainSet
-                | MatchType::IpSet
-                | MatchType::SourceIpSet
-                | MatchType::Mac
-                | MatchType::Fallback
-                | MatchType::MustRules,
-            ) => {
-                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
-                // initializes `MatchSetValue::raw` for these tags. `MatchSetValue`
-                // is `repr(C)`, so the active field starts at the union's address,
-                // and `[u8; 16]` accepts every initialized bit pattern.
-                MockMatchValue::Zero(unsafe { value.value.raw })
-            }
-            Some(MatchType::Port | MatchType::SourcePort) => {
-                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
-                // initializes `MatchSetValue::port_range` before assigning either
-                // port tag. `repr(C)` places that active field at the union's
-                // address, and both `u16` members accept every bit pattern.
-                let range = unsafe { value.value.port_range };
-                MockMatchValue::PortRange {
-                    start: range.port_start,
-                    end: range.port_end,
-                }
-            }
-            Some(MatchType::L4Proto) => {
-                // SAFETY: [Category 5 — Invalid Values] the routing compiler writes
-                // a validated `L4ProtoType` to the active `l4proto_type` field
-                // before assigning this tag. `repr(C)` places the active field at
-                // the union's address, preserving the enum discriminant.
-                MockMatchValue::L4Protocol(unsafe { value.value.l4proto_type } as u8)
-            }
-            Some(MatchType::IpVersion) => {
-                // SAFETY: [Category 5 — Invalid Values] the routing compiler writes
-                // a validated `IpVersionType` to the active `ip_version` field
-                // before assigning this tag. `repr(C)` places the active field at
-                // the union's address, preserving the enum discriminant.
-                MockMatchValue::IpVersion(unsafe { value.value.ip_version } as u8)
-            }
-            Some(MatchType::ProcessName) => {
-                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
-                // initializes the complete `pname` array before assigning this tag.
-                // `repr(C)` places the active array at the union's address, and
-                // every `u32` element accepts every bit pattern.
-                MockMatchValue::ProcessName(unsafe { value.value.pname })
-            }
-            Some(MatchType::Dscp) => {
-                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
-                // initializes `dscp` before assigning this tag. `repr(C)` places
-                // the active `u8` at the union's address, and every byte is valid.
-                MockMatchValue::Dscp(unsafe { value.value.dscp })
-            }
-            Some(MatchType::Upstream | MatchType::QType) => {
-                // SAFETY: [Category 4 — Uninitialized Memory] producers initialize
-                // `index` before assigning either index-bearing tag. `repr(C)`
-                // places the active `u32` at the union's address, and every `u32`
-                // bit pattern is valid.
-                MockMatchValue::Index(unsafe { value.value.index })
-            }
-            None => MockMatchValue::Unknown,
-        };
-        Self {
-            value: normalized,
-            not: value.not,
-            match_type: value.match_type,
-            outbound: value.outbound,
-            must: value.must,
-            mark: value.mark,
-        }
-    }
-}
-
-/// Mock eBPF backend using in-memory maps.
+/// In-memory transactional routing backend used by control-plane tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
-    /// Parameter map (key → value)
-    pub params: HashMap<u32, u32>,
-    /// Domain routing map (hash → outbound index)
-    pub domain_routes: HashMap<u64, u32>,
-    /// IP routing map (prefix → outbound index, stored as (ip, prefix_len) → index)
-    pub ip_routes: HashMap<(u32, u8), u32>,
-    /// Outbound statistics
-    pub stats: HashMap<u32, OutboundStats>,
-    /// Connection tracking (legacy)
-    pub conn_track: HashMap<[u8; 37], u32>,
-
-    /// Routing rules: index → MatchSet (array-style BPF map)
-    pub routing_map: HashMap<u32, MatchSet>,
-    /// Exploded routing metadata: key 0 selects the active generation; each
-    /// following generation block holds its rule count and group bitmaps.
-    pub routing_meta: HashMap<u32, u32>,
-    /// Packed count/bitmap entries consumed by the datapath.
-    pub routing_group_meta: HashMap<u32, RoutingGroupMeta>,
-    /// Domain routing bitmap: LpmKey → DomainRouting
-    pub domain_routing_bitmap: HashMap<[u8; 20], DomainRouting>,
-    /// Destination IP LPM routing bitmap: LpmKey → DomainRouting
-    pub dest_lpm_bitmap: HashMap<[u8; 20], DomainRouting>,
-    /// Source IP LPM routing bitmap: LpmKey → DomainRouting
-    pub source_lpm_bitmap: HashMap<[u8; 20], DomainRouting>,
-    /// MAC LPM routing bitmap: LpmKey → DomainRouting
-    pub mac_lpm_bitmap: HashMap<[u8; 20], DomainRouting>,
+    /// Only the generation selected by the stable root remains resident.
+    routing_generation: Option<MockRoutingGeneration>,
+    active_slot: u32,
+    descriptor: RoutingPolicyDescriptor,
+    next_generation: u64,
+    next_domain_map_id: u32,
+    next_trace_policy: u32,
+    #[cfg(feature = "native-api")]
+    trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
+    pub route_witnesses: HashMap<u32, KernelRouteWitness>,
+    next_trace_id: u32,
     /// TCP connection states (TuplesKey → ConnState)
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
@@ -180,15 +81,16 @@ pub struct MockEbpfBackend {
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
-    /// Every `set_datapath_flags` value written (shared so tests can read it
-    /// after the backend is boxed).
-    pub datapath_flags_writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
-    /// Lifecycle counters (shared so tests can read them after the backend is
-    /// boxed): detach_hooks must only ever run during shutdown.
+    listener_socket_slots: HashMap<u32, std::os::fd::RawFd>,
+    #[cfg(test)]
+    pub listener_clear_fault_at: Option<u32>,
+    /// Every mode-policy write, shared so tests can inspect boxed backends.
+    pub datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
     pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub dynamic_attach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    pub dynamic_attach_fault: bool,
     pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub routing_meta_write_order: Vec<u32>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     #[cfg(feature = "reload-bench-counters")]
     routing_map_writes: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -205,6 +107,8 @@ pub struct MockEbpfBackend {
     #[cfg(test)]
     domain_bitmap_add_faults: usize,
     #[cfg(test)]
+    fail_next_quiesce: bool,
+    #[cfg(test)]
     datapath_flags_fault_nth: Option<usize>,
     #[cfg(test)]
     datapath_flags_writes_after_arm: usize,
@@ -212,12 +116,35 @@ pub struct MockEbpfBackend {
     datapath_flags_write_origin: DatapathFlagsWriteOrigin,
     #[cfg(test)]
     datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
+    #[cfg(test)]
+    pub datapath_observation_fixture: Option<super::DatapathObservation>,
+    #[cfg(test)]
+    pub pname_support: super::PnameSupport,
 }
 
 impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn capture_route_witness(&mut self, mut witness: KernelRouteWitness) -> u32 {
+        if witness.output.flags & ROUTE_TRACE_ENABLED == 0 {
+            return 0;
+        }
+        if self.next_trace_id >= ROUTE_TRACE_LOST - 1 {
+            return ROUTE_TRACE_LOST;
+        }
+        self.next_trace_id += 1;
+        let id = self.next_trace_id;
+        witness.capture_id = id;
+        if self.route_witnesses.len() >= ROUTE_TRACE_CAPACITY as usize
+            && let Some(oldest) = self.route_witnesses.keys().min().copied()
+        {
+            self.route_witnesses.remove(&oldest);
+        }
+        self.route_witnesses.insert(id, witness);
+        id
     }
 
     #[cfg(feature = "reload-bench-counters")]
@@ -259,6 +186,7 @@ impl MockEbpfBackend {
                     decision_token: token,
                     ..Default::default()
                 },
+                routing_generation: 0,
                 ..Default::default()
             },
         );
@@ -328,121 +256,71 @@ impl MockEbpfBackend {
         self.routing_fault = Some((phase, 1));
     }
 
+    fn fact_snapshot(
+        entries: &[(LpmKey, DomainRouting)],
+    ) -> Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])> {
+        let mut result = entries
+            .iter()
+            .map(|(key, value)| (Self::lpm_key_bytes(key), value.bitmap))
+            .collect::<Vec<_>>();
+        result.sort_by_key(|(key, _)| *key);
+        result
+    }
+
     pub fn routing_snapshot(&self) -> MockRoutingSnapshot {
-        fn sorted_bitmap_map(
-            map: &HashMap<[u8; 20], DomainRouting>,
-            generation: u32,
-        ) -> Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])> {
-            let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-            let mut entries = map
-                .iter()
-                .filter_map(|(key, value)| {
-                    let mut logical = [0; ROUTING_BITMAP_WORDS];
-                    logical[..ROUTING_BITMAP_WORDS_PER_GENERATION].copy_from_slice(
-                        &value.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION],
-                    );
-                    logical
-                        .iter()
-                        .any(|word| *word != 0)
-                        .then_some((*key, logical))
-                })
-                .collect::<Vec<_>>();
-            entries.sort_by_key(|(key, _)| *key);
-            entries
-        }
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        let count = self
-            .routing_meta
-            .get(&routing_meta_count_slot(generation))
-            .copied()
-            .unwrap_or(0);
-        let base = generation * MAX_MATCH_SET_LEN;
-        let routing_map = (0..count)
-            .filter_map(|index| {
-                self.routing_map
-                    .get(&(base + index))
-                    .map(|value| (index, MockMatchSetSnapshot::from_match_set(value)))
-            })
-            .collect();
-        let meta_base = routing_meta_generation_base(generation);
-        let routing_meta = (0..ROUTING_META_GENERATION_STRIDE as u32)
-            .map(|offset| {
+        let generation = self.routing_generation.as_ref();
+        let (fingerprint, rule_count, facts, mut domain) =
+            generation.map_or(([0; 32], 0, None, Vec::new()), |generation| {
+                let domain = generation
+                    .domain
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = LpmKey {
+                            prefix_len: 128,
+                            data: *key,
+                        };
+                        (Self::lpm_key_bytes(&key), value.bitmap)
+                    })
+                    .collect::<Vec<_>>();
                 (
-                    offset,
-                    self.routing_meta
-                        .get(&(meta_base + offset))
-                        .copied()
-                        .unwrap_or(0),
+                    generation.fingerprint,
+                    generation.rule_count,
+                    Some(&generation.facts),
+                    domain,
                 )
-            })
-            .collect();
+            });
+        domain.sort_by_key(|(key, _)| *key);
+        let (destination_v4, destination_v6, source_v4, source_v6, mac) = facts.map_or(
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            |facts| {
+                (
+                    Self::fact_snapshot(&facts.destination_v4),
+                    Self::fact_snapshot(&facts.destination_v6),
+                    Self::fact_snapshot(&facts.source_v4),
+                    Self::fact_snapshot(&facts.source_v6),
+                    Self::fact_snapshot(&facts.mac),
+                )
+            },
+        );
         MockRoutingSnapshot {
-            routing_map,
-            routing_meta,
-            dest_lpm: sorted_bitmap_map(&self.dest_lpm_bitmap, generation),
-            source_lpm: sorted_bitmap_map(&self.source_lpm_bitmap, generation),
-            mac_lpm: sorted_bitmap_map(&self.mac_lpm_bitmap, generation),
-            domain: sorted_bitmap_map(&self.domain_routing_bitmap, generation),
+            active_slot: self.active_slot,
+            descriptor: self.descriptor,
+            plan_fingerprint: fingerprint,
+            rule_count,
+            destination_v4,
+            destination_v6,
+            source_v4,
+            source_v6,
+            mac,
+            domain,
         }
-    }
-
-    pub fn active_routing_rule(&self, index: u32) -> Option<&MatchSet> {
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        self.routing_map
-            .get(&(generation * MAX_MATCH_SET_LEN + index))
-    }
-
-    pub fn active_routing_rule_count(&self) -> u32 {
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        self.routing_meta
-            .get(&routing_meta_count_slot(generation))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub fn active_routing_group_word(&self, group: usize, word: usize) -> u32 {
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        let slot = routing_meta_bitmap_base(generation)
-            + (group * ROUTING_GROUP_BITMAP_WORDS + word) as u32;
-        self.routing_meta.get(&slot).copied().unwrap_or(0)
-    }
-
-    pub fn active_routing_group_meta(&self, group: u32) -> Option<RoutingGroupMeta> {
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        self.routing_group_meta
-            .get(&routing_group_meta_index(generation, group))
-            .copied()
     }
 
     fn take_routing_fault(&mut self, phase: RoutingPushPhase) -> anyhow::Result<()> {
         if let Some((configured, remaining)) = self.routing_fault
             && configured == phase
         {
-            self.routing_fault = if remaining > 1 {
-                Some((configured, remaining - 1))
-            } else {
-                None
-            };
+            self.routing_fault = (remaining > 1).then_some((configured, remaining - 1));
             anyhow::bail!("injected routing push failure at {phase:?}");
         }
         Ok(())
@@ -457,11 +335,8 @@ impl MockEbpfBackend {
         if let Some((configured, remaining, map_full)) = self.projection_fault
             && configured == operation
         {
-            self.projection_fault = if remaining > 1 {
-                Some((configured, remaining - 1, map_full))
-            } else {
-                None
-            };
+            self.projection_fault =
+                (remaining > 1).then_some((configured, remaining - 1, map_full));
             if map_full {
                 return Err(super::DomainRouteWriteError::MapFull);
             }
@@ -474,17 +349,6 @@ impl MockEbpfBackend {
 
     // These convert repr(C) types to fixed-size byte arrays so they
     // can be used as HashMap keys (which require Hash + Eq).
-
-    /// Hash a ConnTuple into a fixed-size key for HashMap storage.
-    fn tuple_key(tuple: &ConnTuple) -> [u8; 37] {
-        let mut key = [0u8; 37];
-        key[0..16].copy_from_slice(&tuple.src_ip);
-        key[16..32].copy_from_slice(&tuple.dst_ip);
-        key[32..34].copy_from_slice(&tuple.src_port.to_be_bytes());
-        key[34..36].copy_from_slice(&tuple.dst_port.to_be_bytes());
-        key[36] = tuple.protocol;
-        key
-    }
 
     /// Convert a TuplesKey into a 40-byte array (includes repr(C) padding).
     fn tuples_key_bytes(key: &TuplesKey) -> [u8; 40] {
@@ -512,42 +376,6 @@ impl MockEbpfBackend {
     /// Convert an LpmKey into a 20-byte array.
     fn lpm_key_bytes(key: &LpmKey) -> [u8; 20] {
         super::maps::lpm_key_bytes(key)
-    }
-
-    fn bitmap_for_active_generation(&self, bitmap: &DomainRouting) -> DomainRouting {
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        bitmap.for_generation(generation)
-    }
-
-    fn replace_active_bitmap(
-        &self,
-        current: Option<DomainRouting>,
-        bitmap: &DomainRouting,
-    ) -> DomainRouting {
-        let generation = self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0);
-        let mut value = current.unwrap_or_default();
-        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-        value.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
-            .copy_from_slice(&bitmap.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
-        value
-    }
-
-    /// OR a DomainRouting bitmap into the given in-memory map keyed by LpmKey.
-    fn or_bitmap(map: &mut HashMap<[u8; 20], DomainRouting>, key: &LpmKey, bm: &DomainRouting) {
-        let k = Self::lpm_key_bytes(key);
-        let mut cur = map.get(&k).copied().unwrap_or_default();
-        for i in 0..cur.bitmap.len() {
-            cur.bitmap[i] |= bm.bitmap[i];
-        }
-        map.insert(k, cur);
     }
 
     /// Reverse of tuples_key_bytes.
@@ -584,6 +412,19 @@ impl MockEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for MockEbpfBackend {
+    fn observe_datapath(&self) -> super::DatapathObservation {
+        #[cfg(test)]
+        if let Some(observation) = &self.datapath_observation_fixture {
+            return observation.clone();
+        }
+        super::DatapathObservation::unknown(super::DatapathKind::Mock)
+    }
+
+    #[cfg(test)]
+    fn pname_support(&self) -> super::PnameSupport {
+        self.pname_support
+    }
+
     fn inject_routing_fault(
         &mut self,
         phase: RoutingPushPhase,
@@ -613,10 +454,24 @@ impl EbpfBackend for MockEbpfBackend {
     #[cfg(test)]
     fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
         let mut snapshot = self
-            .domain_routing_bitmap
-            .iter()
-            .map(|(key, bitmap)| (*key, *bitmap))
-            .collect::<Vec<_>>();
+            .routing_generation
+            .as_ref()
+            .map(|generation| {
+                generation
+                    .domain
+                    .iter()
+                    .map(|(key, bitmap)| {
+                        (
+                            Self::lpm_key_bytes(&LpmKey {
+                                prefix_len: 128,
+                                data: *key,
+                            }),
+                            *bitmap,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         snapshot.sort_by_key(|(key, _)| *key);
         snapshot
     }
@@ -632,12 +487,36 @@ impl EbpfBackend for MockEbpfBackend {
     }
     fn publish_listener_sockets(
         &mut self,
-        _tcp4_fd: std::os::fd::RawFd,
-        _tcp6_fd: std::os::fd::RawFd,
-        _udp4_fds: &[std::os::fd::RawFd],
-        _udp6_fds: &[std::os::fd::RawFd],
+        tcp4_fd: std::os::fd::RawFd,
+        tcp6_fd: std::os::fd::RawFd,
+        udp4_fds: &[std::os::fd::RawFd],
+        udp6_fds: &[std::os::fd::RawFd],
     ) -> anyhow::Result<()> {
+        self.listener_socket_slots.insert(0, tcp4_fd);
+        self.listener_socket_slots.insert(1, tcp6_fd);
+        for (base, fds) in [(2, udp4_fds), (6, udp6_fds)] {
+            for (offset, fd) in fds.iter().enumerate() {
+                self.listener_socket_slots.insert(base + offset as u32, *fd);
+            }
+        }
         self.listener_sockets_published = true;
+        Ok(())
+    }
+
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.datapath_ready,
+            "datapath admission must be closed before clearing listeners"
+        );
+        self.listener_sockets_published = false;
+        for key in 0..10 {
+            #[cfg(test)]
+            if self.listener_clear_fault_at == Some(key) {
+                self.listener_clear_fault_at = None;
+                anyhow::bail!("injected listener clear failure");
+            }
+            self.listener_socket_slots.remove(&key);
+        }
         Ok(())
     }
 
@@ -650,7 +529,7 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
-        self.datapath_flags_writes.lock().unwrap().push(flags);
+        self.datapath_flags_writes.lock().push(flags);
         #[cfg(test)]
         {
             self.datapath_flags_writes_after_arm =
@@ -681,13 +560,18 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {
+        self.fail_next_quiesce = true;
+    }
+
+    #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, origin: DatapathFlagsWriteOrigin) {
         self.datapath_flags_write_origin = origin;
     }
 
     #[cfg(test)]
     fn datapath_flags_write_log(&self) -> Vec<u32> {
-        self.datapath_flags_writes.lock().unwrap().clone()
+        self.datapath_flags_writes.lock().clone()
     }
 
     #[cfg(test)]
@@ -697,12 +581,16 @@ impl EbpfBackend for MockEbpfBackend {
 
     #[cfg(test)]
     fn clear_datapath_flags_write_log(&mut self) {
-        self.datapath_flags_writes.lock().unwrap().clear();
+        self.datapath_flags_writes.lock().clear();
         self.datapath_flags_write_trace.clear();
         self.datapath_flags_writes_after_arm = 0;
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_quiesce) {
+            anyhow::bail!("injected quiesce failure");
+        }
         let staged = self
             .udp_conn_states
             .iter()
@@ -722,133 +610,104 @@ impl EbpfBackend for MockEbpfBackend {
                 "mock UDP staging quiescence rejected {token}: {result:?}"
             );
         }
-        Ok(())
-    }
-
-    fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()> {
-        self.params.insert(key as u32, value);
-        Ok(())
-    }
-
-    fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>> {
-        Ok(self.params.get(&(key as u32)).copied())
-    }
-
-    fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::Rules)?;
-        let base = generation * MAX_MATCH_SET_LEN;
-        for (i, rule) in rules.iter().enumerate() {
-            self.routing_map.insert(base + i as u32, *rule);
+        if self.routing_generation.is_some() {
+            let generation = self
+                .next_generation
+                .checked_add(1)
+                .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
+                .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+            self.next_generation = generation;
+            self.descriptor.generation = generation;
         }
-        self.count_routing_writes(rules.len() as u64);
         Ok(())
     }
 
-    fn active_routing_generation(&self) -> anyhow::Result<u32> {
-        Ok(self
-            .routing_meta
-            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-            .copied()
-            .unwrap_or(0))
-    }
-
-    fn publish_routing_generation(
+    fn publish_routing_plan(
         &mut self,
-        generation: u32,
-        count: u32,
-        group_bitmaps: &RoutingGroupBitmaps,
+        plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::Meta)?;
-        for (g, words) in group_bitmaps.iter().enumerate() {
-            for (w, word) in words.iter().enumerate() {
-                let slot = routing_meta_bitmap_base(generation)
-                    + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32;
-                self.routing_meta.insert(slot, *word);
-                self.routing_meta_write_order.push(slot);
-                self.routing_publication_order
-                    .push(MockRoutingPublicationWrite::Exploded(slot));
-            }
-        }
-        self.routing_meta
-            .insert(routing_meta_count_slot(generation), count);
-        self.routing_meta_write_order
-            .push(routing_meta_count_slot(generation));
+        let generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+        anyhow::ensure!(
+            generation <= DNS_ROUTE_GENERATION_MAX,
+            "routing generation counter exhausted at {DNS_ROUTE_GENERATION_MAX}"
+        );
+        anyhow::ensure!(
+            self.active_slot < 2,
+            "invalid active routing slot {}",
+            self.active_slot
+        );
+        let slot = self.active_slot ^ 1;
+        let trace_policy = if plan.trace_enabled() {
+            self.next_trace_policy = self.next_trace_policy.saturating_add(1);
+            self.next_trace_policy
+        } else {
+            0
+        };
+        self.take_routing_fault(RoutingPushPhase::DomainRouting)?;
+        let domain: HashMap<_, _> = learned_domains
+            .iter()
+            .map(|(key, bitmap)| (key.data, *bitmap))
+            .collect();
+        self.take_routing_fault(RoutingPushPhase::DestinationLpm)?;
+        self.take_routing_fault(RoutingPushPhase::SourceLpm)?;
+        self.take_routing_fault(RoutingPushPhase::MacLpm)?;
+        let domain_write_count = domain.len();
         self.routing_publication_order
-            .push(MockRoutingPublicationWrite::Exploded(
-                routing_meta_count_slot(generation),
-            ));
-        for (group, bitmap) in group_bitmaps.iter().enumerate() {
-            let index = routing_group_meta_index(generation, group as u32);
-            self.routing_group_meta.insert(
-                index,
-                RoutingGroupMeta {
-                    rule_count: count,
-                    bitmap: *bitmap,
-                },
-            );
-            self.routing_publication_order
-                .push(MockRoutingPublicationWrite::Packed(index));
-        }
-        self.routing_meta
-            .insert(ROUTING_META_ACTIVE_GENERATION_SLOT, generation);
-        self.routing_meta_write_order
-            .push(ROUTING_META_ACTIVE_GENERATION_SLOT);
+            .push(MockRoutingPublicationWrite::FactMaps(slot));
+        self.take_routing_fault(RoutingPushPhase::Program)?;
         self.routing_publication_order
-            .push(MockRoutingPublicationWrite::Selector(generation));
+            .push(MockRoutingPublicationWrite::Program(slot));
+        self.take_routing_fault(RoutingPushPhase::Attach)?;
+        self.routing_publication_order
+            .push(MockRoutingPublicationWrite::Attach(slot));
+
+        let domain_map_id = self
+            .next_domain_map_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("domain map id counter exhausted"))?;
+        let candidate = MockRoutingGeneration {
+            fingerprint: plan.fingerprint,
+            rule_count: plan.rules.len(),
+            facts: plan.facts.clone(),
+            domain,
+        };
+        self.take_routing_fault(RoutingPushPhase::Root)?;
+        self.routing_generation = Some(candidate);
+        self.active_slot = slot;
+        self.descriptor = RoutingPolicyDescriptor {
+            slot,
+            features: plan.features,
+            generation,
+            domain_map_id,
+            trace_policy,
+        };
+        self.next_generation = generation;
+        self.next_domain_map_id = domain_map_id;
+        self.routing_publication_order
+            .push(MockRoutingPublicationWrite::Root(slot));
         self.count_routing_writes(
-            (ROUTING_GROUP_COUNT * ROUTING_GROUP_BITMAP_WORDS + ROUTING_GROUP_COUNT + 2) as u64,
+            (plan.facts.destination_v4.len()
+                + plan.facts.destination_v6.len()
+                + plan.facts.source_v4.len()
+                + plan.facts.source_v6.len()
+                + plan.facts.mac.len()
+                + plan.rules.len()
+                + domain_write_count
+                + 1) as u64,
         );
         Ok(())
     }
 
-    fn add_domain_route(&mut self, domain: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
-        let hash = fnv1a_hash(domain.as_bytes());
-        self.domain_routes.insert(hash, outbound as u32);
-        Ok(())
+    fn routing_policy_generation(&self) -> u64 {
+        self.next_generation
     }
 
-    fn add_domain_routing_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let bitmap = self.bitmap_for_active_generation(bitmap);
-        Self::or_bitmap(&mut self.domain_routing_bitmap, key, &bitmap);
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::DestinationLpm)?;
-        // Overwrite semantics, matching the real backend: an LPM trie lookup
-        // returns the longest-prefix *match*, not the exact entry, so the
-        // real backend cannot read-modify-write and overwrites instead.
-        // Cross-rule bitmap merging happens in the push plan before entries
-        // reach the backend.
-        self.dest_lpm_bitmap
-            .insert(Self::lpm_key_bytes(key), *bitmap);
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn add_source_lpm_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::SourceLpm)?;
-        self.source_lpm_bitmap
-            .insert(Self::lpm_key_bytes(key), *bitmap);
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::MacLpm)?;
-        self.mac_lpm_bitmap
-            .insert(Self::lpm_key_bytes(key), *bitmap);
-        self.count_routing_writes(1);
-        Ok(())
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
+        Ok(self.active_slot)
     }
 
     fn add_domain_ip_bitmap(
@@ -861,8 +720,14 @@ impl EbpfBackend for MockEbpfBackend {
             self.domain_bitmap_add_faults -= 1;
             anyhow::bail!("injected domain bitmap write failure");
         }
-        let bitmap = self.bitmap_for_active_generation(bitmap);
-        Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, &bitmap);
+        let generation = self
+            .routing_generation
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no active routing generation"))?;
+        let current = generation.domain.entry(ip_key.data).or_default();
+        for (current, update) in current.bitmap.iter_mut().zip(bitmap.bitmap) {
+            *current |= update;
+        }
         self.count_routing_writes(1);
         Ok(())
     }
@@ -874,96 +739,25 @@ impl EbpfBackend for MockEbpfBackend {
     ) -> Result<(), super::DomainRouteWriteError> {
         #[cfg(test)]
         self.take_projection_fault(ProjectionMapOperation::Set)?;
-        let key = Self::lpm_key_bytes(ip_key);
-        let bitmap =
-            self.replace_active_bitmap(self.domain_routing_bitmap.get(&key).copied(), bitmap);
-        self.domain_routing_bitmap.insert(key, bitmap);
+        let generation = self.routing_generation.as_mut().ok_or_else(|| {
+            super::DomainRouteWriteError::Other(anyhow::anyhow!("no active routing generation"))
+        })?;
+        generation.domain.insert(ip_key.data, *bitmap);
         self.count_routing_writes(1);
         Ok(())
     }
+
     fn remove_domain_ip_bitmap(
         &mut self,
         ip_key: &LpmKey,
     ) -> Result<(), super::DomainRouteWriteError> {
         #[cfg(test)]
         self.take_projection_fault(ProjectionMapOperation::Remove)?;
-        let key = Self::lpm_key_bytes(ip_key);
-        let Some(mut bitmap) = self.domain_routing_bitmap.get(&key).copied() else {
-            return Ok(());
-        };
-        let generation = self.active_routing_generation()?;
-        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-        bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
-        if bitmap.bitmap.iter().all(|word| *word == 0) {
-            self.domain_routing_bitmap.remove(&key);
-        } else {
-            self.domain_routing_bitmap.insert(key, bitmap);
-        }
+        let generation = self.routing_generation.as_mut().ok_or_else(|| {
+            super::DomainRouteWriteError::Other(anyhow::anyhow!("no active routing generation"))
+        })?;
+        generation.domain.remove(&ip_key.data);
         self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn stage_domain_routing_generation(
-        &mut self,
-        generation: u32,
-        entries: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::DomainRouting)?;
-        anyhow::ensure!(
-            generation < ROUTING_BITMAP_GENERATIONS as u32,
-            "invalid routing generation {generation}"
-        );
-        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-        let entries_before = self.domain_routing_bitmap.len();
-        for bitmap in self.domain_routing_bitmap.values_mut() {
-            bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
-        }
-        for (key, logical) in entries {
-            let bitmap = self
-                .domain_routing_bitmap
-                .entry(Self::lpm_key_bytes(key))
-                .or_default();
-            bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
-                .copy_from_slice(&logical.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
-        }
-        self.count_routing_writes((entries_before + entries.len()) as u64);
-        Ok(())
-    }
-
-    fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
-        let (ip_str, len_str) = prefix.split_once('/').unwrap_or((prefix, "32"));
-        let ip: u32 = parse_ipv4(ip_str)?;
-        let prefix_len: u8 = len_str.parse().unwrap_or(32);
-        self.ip_routes.insert((ip, prefix_len), outbound as u32);
-        Ok(())
-    }
-
-    fn clear_routes(&mut self) -> anyhow::Result<()> {
-        self.domain_routes.clear();
-        self.ip_routes.clear();
-        self.routing_map.clear();
-        self.routing_meta.clear();
-        self.routing_group_meta.clear();
-        self.routing_meta_write_order.clear();
-        self.routing_publication_order.clear();
-        self.domain_routing_bitmap.clear();
-        self.dest_lpm_bitmap.clear();
-        self.source_lpm_bitmap.clear();
-        self.mac_lpm_bitmap.clear();
-        Ok(())
-    }
-
-    fn prune_lpm_entries(&mut self, keep: &LpmKeepSet) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::PruneLpm)?;
-        let entries_before =
-            self.dest_lpm_bitmap.len() + self.source_lpm_bitmap.len() + self.mac_lpm_bitmap.len();
-        self.dest_lpm_bitmap.retain(|k, _| keep.dest.contains(k));
-        self.source_lpm_bitmap
-            .retain(|k, _| keep.source.contains(k));
-        self.mac_lpm_bitmap.retain(|k, _| keep.mac.contains(k));
-        let entries_after =
-            self.dest_lpm_bitmap.len() + self.source_lpm_bitmap.len() + self.mac_lpm_bitmap.len();
-        self.count_routing_writes((entries_before - entries_after) as u64);
         Ok(())
     }
 
@@ -1079,6 +873,18 @@ impl EbpfBackend for MockEbpfBackend {
         if !udp_state_is_legacy_userspace_owned(&state) {
             return Ok(UdpDecisionCommitResult::Superseded);
         }
+        if unsafe { state.meta.raw } & ROUTING_META_FLAG_WAN_USERSPACE != 0 {
+            let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
+            let track_key = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(key));
+            let track = self.redirect_tracks.get(&track_key).copied();
+            if handoff.is_some_and(|entry| entry.result.decision_token != 0)
+                || track.is_some_and(|entry| entry.decision_token != 0)
+            {
+                return Ok(UdpDecisionCommitResult::TokenMismatch);
+            }
+            self.routing_handoffs.lock().remove(&key_bytes);
+            self.redirect_tracks.remove(&track_key);
+        }
         if self.udp_conn_states.remove(&key_bytes).is_some() {
             super::USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(UdpDecisionCommitResult::Applied)
@@ -1183,17 +989,45 @@ impl EbpfBackend for MockEbpfBackend {
             .remove(&Self::tuples_key_bytes(key)))
     }
 
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries.bind(
+                self.descriptor.trace_policy,
+                owner.fingerprint,
+                dictionary,
+            );
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        key: &TuplesKey,
+        reference: crate::observe::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str> {
+        if reference.trace_id == 0 {
+            return Err("kernel_trace_not_captured");
+        }
+        if reference.trace_id == ROUTE_TRACE_LOST {
+            return Err("kernel_trace_lost");
+        }
+        let witness = self
+            .route_witnesses
+            .get(&reference.trace_id)
+            .ok_or("kernel_trace_sidecar_missing")?;
+        self.trace_dictionaries.capture(witness, key, reference)
+    }
+
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>> {
         Ok(self.cookie_pids.get(&cookie).copied())
     }
 
     fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()> {
         self.cookie_pids.insert(cookie, *entry);
-        Ok(())
-    }
-
-    fn cookie_pid_remove(&mut self, cookie: &u64) -> anyhow::Result<()> {
-        self.cookie_pids.remove(cookie);
         Ok(())
     }
 
@@ -1221,45 +1055,8 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(self.outbound_alive.get(&key).copied().unwrap_or(0) != 0)
     }
 
-    fn get_outbound_stats(&self, outbound: OutboundIndex) -> anyhow::Result<OutboundStats> {
-        Ok(self
-            .stats
-            .get(&(outbound as u32))
-            .copied()
-            .unwrap_or_default())
-    }
-
-    fn clear_outbound_stats(&mut self, outbound: OutboundIndex) -> anyhow::Result<()> {
-        self.stats.insert(outbound as u32, OutboundStats::default());
-        Ok(())
-    }
-
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>> {
         Ok(self.bpf_stats.get(&key).copied())
-    }
-
-    fn conn_track_lookup(&self, tuple: &ConnTuple) -> anyhow::Result<Option<u32>> {
-        Ok(self.conn_track.get(&Self::tuple_key(tuple)).copied())
-    }
-
-    fn conn_track_store(&mut self, tuple: &ConnTuple, outbound_idx: u32) -> anyhow::Result<()> {
-        self.conn_track.insert(Self::tuple_key(tuple), outbound_idx);
-        Ok(())
-    }
-
-    fn conn_track_remove(&mut self, tuple: &ConnTuple) -> anyhow::Result<()> {
-        self.conn_track.remove(&Self::tuple_key(tuple));
-        Ok(())
-    }
-
-    fn redirect_track_snapshot(
-        &self,
-        out: &mut Vec<(RedirectTuple, RedirectEntry)>,
-    ) -> anyhow::Result<()> {
-        for (kb, entry) in &self.redirect_tracks {
-            out.push((Self::bytes_to_redirect_tuple(kb), *entry));
-        }
-        Ok(())
     }
 
     fn redirect_track_for_each_chunk(
@@ -1283,11 +1080,6 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()> {
-        out.extend(self.cookie_pids.iter().map(|(&c, &e)| (c, e)));
-        Ok(())
-    }
-
     fn cookie_pid_for_each_chunk(
         &self,
         chunk_size: usize,
@@ -1305,16 +1097,6 @@ impl EbpfBackend for MockEbpfBackend {
         }
         if !chunk.is_empty() {
             visit(&chunk);
-        }
-        Ok(())
-    }
-
-    fn routing_handoff_snapshot(
-        &self,
-        out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
-    ) -> anyhow::Result<()> {
-        for (kb, entry) in self.routing_handoffs.lock().iter() {
-            out.push((Self::bytes_to_tuples_key(kb), *entry));
         }
         Ok(())
     }
@@ -1340,14 +1122,6 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn redirect_track_remove_batch(&mut self, keys: &[RedirectTuple]) -> anyhow::Result<()> {
-        for key in keys {
-            self.redirect_tracks
-                .remove(&Self::redirect_tuple_bytes(key));
-        }
-        Ok(())
-    }
-
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
         for (kb, entry) in self
             .tcp_conn_states
@@ -1355,30 +1129,6 @@ impl EbpfBackend for MockEbpfBackend {
             .chain(self.udp_conn_states.iter())
         {
             out.push((Self::bytes_to_tuples_key(kb), *entry));
-        }
-        Ok(())
-    }
-
-    fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
-        for key in keys {
-            let kb = Self::tuples_key_bytes(key);
-            self.tcp_conn_states.remove(&kb);
-            self.udp_conn_states.remove(&kb);
-        }
-        Ok(())
-    }
-
-    fn cookie_pid_remove_batch(&mut self, cookies: &[u64]) -> anyhow::Result<()> {
-        for cookie in cookies {
-            self.cookie_pids.remove(cookie);
-        }
-        Ok(())
-    }
-
-    fn routing_handoff_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
-        let handoffs = self.routing_handoffs.get_mut();
-        for key in keys {
-            handoffs.remove(&Self::tuples_key_bytes(key));
         }
         Ok(())
     }
@@ -1477,6 +1227,11 @@ impl EbpfBackend for MockEbpfBackend {
         _role: super::IfaceRole,
         _single_homed: bool,
     ) -> anyhow::Result<super::DynamicHooks> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.dynamic_attach_fault,
+            "injected dynamic attach failure"
+        );
         self.dynamic_attach_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(super::DynamicHooks {
@@ -1491,20 +1246,16 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {
-        self.params.clear();
         self.datapath_ready = false;
         self.listener_sockets_published = false;
-        self.domain_routes.clear();
-        self.ip_routes.clear();
-        self.stats.clear();
-        self.conn_track.clear();
-        self.routing_map.clear();
-        self.routing_meta.clear();
-        self.domain_routing_bitmap.clear();
+        self.listener_socket_slots.clear();
+        self.routing_generation = None;
+        self.descriptor = RoutingPolicyDescriptor::default();
         self.tcp_conn_states.clear();
         self.udp_conn_states.clear();
         self.redirect_tracks.clear();
         self.routing_handoffs.get_mut().clear();
+        self.route_witnesses.clear();
         self.cookie_pids.clear();
         self.outbound_alive.clear();
         self.bpf_stats.clear();
@@ -1573,25 +1324,6 @@ mod janitor_conditional_delete_tests {
     }
 }
 
-/// FNV-1a hash function (same as eBPF side).
-fn fnv1a_hash(data: &[u8]) -> u64 {
-    super::maps::fnv1a_hash(data)
-}
-
-/// Parse an IPv4 string to u32.
-fn parse_ipv4(s: &str) -> anyhow::Result<u32> {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 {
-        anyhow::bail!("Invalid IPv4: {}", s);
-    }
-    let mut ip: u32 = 0;
-    for (i, part) in parts.iter().enumerate() {
-        let byte: u8 = part.parse()?;
-        ip |= (byte as u32) << (24 - i * 8);
-    }
-    Ok(ip)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,19 +1359,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_params() {
-        let mut backend = MockEbpfBackend::new();
-        backend
-            .set_param(ParamKey::BigEndianTproxyPort, 12345)
-            .unwrap();
-        assert_eq!(
-            backend.get_param(ParamKey::BigEndianTproxyPort).unwrap(),
-            Some(12345)
-        );
-        assert_eq!(backend.get_param(ParamKey::ControlPlanePid).unwrap(), None);
-    }
-
-    #[test]
     fn test_mock_datapath_readiness() {
         let mut backend = MockEbpfBackend::new();
         assert!(!backend.datapath_ready);
@@ -1654,37 +1373,32 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_domain_route() {
+    fn listener_clear_rejects_live_admission_and_fences_partial_failure() {
         let mut backend = MockEbpfBackend::new();
         backend
-            .add_domain_route("google.com", OutboundIndex::UserBase)
+            .publish_listener_sockets(10, 11, &[12, 13, 14, 15], &[16, 17, 18, 19])
             .unwrap();
-        let hash = fnv1a_hash(b"google.com");
-        assert!(backend.domain_routes.contains_key(&hash));
-    }
-
-    #[test]
-    fn test_mock_ip_route() {
-        let mut backend = MockEbpfBackend::new();
+        backend.set_datapath_ready(true).unwrap();
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(backend.listener_sockets_published);
+        assert_eq!(backend.listener_socket_slots.len(), 10);
+        backend.set_datapath_ready(false).unwrap();
+        backend.listener_clear_fault_at = Some(4);
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(!backend.listener_sockets_published);
+        assert!(!backend.datapath_ready);
+        assert!(!backend.listener_socket_slots.contains_key(&3));
+        assert_eq!(backend.listener_socket_slots.get(&4), Some(&14));
+        assert!(backend.set_datapath_ready(true).is_err());
+        backend.clear_listener_sockets().unwrap();
+        assert!(backend.listener_socket_slots.is_empty());
+        assert!(backend.set_datapath_ready(true).is_err());
         backend
-            .add_ip_route("10.0.0.0/8", OutboundIndex::Direct)
+            .publish_listener_sockets(20, 21, &[22, 23, 24, 25], &[])
             .unwrap();
-        assert_eq!(backend.ip_routes.len(), 1);
-    }
-
-    #[test]
-    fn test_mock_conn_track() {
-        let mut backend = MockEbpfBackend::new();
-        let tuple = ConnTuple::default();
-        backend
-            .conn_track_store(&tuple, OutboundIndex::Direct as u32)
-            .unwrap();
-        assert_eq!(
-            backend.conn_track_lookup(&tuple).unwrap(),
-            Some(OutboundIndex::Direct as u32)
-        );
-        backend.conn_track_remove(&tuple).unwrap();
-        assert_eq!(backend.conn_track_lookup(&tuple).unwrap(), None);
+        assert_eq!(backend.listener_socket_slots.len(), 6);
+        assert!(!backend.listener_socket_slots.contains_key(&6));
+        backend.set_datapath_ready(true).unwrap();
     }
 
     fn decision_test_key() -> TuplesKey {
@@ -1941,6 +1655,91 @@ mod tests {
     }
 
     #[test]
+    fn wan_userspace_removal_retires_only_owned_state_and_auxiliaries() {
+        let key = decision_test_key();
+        let track_key = RedirectTuple::from_tuples(&key);
+        for must in [false, true] {
+            for (state_token, handoff_token, track_token, expected) in [
+                (Some(0), 0, 0, UdpDecisionCommitResult::Applied),
+                (Some(7), 7, 7, UdpDecisionCommitResult::Superseded),
+                (None, 7, 7, UdpDecisionCommitResult::Missing),
+                (Some(0), 7, 0, UdpDecisionCommitResult::TokenMismatch),
+                (Some(0), 0, 7, UdpDecisionCommitResult::TokenMismatch),
+            ] {
+                let mut backend = MockEbpfBackend::new();
+                if let Some(token) = state_token {
+                    backend
+                        .udp_conn_state_store(
+                            &key,
+                            &ConnState {
+                                decision_token: token,
+                                meta: RoutingMeta {
+                                    raw: ROUTING_META_FLAG_PUBLISHED
+                                        | ROUTING_META_FLAG_WAN_USERSPACE
+                                        | (u64::from(must) << 40)
+                                        | (0x200 << 8),
+                                },
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                backend.routing_handoffs.lock().insert(
+                    MockEbpfBackend::tuples_key_bytes(&key),
+                    RoutingHandoffEntry {
+                        result: RoutingResult {
+                            decision_token: handoff_token,
+                            mark: 0x200,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                backend
+                    .redirect_track_store(
+                        &track_key,
+                        &RedirectEntry {
+                            decision_token: track_token,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(backend.remove_udp_flow(&key, 0).unwrap(), expected);
+                if expected == UdpDecisionCommitResult::Applied {
+                    assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+                    assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+                    assert!(backend.redirect_track_lookup(&track_key).unwrap().is_none());
+                } else {
+                    assert_eq!(
+                        backend
+                            .udp_conn_state_lookup(&key)
+                            .unwrap()
+                            .map(|s| s.decision_token),
+                        state_token
+                    );
+                    assert_eq!(
+                        backend
+                            .routing_handoff_lookup(&key)
+                            .unwrap()
+                            .unwrap()
+                            .result
+                            .decision_token,
+                        handoff_token
+                    );
+                    assert_eq!(
+                        backend
+                            .redirect_track_lookup(&track_key)
+                            .unwrap()
+                            .unwrap()
+                            .decision_token,
+                        track_token
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn abort_accounts_state_delete_and_sequence_survives_cleanup() {
         let mut backend = MockEbpfBackend::new();
         let key = decision_test_key();
@@ -2005,257 +1804,98 @@ mod tests {
         assert!(backend.reset_udp_decision_sequence(1).unwrap());
     }
 
-    #[test]
-    fn test_parse_ipv4() {
-        assert_eq!(parse_ipv4("192.168.1.1").unwrap(), 0xc0a80101);
-        assert_eq!(parse_ipv4("10.0.0.0").unwrap(), 0x0a000000);
-        assert!(parse_ipv4("invalid").is_err());
+    fn routing_plan(tag: u8) -> crate::control::routing_matcher::RoutingPushPlan {
+        let rule = honk_config::routing::RoutingRule {
+            name: format!("policy-{tag}"),
+            condition: honk_config::routing::RoutingCondition {
+                domain: vec![format!("policy-{tag}.test")],
+                ip: vec![format!("192.0.2.{tag}/32")],
+                ..Default::default()
+            },
+            outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: u32::from(tag),
+        };
+        let router = crate::routing::Router::new(&[rule], "direct").unwrap();
+        crate::control::routing_matcher::RoutingPushPlan::compile(
+            &router,
+            &HashMap::from([("direct".into(), 0)]),
+            honk_config::types::DialMode::Domain,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn test_set_routing_rules_and_count() {
+    fn routing_publish_is_atomic_and_root_is_last() {
         let mut backend = MockEbpfBackend::new();
+        backend.publish_routing_plan(&routing_plan(1), &[]).unwrap();
+        let accepted = backend.routing_snapshot();
 
-        let rules = vec![
-            MatchSet {
-                outbound: 10,
-                ..Default::default()
-            },
-            MatchSet {
-                outbound: 20,
-                ..Default::default()
-            },
-            MatchSet {
-                outbound: 30,
-                ..Default::default()
-            },
-        ];
-
-        backend.set_routing_rules(0, &rules).unwrap();
-        let all_groups: RoutingGroupBitmaps =
-            [[u32::MAX; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
-        backend
-            .publish_routing_generation(0, 3, &all_groups)
-            .unwrap();
-
-        assert_eq!(backend.routing_map.len(), 3);
-        assert_eq!(backend.routing_map.get(&0).unwrap().outbound, 10);
-        assert_eq!(backend.routing_map.get(&1).unwrap().outbound, 20);
-        assert_eq!(backend.routing_map.get(&2).unwrap().outbound, 30);
-        assert_eq!(
-            backend
-                .routing_meta
-                .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
-                .copied(),
-            Some(0)
-        );
-        assert_eq!(
-            backend
-                .routing_meta
-                .get(&routing_meta_count_slot(0))
-                .copied(),
-            Some(3)
-        );
-        for g in 0..ROUTING_GROUP_COUNT {
-            for w in 0..ROUTING_GROUP_BITMAP_WORDS {
-                let slot =
-                    routing_meta_bitmap_base(0) + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32;
-                assert_eq!(backend.routing_meta.get(&slot).copied(), Some(u32::MAX));
-            }
-        }
-
-        let fewer = vec![MatchSet {
-            outbound: 99,
-            ..Default::default()
-        }];
-        backend.set_routing_rules(0, &fewer).unwrap();
-        backend
-            .publish_routing_generation(0, 1, &all_groups)
-            .unwrap();
-        assert_eq!(backend.routing_map.len(), 3);
-        assert_eq!(backend.routing_map.get(&0).unwrap().outbound, 99);
-        assert!(backend.routing_map.contains_key(&1));
-        assert_eq!(
-            backend
-                .routing_meta
-                .get(&routing_meta_count_slot(0))
-                .copied(),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn test_add_domain_routing_bitmap() {
-        let mut backend = MockEbpfBackend::new();
-
-        let key = LpmKey {
-            prefix_len: 24,
-            data: [0x0a000001, 0, 0, 0],
+        let domain_key = LpmKey {
+            prefix_len: 128,
+            data: [0, 0, 0xffff0000, 2],
         };
-        let mut bitmap = DomainRouting::default();
-        bitmap.bitmap[0] = 0xDEADBEEF;
-        bitmap.bitmap[1] = 0xCAFEBABE;
-
-        backend.add_domain_routing_bitmap(&key, &bitmap).unwrap();
-
-        let stored = backend
-            .domain_routing_bitmap
-            .get(&MockEbpfBackend::lpm_key_bytes(&key));
-        assert!(stored.is_some());
-        assert_eq!(stored.unwrap().bitmap[0], 0xDEADBEEF);
-        assert_eq!(stored.unwrap().bitmap[1], 0xCAFEBABE);
-
-        let key2 = LpmKey {
-            prefix_len: 16,
-            data: [0x0a000001, 0, 0, 0],
-        };
+        backend.fail_next_routing_phase(RoutingPushPhase::Root);
         assert!(
-            !backend
-                .domain_routing_bitmap
-                .contains_key(&MockEbpfBackend::lpm_key_bytes(&key2))
+            backend
+                .publish_routing_plan(&routing_plan(2), &[(domain_key, DomainRouting::default())],)
+                .is_err()
         );
+        assert_eq!(backend.routing_snapshot(), accepted);
+
+        backend.publish_routing_plan(&routing_plan(3), &[]).unwrap();
+        assert!(backend.routing_snapshot().domain.is_empty());
+        let replacement = routing_plan(2);
+        backend
+            .publish_routing_plan(&replacement, &[(domain_key, DomainRouting::default())])
+            .unwrap();
+        let current = backend.routing_snapshot();
+        assert_eq!(current.active_slot, 1);
+        assert_eq!(current.plan_fingerprint, replacement.fingerprint);
+        assert_eq!(current.domain.len(), 1);
+        assert_eq!(current.domain[0].1, [0; ROUTING_BITMAP_WORDS]);
+        assert!(matches!(
+            backend.routing_publication_order.last(),
+            Some(MockRoutingPublicationWrite::Root(1))
+        ));
     }
 
     #[test]
-    fn test_domain_ip_bitmap_set_overwrites_and_remove() {
+    fn routing_generation_ceiling_rejects_before_staging() {
         let mut backend = MockEbpfBackend::new();
+        backend.next_generation = DNS_ROUTE_GENERATION_MAX - 1;
+        backend.publish_routing_plan(&routing_plan(1), &[]).unwrap();
+        let accepted = backend.routing_snapshot();
+        let writes = backend.routing_publication_order.clone();
+
+        assert!(backend.publish_routing_plan(&routing_plan(2), &[]).is_err());
+        assert_eq!(
+            backend.routing_policy_generation(),
+            DNS_ROUTE_GENERATION_MAX
+        );
+        assert_eq!(backend.routing_snapshot(), accepted);
+        assert_eq!(backend.routing_publication_order, writes);
+    }
+
+    #[test]
+    fn active_domain_zero_is_present_until_removed() {
+        let mut backend = MockEbpfBackend::new();
+        backend.publish_routing_plan(&routing_plan(1), &[]).unwrap();
         let key = LpmKey {
             prefix_len: 128,
-            data: [0, 0, 0xffff0000, 0x0a000001],
+            data: [0, 0, 0xffff0000, 3],
         };
-        let mut bm1 = DomainRouting::default();
-        bm1.bitmap[0] = 0b001;
-        let mut bm2 = DomainRouting::default();
-        bm2.bitmap[0] = 0b100;
-
-        // add_domain_ip_bitmap has OR semantics; set_domain_ip_bitmap must
-        // replace the entry wholesale (used by the post-push rebuild so
-        // bitmaps from a previous rule generation do not accumulate).
-        backend.add_domain_ip_bitmap(&key, &bm1).unwrap();
-        backend.set_domain_ip_bitmap(&key, &bm2).unwrap();
-        let stored = backend
-            .domain_routing_bitmap
-            .get(&MockEbpfBackend::lpm_key_bytes(&key))
-            .unwrap();
-        assert_eq!(stored.bitmap[0], 0b100, "set must replace, not OR");
-
-        backend.remove_domain_ip_bitmap(&key).unwrap();
-        assert!(backend.domain_routing_bitmap.is_empty());
-    }
-
-    #[test]
-    fn test_prune_lpm_entries() {
-        let mut backend = MockEbpfBackend::new();
-        let k1 = LpmKey {
-            prefix_len: 104,
-            data: [0, 0, 0xffff0000, 0x0a000000],
-        };
-        let k2 = LpmKey {
-            prefix_len: 120,
-            data: [0, 0, 0xffff0000, 0x01a8c0],
-        };
-        let mut bm = DomainRouting::default();
-        bm.bitmap[0] = 1;
-        backend.add_dest_lpm_bitmap(&k1, &bm).unwrap();
-        backend.add_dest_lpm_bitmap(&k2, &bm).unwrap();
-
-        let mut keep = LpmKeepSet::default();
-        keep.dest.insert(MockEbpfBackend::lpm_key_bytes(&k2));
-        backend.prune_lpm_entries(&keep).unwrap();
-        assert_eq!(backend.dest_lpm_bitmap.len(), 1);
-        assert!(
-            backend
-                .dest_lpm_bitmap
-                .contains_key(&MockEbpfBackend::lpm_key_bytes(&k2))
-        );
-    }
-
-    #[test]
-    fn routing_snapshot_detects_union_payload_changes() {
-        let mut backend = MockEbpfBackend::new();
-        let rule = |port| MatchSet {
-            value: MatchSetValue {
-                port_range: PortRange {
-                    port_start: port,
-                    port_end: port,
-                },
-            },
-            match_type: MatchType::Port as u8,
-            ..MatchSet::default()
-        };
-        backend.routing_map.insert(0, rule(80));
-        backend.routing_meta.insert(routing_meta_count_slot(0), 1);
-        let before = backend.routing_snapshot();
-
-        backend.routing_map.insert(0, rule(81));
-
-        assert_ne!(backend.routing_snapshot(), before);
-    }
-
-    #[test]
-    fn test_snapshots_and_remove_batch() {
-        let mut backend = MockEbpfBackend::new();
-
-        let rt_key = RedirectTuple {
-            src_ip: In6Addr::default(),
-            dst_ip: In6Addr::default(),
-            ..Default::default()
-        };
-        let rt_entry = RedirectEntry {
-            last_seen_ns: 111,
-            ..Default::default()
-        };
-        backend.redirect_track_store(&rt_key, &rt_entry).unwrap();
-        backend.cookie_pid_store(42, &PIDName::default()).unwrap();
-
-        let handoff_key = TuplesKey {
-            src_ip: In6Addr::default(),
-            dst_ip: In6Addr::default(),
-            src_port: 3000,
-            dst_port: 80,
-            l4proto: 6,
-        };
-        let handoff_entry = RoutingHandoffEntry {
-            last_seen_ns: 222,
-            result: RoutingResult {
-                mark: 7,
-                outbound: 3,
-                ..Default::default()
-            },
-        };
-        backend.routing_handoffs.lock().insert(
-            MockEbpfBackend::tuples_key_bytes(&handoff_key),
-            handoff_entry,
-        );
-
-        let mut rt_out = Vec::new();
-        backend.redirect_track_snapshot(&mut rt_out).unwrap();
-        assert_eq!(rt_out.len(), 1);
-        assert_eq!(rt_out[0].1.last_seen_ns, 111);
-
-        let mut cp_out = Vec::new();
-        backend.cookie_pid_snapshot(&mut cp_out).unwrap();
-        assert_eq!(cp_out.len(), 1);
-        assert_eq!(cp_out[0].0, 42);
-
-        let mut ho_out = Vec::new();
-        backend.routing_handoff_snapshot(&mut ho_out).unwrap();
-        assert_eq!(ho_out.len(), 1);
-        assert_eq!(ho_out[0].1.result.mark, 7);
-
-        backend.redirect_track_remove_batch(&[rt_key]).unwrap();
-        backend.cookie_pid_remove_batch(&[42]).unwrap();
         backend
-            .routing_handoff_remove_batch(&[handoff_key])
+            .set_domain_ip_bitmap(&key, &DomainRouting::default())
             .unwrap();
-
-        assert!(backend.redirect_tracks.is_empty());
-        assert!(backend.cookie_pids.is_empty());
-        assert!(backend.routing_handoffs.lock().is_empty());
+        assert_eq!(backend.routing_snapshot().domain.len(), 1);
+        backend.remove_domain_ip_bitmap(&key).unwrap();
+        assert!(backend.routing_snapshot().domain.is_empty());
     }
 
     #[test]
-    fn test_conn_state_snapshot_and_remove_batch() {
+    fn test_conn_state_snapshot() {
         let mut backend = MockEbpfBackend::new();
 
         let tcp_key = TuplesKey {
@@ -2280,16 +1920,6 @@ mod tests {
         backend.conn_state_snapshot(&mut out).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|(_, s)| s.last_seen_ns == 999));
-
-        backend
-            .conn_state_remove_batch(&[tcp_key, udp_key])
-            .unwrap();
-        assert!(backend.tcp_conn_states.is_empty());
-        assert!(backend.udp_conn_states.is_empty());
-
-        let mut out = Vec::new();
-        backend.conn_state_snapshot(&mut out).unwrap();
-        assert!(out.is_empty());
     }
 
     #[test]
@@ -2400,6 +2030,8 @@ mod tests {
                 outbound: 5,
                 ..Default::default()
             },
+            routing_generation: 0,
+            ..Default::default()
         };
         backend
             .routing_handoffs
@@ -2482,107 +2114,40 @@ mod tests {
     }
 
     #[test]
-    fn test_outbound_stats_get_and_clear() {
-        // The mock mirrors the real backend's read semantics: a missing
-        // entry reads as all-zero (the per-CPU array in the kernel also
-        // starts zeroed), and clear() resets the counters without
-        // disturbing other outbounds.
+    fn trace_capture_exhaustion_and_cleanup_never_reuse_ids() {
         let mut backend = MockEbpfBackend::new();
-
-        let empty = backend.get_outbound_stats(OutboundIndex::UserBase).unwrap();
-        assert_eq!(empty.tx_bytes, 0);
-        assert_eq!(empty.rx_bytes, 0);
-        assert_eq!(empty.tx_packets, 0);
-        assert_eq!(empty.rx_packets, 0);
-
-        let stored = OutboundStats {
-            tx_bytes: 1000,
-            rx_bytes: 2000,
-            tx_packets: 10,
-            rx_packets: 20,
-            ..Default::default()
-        };
-        backend.stats.insert(OutboundIndex::UserBase as u32, stored);
-        backend.stats.insert(
-            OutboundIndex::Direct as u32,
-            OutboundStats {
-                tx_bytes: 5,
-                ..Default::default()
-            },
-        );
-
-        let got = backend.get_outbound_stats(OutboundIndex::UserBase).unwrap();
-        assert_eq!(got.tx_bytes, 1000);
-        assert_eq!(got.rx_bytes, 2000);
-        assert_eq!(got.tx_packets, 10);
-        assert_eq!(got.rx_packets, 20);
-
-        // Clearing one outbound leaves the others untouched.
-        backend
-            .clear_outbound_stats(OutboundIndex::UserBase)
-            .unwrap();
-        let cleared = backend.get_outbound_stats(OutboundIndex::UserBase).unwrap();
-        assert_eq!(cleared.tx_bytes, 0);
-        assert_eq!(cleared.rx_packets, 0);
-        assert_eq!(
-            backend
-                .get_outbound_stats(OutboundIndex::Direct)
-                .unwrap()
-                .tx_bytes,
-            5
-        );
+        let mut witness = KernelRouteWitness::default();
+        assert_eq!(backend.capture_route_witness(witness), 0);
+        witness.output.flags = ROUTE_TRACE_ENABLED;
+        let first = backend.capture_route_witness(witness);
+        futures::executor::block_on(backend.cleanup()).unwrap();
+        assert!(backend.capture_route_witness(witness) > first);
+        backend.next_trace_id = ROUTE_TRACE_LOST - 2;
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST - 1);
+        backend.route_witnesses.clear();
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST);
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST);
+        assert!(backend.route_witnesses.is_empty());
     }
 
     #[test]
     fn test_cleanup_clears_all_maps() {
         let mut backend = MockEbpfBackend::new();
-
         backend
-            .set_param(ParamKey::BigEndianTproxyPort, 12345)
+            .tcp_conn_state_store(&TuplesKey::default(), &ConnState::default())
             .unwrap();
         backend
-            .add_domain_route("example.com", OutboundIndex::Direct)
+            .udp_conn_state_store(&TuplesKey::default(), &ConnState::default())
             .unwrap();
         backend
-            .set_routing_rules(0, &[MatchSet::default()])
+            .redirect_track_store(&RedirectTuple::default(), &RedirectEntry::default())
             .unwrap();
-        backend
-            .publish_routing_generation(
-                0,
-                1,
-                &[[u32::MAX; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT],
-            )
-            .unwrap();
-
-        let tcp_key = TuplesKey::default();
-        backend
-            .tcp_conn_state_store(&tcp_key, &ConnState::default())
-            .unwrap();
-
-        let udp_key = TuplesKey::default();
-        backend
-            .udp_conn_state_store(&udp_key, &ConnState::default())
-            .unwrap();
-
-        let rt_key = RedirectTuple::default();
-        backend
-            .redirect_track_store(&rt_key, &RedirectEntry::default())
-            .unwrap();
-
         backend.cookie_pid_store(42, &PIDName::default()).unwrap();
         backend.set_outbound_alive(1, 0, 4, true).unwrap();
         backend.bpf_stats.insert(0, 999);
 
-        let ct = ConnTuple::default();
-        backend.conn_track_store(&ct, 7).unwrap();
-
         futures::executor::block_on(backend.cleanup()).unwrap();
 
-        assert!(backend.params.is_empty());
-        assert!(backend.domain_routes.is_empty());
-        assert!(backend.routing_map.is_empty());
-        assert!(backend.routing_meta.is_empty());
-        assert!(backend.domain_routing_bitmap.is_empty());
         assert!(backend.tcp_conn_states.is_empty());
         assert!(backend.udp_conn_states.is_empty());
         assert!(backend.redirect_tracks.is_empty());
@@ -2590,8 +2155,5 @@ mod tests {
         assert!(backend.cookie_pids.is_empty());
         assert!(backend.outbound_alive.is_empty());
         assert!(backend.bpf_stats.is_empty());
-        assert!(backend.conn_track.is_empty());
-        assert!(backend.stats.is_empty());
-        assert!(backend.ip_routes.is_empty());
     }
 }

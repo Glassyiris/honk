@@ -1,6 +1,6 @@
 # honk Quick Start
 
-honk is an experimental eBPF transparent proxy engine for Linux. This guide covers the installation, configuration, and startup steps needed by regular users. See the links at the end for configuration fields and implementation details.
+honk is an experimental eBPF transparent proxy engine for Linux. Follow this guide to install, configure, and start it. Links at the end cover configuration fields and implementation details.
 
 > **Warning**
 >
@@ -15,8 +15,7 @@ uname -r
 ```
 
 - Only Linux is supported. The real transparent datapath must run as `root`.
-- The current eBPF program uses `bpf_loop`, which requires upstream Linux `5.17+` unless the distribution backports it.
-- Linux `6.8+` is recommended. The `bpf_redirect_peer` fast path is also available on kernels with the safe backports in `5.15.164+`, `6.1.99+`, and `6.6.40+`; other supported kernels automatically use ordinary redirect.
+- Linux `6.12+` is required for compiled routing and its synchronous map-in-map publication guarantee. Older kernels are rejected before attachment.
 - `netkit` is optional. honk falls back to veth when the kernel does not support it.
 
 `lan_interface` intercepts traffic entering the gateway from the LAN. `wan_interface` intercepts traffic originated by the gateway itself:
@@ -28,7 +27,7 @@ uname -r
 
 ### Kernel configuration
 
-Desktop and server distributions usually enable the required features. Minimal systems such as OpenWrt, Armbian, and VyOS need explicit checking. Display the current kernel configuration with:
+Desktop and server distributions usually enable the required features. Check them explicitly on minimal systems such as OpenWrt, Armbian, and VyOS. Display the current kernel configuration with:
 
 ```shell
 zcat /proc/config.gz 2>/dev/null || cat /boot/config-$(uname -r)
@@ -52,8 +51,9 @@ Held-first-packet UDP, which is enabled by default, additionally requires:
 ```text
 CONFIG_NF_TABLES=y|m
 CONFIG_NF_TABLES_INET=y|m
+CONFIG_NFT_CT=y|m
+CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
-CONFIG_NFNETLINK_QUEUE=y|m
 ```
 
 `pname(...)` routing requires cgroup v2. Without cgroup v2, the remaining features can still start, but process-name routing is disabled.
@@ -97,9 +97,9 @@ Release binaries embed the eBPF object, so `honk-ebpf` does not need to be insta
 
 A source build requires:
 
-- Rust stable;
-- `nightly-2026-07-20`, `rust-src`, and `llvm-tools-preview`;
-- `bpf-linker 0.10.3`;
+- the stable Rust version in the root `rust-toolchain.toml` (`rustfmt`, `clippy`);
+- the nightly in `crates/honk-ebpf/rust-toolchain.toml` (`rust-src`, `llvm-tools`);
+- the `bpf-linker` version in `.github/ci/pins.env`;
 - a C/C++ toolchain, CMake, Clang, LLVM, libclang, libbpf headers, binutils, pkg-config, and Git;
 - network access to crates.io and GitHub.
 
@@ -119,36 +119,32 @@ sudo pacman -S --needed \
   base-devel clang llvm libbpf cmake pkgconf git curl ca-certificates
 ```
 
-Install the Rust toolchains:
+Clone the repository, then install its pinned Rust toolchains:
 
 ```shell
-rustup toolchain install stable --profile minimal
-rustup toolchain install nightly-2026-07-20 --profile minimal \
-  --component rust-src --component llvm-tools-preview
-cargo install bpf-linker --version 0.10.3
+git clone https://github.com/daeuniverse/honk.git
+cd honk
+rustup toolchain install $(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml) \
+  --profile minimal --component rustfmt --component clippy
+rustup toolchain install $(grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml) \
+  --profile minimal --component rust-src --component llvm-tools
+source .github/ci/pins.env
+cargo install bpf-linker --version "$BPF_LINKER_VERSION"
 ```
 
 Build the current `main` branch:
 
 ```shell
-git clone https://github.com/daeuniverse/honk.git
-cd honk
-
-# The current eBPF Cargo config contains a maintainer-local linker path.
-# Use the bpf-linker installed in PATH on a clean machine.
-sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
-  crates/honk-ebpf/.cargo/config.toml
-
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 (
   cd crates/honk-ebpf
-  cargo +nightly-2026-07-20 build --release \
+  cargo build --release \
     -Zbuild-std=core --target bpfel-unknown-none
 )
 
 readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf \
   | grep -q '\.BTF'
-cargo +stable build --release -p honk-core --features ebpf
+cargo build --release -p honk-core --features ebpf
 sudo install -m 0755 target/release/honk-core /usr/local/bin/honk-core
 ```
 
@@ -156,13 +152,13 @@ sudo install -m 0755 target/release/honk-core /usr/local/bin/honk-core
 
 ## Minimal configuration
 
-Start with a direct-only configuration to prove that the datapath works, then add subscriptions or proxy nodes. Replace `br-lan` with the LAN interface that actually receives client traffic. Remove `lan_interface` when only local traffic should be intercepted.
+Start with a direct-only configuration to verify the datapath, then add subscriptions or proxy nodes. Replace `br-lan` with the LAN interface receiving client traffic. Remove `lan_interface` to intercept only local traffic.
 
 ```dae
 global {
     wan_interface: auto
     lan_interface: br-lan
-    data_dir: '/var/share/honk'
+    data_dir: '/var/lib/honk'
     log_level: info
     dial_mode: domain
     auto_config_kernel_parameter: true
@@ -176,9 +172,11 @@ routing {
 Install the configuration:
 
 ```shell
-sudo install -d -m 0700 /etc/honk /var/share/honk
+sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
+
+The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. honk does not automatically relocate them; writable state remains active in place. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below the configured directory.
 
 Start honk in the foreground:
 
@@ -218,11 +216,13 @@ See the [configuration guide](configuration.md) for the complete configuration f
 Download these files only when the configuration references `geoip:` or `geosite:`:
 
 ```shell
-sudo curl -fL --retry 3 -o /var/share/honk/geosite.dat \
+sudo curl -fL --retry 3 -o /var/lib/honk/geosite.dat \
   https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-sudo curl -fL --retry 3 -o /var/share/honk/geoip.dat \
+sudo curl -fL --retry 3 -o /var/lib/honk/geoip.dat \
   https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
 ```
+
+The engine selects the first existing regular file in this order: `$DAE_LOCATION_ASSET/<name>`, `<data_dir>/<name>`, `/var/share/honk/<name>`, `./<name>`, `/usr/local/share/honk/<name>`, `/usr/share/honk/<name>`, `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`.
 
 ## Run with systemd
 
@@ -237,8 +237,8 @@ After=network-online.target
 [Service]
 Type=notify
 User=root
-WorkingDirectory=/var/share/honk
-ExecStart=/usr/local/bin/honk-core --config /etc/honk/config.dae
+WorkingDirectory=/var/lib/honk
+ExecStart=/usr/local/bin/honk-core --config /etc/honk/config.dae --disable-timestamp
 ExecReload=/usr/local/bin/honk-core reload
 Restart=on-failure
 RestartSec=2s
@@ -276,12 +276,12 @@ sudo journalctl -u honk-core --since '5 minutes ago'
 If `honk-tool` was built from source, run its read-only diagnosis:
 
 ```shell
-cargo +stable build --release -p honk-tool
+cargo build --release -p honk-tool
 sudo ./target/release/honk-tool diagnose \
   --api http://127.0.0.1:9090 --pin-root /sys/fs/bpf
 ```
 
-Finally, use a real client to exercise direct and proxied TCP, UDP, and DNS traffic, plus IPv4/IPv6 where required. The presence of `dae0` or a reachable API is not an end-to-end traffic check.
+Use a real client to exercise direct and proxied TCP, UDP, and DNS traffic, plus IPv4/IPv6 where required. The presence of `dae0` or a reachable API is not an end-to-end traffic check.
 
 ## Reload and stop
 
@@ -321,14 +321,14 @@ routing {
 ```
 
 ```shell
-cargo +stable run --release -p honk-core -- \
+cargo run --release -p honk-core -- \
   --config /tmp/honk.dae --mock-ebpf
 ```
 
 ## Current capabilities and limitations
 
 - Outbounds: Direct, Block, SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS.
-- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and non-legacy VLESS modes. VMess and legacy VLESS are TCP-only.
+- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and VLESS when its independent packet permission is enabled. VLESS fallback encoding and multiplex carrier are separate choices; VMess remains TCP-only. See the [VLESS node reference](reference/nodes.md#vless-udp-and-multiplexing).
 - Groups: Selector, URLTest, LoadBalance, Fallback, and Score.
 - DNS upstreams: UDP, TCP, DoT, DoH, DoH3, and DoQ, optionally through a node or group.
 - `direct` and `block` are built-in nodes and must not be redeclared.
@@ -340,15 +340,15 @@ cargo +stable run --release -p honk-core -- \
 
 | Symptom | Action |
 | --- | --- |
-| `bpf-linker-wrapper` is missing | Replace the maintainer-local path with the `bpf-linker` in PATH as shown in the source-build section. |
+| `bpf-linker` is missing | Install it as shown in the source-build section and add Cargo's bin directory to PATH. |
 | `no BTF parsed for object` | Clear `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, rebuild the eBPF object, and confirm `.BTF` with `readelf`. |
-| The verifier reports `unknown bpf func`/`bpf_loop` | Upgrade the kernel or use a distribution kernel that explicitly backports the helper. |
+| The kernel or verifier rejects compiled routing | Use Linux `6.12+` with BPF/BTF and freplace support. Keep the full verifier log and the generated rule attribution; do not bypass the startup failure. |
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
 | LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
-| A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or remove unused Geo rules. |
+| A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |
 | A GNU binary does not execute on VyOS or a minimal system | Use the musl release for the same architecture. |
 
 ## Further reading
@@ -361,3 +361,9 @@ cargo +stable run --release -p honk-core -- \
 - [DNS configuration](reference/dns.md)
 - [CLI](reference/cli.md)
 - [Architecture overview](design/overview.md)
+
+## Check parser changes
+
+From the repository root, run `just parser-ci` with the pinned stable Rust compiler, Go 1.26 or newer, Python 3.11 or newer, and network access. How to write a case is in `crates/honk-config/conformance/README.md`; the oracle and its licence are described in `tools/dae-parse/README.md`. It builds the pinned dae oracle, fetches upstream examples with manifest SHA256 checks, compares decoded structure and recorded dialect differences, then replays saved fuzz inputs. `just fuzz-replay` needs only stable Rust after Cargo dependencies are cached; it uses the same assertions as the fuzz targets. A replay failure prints the input path, and a hung input fails after five seconds.
+
+The `parser` CI lane runs for config code, the oracle, fuzz inputs, corpus source documents and their build inputs, or with `ci:full`. Ordinary workspace commands do not enable `conformance` or `fuzz-checks` and need neither Go nor nightly. The weekly job uses the nightly channel in `crates/honk-ebpf/rust-toolchain.toml` and cargo-fuzz pinned in `.github/ci/pins.env`. It runs `document`, `share_link`, and `lexer` for 480 seconds each with two workers and uploads findings and corpus files. Add a retained finding under `fuzz/artifacts/<target>/` to replay it on stable. Sanitizer-only findings still require the nightly fuzz target.

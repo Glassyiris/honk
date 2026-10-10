@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
 use honk_config::dns::DnsUpstream;
 use honk_config::node::Node;
 use honk_config::types::{DnsProtocol, NodeProtocol};
@@ -25,6 +24,8 @@ use crate::dns::transport::{DialContext, DohClient, DotPool, ProxyDial, TcpPool}
 use crate::dns::upstream_pool::UpstreamPool;
 use crate::dns::{DnsResolver, cache::DnsCache};
 use crate::proxy::{PacketOutbound, PacketTransport, ProtocolEntry, ProxyStream, TcpOutbound};
+
+mod quic_lifecycle;
 
 fn mock_dns_response(txid: u16) -> Vec<u8> {
     vec![
@@ -105,7 +106,7 @@ fn ensure_crypto_provider() {
     });
 }
 
-fn self_signed_server_config() -> (ServerConfig, rustls::RootCertStore) {
+pub(super) fn self_signed_server_config() -> (ServerConfig, rustls::RootCertStore) {
     ensure_crypto_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "dns.test".into()])
         .expect("rcgen");
@@ -131,6 +132,7 @@ struct TrackedUdpTransport {
     socket: UdpSocket,
     remote: SocketAddr,
     active: Arc<AtomicUsize>,
+    fault: Option<Arc<PacketWorkerFault>>,
 }
 
 impl Drop for TrackedUdpTransport {
@@ -151,7 +153,44 @@ impl PacketTransport for TrackedUdpTransport {
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let _teardown = self.fault.as_ref().and_then(|fault| {
+            fault.entered.notify_one();
+            assert!(
+                !fault.panic.swap(false, Ordering::AcqRel),
+                "injected adapter panic"
+            );
+            fault
+                .release
+                .lock()
+                .take()
+                .map(|release| PacketWorkerTeardown {
+                    fault: Arc::clone(fault),
+                    release,
+                })
+        });
         Ok((self.socket.recv(buf).await?, self.remote))
+    }
+}
+
+#[derive(Debug, Default)]
+struct PacketWorkerFault {
+    entered: tokio::sync::Notify,
+    dropping: tokio::sync::Notify,
+    release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    completed: std::sync::atomic::AtomicBool,
+    panic: std::sync::atomic::AtomicBool,
+}
+
+struct PacketWorkerTeardown {
+    fault: Arc<PacketWorkerFault>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drop for PacketWorkerTeardown {
+    fn drop(&mut self) {
+        self.fault.dropping.notify_one();
+        let _ = self.release.recv_timeout(Duration::from_secs(5));
+        self.fault.completed.store(true, Ordering::Release);
     }
 }
 
@@ -159,6 +198,7 @@ impl PacketTransport for TrackedUdpTransport {
 struct TestPacketHandler {
     active: Arc<AtomicUsize>,
     runtime_dials: Arc<AtomicUsize>,
+    fault: Option<Arc<PacketWorkerFault>>,
 }
 
 impl TestPacketHandler {
@@ -175,6 +215,7 @@ impl TestPacketHandler {
             socket,
             remote: target,
             active: Arc::clone(&self.active),
+            fault: self.fault.clone(),
         }))
     }
 }
@@ -224,19 +265,26 @@ pub(super) struct ProxiedQuicFixture {
 }
 
 pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture {
+    proxied_quic_fixture_with_fault(endpoint, None)
+}
+
+fn proxied_quic_fixture_with_fault(
+    endpoint: DnsEndpoint,
+    fault: Option<Arc<PacketWorkerFault>>,
+) -> ProxiedQuicFixture {
     let active = Arc::new(AtomicUsize::new(0));
     let runtime_dials = Arc::new(AtomicUsize::new(0));
     let handler = Arc::new(TestPacketHandler {
         active: Arc::clone(&active),
         runtime_dials: Arc::clone(&runtime_dials),
+        fault,
     });
     let mut registry = crate::proxy::ProxyRegistry::new();
     registry.register(
         ProtocolEntry::new(NodeProtocol::Socks5, Arc::clone(&handler))
             .with_packet(Arc::clone(&handler)),
     );
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
+    let mut node = Node {
         name: "packet-proxy".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:1".into(),
@@ -244,6 +292,7 @@ pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture 
         port: 1,
         ..Default::default()
     };
+    node.id = node.derive_id();
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
             .unwrap(),
@@ -288,7 +337,7 @@ pub(super) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
     .unwrap()
 }
 
-fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
+pub(super) fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
     ensure_crypto_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut tls =
@@ -322,44 +371,13 @@ pub(super) fn spawn_doq_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
             recv.read_exact(&mut length).await.unwrap();
             let mut query = vec![0; u16::from_be_bytes(length) as usize];
             recv.read_exact(&mut query).await.unwrap();
-            let response = mock_dns_response(0);
+            let mut response = query;
+            response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
             send.write_all(&(response.len() as u16).to_be_bytes())
                 .await
                 .unwrap();
             send.write_all(&response).await.unwrap();
             send.finish().unwrap();
-        }
-        connection.closed().await;
-    });
-    (address, task)
-}
-
-pub(super) fn spawn_doh3_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let (endpoint, address) = quic_server_endpoint(b"h3");
-    let task = tokio::spawn(async move {
-        let connection = endpoint.accept().await.unwrap().await.unwrap();
-        let mut h3 = h3::server::builder()
-            .build(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            let resolver = h3.accept().await.unwrap().unwrap();
-            let (_request, mut stream) = resolver.resolve_request().await.unwrap();
-            while let Some(mut data) = stream.recv_data().await.unwrap() {
-                while data.has_remaining() {
-                    let length = data.chunk().len();
-                    data.advance(length);
-                }
-            }
-            stream
-                .send_response(http::Response::builder().status(200).body(()).unwrap())
-                .await
-                .unwrap();
-            stream
-                .send_data(Bytes::from(mock_dns_response(0)))
-                .await
-                .unwrap();
-            stream.finish().await.unwrap();
         }
         connection.closed().await;
     });

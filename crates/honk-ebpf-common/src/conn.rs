@@ -24,6 +24,7 @@ use network_types::{
 ///   offset 30: padding: [u8; 2]
 ///   offset 32: pname: [u8; TASK_COMM_LEN] (process name)
 ///   offset 48: pid: u32
+///   offset 52: trace_id: u32 (immutable route witness, independent of decision_token)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnState {
@@ -36,6 +37,7 @@ pub struct ConnState {
     pub padding: [u8; 2],
     pub pname: [u8; TASK_COMM_LEN],
     pub pid: u32,
+    pub trace_id: u32,
 }
 
 const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 56);
@@ -51,6 +53,7 @@ const _CONN_STATE_MAC_OFFSET: () = assert!(core::mem::offset_of!(ConnState, mac)
 const _CONN_STATE_PADDING_OFFSET: () = assert!(core::mem::offset_of!(ConnState, padding) == 30);
 const _CONN_STATE_PNAME_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pname) == 32);
 const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid) == 48);
+const _: () = assert!(core::mem::offset_of!(ConnState, trace_id) == 52);
 
 // Matches the C enum bpf_stats_key.
 // The C enum's underlying type defaults to int (32-bit); use u32 for compatibility.
@@ -160,7 +163,7 @@ pub struct ParseTransportCtx {
     pub ihl: u8,              // IP header length in 4-byte units
     pub l4proto: u8,          // Actual L4 protocol
     pub listener_l4proto: u8, // Listener protocol
-    pub pad: u8,              // Alignment padding
+    pub is_fragmented: u8,
 }
 
 /// CT_ARGS_HAS_* bit flags.
@@ -180,7 +183,11 @@ pub struct ConntrackArgs {
     pub mac: [u8; 6],
     pub padding: [u8; 2],
     pub pname: [u8; TASK_COMM_LEN],
+    pub trace_id: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 40);
+const _: () = assert!(core::mem::offset_of!(ConntrackArgs, trace_id) == 36);
 
 impl ConntrackArgs {
     #[inline(always)]
@@ -199,33 +206,6 @@ impl ConntrackArgs {
     }
 
     #[inline(always)]
-    pub fn set_routing(&mut self, val: bool) {
-        if val {
-            self.flags |= CT_ARGS_HAS_ROUTING;
-        } else {
-            self.flags &= !CT_ARGS_HAS_ROUTING;
-        }
-    }
-
-    #[inline(always)]
-    pub fn set_mac(&mut self, val: bool) {
-        if val {
-            self.flags |= CT_ARGS_HAS_MAC;
-        } else {
-            self.flags &= !CT_ARGS_HAS_MAC;
-        }
-    }
-
-    #[inline(always)]
-    pub fn set_pname(&mut self, val: bool) {
-        if val {
-            self.flags |= CT_ARGS_HAS_PNAME;
-        } else {
-            self.flags &= !CT_ARGS_HAS_PNAME;
-        }
-    }
-
-    #[inline(always)]
     pub fn set(
         &mut self,
         dscp: u8,
@@ -239,19 +219,19 @@ impl ConntrackArgs {
         self.pid = pid;
 
         if let Some((outbound, mark, must)) = routing {
-            self.set_routing(true);
+            self.flags |= CT_ARGS_HAS_ROUTING;
             self.outbound = *outbound;
             self.mark = *mark;
             self.must = *must;
         }
 
         if let Some(mac_addr) = mac {
-            self.set_mac(true);
+            self.flags |= CT_ARGS_HAS_MAC;
             self.mac.copy_from_slice(mac_addr);
         }
 
         if let Some(pname_bytes) = pname {
-            self.set_pname(true);
+            self.flags |= CT_ARGS_HAS_PNAME;
             self.pname.copy_from_slice(pname_bytes);
         }
     }

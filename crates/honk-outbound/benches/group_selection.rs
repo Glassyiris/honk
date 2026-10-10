@@ -21,6 +21,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
     Group {
         id: Uuid::new_v5(&NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.to_owned(),
+        icon: None,
         policy,
         nodes: nodes.iter().map(|node| node.id).collect(),
         filters: Vec::new(),
@@ -32,6 +33,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
         tolerance: 50,
         idle_timeout: None,
         interrupt_connections: false,
+        own: Default::default(),
         created_at: Utc::now(),
     }
 }
@@ -80,14 +82,17 @@ fn bench_group_selection(c: &mut Criterion) {
             black_box(plan.entries[0].node.id)
         });
     });
-    for _ in 0..8 {
+    for _ in 0..24 {
         let plan = manager.selection_plan_for_target("score", &score_context);
         let reporter = plan.entries[0]
             .feedback
             .as_ref()
             .expect("score feedback")
+            .begin()
+            .expect("score admission")
             .start();
         reporter.setup_succeeded();
+        reporter.tx(1);
         reporter.rx(1);
         reporter.finish(ScoreOutcome::Success);
     }

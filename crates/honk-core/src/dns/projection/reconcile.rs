@@ -1,8 +1,9 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::state::{Batch, DesiredState, PendingRemove, PendingSet, RetryDeadline, RetryMetadata};
+use super::state::{Batch, DesiredState, IP_CAPACITY, PendingSet, RetryMetadata};
 
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
@@ -12,15 +13,18 @@ impl DesiredState {
     pub(super) fn batch(&mut self, now: Instant) -> Batch {
         let mut sets = Vec::new();
         let mut removes = Vec::new();
+        let mut available = IP_CAPACITY.saturating_sub(self.applied.len());
         let candidates = self
             .dirty_ips
             .iter()
+            .filter(|ip| !self.desired.contains_key(ip))
+            .chain(
+                self.dirty_ips
+                    .iter()
+                    .filter(|ip| self.desired.contains_key(ip)),
+            )
             .copied()
-            .filter(|ip| {
-                self.retries
-                    .get(ip)
-                    .is_none_or(|retry| retry.next_at <= now)
-            })
+            .filter(|ip| self.next_attempt_at(*ip, now) == Some(now))
             .take(MAX_BATCH_ENTRIES)
             .collect::<Vec<_>>();
         for ip in candidates {
@@ -31,25 +35,24 @@ impl DesiredState {
                         .get(&ip)
                         .is_none_or(|applied| applied.bitmap != desired.bitmap) =>
                 {
+                    if !self.applied.contains_key(&ip) {
+                        if available == 0 {
+                            continue;
+                        }
+                        available -= 1;
+                    }
                     sets.push(PendingSet {
                         ip,
                         bitmap: *desired,
-                        revision: self.revisions.get(&ip).copied().unwrap_or_default(),
                     });
                 }
                 None if self.applied.contains_key(&ip) => {
-                    removes.push(PendingRemove {
-                        ip,
-                        revision: self.revisions.get(&ip).copied().unwrap_or_default(),
-                    });
+                    removes.push(ip);
                 }
                 Some(_) | None => {
                     self.dirty_ips.remove(&ip);
                     self.retries.remove(&ip);
                 }
-            }
-            if sets.len() + removes.len() >= MAX_BATCH_ENTRIES {
-                break;
             }
         }
         Batch {
@@ -59,49 +62,29 @@ impl DesiredState {
         }
     }
 
-    pub(super) fn commit_success(
-        &mut self,
-        generation: u64,
-        sets: &[PendingSet],
-        removes: &[PendingRemove],
-    ) -> bool {
-        if generation != self.snapshot.generation() {
-            for set in sets {
-                self.applied.insert(set.ip, set.bitmap);
-            }
-            for remove in removes {
-                self.applied.remove(&remove.ip);
-            }
-            self.rebuild_all();
-            return false;
-        }
+    pub(super) fn commit_success(&mut self, sets: &[PendingSet], removes: &[IpAddr]) -> bool {
         let mut current = true;
         for set in sets {
             self.applied.insert(set.ip, set.bitmap);
-            if self.revisions.get(&set.ip) == Some(&set.revision)
-                && self
-                    .desired
-                    .get(&set.ip)
-                    .is_some_and(|desired| desired.bitmap == set.bitmap.bitmap)
+            self.retries.remove(&set.ip);
+            if self
+                .desired
+                .get(&set.ip)
+                .is_some_and(|desired| desired.bitmap == set.bitmap.bitmap)
             {
                 self.dirty_ips.remove(&set.ip);
-                self.retries.remove(&set.ip);
             } else {
                 self.dirty_ips.insert(set.ip);
-                self.retries.remove(&set.ip);
                 current = false;
             }
         }
-        for remove in removes {
-            self.applied.remove(&remove.ip);
-            if self.revisions.get(&remove.ip) == Some(&remove.revision)
-                && !self.desired.contains_key(&remove.ip)
-            {
-                self.dirty_ips.remove(&remove.ip);
-                self.retries.remove(&remove.ip);
+        for &ip in removes {
+            self.applied.remove(&ip);
+            self.retries.remove(&ip);
+            if !self.desired.contains_key(&ip) {
+                self.dirty_ips.remove(&ip);
             } else {
-                self.dirty_ips.insert(remove.ip);
-                self.retries.remove(&remove.ip);
+                self.dirty_ips.insert(ip);
                 current = false;
             }
         }
@@ -116,29 +99,35 @@ impl DesiredState {
         let factor = 1u32 << u32::from(attempts.saturating_sub(1).min(6));
         let next_at = now + RETRY_MIN.saturating_mul(factor).min(RETRY_MAX);
         self.retries.insert(ip, RetryMetadata { attempts, next_at });
-        self.retry_deadlines.push(std::cmp::Reverse(RetryDeadline {
-            at: next_at,
-            ip,
-            attempts,
-        }));
         self.dirty_ips.insert(ip);
+    }
+
+    fn next_attempt_at(&self, ip: std::net::IpAddr, now: Instant) -> Option<Instant> {
+        if self.desired.contains_key(&ip)
+            && !self.applied.contains_key(&ip)
+            && self.applied.len() >= IP_CAPACITY
+        {
+            return None;
+        }
+        Some(
+            self.retries
+                .get(&ip)
+                .map_or(now, |retry| retry.next_at.max(now)),
+        )
     }
 
     pub(super) fn next_deadline(&mut self) -> Option<Instant> {
         self.compact_owner_heaps_if_needed();
-        while let Some(std::cmp::Reverse(deadline)) = self.retry_deadlines.peek() {
-            if self.retries.get(&deadline.ip).is_some_and(|retry| {
-                retry.attempts == deadline.attempts && retry.next_at == deadline.at
-            }) {
-                break;
+        let now = Instant::now();
+        let mut deadline = self.expiry_deadlines.peek().map(|entry| entry.0.at);
+        for ip in &self.dirty_ips {
+            if let Some(next) = self.next_attempt_at(*ip, now) {
+                if next == now {
+                    return Some(now);
+                }
+                deadline = Some(deadline.map_or(next, |current| current.min(next)));
             }
-            self.retry_deadlines.pop();
         }
-        self.expiry_deadlines
-            .peek()
-            .map(|entry| entry.0.at)
-            .into_iter()
-            .chain(self.retry_deadlines.peek().map(|entry| entry.0.at))
-            .min()
+        deadline
     }
 }

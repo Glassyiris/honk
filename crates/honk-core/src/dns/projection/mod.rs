@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,19 +89,13 @@ const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
 pub(crate) struct RoutingProjectionSnapshot {
     generation: u64,
     matcher: Arc<Router>,
-    bitmaps: Arc<HashMap<String, Vec<DomainRouting>>>,
 }
 
 impl RoutingProjectionSnapshot {
-    pub(crate) fn new(
-        generation: u64,
-        matcher: Arc<Router>,
-        bitmaps: HashMap<String, Vec<DomainRouting>>,
-    ) -> Self {
+    pub(crate) fn new(generation: u64, matcher: Arc<Router>) -> Self {
         Self {
             generation,
             matcher,
-            bitmaps: Arc::new(bitmaps),
         }
     }
 
@@ -110,24 +104,8 @@ impl RoutingProjectionSnapshot {
     }
 
     pub(crate) fn bitmap_for(&self, domain: &str) -> Option<DomainRouting> {
-        let rule_name = self.matcher.route_domain(domain)?.rule_name;
-        let mut aggregate = DomainRouting::default();
-        let bitmaps = self.bitmaps.get(rule_name)?;
-        for bitmap in bitmaps {
-            or_bitmap(&mut aggregate, bitmap);
-        }
-        aggregate
-            .bitmap
-            .iter()
-            .any(|word| *word != 0)
-            .then_some(aggregate)
+        self.matcher.domain_bitmap(domain)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectionFreshness {
-    Fresh,
-    Stale,
 }
 
 #[derive(Debug)]
@@ -136,7 +114,6 @@ pub(crate) enum ProjectionObservation<'a> {
         domain: &'a str,
         ips: &'a [IpAddr],
         advertised_ttl: Duration,
-        freshness: ProjectionFreshness,
     },
     Clear {
         domain: &'a str,
@@ -195,17 +172,25 @@ impl PreparedProjectionPublication<'_> {
     pub(crate) fn project(
         &self,
         snapshot: &RoutingProjectionSnapshot,
-    ) -> Vec<(IpAddr, DomainRouting)> {
-        self.projection
-            .state
-            .lock()
-            .project(snapshot)
-            .into_iter()
-            .collect()
+    ) -> BTreeMap<IpAddr, DomainRouting> {
+        self.projection.state.lock().project(snapshot)
     }
 
-    pub(crate) fn commit(self, snapshot: Arc<RoutingProjectionSnapshot>) {
-        self.projection.state.lock().update_snapshot(snapshot);
+    pub(crate) fn commit(
+        self,
+        snapshot: Arc<RoutingProjectionSnapshot>,
+        published: Option<BTreeMap<IpAddr, DomainRouting>>,
+    ) {
+        let mut state = self.projection.state.lock();
+        if let Some(published) = published {
+            // A reload pre-fills the map outside the incremental worker. Record
+            // that exact set, including owners that expired while it loaded.
+            state.applied = published;
+            state.dirty_ips.clear();
+            state.retries.clear();
+        }
+        state.update_snapshot(snapshot);
+        drop(state);
         self.projection.notify_worker();
     }
 }
@@ -362,7 +347,6 @@ impl ProjectionReplacementBenchmark {
                 domain: &domain,
                 ips: std::slice::from_ref(&ip),
                 advertised_ttl: Duration::from_secs(300),
-                freshness: ProjectionFreshness::Fresh,
             },
             now,
         );
@@ -381,7 +365,6 @@ impl ProjectionReplacementBenchmark {
                 domain: &self.domain,
                 ips: std::slice::from_ref(&self.ip),
                 advertised_ttl: Duration::from_secs(300),
-                freshness: ProjectionFreshness::Fresh,
             },
             self.now,
         );

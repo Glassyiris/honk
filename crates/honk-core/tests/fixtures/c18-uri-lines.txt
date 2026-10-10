@@ -1,0 +1,5 @@
+
+# profile comment
+REMARKS=private metadata
+unknown://secret.example:99
+socks5://127.0.0.1:1080#usable

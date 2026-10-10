@@ -264,35 +264,6 @@ impl HopState {
     }
 }
 
-/// Parse an `mport` list (`20000-30000` / `8080,8888-8890`) into ports.
-pub(super) fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
-    let mut ports = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        match part.split_once('-') {
-            Some((lo, hi)) => {
-                let lo: u16 = lo.trim().parse().ok()?;
-                let hi: u16 = hi.trim().parse().ok()?;
-                if lo == 0 || hi < lo {
-                    return None;
-                }
-                ports.extend(lo..=hi);
-            }
-            None => {
-                let port: u16 = part.parse().ok()?;
-                if port == 0 {
-                    return None;
-                }
-                ports.push(port);
-            }
-        }
-    }
-    (!ports.is_empty()).then_some(ports)
-}
-
 #[derive(Debug)]
 pub(super) struct Hy2UdpPoller {
     socket: Arc<tokio::net::UdpSocket>,
@@ -340,8 +311,8 @@ impl AsyncUdpSocket for Hy2UdpSocket {
     ) -> Poll<io::Result<usize>> {
         let base_port = self.hop.lock().as_ref().and_then(HopState::base_port);
         let mut count = 0;
-        for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
-            let mut read_buf = ReadBuf::new(&mut buf[..]);
+        for _ in 0..bufs.len().min(meta.len()) {
+            let mut read_buf = ReadBuf::new(&mut bufs[count][..]);
             match self.socket.poll_recv_from(cx, &mut read_buf) {
                 Poll::Ready(Ok(addr)) => {
                     let len = match &self.obfs {
@@ -353,7 +324,7 @@ impl AsyncUdpSocket for Hy2UdpSocket {
                             Some(port) => SocketAddr::new(addr.ip(), port),
                             None => addr,
                         };
-                        *meta_slot = quinn::udp::RecvMeta {
+                        meta[count] = quinn::udp::RecvMeta {
                             addr,
                             len,
                             stride: len,

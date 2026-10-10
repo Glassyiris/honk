@@ -1,0 +1,6 @@
+proxies:
+  - {name: profile-entry, type: direct}
+  - not-an-object
+  - {name: unsupported-proxy, type: http, server: secret.example, port: 8080}
+  - {name: malformed-proxy, type: socks5, server: secret.example, port: bad}
+  - {name: usable-proxy, type: socks5, server: usable.example, port: 1080}

@@ -11,10 +11,6 @@ pub union In6Addr {
     pub u6_addr64: [u64; 2],
 }
 
-/// IPv4-mapped IPv6 prefix ::ffff/96.
-#[allow(unused)]
-const V4_MAPPED_PREFIX: [__u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
-
 impl In6Addr {
     /// The all-zeros address `::`.
     pub const fn zero() -> Self {
@@ -55,29 +51,16 @@ impl In6Addr {
         }
     }
 
-    /// Returns `true` if this is an IPv4-compatible address (`::/96`, deprecated but
-    /// may still be seen in the kernel).
-    pub fn is_v4_compat(&self) -> bool {
+    /// Whether the address lies in the dae0/dae0peer link subnets, which carry
+    /// honk's own traffic rather than a client's.
+    pub fn is_dae0_link(&self) -> bool {
         unsafe {
-            self.u6_addr32[0] == 0
-                && self.u6_addr32[1] == 0
-                && self.u6_addr32[2] == 0
-                && self.u6_addr32[3] != 0
+            if self.is_v4_mapped() {
+                u32::from_be(self.u6_addr32[3]) & 0xFFFF_0000 == crate::DAE0_IPV4_NET
+            } else {
+                u64::from_be(self.u6_addr64[0]) == crate::DAE0_IPV6_PREFIX_HI
+            }
         }
-    }
-
-    /// Modify only the low 32 bits (IPv4 part), keeping the prefix unchanged.
-    /// The current address must already be v4-mapped or v4-compat.
-    pub fn set_ipv4(&mut self, ipv4_be: __be32) {
-        unsafe {
-            // Store the IPv4 bytes in network byte order.
-            self.u6_addr32[3] = ipv4_be.to_be();
-        }
-    }
-
-    /// Clear the address and set it to a new IPv4-mapped address.
-    pub fn remap_ipv4(&mut self, ipv4_be: __be32) {
-        *self = Self::from_ipv4_mapped(ipv4_be);
     }
 
     /// Get a reference to the 16-byte array without requiring `unsafe` on the caller's side.
@@ -137,25 +120,6 @@ impl core::ops::IndexMut<core::ops::Range<usize>> for In6Addr {
     }
 }
 
-impl AsRef<[u8; 16]> for In6Addr {
-    fn as_ref(&self) -> &[u8; 16] {
-        unsafe { &self.u6_addr8 }
-    }
-}
-
-impl core::ops::Deref for In6Addr {
-    type Target = [u8; 16];
-    fn deref(&self) -> &[u8; 16] {
-        unsafe { &self.u6_addr8 }
-    }
-}
-
-impl AsRef<[u8]> for In6Addr {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { &self.u6_addr8 }
-    }
-}
-
 /// Debug output in `::ffff:c0a8:0101` style.
 impl core::fmt::Debug for In6Addr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -182,5 +146,26 @@ impl core::fmt::Debug for In6Addr {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dae0_link_matches_exactly_the_honk_subnets() {
+        for ip in ["fd00:686f:6e6b::2", "fd00:686f:6e6b::beef"] {
+            let addr = In6Addr::from_ipv6_addr(ip.parse().unwrap());
+            assert!(addr.is_dae0_link(), "{ip}");
+        }
+        for ip in ["fd00:686f:6e6c::1", "fd00:dae:d000::1", "2001:db8::1"] {
+            let addr = In6Addr::from_ipv6_addr(ip.parse().unwrap());
+            assert!(!addr.is_dae0_link(), "{ip}");
+        }
+        assert!(In6Addr::from_ipv4_bytes([169, 254, 0, 11]).is_dae0_link());
+        assert!(In6Addr::from_ipv4_bytes([169, 254, 200, 1]).is_dae0_link());
+        assert!(!In6Addr::from_ipv4_bytes([169, 255, 0, 1]).is_dae0_link());
+        assert!(!In6Addr::from_ipv4_bytes([192, 168, 0, 1]).is_dae0_link());
     }
 }

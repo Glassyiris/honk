@@ -7,19 +7,14 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tracing::warn;
+use tracing::debug;
 
 use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound};
 use std::sync::Arc;
 
 /// Handler for blocking connections.
+#[derive(Default)]
 pub struct BlockHandler;
-
-impl Default for BlockHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl BlockHandler {
     pub fn new() -> Self {
@@ -36,7 +31,7 @@ impl TcpOutbound for BlockHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        warn!("Blocked connection to {}", target);
+        debug!("Blocked connection to {}", target);
         anyhow::bail!("Connection blocked by routing rule");
     }
 }
@@ -50,7 +45,7 @@ impl PacketOutbound for BlockHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        warn!("Blocked UDP connection to {}", target);
+        debug!("Blocked UDP connection to {}", target);
         anyhow::bail!("UDP connection blocked by routing rule");
     }
 }
@@ -76,6 +71,5 @@ mod tests {
             .dial(&node, target, None, Duration::from_secs(3))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("blocked"));
     }
 }

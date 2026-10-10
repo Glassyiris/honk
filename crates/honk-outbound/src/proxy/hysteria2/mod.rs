@@ -55,6 +55,7 @@ use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use bytes::Bytes;
 use honk_config::node::Node;
+use honk_config::options::vocab::parse_port_hopping;
 use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
@@ -62,9 +63,11 @@ use tracing::debug;
 
 use crate::quic::defrag::Defragmenter;
 use crate::quic::{QuicClient, QuicConnState, now_secs};
+use crate::transport_quality::TransportQuality;
 
 use super::{
-    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, QuicSendToken, TcpOutbound,
+    WarmableOutbound,
 };
 
 /// QUIC keep-alive (`hysteria/protocol.go:21`).
@@ -121,6 +124,7 @@ struct Hy2ConnState {
     open: Arc<AtomicUsize>,
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
+    path_health: Arc<crate::quic::QuicPathHealth>,
     /// H3 client preface streams (control + QPACK encoder/decoder). Held
     /// open for the life of the connection: dropping the send half finishes
     /// the stream, and closing a critical H3 stream is a connection error.
@@ -135,6 +139,9 @@ impl QuicConnState for Hy2ConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
+    fn enable_telemetry(&self) {
+        self.path_health.enable_telemetry();
+    }
 }
 
 impl Hy2ConnState {
@@ -143,6 +150,7 @@ impl Hy2ConnState {
         udp_disabled: bool,
         preface: (quinn::SendStream, quinn::SendStream, quinn::SendStream),
     ) -> Self {
+        let path_health = crate::quic::QuicPathHealth::new(&conn);
         let sessions: SessionMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let state = Self {
             conn: conn.clone(),
@@ -151,22 +159,30 @@ impl Hy2ConnState {
             next_session: AtomicU32::new(0),
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
+            path_health: Arc::clone(&path_health),
             _preface: preface,
         };
         if !udp_disabled {
             // Inbound QUIC datagrams demultiplexed by session id
             // (`client_packet.go:5-19`).
-            tokio::spawn(async move {
+            let recv_conn = conn.clone();
+            let recv_sessions = Arc::clone(&sessions);
+            let recv_health = Arc::clone(&path_health);
+            let _ = crate::runtime::spawn_owned(async move {
                 loop {
-                    let Ok(data) = conn.read_datagram().await else {
+                    let Ok(data) = recv_conn.read_datagram().await else {
                         break;
                     };
                     let Some(msg) = decode_udp_message(&data) else {
                         continue;
                     };
-                    let tx = sessions.lock().get(&msg.session_id).cloned();
+                    let tx = recv_sessions.lock().get(&msg.session_id).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            tx.try_send(msg)
+                        {
+                            recv_health.record_session_rx_drop();
+                        }
                     } else {
                         debug!(
                             session_id = msg.session_id,
@@ -175,8 +191,11 @@ impl Hy2ConnState {
                     }
                 }
                 // Connection died: drop all session senders so bridges end.
-                sessions.lock().clear();
+                recv_sessions.lock().clear();
             });
+        }
+        if !udp_disabled {
+            crate::quic::spawn_quic_path_watchdog(conn, path_health);
         }
         crate::quic::spawn_conn_reaper(
             state.conn.clone(),
@@ -203,6 +222,7 @@ struct Hy2TcpStream {
     request: Option<Bytes>,
     response: Vec<u8>,
     body_offset: Option<usize>,
+    observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 impl Hy2TcpStream {
@@ -212,6 +232,7 @@ impl Hy2TcpStream {
             request: Some(encode_tcp_request(addr).into()),
             response: Vec::new(),
             body_offset: None,
+            observer: crate::runtime::flow_observation::current(),
         }
     }
 
@@ -227,7 +248,9 @@ impl Hy2TcpStream {
         if message_len > MAX_MESSAGE_LENGTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Hysteria2: invalid TCP response message length",
+                super::NodeFailure(anyhow::anyhow!(
+                    "Hysteria2: invalid TCP response message length"
+                )),
             ));
         }
         let message_end = offset + message_len as usize;
@@ -241,7 +264,9 @@ impl Hy2TcpStream {
         if padding_len > MAX_PADDING_LENGTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Hysteria2: invalid TCP response padding length",
+                super::NodeFailure(anyhow::anyhow!(
+                    "Hysteria2: invalid TCP response padding length"
+                )),
             ));
         }
         let header_end = offset + padding_len as usize;
@@ -251,10 +276,10 @@ impl Hy2TcpStream {
         if status != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
-                format!(
+                super::TargetFailure(anyhow::anyhow!(
                     "Hysteria2: remote error: {}",
                     String::from_utf8_lossy(message)
-                ),
+                )),
             ));
         }
         Ok(Some(header_end))
@@ -300,12 +325,17 @@ impl AsyncRead for Hy2TcpStream {
             }
             if let Some(header_end) = self.parse_response()? {
                 self.body_offset = Some(header_end);
+                if let Some(observer) = self.observer.take() {
+                    observer.milestone_once(
+                        crate::runtime::flow_observation::Milestone::TargetConfirmed,
+                    );
+                }
                 continue;
             }
             if self.response.len() == MAX_TCP_RESPONSE_BUFFER {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Hysteria2 TCP response header too large",
+                    super::NodeFailure(anyhow::anyhow!("Hysteria2 TCP response header too large")),
                 )));
             }
             let mut chunk = [0; 1024];
@@ -316,7 +346,7 @@ impl AsyncRead for Hy2TcpStream {
                 Poll::Ready(Ok(())) if input.filled().is_empty() => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Hysteria2 TCP response truncated",
+                        super::NodeFailure(anyhow::anyhow!("Hysteria2 TCP response truncated")),
                     )));
                 }
                 Poll::Ready(Ok(())) => self.response.extend_from_slice(input.filled()),
@@ -347,11 +377,24 @@ impl AsyncWrite for Hy2TcpStream {
                 Poll::Ready(Ok(written)) if written <= request_len => {
                     if !chunks[0].is_empty() {
                         self.request = Some(chunks[0].clone());
+                    } else {
+                        if let Some(observer) = &self.observer {
+                            observer.milestone_once(
+                                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                            );
+                        }
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
-                Poll::Ready(Ok(written)) => Poll::Ready(Ok(written - request_len)),
+                Poll::Ready(Ok(written)) => {
+                    if let Some(observer) = &self.observer {
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
+                    }
+                    Poll::Ready(Ok(written - request_len))
+                }
             }
         } else {
             AsyncWrite::poll_write(Pin::new(&mut self.inner), cx, input)
@@ -371,7 +414,13 @@ impl AsyncWrite for Hy2TcpStream {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Ok(_)) => {
+                    if let Some(observer) = &self.observer {
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
+                    }
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             }
         }
@@ -397,6 +446,10 @@ impl crate::runtime::QuicRuntimeClient for Hy2Client {
         self
     }
 
+    async fn enable_metrics(&self, quality: Arc<TransportQuality>) {
+        self.quic.enable_metrics(quality).await;
+    }
+
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
@@ -411,11 +464,11 @@ impl Hy2Client {
         &self,
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<Hy2ConnState>)> {
-        let password = self.password.clone();
+        let password = &self.password;
         let rx_bytes_per_second = self.rx_bytes_per_second;
         self.quic
-            .connection_with(connect_timeout, move |conn| async move {
-                authenticate(&conn, &password, rx_bytes_per_second, connect_timeout).await
+            .connection_with_metrics(connect_timeout, move |conn| async move {
+                authenticate(&conn, password, rx_bytes_per_second, connect_timeout).await
             })
             .await
     }
@@ -513,13 +566,13 @@ impl Hysteria2Handler {
         Self
     }
 
-    fn resolve_password(node: &Node) -> &str {
-        node.hysteria2().unwrap().auth.as_deref().unwrap_or("")
-    }
-
-    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
+    async fn build_client(
+        &self,
+        node: &Node,
+        profiles: Option<Arc<crate::quic::AdaptiveFlowProfiles>>,
+    ) -> anyhow::Result<Arc<Hy2Client>> {
         let hy2 = node.hysteria2().unwrap();
-        let password = Self::resolve_password(node);
+        let password = hy2.auth.as_deref().unwrap_or("");
         let obfs = hy2.obfs.as_deref().filter(|s| !s.is_empty());
         if let Some(obfs) = obfs
             && obfs.len() < SALAMANDER_MIN_PSK_LEN
@@ -567,10 +620,9 @@ impl Hysteria2Handler {
                 // Download throughput is capped by our advertised receive
                 // windows (window/RTT): quinn's 1.25 MiB stream default
                 // tops out around 2 Gbps on a LAN. Stream window keeps the
-                // single-flow ceiling high; the conn window doubles as the
-                // per-connection memory budget (slow consumers buffer up to
-                // ~3x it), so it stays at 8 MiB — measured throughput-neutral
-                // on a 75ms/15%-loss link.
+                // single-flow ceiling high. The conn window starts at 8 MiB
+                // and quinn doubles it up to 32 MiB only while the
+                // application drains it faster than four RTTs per window.
                 stream_receive_window: hy2.init_stream_recv_window.or(Some(8 << 20)),
                 conn_receive_window: hy2.init_conn_recv_window.or(Some(8 << 20)),
                 disable_mtu_discovery: hy2.disable_mtu_discovery == Some(true),
@@ -578,7 +630,8 @@ impl Hysteria2Handler {
             },
         )
         .await?;
-        let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
+        let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config)
+            .with_flow_control_profiles(profiles);
         let mtu = hy2.quic.mtu.unwrap_or(1252);
         let quic = quic.with_max_udp_payload_size(mtu);
         let quic = match (obfs, hop) {
@@ -600,8 +653,9 @@ impl Hysteria2Handler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<Hy2Client>> {
+        let profiles = runtime.quic_flow_control_profiles()?;
         runtime
-            .quic_client(|| self.build_client(runtime.node.as_ref()))
+            .quic_client(|| self.build_client(runtime.node.as_ref(), Some(profiles)))
             .await
     }
 }
@@ -614,12 +668,16 @@ impl WarmableOutbound for Hysteria2Handler {
         connect_timeout: Duration,
         requirement: super::WarmRequirement,
     ) -> anyhow::Result<()> {
-        let client = self.client_for_runtime(&runtime).await?;
-        let (_, state) = client.connection(connect_timeout).await?;
-        if requirement == super::WarmRequirement::Udp && state.udp_disabled {
-            anyhow::bail!("Hysteria2: UDP disabled by server");
-        }
-        Ok(())
+        let warm = async {
+            let client = self.client_for_runtime(&runtime).await?;
+            let (_, state) = client.connection(connect_timeout).await?;
+            if requirement == super::WarmRequirement::Udp && state.udp_disabled {
+                anyhow::bail!("Hysteria2: UDP disabled by server");
+            }
+            Ok(())
+        };
+        let warm = crate::runtime::flow_observation::without(warm);
+        warm.await
     }
 }
 
@@ -642,11 +700,7 @@ impl Hysteria2Handler {
                 async move { client.connection(timeout).await }
             },
             connect_timeout,
-            move |conn| async move {
-                conn.open_bi()
-                    .await
-                    .map_err(|error| anyhow!("Hysteria2: open stream: {error}"))
-            },
+            move |conn| async move { conn.open_bi().await.context("Hysteria2: open stream") },
             |_| true,
             "Hysteria2",
         )
@@ -687,10 +741,11 @@ impl Hysteria2Handler {
             session_id,
             packet_id: AtomicU16::new(0),
             rx: tokio::sync::Mutex::new(rx),
-            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
+            defrag: tokio::sync::Mutex::new(Defragmenter::new(MAX_UDP_SIZE)),
             addr,
             max_datagram,
             target,
+            request_observer: parking_lot::Mutex::new(crate::runtime::flow_observation::current()),
         }))
     }
 }
@@ -704,7 +759,7 @@ impl TcpOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.dial_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -742,7 +797,7 @@ impl PacketOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.udp_transport_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -766,7 +821,10 @@ impl PacketOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        let client = self.build_client(runtime.node.as_ref()).await?;
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             self.udp_transport_via_client(client, target, target_domain, connect_timeout)
                 .await
@@ -778,7 +836,7 @@ impl PacketOutbound for Hysteria2Handler {
 #[async_trait]
 impl ProbeableOutbound for Hysteria2Handler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.build_client(node).await {
+        match self.build_client(node, None).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
             Err(e) => {
                 debug!(
@@ -803,6 +861,7 @@ struct Hy2UdpTransport {
     addr: String,
     max_datagram: usize,
     target: SocketAddr,
+    request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
 }
 
 impl std::fmt::Debug for Hy2UdpTransport {
@@ -826,16 +885,40 @@ impl PacketTransport for Hy2UdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
     }
+    fn send_timeout(&self) -> Duration {
+        self.state.path_health.send_timeout()
+    }
+    fn record_quic_send_started(&self) -> QuicSendToken {
+        self.state.path_health.record_send_started(&self.state.conn)
+    }
+    fn record_quic_send_success(&self, token: QuicSendToken) {
+        self.state
+            .path_health
+            .record_send_success(token, &self.state.conn);
+    }
+    fn record_quic_send_timeout(&self, token: QuicSendToken) {
+        if self
+            .state
+            .path_health
+            .record_send_timeout(token, &self.state.conn)
+        {
+            crate::quic::record_quic_send_timeout();
+        }
+    }
+    fn record_quic_send_failure(&self, token: QuicSendToken) {
+        self.state.path_health.record_send_failure(token);
+    }
+
+    fn quic_path_stalled(&self) -> bool {
+        self.state.path_health.is_stalled()
+    }
     fn send_timeout_is_congestion(&self) -> bool {
         true
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
         if data.len() > MAX_UDP_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "hysteria2 datagram too large",
-            ));
+            return Err(super::PacketRejection::InvalidSize.into());
         }
         self.state.touch();
         let packet_id = self
@@ -855,7 +938,11 @@ impl PacketTransport for Hy2UdpTransport {
                 .conn
                 .send_datagram_wait(bytes::Bytes::from(packet))
                 .await
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other)
+                .map_err(super::quic_carrier_io_error)?;
+        }
+        if let Some(observer) = self.request_observer.lock().take() {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
         }
         Ok(())
     }
@@ -865,7 +952,13 @@ impl PacketTransport for Hy2UdpTransport {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "hysteria2 connection closed",
+                    super::NodeFailure(
+                        self.state
+                            .conn
+                            .close_reason()
+                            .map(anyhow::Error::new)
+                            .unwrap_or_else(|| anyhow::anyhow!("hysteria2 connection closed")),
+                    ),
                 )
             })?;
             let complete =

@@ -506,7 +506,14 @@ impl NlSock {
     }
 
     /// Add/delete a fwmark → table rule.
-    fn rule_fwmark(&mut self, add: bool, family: u8, fwmark: u32, table: u32) -> io::Result<()> {
+    fn rule_fwmark(
+        &mut self,
+        add: bool,
+        family: u8,
+        fwmark: u32,
+        fwmask: u32,
+        table: u32,
+    ) -> io::Result<()> {
         // fib_rule_hdr: family, dst_len, src_len, tos, table, res1, res2,
         // action, flags(u32)
         let header: [u8; 12] = [
@@ -525,7 +532,7 @@ impl NlSock {
         ];
         let mut attrs: Vec<(u16, Attr)> = vec![
             (FRA_FWMARK, Attr::U32(fwmark)),
-            (FRA_FWMASK, Attr::U32(u32::MAX)),
+            (FRA_FWMASK, Attr::U32(fwmask)),
         ];
         if table > 255 {
             attrs.push((FRA_TABLE, Attr::U32(table)));
@@ -542,18 +549,20 @@ impl NlSock {
         &mut self,
         family: u8,
         fwmark: u32,
+        fwmask: u32,
         table: u32,
     ) -> io::Result<()> {
-        self.rule_fwmark(true, family, fwmark, table)
+        self.rule_fwmark(true, family, fwmark, fwmask, table)
     }
 
     pub(crate) fn del_rule_fwmark(
         &mut self,
         family: u8,
         fwmark: u32,
+        fwmask: u32,
         table: u32,
     ) -> io::Result<()> {
-        self.rule_fwmark(false, family, fwmark, table)
+        self.rule_fwmark(false, family, fwmark, fwmask, table)
     }
 
     /// Replace a static neighbour entry (IP → MAC, permanent).
@@ -929,9 +938,11 @@ mod tests {
         }
         const MARK: u32 = 0x0800_0099;
         const TABLE: u32 = 100;
+        const DNS_MASK: u32 = !honk_ebpf_common::DNS_ROUTE_MARK_MASK;
         let mut nl = NlSock::new().unwrap();
         // Idempotent start: drop leftovers from an interrupted earlier run.
-        let _ = nl.del_rule_fwmark(FAM_V4, MARK, TABLE);
+        let _ = nl.del_rule_fwmark(FAM_V4, MARK, u32::MAX, TABLE);
+        let _ = nl.del_rule_fwmark(FAM_V4, MARK, DNS_MASK, TABLE);
         if let Ok((idx, _)) = nl.get_link("honkt0") {
             let _ = nl.del_link(idx);
         }
@@ -962,17 +973,24 @@ mod tests {
                 None,
                 Some(idx),
             )?;
-            nl.add_rule_fwmark(FAM_V4, MARK, TABLE)?;
+            nl.add_rule_fwmark(FAM_V4, MARK, u32::MAX, TABLE)?;
             let rules = rule_dump(&mut nl)?;
             assert!(
                 rules.contains(&(MARK, u32::MAX, TABLE)),
                 "fwmark rule with full mask missing from dump: {rules:?}"
             );
+            nl.add_rule_fwmark(FAM_V4, MARK, DNS_MASK, TABLE)?;
+            assert!(rule_dump(&mut nl)?.contains(&(MARK, DNS_MASK, TABLE)));
+            nl.del_rule_fwmark(FAM_V4, MARK, DNS_MASK, TABLE)?;
+            let rules = rule_dump(&mut nl)?;
+            assert!(rules.contains(&(MARK, u32::MAX, TABLE)));
+            assert!(!rules.contains(&(MARK, DNS_MASK, TABLE)));
             nl.neigh_replace(idx, FAM_V4, &[198, 51, 100, 1], &[0x02, 0, 0, 0, 0, 1])?;
             Ok(())
         })();
 
-        let _ = nl.del_rule_fwmark(FAM_V4, MARK, TABLE);
+        let _ = nl.del_rule_fwmark(FAM_V4, MARK, u32::MAX, TABLE);
+        let _ = nl.del_rule_fwmark(FAM_V4, MARK, DNS_MASK, TABLE);
         if let Ok((idx, _)) = nl.get_link("honkt0") {
             let _ = nl.del_link(idx);
         }

@@ -2,10 +2,32 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 const EINPROGRESS: i32 = libc::EINPROGRESS;
+
+static BYPASS_MARK: OnceLock<u32> = OnceLock::new();
+
+/// Process-wide mark for originated sockets; initialize before startup network I/O.
+pub fn init_bypass_mark(mark: u32) -> io::Result<()> {
+    if *BYPASS_MARK.get_or_init(|| mark) != mark {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "socket bypass mark is already initialized to a different value",
+        ));
+    }
+    Ok(())
+}
+
+/// Effective process mark, retaining the legacy default for standalone users.
+pub fn bypass_mark() -> u32 {
+    BYPASS_MARK
+        .get()
+        .copied()
+        .unwrap_or(honk_ebpf_common::DAE_BYPASS_MARK)
+}
 
 /// Set `SO_MARK` best-effort. In production honk runs as root (eBPF load
 /// requires it) so the mark always applies; unprivileged environments (CI,
@@ -34,12 +56,15 @@ pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Apply TCP keepalive tuning (idle 60s, interval 10s, 3 probes) via
-/// socket2's safe API — no raw setsockopt.
+/// Apply TCP keepalive tuning (idle 15s, interval 10s, 3 probes) via
+/// socket2's safe API — no raw setsockopt. The first probe must fire well
+/// inside a server's idle-kill window (AnyTLS servers drop idle sessions
+/// around 30s): with a 60s first probe, warm mux sessions silently became
+/// corpses that only a real flow would discover (mihomo #1891).
 #[cfg(target_os = "linux")]
 fn apply_tcp_keepalive(socket: &socket2::Socket) -> io::Result<()> {
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
+        .with_time(Duration::from_secs(15))
         .with_interval(Duration::from_secs(10))
         .with_retries(3);
     socket.set_tcp_keepalive(&keepalive)
@@ -72,6 +97,33 @@ fn new_tcp_socket(addr: &SocketAddr, mark: Option<u32>) -> io::Result<socket2::S
 /// handshake so the local eBPF datapath treats it as control-plane traffic
 /// and does not re-route it.
 pub async fn connect_marked_addr(
+    addr: SocketAddr,
+    mark: Option<u32>,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
+    use crate::runtime::flow_observation::{
+        ResolutionLocation, TransportAttempt, TransportError, TransportStatus,
+    };
+    let mut attempt = TransportAttempt::start(Some(addr), ResolutionLocation::Unknown);
+    let result = connect_marked_addr_inner(addr, mark, connect_timeout).await;
+    if let Some(attempt) = &mut attempt {
+        attempt.finish(
+            if result.is_ok() {
+                TransportStatus::Succeeded
+            } else {
+                TransportStatus::Failed
+            },
+            result.as_ref().err().map(|error| match error.kind() {
+                io::ErrorKind::TimedOut => TransportError::Timeout,
+                io::ErrorKind::ConnectionRefused => TransportError::ConnectionRefused,
+                _ => TransportError::ConnectFailed,
+            }),
+        );
+    }
+    result
+}
+
+async fn connect_marked_addr_inner(
     addr: SocketAddr,
     mark: Option<u32>,
     connect_timeout: Duration,
@@ -115,15 +167,25 @@ pub async fn connect_marked(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    let addrs: Vec<_> = crate::bootstrap::resolve(host)
-        .await?
+    // Boxed: marked hosts/nameserver resolution and its lookup observation are
+    // several KiB, and every dial wrapper above this one would embed them.
+    let resolution = Box::pin(crate::bootstrap::resolve(host));
+    let (resolution, selection) =
+        crate::runtime::flow_observation::observe_resolution(resolution).await;
+    let addrs: Vec<_> = resolution?
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
         .collect();
     // Address fallback stays inside one authoritative node; policy selection
     // and its dial-admission accounting remain unchanged.
     crate::address_race::race_resolved_addrs(&addrs, |addr| {
-        connect_marked_addr(addr, mark, connect_timeout)
+        let selection = &selection;
+        async move {
+            if let Some(selection) = selection {
+                selection.selected_ip(addr.ip());
+            }
+            connect_marked_addr(addr, mark, connect_timeout).await
+        }
     })
     .await
     .unwrap_or_else(|| {
@@ -136,12 +198,7 @@ pub async fn connect_marked(
 
 /// Connect to a proxy server from the control plane, bypassing eBPF re-routing.
 pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Result<TcpStream> {
-    connect_marked(
-        addr,
-        Some(honk_ebpf_common::DAE_BYPASS_MARK),
-        connect_timeout,
-    )
-    .await
+    connect_marked(addr, Some(bypass_mark()), connect_timeout).await
 }
 
 /// Bind a UDP socket with `SO_MARK` set so the local eBPF datapath treats it
@@ -151,6 +208,13 @@ pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Resu
 /// classify and redirect the packets back into daens, creating a loop.
 /// Single bypass-mark implementation shared with `quic::marked_udp_socket`.
 pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    marked_udp_socket_with_mark(bind_addr, bypass_mark())
+}
+
+pub(crate) fn marked_udp_socket_with_mark(
+    bind_addr: SocketAddr,
+    mark: u32,
+) -> io::Result<std::net::UdpSocket> {
     let domain = if bind_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -159,7 +223,7 @@ pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocke
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
-    set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+    set_mark_best_effort(&socket, mark)?;
     // QUIC throughput is buffer-bound: the default 208 KiB rmem caps a
     // ~1ms-RTT path at ~2 Gbps (quic-go sets ~7 MiB and lands dae at ~3
     // Gbps). Request 8 MiB; the kernel clamps to 2×rmem_max, and honk-core

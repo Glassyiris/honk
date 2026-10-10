@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use honk_config::dns::DnsConfig;
@@ -55,25 +55,17 @@ impl DnsResolver {
     pub async fn resolve(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
         self.service.resolve_name(domain).await
     }
+    /// Resolve through configured DNS without a post-query bootstrap fallback.
+    pub async fn resolve_without_fallback(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
+        self.service.resolve_name_without_fallback(domain).await
+    }
 
     pub async fn resolve_for_source(
         &self,
         domain: &str,
-        source_ip: IpAddr,
+        source: SocketAddr,
     ) -> anyhow::Result<ResolvedAddr> {
-        self.service
-            .resolve_name_for_source(domain, source_ip)
-            .await
-    }
-
-    pub async fn resolve_first_ipv4(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let result = self.resolve(domain).await?;
-        Ok(result.ipv4.first().copied())
-    }
-
-    pub async fn resolve_first_ipv6(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let result = self.resolve(domain).await?;
-        Ok(result.ipv6.first().copied())
+        self.service.resolve_name_for_source(domain, source).await
     }
 }
 
@@ -91,6 +83,7 @@ fn build_forwarder_from_config(config: &DnsConfig) -> anyhow::Result<Arc<DnsForw
             .with_strategy(config.strategy)
             .with_cache_enabled(config.cache.enabled)
             .with_cache_ttl(config.cache.ttl.min(u64::from(u32::MAX)) as u32)
+            .with_stale_reply_ttl(config.cache.stale_reply_ttl)
             .with_policy_from_config(config)?,
     ))
 }

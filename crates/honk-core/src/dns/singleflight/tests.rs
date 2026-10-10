@@ -24,38 +24,51 @@ fn key(index: u16) -> FlightKey {
         &honk_config::dns::DnsStrategy::Both,
         1,
         DnsRequestMeta::EMPTY,
+        None,
     )
 }
 
-fn template() -> Arc<ResponseTemplate> {
+fn template(rcode: u8) -> Arc<ResponseTemplate> {
     let query = QueryContext::parse(&[0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1])
         .expect("query");
     let mut response = query.canonical_wire().to_vec();
-    response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+    response[2..4].copy_from_slice(&(0x8180_u16 | u16::from(rcode)).to_be_bytes());
     Arc::new(ResponseTemplate::validate(&query, &response).expect("template"))
 }
 
 #[tokio::test]
-async fn waiter_receives_leader_template_when_completed() {
-    // Given
+async fn completion_notifies_attached_waiter_and_preserves_fresh_flight() {
     let flights = Singleflight::default();
-    let FlightRole::Leader(mut leader) = flights.acquire(key(1)) else {
+    let flight_key = key(1);
+    let FlightRole::Leader(leader) = flights.acquire(flight_key.clone()) else {
         panic!("leader");
     };
-    let FlightRole::Waiter(waiter) = flights.acquire(key(1)) else {
+    let FlightRole::Waiter(waiter) = flights.acquire(flight_key.clone()) else {
         panic!("waiter");
     };
 
-    // When
-    leader.publish(template());
-    let received = waiter.receive().await;
+    let completed = template(0);
+    leader.publish(Ok(Arc::clone(&completed)));
+    assert_eq!(flights.active_len(), 0);
 
-    // Then
-    assert!(received.is_some());
-    assert_eq!(flights.active_len(), 1);
-    assert_eq!(flights.counters().leaders, 1);
-    assert_eq!(flights.counters().waiters, 1);
-    drop(leader);
+    let FlightRole::Leader(successor) = flights.acquire(flight_key.clone()) else {
+        panic!("fresh leader");
+    };
+    let FlightRole::Waiter(successor_waiter) = flights.acquire(flight_key) else {
+        panic!("fresh waiter");
+    };
+    let Some(Ok(received)) = waiter.receive().await else {
+        panic!("completed result");
+    };
+    assert_eq!(received.wire(), completed.wire());
+
+    let fresh = template(3);
+    successor.publish(Ok(Arc::clone(&fresh)));
+    let Some(Ok(received)) = successor_waiter.receive().await else {
+        panic!("fresh result");
+    };
+    assert_eq!(received.wire(), fresh.wire());
+    assert_ne!(received.wire(), completed.wire());
     assert_eq!(flights.active_len(), 0);
 }
 
@@ -96,6 +109,7 @@ fn strict_and_compatibility_resolves_do_not_share_a_flight() {
         &honk_config::dns::DnsStrategy::Both,
         1,
         DnsRequestMeta::EMPTY,
+        None,
     )) else {
         panic!("strict leader");
     };
@@ -105,6 +119,7 @@ fn strict_and_compatibility_resolves_do_not_share_a_flight() {
         &honk_config::dns::DnsStrategy::Both,
         1,
         DnsRequestMeta::EMPTY,
+        None,
     )) else {
         panic!("compatibility leader");
     };
@@ -123,6 +138,7 @@ fn preference_sensitive_sources_do_not_share_a_flight() {
             &honk_config::dns::DnsStrategy::PreferIpv4,
             28,
             DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+            None,
         )) else {
             panic!("source leader");
         };
@@ -142,6 +158,7 @@ fn preference_irrelevant_sources_share_a_flight() {
             &honk_config::dns::DnsStrategy::Both,
             28,
             DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+            None,
         )
     };
     let FlightRole::Leader(_leader) = flights.acquire(key_for("192.0.2.1")) else {

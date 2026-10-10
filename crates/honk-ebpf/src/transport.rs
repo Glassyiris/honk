@@ -78,6 +78,10 @@ pub struct ParsedPacket {
     pub udph: UdpHdr,
     pub l4proto: u8,
     pub listener_l4proto: u8,
+    pub is_fragmented: u8,
+    pub routing_input: honk_ebpf_common::RoutingInput,
+    pub route_witness: honk_ebpf_common::KernelRouteWitness,
+    pub trace_id: u32,
 }
 
 /// Malformed packet: invalid header, bad length, too many extension headers.
@@ -95,6 +99,9 @@ pub const ERR_UNKNOWN_PROTO: c_long = -3;
 
 /// Unsupported packet type (not IP); pass through.
 pub const PASS_UNSUPPORTED: c_long = 1;
+
+/// Parsed ICMPv6 Redirect; only locally originated LAN egress suppresses it.
+pub const PASS_NDP_REDIRECT: c_long = 3;
 
 /// Destinations that must never enter routing/conntrack: L2
 /// broadcast/multicast, IPv4 limited broadcast + multicast + 0.0.0.0, IPv6
@@ -249,6 +256,7 @@ impl ParseTransportExt for ParseTransportCtx {
         self.ihl = 0;
         self.l4proto = 0;
         self.listener_l4proto = 0;
+        self.is_fragmented = 0;
         unsafe {
             ptr::write_bytes(
                 &mut self.iph as *mut _ as *mut u8,
@@ -295,8 +303,9 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ihl = self.iph.ihl();
             self.l4proto = self.iph.proto;
 
-            let frag_off = u16::from_be(self.iph.frag_offset()) & 0x1FFF;
-            if frag_off != 0 {
+            let frag_off = u16::from_be_bytes(self.iph.frags);
+            self.is_fragmented = ((frag_off & 0x2000) != 0) as u8;
+            if frag_off & 0x1FFF != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -373,7 +382,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    if (u16::from_be(fragh.frag_off) & 0xFFF8) != 0 {
+                    let frag_off = u16::from_be(fragh.frag_off);
+                    self.is_fragmented |= (frag_off & 0x0001) as u8;
+                    if frag_off & 0xFFF8 != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
                     continue;
@@ -512,8 +523,9 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ihl = iph.ihl();
             self.l4proto = iph.proto;
 
-            let frag_off = u16::from_be(iph.frag_offset()) & 0x1FFF;
-            if frag_off != 0 {
+            let frag_off = u16::from_be_bytes(iph.frags);
+            self.is_fragmented = ((frag_off & 0x2000) != 0) as u8;
+            if frag_off & 0x1FFF != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -570,7 +582,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    if (u16::from_be(fragh.frag_off) & 0xFFF8) != 0 {
+                    let frag_off = u16::from_be(fragh.frag_off);
+                    self.is_fragmented |= (frag_off & 0x0001) as u8;
+                    if frag_off & 0xFFF8 != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
                     continue;
@@ -685,15 +699,20 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
     }
 
     if tctx.l4proto == IPPROTO_ICMPV6 {
-        return PASS_UNSUPPORTED;
+        return if tctx.icmp6h.type_ == 137 {
+            PASS_NDP_REDIRECT
+        } else {
+            PASS_UNSUPPORTED
+        };
     }
 
-    *out = unsafe { mem::zeroed() };
+    // Miss-only routing scratch must not add clearing work to cached packets.
     out.ethh = tctx.ethh;
     out.tcph = tctx.tcph;
     out.udph = tctx.udph;
     out.l4proto = tctx.l4proto;
     out.listener_l4proto = tctx.listener_l4proto;
+    out.is_fragmented = tctx.is_fragmented;
     tctx.fill_tuples(&mut out.tuples);
     0
 }

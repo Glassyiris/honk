@@ -1,9 +1,14 @@
 #[allow(unused_imports)]
 use crate::parser::parse_dae_config;
+use crate::parser::parse_dae_config_with_diagnostics;
 
 #[cfg(test)]
 mod parser_tests {
-    use crate::parser::parse_dae_config;
+    use crate::parser::{
+        parse_dae_config, parse_dae_config_with_detailed_diagnostics,
+        parse_dae_config_with_diagnostics,
+    };
+    use base64::Engine as _;
 
     #[test]
     fn test_parse_example_dae() {
@@ -40,6 +45,133 @@ global {
     }
 
     #[test]
+    fn test_millisecond_durations_keep_the_default_and_return_diagnostics() {
+        for (value, expected) in [("50ms", 50), ("0ms", 0), ("0.5s", 500), ("50", 50)] {
+            let input = format!(
+                "global {{\n    check_tolerance: {value}\n    sniffing_timeout: {value}\n}}"
+            );
+            let mut diagnostics = Vec::new();
+            let config = parse_dae_config_with_diagnostics(&input, &mut diagnostics).unwrap();
+            assert_eq!(config.global.check_tolerance_ms, expected, "{value}");
+            assert_eq!(config.global.sniffing_timeout_ms, expected, "{value}");
+            assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        }
+
+        for value in [
+            "1m", "2h", "1min", "abc", "-5ms", "-0.5s", "1.5ms", "inf", "nan", "",
+        ] {
+            for (setting, key, default) in [
+                ("global.check_tolerance", "check_tolerance", 50),
+                ("global.sniffing_timeout", "sniffing_timeout", 30),
+            ] {
+                let input = format!("global {{\n    {key}: {value}\n}}");
+                let mut diagnostics = Vec::new();
+                let config = parse_dae_config_with_diagnostics(&input, &mut diagnostics).unwrap();
+                let observed = match key {
+                    "check_tolerance" => config.global.check_tolerance_ms,
+                    _ => config.global.sniffing_timeout_ms,
+                };
+                assert_eq!(observed, default, "{setting} for {value}");
+                assert_eq!(diagnostics.len(), 1, "{setting} for {value}");
+                assert_eq!(diagnostics[0].setting, setting);
+            }
+        }
+    }
+
+    #[test]
+    fn test_timer_diagnostic_survives_later_parse_error() {
+        let mut diagnostics = Vec::new();
+        let result = parse_dae_config_with_diagnostics(
+            "global {\n check_tolerance: abc\n nfqueue_enable: invalid\n}",
+            &mut diagnostics,
+        );
+        assert!(result.is_err());
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].setting, "global.check_tolerance");
+    }
+
+    #[test]
+    fn test_from_file_preserves_timer_diagnostics() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(file.path(), "global {\n    check_tolerance: abc\n}").unwrap();
+
+        let mut diagnostics = Vec::new();
+        let config = crate::Config::from_file_with_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(config.global.check_tolerance_ms, 50);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "global.check_tolerance");
+    }
+
+    #[test]
+    fn test_structured_fallback_discards_only_abandoned_dae_diagnostics() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "ignored: |\n  global {\n    check_tolerance: abc\n    nfqueue_enable: invalid\n  }\n\
+             global:\n  check_tolerance_ms: 75\n",
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        parse_dae_config_with_diagnostics("global {\n sniffing_timeout: 2h\n}", &mut diagnostics)
+            .unwrap();
+        let previous = diagnostics.clone();
+        let config = crate::Config::from_file_with_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(config.global.check_tolerance_ms, 75);
+        assert_eq!(diagnostics, previous);
+    }
+
+    #[test]
+    fn test_unrelated_scalar_cannot_hide_dae_semantic_failure() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            include_str!("../../tests/fixtures/invalid_nfqueue_with_scalar.dae"),
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let error = crate::Config::from_file_with_detailed_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert_eq!(error.category, crate::error::ErrorCategory::Parse);
+        assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == "invalid-structured-config")
+        );
+    }
+
+    #[test]
+    fn test_include_preserves_timer_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("config.dae");
+        std::fs::write(&entry, "include {\n    timers.dae\n}").unwrap();
+        std::fs::write(
+            dir.path().join("timers.dae"),
+            "global {\n    sniffing_timeout: 1m\n}",
+        )
+        .unwrap();
+
+        let mut diagnostics = Vec::new();
+        let config =
+            crate::Config::from_file_with_diagnostics(entry.to_str().unwrap(), &mut diagnostics)
+                .unwrap();
+        assert_eq!(config.global.sniffing_timeout_ms, 30);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "global.sniffing_timeout");
+    }
+
+    #[test]
     fn test_parse_store_subscribe() {
         assert!(
             parse_dae_config("global {}")
@@ -57,9 +189,6 @@ global {
 
     #[test]
     fn test_parse_data_dir() {
-        let default = parse_dae_config("global {}").unwrap();
-        assert_eq!(default.global.data_dir, "/var/share/honk");
-
         let custom = parse_dae_config("global {\n data_dir: '/srv/honk'\n}").unwrap();
         assert_eq!(custom.global.data_dir, "/srv/honk");
         custom.validate().unwrap();
@@ -263,22 +392,38 @@ node {
     }
 
     #[test]
-    fn test_parse_vless_mode_link() {
+    fn test_parse_tagged_vmess_with_empty_remark() {
+        let payload = r#"{"ps":"","add":"vmess.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}"#;
+        let link = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        let config = parse_dae_config(&format!("node {{\n edge: '{link}'\n}}")).unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "edge");
+    }
+
+    #[test]
+    fn test_parse_vless_packet_and_mux_links() {
+        use crate::node::VlessUdpPath;
+
         let config = parse_dae_config(
-            "node {\n    xudp: 'vless://uuid@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://uuid@example.com:443?vless_mode=mux-cool#node'\n}",
+            "node {\n    auto: 'vless://00000000-0000-0000-0000-000000000001@example.com:443#node'\n    disabled: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=none&udp=0#node'\n    xudp: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=xudp#node'\n    cool: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=xray&xudpProxyUDP443=allow#node'\n}",
         )
         .unwrap();
-        assert_eq!(config.nodes.len(), 2);
-        assert_eq!(config.nodes[0].name, "xudp");
-        assert_eq!(
-            config.nodes[0].vless().unwrap().mode,
-            crate::node::WireMode::Xudp
-        );
-        assert_eq!(config.nodes[1].name, "cool");
-        assert_eq!(
-            config.nodes[1].vless().unwrap().mode,
-            crate::node::WireMode::MuxCool
-        );
+        assert_eq!(config.nodes.len(), 4);
+        for (index, (name, path)) in [
+            ("auto", Some(VlessUdpPath::Native)),
+            ("disabled", None),
+            ("xudp", Some(VlessUdpPath::Xudp)),
+            ("cool", Some(VlessUdpPath::CoolShared)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(config.nodes[index].name, name);
+            assert_eq!(config.nodes[index].vless().unwrap().udp_path(53), path);
+        }
     }
 
     #[test]
@@ -289,16 +434,10 @@ node {
             "node {\n    'http://proxy.example.com:8080'\n}",
         ] {
             let err = parse_dae_config(input).unwrap_err();
-            assert!(
-                err.to_string().contains("Unknown node protocol"),
-                "removed protocols must be a hard error in the config file: {err}"
-            );
+            assert!(matches!(err, crate::ConfigError::UnknownProtocol(_)));
         }
         let err = parse_dae_config("node {\n    mux = true\n}").unwrap_err();
-        assert!(
-            err.to_string().contains("vless_mode"),
-            "standalone mux must direct users to the normalized link mode: {err}"
-        );
+        assert!(matches!(err, crate::ConfigError::Parse(_)));
     }
 
     #[test]
@@ -449,6 +588,470 @@ group {
 
         let hk1 = config.nodes.iter().find(|n| n.name == "hk1").unwrap();
         assert_eq!(group("hk").nodes, vec![hk1.id]);
+
+        let mut structured: crate::group::Group =
+            serde_json::from_str(r#"{"name":"p","filters":["group('hk')"]}"#).unwrap();
+        crate::parser::resolve_group_filters(
+            std::slice::from_mut(&mut structured),
+            &config.nodes,
+            &config.subscriptions,
+        );
+        assert_eq!(
+            structured.nodes,
+            config.nodes.iter().map(|node| node.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_standalone_group_filter_comments_and_bare_tags() {
+        let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group('hk')   # note
+    }
+    multi {
+        filter: group(hk, sg)
+    }
+}
+"#;
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+
+        assert_eq!(config.groups[0].groups, vec!["hk"]);
+        assert!(config.groups[0].nodes.is_empty());
+        assert_eq!(config.groups[1].groups, vec!["hk", "sg"]);
+        assert!(config.groups[1].nodes.is_empty());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_group_filter_is_reported_and_stays_empty() {
+        let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+    other: 'socks5://127.0.0.1:1081'
+}
+group {
+    hk {
+        filter: name('edge')
+    }
+    proxy {
+        filter: group('hk') && name('edge')
+    }
+    later {
+        filter: name('other')
+    }
+}
+"#;
+        let mut diagnostics = Vec::new();
+        let mut config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+
+        assert!(config.groups[1].groups.is_empty());
+        assert!(config.groups[1].nodes.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "groups[2].filter");
+        assert_eq!(diagnostics[0].value, "1");
+        assert_eq!(config.groups[0].nodes, vec![config.nodes[0].id]);
+        assert_eq!(config.groups[2].nodes, vec![config.nodes[1].id]);
+
+        config
+            .nodes
+            .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1082#new").unwrap());
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &config.nodes,
+            &config.subscriptions,
+        );
+
+        assert!(config.groups[1].groups.is_empty());
+        assert!(config.groups[1].nodes.is_empty());
+    }
+
+    #[test]
+    fn test_nested_call_in_group_filter_is_reported() {
+        let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group('hk' && name('edge')
+    }
+}
+"#;
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+        let group = |name: &str| {
+            config
+                .groups
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap_or_else(|| panic!("group '{}' missing", name))
+        };
+
+        assert!(group("proxy").groups.is_empty());
+        assert!(group("proxy").nodes.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "groups[1].filter");
+        assert_eq!(diagnostics[0].value, "1");
+    }
+
+    #[test]
+    fn test_entry_node_escaped_quote_tag() {
+        let config = parse_dae_config(
+            r#"node {
+    'a\'b': 'socks5://127.0.0.1:1080'
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, r"a\'b");
+    }
+
+    #[test]
+    fn test_entry_node_escaped_quote_uri() {
+        let config = parse_dae_config(
+            r#"node {
+    'socks5://127.0.0.1:1080#left\':socks5://127.0.0.2:1081#right'
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].host, "127.0.0.1");
+        assert_eq!(config.nodes[0].port, 1080);
+        assert_eq!(
+            config.nodes[0].name,
+            r"left\':socks5://127.0.0.2:1081#right"
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_tagless_file_subscription() {
+        let config = parse_dae_config(
+            "subscription {\n 'file://relative/path/to/mysub.sub' # Put subscription content in /etc/dae/relative/path/to/mysub.sub\n}",
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(
+            config.subscriptions[0].url,
+            "file://relative/path/to/mysub.sub"
+        );
+        assert_eq!(config.subscriptions[0].name, "relative");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_comment_tagged_subscription() {
+        let config = parse_dae_config("subscription {\n tag: 'https://h/p' # c\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "https://h/p");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_quoted_subscription_glued_url_is_retained_with_hash_warning() {
+        let input = "subscription {\n paid: 'http://q'#c\n}";
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "legacy-glued-hash");
+        assert_eq!(
+            diagnostics[0].severity,
+            crate::diagnostic::Severity::Warning
+        );
+        let hash = input.find("#c").unwrap();
+        assert_eq!(diagnostics[0].span, Some(hash..hash + 1));
+        assert_eq!(diagnostics[0].message, "put whitespace before a comment");
+    }
+
+    #[test]
+    fn test_entry_literal_hash_in_user_agent() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'(agent#build)\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("agent#build")
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_empty_user_agent() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'()\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(config.subscriptions[0].user_agent.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_entry_subscription_user_agent_trailing_text_skips_entry() {
+        let input = "subscription {\n tag: 'http://q'(agent) junk\n}";
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        assert!(config.subscriptions.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "legacy-ua-boundary");
+        assert_eq!(diagnostics[0].severity, crate::diagnostic::Severity::Error);
+        let tail = input.find("junk").unwrap();
+        assert_eq!(diagnostics[0].span, Some(tail..tail + 1));
+        assert!(diagnostics[0].message.contains("entry is skipped"));
+    }
+
+    #[test]
+    fn test_entry_quoted_user_agent_protects_delimiters() {
+        let config =
+            parse_dae_config("subscription {\n tag: 'http://q'('agent)#build')\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("agent)#build")
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_nested_parentheses() {
+        let config = parse_dae_config(
+            "subscription {\n tag: 'http://q'(Mozilla/5.0 (X11; (Linux)#build))\n}",
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("Mozilla/5.0 (X11; (Linux)#build)")
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_bare_node_fragment() {
+        let config =
+            parse_dae_config("node {\n ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1 # note\n}")
+                .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "hk1");
+        assert_eq!(config.nodes[0].host, "1.2.3.4");
+        assert_eq!(config.nodes[0].port, 8388);
+    }
+
+    #[test]
+    fn test_entry_comment_tagged_node() {
+        let config =
+            parse_dae_config("node {\n edge: 'socks5://127.0.0.1:1080' # note\n}").unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "edge");
+        assert_eq!(config.nodes[0].host, "127.0.0.1");
+        assert_eq!(config.nodes[0].port, 1080);
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_node_trailing_text() {
+        let config =
+            parse_dae_config("node {\n 'ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1' # note\n}")
+                .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "hk1");
+        assert_eq!(config.nodes[0].host, "1.2.3.4");
+        assert_eq!(config.nodes[0].port, 8388);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_quoted() {
+        let config =
+            parse_dae_config("subscription {\n 'https://example.com/no_tag_link'\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "example.com");
+        assert_eq!(
+            config.subscriptions[0].url,
+            "https://example.com/no_tag_link"
+        );
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_bare() {
+        let config =
+            parse_dae_config("subscription {\n https://example.net/sub?x=(1)#frag\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "example.net");
+        assert_eq!(
+            config.subscriptions[0].url,
+            "https://example.net/sub?x=(1)#frag"
+        );
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_user_agent() {
+        let config =
+            parse_dae_config("subscription {\n 'https://example.org/sub'(provider/2.0)\n}")
+                .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "example.org");
+        assert_eq!(config.subscriptions[0].url, "https://example.org/sub");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("provider/2.0")
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_tag_inside_literal() {
+        let config =
+            parse_dae_config("subscription {\n 'paid:https://example.com/sub'\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_quoted_value_without_a_space_after_the_colon() {
+        // dae's grammar tokenizes `:` on its own, so these are the same
+        // entries as `key: 'value'`; they used to keep the quotes as data.
+        let config = parse_dae_config(
+            "global {\n    log_file:'honk.log'\n}\nnode {\n    a:'socks5://127.0.0.1:1080'\n}\nsubscription {\n    paid:\"https://example.com/sub\"\n}\nrouting {\n    domain(suffix:'example.com') -> direct\n    fallback: direct\n}\n",
+        )
+        .unwrap();
+        assert_eq!(config.global.log_file, "honk.log");
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "a");
+        assert_eq!(config.nodes[0].address, "127.0.0.1:1080");
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.routing.rules.len(), 1);
+        assert_eq!(
+            config.routing.rules[0].condition.domain_suffix,
+            vec!["example.com".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_apostrophe_tag() {
+        let config =
+            parse_dae_config("subscription {\n edge': https://example.com/sub\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "edge'");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_escaped_quote_tag() {
+        let config = parse_dae_config(
+            r#"subscription {
+    "paid\"east": "https://example.com/sub"(provider/2.0)
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, r#"paid\"east"#);
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("provider/2.0")
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_colliding_names_select_both_nodes() {
+        let mut config = parse_dae_config(
+            r#"subscription {
+    example.com: 'https://other.example/paid'
+    'https://example.com/free'
+}
+node {
+    paid: 'socks5://127.0.0.1:1080'
+    free: 'socks5://127.0.0.2:1080'
+}
+group {
+    proxy {
+        filter: subtag(example.com)
+    }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 2);
+        assert_eq!(config.nodes.len(), 2);
+        config.nodes[0].subscription_id = Some(config.subscriptions[0].id);
+        config.nodes[1].subscription_id = Some(config.subscriptions[1].id);
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &config.nodes,
+            &config.subscriptions,
+        );
+        assert_eq!(
+            config.groups[0].nodes,
+            vec![config.nodes[0].id, config.nodes[1].id]
+        );
+        assert_eq!(
+            config
+                .subscriptions
+                .iter()
+                .map(|sub| (
+                    sub.name.as_str(),
+                    sub.url.as_str(),
+                    sub.user_agent.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("example.com", "https://other.example/paid", None),
+                ("example.com", "https://example.com/free", None),
+            ]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_entry_subscription_hostless_name() {
+        let config = parse_dae_config("subscription {\n 'https://:80/x'\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "");
+        assert_eq!(config.subscriptions[0].url, "https://:80/x");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_entry_subscription_spaced_tag() {
+        let config =
+            parse_dae_config("subscription {\n paid : https://example.com/sub\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagged_invalid_url() {
+        let config = parse_dae_config("subscription {\n broken: not-a-url\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "broken");
+        assert_eq!(config.subscriptions[0].url, "not-a-url");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+        assert!(matches!(
+            config.validate(),
+            Err(crate::ConfigError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_garbage() {
+        let config = parse_dae_config("subscription {\n foo bar\n}").unwrap();
+        assert!(config.subscriptions.is_empty());
     }
 
     #[test]
@@ -457,10 +1060,11 @@ group {
 subscription {
     my_sub: 'https://www.example.com/subscription/link'
     another_sub: 'https://example.com/another_sub'
+    bare: https://example.com/sub?filter=(hk)#token
 }
 "#;
         let config = parse_dae_config(input).unwrap();
-        assert_eq!(config.subscriptions.len(), 2);
+        assert_eq!(config.subscriptions.len(), 3);
         assert!(config.subscriptions.iter().all(|sub| sub.enabled));
         assert!(
             config
@@ -469,6 +1073,38 @@ subscription {
                 .all(|sub| sub.update_interval == 86_400 && !sub.id.is_nil())
         );
         assert_ne!(config.subscriptions[0].id, config.subscriptions[1].id);
+        assert_eq!(
+            config.subscriptions[2].url,
+            "https://example.com/sub?filter=(hk)#token"
+        );
+    }
+
+    #[test]
+    fn test_parse_subscription_user_agent_forms() {
+        let input = r#"
+subscription {
+    detailed: {
+        url: 'http://example.test/subscription'
+        ua: 'provider/2.0'
+        interval: '10000s'
+    }
+    inline: 'http://example.test/sub'(honk/1.0 like)
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+        assert_eq!(config.subscriptions.len(), 2);
+
+        let detailed = &config.subscriptions[0];
+        assert_eq!(detailed.name, "detailed");
+        assert_eq!(detailed.url, "http://example.test/subscription");
+        assert_eq!(detailed.user_agent.as_deref(), Some("provider/2.0"));
+        assert_eq!(detailed.update_interval, 10_000);
+
+        let inline = &config.subscriptions[1];
+        assert_eq!(inline.name, "inline");
+        assert_eq!(inline.url, "http://example.test/sub");
+        assert_eq!(inline.user_agent.as_deref(), Some("honk/1.0 like"));
+        assert_eq!(inline.update_interval, 86_400);
     }
 
     #[test]
@@ -677,10 +1313,15 @@ experimental {
         );
         assert_eq!(config.experimental.clash_api.secret, "s3cret");
         assert_eq!(config.experimental.clash_api.default_mode, "Global");
-        assert!(config.experimental.cache_file.enabled);
-        assert_eq!(config.experimental.cache_file.path, "cache.db");
-        assert_eq!(config.experimental.cache_file.cache_id, "router1");
-        assert!(config.experimental.cache_file.store_fakeip);
+        assert_eq!(config.experimental.cache_file.enabled, Some(true));
+        assert_eq!(
+            config.experimental.cache_file.legacy_cache_file(),
+            (Some("cache.db"), Some("router1"))
+        );
+        assert_eq!(
+            config.experimental.cache_file.legacy_store_fakeip,
+            Some(true)
+        );
         assert!(config.experimental.cache_file.store_dns);
     }
 
@@ -823,14 +1464,99 @@ group {
 }
 
 #[test]
+fn test_group_filter_trailing_comment() {
+    let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+    other: 'socks5://127.0.0.1:1081'
+}
+group {
+    proxy {
+        filter: name('edge') # comment
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let edge = config
+        .nodes
+        .iter()
+        .find(|node| node.name == "edge")
+        .unwrap();
+    assert_eq!(config.groups[0].nodes, vec![edge.id]);
+
+    let input = r#"
+node {
+    'edge#1': 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: name('edge#1')
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.groups[0].nodes.len(), 1, "a quoted `#` is data");
+}
+
+#[test]
+fn test_group_filter_unterminated_group() {
+    let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group('hk'
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    assert!(
+        config.groups[0].nodes.is_empty(),
+        "unterminated group filter must not select all nodes"
+    );
+    config
+        .nodes
+        .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    assert!(
+        config.groups[0].nodes.is_empty(),
+        "unterminated group filter must remain empty after adding a node"
+    );
+}
+
+#[test]
+fn test_group_filter_unquoted_hash() {
+    let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group(hk#suffix)
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    assert_eq!(config.groups[0].groups, ["hk#suffix"]);
+    assert!(config.groups[0].nodes.is_empty());
+    config
+        .nodes
+        .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    assert_eq!(config.groups[0].groups, ["hk#suffix"]);
+    assert!(config.groups[0].nodes.is_empty());
+}
+
+#[test]
 fn test_group_name_filter_exact_multi_and_regex() {
     // Plain name() params are exact-match, comma-separated values OR-ed;
     // regex: gives a raw pattern (Go dae filter.go parity).
     let input = r#"
 node {
-    juicity-1: 'juicity://u:p@1.1.1.1:443'
-    juicity-2: 'juicity://u:p@2.2.2.2:443'
-    other: 'juicity://u:p@3.3.3.3:443'
+    juicity-1: 'juicity://00000000-0000-0000-0000-000000000001:p@1.1.1.1:443'
+    juicity-2: 'juicity://00000000-0000-0000-0000-000000000001:p@2.2.2.2:443'
+    other: 'juicity://00000000-0000-0000-0000-000000000001:p@3.3.3.3:443'
 }
 group {
     exact {
@@ -875,19 +1601,6 @@ group {
     assert_eq!(names("kw"), vec!["juicity-1"]);
     // Exact match on a shared prefix matches NOTHING (the test.dae case).
     assert!(names("nomatch").is_empty());
-}
-
-#[test]
-fn node_parse_diagnostic_redacts_share_link_credentials() {
-    for uri in [
-        "trojan://super-secret@",
-        "vless://uuid@example.com:443?vless_mode=super-secret",
-    ] {
-        let error = crate::node::Node::from_share_link(uri).unwrap_err();
-        let diagnostic = super::node_parse_diagnostic(&error);
-        assert!(!diagnostic.contains(uri));
-        assert!(!diagnostic.contains("super-secret"));
-    }
 }
 
 #[test]
@@ -1453,6 +2166,33 @@ dns {
 }
 
 #[test]
+fn test_parse_dns_stale_reply_ttl_invalid_uses_default_and_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    optimistic_stale_reply_ttl: x\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(config.dns.cache.stale_reply_ttl, 30);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "dns.optimistic_stale_reply_ttl");
+}
+
+#[test]
+fn test_parse_dns_stale_reply_ttl_numeric_value_has_no_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    optimistic_stale_reply_ttl: 7\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(config.dns.cache.stale_reply_ttl, 7);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
 fn test_parse_dns_accepted_invalid_values_keep_fallbacks() {
     let input = r#"
 dns {
@@ -1463,10 +2203,7 @@ dns {
 }
 "#;
     let config = parse_dae_config(input).unwrap();
-    assert!(matches!(
-        config.dns.strategy,
-        crate::dns::DnsStrategy::PreferIpv4
-    ));
+    assert!(matches!(config.dns.strategy, crate::dns::DnsStrategy::Both));
     assert!(!config.dns.cache.enabled);
     assert_eq!(config.dns.cache.ttl, 60);
     assert_eq!(config.dns.cache.max_size, 10000);
@@ -1695,4 +2432,903 @@ fn test_routing_condition_not_serde_defaults() {
     let cond: crate::routing::RoutingCondition =
         toml::from_str("port = ['443']\n[not]\nport = ['53']").unwrap();
     assert_eq!(cond.not.port, vec!["53"]);
+}
+
+#[test]
+fn test_unparseable_ports_use_the_fallback_and_return_diagnostics() {
+    for (key, value, expected) in [
+        ("tproxy_port", "abc", 12345u16),
+        ("tproxy_port", "0x3039", 12345u16),
+        ("pprof_port", "abc", 0u16),
+    ] {
+        let input = format!("global {{\n    {key}: {value}\n}}");
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(&input, &mut diagnostics).unwrap();
+
+        assert_eq!(diagnostics.len(), 1, "{key}={value}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].setting, format!("global.{key}"));
+        let observed = if key == "tproxy_port" {
+            config.global.tproxy_port
+        } else {
+            config.global.pprof_port
+        };
+        assert_eq!(observed, expected);
+    }
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "global {\n    tproxy_port: 12345\n    pprof_port: 54321\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.global.tproxy_port, 12345);
+    assert_eq!(config.global.pprof_port, 54321);
+}
+
+#[test]
+fn test_unparseable_so_mark_uses_the_fallback_and_returns_a_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "global {\n    so_mark_from_dae: zz\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "global.so_mark_from_dae");
+    assert_eq!(config.global.so_mark_from_dae, 0);
+
+    for value in ["0x10", "10"] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("global {{\n    so_mark_from_dae: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        assert_eq!(config.global.so_mark_from_dae, 16, "{value}");
+    }
+}
+
+#[test]
+fn test_unparseable_second_durations_use_the_fallback_and_return_diagnostics() {
+    for value in ["soon", "1.5s"] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("global {{\n    check_interval: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "check_interval={value}: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].setting, "global.check_interval");
+        assert_eq!(config.global.check_interval_secs, 0);
+    }
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "subscription {\n    timed: {\n        url: 'https://example.com/timed'\n        interval: never\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "subscriptions[1].interval");
+    assert_eq!(config.subscriptions[0].update_interval, 0);
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "global {\n    check_interval: 2s\n}\nsubscription {\n    timed: {\n        url: 'https://example.com/timed'\n        interval: 1h\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.global.check_interval_secs, 2);
+    assert_eq!(config.subscriptions[0].update_interval, 3600);
+}
+
+#[test]
+fn test_unparseable_ipversion_prefer_uses_the_fallback_and_returns_a_diagnostic() {
+    for value in ["ipv4", "0x6"] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("dns {{\n    ipversion_prefer: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "ipversion_prefer={value}: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].setting, "dns.ipversion_prefer");
+        assert!(matches!(config.dns.strategy, crate::dns::DnsStrategy::Both));
+    }
+
+    for (value, expected) in [
+        ("0", crate::dns::DnsStrategy::Both),
+        ("+6", crate::dns::DnsStrategy::PreferIpv6),
+        ("06", crate::dns::DnsStrategy::PreferIpv6),
+    ] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("dns {{\n    ipversion_prefer: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        assert_eq!(config.dns.strategy, expected, "{value}");
+    }
+}
+
+#[test]
+fn test_unparseable_dns_cache_numbers_use_the_fallback_and_return_diagnostics() {
+    for (key, value) in [
+        ("optimistic_cache_ttl", "x"),
+        ("optimistic_cache_ttl", "0x10"),
+    ] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("dns {{\n    {key}: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.len(), 1, "{key}={value}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].setting, format!("dns.{key}"));
+        assert_eq!(config.dns.cache.ttl, 60);
+    }
+
+    let mut diagnostics = Vec::new();
+    let config =
+        parse_dae_config_with_diagnostics("dns {\n    max_cache_size: x\n}", &mut diagnostics)
+            .unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "dns.max_cache_size");
+    assert_eq!(config.dns.cache.max_size, 10000);
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    optimistic_cache_ttl: 4294967296\n    max_cache_size: 123\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.dns.cache.ttl, 4294967296);
+    assert_eq!(config.dns.cache.max_size, 123);
+}
+
+#[test]
+fn test_unparseable_fixed_domain_ttl_is_skipped_and_returns_a_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    fixed_domain_ttl {\n        example.com: 4294967296\n        good.com: 30\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "dns.fixed_domain_ttl[1]");
+    assert!(!config.dns.fixed_domain_ttl.contains_key("example.com"));
+    assert_eq!(config.dns.fixed_domain_ttl.get("good.com"), Some(&30));
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    fixed_domain_ttl {\n        zero.com: 0\n        max.com: 4294967295\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.dns.fixed_domain_ttl.get("zero.com"), Some(&0));
+    assert_eq!(
+        config.dns.fixed_domain_ttl.get("max.com"),
+        Some(&4294967295)
+    );
+}
+
+#[test]
+fn test_unrecognised_booleans_are_false_and_return_diagnostics() {
+    let input = r#"
+global {
+    tproxy_port_protect: flase
+    disable_waiting_network: flase
+    auto_config_kernel_parameter: flase
+    store_subscribe: flase
+    allow_insecure: flase
+    tls_fragment: flase
+    mptcp: flase
+}
+dns {
+    optimistic_cache: flase
+}
+experimental {
+    cache_file {
+        enabled: flase
+        store_fakeip: flase
+        store_dns: flase
+    }
+}
+"#;
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+
+    let expected = [
+        "global.tproxy_port_protect",
+        "global.disable_waiting_network",
+        "global.auto_config_kernel_parameter",
+        "global.store_subscribe",
+        "global.allow_insecure",
+        "global.tls_fragment",
+        "global.mptcp",
+        "dns.optimistic_cache",
+        "experimental.cache_file.enabled",
+        "experimental.cache_file.store_fakeip",
+        "experimental.cache_file.store_dns",
+    ];
+    assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
+    for (diagnostic, setting) in diagnostics.iter().zip(expected) {
+        assert_eq!(diagnostic.setting, setting);
+    }
+    assert!(!config.global.tproxy_port_protect);
+    assert!(!config.global.disable_waiting_network);
+    assert!(!config.global.auto_config_kernel_parameter);
+    assert!(!config.global.store_subscribe);
+    assert!(!config.global.allow_insecure);
+    assert!(!config.global.tls_fragment);
+    assert!(!config.global.mptcp);
+    assert!(!config.dns.cache.enabled);
+    assert_eq!(config.experimental.cache_file.enabled, Some(false));
+    assert!(!config.experimental.cache_file.store_dns);
+
+    let valid_input = r#"
+global {
+    tproxy_port_protect: off
+    disable_waiting_network: no
+    auto_config_kernel_parameter: 0
+    store_subscribe: FALSE
+    allow_insecure: f
+    tls_fragment: n
+    mptcp: t
+}
+dns {
+    optimistic_cache: y
+}
+experimental {
+    cache_file {
+        enabled: true
+        store_dns: on
+    }
+}
+"#;
+    let mut diagnostics = Vec::new();
+    let config =
+        super::parse_dae_config_with_detailed_diagnostics(valid_input, &mut diagnostics).unwrap();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>(),
+        ["legacy-bool-shorthand"; 4]
+    );
+    assert!(!config.global.tproxy_port_protect);
+    assert!(!config.global.disable_waiting_network);
+    assert!(!config.global.auto_config_kernel_parameter);
+    assert!(!config.global.store_subscribe);
+    assert!(!config.global.allow_insecure);
+    assert!(!config.global.tls_fragment);
+    assert!(!config.global.mptcp);
+    assert!(!config.dns.cache.enabled);
+    assert_eq!(config.experimental.cache_file.enabled, Some(true));
+    assert!(config.experimental.cache_file.store_dns);
+}
+
+#[test]
+fn test_unknown_group_policy_returns_a_diagnostic_without_the_text() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "group {\n    odd {\n        policy: mystery('trojan://super-secret@example.com:443')\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "groups[1].policy");
+    assert_eq!(diagnostics[0].value, "");
+    assert!(!diagnostics[0].message.contains("super-secret"));
+    assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
+    assert!(!format!("{config:?}").contains("super-secret"));
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "group {\n    odd {\n        policy: select\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
+}
+
+#[test]
+fn test_unparseable_group_filter_returns_a_diagnostic() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: bogus('x')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(config.groups[0].nodes.is_empty());
+}
+
+#[test]
+fn test_unterminated_group_filter_returns_a_diagnostic() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: group('hk'\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(config.groups[0].nodes.is_empty());
+}
+
+#[test]
+fn test_group_filter_diagnostics_do_not_echo_the_filter() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: bogus('trojan://super-secret@example.com:443')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(config.groups[0].nodes.is_empty());
+    assert!(!diagnostics[0].setting.contains("super-secret"));
+    assert!(!diagnostics[0].value.contains("super-secret"));
+    assert!(!diagnostics[0].message.contains("super-secret"));
+}
+
+#[test]
+fn quoted_conjunction_filter_matches_literal_on_reresolution() {
+    let input = "node {\n    'a&&b': 'socks5://127.0.0.1:1080'\n    other: 'socks5://127.0.0.1:1081'\n}\ngroup {\n    proxy {\n        filter: name('a&&b')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let mut config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(config.groups[0].nodes, [config.nodes[0].id]);
+    assert!(diagnostics.is_empty());
+
+    config.nodes[0].name = "renamed".to_string();
+    let replacement = crate::node::Node::from_share_link("socks5://127.0.0.1:1082#a&&b").unwrap();
+    let replacement_id = replacement.id;
+    config.nodes.push(replacement);
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    assert_eq!(config.groups[0].nodes, [replacement_id]);
+}
+
+#[test]
+fn test_filter_ordinal_skips_subgroup_declarations() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: group('hk')\n        filter: bogus('x')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(config.groups[0].nodes.is_empty());
+    assert_eq!(config.groups[0].groups, ["hk"]);
+}
+
+/// The injected `direct`/`block` are outbounds, not pool members: an
+/// unfiltered group, a regex and a keyword skip them; only a filter that
+/// spells the name admits one, and a negated name never does.
+#[test]
+fn test_group_filters_skip_injected_builtins_unless_named() {
+    let input = r#"
+node {
+    a: 'juicity://00000000-0000-0000-0000-000000000001:p@1.1.1.1:443'
+    b: 'juicity://00000000-0000-0000-0000-000000000001:p@2.2.2.2:443'
+}
+group {
+    all { policy: min_moving_avg }
+    re {
+        filter: name(regex: '.')
+        policy: min_moving_avg
+    }
+    kw {
+        filter: name(keyword: 'ir')
+        policy: select
+    }
+    named {
+        filter: name('direct', 'a')
+        policy: select
+    }
+    negated {
+        filter: !name('a')
+        policy: select
+    }
+    tag {
+        filter: subtag(regex: '.*')
+        policy: select
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    config.ensure_builtin_nodes();
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    let names = |tag: &str| {
+        let group = config.groups.iter().find(|g| g.name == tag).unwrap();
+        let mut names: Vec<&str> = group
+            .nodes
+            .iter()
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == *id)
+                    .unwrap()
+                    .name
+                    .as_str()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names("all"), vec!["a", "b"]);
+    assert_eq!(names("re"), vec!["a", "b"]);
+    assert!(names("kw").is_empty(), "keyword must not reach `direct`");
+    assert_eq!(names("named"), vec!["a", "direct"]);
+    assert_eq!(names("negated"), vec!["b"]);
+    assert!(names("tag").is_empty());
+}
+
+#[cfg(test)]
+mod subscription_entry_options {
+    use crate::diagnostic::{DetailedDiagnostic, Severity};
+    use crate::parser::parse_dae_config_with_detailed_diagnostics;
+    use crate::subscription::Subscription;
+
+    fn parse(input: &str) -> (Vec<Subscription>, Vec<DetailedDiagnostic>) {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        (config.subscriptions, diagnostics)
+    }
+
+    type Fetch<'a> = (&'a str, &'a str, Option<&'a str>, u64, bool, &'a str);
+
+    fn fetch(subscription: &Subscription) -> Fetch<'_> {
+        (
+            &subscription.name,
+            &subscription.url,
+            subscription.user_agent.as_deref(),
+            subscription.update_interval,
+            subscription.cache,
+            &subscription.download_detour,
+        )
+    }
+
+    #[test]
+    fn options_follow_the_link_on_the_entry_line() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n b: 'https://example.test/b' {\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  route: direct\n }\n c: 'https://example.test/c' { ua: 'v2rayN' }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [
+                (
+                    "b",
+                    "https://example.test/b",
+                    Some("v2rayN"),
+                    3600,
+                    false,
+                    "direct"
+                ),
+                (
+                    "c",
+                    "https://example.test/c",
+                    Some("v2rayN"),
+                    Subscription::default().update_interval,
+                    true,
+                    ""
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_option_is_read_on_its_own_and_comments_are_skipped() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n ua: 'https://example.test/ua' { # own agent\n  ua: 'clash.meta' # trailing\n }\n \
+             interval: 'https://example.test/interval' {\n  # manual refresh\n  interval: 0\n }\n \
+             cache: 'https://example.test/cache' {\n  cache: false\n }\n \
+             route: 'https://example.test/route' {\n  route: proxy\n }\n \
+             empty: 'https://example.test/empty' {}\n}\ngroup {\n proxy { policy: min_moving_avg }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let defaults = Subscription::default();
+        let default = |name, url| {
+            (
+                name,
+                url,
+                None,
+                defaults.update_interval,
+                defaults.cache,
+                "",
+            )
+        };
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [
+                (
+                    "ua",
+                    "https://example.test/ua",
+                    Some("clash.meta"),
+                    defaults.update_interval,
+                    true,
+                    ""
+                ),
+                (
+                    "interval",
+                    "https://example.test/interval",
+                    None,
+                    0,
+                    true,
+                    ""
+                ),
+                (
+                    "cache",
+                    "https://example.test/cache",
+                    None,
+                    defaults.update_interval,
+                    false,
+                    ""
+                ),
+                (
+                    "route",
+                    "https://example.test/route",
+                    None,
+                    defaults.update_interval,
+                    true,
+                    "proxy"
+                ),
+                default("empty", "https://example.test/empty"),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_forms_read_unchanged_without_warnings() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n a: 'https://example.test/a'\n b: 'https://example.test/b'('clash.meta')\n \
+             c: {\n  url: 'https://example.test/c'\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  download_detour: direct\n }\n \
+             d: {\n  url: 'https://example.test/d'\n  route: direct\n }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let interval = Subscription::default().update_interval;
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [
+                ("a", "https://example.test/a", None, interval, true, ""),
+                (
+                    "b",
+                    "https://example.test/b",
+                    Some("clash.meta"),
+                    interval,
+                    true,
+                    ""
+                ),
+                (
+                    "c",
+                    "https://example.test/c",
+                    Some("v2rayN"),
+                    3600,
+                    false,
+                    "direct"
+                ),
+                (
+                    "d",
+                    "https://example.test/d",
+                    None,
+                    interval,
+                    true,
+                    "direct"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_block_and_entry_options_read_the_same_subscription() {
+        let (old, old_diagnostics) = parse(
+            "subscription {\n s: {\n  url: 'https://example.test/s'\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  download_detour: direct\n }\n}",
+        );
+        let (new, new_diagnostics) = parse(
+            "subscription {\n s: 'https://example.test/s' {\n  ua: 'v2rayN'\n  interval: 3600s\n  cache: false\n  route: direct\n }\n}",
+        );
+        assert!(old_diagnostics.is_empty() && new_diagnostics.is_empty());
+        assert_eq!(
+            old.iter().map(fetch).collect::<Vec<_>>(),
+            new.iter().map(fetch).collect::<Vec<_>>()
+        );
+        assert_eq!(old[0].headers, new[0].headers);
+        assert_eq!(old[0].enabled, new[0].enabled);
+    }
+
+    #[test]
+    fn route_and_download_detour_together_are_refused_at_the_entry() {
+        let input = "subscription {\n a: 'https://example.test/a'\n b: {\n  url: 'https://example.test/b'\n  download_detour: direct\n  route: routing\n }\n}";
+        let error = parse_dae_config_with_detailed_diagnostics(input, &mut Vec::new())
+            .expect_err("both keys must be refused");
+        assert_eq!(error.diagnostic.code, "conflicting-subscription-route");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "subscriptions[2].route"
+        );
+        assert_eq!(error.diagnostic.line, Some(6));
+    }
+
+    #[test]
+    fn entry_options_reject_unknown_keys_including_url_and_download_detour() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n a: 'https://example.test/a' {\n  url: 'https://example.test/other'\n  download_detour: direct\n  proxy: x\n  ua: 'v2rayN'\n }\n}",
+        );
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [(
+                "a",
+                "https://example.test/a",
+                Some("v2rayN"),
+                Subscription::default().update_interval,
+                true,
+                ""
+            )]
+        );
+        let unknown = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "unknown-key")
+            .map(|diagnostic| (diagnostic.severity, diagnostic.line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unknown,
+            [
+                (Severity::Warning, Some(3)),
+                (Severity::Warning, Some(4)),
+                (Severity::Warning, Some(5))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_header_that_is_not_a_quoted_link_stays_a_legacy_wrapper() {
+        let (subscriptions, diagnostics) =
+            parse("subscription {\n a: b: {\n  url: 'http://example.test/sub'\n }\n}");
+        assert_eq!(subscriptions.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "legacy-wrapper")
+        );
+    }
+}
+
+#[cfg(test)]
+mod assets_block {
+    use crate::Config;
+    use crate::diagnostic::DetailedDiagnostic;
+    use crate::parser::parse_dae_config_with_detailed_diagnostics;
+
+    const GROUP: &str = "group {\n proxy { policy: min_moving_avg }\n}\n";
+
+    fn parse(input: &str) -> (Config, Vec<DetailedDiagnostic>) {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+        (config, diagnostics)
+    }
+
+    fn legacy(diagnostics: &[DetailedDiagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .filter(|d| d.code == "legacy-assets-key")
+            .map(|d| d.setting.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_key_reaches_the_field_its_download_reads() {
+        let (config, diagnostics) = parse(&format!(
+            "{GROUP}assets {{\n route: proxy\n geodata {{\n  geosite: 'https://example.test/geosite.dat'\n  geoip: 'https://example.test/geoip.dat'\n  route: direct\n }}\n ui {{\n  url: 'https://example.test/ui.zip'\n  route: proxy\n }}\n subscription {{\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }}\n}}"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let native = &config.experimental.native_api;
+        assert_eq!(
+            native.geosite_download_url,
+            "https://example.test/geosite.dat"
+        );
+        assert_eq!(native.geoip_download_url, "https://example.test/geoip.dat");
+        assert_eq!(native.geodata_download_detour, "direct");
+        let clash = &config.experimental.clash_api;
+        assert_eq!(
+            clash.external_ui_download_url,
+            "https://example.test/ui.zip"
+        );
+        assert_eq!(clash.external_ui_download_detour, "proxy");
+        assert_eq!(config.assets.route, "proxy");
+        let defaults = &config.assets.subscription;
+        assert_eq!(defaults.ua.as_deref(), Some("clash.meta"));
+        assert_eq!(defaults.interval, Some(3600));
+        assert_eq!(defaults.cache, Some(false));
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn a_subscription_entry_wins_over_assets_and_assets_over_the_built_in() {
+        // The assets block comes after the entries on purpose.
+        let (config, diagnostics) = parse(&format!(
+            "{GROUP}subscription {{\n a: 'https://example.test/a'\n b: 'https://example.test/b' {{\n  ua: 'v2rayN'\n  interval: 0s\n  cache: true\n  route: direct\n }}\n c: 'https://example.test/c'(legacy-ua)\n d: {{\n  url: 'https://example.test/d'\n  download_detour: routing\n }}\n}}\nassets {{\n route: proxy\n subscription {{\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }}\n}}"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let fetch = config
+            .subscriptions
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    s.user_agent.as_deref(),
+                    s.update_interval,
+                    s.cache,
+                    s.download_detour.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fetch,
+            [
+                ("a", Some("clash.meta"), 3600, false, "proxy"),
+                ("b", Some("v2rayN"), 0, true, "direct"),
+                ("c", Some("legacy-ua"), 3600, false, "proxy"),
+                ("d", Some("clash.meta"), 3600, false, "routing"),
+            ]
+        );
+
+        let (config, _) = parse("subscription {\n a: 'https://example.test/a'\n}");
+        let a = &config.subscriptions[0];
+        assert_eq!(
+            (a.user_agent.as_deref(), a.update_interval, a.cache),
+            (None, 86400, true),
+            "no assets block keeps the built-in defaults"
+        );
+        assert_eq!(a.download_detour, "");
+    }
+
+    #[test]
+    fn a_sub_block_route_wins_over_assets_route_and_that_over_routing() {
+        let (config, _) = parse(&format!(
+            "{GROUP}assets {{\n route: proxy\n geodata {{\n  route: direct\n }}\n}}"
+        ));
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "direct"
+        );
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour,
+            "proxy"
+        );
+
+        let (config, _) = parse("assets {\n route: direct\n ui {\n  route: routing\n }\n}");
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "direct"
+        );
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour, "",
+            "routing is the UI download's empty default"
+        );
+
+        let (config, _) = parse("assets {\n route: routing\n}");
+        assert_eq!(
+            config.experimental.native_api.geodata_download_detour,
+            "routing"
+        );
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour,
+            ""
+        );
+
+        let (config, _) = parse("global {\n}");
+        assert_eq!(config.experimental.native_api.geodata_download_detour, "");
+        assert_eq!(
+            config.experimental.clash_api.external_ui_download_detour,
+            ""
+        );
+    }
+
+    #[test]
+    fn assets_route_is_validated_as_a_download_detour() {
+        let (config, _) = parse("assets {\n route: missing\n}");
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-assets-route");
+        assert_eq!(error.diagnostic.setting.to_string(), "assets.route");
+    }
+
+    #[test]
+    fn old_experimental_keys_keep_working_and_warn_at_each_occurrence() {
+        let (config, diagnostics) = parse(&format!(
+            "{GROUP}assets {{\n route: direct\n}}\nexperimental {{\n native_api {{\n  geosite_download_url: 'https://old.test/geosite.dat'\n  geoip_download_url: 'https://old.test/geoip.dat'\n  geodata_download_detour: proxy\n }}\n clash_api {{\n  external_ui_download_url: 'https://old.test/ui.zip'\n  external_ui_download_detour: proxy\n }}\n clash_api {{\n  external_ui_download_url: 'https://old.test/ui.zip'\n }}\n}}"
+        ));
+        assert_eq!(
+            legacy(&diagnostics),
+            [
+                "experimental.native_api.geosite_download_url",
+                "experimental.native_api.geoip_download_url",
+                "experimental.native_api.geodata_download_detour",
+                "experimental.clash_api.external_ui_download_url",
+                "experimental.clash_api.external_ui_download_detour",
+                "experimental.clash_api.external_ui_download_url",
+            ]
+        );
+        let native = &config.experimental.native_api;
+        assert_eq!(native.geosite_download_url, "https://old.test/geosite.dat");
+        assert_eq!(native.geoip_download_url, "https://old.test/geoip.dat");
+        assert_eq!(native.geodata_download_detour, "proxy");
+        let clash = &config.experimental.clash_api;
+        assert_eq!(clash.external_ui_download_url, "https://old.test/ui.zip");
+        assert_eq!(clash.external_ui_download_detour, "proxy");
+    }
+
+    #[test]
+    fn each_legacy_key_occurrence_warns_at_its_line() {
+        let (_, diagnostics) = parse(&format!(
+            "{GROUP}experimental {{\n native_api {{\n  geosite_download_url: 'https://a.test'\n  geosite_download_url: 'https://b.test'\n }}\n}}"
+        ));
+        let lines: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "legacy-assets-key")
+            .map(|d| (d.line, d.span.is_some()))
+            .collect();
+        assert_eq!(lines, [(Some(6), true), (Some(7), true)], "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_setting_in_both_places_is_refused_naming_both() {
+        for (new, old) in [
+            (
+                "geodata {\n  geosite: 'https://a.test'\n }",
+                "native_api {\n  geosite_download_url: 'https://b.test'\n }",
+            ),
+            (
+                "geodata {\n  geoip: 'https://a.test'\n }",
+                "native_api {\n  geoip_download_url: 'https://b.test'\n }",
+            ),
+            (
+                "geodata {\n  route: direct\n }",
+                "native_api {\n  geodata_download_detour: direct\n }",
+            ),
+            (
+                "ui {\n  url: 'https://a.test'\n }",
+                "clash_api {\n  external_ui_download_url: 'https://b.test'\n }",
+            ),
+            (
+                "ui {\n  route: direct\n }",
+                "clash_api {\n  external_ui_download_detour: direct\n }",
+            ),
+        ] {
+            let mut diagnostics = Vec::new();
+            let error = parse_dae_config_with_detailed_diagnostics(
+                &format!("assets {{\n {new}\n}}\nexperimental {{\n {old}\n}}"),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+            let warning = diagnostics
+                .iter()
+                .find(|d| d.code == "legacy-assets-key")
+                .unwrap();
+            assert_eq!(warning.line, Some(8), "{warning:?}");
+            let d = &error.diagnostic;
+            assert_eq!(d.code, "conflicting-assets-setting");
+            assert!(d.setting.to_string().starts_with("assets."), "{d:?}");
+            let old_key = old.split(['{', ':']).nth(1).unwrap().trim();
+            assert!(d.message.contains(&d.setting.to_string()), "{d:?}");
+            assert!(d.message.contains(old_key), "{d:?}");
+            assert_eq!(d.line, Some(3), "{d:?}");
+        }
+    }
 }

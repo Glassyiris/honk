@@ -1,12 +1,11 @@
 use super::*;
 
-/// Recursively collect the member node ids of a group, expanding nested
-/// sub-groups (`Group.groups`). Config-level twin of the GroupManager's
-/// leaf expansion — the config may still contain group cycles (the
-/// GroupManager cuts them on its own copy), so a visited guard and the
-/// shared depth cap apply here too.
+/// Collect reachable leaf ids through membership and explicit final edges.
+/// Config retains cycles cut from GroupManager's copy, so both walks use
+/// a path guard and the shared group-depth cap.
 pub(in crate::control) fn collect_group_leaf_ids<'a>(
     group: &'a Group,
+    config: &'a Config,
     groups_by_name: &std::collections::HashMap<&'a str, &'a Group>,
     depth: usize,
     visited: &mut Vec<&'a str>,
@@ -19,7 +18,24 @@ pub(in crate::control) fn collect_group_leaf_ids<'a>(
     out.extend(group.nodes.iter().copied());
     for tag in &group.groups {
         if let Some(sub) = groups_by_name.get(tag.as_str()) {
-            collect_group_leaf_ids(sub, groups_by_name, depth + 1, visited, out);
+            collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
+        }
+    }
+    if let Some(final_name) = group.final_outbound.as_deref() {
+        match final_name {
+            Config::BUILTIN_DIRECT_NODE => {
+                out.insert(honk_config::config::DIRECT_NODE_ID);
+            }
+            Config::BUILTIN_BLOCK_NODE => {
+                out.insert(honk_config::config::BLOCK_NODE_ID);
+            }
+            name => {
+                if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                    out.insert(node.id);
+                } else if let Some(sub) = groups_by_name.get(name) {
+                    collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
+                }
+            }
         }
     }
     visited.pop();
@@ -32,10 +48,9 @@ pub(in crate::control) fn groups_by_name(
     config.groups.iter().map(|g| (g.name.as_str(), g)).collect()
 }
 
-/// Nodes that should be health-checked: members of any group — with
-/// nested sub-groups expanded to their leaf nodes (Selector members are
-/// probed too — alive display + failure discovery — not just URLTest
-/// members). Ungrouped nodes are skipped unless no groups exist at all.
+/// Nodes reachable through group membership or explicit finals are probed
+/// for alive display and recovery, including Selector leaves. Ungrouped
+/// nodes are skipped unless no reachable leaves exist.
 /// Returns `(NodeId, node name, address)` triples.
 pub(in crate::control) fn health_check_targets(
     config: &Config,
@@ -46,7 +61,7 @@ pub(in crate::control) fn health_check_targets(
         .iter()
         .flat_map(|g| {
             let mut ids = std::collections::BTreeSet::new();
-            collect_group_leaf_ids(g, &by_name, 0, &mut Vec::new(), &mut ids);
+            collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
             ids
         })
         .collect();
@@ -95,18 +110,16 @@ pub(in crate::control) fn sync_health_check_nodes(
 
 /// URLTest group registrations for the alive set's idle-suspension table:
 /// `(group name, member NodeIds, idle timeout)` per URLTest group.
-/// Members shared with any non-URLTest group (Selector, LoadBalance,
-/// Fallback) are excluded — those are probed unconditionally, same as
-/// Selector members. Nested sub-groups are expanded to their leaf nodes
-/// (health state lives on real nodes). Used identically at startup and on
-/// config reload.
+/// Leaves shared with any non-URLTest group are probed unconditionally.
+/// Membership and explicit final edges both participate, since health state
+/// lives on real nodes. Used identically at startup and on config reload.
 pub(in crate::control) fn urltest_group_registrations(
     config: &Config,
 ) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
     let by_name = groups_by_name(config);
     let leaf_ids = |g: &Group| {
         let mut ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(g, &by_name, 0, &mut Vec::new(), &mut ids);
+        collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
         ids
     };
     let always_probed_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
@@ -154,42 +167,47 @@ pub(in crate::control) fn group_check_url_registrations(config: &Config) -> Vec<
         .collect()
 }
 
-/// Wire the `interrupt_connections` callback into a group manager: when a
-/// group's selected node changes, close its tracked connections so they
-/// re-dial through the new node. The callback reads the *current* manager
-/// through the shared cell, so it keeps working after a reload swaps the
-/// manager out. Tracked connections record the dialed leaf node name, so
-/// the target set covers the group name, its member tags, and every leaf
-/// reachable through nested sub-groups.
+/// Automatic policy changes cancel captured group/network owners without rebuilding provenance.
 pub(in crate::control) fn install_interrupt_callback(
     group_manager: &GroupManager,
-    group_manager_cell: &SharedGroupManager,
+    groups: &[honk_config::group::Group],
     tracker: &Arc<ConnectionTracker>,
+    diagnostics: &crate::config_diagnostics::SharedDiagnostics,
+    generation: u64,
+    #[cfg(feature = "native-api")] native: Option<&Arc<crate::observe::Observation>>,
 ) {
     if group_manager.has_interrupt_connections() {
         tracker.enable_for_interrupts();
     }
-
-    let cell = group_manager_cell.clone();
-    let tracker = tracker.clone();
-    group_manager.set_interrupt_callback(Some(Arc::new(move |group_name: &str| {
-        let gm = cell.read().clone();
-        let mut targets: std::collections::HashSet<String> =
-            gm.node_names_in_group(group_name).into_iter().collect();
-        targets.extend(gm.leaf_node_names_in_group(group_name));
-        targets.insert(group_name.to_string());
-        let mut closed = 0usize;
-        for snap in tracker.snapshot() {
-            if targets.contains(&snap.proxy) {
-                tracker.remove(&snap.id);
-                closed += 1;
-            }
+    let identities: std::collections::HashMap<_, _> = groups
+        .iter()
+        .map(|group| (group.name.clone(), group.id.to_string()))
+        .collect();
+    let tracker = Arc::clone(tracker);
+    let diagnostics = Arc::clone(diagnostics);
+    #[cfg(feature = "native-api")]
+    let native = native.cloned();
+    group_manager.set_interrupt_callback(Some(Arc::new(move |name, network| {
+        if diagnostics.read().generation != generation {
+            return;
         }
-        if closed > 0 {
-            info!(
-                "interrupt_connections: closed {} connection(s) for group '{}'",
-                closed, group_name
-            );
+        let identity = identities.get(name).cloned();
+        #[cfg(feature = "native-api")]
+        let identity = if let Some(native) = &native {
+            native.catalog.snapshot().groups.get(name).cloned()
+        } else {
+            identity
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        let network = match network {
+            honk_outbound::group::SelectionNetwork::Tcp => "tcp",
+            honk_outbound::group::SelectionNetwork::Udp => "udp",
+        };
+        for selected in tracker.snapshot_group(&identity, Some(network)) {
+            // The transport/removal owner, not this synchronous callback, owns completion.
+            drop(tracker.start_close(selected));
         }
     })));
 }
@@ -203,18 +221,16 @@ pub(in crate::control) fn install_selector_warm_callback(
 ) {
     let notify = Arc::clone(notify);
     group_manager.set_selector_change_callback(Some(Arc::new(move || {
-        notify.notify_one();
+        notify.notify_waiters();
     })));
 }
 
 /// Build the NodeId → eBPF outbound id map used for
 /// `OUTBOUND_CONNECTIVITY_MAP` pushes. Numbering matches
 /// `push_routing_to_ebpf`: direct=0, block=1, group i → `UserBase + i`;
-/// group member nodes inherit their group's id (first group wins when a
-/// node is in several groups), with nested sub-groups expanded to their
-/// leaves so a leaf dialed via a sub-group still maps to the top group's
-/// slot. Nodes outside any group have no eBPF outbound id and are absent
-/// from the map.
+/// Reachable leaves inherit their group's id (first group wins), expanding
+/// membership and explicit final edges so final-only health transitions also
+/// update the containing group's slot. Unreachable nodes are absent.
 pub(in crate::control) fn build_outbound_id_map(
     config: &Config,
 ) -> std::collections::HashMap<uuid::Uuid, u8> {
@@ -223,7 +239,7 @@ pub(in crate::control) fn build_outbound_id_map(
     for (i, group) in config.groups.iter().enumerate() {
         let id = OutboundIndex::UserBase as u8 + i as u8;
         let mut leaf_ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(group, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
+        collect_group_leaf_ids(group, config, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
         for node_id in leaf_ids {
             map.entry(node_id).or_insert(id);
         }
@@ -242,11 +258,18 @@ pub(in crate::control) fn group_datapath_alive(
     domain: ProbeDomain,
     ipver: IpVersion,
 ) -> bool {
-    let leaves = group_manager.leaf_nodes_in_group(&group.name);
-    (domain == ProbeDomain::Tcp && group.final_outbound.is_none() && leaves.len() == 1)
-        || leaves
+    (domain == ProbeDomain::Tcp
+        && group.final_outbound.is_none()
+        && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
+        || group_manager
+            .reachable_leaf_nodes_in_group(&group.name)
             .iter()
-            .any(|node| alive_set.is_alive_for(node.id, domain, ipver))
+            .any(|node| {
+                (domain == ProbeDomain::Tcp
+                    || node.protocol() == NodeProtocol::Block
+                    || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
+                    && alive_set.is_alive_for(node.id, domain, ipver)
+            })
 }
 
 pub(crate) fn group_connectivity_snapshot(
@@ -310,8 +333,8 @@ impl ControlPlane {
     /// (control plane, per-connection handles, clash API) picks up new or
     /// changed groups at once. Runtime selector choices migrate by group
     /// name (choices whose group or selected node vanished are dropped);
-    /// cache.db-backed choices survive because every change is persisted
-    /// at set time, so no cache.db restore runs here. The alive set's
+    /// choices kept in the state db survive because every change is persisted
+    /// at set time, so no restore runs here. The alive set's
     /// health-check registrations and URLTest group table are refreshed to
     /// match the new group membership, and the node → eBPF outbound id map
     /// (`outbound_id_map`, already refreshed by the reload path) is built
@@ -327,14 +350,24 @@ impl ControlPlane {
             Some(self.alive_set.clone()),
             self.group_manager.read().score_state(),
         );
+        let runtimes = self.runtime_registry.read().clone();
+        new_gm.bind_transport_quality(&runtimes);
         // Migrate runtime choices before wiring callbacks: migration must
         // not fire persistence or connection interruption.
         new_gm.migrate_selector_choices_from(&self.group_manager.read());
-        install_interrupt_callback(&new_gm, &self.group_manager, &self.connection_tracker);
+        install_interrupt_callback(
+            &new_gm,
+            &groups,
+            &self.connection_tracker,
+            &self.diagnostics,
+            self.diagnostics.read().generation,
+            #[cfg(feature = "native-api")]
+            self.native.as_ref(),
+        );
         if let Some(ref db) = self.cache_db {
             let db_cb = db.clone();
-            new_gm.set_persist_callback(Some(Arc::new(move |group, node| {
-                db_cb.save_selector_choice(group, node);
+            new_gm.set_persist_callback(Some(Arc::new(move |group, network, member| {
+                db_cb.save_network_selector(group, network, member);
             })));
         }
         {

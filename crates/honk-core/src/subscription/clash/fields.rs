@@ -1,0 +1,266 @@
+use honk_config::options::vocab::{coalesce_equal, optional_text};
+use serde_yaml::{Mapping, Value};
+
+use super::super::yaml_value;
+
+pub(super) fn raw_alias<'a>(
+    mapping: &'a Mapping,
+    keys: &[&str],
+) -> Result<Option<&'a Value>, &'static str> {
+    coalesce_equal(
+        keys.iter()
+            .filter_map(|key| yaml_value(mapping, key))
+            .map(|value| Ok((!matches!(value, Value::Null)).then_some(value))),
+        "conflicting aliases",
+    )
+}
+
+fn parsed_alias<T: PartialEq>(
+    mapping: &Mapping,
+    keys: &[&str],
+    parse: impl Fn(&Value) -> Result<Option<T>, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    coalesce_equal(
+        keys.iter()
+            .filter_map(|key| yaml_value(mapping, key))
+            .map(parse),
+        "conflicting aliases",
+    )
+}
+
+pub(super) fn text(value: &Value) -> Result<Option<String>, &'static str> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(value.clone())),
+        Value::Number(value) if value.as_f64().is_some_and(|value| value.is_finite()) => {
+            Ok(Some(value.to_string()))
+        }
+        Value::Number(_) => Err("field must be a finite scalar"),
+        _ => Err("field must be a scalar"),
+    }
+}
+
+pub(super) fn text_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<String>, &'static str> {
+    parsed_alias(mapping, keys, text)
+}
+
+pub(super) fn optional_text_alias(
+    mapping: &Mapping,
+    keys: &[&str],
+) -> Result<Option<String>, &'static str> {
+    parsed_alias(mapping, keys, |value| {
+        let value = text(value)?;
+        if optional_text([value.as_deref()])?.is_some() {
+            Ok(value)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+pub(super) fn vmess_cipher_alias(
+    mapping: &Mapping,
+    keys: &[&str],
+) -> Result<Option<String>, &'static str> {
+    parsed_alias(mapping, keys, |value| {
+        let value = text(value)?;
+        honk_config::options::vocab::vmess_cipher(value.as_deref())
+            .map(|value| value.map(str::to_owned))
+    })
+}
+
+pub(super) fn tuic_relay_alias(mapping: &Mapping) -> Result<Option<()>, &'static str> {
+    parsed_alias(
+        mapping,
+        &["udp-relay-mode", "udp_relay_mode"],
+        |value| match text(value)?.as_deref().map(str::trim) {
+            None => Ok(None),
+            Some("" | "native") => Ok(Some(())),
+            Some(_) => Err("unsupported TUIC UDP relay mode"),
+        },
+    )
+}
+
+pub(super) fn bool_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<bool>, &'static str> {
+    parsed_alias(mapping, keys, |value| match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(*value)),
+        _ => Err("field must be boolean"),
+    })
+}
+
+fn u64_value(value: &Value) -> Result<u64, &'static str> {
+    match value {
+        Value::Number(value) => value.as_u64().ok_or("field must be a non-negative integer"),
+        Value::String(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| "field must be a non-negative integer"),
+        _ => Err("field must be a non-negative integer"),
+    }
+}
+
+pub(super) fn u64_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<u64>, &'static str> {
+    parsed_alias(mapping, keys, |value| match value {
+        Value::Null => Ok(None),
+        value => u64_value(value).map(Some),
+    })
+}
+
+pub(in crate::subscription) fn duration_secs(value: &Value) -> Result<u64, &'static str> {
+    match value {
+        Value::Number(_) => u64_value(value),
+        Value::String(raw) => {
+            let raw = raw.trim();
+            let (number, multiplier) = if let Some(value) = raw.strip_suffix("ms") {
+                (value, 0)
+            } else if let Some(value) = raw.strip_suffix('s') {
+                (value, 1)
+            } else if let Some(value) = raw.strip_suffix('m') {
+                (value, 60)
+            } else if let Some(value) = raw.strip_suffix('h') {
+                (value, 3600)
+            } else {
+                (raw, 1)
+            };
+            let number: u64 = number
+                .trim()
+                .parse()
+                .map_err(|_| "field must be a duration")?;
+            if multiplier == 0 {
+                Ok(number / 1000 + u64::from(!number.is_multiple_of(1000)))
+            } else {
+                number
+                    .checked_mul(multiplier)
+                    .ok_or("duration is too large")
+            }
+        }
+        _ => Err("field must be a duration"),
+    }
+}
+
+pub(super) fn duration_alias(
+    mapping: &Mapping,
+    keys: &[&str],
+) -> Result<Option<u64>, &'static str> {
+    parsed_alias(mapping, keys, |value| match value {
+        Value::Null => Ok(None),
+        value => duration_secs(value).map(Some),
+    })
+}
+
+fn rate_mbps(value: &Value) -> Result<Option<u32>, &'static str> {
+    let Some(raw) = text(value)? else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    let raw = raw
+        .strip_suffix("Mbps")
+        .or_else(|| raw.strip_suffix("mbps"))
+        .or_else(|| raw.strip_suffix("Mb/s"))
+        .unwrap_or(raw)
+        .trim();
+    raw.parse().map(Some).map_err(|_| "field must be Mbps")
+}
+
+pub(super) fn rate_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<u32>, &'static str> {
+    parsed_alias(mapping, keys, rate_mbps)
+}
+
+fn list_text(value: &Value) -> Result<Option<String>, &'static str> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Sequence(values) => {
+            let mut joined = String::new();
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    joined.push(',');
+                }
+                if let Some(value) = text(value)? {
+                    joined.push_str(&value);
+                }
+            }
+            Ok(Some(joined))
+        }
+        value => text(value),
+    }
+}
+
+pub(super) fn list_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<String>, &'static str> {
+    parsed_alias(mapping, keys, list_text)
+}
+
+pub(super) fn alpn_list(value: &Value) -> Result<Vec<String>, &'static str> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(value) => Ok(value
+            .split(',')
+            .map(|value| value.trim().to_owned())
+            .collect()),
+        Value::Sequence(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or("ALPN must be a string or string array")
+            })
+            .collect(),
+        _ => Err("ALPN must be a string or string array"),
+    }
+}
+
+pub(super) fn ports(value: &Value) -> Result<Option<String>, &'static str> {
+    let Some(value) = list_text(value)? else {
+        return Ok(None);
+    };
+    let mut normalized = String::new();
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if !normalized.is_empty() {
+            normalized.push(',');
+        }
+        for character in part.chars() {
+            normalized.push(if character == ':' { '-' } else { character });
+        }
+    }
+    if normalized.is_empty() {
+        return Err("port range is empty");
+    }
+    Ok(Some(normalized))
+}
+
+pub(super) fn active(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => {
+            value.as_i64() != Some(0) && value.as_u64() != Some(0) && value.as_f64() != Some(0.0)
+        }
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Sequence(value) => !value.is_empty(),
+        Value::Mapping(value) => {
+            !value.is_empty()
+                && yaml_value(value, "enabled")
+                    .is_none_or(|enabled| !matches!(enabled, Value::Null | Value::Bool(false)))
+        }
+        Value::Tagged(_) => true,
+    }
+}
+
+pub(super) fn active_for_key(key: &str, value: &Value) -> bool {
+    if matches!(key, "pin-sha256" | "pin_sha256") {
+        return !matches!(value, Value::Null);
+    }
+    if matches!(key, "packet-encoding" | "packet_encoding") {
+        return match value {
+            Value::Null => false,
+            Value::String(value) => !matches!(value.trim(), "" | "none" | "legacy"),
+            _ => active(value),
+        };
+    }
+    active(value)
+}

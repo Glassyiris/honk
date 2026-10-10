@@ -5,23 +5,25 @@ impl RealEbpfBackend {
         obj: &[u8],
         pin_root: &Path,
         tproxy_port: u16,
-        tproxy_mark: u32,
         lan_ifname: Option<&str>,
         wan_ifname: &str,
         single_homed: bool,
     ) -> anyhow::Result<Self> {
+        let version =
+            kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
+        anyhow::ensure!(
+            version >= (6, 12, 0),
+            "compiled routing requires Linux 6.12 or newer (running {}.{}.{})",
+            version.0,
+            version.1,
+            version.2
+        );
         let process_name_offsets = process_name::detect();
         let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
-        let dae0_ifindex = std::fs::read_to_string("/sys/class/net/dae0/ifindex")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let dae0peer_ifindex = std::fs::read_to_string("/sys/class/net/dae0peer/ifindex")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+        let dae0_ifindex = crate::netlink::ifindex_of("dae0").unwrap_or(0);
+        let dae0peer_ifindex = crate::netlink::ifindex_of("dae0peer").unwrap_or(0);
         let dae0peer_mac = std::fs::read_to_string("/sys/class/net/dae0peer/address")
             .ok()
             .map(|s| {
@@ -43,7 +45,7 @@ impl RealEbpfBackend {
         } else {
             Self::bridge_interface(wan_ifname).unwrap_or_else(|| wan_ifname.to_string())
         };
-        let wan_ifindex = Self::iface_ifindex(&ebpf_wan_ifname);
+        let wan_ifindex = crate::netlink::ifindex_of(&ebpf_wan_ifname).unwrap_or(0);
         let local_ifname = if ebpf_lan_ifname.is_empty() {
             &ebpf_wan_ifname
         } else {
@@ -90,7 +92,7 @@ impl RealEbpfBackend {
             use_redirect_peer,
             has_bpf_get_current_task: matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
                 as u8,
-            dae_socket_mark: DAE_BYPASS_MARK,
+            dae_socket_mark: honk_outbound::util::bypass_mark(),
             control_plane_pid: std::process::id(),
             local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
             ..Default::default()
@@ -104,9 +106,12 @@ impl RealEbpfBackend {
         if sequence_pin.try_exists()? {
             syscall::validate_pinned_udp_decision_sequence(&sequence_pin)?;
         }
+        let routing_generation_sequence = routing::open_routing_generation_sequence(
+            &pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP),
+        )?;
 
-        // A stale pin must never hide a generation-owned map. The token
-        // allocator is the sole exception because token reuse is forbidden.
+        // A stale pin must never hide a generation-owned map. Persistent
+        // allocators are opened separately because generation reuse is forbidden.
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut loader = EbpfLoader::new();
         loader
@@ -121,8 +126,16 @@ impl RealEbpfBackend {
                 .override_global("TASK_MM_OFFSET", &offsets.task_mm, true)
                 .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
         }
+        #[cfg(feature = "native-api")]
+        let receive_trace_offsets = receive_trace::detect();
+        #[cfg(feature = "native-api")]
+        if let Some(offsets) = &receive_trace_offsets {
+            offsets.configure(&mut loader);
+        }
         let mut bpf = loader.load(obj)?;
+        validate_routing_handoff_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
+        let mut pinned_maps = Vec::new();
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
             // These cannot be pinned to bpffs; skip them to avoid noisy warnings.
@@ -134,10 +147,13 @@ impl RealEbpfBackend {
                 continue;
             }
             let pin_path = pin_root.join(name);
+            // Recorded before the attempt, not after it: a stale pin whose unlink and re-pin both
+            // fail still belongs to us, and cleanup is the next chance to remove it.
+            pinned_maps.push(name.to_owned());
             if let Err(error) = std::fs::remove_file(&pin_path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                warn!("remove stale pin '{}': {}", name, error);
+                debug!("remove stale pin '{}': {}", name, error);
             }
             if let Err(e) = map.pin(&pin_path) {
                 warn!("pin '{}': {}", name, e);
@@ -152,50 +168,6 @@ impl RealEbpfBackend {
             process_name::PnameCaptureMode::Comm => {
                 warn!("kernel argv capture unavailable; using thread comm")
             }
-        }
-        // Install a complete generation-0 fallback before any TC hook is
-        // attached. New flows therefore punt to userspace until the first
-        // compiled routing generation is published.
-        {
-            let generation = 0u32;
-            let cold_start = MatchSet {
-                match_type: MatchType::Fallback as u8,
-                outbound: OutboundIndex::ControlPlaneRouting as u8,
-                ..Default::default()
-            };
-            set_array_value(&mut bpf, "ROUTING_MAP", 0, &cold_start)
-                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_MAP init: {e}"))?;
-
-            let bitmap = [1u32, 0, 0, 0];
-            for group in 0..ROUTING_GROUP_COUNT as u32 {
-                for (word, value) in bitmap.iter().enumerate() {
-                    let slot = routing_meta_bitmap_base(generation)
-                        + group * ROUTING_GROUP_BITMAP_WORDS as u32
-                        + word as u32;
-                    set_array_value(&mut bpf, "ROUTING_META_MAP", slot, value)
-                        .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {e}"))?;
-                }
-            }
-            let count = 1u32;
-            let count_slot = routing_meta_count_slot(generation);
-            set_array_value(&mut bpf, "ROUTING_META_MAP", count_slot, &count)
-                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {e}"))?;
-            for group in 0..ROUTING_GROUP_COUNT as u32 {
-                let index = routing_group_meta_index(generation, group);
-                let meta = RoutingGroupMeta {
-                    rule_count: count,
-                    bitmap,
-                };
-                set_array_value(&mut bpf, "ROUTING_GROUP_META_MAP", index, &meta)
-                    .map_err(|e| anyhow::anyhow!("cold-start ROUTING_GROUP_META_MAP init: {e}"))?;
-            }
-            set_array_value(
-                &mut bpf,
-                "ROUTING_META_MAP",
-                ROUTING_META_ACTIVE_GENERATION_SLOT,
-                &generation,
-            )
-            .map_err(|e| anyhow::anyhow!("cold-start routing selector init: {e}"))?;
         }
         // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
         // This enables pname routing and control-plane traffic bypass (Go dae parity).
@@ -275,7 +247,7 @@ impl RealEbpfBackend {
             if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_lan_ifname) {
                 let msg = e.to_string();
                 if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                    warn!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
+                    debug!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
                 }
             }
         }
@@ -324,15 +296,11 @@ impl RealEbpfBackend {
             if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_wan_ifname) {
                 let msg = e.to_string();
                 if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                    warn!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
+                    debug!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
                 }
             }
 
-            let wan_egress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
-                "wan_egress_l2"
-            } else {
-                "wan_egress_l3"
-            };
+            let wan_egress_prog = Self::wan_program_pair(&ebpf_wan_ifname).1;
             interface_links.push(
                 Self::attach_tc_owned(
                     &mut bpf,
@@ -359,11 +327,7 @@ impl RealEbpfBackend {
         if single_homed {
             info!("Single-homed interface detected; skipping wan_ingress attach");
         } else if !ebpf_wan_ifname.is_empty() {
-            let wan_ingress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
-                "wan_ingress_l2"
-            } else {
-                "wan_ingress_l3"
-            };
+            let wan_ingress_prog = Self::wan_program_pair(&ebpf_wan_ifname).0;
             interface_links.push(
                 Self::attach_tc_owned(
                     &mut bpf,
@@ -393,17 +357,13 @@ impl RealEbpfBackend {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
                     let msg = e.to_string();
                     if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                        warn!(
+                        debug!(
                             "failed to add clsact qdisc to bridge slave {}: {}",
                             slave, e
                         );
                     }
                 }
-                let slave_prog = if Self::iface_is_ethernet(slave) {
-                    "lan_ingress_l2"
-                } else {
-                    "lan_ingress_l3"
-                };
+                let slave_prog = Self::lan_program_pair(slave).0;
                 // A slave we cannot attach silently leaves that traffic
                 // outside the proxy — abort rather than run half-covered.
                 interface_links.push(
@@ -452,13 +412,9 @@ impl RealEbpfBackend {
             let slave_dir = aya::programs::TcAttachType::Ingress;
             for slave in &lan_slaves {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
+                    debug!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
-                let slave_prog = if Self::iface_is_ethernet(slave) {
-                    "lan_ingress_l2"
-                } else {
-                    "lan_ingress_l3"
-                };
+                let slave_prog = Self::lan_program_pair(slave).0;
                 interface_links.push(
                     Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
                         anyhow::anyhow!("attach lan_ingress to bond slave {}: {}", slave, e)
@@ -486,7 +442,7 @@ impl RealEbpfBackend {
             let slave_dir = aya::programs::TcAttachType::Egress;
             for slave in &wan_egress_slaves {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
+                    debug!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
                 // Bond slaves are ARPHRD_ETHER and see fully-framed skbs at
                 // their TC egress hook (the bond driver has already built
@@ -581,11 +537,11 @@ impl RealEbpfBackend {
         Ok(Self {
             bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
-            tproxy_port,
-            tproxy_mark,
+            pinned_maps,
             interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,
+            pname_mode,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
@@ -594,8 +550,20 @@ impl RealEbpfBackend {
             event_flush_handle,
             cap_lookup_and_delete: BatchCapability::new(),
             cap_lookup_batch: BatchCapability::new(),
-            cap_delete_batch: BatchCapability::new(),
-            cap_update_batch: BatchCapability::new(),
+            routing_generation: None,
+            routing_slot: 0,
+            routing_generation_counter: 0,
+            routing_generation_sequence,
+            next_trace_policy: 0,
+            #[cfg(feature = "native-api")]
+            trace_dictionaries: Default::default(),
+            #[cfg(feature = "native-api")]
+            receive_trace: None,
+            #[cfg(feature = "native-api")]
+            receive_trace_available: receive_trace_offsets.is_some(),
+            #[cfg(feature = "native-api")]
+            receive_trace_attempted: false,
+            udp_staging_quiesce_incomplete: false,
         })
     }
 
@@ -620,7 +588,7 @@ impl RealEbpfBackend {
         let id = p
             .attach(iface, dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
-        info!(
+        debug!(
             "attached '{}' to {} ({:?}) link_id={:?}",
             prog, iface, dir, id
         );
@@ -635,7 +603,7 @@ impl RealEbpfBackend {
         iface: &str,
         dir: aya::programs::TcAttachType,
     ) -> anyhow::Result<(u32, bool, aya::programs::tc::SchedClassifierLink)> {
-        let ifindex = Self::iface_ifindex(iface);
+        let ifindex = crate::netlink::ifindex_of(iface).unwrap_or(0);
         let id = Self::attach_tc_at(bpf, prog, iface, dir)?;
         let p: &mut aya::programs::SchedClassifier = bpf
             .program_mut(prog)
@@ -676,9 +644,7 @@ impl RealEbpfBackend {
             .unwrap_or(false)
     }
 
-    /// Pick the ingress/egress program pair for a LAN interface.
-    /// Bridge masters use L3; physical/veth Ethernet interfaces use L2;
-    /// everything else falls back to L3.
+    /// Ethernet interfaces, including bridge masters, use L2; others use L3.
     fn lan_program_pair(iface: &str) -> (&'static str, &'static str) {
         // NOTE: bridge masters are attached with L2 programs because the TC
         // ingress qdisc on a Linux bridge sees the full Ethernet frame.
@@ -686,6 +652,16 @@ impl RealEbpfBackend {
             ("lan_ingress_l2", "lan_egress_l2")
         } else {
             ("lan_ingress_l3", "lan_egress_l3")
+        }
+    }
+
+    /// Pick the ingress/egress program pair for a WAN interface using the
+    /// same Ethernet detection as the LAN selector.
+    fn wan_program_pair(iface: &str) -> (&'static str, &'static str) {
+        if Self::iface_is_ethernet(iface) {
+            ("wan_ingress_l2", "wan_egress_l2")
+        } else {
+            ("wan_ingress_l3", "wan_egress_l3")
         }
     }
 
@@ -700,14 +676,6 @@ impl RealEbpfBackend {
                 .as_sockaddr_in()
                 .map(|sock| u32::from_ne_bytes(sock.ip().octets()))
         })
-    }
-
-    /// Read the kernel ifindex for an interface, or 0 if it cannot be read.
-    fn iface_ifindex(iface: &str) -> u32 {
-        std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", iface))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
     }
 
     /// Return the bridge master of `iface` if it is a bridge slave.
@@ -774,9 +742,9 @@ impl RealEbpfBackend {
         single_homed: bool,
     ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
         let ifname = Self::bridge_interface(ifname).unwrap_or_else(|| ifname.to_string());
-        info!("Attaching LAN programs to additional interface: {}", ifname);
+        debug!("Attaching LAN programs to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(&ifname);
-        let ifindex = Self::iface_ifindex(&ifname);
+        let ifindex = crate::netlink::ifindex_of(&ifname).unwrap_or(0);
         let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
         let mut hooks = crate::ebpf::DynamicHooks {
             ingress: self.interface_hooked(ifindex, false),
@@ -795,16 +763,12 @@ impl RealEbpfBackend {
 
     /// Attach WAN egress to an additional interface.
     pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        info!("Attaching WAN egress to additional interface: {}", ifname);
+        debug!("Attaching WAN egress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        if self.interface_hooked(Self::iface_ifindex(ifname), true) {
+        if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), true) {
             return Ok(());
         }
-        let prog = if Self::iface_is_ethernet(ifname) {
-            "wan_egress_l2"
-        } else {
-            "wan_egress_l3"
-        };
+        let prog = Self::wan_program_pair(ifname).1;
         self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Egress)
     }
 
@@ -812,16 +776,12 @@ impl RealEbpfBackend {
     /// conntrack updates for replies arriving from the WAN).  L2/L3 is
     /// chosen by interface type, same as `attach_wan_egress`.
     pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        info!("Attaching WAN ingress to additional interface: {}", ifname);
+        debug!("Attaching WAN ingress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        if self.interface_hooked(Self::iface_ifindex(ifname), false) {
+        if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), false) {
             return Ok(());
         }
-        let prog = if Self::iface_is_ethernet(ifname) {
-            "wan_ingress_l2"
-        } else {
-            "wan_ingress_l3"
-        };
+        let prog = Self::wan_program_pair(ifname).0;
         self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Ingress)
     }
 
@@ -834,21 +794,17 @@ impl RealEbpfBackend {
         ifname: &str,
         role: crate::ebpf::IfaceRole,
     ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
-        info!(
+        debug!(
             "Attaching slave programs to additional interface: {}",
             ifname
         );
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        let ifindex = Self::iface_ifindex(ifname);
+        let ifindex = crate::netlink::ifindex_of(ifname).unwrap_or(0);
         let mut hooks = crate::ebpf::DynamicHooks {
             ingress: self.interface_hooked(ifindex, false),
             egress: self.interface_hooked(ifindex, true),
         };
-        let ingress_prog = if Self::iface_is_ethernet(ifname) {
-            "lan_ingress_l2"
-        } else {
-            "lan_ingress_l3"
-        };
+        let ingress_prog = Self::lan_program_pair(ifname).0;
         if !hooks.ingress {
             self.attach_tc_tracked(ingress_prog, ifname, aya::programs::TcAttachType::Ingress)?;
             hooks.ingress = true;

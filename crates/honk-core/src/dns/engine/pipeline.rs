@@ -2,7 +2,9 @@ use tracing::debug;
 
 use super::{DnsEngine, PreparedQuery};
 use crate::dns::cache::{CacheKey, OperationKind, PublicationEpoch};
-use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode, is_filtered_qtype};
+use crate::dns::forwarder::{
+    CacheAccess, DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions, is_filtered_qtype,
+};
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus};
 use crate::dns::planner::{RequestPlan, RequestScope, UpstreamTag};
 use crate::dns::query::{DnsRequestMeta, IngressProfile};
@@ -12,15 +14,15 @@ mod cache;
 mod flight {
     use std::sync::Arc;
 
-    use super::{ExecutionContext, cache};
+    use super::{CacheAccess, ExecutionContext, cache};
     use crate::dns::forwarder::DnsForwardError;
     use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
     use crate::dns::response::ResponseTemplate;
     use crate::dns::singleflight::FlightLeader;
 
-    pub(super) fn publish_outcome(mut leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
+    pub(super) fn publish_outcome(leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
         if let Some(template) = outcome.template() {
-            leader.publish(Arc::new(template.clone()));
+            leader.publish(Ok(Arc::new(template.clone())));
         }
         outcome
     }
@@ -29,7 +31,7 @@ mod flight {
         context: &ExecutionContext<'_>,
         template: Arc<ResponseTemplate>,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        if !context.bypass_cache_read
+        if context.options.cache == CacheAccess::Normal
             && let Some(outcome) = cache::lookup(context, false).await?
         {
             return Ok(outcome);
@@ -99,6 +101,7 @@ use plan::{rejected_outcome, request_exchange};
 pub(crate) struct ResolveExecution {
     refresh_owner: Option<FlightLeader>,
     publication_epoch: PublicationEpoch,
+    refreshing: Option<u64>,
 }
 
 pub(super) struct ExecutionContext<'a> {
@@ -111,9 +114,10 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) logical_upstream: UpstreamTag,
     pub(super) request_scope: RequestScope,
     pub(super) reuse_eligible: bool,
-    pub(super) bypass_cache_read: bool,
+    pub(super) options: &'a ResolveOptions,
     pub(super) mode: ResolveMode,
     pub(super) publication_epoch: PublicationEpoch,
+    pub(super) refreshing: Option<u64>,
 }
 
 impl ResolveExecution {
@@ -121,50 +125,62 @@ impl ResolveExecution {
         Self {
             refresh_owner: None,
             publication_epoch,
+            refreshing: None,
         }
     }
 
-    pub(crate) const fn refresh(owner: FlightLeader, publication_epoch: PublicationEpoch) -> Self {
+    pub(crate) const fn refresh(
+        owner: FlightLeader,
+        publication_epoch: PublicationEpoch,
+        refreshing: u64,
+    ) -> Self {
         Self {
             refresh_owner: Some(owner),
             publication_epoch,
+            refreshing: Some(refreshing),
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve(
     forwarder: &DnsForwarder,
     raw_query: &[u8],
     metadata: DnsRequestMeta,
     ingress: IngressProfile,
-    bypass_cache_read: bool,
+    options: &ResolveOptions,
     mode: ResolveMode,
     publication_epoch: PublicationEpoch,
+    evidence: Option<&mut crate::dns::outcome::RouteSource>,
 ) -> Result<DnsOutcome, DnsForwardError> {
     resolve_with_owner(
         forwarder,
         raw_query,
         metadata,
         ingress,
-        bypass_cache_read,
+        options,
         mode,
         ResolveExecution::foreground(publication_epoch),
+        evidence,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_with_owner(
     forwarder: &DnsForwarder,
     raw_query: &[u8],
     metadata: DnsRequestMeta,
     ingress: IngressProfile,
-    bypass_cache_read: bool,
+    options: &ResolveOptions,
     mode: ResolveMode,
     execution: ResolveExecution,
+    evidence: Option<&mut crate::dns::outcome::RouteSource>,
 ) -> Result<DnsOutcome, DnsForwardError> {
     let ResolveExecution {
         refresh_owner,
         publication_epoch,
+        refreshing,
     } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = forwarder.engine().await?;
@@ -173,11 +189,20 @@ pub(crate) async fn resolve_with_owner(
     if !is_filtered_qtype(qtype, &forwarder.strategy)
         && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
     {
+        crate::observe::flows::dns::source("hosts", Some("bypass"));
         return Ok(outcome);
     }
-    let prepared =
-        engine.prepare_parsed(parsed, metadata, matches!(mode, ResolveMode::Compatibility))?;
-    let reuse_eligible = prepared.is_cacheable() && prepared.is_coalescable();
+    let prepared = engine.prepare_parsed(
+        parsed,
+        metadata,
+        matches!(mode, ResolveMode::Compatibility),
+        options.forced_upstream.as_ref(),
+        evidence,
+    )?;
+    crate::observe::flows::dns::source("unknown", Some("bypass"));
+    let reuse_eligible = options.cache != CacheAccess::Bypass
+        && prepared.is_cacheable()
+        && prepared.is_coalescable();
 
     if is_filtered_qtype(qtype, &forwarder.strategy) {
         return rejected_outcome(
@@ -212,9 +237,10 @@ pub(crate) async fn resolve_with_owner(
         logical_upstream,
         request_scope: request_scope.clone(),
         reuse_eligible,
-        bypass_cache_read,
+        options,
         mode,
         publication_epoch,
+        refreshing,
     };
     if reuse_eligible && let Some(outcome) = cache::lookup(&context, true).await? {
         return Ok(outcome);
@@ -228,7 +254,7 @@ pub(crate) async fn resolve_with_owner(
         return operation::run_as_leader(owner, &context).await;
     }
 
-    let flight_key = if bypass_cache_read {
+    let flight_key = if options.cache == CacheAccess::Refresh {
         FlightKey::Refresh(context.cache_key.with_operation(OperationKind::Refresh))
     } else {
         FlightKey::resolve(
@@ -237,23 +263,33 @@ pub(crate) async fn resolve_with_owner(
             &forwarder.strategy,
             qtype,
             metadata,
+            options.forced_upstream.as_ref(),
         )
     };
-    let flights = forwarder.cache_service().await.singleflight();
+    let flights = forwarder.singleflight();
     loop {
         match flights.acquire(flight_key.clone()) {
             FlightRole::Rejected => return Err(DnsForwardError::Overloaded),
-            FlightRole::Ready(template) => {
-                return flight::waiter_outcome(&context, template).await;
-            }
-            FlightRole::Waiter(waiter) => match waiter.receive().await {
-                Some(template) => {
-                    return flight::waiter_outcome(&context, template).await;
+            FlightRole::Waiter(waiter) => {
+                crate::observe::flows::dns::source("coalesced", None);
+                match waiter.receive().await {
+                    Some(result) => {
+                        return flight::waiter_outcome(
+                            &context,
+                            result.map_err(DnsForwardError::Shared)?,
+                        )
+                        .await;
+                    }
+                    None => {
+                        crate::observe::flows::dns::source("unknown", None);
+                        continue;
+                    }
                 }
-                None => continue,
-            },
+            }
             FlightRole::Leader(leader) => {
-                if !bypass_cache_read && let Some(outcome) = cache::lookup(&context, true).await? {
+                if options.cache == CacheAccess::Normal
+                    && let Some(outcome) = cache::lookup(&context, true).await?
+                {
                     return Ok(flight::publish_outcome(leader, outcome));
                 }
                 return operation::run_as_leader(leader, &context).await;

@@ -1,6 +1,7 @@
+use super::validation::ValidationFailure;
 use crate::types::NodeProtocol;
 
-use super::WireMode;
+use super::{VlessConfig, identity_field};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TlsOptions {
@@ -14,6 +15,53 @@ pub struct TlsOptions {
     pub reality_short_id: Option<String>,
     pub reality_spider_x: Option<String>,
     pub pin_sha256: Option<String>,
+    pub alpn: Vec<String>,
+}
+
+impl TlsOptions {
+    /// Resolve key presence without turning incomplete REALITY intent into ordinary TLS.
+    /// Decoding the key and short ID belongs to the outbound handshake parser.
+    pub fn effective_reality_public_key(&self) -> Result<Option<&str>, &'static str> {
+        match self.reality_public_key.as_deref().map(str::trim) {
+            Some(key) if !key.is_empty() => Ok(Some(key)),
+            None if self.reality_short_id.is_none() && self.reality_spider_x.is_none() => Ok(None),
+            _ => Err("REALITY requires reality_public_key"),
+        }
+    }
+
+    /// True when the dial speaks TLS or authenticated REALITY.
+    pub fn is_secure(&self) -> bool {
+        self.enabled || matches!(self.effective_reality_public_key(), Ok(Some(_)))
+    }
+
+    pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {
+        if self.alpn == ["h2"] {
+            Ok(())
+        } else {
+            Err("XHTTP requires H2-only ALPN")
+        }
+    }
+
+    pub(super) fn validate_alpn(&self) -> Result<(), ValidationFailure> {
+        let mut encoded_len = 0usize;
+        for protocol in &self.alpn {
+            let len = protocol.len();
+            if !(1..=255).contains(&len) {
+                return Err(ValidationFailure::new(
+                    Some("tls_alpn"),
+                    "TLS ALPN protocol names must be 1..=255 bytes",
+                ));
+            }
+            encoded_len += len + 1;
+        }
+        if encoded_len > 65_533 {
+            return Err(ValidationFailure::new(
+                Some("tls_alpn"),
+                "TLS ALPN protocol list exceeds 65533 encoded bytes",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +70,7 @@ pub struct StreamTransportOptions {
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
     pub grpc_service: Option<String>,
+    pub xhttp: Option<super::XhttpOptions>,
 }
 
 impl Default for StreamTransportOptions {
@@ -31,7 +80,49 @@ impl Default for StreamTransportOptions {
             ws_path: None,
             ws_host: None,
             grpc_service: None,
+            xhttp: None,
         }
+    }
+}
+
+impl StreamTransportOptions {
+    pub fn is_xhttp(&self) -> bool {
+        self.transport == "xhttp"
+    }
+
+    pub fn normalize(&mut self) -> Result<(), &'static str> {
+        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)?;
+        if kind == "xhttp" {
+            self.transport = "xhttp".into();
+            self.xhttp
+                .get_or_insert_with(Default::default)
+                .normalize()?;
+        }
+        self.check().map_err(|(_, message)| message)
+    }
+
+    pub(super) fn check(&self) -> Result<(), (&'static str, &'static str)> {
+        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)
+            .map_err(|message| ("transport", message))?;
+        if kind == "xhttp" {
+            if !self.is_xhttp() {
+                return Err((
+                    "transport",
+                    "XHTTP transport must be normalized before admission",
+                ));
+            }
+            self.xhttp
+                .as_ref()
+                .ok_or(("xhttp", "XHTTP requires canonical options"))?
+                .validate()
+                .map_err(|message| ("xhttp", message))?;
+            if self.ws_path.is_some() || self.ws_host.is_some() || self.grpc_service.is_some() {
+                return Err(("xhttp", "XHTTP cannot use WebSocket or gRPC options"));
+            }
+        } else if self.xhttp.is_some() {
+            return Err(("xhttp", "XHTTP options require XHTTP transport"));
+        }
+        Ok(())
     }
 }
 
@@ -70,43 +161,6 @@ pub struct VmessConfig {
     pub network: Option<String>,
     pub transport: StreamTransportOptions,
     pub tls: TlsOptions,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct VlessConfig {
-    pub uuid: Option<String>,
-    pub encryption: Option<String>,
-    pub mode: WireMode,
-    pub flow: Option<String>,
-    pub network: Option<String>,
-    pub transport: StreamTransportOptions,
-    pub tls: TlsOptions,
-}
-
-impl VlessConfig {
-    pub fn validate(&self, name: &str) -> Result<(), crate::ConfigError> {
-        if self.mode != WireMode::Legacy {
-            if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
-                && !(self.mode == WireMode::Xudp && flow == "xtls-rprx-vision")
-            {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Node '{name}' combines VLESS mode '{}' with flow; this combination is unsupported",
-                    self.mode.as_str()
-                )));
-            }
-            if self
-                .encryption
-                .as_deref()
-                .is_some_and(|value| !value.is_empty() && value != "none")
-            {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Node '{name}' combines VLESS mode '{}' with VLESS Encryption; this combination is unsupported",
-                    self.mode.as_str()
-                )));
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -275,43 +329,31 @@ impl OutboundConfig {
 
     pub(crate) fn credential_fingerprint(&self) -> String {
         match self {
-            Self::Shadowsocks(config) => format!(
-                "{}|{}",
+            Self::Shadowsocks(config) => identity_join(&[
                 config.encryption.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::Trojan(config) => config.password.as_deref().unwrap_or("").to_string(),
-            Self::Vmess(config) => config.uuid.as_deref().unwrap_or("").to_string(),
-            Self::Vless(config)
-                if config
-                    .encryption
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty() && value != "none") =>
-            {
-                format!(
-                    "{}|{}",
-                    config.encryption.as_deref().unwrap_or_default(),
-                    config.uuid.as_deref().unwrap_or("")
-                )
-            }
-            Self::Vless(config) => config.uuid.as_deref().unwrap_or("").to_string(),
-            Self::Socks5(config) => format!(
-                "{}|{}",
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Trojan(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
+            Self::Vmess(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
+            Self::Vless(config) if config.is_encrypted() => identity_join(&[
+                config.encryption.as_deref().unwrap_or_default(),
+                config.uuid.as_deref().unwrap_or(""),
+            ]),
+            Self::Vless(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
+            Self::Socks5(config) => identity_join(&[
                 config.username.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::Hysteria2(config) => config.auth.as_deref().unwrap_or("").to_string(),
-            Self::Tuic(config) => format!(
-                "{}|{}",
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Hysteria2(config) => identity_join(&[config.auth.as_deref().unwrap_or("")]),
+            Self::Tuic(config) => identity_join(&[
                 config.uuid.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::Juicity(config) => format!(
-                "{}|{}",
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Juicity(config) => identity_join(&[
                 config.uuid.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::AnyTls(config) => config.password.as_deref().unwrap_or("").to_string(),
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
             Self::Direct | Self::Block => String::new(),
         }
     }
@@ -342,17 +384,45 @@ impl OutboundConfig {
             tls.and_then(|tls| tls.reality_spider_x.as_deref())
                 .unwrap_or(""),
             match self {
-                Self::Vless(config) => config.flow.as_deref().unwrap_or(""),
+                Self::Vless(config) => config.wire_flow().unwrap_or(""),
                 _ => "",
             },
         ]
+        .map(identity_field)
         .join("|");
-        if let Self::Vless(config) = self
-            && config.mode != WireMode::Legacy
-        {
+        if let Self::Vless(config) = self {
             fingerprint.push('|');
-            fingerprint.push_str(config.mode.as_str());
+            fingerprint.push_str(&config.identity_fingerprint());
+            // Keep TLS-on IDs stable while separating the plaintext dial path.
+            if !config.tls.enabled && config.tls.reality_public_key.is_none() {
+                fingerprint.push_str("|tls:0");
+            }
+        }
+        if let Some(options) = transport
+            .filter(|transport| transport.is_xhttp())
+            .and_then(|transport| transport.xhttp.as_ref())
+        {
+            fingerprint.push_str("|xhttp:");
+            fingerprint.push_str(&serde_json::to_string(options).expect("XHTTP options serialize"));
+            fingerprint.push_str(if tls.is_some_and(TlsOptions::is_secure) {
+                "|xhttp-tls:1"
+            } else {
+                "|xhttp-tls:0"
+            });
         }
         fingerprint
     }
+}
+
+fn identity_join(fields: &[&str]) -> String {
+    let capacity =
+        fields.iter().map(|field| field.len()).sum::<usize>() + fields.len().saturating_sub(1);
+    let mut identity = String::with_capacity(capacity);
+    for (index, field) in fields.iter().enumerate() {
+        if index != 0 {
+            identity.push('|');
+        }
+        identity.push_str(&identity_field(field));
+    }
+    identity
 }

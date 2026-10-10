@@ -1,19 +1,6 @@
-use aya_ebpf_bindings::bindings::{__be16, __u16};
-
 use crate::{TASK_COMM_LEN, dae_ip::In6Addr};
 
-pub const MAX_MATCH_SET_LEN: usize = 128;
-pub const ROUTING_BITMAP_WORDS_PER_GENERATION: usize = MAX_MATCH_SET_LEN / 32;
-pub const ROUTING_BITMAP_GENERATIONS: usize = 2;
-pub const ROUTING_BITMAP_WORDS: usize =
-    ROUTING_BITMAP_WORDS_PER_GENERATION * ROUTING_BITMAP_GENERATIONS;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IPPort {
-    pub ip: In6Addr,
-    pub port: __be16,
-}
+pub const ROUTING_BITMAP_WORDS: usize = crate::ROUTING_FACT_CAPACITY / 32;
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -63,52 +50,34 @@ pub struct Tuples {
 pub struct RoutingHandoffEntry {
     pub last_seen_ns: u64,
     pub result: RoutingResult,
+    pub routing_generation: u64,
+    pub trace_id: u32,
+    pub trace_padding: u32,
 }
 
-const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 48);
+const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 64);
 const _ROUTING_HANDOFF_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RoutingHandoffEntry>() == 8);
 const _ROUTING_HANDOFF_LAST_SEEN_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingHandoffEntry, last_seen_ns) == 0);
 const _ROUTING_HANDOFF_RESULT_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingHandoffEntry, result) == 8);
+const _ROUTING_HANDOFF_GENERATION_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingHandoffEntry, routing_generation) == 48);
 const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
     core::mem::offset_of!(RoutingHandoffEntry, result)
         + core::mem::offset_of!(RoutingResult, decision_token)
         == 44
 );
+const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_id) == 56);
+const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_padding) == 60);
 
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct PortRange {
-    pub port_start: __u16,
-    pub port_end: __u16,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct DomainRouting {
     pub bitmap: [u32; ROUTING_BITMAP_WORDS],
 }
-
-impl DomainRouting {
-    pub fn for_generation(&self, generation: u32) -> Self {
-        let mut shifted = Self::default();
-        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-        if offset + ROUTING_BITMAP_WORDS_PER_GENERATION <= shifted.bitmap.len() {
-            shifted.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
-                .copy_from_slice(&self.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
-        }
-        shifted
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct IPPortProto {
-    pub ip: In6Addr,
-    pub port: __be16,
-    pub proto: u8,
-}
+const _: () = assert!(ROUTING_BITMAP_WORDS == crate::ROUTING_FACT_CAPACITY / 32);
+const _: () = assert!(core::mem::size_of::<DomainRouting>() == 32);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

@@ -1,3 +1,5 @@
+use super::*;
+
 #[tokio::test]
 async fn clones_share_lazy_engine_and_policy_change_resets_it() {
     let forwarder = DnsForwarder::new(
@@ -91,40 +93,25 @@ async fn service_flush_cancels_stalled_query_without_cache_resurrection() {
 
 #[tokio::test]
 async fn service_flush_fences_background_refresh_memory_and_persistence() {
-    use honk_config::experimental::CacheFileConfig;
-
     let directory = tempfile::tempdir().expect("tempdir");
-    let database = Arc::new(
-        crate::cachedb::CacheDb::open(
-            &CacheFileConfig {
-                enabled: true,
-                path: directory
-                    .path()
-                    .join("cache.db")
-                    .to_string_lossy()
-                    .into_owned(),
-                cache_id: String::new(),
-                store_fakeip: false,
-                store_dns: true,
-            },
-        )
-        .expect("cache.db"),
-    );
+    let database = Arc::new(crate::state::cache::CacheDb::in_dir(directory.path()));
     let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
         refreshed: make_a_response([192, 0, 2, 2], 300),
+        later: RefreshFenceLater::Response(make_a_response([192, 0, 2, 2], 300)),
         call_count: AtomicUsize::new(0),
         refresh_entered: tokio::sync::Notify::new(),
         refresh_release: tokio::sync::Semaphore::new(0),
     });
     let cache = test_cache();
     cache.lock().await.set_persister(Some(persister.clone()));
-    let service = crate::dns::DnsService::with_forwarder(Arc::new(DnsForwarder::new(
+    let forwarder = Arc::new(DnsForwarder::new(
         upstream.clone(),
         cache.clone(),
         test_router(),
-    )));
+    ));
+    let service = crate::dns::DnsService::with_forwarder(Arc::clone(&forwarder));
     let query = make_a_query();
 
     let primed = service
@@ -147,9 +134,8 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
         .expect("flush");
     assert!(persisted);
     upstream.refresh_release.add_permits(1);
-    let cache_service = cache.lock().await.service();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while cache_service.refresh_task_count() != 0 {
+        while forwarder.refresh_task_count() != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -158,7 +144,7 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
 
     assert!(cache.lock().await.is_empty());
     persister.shutdown().await.expect("persistence shutdown");
-    assert!(database.load_dns_v2().expect("persisted rows").is_empty());
+    assert!(database.load_dns().expect("persisted rows").is_empty());
 
     let refreshed = service
         .resolve(&query, IngressProfile::Internal)
@@ -171,25 +157,8 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
 
 #[tokio::test]
 async fn cancelled_persistent_flush_reopens_cache_publication() {
-    use honk_config::experimental::CacheFileConfig;
-
     let directory = tempfile::tempdir().expect("tempdir");
-    let database = Arc::new(
-        crate::cachedb::CacheDb::open(
-            &CacheFileConfig {
-                enabled: true,
-                path: directory
-                    .path()
-                    .join("cache.db")
-                    .to_string_lossy()
-                    .into_owned(),
-                cache_id: String::new(),
-                store_fakeip: false,
-                store_dns: true,
-            },
-        )
-        .expect("cache.db"),
-    );
+    let database = Arc::new(crate::state::cache::CacheDb::in_dir(directory.path()));
     let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
     let cache = test_cache();
     cache.lock().await.set_persister(Some(persister.clone()));
@@ -221,5 +190,5 @@ async fn cancelled_persistent_flush_reopens_cache_publication() {
         .expect("post-cancellation resolve");
     assert_eq!(cache.lock().await.len(), 1);
     persister.shutdown().await.expect("persistence shutdown");
-    assert_eq!(database.load_dns_v2().expect("persisted rows").len(), 1);
+    assert_eq!(database.load_dns().expect("persisted rows").len(), 1);
 }

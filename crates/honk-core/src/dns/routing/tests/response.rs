@@ -102,6 +102,39 @@ fn cidr_match_preserves_requery_and_fallback() {
 }
 
 #[test]
+fn c23_network_forms_share_identity_and_response_behavior() {
+    for (input, canonical, answer) in [
+        ("192.0.2.1", "192.0.2.1/32", "192.0.2.1"),
+        ("2001:db8::1", "2001:db8::1/128", "2001:db8::1"),
+        ("192.0.2.17/24", "192.0.2.0/24", "192.0.2.99"),
+    ] {
+        let config = |network: &str| {
+            let mut config = honk_config::dns::DnsConfig::default();
+            config.routing.response.rules.push(DnsResponseRule {
+                conditions: vec![DnsCond::Ip {
+                    not: false,
+                    cidrs: vec![network.into()],
+                    geoip: vec![],
+                }],
+                action: DnsResponseAction::Reject,
+            });
+            config
+        };
+        let candidate = config(input);
+        let router = DnsRouter::new(&candidate.routing).unwrap();
+        assert_eq!(
+            router.select_response("example.test", 1, &[answer.parse().unwrap()], "default"),
+            DnsResponseDecision::Reject
+        );
+        assert_eq!(
+            crate::dns::policy::PolicyId::from_config(&candidate).unwrap(),
+            crate::dns::policy::PolicyId::from_config(&config(canonical)).unwrap()
+        );
+        assert!(DnsRouter::new(&config("PRIVATE_INVALID").routing).is_err());
+    }
+}
+
+#[test]
 fn fixed_ttl_lookup_preserves_exact_domain_semantics() {
     let ttl = HashMap::from([("nocache.test".into(), 0), ("custom.test".into(), 300)]);
     let router = DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &ttl)

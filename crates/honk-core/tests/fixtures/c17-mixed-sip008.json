@@ -1,0 +1,7 @@
+{
+  "servers": [
+    "not-an-object",
+    {"remarks":"malformed-proxy","server":"secret.example","server_port":"bad","method":"aes-256-gcm","password":"secret-password"},
+    {"remarks":"usable-proxy","server":"usable.example","server_port":8388,"method":"aes-256-gcm","password":"secret-password"}
+  ]
+}

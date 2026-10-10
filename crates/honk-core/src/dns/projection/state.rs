@@ -5,15 +5,60 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
-use super::{ProjectionFreshness, ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
+use super::{ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
 type OwnerKey = Arc<str>;
+
+// Leave a quarter of the map for sniff writes and another quarter unavailable
+// to present-zero facts, so DNS misses cannot crowd out later matching facts.
+pub(super) const IP_CAPACITY: usize = crate::ebpf::maps::DOMAIN_MAP_CAPACITY as usize * 3 / 4;
+pub(super) const ZERO_IP_CAPACITY: usize = crate::ebpf::maps::DOMAIN_MAP_CAPACITY as usize / 2;
+
+fn aggregate_domains(
+    snapshot: &RoutingProjectionSnapshot,
+    domains: &BTreeSet<OwnerKey>,
+) -> Option<DomainRouting> {
+    let mut aggregate = None;
+    for domain in domains {
+        if let Some(bitmap) = snapshot.bitmap_for(domain) {
+            or_bitmap(aggregate.get_or_insert_default(), &bitmap);
+        }
+    }
+    aggregate
+}
+
+fn insert_bounded(
+    entries: &mut BTreeMap<IpAddr, DomainRouting>,
+    zero_ips: &mut BTreeSet<IpAddr>,
+    ip: IpAddr,
+    bitmap: DomainRouting,
+) -> Option<IpAddr> {
+    entries.insert(ip, bitmap);
+    if bitmap.bitmap == [0; 8] {
+        zero_ips.insert(ip);
+    } else {
+        zero_ips.remove(&ip);
+    }
+    let evicted = if zero_ips.len() > ZERO_IP_CAPACITY || entries.len() > IP_CAPACITY {
+        // Within one priority, lower addresses win independently of arrival order.
+        zero_ips
+            .last()
+            .copied()
+            .or_else(|| entries.last_key_value().map(|(ip, _)| *ip))
+    } else {
+        None
+    };
+    if let Some(evicted) = evicted {
+        entries.remove(&evicted);
+        zero_ips.remove(&evicted);
+    }
+    evicted
+}
 
 #[derive(Debug)]
 pub(super) struct DomainOwner {
     pub(super) ips: BTreeSet<IpAddr>,
     pub(super) expires_at: Instant,
     pub(super) sequence: u64,
-    pub(super) _freshness: ProjectionFreshness,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,20 +71,13 @@ pub(super) struct RetryMetadata {
 pub(super) struct Batch {
     pub(super) generation: u64,
     pub(super) sets: Vec<PendingSet>,
-    pub(super) removes: Vec<PendingRemove>,
+    pub(super) removes: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PendingSet {
     pub(super) ip: IpAddr,
     pub(super) bitmap: DomainRouting,
-    pub(super) revision: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PendingRemove {
-    pub(super) ip: IpAddr,
-    pub(super) revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,13 +87,6 @@ pub(super) struct DeadlineEntry {
     pub(super) sequence: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct RetryDeadline {
-    pub(super) at: Instant,
-    pub(super) ip: IpAddr,
-    pub(super) attempts: u8,
-}
-
 pub(super) struct DesiredState {
     pub(super) capacity: usize,
     pub(super) sequence: u64,
@@ -63,13 +94,13 @@ pub(super) struct DesiredState {
     pub(super) owners: BTreeMap<OwnerKey, DomainOwner>,
     pub(super) reverse: BTreeMap<IpAddr, BTreeSet<OwnerKey>>,
     pub(super) desired: BTreeMap<IpAddr, DomainRouting>,
-    pub(super) revisions: BTreeMap<IpAddr, u64>,
+    zero_ips: BTreeSet<IpAddr>,
+    capacity_warning_emitted: bool,
     pub(super) applied: BTreeMap<IpAddr, DomainRouting>,
     pub(super) dirty_ips: BTreeSet<IpAddr>,
     pub(super) retries: BTreeMap<IpAddr, RetryMetadata>,
     pub(super) expiry_deadlines: BinaryHeap<Reverse<DeadlineEntry>>,
     pub(super) eviction_order: BinaryHeap<Reverse<(u64, OwnerKey)>>,
-    pub(super) retry_deadlines: BinaryHeap<Reverse<RetryDeadline>>,
 }
 
 impl DesiredState {
@@ -81,13 +112,13 @@ impl DesiredState {
             owners: BTreeMap::new(),
             reverse: BTreeMap::new(),
             desired: BTreeMap::new(),
-            revisions: BTreeMap::new(),
+            zero_ips: BTreeSet::new(),
+            capacity_warning_emitted: false,
             applied: BTreeMap::new(),
             dirty_ips: BTreeSet::new(),
             retries: BTreeMap::new(),
             expiry_deadlines: BinaryHeap::new(),
             eviction_order: BinaryHeap::new(),
-            retry_deadlines: BinaryHeap::new(),
         }
     }
 
@@ -107,8 +138,7 @@ impl DesiredState {
                 domain,
                 ips,
                 advertised_ttl,
-                freshness,
-            } => self.replace(domain, ips, now + advertised_ttl, freshness),
+            } => self.replace(domain, ips, now + advertised_ttl),
             ProjectionObservation::Clear { domain } => {
                 self.remove_owner(domain);
                 0
@@ -117,19 +147,20 @@ impl DesiredState {
         }
     }
 
-    fn replace(
-        &mut self,
-        domain: &str,
-        ips: &[IpAddr],
-        expires_at: Instant,
-        freshness: ProjectionFreshness,
-    ) -> u64 {
+    fn replace(&mut self, domain: &str, ips: &[IpAddr], expires_at: Instant) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
-        let ips = ips.iter().copied().collect::<BTreeSet<_>>();
+        let ips = ips
+            .iter()
+            .map(|ip| ip.to_canonical())
+            .collect::<BTreeSet<_>>();
         let existing = self.owners.get_key_value(domain).map(|(key, owner)| {
             let removed = owner.ips.difference(&ips).copied().collect::<Vec<_>>();
-            let added = ips.difference(&owner.ips).copied().collect::<Vec<_>>();
+            let added = ips
+                .iter()
+                .filter(|ip| !owner.ips.contains(ip) || !self.desired.contains_key(ip))
+                .copied()
+                .collect::<Vec<_>>();
             (Arc::clone(key), removed, added)
         });
 
@@ -163,7 +194,6 @@ impl DesiredState {
             owner.ips = ips;
             owner.expires_at = expires_at;
             owner.sequence = sequence;
-            owner._freshness = freshness;
         } else {
             affected.reserve(ips.len());
             for ip in &ips {
@@ -179,7 +209,6 @@ impl DesiredState {
                     ips,
                     expires_at,
                     sequence,
-                    _freshness: freshness,
                 },
             );
         }
@@ -235,19 +264,10 @@ impl DesiredState {
 
     fn recompute_ips(&mut self, ips: impl IntoIterator<Item = IpAddr>) {
         for ip in ips {
-            let mut aggregate = DomainRouting::default();
-            if let Some(domains) = self.reverse.get(&ip) {
-                for domain in domains {
-                    if let Some(bitmap) = self.snapshot.bitmap_for(domain) {
-                        or_bitmap(&mut aggregate, &bitmap);
-                    }
-                }
-            }
-            let next = aggregate
-                .bitmap
-                .iter()
-                .any(|word| *word != 0)
-                .then_some(aggregate);
+            let next = self
+                .reverse
+                .get(&ip)
+                .and_then(|domains| aggregate_domains(&self.snapshot, domains));
             let unchanged = match (self.desired.get(&ip), next.as_ref()) {
                 (Some(current), Some(next)) => current.bitmap == next.bitmap,
                 (None, None) => true,
@@ -256,25 +276,52 @@ impl DesiredState {
             if unchanged {
                 continue;
             }
-            let revision = self.revisions.entry(ip).or_default();
-            *revision = revision.wrapping_add(1);
-            if let Some(next) = next {
-                self.desired.insert(ip, next);
+            let evicted = if let Some(next) = next {
+                insert_bounded(&mut self.desired, &mut self.zero_ips, ip, next)
             } else {
                 self.desired.remove(&ip);
+                self.zero_ips.remove(&ip);
+                None
+            };
+            if evicted.is_some() && !self.capacity_warning_emitted {
+                tracing::warn!(
+                    ip_capacity = IP_CAPACITY,
+                    zero_ip_capacity = ZERO_IP_CAPACITY,
+                    "DNS routing projection capacity reached; omitted IPs use cache-miss routing"
+                );
+                self.capacity_warning_emitted = true;
             }
-            self.dirty_ips.insert(ip);
+            if evicted != Some(ip) || self.applied.contains_key(&ip) {
+                self.dirty_ips.insert(ip);
+            }
+            if let Some(evicted) = evicted.filter(|evicted| *evicted != ip) {
+                self.dirty_ips.insert(evicted);
+            }
         }
     }
 
     pub(super) fn rebuild_all(&mut self) {
+        let desired = self.project(&self.snapshot);
         let ips = self
-            .reverse
+            .desired
             .keys()
+            .chain(desired.keys())
             .chain(self.applied.keys())
             .copied()
             .collect::<BTreeSet<_>>();
-        self.recompute_ips(ips);
+        for ip in ips {
+            let next = desired.get(&ip).map(|entry| entry.bitmap);
+            if self.desired.get(&ip).map(|entry| entry.bitmap) != next
+                || self.applied.get(&ip).map(|entry| entry.bitmap) != next
+            {
+                self.dirty_ips.insert(ip);
+            }
+        }
+        self.zero_ips = desired
+            .iter()
+            .filter_map(|(ip, bitmap)| (bitmap.bitmap == [0; 8]).then_some(*ip))
+            .collect();
+        self.desired = desired;
     }
 
     fn prune_stale_expiry_heads(&mut self) {
@@ -315,24 +362,15 @@ impl DesiredState {
         &self,
         snapshot: &RoutingProjectionSnapshot,
     ) -> BTreeMap<IpAddr, DomainRouting> {
-        self.reverse
-            .iter()
-            .filter_map(|(ip, domains)| {
-                let mut aggregate = DomainRouting::default();
-                for domain in domains {
-                    if let Some(bitmap) = snapshot.bitmap_for(domain) {
-                        or_bitmap(&mut aggregate, &bitmap);
-                    }
-                }
-                aggregate
-                    .bitmap
-                    .iter()
-                    .any(|word| *word != 0)
-                    .then_some((*ip, aggregate))
-            })
-            .collect()
+        let mut entries = BTreeMap::new();
+        let mut zero_ips = BTreeSet::new();
+        for (ip, domains) in &self.reverse {
+            if let Some(bitmap) = aggregate_domains(snapshot, domains) {
+                insert_bounded(&mut entries, &mut zero_ips, *ip, bitmap);
+            }
+        }
+        entries
     }
-
     pub(super) fn expire(&mut self, now: Instant) {
         self.prune_stale_expiry_heads();
         while let Some(Reverse(deadline)) = self.expiry_deadlines.peek() {

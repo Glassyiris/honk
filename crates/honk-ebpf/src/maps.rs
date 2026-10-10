@@ -1,32 +1,22 @@
 use aya_ebpf::Global;
-use aya_ebpf::bindings::__be32;
-use aya_ebpf::btf_maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf, SockMap};
+use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SockMap};
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
     BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
     UdpDecisionSequence,
 };
 use honk_ebpf_common::event::DaeEvent;
-use honk_ebpf_common::redirect_need::{
-    DomainRouting, MAX_MATCH_SET_LEN, PIDName, RoutingHandoffEntry, TuplesKey,
-};
-use honk_ebpf_common::route::{
-    MatchSet, ROUTING_GROUP_META_MAP_LEN, ROUTING_META_MAP_LEN, RoutingGroupMeta,
-};
-use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
+use honk_ebpf_common::redirect_need::{PIDName, RoutingHandoffEntry, TuplesKey};
+use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, RoutingPolicyDescriptor};
+#[cfg(feature = "routing-test")]
+use honk_ebpf_common::{RoutingInput, RoutingTestResult};
 
-use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
 
-/// Maximum LPM trie size: 65,536 entries.
-/// Reduced from 2,048,000 to stay under kernel memory limits.
-/// Each entry consumes ~20 bytes of kernel memory, so 65,536 entries
-/// ≈ 1.3 MB per LPM map.
-pub const MAX_LPM_SIZE: usize = 65536;
+/// LPM tries are generation-owned by userspace and bound to the generated
+/// routing extension; no legacy fact map is present in the static datapath.
 pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
-pub const MAX_LPM_NUM: usize = MAX_MATCH_SET_LEN + 8;
 pub const MAX_COOKIE_PID_PNAME_MAPPING_NUM: usize = 65536;
-pub const MAX_DOMAIN_ROUTING_NUM: usize = 65536;
 
 #[repr(C)]
 pub struct UdpDecisionScratch {
@@ -36,22 +26,8 @@ pub struct UdpDecisionScratch {
     pub state: ConnState,
 }
 
-// Global variable: corresponds to the C `const volatile struct dae_param PARAM = {};`.
 #[unsafe(no_mangle)]
-pub static PARAM: Global<DaeParam> = Global::new(DaeParam {
-    tproxy_port: 0,
-    control_plane_pid: 0,
-    dae0_ifindex: 0,
-    dae_netns_id: 0,
-    wan_ifindex: 0,
-    dae0peer_mac: [0; 6],
-    padding_after_mac: [0; 2],
-    use_redirect_peer: 0,
-    has_bpf_get_current_task: 0,
-    padding2: 0,
-    dae_socket_mark: 0,
-    local_ip: 0,
-});
+pub static PARAM: Global<DaeParam> = Global::new(DaeParam::DEFAULT);
 
 /// WAN interface ifindex used by the egress program to identify locally-
 /// generated packets that the bonding driver forwards onto the bond master.
@@ -92,8 +68,8 @@ pub fn datapath_flags() -> u32 {
 #[btf_map]
 pub static UDP_DECISION_SEQUENCE: Array<UdpDecisionSequence, 1, 0> = Array::new();
 
-/// Active grace-period slot for token-bound decision work. Userspace flips
-/// this before waiting on the previous per-CPU slot.
+/// Active grace-period slot for token-bound decisions and WAN UDP routing.
+/// Userspace flips this before waiting on the previous per-CPU slot.
 #[btf_map]
 pub static UDP_DECISION_EPOCH: Array<u32, 1, 0> = Array::new();
 
@@ -162,6 +138,16 @@ pub fn udp_decision_retiring(key: &TuplesKey) -> bool {
 pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = HashMap::new();
 
 #[btf_map]
+/// LAN framing of the client side of a redirected non-DNS UDP flow, keyed by the
+/// client address and port alone (destination zeroed, token cleared). A reply
+/// from a peer the client never contacted has no exact `REDIRECT_TRACK` entry
+/// but must still reach the same client. Kernel LRU eviction is approximate:
+/// near capacity, and sooner with many CPUs, it can drop a quiet client before
+/// the map is full. That only restores the previous behaviour for that client,
+/// unlike the plain hashes above, so no userspace sweep owns it.
+pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
+
+#[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
 /// timeout).
 pub static ROUTING_HANDOFF_MAP: HashMap<
@@ -171,34 +157,36 @@ pub static ROUTING_HANDOFF_MAP: HashMap<
     1,
 > = HashMap::new();
 
-#[btf_map]
-/// Two physical rule banks. `ROUTING_META_MAP[0]` selects the active bank;
-/// the inactive bank is populated before that single-slot switch.
-pub static ROUTING_MAP: Array<MatchSet, ROUTING_MAP_LEN, 0> = Array::new();
+#[repr(C)]
+pub struct RouteTraceSequence {
+    pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
+    pub next: u32,
+}
 
-/// Routing metadata for the two rule banks. Slot 0 is the active generation;
-/// each following block contains one generation's count and group bitmaps.
+// Instance-local: unlike the UDP decision allocator, this map is never reused.
 #[btf_map]
-pub static ROUTING_META_MAP: Array<u32, ROUTING_META_MAP_LEN, 0> = Array::new();
-/// Packed count and bitmap for each (generation, flow-group) pair.
-#[btf_map]
-pub static ROUTING_GROUP_META_MAP: Array<RoutingGroupMeta, { ROUTING_GROUP_META_MAP_LEN }, 0> =
-    Array::new();
-#[btf_map]
-pub static DOMAIN_ROUTING_MAP: HashMap<[__be32; 4], DomainRouting, MAX_DOMAIN_ROUTING_NUM, 1> =
-    HashMap::new();
+pub static ROUTE_TRACE_SEQUENCE: Array<RouteTraceSequence, 1> = Array::new();
 
 #[btf_map]
-pub static DEST_LPM_ROUTING_MAP: LpmTrie<[__be32; 4], DomainRouting, MAX_LPM_SIZE, 1> =
-    LpmTrie::new();
+pub static ROUTE_TRACE_MAP: LruHashMap<
+    u32,
+    honk_ebpf_common::KernelRouteWitness,
+    { honk_ebpf_common::ROUTE_TRACE_CAPACITY as usize },
+> = LruHashMap::new();
 
+/// Stable one-entry policy root. The backend atomically swaps the immutable
+/// descriptor map only after every inactive target slot and its generation-owned
+/// fact maps are ready.
 #[btf_map]
-pub static SOURCE_LPM_ROUTING_MAP: LpmTrie<[__be32; 4], DomainRouting, MAX_LPM_SIZE, 1> =
-    LpmTrie::new();
+pub static ROUTING_POLICY_ROOT: ArrayOfMaps<Array<RoutingPolicyDescriptor, 1>, 1> =
+    ArrayOfMaps::new();
+#[cfg(feature = "routing-test")]
+#[btf_map]
+pub static ROUTING_TEST_INPUT: Array<RoutingInput, 1> = Array::new();
 
+#[cfg(feature = "routing-test")]
 #[btf_map]
-pub static MAC_LPM_ROUTING_MAP: LpmTrie<[__be32; 4], DomainRouting, MAX_LPM_SIZE, 1> =
-    LpmTrie::new();
+pub static ROUTING_TEST_OUTPUT: Array<RoutingTestResult, 1> = Array::new();
 
 #[btf_map]
 pub static COOKIE_PID_MAP: HashMap<u64, PIDName, MAX_COOKIE_PID_PNAME_MAPPING_NUM, 1> =
@@ -252,12 +240,6 @@ pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();
 
 #[btf_map]
 pub static PKT_SCRATCH_KEY: PerCpuArray<ParsedPacket, 1> = PerCpuArray::new();
-
-#[btf_map]
-pub static ROUTE_CTX_SCRATCH_MAP: PerCpuArray<RouteCtx, 1> = PerCpuArray::new();
-
-#[btf_map]
-pub static WAN_EGRESS_ROUTE_SCRATCH_MAP: PerCpuArray<WanEgressRouteScratch, 1> = PerCpuArray::new();
 
 #[btf_map]
 pub static CONNTRACK_ARGS_MAP: PerCpuArray<ConntrackArgs, 1> = PerCpuArray::new();

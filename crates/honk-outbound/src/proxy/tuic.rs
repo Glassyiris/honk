@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -15,10 +15,12 @@ use tracing::debug;
 
 use crate::quic::defrag::Defragmenter;
 use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
+use crate::transport_quality::TransportQuality;
 
 use super::addr::{self, SocksAddr};
 use super::{
-    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, QuicSendToken, TcpOutbound,
+    WarmableOutbound,
 };
 
 const TUIC_VERSION: u8 = 0x05;
@@ -51,8 +53,8 @@ enum TuicAddr {
 }
 
 impl TuicAddr {
-    fn new(target: SocketAddr, target_domain: Option<&str>) -> Self {
-        TuicAddr::Addr(SocksAddr::new(target, target_domain))
+    fn new(target: SocketAddr, target_domain: Option<&str>) -> io::Result<Self> {
+        Ok(TuicAddr::Addr(SocksAddr::new(target, target_domain)?))
     }
 
     fn encoded_len(&self) -> usize {
@@ -242,11 +244,13 @@ struct TuicConnState {
     /// UDP-over-stream fallback: the peer did not negotiate QUIC datagrams.
     udp_over_stream: bool,
     sessions: SessionMap,
-    next_session: AtomicU16,
+    next_session: AtomicU32,
     /// Number of open TCP streams + UDP bridges on this connection.
     open: Arc<AtomicUsize>,
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
+    path_health: Arc<crate::quic::QuicPathHealth>,
+    task_scope: crate::runtime::TaskScope,
 }
 
 impl QuicConnState for TuicConnState {
@@ -257,58 +261,77 @@ impl QuicConnState for TuicConnState {
     fn open_counter(&self) -> &Arc<AtomicUsize> {
         &self.open
     }
+    fn enable_telemetry(&self) {
+        self.path_health.enable_telemetry();
+    }
 }
 
 impl TuicConnState {
     fn new(conn: quinn::Connection) -> Self {
         let sessions: SessionMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let path_health = crate::quic::QuicPathHealth::new(&conn);
         let state = Self {
             udp_over_stream: conn.max_datagram_size().is_none(),
             conn: conn.clone(),
             sessions: Arc::clone(&sessions),
-            next_session: AtomicU16::new(0),
+            next_session: AtomicU32::new(0),
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
+            path_health: Arc::clone(&path_health),
+            task_scope: crate::runtime::TaskScope::capture(),
         };
-        tokio::spawn(Self::datagram_loop(conn.clone(), Arc::clone(&sessions)));
-        tokio::spawn(Self::uni_stream_loop(conn.clone(), Arc::clone(&sessions)));
+        let _ = crate::runtime::spawn_owned(Self::datagram_loop(
+            conn.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&path_health),
+        ));
+        let _ = crate::runtime::spawn_owned(Self::uni_stream_loop(
+            conn.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&path_health),
+        ));
+        crate::quic::spawn_quic_path_watchdog(conn.clone(), Arc::clone(&path_health));
         let open = Arc::downgrade(&state.open);
         let last_activity = Arc::downgrade(&state.last_activity);
-        if state.udp_over_stream {
-            // No heartbeat frames without datagram support; idle reaping only.
-            crate::quic::spawn_conn_reaper(
-                conn,
-                open,
-                last_activity,
-                HEARTBEAT_INTERVAL,
-                CONN_IDLE_TIMEOUT,
-                None,
-            );
-        } else {
-            // Heartbeat datagrams every 10s while the connection is in use
-            // (`client.go:216-230`); ends the loop when the send fails.
-            crate::quic::spawn_conn_reaper(
-                conn,
-                open,
-                last_activity,
-                HEARTBEAT_INTERVAL,
-                CONN_IDLE_TIMEOUT,
+        crate::quic::spawn_conn_reaper(
+            conn,
+            open,
+            last_activity,
+            HEARTBEAT_INTERVAL,
+            CONN_IDLE_TIMEOUT,
+            if state.udp_over_stream {
+                None
+            } else {
                 Some(Box::new(|conn: &quinn::Connection| {
-                    conn.send_datagram(bytes::Bytes::from_static(&[TUIC_VERSION, CMD_HEARTBEAT]))
-                        .is_ok()
-                })),
-            );
-        }
+                    !matches!(
+                        conn.send_datagram(bytes::Bytes::from_static(&[
+                            TUIC_VERSION,
+                            CMD_HEARTBEAT,
+                        ])),
+                        Err(quinn::SendDatagramError::ConnectionLost(_))
+                    )
+                }))
+            },
+        );
         state
     }
 
-    fn alloc_session(&self) -> u16 {
-        self.next_session.fetch_add(1, Ordering::Relaxed)
+    fn alloc_session(&self) -> Option<u16> {
+        self.next_session
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next <= u16::MAX as u32).then_some(next + 1)
+            })
+            .ok()
+            .map(|session| session as u16)
     }
 
     /// Inbound QUIC datagrams: PACKET frames are demultiplexed by session id
     /// (sing `loopMessages`, `client_packet.go:12-50`).
-    async fn datagram_loop(conn: quinn::Connection, sessions: SessionMap) {
+    async fn datagram_loop(
+        conn: quinn::Connection,
+        sessions: SessionMap,
+        path_health: Arc<crate::quic::QuicPathHealth>,
+    ) {
         loop {
             let data = match conn.read_datagram().await {
                 Ok(data) => data,
@@ -321,8 +344,11 @@ impl TuicConnState {
                 CMD_PACKET => {
                     if let Ok(msg) = decode_udp_message(&data[2..]) {
                         let tx = sessions.lock().get(&msg.session_id).cloned();
-                        if let Some(tx) = tx {
-                            let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
+                        if let Some(tx) = tx
+                            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                                tx.try_send(msg)
+                        {
+                            path_health.record_session_rx_drop();
                         }
                     }
                 }
@@ -336,14 +362,19 @@ impl TuicConnState {
 
     /// Inbound uni streams carry one PACKET frame each in UDP-over-stream
     /// mode (sing `loopUniStreams`, `client_packet.go:52-93`).
-    async fn uni_stream_loop(conn: quinn::Connection, sessions: SessionMap) {
+    async fn uni_stream_loop(
+        conn: quinn::Connection,
+        sessions: SessionMap,
+        path_health: Arc<crate::quic::QuicPathHealth>,
+    ) {
         loop {
             let mut recv = match conn.accept_uni().await {
                 Ok(recv) => recv,
                 Err(_) => break,
             };
             let sessions = Arc::clone(&sessions);
-            tokio::spawn(async move {
+            let path_health = Arc::clone(&path_health);
+            let _ = crate::runtime::spawn_owned(async move {
                 let mut head = [0u8; 2];
                 if read_exact(&mut recv, &mut head).await.is_err() {
                     return;
@@ -353,8 +384,11 @@ impl TuicConnState {
                 }
                 if let Ok(msg) = read_udp_message_stream(&mut recv).await {
                     let tx = sessions.lock().get(&msg.session_id).cloned();
-                    if let Some(tx) = tx {
-                        let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
+                    if let Some(tx) = tx
+                        && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            tx.try_send(msg)
+                    {
+                        path_health.record_session_rx_drop();
                     }
                 }
             });
@@ -374,6 +408,10 @@ impl crate::runtime::QuicRuntimeClient for TuicClient {
         self
     }
 
+    async fn enable_metrics(&self, quality: Arc<TransportQuality>) {
+        self.quic.enable_metrics(quality).await;
+    }
+
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
@@ -389,10 +427,10 @@ impl TuicClient {
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<TuicConnState>)> {
         let uuid = self.uuid;
-        let password = self.password.clone();
+        let password = &self.password;
         self.quic
-            .connection_with(connect_timeout, move |conn| async move {
-                crate::quic::exporter_auth(&conn, &uuid, &password, TUIC_VERSION, true, AUTH_GRACE)
+            .connection_with_metrics(connect_timeout, move |conn| async move {
+                crate::quic::exporter_auth(&conn, &uuid, password, TUIC_VERSION, true, AUTH_GRACE)
                     .await?;
                 Ok(TuicConnState::new(conn))
             })
@@ -410,7 +448,11 @@ impl TuicHandler {
         Self
     }
 
-    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<TuicClient>> {
+    async fn build_client(
+        &self,
+        node: &Node,
+        profiles: Option<Arc<crate::quic::AdaptiveFlowProfiles>>,
+    ) -> anyhow::Result<Arc<TuicClient>> {
         let tuic = node.tuic().unwrap();
         let uuid_str = tuic
             .uuid
@@ -428,33 +470,31 @@ impl TuicHandler {
         // ALPN override from the share link (`alpn=h3`, comma-separated);
         // servers configured without `tuic` in their ALPN list reject the
         // handshake at the TLS layer otherwise.
-        let alpn: Vec<Vec<u8>> = tuic
+        let mut alpn: Vec<&[u8]> = tuic
             .alpn
             .as_deref()
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(|p| p.as_bytes().to_vec())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec![b"tuic".to_vec()]);
-        // quinn's default stream window (1.25MB) caps a single stream at
-        // ~12.5MB/s per 100ms of RTT — unusable on long-fat links. Default
-        // to 8MB stream / 8MB conn (conn window = memory budget, see hy2).
-        // Explicit node fields override.
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::as_bytes)
+            .collect();
+        if alpn.is_empty() {
+            alpn.push(b"tuic");
+        }
         let options = crate::quic::QuicClientOptions {
             congestion: Some(crate::quic::congestion_factory(tuic.congestion.as_deref())),
+            // Keep both protocol and QUIC PING liveness in fallback mode.
+            keep_alive: Some(HEARTBEAT_INTERVAL),
             stream_receive_window: Some(tuic.init_stream_recv_window.unwrap_or(8 << 20)),
             conn_receive_window: Some(tuic.init_conn_recv_window.unwrap_or(8 << 20)),
             max_udp_payload_size: tuic.quic.mtu,
             ..Default::default()
         };
-        let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
-        let config = crate::quic::client_config(node, &alpn_refs, options).await?;
+        let config = crate::quic::client_config(node, &alpn, options).await?;
         Ok(Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                .with_flow_control_profiles(profiles)
                 .with_max_udp_payload_size(tuic.quic.mtu.unwrap_or(1252)),
             uuid: *uuid.as_bytes(),
             password,
@@ -465,8 +505,9 @@ impl TuicHandler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<TuicClient>> {
+        let profiles = runtime.quic_flow_control_profiles()?;
         runtime
-            .quic_client(|| self.build_client(runtime.node.as_ref()))
+            .quic_client(|| self.build_client(runtime.node.as_ref(), Some(profiles)))
             .await
     }
 
@@ -477,7 +518,7 @@ impl TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = TuicAddr::new(target, target_domain);
+        let addr = TuicAddr::new(target, target_domain)?;
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
             |timeout| {
@@ -496,6 +537,11 @@ impl TuicHandler {
                     send.write_all(&header)
                         .await
                         .context("TUIC: send CONNECT")?;
+                    if let Some(observer) = crate::runtime::flow_observation::current() {
+                        observer.milestone_once(
+                            crate::runtime::flow_observation::Milestone::TargetRequestSent,
+                        );
+                    }
                     Ok((send, recv))
                 }
             },
@@ -517,21 +563,33 @@ impl TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let (_conn, state) = client.connection(connect_timeout).await?;
-        state.touch();
-        let session_id = state.alloc_session();
-        let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
-        state.sessions.lock().insert(session_id, tx);
-        state.open.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(TuicUdpTransport {
-            state,
-            session_id,
-            packet_id: AtomicU16::new(0),
-            rx: tokio::sync::Mutex::new(rx),
-            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
-            target_addr: TuicAddr::new(target, target_domain),
-            target,
-        }))
+        let target_addr = TuicAddr::new(target, target_domain)?;
+        loop {
+            let (conn, state) = client.connection(connect_timeout).await?;
+            let observation = crate::session::ObservedSessionOpen::start();
+            let Some(session_id) = state.alloc_session() else {
+                observation.finish(crate::runtime::flow_observation::SessionEvent::OpenCapacity);
+                client.quic.invalidate(&conn).await;
+                continue;
+            };
+            state.touch();
+            let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
+            state.sessions.lock().insert(session_id, tx);
+            state.open.fetch_add(1, Ordering::Relaxed);
+            observation.finish(crate::runtime::flow_observation::SessionEvent::OpenSucceeded);
+            return Ok(Arc::new(TuicUdpTransport {
+                state,
+                session_id,
+                packet_id: AtomicU16::new(0),
+                rx: tokio::sync::Mutex::new(rx),
+                defrag: tokio::sync::Mutex::new(Defragmenter::new(u16::MAX as usize)),
+                target_addr,
+                target,
+                request_observer: parking_lot::Mutex::new(
+                    crate::runtime::flow_observation::current(),
+                ),
+            }));
+        }
     }
 
     async fn send_udp(
@@ -584,9 +642,13 @@ impl WarmableOutbound for TuicHandler {
         connect_timeout: Duration,
         _requirement: super::WarmRequirement,
     ) -> anyhow::Result<()> {
-        let client = self.client_for_runtime(&runtime).await?;
-        client.connection(connect_timeout).await?;
-        Ok(())
+        let warm = async {
+            let client = self.client_for_runtime(&runtime).await?;
+            client.connection(connect_timeout).await?;
+            Ok(())
+        };
+        let warm = crate::runtime::flow_observation::without(warm);
+        warm.await
     }
 }
 
@@ -599,7 +661,7 @@ impl TcpOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.dial_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -637,7 +699,7 @@ impl PacketOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.build_client(node).await?;
+        let client = self.build_client(node, None).await?;
         self.udp_transport_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -661,7 +723,10 @@ impl PacketOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        let client = self.build_client(runtime.node.as_ref()).await?;
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             self.udp_transport_via_client(client, target, target_domain, connect_timeout)
                 .await
@@ -673,7 +738,7 @@ impl PacketOutbound for TuicHandler {
 #[async_trait]
 impl ProbeableOutbound for TuicHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.build_client(node).await {
+        match self.build_client(node, None).await {
             Ok(client) => match client.connection(Duration::from_secs(5)).await {
                 Ok((conn, _)) => crate::quic::survives_auth_close_window(&conn).await,
                 Err(_) => false,
@@ -698,6 +763,7 @@ struct TuicUdpTransport {
     defrag: tokio::sync::Mutex<Defragmenter>,
     target_addr: TuicAddr,
     target: SocketAddr,
+    request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
 }
 
 impl std::fmt::Debug for TuicUdpTransport {
@@ -715,7 +781,7 @@ impl Drop for TuicUdpTransport {
         self.state.open.fetch_sub(1, Ordering::Relaxed);
         let conn = self.state.conn.clone();
         let session_id = self.session_id;
-        tokio::spawn(async move {
+        let _ = self.state.task_scope.spawn(async move {
             TuicHandler::send_dissociate(&conn, session_id).await;
         });
     }
@@ -725,6 +791,33 @@ impl Drop for TuicUdpTransport {
 impl PacketTransport for TuicUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
+    }
+    fn send_timeout(&self) -> Duration {
+        self.state.path_health.send_timeout()
+    }
+    fn record_quic_send_started(&self) -> QuicSendToken {
+        self.state.path_health.record_send_started(&self.state.conn)
+    }
+    fn record_quic_send_success(&self, token: QuicSendToken) {
+        self.state
+            .path_health
+            .record_send_success(token, &self.state.conn);
+    }
+    fn record_quic_send_timeout(&self, token: QuicSendToken) {
+        if self
+            .state
+            .path_health
+            .record_send_timeout(token, &self.state.conn)
+        {
+            crate::quic::record_quic_send_timeout();
+        }
+    }
+    fn record_quic_send_failure(&self, token: QuicSendToken) {
+        self.state.path_health.record_send_failure(token);
+    }
+
+    fn quic_path_stalled(&self) -> bool {
+        self.state.path_health.is_stalled()
     }
     fn send_timeout_is_congestion(&self) -> bool {
         !self.state.udp_over_stream
@@ -743,13 +836,27 @@ impl PacketTransport for TuicUdpTransport {
             data,
         )
         .await
-        .map_err(io::Error::other)
+        .map_err(|error| io::Error::other(crate::SharedError::new(error)))
+        .map_err(super::quic_carrier_io_error)?;
+        if let Some(observer) = self.request_observer.lock().take() {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+        }
+        Ok(())
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "TUIC connection closed")
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    super::NodeFailure(
+                        self.state
+                            .conn
+                            .close_reason()
+                            .map(anyhow::Error::new)
+                            .unwrap_or_else(|| anyhow::anyhow!("TUIC connection closed")),
+                    ),
+                )
             })?;
             let complete =
                 self.defrag
@@ -771,388 +878,4 @@ impl PacketTransport for TuicUdpTransport {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::quic::testutil;
-    use quinn::VarInt;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// AUTHENTICATE command byte (the shared `exporter_auth` writes it
-    /// inline; only the test server decodes it).
-    const CMD_AUTHENTICATE: u8 = 0x00;
-
-    const TEST_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
-    const TEST_PASSWORD: &str = "tuic-test-password";
-
-    fn test_node(port: u16, password: &str) -> Node {
-        Node {
-            name: "tuic-test".to_string(),
-            host: "127.0.0.1".to_string(),
-            address: format!("127.0.0.1:{port}"),
-            port,
-            outbound: honk_config::node::OutboundConfig::Tuic(honk_config::node::TuicConfig {
-                uuid: Some(TEST_UUID.to_string()),
-                password: Some(password.to_string()),
-                quic: honk_config::node::QuicOptions {
-                    tls: honk_config::node::TlsOptions {
-                        skip_cert_verify: true,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// Minimal in-process TUIC v5 server: verifies the AUTHENTICATE token
-    /// with the same TLS exporter, echoes CONNECT streams back, echoes UDP
-    /// packets back on the path they arrived (datagram or uni stream).
-    async fn start_server(datagrams: bool, password: &'static str) -> SocketAddr {
-        start_server_with_alpn(&[b"tuic"], datagrams, password).await
-    }
-
-    async fn start_server_with_alpn(
-        alpn: &[&[u8]],
-        datagrams: bool,
-        password: &'static str,
-    ) -> SocketAddr {
-        let (endpoint, addr) = testutil::server_endpoint(alpn, datagrams).unwrap();
-        tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                tokio::spawn(async move {
-                    let Ok(conn) = incoming.await else { return };
-                    handle_connection(conn, password).await;
-                });
-            }
-        });
-        addr
-    }
-
-    async fn handle_connection(conn: quinn::Connection, password: &'static str) {
-        // Uni streams: authenticate + UDP-over-stream packets.
-        let uni_conn = conn.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok(mut recv) = uni_conn.accept_uni().await else {
-                    break;
-                };
-                let conn = uni_conn.clone();
-                tokio::spawn(async move {
-                    let mut head = [0u8; 2];
-                    if read_exact(&mut recv, &mut head).await.is_err() {
-                        return;
-                    }
-                    match (head[0], head[1]) {
-                        (TUIC_VERSION, CMD_AUTHENTICATE) => {
-                            let mut rest = [0u8; 48];
-                            if read_exact(&mut recv, &mut rest).await.is_err() {
-                                return;
-                            }
-                            let uuid: &[u8; 16] = rest[..16].try_into().unwrap();
-                            let mut token = [0u8; 32];
-                            if conn
-                                .export_keying_material(&mut token, uuid, password.as_bytes())
-                                .is_err()
-                            {
-                                return;
-                            }
-                            if token != rest[16..] {
-                                conn.close(VarInt::from_u32(0xfffffff1), b"authentication failed");
-                            }
-                        }
-                        (TUIC_VERSION, CMD_PACKET) => {
-                            let Ok(msg) = read_udp_message_stream(&mut recv).await else {
-                                return;
-                            };
-                            // Echo the packet back on a fresh uni stream.
-                            let pkt = encode_udp_packet(
-                                msg.session_id,
-                                msg.packet_id,
-                                msg.frag_total,
-                                msg.frag_id,
-                                &msg.addr,
-                                &msg.data,
-                            );
-                            if let Ok(mut send) = conn.open_uni().await {
-                                let _ = send.write_all(&pkt).await;
-                                let _ = send.finish();
-                            }
-                        }
-                        _ => {}
-                    }
-                });
-            }
-        });
-        // Bi streams: CONNECT echo.
-        let bi_conn = conn.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut send, mut recv)) = bi_conn.accept_bi().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut head = [0u8; 2];
-                    if read_exact(&mut recv, &mut head).await.is_err() {
-                        return;
-                    }
-                    if head != [TUIC_VERSION, CMD_CONNECT] {
-                        return;
-                    }
-                    if TuicAddr::read_from_stream(&mut recv).await.is_err() {
-                        return;
-                    }
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match recv.read(&mut buf).await {
-                            Ok(Some(n)) => {
-                                if send.write_all(&buf[..n]).await.is_err() {
-                                    return;
-                                }
-                            }
-                            _ => return,
-                        }
-                    }
-                });
-            }
-        });
-        // Datagrams: echo PACKET frames verbatim.
-        loop {
-            let Ok(data) = conn.read_datagram().await else {
-                break;
-            };
-            if data.len() >= 2 && data[0] == TUIC_VERSION && data[1] == CMD_PACKET {
-                let _ = conn.send_datagram(data);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_dial_tcp_echo() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-
-        let mut stream = handler
-            .dial(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial should succeed");
-        stream.stream.write_all(b"hello tuic").await.unwrap();
-        let mut buf = [0u8; 64];
-        let n = stream.stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"hello tuic");
-    }
-
-    #[tokio::test]
-    async fn test_dial_tcp_domain_echo() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-
-        let mut stream = handler
-            .dial(&node, target, Some("example.com"), Duration::from_secs(5))
-            .await
-            .expect("dial should succeed");
-        stream.stream.write_all(b"domain").await.unwrap();
-        let mut buf = [0u8; 16];
-        let n = stream.stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"domain");
-    }
-
-    #[tokio::test]
-    async fn test_wrong_password_rejected() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), "wrong-password");
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-
-        // TUIC has no auth response, so the dial proceeds optimistically
-        // (zero auth grace, sing-quic/dae parity); the rejection surfaces
-        // ~1 RTT later when the server closes the connection. The
-        // connectivity probe (which waits for exactly that) must say no.
-        let _ = handler
-            .dial(&node, target, None, Duration::from_secs(5))
-            .await;
-        assert!(!handler.test_connectivity(&node).await);
-    }
-
-    #[tokio::test]
-    async fn test_custom_alpn() {
-        // Server only accepts `h3` (HTTP/3-camouflaged TUIC deployment).
-        let server_addr = start_server_with_alpn(&[b"h3"], true, TEST_PASSWORD).await;
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-
-        // Share-link `alpn=h3` is honored: the handshake succeeds.
-        let mut node = test_node(server_addr.port(), TEST_PASSWORD);
-        node.tuic_mut().unwrap().alpn = Some("h3".to_string());
-        let mut stream = handler
-            .dial(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("matching custom ALPN should connect");
-        stream.stream.write_all(b"alpn").await.unwrap();
-        let mut buf = [0u8; 16];
-        let n = stream.stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"alpn");
-
-        // Default ALPN (`tuic`) is rejected at the TLS layer.
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let result = handler
-            .dial(&node, target, None, Duration::from_secs(5))
-            .await;
-        assert!(result.is_err(), "mismatched ALPN must fail the handshake");
-    }
-
-    #[tokio::test]
-    async fn test_udp_transport_native_datagram_echo() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-        let transport = handler
-            .dial_udp_transport(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial_udp_transport should succeed");
-        assert_eq!(transport.relay_addr(), target);
-        assert!(transport.send_timeout_is_congestion());
-        transport.send_packet(b"dns-query").await.unwrap();
-        let mut buf = [0u8; 256];
-        let (n, src) =
-            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
-                .await
-                .expect("reply timed out")
-                .unwrap();
-        assert_eq!(src, target);
-        assert_eq!(&buf[..n], b"dns-query");
-    }
-
-    #[tokio::test]
-    async fn test_udp_transport_over_stream_echo() {
-        // Server without QUIC datagram support → UDP-over-stream fallback.
-        let server_addr = start_server(false, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-        let transport = handler
-            .dial_udp_transport(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial_udp_transport should succeed");
-        assert!(!transport.send_timeout_is_congestion());
-        transport.send_packet(b"stream-query").await.unwrap();
-        let mut buf = [0u8; 256];
-        let (n, src) =
-            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
-                .await
-                .expect("reply timed out")
-                .unwrap();
-        assert_eq!(src, target);
-        assert_eq!(&buf[..n], b"stream-query");
-    }
-
-    #[tokio::test]
-    async fn test_connection_reuse_across_dials() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-
-        for i in 0..3 {
-            let mut stream = handler
-                .dial(&node, target, None, Duration::from_secs(5))
-                .await
-                .expect("dial should succeed");
-            let payload = format!("req{i}");
-            stream.stream.write_all(payload.as_bytes()).await.unwrap();
-            let mut buf = [0u8; 16];
-            let n = stream.stream.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], payload.as_bytes());
-        }
-    }
-
-    #[test]
-    fn test_addr_codec_roundtrip() {
-        let cases = [
-            TuicAddr::Addr(SocksAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(93, 184, 216, 34),
-                80,
-            ))),
-            TuicAddr::Addr(SocksAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
-                443,
-                0,
-                0,
-            ))),
-            TuicAddr::Addr(SocksAddr::Domain("example.com".to_string(), 8080)),
-            TuicAddr::None,
-        ];
-        for addr in cases {
-            let mut buf = Vec::new();
-            addr.encode(&mut buf);
-            assert_eq!(buf.len(), addr.encoded_len());
-            let mut cursor = &buf[..];
-            let decoded = TuicAddr::decode(&mut cursor).unwrap();
-            assert_eq!(decoded, addr);
-            assert!(cursor.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_udp_message_codec_roundtrip() {
-        let addr = TuicAddr::Addr(SocksAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::new(8, 8, 8, 8),
-            53,
-        )));
-        let pkt = encode_udp_packet(7, 42, 1, 0, &addr, b"payload");
-        assert_eq!(pkt[0], TUIC_VERSION);
-        assert_eq!(pkt[1], CMD_PACKET);
-        let msg = decode_udp_message(&pkt[2..]).unwrap();
-        assert_eq!(msg.session_id, 7);
-        assert_eq!(msg.packet_id, 42);
-        assert_eq!(msg.frag_total, 1);
-        assert_eq!(msg.frag_id, 0);
-        assert_eq!(msg.addr, addr);
-        assert_eq!(msg.data, b"payload");
-    }
-
-    #[test]
-    fn test_fragmentation_and_defrag() {
-        let addr = TuicAddr::Addr(SocksAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::new(8, 8, 8, 8),
-            53,
-        )));
-        let data = vec![0xabu8; 3000];
-        let max = 1200;
-        let frags = fragment_udp_packets(1, 99, &addr, &data, max).unwrap();
-        assert_eq!(frags.len(), 3);
-        assert!(frags.iter().all(|f| f.len() <= max));
-
-        let mut defrag = Defragmenter::new();
-        let mut out = None;
-        // Feed out of order; only the last missing fragment completes it.
-        for pkt in frags.iter().rev() {
-            let msg = decode_udp_message(&pkt[2..]).unwrap();
-            out = defrag
-                .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data)
-                .or(out);
-        }
-        assert_eq!(out.expect("reassembled payload"), data);
-    }
-
-    #[test]
-    fn test_fragmentation_small_packet_not_fragmented() {
-        let addr = TuicAddr::Addr(SocksAddr::Domain("example.com".to_string(), 443));
-        let data = b"tiny";
-        let frags = fragment_udp_packets(1, 1, &addr, data, 1200).unwrap();
-        assert_eq!(frags.len(), 1);
-        let msg = decode_udp_message(&frags[0][2..]).unwrap();
-        assert_eq!(msg.frag_total, 1);
-        assert_eq!(msg.addr, addr);
-        assert_eq!(msg.data, data);
-    }
-}
+mod tests;

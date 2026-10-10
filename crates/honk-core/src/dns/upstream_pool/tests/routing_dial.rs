@@ -6,6 +6,7 @@ use honk_outbound::group::GroupManager;
 use tokio::sync::RwLock;
 
 use super::*;
+use crate::dns::forwarder::DnsUpstreamPool;
 use crate::routing::Router;
 
 fn route(ip: &str, outbound: &str) -> RoutingRule {
@@ -22,35 +23,67 @@ fn route(ip: &str, outbound: &str) -> RoutingRule {
     }
 }
 
-#[test]
-fn dial_context_pins_its_outbound_runtime_generation() {
-    let node = test_node("dns-proxy");
+#[tokio::test]
+async fn dns_proxy_query_survives_traffic_registry_retirement() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut node = test_node("dns-proxy");
+    let address = listener.local_addr().unwrap();
+    node.address = address.ip().to_string();
+    node.port = address.port();
+    node.outbound =
+        honk_config::node::OutboundConfig::from_protocol(honk_config::types::NodeProtocol::Socks5);
+    node.id = node.derive_id();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.read_exact(&mut [0; 3]).await.unwrap();
+        stream.write_all(&[5, 0]).await.unwrap();
+        stream.read_exact(&mut [0; 10]).await.unwrap();
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 53])
+            .await
+            .unwrap();
+        let length = stream.read_u16().await.unwrap();
+        let mut query = vec![0; length as usize];
+        stream.read_exact(&mut query).await.unwrap();
+        let response = mock_dns_response(u16::from_be_bytes([query[0], query[1]]));
+        stream.write_u16(response.len() as u16).await.unwrap();
+        stream.write_all(&response).await.unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
             .unwrap(),
     );
-    let upstream = make_upstream("proxy", "1.1.1.1:53", DnsProtocol::Tcp);
+    let upstream = DnsUpstream {
+        outbound: Some(node.name.clone()),
+        ..make_upstream("proxy", "1.1.1.1:53", DnsProtocol::Tcp)
+    };
     let pool = UpstreamPool::new_with_proxy(
         &[upstream],
         make_router(),
         Some(Arc::new(
             crate::proxy::ProxyRegistry::default_resolver().unwrap(),
         )),
-        vec![node.clone()],
+        vec![node],
         vec![],
     )
-    .unwrap()
-    .with_runtime_generation(Arc::clone(&generation));
+    .unwrap();
+    pool.set_runtime_generation(Arc::clone(&generation))
+        .unwrap();
 
-    let entry = pool.entries.get("proxy").unwrap();
-    let context = pool
-        .dial_context(entry, Some(&node), "1.1.1.1:53".parse().unwrap())
-        .expect("proxy registry");
-    let captured = context
-        .proxy
-        .and_then(|proxy| proxy.generation)
-        .expect("proxy dial must capture the owning DNS generation");
-    assert!(Arc::ptr_eq(&captured, &generation));
+    generation.begin_retirement();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        pool.query("proxy", &mock_dns_query(123)),
+    )
+    .await
+    .expect("retired traffic registry must not block the DNS-owned dial")
+    .unwrap();
+    assert_eq!(response, mock_dns_response(123));
+    pool.close().await;
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -107,10 +140,17 @@ async fn resolve_dial_leaf_implicit_uses_traffic_router() {
 }
 
 #[tokio::test]
-async fn implicit_quic_routes_match_udp_traffic_rules() {
+async fn implicit_quic_routes_use_data_udp_health() {
     let node = test_node("proxy-leaf");
     let group = test_group("proxy", GroupPolicy::Score, vec![node.id]);
-    let manager = GroupManager::new(&[group], std::slice::from_ref(&node)).into_shared();
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    alive.report_unavailable_forced(
+        node.id,
+        honk_outbound::alive::ProbeDomain::DnsUdp,
+        honk_outbound::alive::IpVersion::V4,
+    );
+    let manager = GroupManager::with_alive_set(&[group], std::slice::from_ref(&node), Some(alive))
+        .into_shared();
     let traffic = Arc::new(RwLock::new(
         Router::new(
             &[RoutingRule {
@@ -145,9 +185,55 @@ async fn implicit_quic_routes_match_udp_traffic_rules() {
         assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Udp);
         assert_eq!(
             context.probe_domain,
-            honk_outbound::alive::ProbeDomain::DnsUdp
+            honk_outbound::alive::ProbeDomain::DataUdp
         );
     }
+}
+
+/// The proxied carrier of a plain `udp://` upstream is pooled TCP-DNS
+/// (never real UDP through the node), so its selection follows TCP health:
+/// a node whose `:53` UDP probe died keeps serving TCP-carried DNS.
+#[tokio::test]
+async fn implicit_udp_route_follows_tcp_carrier_health() {
+    let node = test_node("proxy-leaf");
+    let group = test_group("proxy", GroupPolicy::Score, vec![node.id]);
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    alive.report_unavailable_forced(
+        node.id,
+        honk_outbound::alive::ProbeDomain::DnsUdp,
+        honk_outbound::alive::IpVersion::V4,
+    );
+    let manager = GroupManager::with_alive_set(&[group], std::slice::from_ref(&node), Some(alive))
+        .into_shared();
+    let traffic = Arc::new(RwLock::new(
+        Router::new(
+            &[RoutingRule {
+                name: "udp-dns".into(),
+                condition: RoutingCondition {
+                    protocol: vec!["udp".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("proxy".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            }],
+            "direct",
+        )
+        .unwrap(),
+    ));
+    let upstreams = [make_upstream("udp", "192.0.2.53:53", DnsProtocol::Udp)];
+    let pool =
+        UpstreamPool::new_with_proxy(&upstreams, make_router(), None, vec![node.clone()], vec![])
+            .unwrap()
+            .with_group_manager(manager)
+            .with_traffic_router(traffic);
+
+    let route = pool.resolve_dial_route(&pool.entries["udp"]).await.unwrap();
+    assert_eq!(route.node.as_ref().expect("TCP-carried route").id, node.id);
+    let context = route.feedback.expect("Score feedback").context().clone();
+    assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Tcp);
+    assert_eq!(context.probe_domain, honk_outbound::alive::ProbeDomain::Tcp);
 }
 
 #[tokio::test]
@@ -275,7 +361,8 @@ async fn tcp_fallback_keeps_selected_score_group_chain() {
             .collect::<Vec<_>>(),
         ["selected"]
     );
-    let feedback = pool.tcp_feedback_for_route(entry, &route).unwrap();
+    let _business = route.feedback.as_ref().unwrap().begin().unwrap();
+    let feedback = pool.tcp_feedback_for_route(entry, &route).unwrap().unwrap();
     assert_eq!(
         feedback
             .attributions()
