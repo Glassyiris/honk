@@ -1174,8 +1174,8 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
 #[test]
 fn dae0_internal_addr_covers_real_dae0_addresses() {
     // The internal-addr check must match the actual dae0/dae0peer
-    // addresses assigned by the netns setup; both sides share the
-    // DAENS_*/DAE0_* constants in the crate root so they cannot drift.
+    // addresses assigned by the netns setup; this pins the crate-root
+    // DAENS_* strings to the DAE0_* constants in honk-ebpf-common.
     for s in [
         crate::DAENS_HOST_IPV6,
         crate::DAENS_PEER_IPV6,
