@@ -124,6 +124,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",
+            family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
             advertised_ttl: Duration::from_secs(30),
         },
@@ -157,6 +158,57 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     assert_eq!(projected_again[0].1.bitmap, projected[0].1.bitmap);
     persister.shutdown().await.expect("persistence shutdown");
     assert!(database.load_dns().expect("persisted rows").is_empty());
+    controller.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn other_query_types_keep_learned_ipv4_association() {
+    struct QtypeUpstream;
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for QtypeUpstream {
+        async fn query(&self, _name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let (_, qtype) = crate::dns::forwarder::parse_dns_question(raw).expect("question");
+            if qtype == 1 {
+                return Ok(a_response(raw, [192, 0, 2, 10]));
+            }
+            let mut nodata = raw.to_vec();
+            nodata[2] = 0x81;
+            nodata[3] = 0x80;
+            Ok(nodata)
+        }
+    }
+
+    let forwarder = Arc::new(DnsForwarder::new(
+        Arc::new(QtypeUpstream),
+        Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+        Arc::new(
+            crate::dns::routing::DnsRouter::new_from_dns_config(&Default::default())
+                .expect("DNS router"),
+        ),
+    ));
+    let (controller, _ebpf) = projection_controller(forwarder);
+    let snapshot = Arc::clone(
+        controller
+            .runtime_provider()
+            .try_acquire()
+            .unwrap()
+            .runtime()
+            .routing_projection(),
+    );
+    // A, then the AAAA and HTTPS NODATA a dual-stack browser sends next.
+    for qtype in [1, 28, 65] {
+        controller
+            .answer_query_for_test(
+                &crate::dns::forwarder::build_dns_query("example.com", qtype),
+                DnsRequestMeta::EMPTY,
+                IngressProfile::Internal,
+            )
+            .await;
+        let projected = controller.project_routes(&snapshot);
+        assert_eq!(projected.len(), 1, "association lost after QTYPE {qtype}");
+        assert_eq!(projected[0].0, std::net::IpAddr::from([192, 0, 2, 10]));
+    }
     controller.shutdown(Duration::from_secs(1)).await;
 }
 
