@@ -269,7 +269,8 @@ pub fn quic_stats_snapshot() -> QuicStatsSnapshot {
     snapshot
 }
 
-/// Count a QUIC packet-send timeout observed by the core driver.
+/// Count a UDP packet send whose deadline expired while still accepted into
+/// its connection's current no-ACK wait; congestion, not node failure.
 pub fn record_quic_send_timeout() {
     quic_metrics()
         .totals
@@ -277,7 +278,8 @@ pub fn record_quic_send_timeout() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count a QUIC path retired by the core driver watchdog.
+/// Count a shared QUIC connection the path watchdog retired after a full
+/// no-ACK grace.
 pub fn record_quic_path_stall() {
     quic_metrics()
         .totals
