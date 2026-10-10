@@ -138,6 +138,24 @@ async fn address_families_are_owned_independently_until_nxdomain() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn address_family_owners_expire_independently() {
+    let now = tokio::time::Instant::now();
+    let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 4));
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    state.observe(positive("a.test", &[v4], Duration::from_secs(30)), now);
+    state.observe(positive("a.test", &[v6], Duration::from_secs(60)), now);
+
+    let later = now + Duration::from_secs(31);
+    state.expire(later);
+    assert!(!state.desired.contains_key(&v4) && state.desired.contains_key(&v6));
+
+    state.observe(positive("a.test", &[v4], Duration::from_secs(60)), later);
+    state.expire(now + Duration::from_secs(61));
+    assert!(state.desired.contains_key(&v4) && !state.desired.contains_key(&v6));
+}
+
+#[tokio::test(start_paused = true)]
 async fn positive_refresh_uses_advertised_ttl_and_retain_keeps_owner() {
     let now = tokio::time::Instant::now();
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
