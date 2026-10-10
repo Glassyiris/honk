@@ -1,0 +1,15 @@
+AbcSingBoxServer [service] — ready — up 7m34s — pid 818976
+ready=true persist=false detached=false
++0800 2026-10-11 03:43:05 ERROR [4015569279 83ms] inbound/anytls[anytls-sb]: process connection from 10.10.10.70:49086: TLS handshake: EOF
++0800 2026-10-11 03:45:26 ERROR [784712050 0ms] inbound/anytls[anytls-sb]: process connection from 10.10.10.49:55636: TLS handshake: EOF
++0800 2026-10-11 03:45:26 ERROR [2709824395 0ms] inbound/trojan[trojan]: process connection from 10.10.10.49:38840: TLS handshake: EOF
++0800 2026-10-11 03:49:15 ERROR [3703779937 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:60818: shadowsocks: serve TCP from 10.10.10.49:60818: bad timestamp: received 1791661720, diff 35s
++0800 2026-10-11 03:49:17 ERROR [1669009040 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:60820: shadowsocks: serve TCP from 10.10.10.49:60820: bad timestamp: received 1791661722, diff 35s
++0800 2026-10-11 03:49:17 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:43372: shadowsocks: serve UDP from 10.10.10.49:43372: bad timestamp: received 1791661722, diff 35s
++0800 2026-10-11 03:49:19 ERROR [4269731950 3.56s] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:60804: shadowsocks: serve TCP from 10.10.10.49:60804: bad timestamp: received 1791661724, diff 35s
++0800 2026-10-11 03:49:19 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:35401: shadowsocks: serve UDP from 10.10.10.49:35401: bad timestamp: received 1791661724, diff 35s
++0800 2026-10-11 03:49:24 ERROR [1749723590 8.71s] inbound/trojan[trojan]: process connection from 10.10.10.49:37116: TLS handshake: EOF
++0800 2026-10-11 03:49:28 ERROR [2023235726 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:34236: shadowsocks: serve TCP from 10.10.10.49:34236: bad timestamp: received 1791661733, diff 35s
++0800 2026-10-11 03:49:28 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:55109: shadowsocks: serve UDP from 10.10.10.49:55109: bad timestamp: received 1791661733, diff 35s
++0800 2026-10-11 03:49:37 ERROR [1772903720 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:36698: shadowsocks: serve TCP from 10.10.10.49:36698: bad timestamp: received 1791661742, diff 35s
++0800 2026-10-11 03:49:37 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:58906: shadowsocks: serve UDP from 10.10.10.49:58906: bad timestamp: received 1791661742, diff 35s

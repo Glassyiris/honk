@@ -1,0 +1,11 @@
+| engine | protocol | cold(s) | hot p50(s) | hot p95(s) | bw(Mbps) | cpu(cores) | rss(MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| sing-box | direct | 0.003320 | - | - | 9406 | 0.34 | 75 |
+| sing-box | hy2 | 0.011155 | 0.001521 | 0.015220 | 2338 | 0.56 | 80 |
+| sing-box | hy2/udp | 0.000253 | - | - | 895(19.9%) | 0.98 | - |
+
+## loaded latency stability (200 samples, 250ms cadence)
+| engine | protocol | load(Mbps) | p50(ms) | p95(ms) | p99(ms) | max(ms) | failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| sing-box | direct | 9408 | 2.755 | 3.637 | 4.079 | 4.412 | 0/200 |
+| sing-box | hy2 | 2720 | 10.715 | 35.023 | 184.167 | 364.786 | 0/200 |

@@ -1,0 +1,269 @@
+[
+  {
+    "engine": "honk",
+    "pid": 1087109,
+    "client_exit": 0,
+    "samples": {
+      "http": {
+        "8080": {
+          "status": 200,
+          "server_observed_client": "10.10.10.49",
+          "body_bytes": 1024
+        },
+        "8001": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8002": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8003": {
+          "error": "RemoteDisconnected"
+        },
+        "8004": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8005": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8006": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        }
+      },
+      "udp": {
+        "53531": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53531
+          ]
+        },
+        "53532": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53532
+          ]
+        },
+        "53533": {
+          "error": "TimeoutError"
+        },
+        "53534": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53534
+          ]
+        },
+        "53535": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53535
+          ]
+        },
+        "53536": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53536
+          ]
+        }
+      }
+    },
+    "bpftool_net": "xdp:\n\ntc:\nens3(2) tcx/ingress ingress_rev_snat prog_id 58 link_id 4 \nens3(2) tcx/ingress wan_ingress_l2 prog_id 19130 link_id 13434 \nens3(2) tcx/egress egress_snat prog_id 61 link_id 9 \nens3(2) tcx/egress wan_egress_l2 prog_id 19129 link_id 13433 \nveth-lab(1099) tcx/ingress lan_ingress_l2 prog_id 19127 link_id 13431 \nveth-lab(1099) tcx/egress lan_egress_l2 prog_id 19128 link_id 13432 \ndae0(1101) tcx/ingress dae0_ingress prog_id 19131 link_id 13435 \n\nflow_dissector:\n\nnetfilter:\n\n",
+    "namespace_links": "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> \ngre0@NONE        DOWN           0.0.0.0 <NOARP> \ngretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> \nerspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> \nveth-client@if1099 UP             12:21:d2:7f:c2:ac <BROADCAST,MULTICAST,UP,LOWER_UP> \n"
+  },
+  {
+    "engine": "dae",
+    "pid": 1087141,
+    "client_exit": 0,
+    "samples": {
+      "http": {
+        "8080": {
+          "status": 200,
+          "server_observed_client": "10.10.10.49",
+          "body_bytes": 1024
+        },
+        "8001": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8002": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8003": {
+          "error": "RemoteDisconnected"
+        },
+        "8004": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8005": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8006": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        }
+      },
+      "udp": {
+        "53531": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53531
+          ]
+        },
+        "53532": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53532
+          ]
+        },
+        "53533": {
+          "error": "TimeoutError"
+        },
+        "53534": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53534
+          ]
+        },
+        "53535": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53535
+          ]
+        },
+        "53536": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53536
+          ]
+        }
+      }
+    },
+    "bpftool_net": "xdp:\n\ntc:\nens3(2) tcx/ingress tproxy_wan_ingress_l2 prog_id 19156 link_id 13449 \nens3(2) tcx/ingress ingress_rev_snat prog_id 58 link_id 4 \nens3(2) tcx/egress tproxy_wan_egress_l2 prog_id 19154 link_id 13450 \nens3(2) tcx/egress egress_snat prog_id 61 link_id 9 \nveth-lab(1099) tcx/ingress tproxy_lan_ingress_l2 prog_id 19144 link_id 13451 \nveth-lab(1099) tcx/egress tproxy_lan_egress_l2 prog_id 19142 link_id 13452 \ndae0(1103) tcx/ingress tproxy_dae0_ingress prog_id 19140 link_id 13453 \n\nflow_dissector:\n\nnetfilter:\n\n",
+    "namespace_links": "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> \ngre0@NONE        DOWN           0.0.0.0 <NOARP> \ngretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> \nerspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> \nveth-client@if1099 UP             12:21:d2:7f:c2:ac <BROADCAST,MULTICAST,UP,LOWER_UP> \n"
+  },
+  {
+    "engine": "sing-box",
+    "pid": 1087163,
+    "client_exit": 0,
+    "samples": {
+      "http": {
+        "8080": {
+          "status": 200,
+          "server_observed_client": "10.10.10.49",
+          "body_bytes": 1024
+        },
+        "8001": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8002": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8003": {
+          "error": "RemoteDisconnected"
+        },
+        "8004": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8005": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        },
+        "8006": {
+          "status": 200,
+          "server_observed_client": "10.10.10.70",
+          "body_bytes": 1024
+        }
+      },
+      "udp": {
+        "53531": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53531
+          ]
+        },
+        "53532": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53532
+          ]
+        },
+        "53533": {
+          "error": "TimeoutError"
+        },
+        "53534": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53534
+          ]
+        },
+        "53535": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53535
+          ]
+        },
+        "53536": {
+          "matching_reply": true,
+          "server_observed_client": "10.10.10.70",
+          "peer": [
+            "10.10.10.70",
+            53536
+          ]
+        }
+      }
+    },
+    "bpftool_net": "xdp:\n\ntc:\nens3(2) tcx/ingress ingress_rev_snat prog_id 58 link_id 4 \nens3(2) tcx/egress egress_snat prog_id 61 link_id 9 \n\nflow_dissector:\n\nnetfilter:\n\n",
+    "namespace_links": "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> \ngre0@NONE        DOWN           0.0.0.0 <NOARP> \ngretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> \nerspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> \nsb0              UNKNOWN        <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> \nveth-client@if1099 UP             12:21:d2:7f:c2:ac <BROADCAST,MULTICAST,UP,LOWER_UP> \n"
+  }
+]

@@ -1,0 +1,76 @@
+{
+  "clean": true,
+  "remote_host": "10.10.10.49",
+  "native_test_namespaces_removed": [
+    "honk-native-client",
+    "honk-native-server"
+  ],
+  "native_test_links_removed": [
+    "hni-client",
+    "hni-server"
+  ],
+  "benchmark_engine_pids": [],
+  "dae0_daens_absent": true,
+  "lab_namespace": "recreated and retained with 192.168.222.2/24 and default via 192.168.222.1",
+  "preserved_services": [
+    "sshd",
+    "tailscaled",
+    "einat"
+  ],
+  "preserved_tcx_links": [
+    {
+      "program_id": 58,
+      "link_id": 4
+    },
+    {
+      "program_id": 61,
+      "link_id": 9
+    }
+  ],
+  "forwarding_before_after": {
+    "ipv4": [
+      1,
+      1
+    ],
+    "ipv6": [
+      1,
+      1
+    ]
+  },
+  "persistent_sequences": {
+    "UDP_DECISION_SEQUENCE": {
+      "preserved": true,
+      "next_before": 12,
+      "next_after": 12,
+      "exhausted": 0
+    },
+    "ROUTING_GENERATION_SEQUENCE": {
+      "preserved": true,
+      "before": 211,
+      "after": 265,
+      "reset": false
+    }
+  },
+  "vm_ntp_policy": "off, unchanged",
+  "client_clock_offset_after_campaign_seconds": -0.094236695,
+  "temporary_physical_services_stopped": [
+    "AbcIperf5201",
+    "AbcIperf5202",
+    "AbcIperf5203",
+    "AbcIperf5204",
+    "AbcIperf5205",
+    "AbcIperf5206",
+    "AbcIperf5300",
+    "AbcAnyTlsServer",
+    "AbcSingBoxServer",
+    "AbcPhysicalTargets"
+  ],
+  "original_local_mock_honk_pid_preserved": 1262137,
+  "evidence": [
+    "host-before.txt",
+    "cleanup-completed.txt",
+    "host-after.txt",
+    "target-after.txt"
+  ],
+  "archives_and_binaries": "retained; no blanket deletion of prior results, unit files or pins"
+}

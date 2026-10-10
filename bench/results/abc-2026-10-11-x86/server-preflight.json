@@ -1,0 +1,45 @@
+{
+  "target": "10.10.10.70",
+  "tcp": {
+    "2443": "ConnectionRefusedError",
+    "2445": "ConnectionRefusedError",
+    "2446": "ConnectionRefusedError",
+    "2447": "ConnectionRefusedError",
+    "5201": "ConnectionRefusedError",
+    "5202": "ConnectionRefusedError",
+    "5203": "ConnectionRefusedError",
+    "5204": "ConnectionRefusedError",
+    "5205": "ConnectionRefusedError",
+    "5206": "ConnectionRefusedError",
+    "5300": "ConnectionRefusedError"
+  },
+  "http": {
+    "8001": "URLError",
+    "8002": "URLError",
+    "8003": "URLError",
+    "8004": "URLError",
+    "8005": "URLError",
+    "8006": "URLError",
+    "8080": "URLError"
+  },
+  "udp_echo": {
+    "53531": {
+      "error": "TimeoutError"
+    },
+    "53532": {
+      "error": "TimeoutError"
+    },
+    "53533": {
+      "error": "TimeoutError"
+    },
+    "53534": {
+      "error": "TimeoutError"
+    },
+    "53535": {
+      "error": "TimeoutError"
+    },
+    "53536": {
+      "error": "TimeoutError"
+    }
+  }
+}

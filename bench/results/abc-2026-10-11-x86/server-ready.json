@@ -1,0 +1,75 @@
+{
+  "target": "10.10.10.70",
+  "tcp": {
+    "2443": "ready",
+    "2445": "ready",
+    "2446": "ready",
+    "2447": "ready",
+    "5201": "ready",
+    "5202": "ready",
+    "5203": "ready",
+    "5204": "ready",
+    "5205": "ready",
+    "5206": "ready",
+    "5300": "ready"
+  },
+  "http": {
+    "8001": 200,
+    "8002": 200,
+    "8003": 200,
+    "8004": 200,
+    "8005": 200,
+    "8006": 200,
+    "8080": 200
+  },
+  "udp_echo": {
+    "53531": {
+      "matching_reply": true,
+      "observed_client": "10.10.10.49",
+      "peer": [
+        "10.10.10.70",
+        53531
+      ]
+    },
+    "53532": {
+      "matching_reply": true,
+      "observed_client": "10.10.10.49",
+      "peer": [
+        "10.10.10.70",
+        53532
+      ]
+    },
+    "53533": {
+      "matching_reply": true,
+      "observed_client": "10.10.10.49",
+      "peer": [
+        "10.10.10.70",
+        53533
+      ]
+    },
+    "53534": {
+      "matching_reply": true,
+      "observed_client": "10.10.10.49",
+      "peer": [
+        "10.10.10.70",
+        53534
+      ]
+    },
+    "53535": {
+      "matching_reply": true,
+      "observed_client": "10.10.10.49",
+      "peer": [
+        "10.10.10.70",
+        53535
+      ]
+    },
+    "53536": {
+      "matching_reply": true,
+      "observed_client": "10.10.10.49",
+      "peer": [
+        "10.10.10.70",
+        53536
+      ]
+    }
+  }
+}

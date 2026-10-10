@@ -1,0 +1,141 @@
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens3             UP             00:a0:98:04:2a:4b <BROADCAST,MULTICAST,UP,LOWER_UP> 
+tailscale0       UNKNOWN        <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> 
+gre0@NONE        DOWN           0.0.0.0 <NOARP> 
+gretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+erspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+veth-lab@if1270  UP             ee:b6:8a:84:88:f8 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+0:	from all lookup local
+5210:	from all fwmark 0x80000/0xff0000 lookup main
+5230:	from all fwmark 0x80000/0xff0000 lookup default
+5250:	from all fwmark 0x80000/0xff0000 unreachable
+5270:	from all lookup 52
+32766:	from all lookup main
+32767:	from all lookup default
+lab (id: 0)
+default via 192.168.222.1 dev veth-client 
+192.168.222.0/24 dev veth-client proto kernel scope link src 192.168.222.2 
+table ip filter {
+	chain ts-input {
+		ip saddr 100.116.246.19 iifname "lo" counter packets 0 bytes 0 accept
+		iifname "tailscale0" counter packets 408316 bytes 50991437 accept
+		udp dport # Warning: table ip filter is managed by iptables-nft, do not touch!
+41641 counter packets 22014 bytes 1320860 accept
+		ip saddr 100.115.92.0/23 iifname != "tailscale0" counter packets 0 bytes 0 return
+		ip saddr 100.64.0.0/10 iifname != "tailscale0" counter packets 421 bytes 23576 drop
+	}
+
+	chain ts-forward {
+		iifname "tailscale0" counter packets 49 bytes 6914 xt target "MARK"
+		meta mark & 0x00ff0000 == 0x00040000 counter packets 49 bytes 6914 accept
+		ip saddr 100.64.0.0/10 oifname "tailscale0" counter packets 0 bytes 0 drop
+		oifname "tailscale0" counter packets 78 bytes 7118 accept
+	}
+
+	chain INPUT {
+		type filter hook input priority filter; policy accept;
+		counter packets 264185354 bytes 3234364104226 jump ts-input
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		counter packets 178536980 bytes 2473114704331 jump ts-forward
+	}
+}
+table ip nat {
+	chain ts-postrouting {
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		counter packets 3613074 bytes 293235846 jump ts-postrouting
+	}
+}
+table ip6 filter {
+	chain ts-input {
+		ip6 saddr fd7a:115c:a1e0::bb32:f614 iifname "lo" counter packets 0 bytes 0 accept
+		iifname "tailscale0" counter packets 19633 bytes 2758037 accept
+		udp dport 41641 counter packets 20328 bytes 1870469 accept
+	}
+
+	chain ts-forward {
+		iifname "tailscale0" counter packets 0 bytes 0 xt target "MARK"
+		meta mark & 0x00ff0000 == 0x00040000 counter packets 0 bytes 0 accept
+		oifname "tailscale0" counter packets 0 bytes 0 accept
+	}
+
+	chain INPUT {
+		type filter hook input priority filter; policy accept;
+		counter packets 2595884 bytes 20606710634 jump ts-input
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		counter packets 36395 bytes 3696218 jump ts-forward
+	}
+}
+table ip6 nat {
+	chain ts-postrouting {
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		counter packets 905989 bytes 75655206 jump ts-postrouting
+	}
+}
+table ip mangle {
+	chain PREROUTING {
+		type filter hook prerouting priority mangle; policy accept;
+		xt match "conntrack" xt match "connmark" counter packets 185920 bytes 13141633 xt target "CONNMARK"
+	}
+
+	chain OUTPUT {
+		type route hook output priority mangle; policy accept;
+		xt match "conntrack" meta mark & 0x00ff0000 != 0x00000000 counter packets 9326630 bytes 559713702 xt target "CONNMARK"
+	}
+}
+table ip6 mangle {
+	chain PREROUTING {
+		type filter hook prerouting priority mangle; policy accept;
+		xt match "conntrack" xt match "connmark" counter packets 337561 bytes 37165922 xt target "CONNMARK"
+	}
+
+	chain OUTPUT {
+		type route hook output priority mangle; policy accept;
+		xt match "conntrack" meta mark & 0x00ff0000 != 0x00000000 counter packets 9281678 bytes 742695344 xt target "CONNMARK"
+	}
+}
+table ip labnat {
+	chain post {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "ens3" ip saddr 192.168.222.0/24 masquerade
+	}
+}
+# Warning: table ip6 filter is managed by iptables-nft, do not touch!
+# Warning: table ip mangle is managed by iptables-nft, do not touch!
+# Warning: table ip6 mangle is managed by iptables-nft, do not touch!
+xdp:
+
+tc:
+ens3(2) tcx/ingress ingress_rev_snat prog_id 58 link_id 4 
+ens3(2) tcx/egress egress_snat prog_id 61 link_id 9 
+
+flow_dissector:
+
+netfilter:
+
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0x00","0x00","0x00","0x00","0x0c","0x00","0x00","0x00","0x00","0x00","0x00","0x00"],"formatted":{"key":0,"value":{"lock":{"val":0},"next":12,"exhausted":0}}}]
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0x09","0x01","0x00","0x00","0x00","0x00","0x00","0x00"]}]
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+active
+active
+active
+Timezone=UTC
+LocalRTC=no
+CanNTP=yes
+NTP=no
+NTPSynchronized=no
+TimeUSec=Sat 2026-10-10 20:47:17 UTC
+RTCTimeUSec=Sat 2026-10-10 20:47:17 UTC
+    PID COMMAND         COMMAND

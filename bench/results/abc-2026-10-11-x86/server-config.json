@@ -1,0 +1,129 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "listen": "10.10.10.70",
+      "listen_port": 8443,
+      "users": [
+        {
+          "password": "testpass123"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/tmp/honk-bench-abc-20261011/cert.pem",
+        "key_path": "/tmp/honk-bench-abc-20261011/key.pem"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic",
+      "listen": "10.10.10.70",
+      "listen_port": 2444,
+      "users": [
+        {
+          "uuid": "00000000-0000-0000-0000-000000000001",
+          "password": "testpass123"
+        }
+      ],
+      "congestion_control": "cubic",
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/tmp/honk-bench-abc-20261011/cert.pem",
+        "key_path": "/tmp/honk-bench-abc-20261011/key.pem",
+        "alpn": [
+          "tuic"
+        ]
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022",
+      "listen": "10.10.10.70",
+      "listen_port": 2447,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "8JCsHssyVTFyPy5lYdNhZg=="
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan",
+      "listen": "10.10.10.70",
+      "listen_port": 2446,
+      "users": [
+        {
+          "password": "testpass123"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/tmp/honk-bench-abc-20261011/cert.pem",
+        "key_path": "/tmp/honk-bench-abc-20261011/key.pem"
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-sb",
+      "listen": "10.10.10.70",
+      "listen_port": 2445,
+      "users": [
+        {
+          "password": "testpass123"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/tmp/honk-bench-abc-20261011/cert.pem",
+        "key_path": "/tmp/honk-bench-abc-20261011/key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_cidr": [
+          "10.10.10.70/32"
+        ],
+        "port": [
+          8001,
+          8002,
+          8003,
+          8004,
+          8005,
+          8006,
+          8080,
+          5201,
+          5202,
+          5203,
+          5204,
+          5205,
+          5206,
+          5300,
+          53531,
+          53532,
+          53533,
+          53534,
+          53535,
+          53536,
+          53539
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "action": "reject"
+      }
+    ],
+    "final": "direct"
+  }
+}

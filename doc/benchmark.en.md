@@ -1,9 +1,9 @@
 # Benchmark Lab and Results
 
-This document describes the reproducible benchmark environment for honk, the
-measurement methodology, and the most recent results against
-[dae](https://github.com/daeuniverse/dae) (same-time A/B). It lives in the
-repo so the setup and the numbers stay in sync with the code.
+This document describes the reproducible honk benchmark environment and
+same-host A/B/C results against [dae](https://github.com/daeuniverse/dae) and
+[sing-box](https://github.com/SagerNet/sing-box). Dated results retain their
+original binaries and server fixtures; the newest campaign appears first.
 
 ## Lab topology
 
@@ -24,7 +24,7 @@ repo so the setup and the numbers stay in sync with the code.
 └──────────────────────────────────────┘
 ```
 
-- **x86 engine host (`10.10.10.49`)**: Debian 13 VM, four host-passthrough
+- **x86 engine host (`10.10.10.49`)**: Arch Linux VM, kernel `7.2.3-arch1-3`, four host-passthrough
   i5-13600K vCPUs and 2 GiB RAM, with `ens3` as WAN. Its client lives in
   network namespace `lab` (`veth-lab` ↔ `veth-client`, 192.168.222.0/24,
   nftables masquerade). The direct control reaches about 9.4 Gbps.
@@ -32,12 +32,13 @@ repo so the setup and the numbers stay in sync with the code.
   Cortex-A53 cores, 968 MiB usable RAM, and `eth0` as WAN. It uses the
   identical `lab` namespace topology; the direct control is approximately
   0.8–0.9 Gbps.
-- **Real datapath**: both hosts run either honk or dae, never both. Every
-  measured client flow crosses the engine's real eBPF/TPROXY path; no
-  loopback shortcut is measured.
-- **Server host (`10.10.10.70`)**: protocol servers (official hysteria,
-  tuic-server, sing-box, Go anytls-server) plus local targets. Servers dial
-  out to the internet directly, so "internet" tests traverse server → WAN.
+- **Real datapath**: only one engine runs at a time. honk and dae intercept
+  the client namespace through real eBPF/TPROXY; sing-box runs its `mixed`
+  TUN stack inside that namespace. All arms cross the physical LAN to `.70`.
+  This compares complete configured stacks, not identical interception code.
+- **Server host (`10.10.10.70`)**: the current fixture uses sing-box 1.14.3
+  and official anytls-go 0.0.13 with local HTTP/UDP/iperf3 targets. Earlier
+  campaigns used the server versions recorded in their own dated sections.
 - **Isolation**: nothing here touches the production gateway (`10.10.10.1`).
   Production validations are done separately and called out as such.
 
@@ -56,37 +57,38 @@ repo so the setup and the numbers stay in sync with the code.
 - The x86 VM uses host CPU passthrough (AES-NI + AVX2). Historical qemu64
   measurements without SIMD are retained below only as explicitly dated
   history, not as the current x86 baseline.
-- The rprx server's process/version on `.70` was not retrievable with the
-  available SSH credentials. Exact client wire parameters and both client
-  binary hashes are retained, but those rows must not be used as a
-  server-version regression baseline.
+- Historical rprx rows lack a retrievable server process/version identity.
+  Their client parameters and binary hashes remain archived, but those rows
+  are not a server-version regression baseline.
 - The 2026-08-08 proxy matrix covers every endpoint configured at that time:
   HY2, TUIC, SS2022, Trojan, two AnyTLS servers, VLESS Vision/REALITY, and
   VMess. No SOCKS5 endpoint is available. Juicity was absent from that matrix;
   a dedicated 2026-08-26 comparison against the existing Go server is reported
   below. The older Juicity direct-UDP offload result is not a proxy comparison.
 
-## What's running where
+## Server fixtures
 
 | Component | Binary | Config |
 | --- | --- | --- |
-| hy2 server | sing-box 1.12.4 | `:8443`, password `testpass123`, cert CN `hy2.test` |
-| TUIC server | sing-box 1.12.4 | `:2444`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, requires SNI `hy2.test` |
-| Juicity server | official Go `juicity-server` v0.4.3 | `:2451`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, SNI `hy2.test` |
-| AnyTLS server | sing-box 1.12.4 | `:2445`, password `testpass123` |
-| AnyTLS server | Go reference `anytls-server` | `:2443`, `-p testpass123` |
-| SS 2022 server | sing-box 1.12.4 | `:2447`, `2022-blake3-aes-128-gcm`, psk `8JCsHssyVTFyPy5lYdNhZg==` |
-| Trojan server | sing-box 1.12.4 | `:2446`, password `testpass123`, SNI `hy2.test` |
-| Targets | python http.server, iperf3 | ports `8001-8006` + `8080` (direct), `5201-5206` + `5300` (direct); UDP echo `53531-53536` |
+| hy2 server | sing-box 1.14.3 | `:8443`, password `testpass123`, cert CN `hy2.test` |
+| TUIC server | sing-box 1.14.3 | `:2444`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, requires SNI `hy2.test` |
+| Juicity server (historical, not in the current matrix) | official Go `juicity-server` v0.4.3 | `:2451`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, SNI `hy2.test` |
+| AnyTLS server | sing-box 1.14.3 | `:2445`, password `testpass123` |
+| AnyTLS server | official anytls-go 0.0.13 | `:2443`, `-p testpass123` |
+| SS 2022 server | sing-box 1.14.3 | `:2447`, `2022-blake3-aes-128-gcm`, psk `8JCsHssyVTFyPy5lYdNhZg==` |
+| Trojan server | sing-box 1.14.3 | `:2446`, password `testpass123`, SNI `hy2.test` |
+| Targets | Python HTTP/UDP fixture, iperf3 3.21 | HTTP `8001-8006` + `8080`, iperf3 `5201-5206` + `5300`, UDP echo `53531-53536`, local probe DNS `53539` |
 
 Standard engine configs route by destination port so no API switching is
 needed: `5201/8001 → hy2`, `5202/8002 → tuic`, `5203/8003 → ss2022`,
 `5204/8004 → trojan`, `5205/8005 → anytls-sb`, `5206/8006 → anytls-go`.
 The dedicated honk-only rprx configs remap VLESS Vision/REALITY/VMess onto the
 live target slots 1–3 via harness index overrides; the dedicated Juicity
-configs reuse slot 1 for a paired honk/dae run. The current x86 kdae build
-includes AnyTLS; ARM honk-vs-dae uses the four-protocol shared surface. Node
-server ports are `direct(must)` and everything else falls back to direct.
+configs reuse slot 1 for a paired honk/dae run. Current upstream dae supports
+the full six-protocol matrix; historical ARM comparisons used the shared
+four-protocol surface. Node server ports are `direct(must)` and unmatched
+destinations fall back to direct. UDP echo ports must be routed explicitly
+in every client config, including sing-box.
 
 ## Methodology
 
@@ -96,9 +98,10 @@ See `bench/README.md` for usage and lab requirements.
 
 Per engine × protocol:
 
-- **cold** — first-request latency on a freshly restarted engine, 3 runs,
-  median. Health checks are at 3600s in both lab configs so the first probe
-  doesn't race the measurement.
+- **cold** — first-request latency after a fresh engine restart and the
+  driver's readiness delay, 3 runs, median. A 3600s check interval limits
+  periodic probes, but startup probes and pools can already be warm. This
+  is not a guaranteed cold TLS/QUIC handshake measurement.
 - **hot p50/p95** — open-stream latency over 15 requests against the
   per-protocol HTTP target (proxy session already warm). For QUIC protocols
   this is dominated by connection/session reuse; for mux protocols by the
@@ -121,7 +124,7 @@ Per engine × protocol:
   (`/proc/<pid>/stat` utime+stime delta over wall time). The honk pid is
   anchored on the clash-API listener so a second instance parked on the
   singleton flock (zero CPU) can't poison the metric.
-- **rss** — engine RSS after the bandwidth runs.
+- **rss** — integer MiB (`VmRSS / 1024`) after the bandwidth runs.
 - **direct baseline** — same measurements on the unproxied path
   (`8080`/`5300`).
 
@@ -138,9 +141,10 @@ ssh root@10.10.10.118 \
    'honk dae' 'hy2 tuic ss2022 trojan'"
 ```
 
-`lab-bench.sh` prints host/kernel and binary SHA-256 identities. Standard rows
-append to `TSV`; loaded-stability summaries append to `STABILITY_TSV`, with raw
-samples and load JSON under `STABILITY_DIR`. Collector fixtures run with
+`lab-bench.sh` prints host/kernel and all three binary SHA-256 identities.
+Standard rows append to `TSV`; loaded summaries append to `STABILITY_TSV`.
+`STABILITY_DIR` retains every TCP bandwidth-run JSON, UDP bandwidth JSON,
+loaded sample, summary and load JSON. Collector fixtures run with
 `python3 bench/tests/latency_stability_test.py`.
 
 ### VLESS Vision codec candidate benchmark
@@ -168,6 +172,187 @@ ssh root@10.10.10.50 \
 Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
+
+## Results (2026-10-11, current honk / upstream dae / sing-box A/B/C)
+
+One sequential x86 campaign on `.49`, **2026-10-10 19:54:28–20:34:38 UTC**
+(2026-10-11 03:54–04:34 UTC+8). This is the full six-protocol matrix plus
+three direct controls: 63 TCP bandwidth runs, 18 UDP runs, and 4,200 paced
+HTTP attempts under load. It is not a repeated statistical comparison.
+
+| Engine | Measured revision / build | Executable SHA-256 prefix |
+| --- | --- | --- |
+| honk | `f65f0548` (merge of `fba795da`), release/opt-s, static musl | `f4c4a83bf21b7ac7` |
+| dae | [v2.1.1](https://github.com/daeuniverse/dae/releases/tag/v2.1.1), `dbae2e82`, official generic x86-64 | `a217bf5edf5a5cac` |
+| sing-box | [v1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3), `7054cac5`, official amd64 | `768d31fa7f68debc` |
+
+The dae and sing-box tags were the latest **stable** upstream releases when
+resolved, not rolling/nightly builds or dae forks. Full identities, release
+asset digests, eight input hashes and the exact command are archived in
+[metadata](../bench/results/abc-2026-10-11-x86/metadata.json) and
+[command receipts](../bench/results/abc-2026-10-11-x86/commands.jsonl).
+
+honk includes `ebpf,native-api,clash-api,mimalloc,rprx`; its native listener
+is unconfigured, so this is not an active native-observation/UI overhead test.
+It retains the lab's explicit QUIC MTU 1452 and UDP warm count 8. TUIC uses
+cubic in all clients. Configs use distinct `proxy-*` group names and local
+HTTP/DNS health targets, with a 3600s interval. The physical target is an
+NTP-synchronized i9-13900H workstation with 20 logical CPUs and 31 GiB RAM;
+its fixtures are sing-box 1.14.3, official anytls-go 0.0.13 and iperf3 3.21,
+with a fixed 1,024-byte HTTP response. This compares those exact configured
+stacks, not every engine's untouched defaults or the older server versions.
+
+**Preflight matters.** Old sing-box echo rules fell through to direct; the
+six UDP echo ports are now explicit proxy routes. All 18 TCP and 18 UDP
+proxy routes were proven by the server-observed source `.70`, versus `.49`
+for direct controls; real TCX/TUN attachments are retained in
+[attribution-ready.json](../bench/results/abc-2026-10-11-x86/attribution-ready.json).
+SS2022 initially rejected all three clients at a -34.878s client clock offset.
+After the VM RTC tick timed out, one-time clock calibration from the
+synchronized target reduced the measured offset to -0.056s; timestamp
+validation and the VM's NTP policy were not weakened or changed. Rejected
+preflight evidence remains archived and is not included in these tables.
+
+### TCP throughput, process CPU and RSS
+
+Three 8-second reverse runs per route; median receiver Mbps and that run's
+process CPU, followed by integer RSS MiB. Process CPU excludes kernel/eBPF,
+softirq and target costs; RSS excludes kernel map allocations.
+
+| Protocol | honk Mbps / process cores / MiB | dae Mbps / process cores / MiB | sing-box Mbps / process cores / MiB |
+| --- | --- | --- | --- |
+| direct | 9406 / 0.00 / 45 | 9405 / 0.00 / 47 | 9400 / 0.40 / 63 |
+| hy2 | 3135 / 0.31 / 42 | 3762 / 0.70 / 63 | 2860 / 0.62 / 66 |
+| tuic | 3561 / 0.35 / 44 | 3306 / 0.65 / 59 | 3265 / 0.75 / 72 |
+| ss2022 | 9396 / 0.30 / 47 | 9399 / 0.36 / 62 | 9389 / 0.48 / 71 |
+| trojan | 9380 / 0.35 / 47 | 9390 / 0.43 / 60 | 9383 / 0.65 / 71 |
+| anytls-sb | 9394 / 0.40 / 47 | 9381 / 0.22 / 63 | 9388 / 0.71 / 73 |
+| anytls-go | 9387 / 0.44 / 46 | 9380 / 0.24 / 63 | 9376 / 0.87 / 76 |
+
+SS2022, Trojan and both AnyTLS TCP routes reach the native direct-path ceiling.
+honk's HY2 is 16.7% below dae and 9.6% above sing-box; TUIC is 7.7%/9.1%
+above them in this campaign. honk uses less proxy-row RSS throughout. Its
+process CPU is lower than sing-box throughout and lower than dae for QUIC,
+SS2022 and Trojan, but **higher than dae for both AnyTLS servers**.
+
+### First request and unloaded hot latency
+
+Cold means first request after daemon readiness, not a guaranteed cold
+physical carrier; startup probes/pools can already be warm. Hot p50/p95 use
+15 successful-request attempts and include the full HTTP body.
+Direct controls retain one first-request sample in the raw output, not the
+three-restart proxy cold median; no direct UDP bandwidth row is collected.
+
+| Protocol | honk cold / hot p50 / hot p95 (ms) | dae cold / hot p50 / hot p95 (ms) | sing-box cold / hot p50 / hot p95 (ms) |
+| --- | --- | --- | --- |
+| hy2 | 4.114 / 1.512 / 3.186 | 6.111 / 0.863 / 0.983 | 9.475 / 0.954 / 1.372 |
+| tuic | 4.001 / 1.867 / 3.444 | 7.983 / 1.115 / 1.507 | 14.772 / 1.336 / 2.075 |
+| ss2022 | 3.343 / 2.171 / 3.136 | 3.933 / 2.225 / 2.869 | 3.659 / 1.591 / 3.761 |
+| trojan | 6.695 / 0.657 / 7.191 | 9.316 / 5.301 / 8.632 | 9.684 / 4.174 / 5.904 |
+| anytls-sb | 3.662 / 2.187 / 2.789 | 8.087 / 1.730 / 4.468 | 7.268 / 1.328 / 1.695 |
+| anytls-go | 3.510 / 1.820 / 2.242 | 7.700 / 1.282 / 2.598 | 9.646 / 1.307 / 1.932 |
+
+### UDP saturation
+
+RTT is the median of responses to 15 echo attempts; individual echo samples
+are not retained. Bandwidth uses one 8-second reverse run with a configured
+10 Gbps offer and 1,200-byte datagrams. Loss is iperf's receiver-reported
+packet loss, not an ordinary-load reliability claim; actual sender rate can
+be lower than the configured offer and remains in the raw JSON.
+
+| Protocol | honk RTT ms / Mbps (loss) / process cores | dae RTT ms / Mbps (loss) / process cores | sing-box RTT ms / Mbps (loss) / process cores |
+| --- | --- | --- | --- |
+| hy2 | 0.424 / 1101(86.5%) / 0.49 | 0.440 / 1056(87.1%) / 0.70 | 0.491 / invalid / — |
+| tuic | 0.334 / 989(69.9%) / 0.55 | 0.771 / 1147(86.0%) / 0.76 | 0.305 / 1027(87.4%) / 1.41 |
+| ss2022 | 0.280 / 2078(69.1%) / 0.76 | 0.197 / 2908(56.9%) / 1.27 | 0.178 / 2963(55.9%) / 1.41 |
+| trojan | 0.128 / 1773(78.4%) / 0.73 | 0.193 / 3142(59.6%) / 1.12 | 0.201 / 3426(55.4%) / 1.51 |
+| anytls-sb | 0.200 / 1600(79.4%) / 0.56 | 0.228 / 1550(80.3%) / 0.63 | 0.164 / 1398(81.1%) / 1.17 |
+| anytls-go | 0.269 / 1726(78.4%) / 0.59 | 0.204 / 1656(79.1%) / 0.30 | 0.187 / 1327(82.6%) / 1.18 |
+
+The sing-box HY2 UDP run received packets but ended with `server test duration
+expired`, no terminal receiver totals. The driver's `0(-)` is **invalid**, not
+zero throughput; partial intervals are not a replacement for completed totals.
+Its failed-transfer CPU value is not compared either. Original evidence is
+[raw/sing-box-5201.udp.json](../bench/results/abc-2026-10-11-x86/raw/sing-box-5201.udp.json).
+UDP is not a blanket honk win: TUIC, SS2022 and Trojan trail the other clients;
+both AnyTLS rates are competitive, but this single saturation sample is not
+a normal-traffic packet-loss or statistical superiority claim.
+
+### Loaded latency and retained failures
+
+200 absolute 250ms deadlines per route, one same-route reverse stream, 5s
+HTTP timeout. Percentiles and maxima are **success-only**; failures remain in
+the 200-attempt denominator. Compare tails with their achieved pressure,
+not as a fixed-load experiment. The largest scheduling lag was 2.036ms.
+
+| Engine | Protocol | Load Mbps | p50 ms | p95 ms | p99 ms | Max ms | Failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 9408 | 3.284 | 4.040 | 5.335 | 1007.208 | 0/200 |
+| honk | hy2 | 3048 | 1.797 | 2.239 | 2.623 | 2.868 | 3/200 |
+| honk | tuic | 3645 | 1.843 | 2.130 | 2.560 | 2.894 | 0/200 |
+| honk | ss2022 | 9402 | 2.868 | 7.369 | 13.012 | 15.906 | 0/200 |
+| honk | trojan | 9389 | 2.062 | 5.497 | 8.842 | 10.256 | 0/200 |
+| honk | anytls-sb | 9388 | 2.567 | 8.609 | 15.587 | 20.091 | 0/200 |
+| honk | anytls-go | 9354 | 2.496 | 12.660 | 17.358 | 23.054 | 0/200 |
+| dae | direct | 9404 | 2.761 | 3.780 | 4.260 | 4.501 | 0/200 |
+| dae | hy2 | 3509 | 1.466 | 2.086 | 3.413 | 13.956 | 0/200 |
+| dae | tuic | 3436 | 1.807 | 2.035 | 2.378 | 3.012 | 2/200 |
+| dae | ss2022 | 9402 | 3.589 | 8.266 | 10.356 | 11.732 | 0/200 |
+| dae | trojan | 9380 | 5.491 | 11.818 | 22.010 | 45.234 | 0/200 |
+| dae | anytls-sb | 9378 | 2.546 | 10.662 | 14.092 | 14.591 | 1/200 |
+| dae | anytls-go | 9386 | 2.199 | 5.161 | 8.523 | 15.687 | 0/200 |
+| sing-box | direct | 9407 | 2.416 | 3.014 | 3.543 | 1034.084 | 0/200 |
+| sing-box | hy2 | 2672 | 8.913 | 20.916 | 25.597 | 30.111 | 0/200 |
+| sing-box | tuic | 3288 | 1.856 | 2.294 | 2.699 | 3.050 | 0/200 |
+| sing-box | ss2022 | 9396 | 3.547 | 7.961 | 11.641 | 42.763 | 0/200 |
+| sing-box | trojan | 9364 | 5.433 | 11.841 | 17.291 | 19.717 | 0/200 |
+| sing-box | anytls-sb | 9363 | 2.393 | 7.450 | 12.844 | 19.851 | 0/200 |
+| sing-box | anytls-go | 9370 | 2.380 | 7.423 | 15.281 | 17.170 | 0/200 |
+
+honk HY2 has three approximately 5-second timeouts despite its 2.623ms
+success-only p99. dae TUIC has two timeouts and dae AnyTLS-SB one; every
+other arm has 0/200 failures. honk and sing-box direct controls each have an
+approximately one-second successful outlier. These facts prevent a universal
+latency-stability win or an unconditional-tail claim from the small p99 cells.
+
+### Separate invalid-UDP follow-up
+
+A same-method sing-box direct/HY2 rerun at **20:36:59–20:40:52 UTC** completed
+its UDP totals without changing versions, configs, offer, datagram length or
+sampling. Its additional six TCP samples, one UDP sample and 400 loaded
+attempts live separately in [followup-summary.json](../bench/results/abc-2026-10-11-x86/followup-summary.json)
+and [hy2-udp-followup-raw](../bench/results/abc-2026-10-11-x86/hy2-udp-followup-raw/).
+It does not replace the invalid main UDP cell or the main campaign's TCP/tails.
+
+| Scope | TCP Mbps | UDP Mbps (loss) | Loaded Mbps | Loaded p99 ms | Loaded max ms | Failures |
+| --- | --- | --- | --- | --- | --- | --- |
+| sing-box HY2 follow-up | 2338 | 895(19.9%) | 2720 | 184.167 | 364.786 | 0/200 |
+
+The rerun's HY2 TCP rate was 18.3% below its main-run rate, and loaded tails
+also changed substantially. Historical ±5% lab variation is not a bound for
+this campaign; one main run plus a targeted rerun does not establish a
+statistical ranking or a stable loss rate.
+
+### Evidence and verification scope
+
+[Complete campaign evidence](../bench/results/abc-2026-10-11-x86/) retains
+original stdout/stderr and pipe-delimited TSVs, 63 TCP and 18 UDP JSONs,
+all 4,200 loaded attempts, per-route summaries/pressure JSONs, engine logs,
+frozen driver/configs, binary hashes, clock/cleanup receipts and failed
+preflights. Main-run results are not silently replaced by follow-up outcomes.
+Individual cold/hot request times and daemon CPU tick/wall-time samples were
+not retained; their summary values are preserved in stdout/TSV but cannot be
+independently reconstructed from bandwidth JSON.
+Final [cleanup.json](../bench/results/abc-2026-10-11-x86/cleanup.json) verifies
+no benchmark engine or `dae0`/`daens` remains on `.49`, both persistent sequence
+pins survive without reset, and the recreated lab namespace/NAT plus original
+SSH/Tailscale/einat remain. All ten temporary `.70` services were stopped;
+its pre-existing mock honk process and prior benchmark archives were left intact.
+Build, the full outbound gate (rprx off/on), seven Criterion smoke cases,
+five collector tests and actual 36-route attribution passed; see
+[verification.json](../bench/results/abc-2026-10-11-x86/verification.json).
+The full workspace, `test-routing`, `test-netns`, active native API/UI and
+ARM benchmarks were not run for this campaign. No production-gateway changes.
 
 ## Results (2026-09-02, dae-family matrix: dae / kdae / cdae vs sing-box)
 

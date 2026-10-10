@@ -1,0 +1,4 @@
+AbcAnyTlsServer [service] — ready — up 1h3m — pid 819133
+ready=true persist=false detached=false
+time="2026-10-11T03:43:06+08:00" level=info msg="[Server] anytls/0.0.13"
+time="2026-10-11T03:43:06+08:00" level=info msg="[Server] Listening TCP 10.10.10.70:2443"

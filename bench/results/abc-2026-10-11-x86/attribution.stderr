@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "<string>", line 14, in <module>
+    if p.poll() is not None: raise RuntimeError(engine+" exited before readiness")
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: honk exited before readiness

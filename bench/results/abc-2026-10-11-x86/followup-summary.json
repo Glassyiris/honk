@@ -1,0 +1,23 @@
+{
+  "sequence": 2,
+  "startedAt": "2026-10-10T20:36:59.034315+00:00",
+  "endedAt": "2026-10-10T20:40:52.140353+00:00",
+  "exitStatus": 0,
+  "scope": "sing-box direct and HY2, unchanged full default sampling; not substituted for main results",
+  "tcp_samples": 6,
+  "udp_samples": 1,
+  "loaded_attempts": 400,
+  "loaded_failures": 0,
+  "hy2_tcp_mbps": 2338,
+  "hy2_udp": "895(19.9%)",
+  "hy2_loaded": {
+    "engine": "sing-box",
+    "protocol": "hy2",
+    "load_mbps": "2720",
+    "p50_ms": "10.715",
+    "p95_ms": "35.023",
+    "p99_ms": "184.167",
+    "max_ms": "364.786",
+    "failures": "0/200"
+  }
+}

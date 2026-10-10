@@ -1,8 +1,8 @@
 # Benchmark 实验环境与结果
 
-本文档描述 honk 可复现的 benchmark 环境、测量方法学,以及与
-[dae](https://github.com/daeuniverse/dae) 的同时刻 A/B 最新结果。文档放在仓库里,
-以便实验方法和数据与代码保持同步。
+本文档记录 honk 可复现的 benchmark 环境，以及与
+[dae](https://github.com/daeuniverse/dae)、[sing-box](https://github.com/SagerNet/sing-box)
+的同机 A/B/C 结果。历史结果保留当时的二进制和服务端配置，最新一轮排在最前。
 
 ## 实验拓扑
 
@@ -23,18 +23,18 @@
 └──────────────────────────────────────┘
 ```
 
-- **x86 引擎机(`10.10.10.49`)**:Debian 13 VM,4 个 host-passthrough
+- **x86 引擎机(`10.10.10.49`)**:Arch Linux VM，内核 `7.2.3-arch1-3`，4 个 host-passthrough
   i5-13600K vCPU、2 GiB RAM,WAN 为 `ens3`。客户端在 network namespace
   `lab` 中(`veth-lab` ↔ `veth-client`,192.168.222.0/24,nftables
   masquerade),direct 对照约 9.4 Gbps。
 - **ARM 引擎机(`10.10.10.118`)**:NanoPi R2S,RK3328 四核 Cortex-A53,
   可用内存 968 MiB,WAN 为 `eth0`。使用相同 `lab` netns 拓扑,direct 对照
   约 0.8–0.9 Gbps。
-- **真实数据面**:两台机器均只运行 honk 或 dae 之一。全部被测客户端流量都
-  经过真实 eBPF/TPROXY 路径,不测 loopback 捷径。
-- **服务端(`10.10.10.70`)**:协议服务端(官方 hysteria、tuic-server、
-  sing-box、Go anytls-server)加本地目标服务。服务端直接出 WAN,所以
-  "internet" 测试经过 服务端 → 外网。
+- **真实数据面**:同一时刻只运行一个引擎。honk 和 dae 经真实 eBPF/TPROXY
+  截获 client netns 流量；sing-box 在该 netns 内运行 `mixed` TUN stack。
+  三组均经物理 LAN 到达 `.70`，比较的是完整配置栈，不是完全相同的截获实现。
+- **服务端(`10.10.10.70`)**:本轮使用 sing-box 1.14.3 和官方 anytls-go 0.0.13，
+  配合本地 HTTP/UDP/iperf3 targets。历史各轮的服务端版本见对应日期章节。
 - **隔离**:这里的一切不触碰生产网关(`10.10.10.1`)；生产验证另行标注。
 
 ### 已知的实验室限制
@@ -48,34 +48,34 @@
   该 arm 即失效,发布前必须重跑。
 - x86 VM 使用 host CPU 透传(AES-NI + AVX2)。下文无 SIMD 的旧 qemu64
   数字只保留为明确标日期的历史,不是当前 x86 基线。
-- 当前 SSH 凭据无法读取 `.70` 上 rprx server 的 process/version。精确客户端
-  wire 参数和两端 client binary hash 已保留,但这些行不能当作 server-version
-  回归基线。
+- 历史 rprx 行缺少可读取的服务端 process/version 身份；其客户端 wire 参数和
+  binary hash 仍保留，但不能作为服务端版本回归基线。
 - 2026-08-08 代理矩阵覆盖当时已配置的全部 endpoint：HY2、TUIC、SS2022、
   Trojan、两个 AnyTLS server、VLESS Vision/REALITY 与 VMess。当前仍无
   SOCKS5 endpoint。Juicity 未进入该矩阵；下文补充 2026-08-26 针对现有 Go
   server 的专用对比。较早的 Juicity direct-UDP 卸载结果不是代理对比。
 
-## 各组件位置
+## 服务端 fixtures
 
 | 组件 | 二进制 | 配置 |
 | --- | --- | --- |
-| hy2 server | sing-box 1.12.4 | `:8443`,密码 `testpass123`,证书 CN `hy2.test` |
-| TUIC server | sing-box 1.12.4 | `:2444`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,要求 SNI `hy2.test` |
-| Juicity server | 官方 Go `juicity-server` v0.4.3 | `:2451`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,SNI `hy2.test` |
-| AnyTLS server | sing-box 1.12.4 | `:2445`,密码 `testpass123` |
-| AnyTLS server | Go 参考实现 `anytls-server` | `:2443`,`-p testpass123` |
-| SS 2022 server | sing-box 1.12.4 | `:2447`,`2022-blake3-aes-128-gcm`,psk `8JCsHssyVTFyPy5lYdNhZg==` |
-| Trojan server | sing-box 1.12.4 | `:2446`,密码 `testpass123`,SNI `hy2.test` |
-| 目标服务 | python http.server, iperf3 | 端口 `8001-8006` + `8080`(direct),`5201-5206` + `5300`(direct);UDP echo `53531-53536` |
+| hy2 server | sing-box 1.14.3 | `:8443`,密码 `testpass123`,证书 CN `hy2.test` |
+| TUIC server | sing-box 1.14.3 | `:2444`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,要求 SNI `hy2.test` |
+| Juicity server（历史 fixture，不在本轮矩阵中） | 官方 Go `juicity-server` v0.4.3 | `:2451`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,SNI `hy2.test` |
+| AnyTLS server | sing-box 1.14.3 | `:2445`,密码 `testpass123` |
+| AnyTLS server | 官方 anytls-go 0.0.13 | `:2443`,`-p testpass123` |
+| SS 2022 server | sing-box 1.14.3 | `:2447`,`2022-blake3-aes-128-gcm`,psk `8JCsHssyVTFyPy5lYdNhZg==` |
+| Trojan server | sing-box 1.14.3 | `:2446`,密码 `testpass123`,SNI `hy2.test` |
+| 目标服务 | Python HTTP/UDP fixture、iperf3 3.21 | HTTP `8001-8006` + `8080`、iperf3 `5201-5206` + `5300`、UDP echo `53531-53536`、本地 probe DNS `53539` |
 
 常规引擎配置按目标端口路由,无需 API 切换：`5201/8001 → hy2`、
 `5202/8002 → tuic`、`5203/8003 → ss2022`、`5204/8004 → trojan`、
 `5205/8005 → anytls-sb`、`5206/8006 → anytls-go`。专用 honk-only rprx
 配置通过 harness index override 把 VLESS Vision/REALITY/VMess 复用到在线
-目标槽 1–3；专用 Juicity 配置复用槽 1 完成 honk/dae 配对。当前 x86 kdae
-build 包含 AnyTLS；ARM honk-vs-dae 只比较双方共有的四协议。节点服务端口为
-`direct(must)`,其余全部回落 direct。
+目标槽 1–3；专用 Juicity 配置复用槽 1 完成 honk/dae 配对。当前上游 dae
+支持完整六协议矩阵；历史 ARM 对照使用四协议共有面。节点服务端口为
+`direct(must)`，未匹配的目的地回落 direct。每个客户端配置（包括 sing-box）
+都必须显式路由 UDP echo 端口。
 
 ## 方法学
 
@@ -85,8 +85,9 @@ build 包含 AnyTLS；ARM honk-vs-dae 只比较双方共有的四协议。节点
 
 每个 引擎 × 协议 测量:
 
-- **cold**——全新重启引擎后的首个请求延迟,3 次取中位数。两个实验室配置的
-  健康检查间隔都是 3600s,首个探测不会抢跑测量。
+- **cold**——每次重新启动引擎并经过 driver readiness 等待后的首个 HTTP 请求，
+  3 次取中位数。3600s 间隔限制周期探测，但启动探测和连接池可能已完成预热；
+  这不是保证物理 TLS/QUIC 握手全冷的测量。
 - **hot p50/p95**——对每协议 HTTP 目标连发 15 个请求的开流延迟(代理会话已
   热)。QUIC 协议这项主要由连接/会话恢复决定,mux 协议由池化会话决定。
   常规 HTTP 样本必须得到成功的 2xx/3xx；连接或 status 失败会把该行标为
@@ -103,7 +104,7 @@ build 包含 AnyTLS；ARM honk-vs-dae 只比较双方共有的四协议。节点
 - **cpu**——中位数带宽那一轮期间的引擎 CPU 核数
   (`/proc/<pid>/stat` utime+stime 差值除以墙钟时间)。honk 的 pid 锚定
   clash API 监听者,停在单实例锁上的第二实例(零 CPU)不会污染指标。
-- **rss**——带宽轮结束后的引擎 RSS。
+- **rss**——带宽轮结束后的整数 MiB（`VmRSS / 1024`）。
 - **direct 基线**——同样方法测量未代理路径(`8080`/`5300`)。
 
 ```bash
@@ -119,10 +120,10 @@ ssh root@10.10.10.118 \
    'honk dae' 'hy2 tuic ss2022 trojan'"
 ```
 
-`lab-bench.sh` 会在 stderr 记录 host/kernel 与二进制 SHA-256。常规行追加到
-`TSV`,loaded-stability summary 追加到 `STABILITY_TSV`,原始 sample 与 load
-JSON 保存在 `STABILITY_DIR`。collector fixture 用
-`python3 bench/tests/latency_stability_test.py` 验证。
+`lab-bench.sh` 记录 host/kernel 与三个二进制的 SHA-256。常规行追加到 `TSV`，
+loaded summary 追加到 `STABILITY_TSV`；`STABILITY_DIR` 保留每一轮 TCP 带宽
+JSON、UDP 带宽 JSON、loaded sample、summary 和 load JSON。collector fixture
+用 `python3 bench/tests/latency_stability_test.py` 验证。
 
 ### VLESS Vision codec 候选基准
 
@@ -148,6 +149,169 @@ ssh root@10.10.10.50 \
 
 候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
 点估计回退不超过 3% 时通过。
+
+## 结果（2026-10-11，当前 honk / 上游 dae / sing-box A/B/C）
+
+在 `.49` 顺序执行一轮完整 x86 对照，时间为 **2026-10-10 19:54:28–20:34:38 UTC**
+（UTC+8 的 2026-10-11 03:54–04:34）。覆盖六协议和三个 direct 对照：63 轮 TCP
+带宽、18 轮 UDP 带宽、4,200 次负载下的定时 HTTP 请求；不是多轮统计对照。
+
+| Engine | Measured revision / build | Executable SHA-256 prefix |
+| --- | --- | --- |
+| honk | `f65f0548` (merge of `fba795da`), release/opt-s, static musl | `f4c4a83bf21b7ac7` |
+| dae | [v2.1.1](https://github.com/daeuniverse/dae/releases/tag/v2.1.1), `dbae2e82`, official generic x86-64 | `a217bf5edf5a5cac` |
+| sing-box | [v1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3), `7054cac5`, official amd64 | `768d31fa7f68debc` |
+
+dae 与 sing-box 在解析版本时均为上游最新**稳定版**，不是 rolling/nightly 或 dae
+fork。完整 SHA、release asset 校验和、八个输入文件 hash 与精确命令见
+[metadata](../bench/results/abc-2026-10-11-x86/metadata.json) 和
+[command receipts](../bench/results/abc-2026-10-11-x86/commands.jsonl)。
+
+honk 编译了 `ebpf,native-api,clash-api,mimalloc,rprx`，但未配置 native listener，
+因此不测活跃 native observation/UI 开销。沿用 lab 的 QUIC MTU 1452 与 UDP warm
+count 8；三端 TUIC 均为 cubic。配置使用不与节点重名的 `proxy-*` group，以及本地
+HTTP/DNS 健康目标和 3600s 间隔。物理服务端是 NTP 已同步的 i9-13900H workstation，
+20 个逻辑 CPU、31 GiB RAM；使用 sing-box 1.14.3、官方 anytls-go 0.0.13、iperf3
+3.21，HTTP body 固定 1,024 字节。比较的是这些精确配置栈，不是各引擎完全未改的
+默认配置，也不是旧服务端版本的回归对照。
+
+**预检不能省。** 旧 sing-box echo 规则会回落 direct，现已显式路由六个 UDP echo
+端口。服务端观察到的源地址在 18 条 TCP 和 18 条 UDP 代理路由中均为 `.70`，
+direct 对照为 `.49`；真实 TCX/TUN 附着见
+[attribution-ready.json](../bench/results/abc-2026-10-11-x86/attribution-ready.json)。
+SS2022 起初因客户端慢 34.878s 而拒绝三个引擎；VM RTC tick 校时失败后，以已同步
+的物理服务端做一次性校准，实测偏差降到 -0.056s。没有放宽时间戳验证，也没有改动
+VM 的 NTP 策略。失败预检仍保留，未混入以下正式表格。
+
+### TCP 吞吐、进程 CPU 与 RSS
+
+每条路由三轮 8s reverse iperf3，取接收端 Mbps 中位数与同轮进程 CPU，再记录
+整数 RSS MiB。进程 CPU 不包含 kernel/eBPF、softirq 和服务端成本；RSS 不包含
+内核 map 分配。
+
+| Protocol | honk Mbps / process cores / MiB | dae Mbps / process cores / MiB | sing-box Mbps / process cores / MiB |
+| --- | --- | --- | --- |
+| direct | 9406 / 0.00 / 45 | 9405 / 0.00 / 47 | 9400 / 0.40 / 63 |
+| hy2 | 3135 / 0.31 / 42 | 3762 / 0.70 / 63 | 2860 / 0.62 / 66 |
+| tuic | 3561 / 0.35 / 44 | 3306 / 0.65 / 59 | 3265 / 0.75 / 72 |
+| ss2022 | 9396 / 0.30 / 47 | 9399 / 0.36 / 62 | 9389 / 0.48 / 71 |
+| trojan | 9380 / 0.35 / 47 | 9390 / 0.43 / 60 | 9383 / 0.65 / 71 |
+| anytls-sb | 9394 / 0.40 / 47 | 9381 / 0.22 / 63 | 9388 / 0.71 / 73 |
+| anytls-go | 9387 / 0.44 / 46 | 9380 / 0.24 / 63 | 9376 / 0.87 / 76 |
+
+SS2022、Trojan 与两个 AnyTLS TCP 路由达到 native direct 路径上限。本轮 honk HY2
+比 dae 低 16.7%、比 sing-box 高 9.6%，TUIC 分别高 7.7%/9.1%。honk 的代理行 RSS
+均更低；进程 CPU 各行均低于 sing-box，QUIC/SS2022/Trojan 也低于 dae，但**两个
+AnyTLS server 的进程 CPU 都高于 dae**。
+
+### 首个请求与空载 hot 延迟
+
+cold 指 daemon readiness 之后的首个请求，不保证物理 carrier 全冷；启动探测和
+连接池可能已预热。hot p50/p95 使用 15 次请求尝试，耗时包含完整 HTTP body。
+direct 对照的原始首请求只有一次，不是代理行的三次重启中位数；没有 direct UDP
+带宽行。
+
+| Protocol | honk cold / hot p50 / hot p95 (ms) | dae cold / hot p50 / hot p95 (ms) | sing-box cold / hot p50 / hot p95 (ms) |
+| --- | --- | --- | --- |
+| hy2 | 4.114 / 1.512 / 3.186 | 6.111 / 0.863 / 0.983 | 9.475 / 0.954 / 1.372 |
+| tuic | 4.001 / 1.867 / 3.444 | 7.983 / 1.115 / 1.507 | 14.772 / 1.336 / 2.075 |
+| ss2022 | 3.343 / 2.171 / 3.136 | 3.933 / 2.225 / 2.869 | 3.659 / 1.591 / 3.761 |
+| trojan | 6.695 / 0.657 / 7.191 | 9.316 / 5.301 / 8.632 | 9.684 / 4.174 / 5.904 |
+| anytls-sb | 3.662 / 2.187 / 2.789 | 8.087 / 1.730 / 4.468 | 7.268 / 1.328 / 1.695 |
+| anytls-go | 3.510 / 1.820 / 2.242 | 7.700 / 1.282 / 2.598 | 9.646 / 1.307 / 1.932 |
+
+### UDP 饱和负载
+
+RTT 为 15 次 echo 尝试中收到响应的中位数，没有保留逐个 echo sample。带宽为
+单轮 8s reverse、配置供给 10 Gbps、datagram 1,200B。loss 是 iperf 接收端报告的
+packet loss，不是常规负载下的可靠性结论；实际 sender rate 可能低于配置供给，
+原始 JSON 保留了该事实。
+
+| Protocol | honk RTT ms / Mbps (loss) / process cores | dae RTT ms / Mbps (loss) / process cores | sing-box RTT ms / Mbps (loss) / process cores |
+| --- | --- | --- | --- |
+| hy2 | 0.424 / 1101(86.5%) / 0.49 | 0.440 / 1056(87.1%) / 0.70 | 0.491 / invalid / — |
+| tuic | 0.334 / 989(69.9%) / 0.55 | 0.771 / 1147(86.0%) / 0.76 | 0.305 / 1027(87.4%) / 1.41 |
+| ss2022 | 0.280 / 2078(69.1%) / 0.76 | 0.197 / 2908(56.9%) / 1.27 | 0.178 / 2963(55.9%) / 1.41 |
+| trojan | 0.128 / 1773(78.4%) / 0.73 | 0.193 / 3142(59.6%) / 1.12 | 0.201 / 3426(55.4%) / 1.51 |
+| anytls-sb | 0.200 / 1600(79.4%) / 0.56 | 0.228 / 1550(80.3%) / 0.63 | 0.164 / 1398(81.1%) / 1.17 |
+| anytls-go | 0.269 / 1726(78.4%) / 0.59 | 0.204 / 1656(79.1%) / 0.30 | 0.187 / 1327(82.6%) / 1.18 |
+
+sing-box HY2 UDP 虽已收到数据，但最终为 `server test duration expired`，没有
+terminal receiver totals。driver 的 `0(-)` 应读作 **invalid**，不是零吞吐，
+不能以 partial interval 替代完整总量；失败传输的 CPU 也不参与比较。原始证据为
+[raw/sing-box-5201.udp.json](../bench/results/abc-2026-10-11-x86/raw/sing-box-5201.udp.json)。
+UDP 并非 honk 全胜：TUIC、SS2022、Trojan 落后于其他端；两个 AnyTLS rate 有
+竞争力，但单次饱和 sample 不能证明常规流量丢包率或统计优势。
+
+### Loaded 延迟与保留的失败
+
+每条路由 200 个绝对 250ms deadline，同一路由一条 reverse stream，HTTP timeout
+5s。分位数和最大值都只计算**成功请求**；失败仍在 200 次尝试的分母中。比较尾延迟
+必须同时看 achieved load，不是固定压力实验。最大调度偏差为 2.036ms。
+
+| Engine | Protocol | Load Mbps | p50 ms | p95 ms | p99 ms | Max ms | Failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 9408 | 3.284 | 4.040 | 5.335 | 1007.208 | 0/200 |
+| honk | hy2 | 3048 | 1.797 | 2.239 | 2.623 | 2.868 | 3/200 |
+| honk | tuic | 3645 | 1.843 | 2.130 | 2.560 | 2.894 | 0/200 |
+| honk | ss2022 | 9402 | 2.868 | 7.369 | 13.012 | 15.906 | 0/200 |
+| honk | trojan | 9389 | 2.062 | 5.497 | 8.842 | 10.256 | 0/200 |
+| honk | anytls-sb | 9388 | 2.567 | 8.609 | 15.587 | 20.091 | 0/200 |
+| honk | anytls-go | 9354 | 2.496 | 12.660 | 17.358 | 23.054 | 0/200 |
+| dae | direct | 9404 | 2.761 | 3.780 | 4.260 | 4.501 | 0/200 |
+| dae | hy2 | 3509 | 1.466 | 2.086 | 3.413 | 13.956 | 0/200 |
+| dae | tuic | 3436 | 1.807 | 2.035 | 2.378 | 3.012 | 2/200 |
+| dae | ss2022 | 9402 | 3.589 | 8.266 | 10.356 | 11.732 | 0/200 |
+| dae | trojan | 9380 | 5.491 | 11.818 | 22.010 | 45.234 | 0/200 |
+| dae | anytls-sb | 9378 | 2.546 | 10.662 | 14.092 | 14.591 | 1/200 |
+| dae | anytls-go | 9386 | 2.199 | 5.161 | 8.523 | 15.687 | 0/200 |
+| sing-box | direct | 9407 | 2.416 | 3.014 | 3.543 | 1034.084 | 0/200 |
+| sing-box | hy2 | 2672 | 8.913 | 20.916 | 25.597 | 30.111 | 0/200 |
+| sing-box | tuic | 3288 | 1.856 | 2.294 | 2.699 | 3.050 | 0/200 |
+| sing-box | ss2022 | 9396 | 3.547 | 7.961 | 11.641 | 42.763 | 0/200 |
+| sing-box | trojan | 9364 | 5.433 | 11.841 | 17.291 | 19.717 | 0/200 |
+| sing-box | anytls-sb | 9363 | 2.393 | 7.450 | 12.844 | 19.851 | 0/200 |
+| sing-box | anytls-go | 9370 | 2.380 | 7.423 | 15.281 | 17.170 | 0/200 |
+
+honk HY2 有三次约 5s timeout，不能被成功请求的 2.623ms p99 掩盖；dae TUIC 有
+两次 timeout、dae AnyTLS-SB 一次，其余均 0/200。honk 和 sing-box 的 direct
+对照各有约 1s 的成功请求离群值。因此，小 p99 单元格不能推出无条件 tail 或全面
+延迟稳定性胜利。
+
+### 失败 UDP 的独立复测
+
+在 **20:36:59–20:40:52 UTC**，按同一完整方法复测 sing-box direct/HY2。没有改动
+版本、配置、供给、datagram 长度或采样，本次 UDP 得到完整总量。额外六个 TCP
+sample、一个 UDP sample 和 400 次 loaded 尝试独立存放于
+[followup-summary.json](../bench/results/abc-2026-10-11-x86/followup-summary.json) 与
+[hy2-udp-followup-raw](../bench/results/abc-2026-10-11-x86/hy2-udp-followup-raw/)，
+不回填主轮 invalid UDP 单元格，也不替换主轮 TCP/tail 数据。
+
+| Scope | TCP Mbps | UDP Mbps (loss) | Loaded Mbps | Loaded p99 ms | Loaded max ms | Failures |
+| --- | --- | --- | --- | --- | --- | --- |
+| sing-box HY2 follow-up | 2338 | 895(19.9%) | 2720 | 184.167 | 364.786 | 0/200 |
+
+复测 HY2 TCP 比主轮低 18.3%，loaded tail 也有明显变化。历史约 ±5% 的 lab
+波动不是本轮的统计界限；一轮主矩阵加一次针对性复测，不能确立稳定丢包率或
+统计排名。
+
+### 原始证据与验证边界
+
+[完整 campaign evidence](../bench/results/abc-2026-10-11-x86/) 保留原始 stdout/
+stderr、pipe-delimited TSV、63 个 TCP 与 18 个 UDP JSON、全部 4,200 次 loaded
+尝试、每路由 summary/pressure JSON、engine log、冻结的 driver/config、binary
+hash、clock/cleanup receipt 和失败预检；不以复测的有利结果静默替换主轮数据。
+没有保留逐次 cold/hot 耗时或 daemon CPU tick/wall-time sample；stdout/TSV
+保留了汇总值，但不能仅凭 bandwidth JSON 独立重建这些指标。
+最终 [cleanup.json](../bench/results/abc-2026-10-11-x86/cleanup.json) 验证 `.49`
+无 benchmark 引擎或 `dae0`/`daens`，两个持久序列 pin 均保留且未重置；重建后的
+lab namespace/NAT 与原 SSH/Tailscale/einat 均保留。`.70` 的十个临时服务已停止，
+原 mock honk 进程及既有 benchmark 档案没有被清除。
+静态构建、完整 outbound gate（rprx off/on）、七个 Criterion smoke case、五个
+collector test 与真实 36 路由归因均通过，见
+[verification.json](../bench/results/abc-2026-10-11-x86/verification.json)。
+本轮没有运行完整 workspace、`test-routing`、`test-netns`、活跃 native API/UI
+或 ARM benchmark；没有改动生产网关。
 
 ## 结果(2026-09-02,dae 家族矩阵:dae / kdae / cdae 对 sing-box)
 

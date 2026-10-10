@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "campaign": {
+    "startedAt": "2026-10-10T19:54:28.656582+00:00",
+    "endedAt": "2026-10-10T20:34:38.193678+00:00",
+    "exitStatus": 0
+  },
+  "standard_rows": 39,
+  "loaded_rows": 21,
+  "tcp_samples": 63,
+  "udp_samples": 18,
+  "valid_udp_samples": 17,
+  "invalid_udp": [
+    {
+      "engine": "sing-box",
+      "protocol": "hy2",
+      "reported_value": "0(-)",
+      "error": "server test duration expired: ",
+      "evidence": "raw/sing-box-5201.udp.json"
+    }
+  ],
+  "loaded_attempts": 4200,
+  "loaded_failures": 6,
+  "loaded_failures_by_route": {
+    "honk/hy2": "3/200",
+    "dae/tuic": "2/200",
+    "dae/anytls-sb": "1/200"
+  },
+  "limits": [
+    "One sequential same-host campaign, not a repeated statistical comparison",
+    "Cold is first request after daemon readiness, not guaranteed cold transport",
+    "Process CPU excludes kernel/eBPF/softirq and target costs",
+    "Loaded latency percentiles include successful requests only; failures remain separate",
+    "Loaded bandwidth varies by arm",
+    "Incomplete UDP run is invalid, not zero throughput"
+  ]
+}

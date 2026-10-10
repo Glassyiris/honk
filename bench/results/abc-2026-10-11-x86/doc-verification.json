@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "tables_per_language": 6,
+  "new_local_links": "all exist",
+  "main_tables": "derived from and equal to audited original39standard/21loaded rows",
+  "followup": "separate original outcome, no main replacement",
+  "command_output_hashes": "both sequences stdout/stderr match",
+  "independent_reviews": [
+    "RunnerContractReview",
+    "EvidenceAudit"
+  ],
+  "main_unconditional_failure_disclosure": "honk HY2 3/200, dae TUIC2/200, dae AnyTLS-SB1/200",
+  "invalid_main_udp": "sing-box HY2; positive partial intervals not reconstructed as terminal throughput",
+  "cleanup_receipt": "cleanup.json"
+}

@@ -1,0 +1,13 @@
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens3             UP             00:a0:98:04:2a:4b <BROADCAST,MULTICAST,UP,LOWER_UP> 
+tailscale0       UNKNOWN        <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> 
+gre0@NONE        DOWN           0.0.0.0 <NOARP> 
+gretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+erspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+veth-lab@if628   UP             ee:b6:8a:84:88:f8 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+lab (id: 2)
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0x00","0x00","0x00","0x00","0x0c","0x00","0x00","0x00","0x00","0x00","0x00","0x00"],"formatted":{"key":0,"value":{"lock":{"val":0},"next":12,"exhausted":0}}}]
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0xd3","0x00","0x00","0x00","0x00","0x00","0x00","0x00"]}]
+active
+active
+active

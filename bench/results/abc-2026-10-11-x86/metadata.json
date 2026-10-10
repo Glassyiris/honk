@@ -1,0 +1,103 @@
+{
+  "dae": {
+    "tag": "v2.1.1",
+    "release_url": "https://github.com/daeuniverse/dae/releases/tag/v2.1.1",
+    "published_at": "2026-09-18T14:44:07Z",
+    "prerelease": false,
+    "archive": {
+      "name": "dae-linux-x86_64.tar.xz",
+      "browser_download_url": "https://github.com/daeuniverse/dae/releases/download/v2.1.1/dae-linux-x86_64.tar.xz",
+      "digest": "sha256:c550af580dc97cc90986260da78c4bf72917f3213c2b5d8b79c45199d9c3dc90",
+      "size": 11843556
+    },
+    "revision": "dbae2e82d3ed5324e1648548720f8bbc8cde3882",
+    "binary_sha256": "a217bf5edf5a5cac371e086af952b5c676e6ecaf8d7b07ba491916b656b66122",
+    "go": "go1.26.8-X:heapminimum512kib,newinliner,simd"
+  },
+  "sing-box": {
+    "tag": "v1.14.3",
+    "release_url": "https://github.com/SagerNet/sing-box/releases/tag/v1.14.3",
+    "published_at": "2026-10-09T05:35:00Z",
+    "prerelease": false,
+    "archive": {
+      "name": "sing-box-1.14.3-linux-amd64.tar.gz",
+      "browser_download_url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz",
+      "digest": "sha256:e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee",
+      "size": 31678266
+    },
+    "revision": "7054cac5124465ffdb145870d7c01885566711b1",
+    "binary_sha256": "768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93",
+    "go": "go1.26.8",
+    "cgo": "disabled"
+  },
+  "honk": {
+    "source_revision": "fba795dad1c8edacca1fffedc3b3a46923f66e3b",
+    "merge_revision": "f65f05486bc46b9576f067a755c375a52c0ddc97",
+    "version": "v0.0.1.beta.82-253-gf65f0548",
+    "binary_sha256": "f4c4a83bf21b7ac7e48b8b1aa7e953169d3e27ec7f04c45cc2a9bf4fd4cfad09",
+    "target": "x86_64-unknown-linux-musl",
+    "profile": "release",
+    "opt_level": "s",
+    "lto": true,
+    "codegen_units": 1,
+    "features": [
+      "ebpf",
+      "native-api",
+      "clash-api",
+      "mimalloc",
+      "rprx"
+    ],
+    "native_listener": "unconfigured",
+    "rustc": "1.98.1",
+    "bpf_object_sha256": "4db9ec78e909acfce4d76b3a36b750acc31f104b6c7dbdba3068d8aef214d430"
+  },
+  "server": {
+    "host": "10.10.10.70",
+    "protocols": "sing-box 1.14.3: Hysteria2, TUIC/cubic, SS2022, Trojan, AnyTLS; official anytls-go 0.0.13: AnyTLS-Go",
+    "anytls_go": {
+      "revision": "9666872946857b50a74fdb692896d77b53773cb2",
+      "release_url": "https://github.com/anytls/anytls-go/releases/tag/v0.0.13",
+      "archive_url": "https://github.com/anytls/anytls-go/releases/download/v0.0.13/anytls_0.0.13_linux_amd64.zip",
+      "archive_sha256": "7e80fc099ea54a71110d256dd60648c47c63c70a3c499eb1f6d7aaa4edb7016f",
+      "binary_sha256": "c1a3a52cf3246a51b2cbf427283cde2482fe99b6868588a57786c24324ac44fa"
+    }
+  },
+  "sampling": {
+    "engines": [
+      "honk",
+      "dae",
+      "sing-box"
+    ],
+    "protocols": [
+      "hy2",
+      "tuic",
+      "ss2022",
+      "trojan",
+      "anytls-sb",
+      "anytls-go"
+    ],
+    "cold_restarts": 3,
+    "hot_requests": 15,
+    "tcp_runs": 3,
+    "tcp_seconds": 8,
+    "udp_seconds": 8,
+    "udp_offered_bps": 10000000000,
+    "udp_datagram_bytes": 1200,
+    "loaded_samples": 200,
+    "loaded_interval_ms": 250,
+    "loaded_timeout_seconds": 5,
+    "loaded_retries": 2,
+    "http_body_bytes": 1024,
+    "client_clk_tck": 100
+  },
+  "configuration_sha256": {
+    "honk-lab.dae": "9b395101e00fba877731df0ae8c29b553895946b12e22dd88acfc0402d134f43",
+    "dae-lab.dae": "3c0966bd4c929cb127dc37b878ce65ebef10724b1507d00e7e17f42fc7e50e67",
+    "sb-client.json": "56646bc1793bfac49776fcc5d8b76022bc238fdeeae0d992efe0527e770b0432",
+    "server-config.json": "ad27f67a0cabb67cb4614cb587842f80d1cdcdc9e32ef4a628dd0b5a85bc1751",
+    "target-config.json": "a042273a75b036fff575385584aec60831760c4502a940b5206dde7b4fc2d04d",
+    "lab-bench.sh": "d0f240064b2acc82ab060d0ad3a1a2ca41e6aa710fd0004b8044fabc3fe752bb",
+    "latency_stability.py": "aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575",
+    "setup-netns.sh": "60220073c7865d41de86e79ef778c215f8091bf74fe64cc10d41d320ecee8b1b"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "reference_host": "10.10.10.70",
+  "client_host": "10.10.10.49",
+  "method": "one-time date calibration from NTP-synchronized reference; NTP policy unchanged",
+  "offset_seconds": -0.055565952,
+  "roundtrip_seconds": 0.138781011,
+  "rtc_attempt": "hwclock --hctosys failed: RTC tick timeout"
+}

@@ -1,0 +1,120 @@
+AbcSingBoxServer [service] — ready — up 1h3m — pid 818976
+ready=true persist=false detached=false
++0800 2026-10-11 03:43:05 ERROR [4015569279 83ms] inbound/anytls[anytls-sb]: process connection from 10.10.10.70:49086: TLS handshake: EOF
++0800 2026-10-11 03:45:26 ERROR [784712050 0ms] inbound/anytls[anytls-sb]: process connection from 10.10.10.49:55636: TLS handshake: EOF
++0800 2026-10-11 03:45:26 ERROR [2709824395 0ms] inbound/trojan[trojan]: process connection from 10.10.10.49:38840: TLS handshake: EOF
++0800 2026-10-11 03:49:15 ERROR [3703779937 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:60818: shadowsocks: serve TCP from 10.10.10.49:60818: bad timestamp: received 1791661720, diff 35s
++0800 2026-10-11 03:49:17 ERROR [1669009040 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:60820: shadowsocks: serve TCP from 10.10.10.49:60820: bad timestamp: received 1791661722, diff 35s
++0800 2026-10-11 03:49:17 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:43372: shadowsocks: serve UDP from 10.10.10.49:43372: bad timestamp: received 1791661722, diff 35s
++0800 2026-10-11 03:49:19 ERROR [4269731950 3.56s] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:60804: shadowsocks: serve TCP from 10.10.10.49:60804: bad timestamp: received 1791661724, diff 35s
++0800 2026-10-11 03:49:19 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:35401: shadowsocks: serve UDP from 10.10.10.49:35401: bad timestamp: received 1791661724, diff 35s
++0800 2026-10-11 03:49:24 ERROR [1749723590 8.71s] inbound/trojan[trojan]: process connection from 10.10.10.49:37116: TLS handshake: EOF
++0800 2026-10-11 03:49:28 ERROR [2023235726 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:34236: shadowsocks: serve TCP from 10.10.10.49:34236: bad timestamp: received 1791661733, diff 35s
++0800 2026-10-11 03:49:28 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:55109: shadowsocks: serve UDP from 10.10.10.49:55109: bad timestamp: received 1791661733, diff 35s
++0800 2026-10-11 03:49:37 ERROR [1772903720 0ms] inbound/shadowsocks[ss2022]: process connection from 10.10.10.49:36698: shadowsocks: serve TCP from 10.10.10.49:36698: bad timestamp: received 1791661742, diff 35s
++0800 2026-10-11 03:49:37 ERROR inbound/shadowsocks[ss2022]: process packet from 10.10.10.49:58906: shadowsocks: serve UDP from 10.10.10.49:58906: bad timestamp: received 1791661742, diff 35s
++0800 2026-10-11 03:52:49 ERROR [1826453226 3.71s] inbound/trojan[trojan]: process connection from 10.10.10.49:39446: TLS handshake: EOF
++0800 2026-10-11 03:54:45 ERROR [2759274352 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:49938: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:54:45 ERROR [2510395863 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:49962: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:55:05 ERROR [2187305327 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:59028: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:55:25 ERROR [166023432 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:49154: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:55:45 ERROR [3689850659 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:46018: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:55:52 ERROR [297490033 1.98s] inbound/trojan[trojan]: process connection from 10.10.10.49:34118: TLS handshake: EOF
++0800 2026-10-11 03:55:57 ERROR [2986554912 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:48270: TLS handshake: EOF
++0800 2026-10-11 03:55:57 ERROR [2163389749 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:48240: TLS handshake: EOF
++0800 2026-10-11 03:56:02 ERROR [542649719 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:48284: TLS handshake: EOF
++0800 2026-10-11 03:56:02 ERROR [1092311596 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:48292: TLS handshake: EOF
++0800 2026-10-11 03:56:08 ERROR [4142016357 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:59908: TLS handshake: EOF
++0800 2026-10-11 03:56:19 ERROR [3229939327 8.4s] connection: connection download closed: stream 76 canceled by remote with error code 0
++0800 2026-10-11 03:56:25 ERROR [4219771225 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:59924: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:56:25 ERROR [2595812861 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:59918: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:56:27 ERROR [3579604893 8.4s] connection: connection download closed: stream 84 canceled by remote with error code 0
++0800 2026-10-11 03:56:35 ERROR [3951628439 8.4s] connection: connection download closed: stream 92 canceled by remote with error code 0
++0800 2026-10-11 03:56:45 ERROR [2933614342 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:48968: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:57:05 ERROR [2133424319 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:60858: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:57:25 ERROR [2081019525 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:55948: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:57:32 ERROR [866683900 57.4s] connection: connection download closed: stream 100 canceled by remote with error code 0
++0800 2026-10-11 03:57:41 ERROR [1475666879 10.29s] inbound/trojan[trojan]: process connection from 10.10.10.49:60442: TLS handshake: EOF
++0800 2026-10-11 03:57:46 ERROR [986640445 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:49662: TLS handshake: EOF
++0800 2026-10-11 03:57:46 ERROR [3115017353 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:49678: TLS handshake: EOF
++0800 2026-10-11 03:57:51 ERROR [1482773120 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:49712: TLS handshake: EOF
++0800 2026-10-11 03:57:51 ERROR [3728612104 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:49714: TLS handshake: EOF
++0800 2026-10-11 03:57:57 ERROR [2694370763 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:56532: TLS handshake: EOF
++0800 2026-10-11 03:57:57 ERROR [3004999508 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:56546: TLS handshake: EOF
++0800 2026-10-11 03:58:08 ERROR [3707687753 8.4s] connection: connection download closed: stream 72 canceled by remote with error code 0
++0800 2026-10-11 03:58:14 ERROR [4282691094 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:56580: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:58:14 ERROR [1249337585 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:56600: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:58:16 ERROR [4177588836 8.4s] connection: connection download closed: stream 84 canceled by remote with error code 0
++0800 2026-10-11 03:58:24 ERROR [1931613536 8.4s] connection: connection download closed: stream 92 canceled by remote with error code 0
++0800 2026-10-11 03:58:34 ERROR [1818715355 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:46376: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:58:54 ERROR [1305539831 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:47666: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:59:14 ERROR [4293244506 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:55962: TLS handshake: context deadline exceeded
++0800 2026-10-11 03:59:21 ERROR [1161582018 57.4s] connection: connection download closed: stream 100 canceled by remote with error code 0
++0800 2026-10-11 03:59:30 ERROR [4137779272 10.38s] inbound/trojan[trojan]: process connection from 10.10.10.49:43716: TLS handshake: EOF
++0800 2026-10-11 03:59:35 ERROR [1928836870 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:56850: TLS handshake: EOF
++0800 2026-10-11 03:59:35 ERROR [3147781366 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:56856: TLS handshake: EOF
++0800 2026-10-11 03:59:40 ERROR [1733898420 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:56902: TLS handshake: EOF
++0800 2026-10-11 03:59:40 ERROR [4087596459 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:56890: TLS handshake: EOF
++0800 2026-10-11 03:59:46 ERROR [1331734762 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:34870: TLS handshake: EOF
++0800 2026-10-11 04:00:03 ERROR [2876312965 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:34910: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:00:03 ERROR [2684604581 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:34894: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:00:23 ERROR [3058958837 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:55006: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:00:43 ERROR [3762218489 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:58696: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:01:03 ERROR [1722110361 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:43826: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:01:18 ERROR [2502131789 10.38s] inbound/trojan[trojan]: process connection from 10.10.10.49:50232: TLS handshake: EOF
++0800 2026-10-11 04:01:24 ERROR [386976256 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:39968: TLS handshake: EOF
++0800 2026-10-11 04:01:29 ERROR [679843392 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:39984: TLS handshake: EOF
++0800 2026-10-11 04:02:22 ERROR [1262914119 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:58690: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:03:07 ERROR [2946813346 379ms] inbound/trojan[trojan]: process connection from 10.10.10.49:37716: TLS handshake: EOF
++0800 2026-10-11 04:03:13 ERROR [457025657 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:37742: TLS handshake: EOF
++0800 2026-10-11 04:03:13 ERROR [105550049 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:37732: TLS handshake: EOF
++0800 2026-10-11 04:03:18 ERROR [1069214297 2.91s] inbound/trojan[trojan]: process connection from 10.10.10.49:36590: TLS handshake: EOF
++0800 2026-10-11 04:03:18 ERROR [2264313937 2.91s] inbound/trojan[trojan]: process connection from 10.10.10.49:36588: TLS handshake: EOF
++0800 2026-10-11 04:03:22 ERROR [310111098 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:36622: TLS handshake: EOF
++0800 2026-10-11 04:03:40 ERROR [2175837612 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:47198: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:03:40 ERROR [3381545937 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:47202: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:04:00 ERROR [2026001836 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:59348: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:04:20 ERROR [2730480502 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:46862: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:04:40 ERROR [2677550881 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:42312: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:04:55 ERROR [1585320345 10.38s] inbound/trojan[trojan]: process connection from 10.10.10.49:57514: TLS handshake: EOF
++0800 2026-10-11 04:05:01 ERROR [1214520836 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:39110: TLS handshake: EOF
++0800 2026-10-11 04:05:01 ERROR [2795478733 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:39126: TLS handshake: EOF
++0800 2026-10-11 04:05:06 ERROR [1608686987 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:38164: TLS handshake: EOF
++0800 2026-10-11 04:05:06 ERROR [3964769775 2.80s] inbound/trojan[trojan]: process connection from 10.10.10.49:38152: TLS handshake: EOF
++0800 2026-10-11 04:05:11 ERROR [13633983 2.81s] inbound/trojan[trojan]: process connection from 10.10.10.49:38206: TLS handshake: EOF
++0800 2026-10-11 04:05:29 ERROR [876079535 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:59024: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:05:29 ERROR [690685639 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:59032: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:05:49 ERROR [2047739450 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:44022: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:06:09 ERROR [2074740982 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:58288: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:06:29 ERROR [683649016 15.0s] inbound/trojan[trojan]: process connection from 10.10.10.49:39896: TLS handshake: context deadline exceeded
++0800 2026-10-11 04:06:44 ERROR [1001992934 10.38s] inbound/trojan[trojan]: process connection from 10.10.10.49:42044: TLS handshake: EOF
++0800 2026-10-11 04:08:42 ERROR [3729725614 8.0s] connection: connection download closed: stream 72 canceled by remote with error code 0
++0800 2026-10-11 04:08:50 ERROR [1876143739 8.0s] connection: connection download closed: stream 80 canceled by remote with error code 0
++0800 2026-10-11 04:08:58 ERROR [2869688112 8.0s] connection: connection download closed: stream 88 canceled by remote with error code 0
++0800 2026-10-11 04:09:55 ERROR [724175576 57.1s] connection: connection download closed: stream 96 canceled by remote with error code 0
++0800 2026-10-11 04:10:34 ERROR [1019994330 8.0s] connection: connection download closed: stream 68 canceled by remote with error code 0
++0800 2026-10-11 04:10:42 ERROR [3627733802 8.0s] connection: connection download closed: stream 76 canceled by remote with error code 0
++0800 2026-10-11 04:10:50 ERROR [3154119364 8.0s] connection: connection download closed: stream 84 canceled by remote with error code 0
++0800 2026-10-11 04:11:47 ERROR [1282353145 57.0s] connection: connection download closed: stream 92 canceled by remote with error code 0
++0800 2026-10-11 04:22:56 ERROR [1545005833 8.2s] connection: connection download closed: stream 68 canceled by remote with error code 0
++0800 2026-10-11 04:23:04 ERROR [3385689634 8.1s] connection: connection download closed: stream 76 canceled by remote with error code 0
++0800 2026-10-11 04:23:04 ERROR [1308722464 8.1s] connection: connection download closed: stream 80 canceled by remote with error code 0
++0800 2026-10-11 04:23:12 ERROR [2876231621 8.1s] connection: connection download closed: stream 88 canceled by remote with error code 0
++0800 2026-10-11 04:23:12 ERROR [127858567 8.1s] connection: connection download closed: stream 84 canceled by remote with error code 0
++0800 2026-10-11 04:24:09 ERROR [1008625400 57.1s] connection: connection download closed: stream 96 canceled by remote with error code 0
++0800 2026-10-11 04:24:09 ERROR [117766192 57.1s] connection: connection download closed: stream 92 canceled by remote with error code 0
++0800 2026-10-11 04:25:32 ERROR [3318456179 8.0s] connection: connection download closed: stream 68 canceled by remote with error code 0
++0800 2026-10-11 04:25:32 ERROR [1654557200 8.0s] connection: connection download closed: stream 64 canceled by remote with error code 0
++0800 2026-10-11 04:25:40 ERROR [4004564905 8.0s] connection: connection download closed: stream 72 canceled by remote with error code 0
++0800 2026-10-11 04:25:40 ERROR [1029820411 8.0s] connection: connection download closed: stream 76 canceled by remote with error code 0
++0800 2026-10-11 04:25:48 ERROR [3275401395 8.0s] connection: connection download closed: stream 84 canceled by remote with error code 0
++0800 2026-10-11 04:25:48 ERROR [596100638 8.1s] connection: connection download closed: stream 80 canceled by remote with error code 0
++0800 2026-10-11 04:26:45 ERROR [3333541388 57.0s] connection: connection download closed: stream 88 canceled by remote with error code 0
++0800 2026-10-11 04:26:45 ERROR [4181709555 57.0s] connection: connection download closed: stream 92 canceled by remote with error code 0
++0800 2026-10-11 04:26:53 ERROR [901328437 8.0s] connection: connection download closed: stream 896 canceled by remote with error code 0
++0800 2026-10-11 04:39:00 ERROR [3945655383 8.35s] connection: connection download closed: stream 68 canceled by remote with error code 0
++0800 2026-10-11 04:39:09 ERROR [3860600896 8.43s] connection: connection download closed: stream 76 canceled by remote with error code 0
++0800 2026-10-11 04:39:17 ERROR [2334846460 8.4s] connection: connection download closed: stream 84 canceled by remote with error code 0
++0800 2026-10-11 04:40:14 ERROR [1403609745 57.40s] connection: connection download closed: stream 92 canceled by remote with error code 0
++0800 2026-10-11 04:40:14 ERROR [1038453337 57.10s] connection: connection download closed: stream 96 canceled by remote with error code 0
++0800 2026-10-11 04:40:51 ERROR [3879960844 35.97s] connection: connection download closed: stream 900 canceled by remote with error code 0

@@ -1,0 +1,422 @@
+AbcIperf5202 [service] — ready — up 1h2m — pid 821172
+ready=true persist=false detached=false
+iperf3: error - unable to receive cookie at server: Transport endpoint is not connected
+-----------------------------------------------------------
+Server listening on 5202 (test #1)
+-----------------------------------------------------------
+iperf3: error - unable to receive cookie at server: Transport endpoint is not connected
+-----------------------------------------------------------
+Server listening on 5202 (test #2)
+-----------------------------------------------------------
+-----------------------------------------------------------
+Server listening on 5202 (test #3)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 40498
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 40514
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   415 MBytes  3.47 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   421 MBytes  3.53 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   433 MBytes  3.63 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   415 MBytes  3.48 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   407 MBytes  3.41 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   415 MBytes  3.48 Gbits/sec    0    639 KBytes       
+[  5]   6.00-7.00   sec   412 MBytes  3.46 Gbits/sec    0    639 KBytes       
+[  5]   7.00-8.00   sec   437 MBytes  3.66 Gbits/sec    0    639 KBytes       
+[  5]   8.00-8.04   sec  15.8 MBytes  3.46 Gbits/sec    0    639 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.04   sec  3.29 GBytes  3.52 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #4)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 38674
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 38680
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   392 MBytes  3.28 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   410 MBytes  3.44 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   434 MBytes  3.64 Gbits/sec    0   1023 KBytes       
+[  5]   3.00-4.00   sec   417 MBytes  3.50 Gbits/sec    0   1023 KBytes       
+[  5]   4.00-5.00   sec   441 MBytes  3.70 Gbits/sec    0   1023 KBytes       
+[  5]   5.00-6.00   sec   442 MBytes  3.71 Gbits/sec    0   1023 KBytes       
+[  5]   6.00-7.00   sec   429 MBytes  3.60 Gbits/sec    0   1023 KBytes       
+[  5]   7.00-8.00   sec   419 MBytes  3.52 Gbits/sec    0   1023 KBytes       
+[  5]   8.00-8.04   sec  15.1 MBytes  3.32 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.04   sec  3.32 GBytes  3.55 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #5)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 56456
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 56470
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   400 MBytes  3.36 Gbits/sec    1    639 KBytes       
+[  5]   1.00-2.00   sec   397 MBytes  3.33 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   422 MBytes  3.54 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   434 MBytes  3.64 Gbits/sec    0   1023 KBytes       
+[  5]   4.00-5.00   sec   438 MBytes  3.68 Gbits/sec    0   1023 KBytes       
+[  5]   5.00-6.00   sec   416 MBytes  3.49 Gbits/sec    0   1023 KBytes       
+[  5]   6.00-7.00   sec   438 MBytes  3.67 Gbits/sec    0   1023 KBytes       
+[  5]   7.00-8.00   sec   435 MBytes  3.65 Gbits/sec    0   1023 KBytes       
+[  5]   8.00-8.04   sec  20.5 MBytes  4.34 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.04   sec  3.32 GBytes  3.55 Gbits/sec    1            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #6)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 52958
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 52974
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   425 MBytes  3.57 Gbits/sec    1    639 KBytes       
+[  5]   1.00-2.00   sec   439 MBytes  3.69 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   452 MBytes  3.79 Gbits/sec    0   1023 KBytes       
+[  5]   3.00-4.00   sec   440 MBytes  3.69 Gbits/sec    0   1023 KBytes       
+[  5]   4.00-5.00   sec   428 MBytes  3.59 Gbits/sec    0   1023 KBytes       
+[  5]   5.00-6.00   sec   447 MBytes  3.75 Gbits/sec    0   1023 KBytes       
+[  5]   6.00-7.00   sec   438 MBytes  3.67 Gbits/sec    0   1023 KBytes       
+[  5]   7.00-8.00   sec   417 MBytes  3.49 Gbits/sec    0   1023 KBytes       
+[  5]   8.00-9.00   sec   436 MBytes  3.66 Gbits/sec    0   1023 KBytes       
+[  5]   9.00-10.00  sec   439 MBytes  3.69 Gbits/sec    0   1023 KBytes       
+[  5]  10.00-11.00  sec   437 MBytes  3.67 Gbits/sec    0   1023 KBytes       
+[  5]  11.00-12.00  sec   444 MBytes  3.73 Gbits/sec    0   1023 KBytes       
+[  5]  12.00-13.00  sec   449 MBytes  3.77 Gbits/sec    0   1023 KBytes       
+[  5]  13.00-14.00  sec   425 MBytes  3.56 Gbits/sec    0   1023 KBytes       
+[  5]  14.00-15.00  sec   442 MBytes  3.70 Gbits/sec    0   1023 KBytes       
+[  5]  15.00-16.00  sec   445 MBytes  3.74 Gbits/sec    0   1023 KBytes       
+[  5]  16.00-17.00  sec   426 MBytes  3.58 Gbits/sec    0   1023 KBytes       
+[  5]  17.00-18.00  sec   442 MBytes  3.71 Gbits/sec    0   1023 KBytes       
+[  5]  18.00-19.00  sec   430 MBytes  3.61 Gbits/sec    0   1023 KBytes       
+[  5]  19.00-20.00  sec   428 MBytes  3.59 Gbits/sec    0   1023 KBytes       
+[  5]  20.00-21.00  sec   453 MBytes  3.81 Gbits/sec    0   1023 KBytes       
+[  5]  21.00-22.00  sec   440 MBytes  3.69 Gbits/sec    0   1023 KBytes       
+[  5]  22.00-23.00  sec   442 MBytes  3.71 Gbits/sec    0   1023 KBytes       
+[  5]  23.00-24.00  sec   426 MBytes  3.57 Gbits/sec    0   1023 KBytes       
+[  5]  24.00-25.00  sec   429 MBytes  3.60 Gbits/sec    0   1023 KBytes       
+[  5]  25.00-26.00  sec   432 MBytes  3.62 Gbits/sec    0   1023 KBytes       
+[  5]  26.00-27.00  sec   438 MBytes  3.67 Gbits/sec    0   1023 KBytes       
+[  5]  27.00-28.00  sec   423 MBytes  3.55 Gbits/sec    0   1023 KBytes       
+[  5]  28.00-29.00  sec   430 MBytes  3.61 Gbits/sec    0   1023 KBytes       
+[  5]  29.00-30.00  sec   436 MBytes  3.66 Gbits/sec    0   1023 KBytes       
+[  5]  30.00-31.00  sec   398 MBytes  3.35 Gbits/sec    0   1023 KBytes       
+[  5]  31.00-32.00  sec   424 MBytes  3.55 Gbits/sec    0   1023 KBytes       
+[  5]  32.00-33.00  sec   427 MBytes  3.58 Gbits/sec    0   1023 KBytes       
+[  5]  33.00-34.00  sec   421 MBytes  3.53 Gbits/sec    0   1023 KBytes       
+[  5]  34.00-35.00  sec   446 MBytes  3.74 Gbits/sec    0   1023 KBytes       
+[  5]  35.00-36.00  sec   443 MBytes  3.71 Gbits/sec    0   1023 KBytes       
+[  5]  36.00-37.00  sec   443 MBytes  3.72 Gbits/sec    0   1023 KBytes       
+[  5]  37.00-38.00  sec   443 MBytes  3.72 Gbits/sec    0   1023 KBytes       
+[  5]  38.00-39.00  sec   432 MBytes  3.63 Gbits/sec    0   1023 KBytes       
+[  5]  39.00-40.00  sec   453 MBytes  3.80 Gbits/sec    0   1023 KBytes       
+[  5]  40.00-41.00  sec   433 MBytes  3.63 Gbits/sec    0   1023 KBytes       
+[  5]  41.00-42.00  sec   425 MBytes  3.57 Gbits/sec    0   1023 KBytes       
+[  5]  42.00-43.00  sec   407 MBytes  3.41 Gbits/sec    0   1023 KBytes       
+[  5]  43.00-44.00  sec   426 MBytes  3.58 Gbits/sec    0   1023 KBytes       
+[  5]  44.00-45.00  sec   433 MBytes  3.64 Gbits/sec    0   1023 KBytes       
+[  5]  45.00-46.00  sec   423 MBytes  3.54 Gbits/sec    0   1023 KBytes       
+[  5]  46.00-47.00  sec   432 MBytes  3.63 Gbits/sec    0   1023 KBytes       
+[  5]  47.00-48.00  sec   420 MBytes  3.52 Gbits/sec    0   1023 KBytes       
+[  5]  48.00-49.00  sec   430 MBytes  3.61 Gbits/sec    0   1023 KBytes       
+[  5]  49.00-50.00  sec   428 MBytes  3.59 Gbits/sec    0   1023 KBytes       
+[  5]  50.00-51.00  sec   449 MBytes  3.77 Gbits/sec    0   1023 KBytes       
+[  5]  51.00-52.00  sec   459 MBytes  3.85 Gbits/sec    0   1023 KBytes       
+[  5]  52.00-53.00  sec   448 MBytes  3.76 Gbits/sec    0   1023 KBytes       
+[  5]  53.00-54.00  sec   444 MBytes  3.72 Gbits/sec    0   1023 KBytes       
+[  5]  54.00-55.00  sec   423 MBytes  3.55 Gbits/sec    0   1023 KBytes       
+[  5]  55.00-56.00  sec   433 MBytes  3.64 Gbits/sec    0   1023 KBytes       
+[  5]  56.00-57.00  sec   426 MBytes  3.57 Gbits/sec    0   1023 KBytes       
+[  5]  57.00-57.04  sec  16.5 MBytes  3.44 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-57.04  sec  24.2 GBytes  3.64 Gbits/sec    1            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #7)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 41320
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 55817
+[ ID] Interval           Transfer     Bitrate         Total Datagrams
+[  5]   0.00-1.00   sec   962 MBytes  8.07 Gbits/sec  840908  
+[  5]   1.00-2.00   sec   979 MBytes  8.22 Gbits/sec  855700  
+[  5]   2.00-3.00   sec   977 MBytes  8.20 Gbits/sec  853829  
+[  5]   3.00-4.00   sec   954 MBytes  8.00 Gbits/sec  833277  
+[  5]   4.00-5.00   sec   976 MBytes  8.19 Gbits/sec  852777  
+[  5]   5.00-6.00   sec   979 MBytes  8.21 Gbits/sec  855199  
+[  5]   6.00-7.00   sec   978 MBytes  8.20 Gbits/sec  854197  
+[  5]   7.00-8.00   sec   966 MBytes  8.11 Gbits/sec  844382  
+[  5]   8.00-8.04   sec  39.4 MBytes  8.21 Gbits/sec  34441  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
+[  5]   0.00-8.04   sec  7.63 GBytes  8.15 Gbits/sec  0.000 ms  0/6824710 (0%)  sender
+-----------------------------------------------------------
+Server listening on 5202 (test #8)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 49248
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 49254
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   475 MBytes  3.98 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   396 MBytes  3.32 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   405 MBytes  3.40 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   394 MBytes  3.30 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   386 MBytes  3.24 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   372 MBytes  3.12 Gbits/sec    0   1023 KBytes       
+[  5]   6.00-7.00   sec   391 MBytes  3.28 Gbits/sec    0   1023 KBytes       
+[  5]   7.00-8.00   sec   369 MBytes  3.10 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.00   sec  3.11 GBytes  3.34 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #9)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 48310
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 48316
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   375 MBytes  3.14 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   376 MBytes  3.16 Gbits/sec    1    639 KBytes       
+[  5]   2.00-3.00   sec   362 MBytes  3.03 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   358 MBytes  3.01 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   378 MBytes  3.17 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   378 MBytes  3.18 Gbits/sec    0    639 KBytes       
+[  5]   6.00-7.00   sec   379 MBytes  3.18 Gbits/sec    0    639 KBytes       
+[  5]   7.00-8.00   sec   387 MBytes  3.24 Gbits/sec    0    639 KBytes       
+[  5]   8.00-8.00   sec   896 KBytes  5.56 Gbits/sec    0    639 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.00   sec  2.92 GBytes  3.14 Gbits/sec    1            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #10)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 33310
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 33320
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   372 MBytes  3.12 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   387 MBytes  3.25 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   373 MBytes  3.13 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   394 MBytes  3.30 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   416 MBytes  3.49 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   400 MBytes  3.35 Gbits/sec    0    639 KBytes       
+[  5]   6.00-7.00   sec   394 MBytes  3.30 Gbits/sec    0    639 KBytes       
+[  5]   7.00-8.00   sec   422 MBytes  3.54 Gbits/sec    0    639 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.00   sec  3.08 GBytes  3.31 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #11)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 36330
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 36340
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   359 MBytes  3.01 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   391 MBytes  3.28 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   390 MBytes  3.27 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   380 MBytes  3.19 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   386 MBytes  3.24 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   395 MBytes  3.31 Gbits/sec    0    639 KBytes       
+[  5]   6.00-7.00   sec   392 MBytes  3.29 Gbits/sec    0    639 KBytes       
+[  5]   7.00-8.00   sec   414 MBytes  3.47 Gbits/sec    0    639 KBytes       
+[  5]   8.00-9.00   sec   412 MBytes  3.46 Gbits/sec    0    639 KBytes       
+[  5]   9.00-10.00  sec   412 MBytes  3.45 Gbits/sec    0    639 KBytes       
+[  5]  10.00-11.00  sec   422 MBytes  3.54 Gbits/sec    0    639 KBytes       
+[  5]  11.00-12.00  sec   424 MBytes  3.56 Gbits/sec    0    639 KBytes       
+[  5]  12.00-13.00  sec   405 MBytes  3.39 Gbits/sec    0    639 KBytes       
+[  5]  13.00-14.00  sec   398 MBytes  3.34 Gbits/sec    0    639 KBytes       
+[  5]  14.00-15.00  sec   412 MBytes  3.45 Gbits/sec    0    639 KBytes       
+[  5]  15.00-16.00  sec   404 MBytes  3.39 Gbits/sec    0    639 KBytes       
+[  5]  16.00-17.00  sec   397 MBytes  3.33 Gbits/sec    0    639 KBytes       
+[  5]  17.00-18.00  sec   402 MBytes  3.37 Gbits/sec    0    639 KBytes       
+[  5]  18.00-19.00  sec   402 MBytes  3.37 Gbits/sec    0    639 KBytes       
+[  5]  19.00-20.00  sec   406 MBytes  3.40 Gbits/sec    0   1023 KBytes       
+[  5]  20.00-21.00  sec   417 MBytes  3.50 Gbits/sec    0   1023 KBytes       
+[  5]  21.00-22.00  sec   400 MBytes  3.35 Gbits/sec    0   1023 KBytes       
+[  5]  22.00-23.00  sec   404 MBytes  3.39 Gbits/sec    0   1023 KBytes       
+[  5]  23.00-24.00  sec   409 MBytes  3.43 Gbits/sec    0   1023 KBytes       
+[  5]  24.00-25.00  sec   429 MBytes  3.60 Gbits/sec    0   1023 KBytes       
+[  5]  25.00-26.00  sec   392 MBytes  3.29 Gbits/sec    0   1023 KBytes       
+[  5]  26.00-27.00  sec   418 MBytes  3.51 Gbits/sec    0   1023 KBytes       
+[  5]  27.00-28.00  sec   416 MBytes  3.49 Gbits/sec    0   1023 KBytes       
+[  5]  28.00-29.00  sec   412 MBytes  3.45 Gbits/sec    0   1023 KBytes       
+[  5]  29.00-30.00  sec   421 MBytes  3.53 Gbits/sec    0   1023 KBytes       
+[  5]  30.00-31.00  sec   425 MBytes  3.57 Gbits/sec    0   1023 KBytes       
+[  5]  31.00-32.00  sec   398 MBytes  3.33 Gbits/sec    0   1023 KBytes       
+[  5]  32.00-33.00  sec   399 MBytes  3.35 Gbits/sec    0   1023 KBytes       
+[  5]  33.00-34.00  sec   404 MBytes  3.39 Gbits/sec    0   1023 KBytes       
+[  5]  34.00-35.00  sec   419 MBytes  3.52 Gbits/sec    0   1023 KBytes       
+[  5]  35.00-36.00  sec   411 MBytes  3.45 Gbits/sec    0   1023 KBytes       
+[  5]  36.00-37.00  sec   409 MBytes  3.43 Gbits/sec    0   1023 KBytes       
+[  5]  37.00-38.00  sec   414 MBytes  3.47 Gbits/sec    0   1023 KBytes       
+[  5]  38.00-39.00  sec   406 MBytes  3.41 Gbits/sec    0   1023 KBytes       
+[  5]  39.00-40.00  sec   411 MBytes  3.44 Gbits/sec    0   1023 KBytes       
+[  5]  40.00-41.00  sec   416 MBytes  3.49 Gbits/sec    0   1023 KBytes       
+[  5]  41.00-42.00  sec   421 MBytes  3.53 Gbits/sec    0   1023 KBytes       
+[  5]  42.00-43.00  sec   419 MBytes  3.52 Gbits/sec    0   1023 KBytes       
+[  5]  43.00-44.00  sec   408 MBytes  3.42 Gbits/sec    0   1023 KBytes       
+[  5]  44.00-45.00  sec   418 MBytes  3.51 Gbits/sec    0   1023 KBytes       
+[  5]  45.00-46.00  sec   410 MBytes  3.44 Gbits/sec    0   1023 KBytes       
+[  5]  46.00-47.00  sec   409 MBytes  3.43 Gbits/sec    0   1023 KBytes       
+[  5]  47.00-48.00  sec   415 MBytes  3.48 Gbits/sec    0   1023 KBytes       
+[  5]  48.00-49.00  sec   424 MBytes  3.56 Gbits/sec    0   1023 KBytes       
+[  5]  49.00-50.00  sec   429 MBytes  3.60 Gbits/sec    0   1023 KBytes       
+[  5]  50.00-51.00  sec   420 MBytes  3.53 Gbits/sec    0   1023 KBytes       
+[  5]  51.00-52.00  sec   436 MBytes  3.66 Gbits/sec    0   1023 KBytes       
+[  5]  52.00-53.00  sec   420 MBytes  3.52 Gbits/sec    0   1023 KBytes       
+[  5]  53.00-54.00  sec   425 MBytes  3.56 Gbits/sec    0   1023 KBytes       
+[  5]  54.00-55.00  sec   426 MBytes  3.57 Gbits/sec    0   1023 KBytes       
+[  5]  55.00-56.00  sec   417 MBytes  3.50 Gbits/sec    0   1023 KBytes       
+[  5]  56.00-57.00  sec   420 MBytes  3.52 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-57.00  sec  22.8 GBytes  3.44 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #12)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 43346
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 37337
+[ ID] Interval           Transfer     Bitrate         Total Datagrams
+[  5]   0.00-1.00   sec   955 MBytes  8.01 Gbits/sec  834889  
+[  5]   1.00-2.00   sec   982 MBytes  8.24 Gbits/sec  857852  
+[  5]   2.00-3.00   sec   981 MBytes  8.23 Gbits/sec  857572  
+[  5]   3.00-4.00   sec   980 MBytes  8.22 Gbits/sec  856088  
+[  5]   4.00-5.00   sec   981 MBytes  8.23 Gbits/sec  856828  
+[  5]   5.00-6.00   sec   980 MBytes  8.22 Gbits/sec  856336  
+[  5]   6.00-7.00   sec   979 MBytes  8.21 Gbits/sec  855636  
+[  5]   7.00-8.00   sec   981 MBytes  8.23 Gbits/sec  857646  
+[  5]   8.00-8.00   sec   257 KBytes  8.15 Gbits/sec  219  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
+[  5]   0.00-8.00   sec  7.64 GBytes  8.20 Gbits/sec  0.000 ms  0/6833066 (0%)  sender
+-----------------------------------------------------------
+Server listening on 5202 (test #13)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 43330
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 43342
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   361 MBytes  3.02 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   404 MBytes  3.39 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   398 MBytes  3.34 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   417 MBytes  3.50 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   371 MBytes  3.11 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   385 MBytes  3.23 Gbits/sec    0    639 KBytes       
+[  5]   6.00-7.00   sec   408 MBytes  3.43 Gbits/sec    0    639 KBytes       
+[  5]   7.00-8.00   sec   400 MBytes  3.35 Gbits/sec    0    639 KBytes       
+[  5]   8.00-8.00   sec   896 KBytes  11.4 Gbits/sec    0    639 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.00   sec  3.07 GBytes  3.30 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #14)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 48520
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 48534
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   371 MBytes  3.11 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   360 MBytes  3.02 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   397 MBytes  3.33 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   374 MBytes  3.14 Gbits/sec    0    639 KBytes       
+[  5]   4.00-5.00   sec   388 MBytes  3.25 Gbits/sec    0    639 KBytes       
+[  5]   5.00-6.00   sec   386 MBytes  3.24 Gbits/sec    0    639 KBytes       
+[  5]   6.00-7.00   sec   385 MBytes  3.23 Gbits/sec    0    639 KBytes       
+[  5]   7.00-8.00   sec   376 MBytes  3.16 Gbits/sec    0    639 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.00   sec  2.97 GBytes  3.18 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #15)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 47678
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 47686
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   378 MBytes  3.16 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   377 MBytes  3.16 Gbits/sec    0    639 KBytes       
+[  5]   2.00-3.00   sec   384 MBytes  3.22 Gbits/sec    0    639 KBytes       
+[  5]   3.00-4.00   sec   397 MBytes  3.33 Gbits/sec    0   1023 KBytes       
+[  5]   4.00-5.00   sec   391 MBytes  3.28 Gbits/sec    0   1023 KBytes       
+[  5]   5.00-6.00   sec   380 MBytes  3.19 Gbits/sec    0   1023 KBytes       
+[  5]   6.00-7.00   sec   395 MBytes  3.32 Gbits/sec    0   1023 KBytes       
+[  5]   7.00-8.00   sec   415 MBytes  3.48 Gbits/sec    0   1023 KBytes       
+[  5]   8.00-8.00   sec  1.62 MBytes  14.5 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-8.00   sec  3.05 GBytes  3.27 Gbits/sec    0            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #16)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 47692
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 47704
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   378 MBytes  3.17 Gbits/sec    0    639 KBytes       
+[  5]   1.00-2.00   sec   374 MBytes  3.13 Gbits/sec    0   1023 KBytes       
+[  5]   2.00-3.00   sec   397 MBytes  3.33 Gbits/sec    0   1023 KBytes       
+[  5]   3.00-4.00   sec   379 MBytes  3.18 Gbits/sec    0   1023 KBytes       
+[  5]   4.00-5.00   sec   380 MBytes  3.19 Gbits/sec    0   1023 KBytes       
+[  5]   5.00-6.00   sec   391 MBytes  3.28 Gbits/sec    0   1023 KBytes       
+[  5]   6.00-7.00   sec   383 MBytes  3.21 Gbits/sec    0   1023 KBytes       
+[  5]   7.00-8.00   sec   378 MBytes  3.17 Gbits/sec    0   1023 KBytes       
+[  5]   8.00-9.00   sec   403 MBytes  3.38 Gbits/sec    0   1023 KBytes       
+[  5]   9.00-10.00  sec   400 MBytes  3.36 Gbits/sec    0   1023 KBytes       
+[  5]  10.00-11.00  sec   387 MBytes  3.25 Gbits/sec    0   1023 KBytes       
+[  5]  11.00-12.00  sec   416 MBytes  3.49 Gbits/sec    0   1023 KBytes       
+[  5]  12.00-13.00  sec   411 MBytes  3.45 Gbits/sec    0   1023 KBytes       
+[  5]  13.00-14.00  sec   398 MBytes  3.33 Gbits/sec    0   1023 KBytes       
+[  5]  14.00-15.00  sec   397 MBytes  3.33 Gbits/sec    0   1023 KBytes       
+[  5]  15.00-16.00  sec   408 MBytes  3.42 Gbits/sec    0   1023 KBytes       
+[  5]  16.00-17.00  sec   394 MBytes  3.30 Gbits/sec    0   1023 KBytes       
+[  5]  17.00-18.00  sec   406 MBytes  3.41 Gbits/sec    0   1023 KBytes       
+[  5]  18.00-19.00  sec   385 MBytes  3.23 Gbits/sec    0   1023 KBytes       
+[  5]  19.00-20.00  sec   384 MBytes  3.22 Gbits/sec    0   1023 KBytes       
+[  5]  20.00-21.00  sec   410 MBytes  3.44 Gbits/sec    0   1023 KBytes       
+[  5]  21.00-22.00  sec   379 MBytes  3.18 Gbits/sec    0   1023 KBytes       
+[  5]  22.00-23.00  sec   399 MBytes  3.34 Gbits/sec    0   1023 KBytes       
+[  5]  23.00-24.00  sec   381 MBytes  3.19 Gbits/sec    0   1023 KBytes       
+[  5]  24.00-25.00  sec   382 MBytes  3.21 Gbits/sec    0   1023 KBytes       
+[  5]  25.00-26.00  sec   402 MBytes  3.37 Gbits/sec    0   1023 KBytes       
+[  5]  26.00-27.00  sec   386 MBytes  3.24 Gbits/sec    0   1023 KBytes       
+[  5]  27.00-28.00  sec   392 MBytes  3.29 Gbits/sec    0   1023 KBytes       
+[  5]  28.00-29.00  sec   377 MBytes  3.16 Gbits/sec    0   1023 KBytes       
+[  5]  29.00-30.00  sec   377 MBytes  3.16 Gbits/sec    0   1023 KBytes       
+[  5]  30.00-31.00  sec   392 MBytes  3.29 Gbits/sec    0   1023 KBytes       
+[  5]  31.00-32.00  sec   388 MBytes  3.25 Gbits/sec    0   1023 KBytes       
+[  5]  32.00-33.00  sec   394 MBytes  3.30 Gbits/sec    0   1023 KBytes       
+[  5]  33.00-34.00  sec   367 MBytes  3.08 Gbits/sec    0   1023 KBytes       
+[  5]  34.00-35.00  sec   403 MBytes  3.38 Gbits/sec    0   1023 KBytes       
+[  5]  35.00-36.00  sec   396 MBytes  3.32 Gbits/sec    0   1023 KBytes       
+[  5]  36.00-37.00  sec   372 MBytes  3.12 Gbits/sec    0   1023 KBytes       
+[  5]  37.00-38.00  sec   387 MBytes  3.25 Gbits/sec    0   1023 KBytes       
+[  5]  38.00-39.00  sec   400 MBytes  3.36 Gbits/sec    0   1023 KBytes       
+[  5]  39.00-40.00  sec   399 MBytes  3.35 Gbits/sec    0   1023 KBytes       
+[  5]  40.00-41.00  sec   398 MBytes  3.33 Gbits/sec    1   1023 KBytes       
+[  5]  41.00-42.00  sec   389 MBytes  3.27 Gbits/sec    0   1023 KBytes       
+[  5]  42.00-43.00  sec   391 MBytes  3.28 Gbits/sec    0   1023 KBytes       
+[  5]  43.00-44.00  sec   417 MBytes  3.50 Gbits/sec    0   1023 KBytes       
+[  5]  44.00-45.00  sec   401 MBytes  3.36 Gbits/sec    0   1023 KBytes       
+[  5]  45.00-46.00  sec   385 MBytes  3.23 Gbits/sec    0   1023 KBytes       
+[  5]  46.00-47.00  sec   395 MBytes  3.31 Gbits/sec    0   1023 KBytes       
+[  5]  47.00-48.00  sec   394 MBytes  3.30 Gbits/sec    0   1023 KBytes       
+[  5]  48.00-49.00  sec   406 MBytes  3.40 Gbits/sec    0   1023 KBytes       
+[  5]  49.00-50.00  sec   410 MBytes  3.44 Gbits/sec    0   1023 KBytes       
+[  5]  50.00-51.00  sec   376 MBytes  3.15 Gbits/sec    0   1023 KBytes       
+[  5]  51.00-52.00  sec   376 MBytes  3.15 Gbits/sec    0   1023 KBytes       
+[  5]  52.00-53.00  sec   392 MBytes  3.29 Gbits/sec    0   1023 KBytes       
+[  5]  53.00-54.00  sec   387 MBytes  3.25 Gbits/sec    0   1023 KBytes       
+[  5]  54.00-55.00  sec   398 MBytes  3.34 Gbits/sec    0   1023 KBytes       
+[  5]  55.00-56.00  sec   402 MBytes  3.38 Gbits/sec    0   1023 KBytes       
+[  5]  56.00-57.00  sec   393 MBytes  3.29 Gbits/sec    0   1023 KBytes       
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-57.00  sec  21.8 GBytes  3.29 Gbits/sec    1            sender
+-----------------------------------------------------------
+Server listening on 5202 (test #17)
+-----------------------------------------------------------
+Accepted connection from 10.10.10.70, port 37462
+[  5] local 10.10.10.70 port 5202 connected to 10.10.10.70 port 41912
+[ ID] Interval           Transfer     Bitrate         Total Datagrams
+[  5]   0.00-1.00   sec   963 MBytes  8.08 Gbits/sec  841670  
+[  5]   1.00-2.00   sec   977 MBytes  8.19 Gbits/sec  853383  
+[  5]   2.00-3.00   sec   977 MBytes  8.20 Gbits/sec  853692  
+[  5]   3.00-4.00   sec   975 MBytes  8.18 Gbits/sec  851977  
+[  5]   4.00-5.00   sec   976 MBytes  8.19 Gbits/sec  853208  
+[  5]   5.00-6.00   sec   975 MBytes  8.18 Gbits/sec  852265  
+[  5]   6.00-7.00   sec   977 MBytes  8.19 Gbits/sec  853342  
+[  5]   7.00-8.00   sec   978 MBytes  8.20 Gbits/sec  854646  
+[  5]   8.00-8.00   sec  1.95 MBytes  8.25 Gbits/sec  1700  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
+[  5]   0.00-8.00   sec  7.62 GBytes  8.18 Gbits/sec  0.000 ms  0/6815883 (0%)  sender

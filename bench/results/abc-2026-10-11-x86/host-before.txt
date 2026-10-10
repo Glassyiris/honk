@@ -1,0 +1,331 @@
+2026-10-10T19:39:57+00:00
+Linux archlinux 7.2.3-arch1-3 #1 SMP PREEMPT_DYNAMIC Sun, 06 Sep 2026 13:01:04 +0000 x86_64 GNU/Linux
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           46 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  4
+On-line CPU(s) list:                     0-3
+Vendor ID:                               GenuineIntel
+Model name:                              13th Gen Intel(R) Core(TM) i5-13600K
+CPU family:                              6
+Model:                                   183
+Thread(s) per core:                      1
+Core(s) per socket:                      1
+Socket(s):                               4
+Stepping:                                1
+Microcode version:                       0x12f
+BogoMIPS:                                6988.80
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves avx_vnni arat vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize flush_l1d arch_capabilities
+Virtualization:                          VT-x
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               128 KiB (4 instances)
+L1i cache:                               256 KiB (4 instances)
+L2 cache:                                16 MiB (4 instances)
+L3 cache:                                96 MiB (4 instances)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-3
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Mitigation; Clear Register File
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+               total        used        free      shared  buff/cache   available
+Mem:            1952         644         481           0        1015        1307
+Swap:           2039         458        1581
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens3             UP             00:a0:98:04:2a:4b <BROADCAST,MULTICAST,UP,LOWER_UP> 
+tailscale0       UNKNOWN        <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> 
+gre0@NONE        DOWN           0.0.0.0 <NOARP> 
+gretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+erspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+hni-client@if312 UP             d2:0a:ba:32:48:c0 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+hni-server@if314 UP             1e:dc:a1:16:4c:08 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+veth-lab@if628   UP             ee:b6:8a:84:88:f8 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+0:	from all lookup local
+5210:	from all fwmark 0x80000/0xff0000 lookup main
+5230:	from all fwmark 0x80000/0xff0000 lookup default
+5250:	from all fwmark 0x80000/0xff0000 unreachable
+5270:	from all lookup 52
+32766:	from all lookup main
+32767:	from all lookup default
+lab (id: 2)
+honk-native-server (id: 1)
+honk-native-client (id: 0)
+table ip filter {
+	chain ts-input {
+		ip saddr 100.116.246.19 iifname "lo" counter packets 0 bytes 0 accept
+		iifname "tailscale0" counter packets 408260 bytes 50983056 accept
+		udp dport 41641 counter packets 20604 bytes 1236260 accept
+		ip saddr 100.115.92.0/23 iifname != "tailscale0" counter packets 0 bytes 0 return
+		ip saddr 100.64.0.0/10 iifname != "tailscale0" counter packets 421 bytes 23576 drop
+	}
+
+	chain ts-forward {
+		iifname "tailscale0" counter packets 49 bytes 6914 xt target "MARK"
+		meta mark & 0x00ff0000 == 0x00040000 counter packets 49 bytes 6914 accept
+		ip saddr 100.64.0.0/10 oifname "tailscale0" counter packets 0 bytes 0 drop
+		oifname "tailscale0" counter packets 78 bytes 7118 accept
+	}
+
+	chain INPUT {
+		type filter hook input priority filter; policy accept;
+		counter packets 170187373 bytes 2299705741630 jump ts-input
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		counter packets 60999915 bytes 1594590129591 jump ts-forward
+	}
+}
+table ip nat {
+	chain ts-postrouting {
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		counter packets 3609804 bytes 292823515 jump ts-postrouting
+	}
+}
+table ip6 filter {
+	chain ts-input {
+		ip6 saddr fd7a:115c:a1e0::bb32:f614 iifname "lo" counter packets 0 bytes 0 accept
+		iifname "tailscale0" counter packets 19633 bytes 2758037 accept
+		udp dport 41641 counter packets 19115 bytes 1758873 accept
+	}
+
+	chain ts-forward {
+		iifname "tailscale0" counter packets 0 bytes 0 xt target "MARK"
+		meta mark & 0x00ff0000 == 0x00040000 counter packets 0 bytes 0 accept
+		oifname "tailscale0" counter packets 0 bytes 0 accept
+	}
+
+	chain INPUT {
+		type filter hook input priority filter; policy accept;
+		counter packets 2593221 bytes 20606449485 jump ts-input
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		counter packets 36395 bytes 3696218 jump ts-forward
+	}
+}
+table ip6 nat {
+	chain ts-postrouting {
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		counter packets 905043 bytes 75573022 jump ts-postrouting
+	}
+}
+table ip mangle {
+	chain PREROUTING {
+		type filter hook prerouting priority mangle; policy accept;
+		xt match "conntrack" xt match "connmark" counter packets 183644 bytes 13007875 xt target "CONNMARK"
+	}
+
+	chain OUTPUT {
+		type route hook output priority mangle; policy accept;
+		xt match "conntrack" meta mark & 0x00ff0000 != 0x00000000 counter packets 9323678 bytes 559538838 xt target "CONNMARK"
+	}
+}
+table ip6 mangle {
+	chain PREROUTING {
+		type filter hook prerouting priority mangle; policy accept;
+		xt match "conntrack" xt match "connmark" counter packets 335417 bytes 36946211 xt target "CONNMARK"
+	}
+
+	chain OUTPUT {
+		type route hook output priority mangle; policy accept;
+		xt match "conntrack" meta mark & 0x00ff0000 != 0x00000000 counter packets 9279610 bytes 742523224 xt target "CONNMARK"
+	}
+}
+table ip labnat {
+	chain post {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "ens3" ip saddr 192.168.222.0/24 masquerade
+	}
+}
+xdp:
+
+tc:
+ens3(2) tcx/ingress ingress_rev_snat prog_id 58 link_id 4 
+ens3(2) tcx/egress egress_snat prog_id 61 link_id 9 
+
+flow_dissector:
+
+netfilter:
+
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0x00","0x00","0x00","0x00","0x0c","0x00","0x00","0x00","0x00","0x00","0x00","0x00"],"formatted":{"key":0,"value":{"lock":{"val":0},"next":12,"exhausted":0}}}]
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0xd3","0x00","0x00","0x00","0x00","0x00","0x00","0x00"]}]
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+    PID COMMAND         COMMAND
+      1 systemd         /usr/lib/systemd/systemd --switched-root --system --deserialize=56
+      2 kthreadd        [kthreadd]
+      3 pool_workqueue_ [pool_workqueue_release]
+      4 kworker/R-rcu_g [kworker/R-rcu_gp]
+      5 kworker/R-sync_ [kworker/R-sync_wq]
+      6 kworker/R-kvfre [kworker/R-kvfree_rcu_reclaim]
+      7 kworker/R-slub_ [kworker/R-slub_flushwq]
+      8 kworker/R-netns [kworker/R-netns]
+     13 kworker/R-mm_pe [kworker/R-mm_percpu_wq]
+     15 ksoftirqd/0     [ksoftirqd/0]
+     16 rcu_preempt     [rcu_preempt]
+     17 rcub/0          [rcub/0]
+     18 rcu_exp_par_gp_ [rcu_exp_par_gp_kthread_worker/0]
+     19 rcu_exp_gp_kthr [rcu_exp_gp_kthread_worker]
+     20 migration/0     [migration/0]
+     21 kprobe-optimize [kprobe-optimizer]
+     22 idle_inject/0   [idle_inject/0]
+     23 cpuhp/0         [cpuhp/0]
+     24 cpuhp/1         [cpuhp/1]
+     25 idle_inject/1   [idle_inject/1]
+     26 migration/1     [migration/1]
+     27 ksoftirqd/1     [ksoftirqd/1]
+     29 kworker/1:0H-kb [kworker/1:0H-kblockd]
+     30 cpuhp/2         [cpuhp/2]
+     31 idle_inject/2   [idle_inject/2]
+     32 migration/2     [migration/2]
+     33 ksoftirqd/2     [ksoftirqd/2]
+     36 cpuhp/3         [cpuhp/3]
+     37 idle_inject/3   [idle_inject/3]
+     38 migration/3     [migration/3]
+     39 ksoftirqd/3     [ksoftirqd/3]
+     41 kworker/3:0H-kb [kworker/3:0H-kblockd]
+     46 kdevtmpfs       [kdevtmpfs]
+     47 kworker/R-inet_ [kworker/R-inet_frag_wq]
+     48 rcu_tasks_kthre [rcu_tasks_kthread]
+     49 rcu_tasks_rude_ [rcu_tasks_rude_kthread]
+     50 kauditd         [kauditd]
+     51 khungtaskd      [khungtaskd]
+     52 oom_reaper      [oom_reaper]
+     54 kworker/R-write [kworker/R-writeback]
+     56 kcompactd0      [kcompactd0]
+     57 ksmd            [ksmd]
+     58 khugepaged      [khugepaged]
+     59 kworker/R-kbloc [kworker/R-kblockd]
+     60 kworker/R-blkcg [kworker/R-blkcg_punt_bio]
+     61 kworker/R-kinte [kworker/R-kintegrityd]
+     62 irq/9-acpi      [irq/9-acpi]
+     64 kworker/R-tpm_d [kworker/R-tpm_dev_wq]
+     65 kworker/R-ata_s [kworker/R-ata_sff]
+     66 kworker/R-edac- [kworker/R-edac-poller]
+     67 kworker/R-devfr [kworker/R-devfreq_wq]
+     68 watchdogd       [watchdogd]
+     69 kworker/R-quota [kworker/R-quota_events_unbound]
+     72 kswapd0         [kswapd0]
+     74 kworker/R-kthro [kworker/R-kthrotld]
+     75 kworker/R-acpi_ [kworker/R-acpi_thermal_pm]
+     77 scsi_eh_0       [scsi_eh_0]
+     78 kworker/R-scsi_ [kworker/R-scsi_tmf_0]
+     79 scsi_eh_1       [scsi_eh_1]
+     80 kworker/R-scsi_ [kworker/R-scsi_tmf_1]
+     81 scsi_eh_2       [scsi_eh_2]
+     82 kworker/R-scsi_ [kworker/R-scsi_tmf_2]
+     83 scsi_eh_3       [scsi_eh_3]
+     84 kworker/R-scsi_ [kworker/R-scsi_tmf_3]
+     85 scsi_eh_4       [scsi_eh_4]
+     86 kworker/R-scsi_ [kworker/R-scsi_tmf_4]
+     87 scsi_eh_5       [scsi_eh_5]
+     88 kworker/R-scsi_ [kworker/R-scsi_tmf_5]
+     99 kworker/R-mld   [kworker/R-mld]
+    100 kworker/R-ipv6_ [kworker/R-ipv6_addrconf]
+    101 kworker/R-kstrp [kworker/R-kstrp]
+    105 kworker/R-zswap [kworker/R-zswap-shrink]
+    106 kworker/u21:0   [kworker/u21:0]
+    107 kworker/u22:0   [kworker/u22:0]
+    109 kworker/u24:0   [kworker/u24:0]
+    110 kworker/u25:0   [kworker/u25:0]
+    112 kworker/3:1H-kb [kworker/3:1H-kblockd]
+    150 kworker/2:1H-kb [kworker/2:1H-kblockd]
+    152 scsi_eh_6       [scsi_eh_6]
+    154 kworker/R-scsi_ [kworker/R-scsi_tmf_6]
+    155 scsi_eh_7       [scsi_eh_7]
+    156 kworker/R-scsi_ [kworker/R-scsi_tmf_7]
+    159 kworker/0:1H-kb [kworker/0:1H-kblockd]
+    166 kworker/R-ttm   [kworker/R-ttm]
+    167 card1-crtc0     [card1-crtc0]
+    168 card1-crtc1     [card1-crtc1]
+    169 card1-crtc2     [card1-crtc2]
+    170 card1-crtc3     [card1-crtc3]
+    171 kworker/1:1H-kb [kworker/1:1H-kblockd]
+    180 jbd2/sda2-8     [jbd2/sda2-8]
+    181 kworker/R-ext4- [kworker/R-ext4-rsv-conversion]
+    225 systemd-journal /usr/lib/systemd/systemd-journald
+    251 systemd-userdbd /usr/lib/systemd/systemd-userdbd
+    260 psimon          [psimon]
+    267 systemd-udevd   /usr/lib/systemd/systemd-udevd
+    268 psimon          [psimon]
+    269 systemd-network /usr/lib/systemd/systemd-networkd
+    292 kworker/R-cfg80 [kworker/R-cfg80211]
+    326 dbus-broker-lau /usr/bin/dbus-broker-launch --scope system --audit
+    327 dbus-broker     dbus-broker --log 10 --controller 9 --machine-id 4b22b835c9b049dc8ad6e4a92a0906f8 --max-bytes 536870912 --max-fds 4096 --max-matches 16384 --audit
+    328 sshd            sshd: /usr/bin/sshd -D [listener] 0 of 10-100 startups
+    329 systemd-logind  /usr/lib/systemd/systemd-logind
+    331 tailscaled      /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641
+    342 login           login -- root
+    386 einat           /usr/local/bin/einat -c /etc/einat/config.toml
+    475 systemd         /usr/lib/systemd/systemd --user
+    477 (sd-pam)        (sd-pam)
+    482 psimon          [psimon]
+    485 bash            -bash
+  48111 kworker/u23:10- [kworker/u23:10-ttm]
+  48211 kworker/u23:0-t [kworker/u23:0-ttm]
+  69317 dirmngr         /usr/bin/dirmngr --homedir /etc/pacman.d/gnupg --supervised
+  88630 kworker/u16:0-i [kworker/u16:0-ipv6_addrconf]
+ 368737 kworker/2:2H    [kworker/2:2H]
+ 371237 kworker/0:2H    [kworker/0:2H]
+ 714320 psimon          [psimon]
+1073319 kworker/u16:1   [kworker/u16:1]
+1076977 kworker/2:2-eve [kworker/2:2-events]
+1080457 kworker/3:1-eve [kworker/3:1-events]
+1081765 kworker/1:2-eve [kworker/1:2-events]
+1084080 kworker/2:1-mem [kworker/2:1-memcg]
+1085763 kworker/u19:2-e [kworker/u19:2-events_power_efficient]
+1086198 kworker/u18:0-e [kworker/u18:0-events_power_efficient]
+1086284 kworker/u17:0-e [kworker/u17:0-events_power_efficient]
+1086287 kworker/u20:1-e [kworker/u20:1-ext4-rsv-conversion]
+1086301 kworker/u17:2-f [kworker/u17:2-flush-8:0]
+1086347 kworker/u20:2-e [kworker/u20:2-events_unbound]
+1086416 kworker/u19:1-e [kworker/u19:1-events_unbound]
+1086424 kworker/u19:0-e [kworker/u19:0-events_unbound]
+1086452 sshd-session    sshd-session: root [postauth]
+1086455 sshd-session    sshd-session: root@notty
+1086464 kworker/u18:2-e [kworker/u18:2-events_power_efficient]
+1086487 kworker/u17:1-e [kworker/u17:1-events_unbound]
+1086497 kworker/u18:4-e [kworker/u18:4-events_power_efficient]
+1086581 kworker/0:0-cgr [kworker/0:0-cgroup_release]
+1086582 kworker/1:1-cgr [kworker/1:1-cgroup_release]
+1086598 kworker/3:2-cgr [kworker/3:2-cgroup_free]
+1086645 kworker/u20:0-f [kworker/u20:0-flush-8:0]
+1086734 kworker/0:3-eve [kworker/0:3-events]
+1086857 systemd-userwor systemd-userwork: waiting...
+1086858 systemd-userwor systemd-userwork: waiting...
+1086859 kworker/u18:1-e [kworker/u18:1-events_power_efficient]
+1086860 systemd-userwor systemd-userwork: waiting...
+1086873 kworker/2:0     [kworker/2:0]
+1086878 kworker/u20:3-e [kworker/u20:3-events_power_efficient]
+1086879 sshd-session    sshd-session: root [postauth]
+1086882 sshd-session    sshd-session: root@notty
+1086883 ps              ps -eo pid,comm,args
+# Warning: table ip filter is managed by iptables-nft, do not touch!
+# Warning: table ip6 filter is managed by iptables-nft, do not touch!
+# Warning: table ip mangle is managed by iptables-nft, do not touch!
+# Warning: table ip6 mangle is managed by iptables-nft, do not touch!

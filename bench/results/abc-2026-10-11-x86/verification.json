@@ -1,0 +1,44 @@
+{
+  "source_revision": "f65f05486bc46b9576f067a755c375a52c0ddc97",
+  "build": {
+    "command": "env PATH=/root/.cargo/bin:$PATH CARGO_TARGET_DIR=/root/.herdr/worktrees/honk/feat-native-api/target CARGO_BUILD_JOBS=8 just build-musl ebpf,native-api",
+    "result": "passed",
+    "output": "static-build.stdout",
+    "warnings": [
+      "two unused BoringSSL library search directories in linker stderr"
+    ]
+  },
+  "outbound_gate": {
+    "command": "env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY PATH=/root/.cargo/bin:$PATH CARGO_TARGET_DIR=/root/.herdr/worktrees/honk/feat-native-api/target CARGO_BUILD_JOBS=6 sh ci/outbound-ci.sh",
+    "result": "passed",
+    "output": "outbound-gate.stdout"
+  },
+  "criterion_smoke": {
+    "command": "env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY PATH=/root/.cargo/bin:$PATH CARGO_TARGET_DIR=/root/.herdr/worktrees/honk/feat-native-api/target CARGO_BUILD_JOBS=6 cargo bench -p honk-outbound --profile dev --bench group_selection -- --test",
+    "result": "passed",
+    "cases": 7,
+    "output": "outbound-gate.stdout"
+  },
+  "collector": {
+    "command": "python3 bench/tests/latency_stability_test.py",
+    "result": "passed",
+    "tests": 5
+  },
+  "shell_syntax": {
+    "command": "bash -n bench/lab-bench.sh",
+    "result": "passed"
+  },
+  "real_route_attribution": {
+    "result": "passed",
+    "proxy_tcp_routes": 18,
+    "proxy_udp_routes": 18,
+    "direct_controls": 3,
+    "evidence": "attribution-ready.json"
+  },
+  "not_run": [
+    "full workspace suite",
+    "just test-routing",
+    "just test-netns",
+    "ARM benchmark"
+  ]
+}

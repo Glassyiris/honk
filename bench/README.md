@@ -1,7 +1,7 @@
 # Lab benchmark harness
 
-`lab-bench.sh` is the single A/B benchmark harness for honk vs dae on the
-lab (see `doc/benchmark.en.md` for the topology and the latest results).
+`lab-bench.sh` is the A/B/C benchmark harness for honk, upstream dae and
+sing-box (see `doc/benchmark.en.md` for topology and dated results).
 It replaces the old `bench.sh` / `bench-cold.sh` / `bench-cpu.sh` /
 `bench-honest.sh` script set.
 
@@ -9,15 +9,15 @@ It replaces the old `bench.sh` / `bench-cold.sh` / `bench-cpu.sh` /
 
 Per engine × protocol:
 
-- **cold** — first-request latency on a freshly restarted engine (3 runs,
-  median; health checks are set to 3600s in both lab configs so they don't
-  race the measurement)
+- **cold** — first HTTP request after a fresh daemon restart and readiness
+  delay (3 runs, median). A 3600s interval limits periodic probes, but startup
+  probes/pools can already be warm; this is not a guaranteed cold handshake.
 - **hot p50/p95** — open-stream latency over 15 requests (proxy session
   already warm); only 2xx/3xx responses count, otherwise the row is `invalid`
 - **bw** — iperf3 `-R` download, 3 runs, median receiver bitrate
 - **cpu** — engine CPU cores during the median bandwidth run
   (`/proc/<pid>/stat` utime+stime delta over wall time)
-- **rss** — engine RSS after the bandwidth runs
+- **rss** — integer MiB (`VmRSS / 1024`) after the bandwidth runs
 - **loaded latency stability** — 200 new HTTP streams at a fixed 250 ms
   cadence while one reverse iperf3 stream loads the same outbound; reports
   load, p50/p95/p99/max, and failures, with one JSONL row per attempt
@@ -67,8 +67,9 @@ lifecycle.
 Stdout contains the conventional throughput table followed by the loaded
 latency-stability table. Standard rows append to `TSV` (default
 `/root/bench-results.tsv`); stability rows append to `STABILITY_TSV`, while
-raw samples, summaries, and iperf3 JSON go under `STABILITY_DIR`. The driver
-prints host/kernel and honk/dae SHA-256 identities on stderr.
+raw samples, summaries, and iperf3 JSON go under `STABILITY_DIR`, including
+every regular TCP/UDP bandwidth JSON. The driver prints host/kernel and all
+three binary SHA-256 identities on stderr.
 
 ## Requirements on the lab
 
@@ -82,6 +83,11 @@ prints host/kernel and honk/dae SHA-256 identities on stderr.
   harness uses the API listener to identify the *active* engine process
   (a second honk instance parked on the singleton flock reports zero CPU
   and would poison the metrics).
+- Use non-colliding node/group names with current honk; the measured configs
+  and complete invocation are frozen in `results/abc-2026-10-11-x86/`.
+- Check client/server clock skew before SS2022: its timestamp validation must
+  remain enabled. The 2026-10-11 preflight rejected all three clients at a
+  35-second offset before host-clock calibration.
 - Live targets on 10.10.10.70: HTTP `8001-8006`, iperf3 `5201-5206`,
   direct controls `8080`/`5300`, and UDP echo `53531-53536`; churn/reload
   servers use `18006-18007` (`18007/big.bin` is the throttled long stream).
@@ -152,14 +158,15 @@ bash bench/tests/runtime-memory-cli.sh
 
 ## sing-box as a third engine
 
-`lab-bench.sh sing-box '<protos>'` runs sing-box 1.13.14 as a TUN client
-**inside** the lab netns (`bench/sb-client.json` → `/root/sb-client.json`,
-binary at `/root/sing-box`): client traffic hits the TUN, per-port route
-rules pick the outbound, outbounds bind `veth-client`. Because no gateway
-engine is running, the host must plain-forward lab traffic — the harness
-assumes an idempotent masquerade (`/root/setup-nat.sh`, table `labnat`,
-saddr 192.168.222.0/24 oif ens3). After each sing-box run the netns is
-rebuilt (its TUN auto_route rewrites the routing table).
+`lab-bench.sh 'honk dae sing-box' '<protos>'` includes a sing-box TUN client
+**inside** the lab netns. `SB_BIN` and `SB_CONFIG` override the defaults
+`/root/sing-box` and `/root/sb-client.json` without replacing existing files.
+Client traffic hits the TUN, per-port rules choose the outbound, and outbounds
+bind `veth-client`; UDP echo ports are explicit proxy routes too. With no
+gateway engine running, the host plain-forwards through table `labnat`
+(`saddr 192.168.222.0/24 oif ens3 masquerade`). After each sing-box run,
+`/root/setup-netns.sh` rebuilds the lab netns because TUN auto_route rewrites
+its routes; a snapshot is included in the current campaign's evidence.
 
 ## UDP measurements
 
@@ -168,9 +175,10 @@ Each UDP-capable protocol row gets a `<proto>/udp` companion row: echo RTT
 53530–53536) and iperf3 `-u -b 10G -l 1200 -R` (receiver bps + loss at a
 saturating offered rate). Datagrams are pinned to 1200 B: QUIC datagrams cap
 near that — honk's hy2/tuic drop oversized datagrams (protocol-normal;
-iperf3's ~1448 B default would measure the cap, not the tunnel). honk's
-VLESS/VMess variants have no packet handler, so the harness writes explicit
-`n/a` fields and does not accidentally measure a direct fallback.
+iperf3's ~1448 B default would measure the cap, not the tunnel). The retained
+rprx branch of this driver reports VLESS/VMess UDP as `n/a`; it was not rerun
+in the 2026-10-11 six-protocol matrix. This is a harness-coverage limit, not a
+declaration of current honk VLESS capability.
 
 ## Loaded latency stability
 

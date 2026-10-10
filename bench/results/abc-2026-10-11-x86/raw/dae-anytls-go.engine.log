@@ -1,0 +1,28 @@
+[2026-10-10 20:18:32]  INFO Include config files: [/root/honk-bench-abc-20261011/dae-lab.dae]
+[2026-10-10 20:18:32]  WARN so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture
+[2026-10-10 20:18:32]  INFO purging stale TC filters before startup
+[2026-10-10 20:18:32]  INFO Waiting for network...
+[2026-10-10 20:18:33]  INFO Network online.
+[2026-10-10 20:18:33]  INFO Network check took 694.731044ms (1 attempt(s))
+[2026-10-10 20:18:33]  INFO Building control plane and routing rules...
+[2026-10-10 20:18:33]  INFO Kernel v7.2.3 supports Netkit, attempting to create Netkit device pair
+[2026-10-10 20:18:33]  INFO Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)
+[2026-10-10 20:18:33]  INFO Successfully created Netkit device pair dae0 <-> dae0peer using netlink API
+[2026-10-10 20:18:33]  INFO Successfully created Netkit device pair (performance mode)
+[2026-10-10 20:18:33]  INFO Loading eBPF programs and maps into the kernel...
+[2026-10-10 20:18:33]  INFO The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure.
+[2026-10-10 20:18:33]  INFO Safely enabled bpf_redirect_peer() (kernel v7.2.3, netkit+scrub=NONE)
+[2026-10-10 20:18:33]  INFO sysctl /proc/sys/net/ipv4/conf/dae0/rp_filter has unexpected value 2, expected 0
+[2026-10-10 20:18:33]  INFO Loaded eBPF programs and maps
+[2026-10-10 20:18:33]  WARN AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.
+[2026-10-10 20:18:33]  INFO Optimizing and loading routing rules (this may take a while for large rule sets)...
+[2026-10-10 20:18:33]  INFO Building routing matcher...
+[2026-10-10 20:18:33]  INFO Loading routing rules into kernel space (BPF)...
+[2026-10-10 20:18:33]  INFO Routing match set len: 25/1024
+[2026-10-10 20:18:33]  INFO Building userspace routing matcher...
+[2026-10-10 20:18:33]  INFO Health check will only verify 7 outbounds referenced by routing rules: [proxy-ss2022 proxy-trojan proxy-anytls-sb proxy-anytls-go direct proxy-hy2 proxy-tuic]
+[2026-10-10 20:18:33]  INFO Memory usage after routing build: Alloc=5MiB, Sys=30MiB, HeapObjects=14967
+[2026-10-10 20:18:33]  INFO Bind to LAN: veth-lab
+[2026-10-10 20:18:33]  INFO Bind to WAN: ens3
+[2026-10-10 20:18:33]  INFO Control plane built in 293.518303ms
+[2026-10-10 20:18:33]  INFO Total startup time: 988.45411ms

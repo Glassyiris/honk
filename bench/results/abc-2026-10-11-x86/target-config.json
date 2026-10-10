@@ -1,0 +1,24 @@
+{
+  "bind": "10.10.10.70",
+  "cert": "/tmp/honk-bench-abc-20261011/cert.pem",
+  "key": "/tmp/honk-bench-abc-20261011/key.pem",
+  "http_ports": [
+    8001,
+    8002,
+    8003,
+    8004,
+    8005,
+    8006,
+    8080
+  ],
+  "https_ports": [],
+  "udp_ports": [
+    53531,
+    53532,
+    53533,
+    53534,
+    53535,
+    53536
+  ],
+  "dns_port": 53539
+}

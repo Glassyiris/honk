@@ -1,0 +1,33 @@
+Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess
+udp   UNCONN 0      0            0.0.0.0:12345      0.0.0.0:*    users:(("honk-core",pid=1262137,fd=30))
+udp   UNCONN 0      0            0.0.0.0:12345      0.0.0.0:*    users:(("honk-core",pid=1262137,fd=29))
+udp   UNCONN 0      0            0.0.0.0:12345      0.0.0.0:*    users:(("honk-core",pid=1262137,fd=28))
+udp   UNCONN 0      0            0.0.0.0:12345      0.0.0.0:*    users:(("honk-core",pid=1262137,fd=27))
+udp   UNCONN 0      0         127.0.0.54:53         0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=24))
+udp   UNCONN 0      0      127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=22))
+udp   UNCONN 0      0            0.0.0.0:5353       0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=17))
+udp   UNCONN 0      0            0.0.0.0:5355       0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=13))
+udp   UNCONN 0      0               [::]:12345         [::]:*    users:(("honk-core",pid=1262137,fd=31))
+udp   UNCONN 0      0               [::]:12345         [::]:*    users:(("honk-core",pid=1262137,fd=32))
+udp   UNCONN 0      0               [::]:12345         [::]:*    users:(("honk-core",pid=1262137,fd=33))
+udp   UNCONN 0      0               [::]:12345         [::]:*    users:(("honk-core",pid=1262137,fd=34))
+udp   UNCONN 0      0               [::]:5353          [::]:*    users:(("systemd-resolve",pid=568,fd=18))
+udp   UNCONN 0      0               [::]:5355          [::]:*    users:(("systemd-resolve",pid=568,fd=15))
+tcp   LISTEN 0      512        127.0.0.1:7878       0.0.0.0:*    users:(("omp",pid=572765,fd=51))
+tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=707,fd=6))
+tcp   LISTEN 0      4096         0.0.0.0:5355       0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=14))
+tcp   LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=23))
+tcp   LISTEN 0      4096      127.0.0.54:53         0.0.0.0:*    users:(("systemd-resolve",pid=568,fd=25))
+tcp   LISTEN 0      512        127.0.0.1:44827      0.0.0.0:*    users:(("omp",pid=748722,fd=57))
+tcp   LISTEN 0      128          0.0.0.0:12345      0.0.0.0:*    users:(("honk-core",pid=1262137,fd=25))
+tcp   LISTEN 0      512        127.0.0.1:42951      0.0.0.0:*    users:(("omp",pid=572765,fd=53))
+tcp   LISTEN 0      128        127.0.0.1:9527       0.0.0.0:*    users:(("honk-core",pid=1262137,fd=24))
+tcp   LISTEN 0      128             [::]:22            [::]:*    users:(("sshd",pid=707,fd=7))
+tcp   LISTEN 0      4096            [::]:5355          [::]:*    users:(("systemd-resolve",pid=568,fd=16))
+tcp   LISTEN 0      4096               *:8787             *:*    users:(("static-web-serv",pid=4142920,fd=3),("static-web-serv",pid=4142920,fd=1),("static-web-serv",pid=4142920,fd=0),("systemd",pid=1,fd=345))
+tcp   LISTEN 0      128             [::]:12345         [::]:*    users:(("honk-core",pid=1262137,fd=26))
+    PID COMMAND   COMMAND
+1262137 honk-core /root/.herdr/worktrees/honk/feat-native-api/target/debug/honk-core -c /tmp/hk/c.dae --mock-ebpf --data-dir /tmp/hk/data
+
+
+Wall time: 0.07 seconds
