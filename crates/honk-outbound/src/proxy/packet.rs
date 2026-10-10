@@ -15,7 +15,7 @@ pub struct QuicSendToken {
     pub(crate) ack_epoch: u64,
     pub(crate) ack_baseline: u64,
     pub(crate) sent_baseline: u64,
-    pub(crate) started_at: u64,
+    active: bool,
 }
 
 impl QuicSendToken {
@@ -23,25 +23,20 @@ impl QuicSendToken {
         ack_epoch: 0,
         ack_baseline: 0,
         sent_baseline: 0,
-        started_at: 0,
+        active: false,
     };
 
-    pub(crate) fn new(
-        ack_epoch: u64,
-        ack_baseline: u64,
-        sent_baseline: u64,
-        started_at: u64,
-    ) -> Self {
+    pub(crate) fn new(ack_epoch: u64, ack_baseline: u64, sent_baseline: u64) -> Self {
         Self {
             ack_epoch,
             ack_baseline,
             sent_baseline,
-            started_at,
+            active: true,
         }
     }
 
     pub(crate) fn is_active(self) -> bool {
-        self.started_at != 0
+        self.active
     }
 }
 

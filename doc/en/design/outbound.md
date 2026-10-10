@@ -803,11 +803,13 @@ cooldown, never shrinks automatically, and applies to the live connection and
 active/future streams without reconnecting. Zero-progress samples preserve a pending
 promotion only while the corresponding connection credit remains pressured.
 Native TUIC and Hysteria2 UDP
-endpoints use a per-send deadline of `clamp(4 × SRTT, 1 s, 5 s)`. Three
-consecutive send deadlines, or no newly acknowledged QUIC packet is observed for
-`max(8 × SRTT, 10 s)`, retires the endpoint and closes that connection so the
-next flow redials. A successful send resets the send streak; observed delivery
-progress resets both clocks. Attempted UDP packets are never replayed. TUIC
+endpoints use a per-send deadline of `clamp(4 × SRTT, 1 s, 5 s)`; a deadline
+alone never closes the connection, because Quinn parks a send while
+congestion control holds capacity. The path watchdog closes the connection, so the next flow
+redials, only when no newly acknowledged QUIC packet is observed for
+`max(8 × SRTT, 10 s)` while at least three ack-eliciting packets sent since
+the last acknowledgement are still unacknowledged. Observed delivery
+progress resets that clock. Attempted UDP packets are never replayed. TUIC
 also enables Quinn PING keepalive, including its UDP-over-stream fallback where
 protocol heartbeat datagrams are unavailable.
 
