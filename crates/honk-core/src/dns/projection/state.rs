@@ -31,7 +31,12 @@ fn aggregate_domains(
     owners: &BTreeSet<FamilyOwner>,
 ) -> Option<DomainRouting> {
     let mut aggregate = None;
+    let mut previous = None;
+    // Both family owners of one name may share a canonical IP; the bitmap is per name.
     for (domain, _) in owners {
+        if previous.replace(domain) == Some(domain) {
+            continue;
+        }
         if let Some(bitmap) = snapshot.bitmap_for(domain) {
             or_bitmap(aggregate.get_or_insert_default(), &bitmap);
         }
