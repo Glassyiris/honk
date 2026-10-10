@@ -31,6 +31,10 @@ pub const ROUTE_FACT_SOURCE: u32 = 1 << 2;
 pub const ROUTE_FACT_MAC: u32 = 1 << 3;
 pub const ROUTE_FACT_PRESENT_SHIFT: u32 = 16;
 
+pub const ROUTING_INPUT_MAC_PRESENT: u32 = 1;
+/// Rule-mode permission captured by the static caller, never a second map read.
+pub const ROUTING_INPUT_ALLOW_DIRECT_FINALITY: u32 = 1 << 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoutingInput {
@@ -45,7 +49,8 @@ pub struct RoutingInput {
     pub dscp: u32,
     pub is_wan: u32,
     pub pname_len: u32,
-    pub mac_present: u32,
+    /// MAC provenance and captured direct-finality permission.
+    pub flags: u32,
 }
 
 impl Default for RoutingInput {
@@ -263,7 +268,7 @@ const _: () = assert!(core::mem::offset_of!(RoutingInput, ip_version) == 108);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, dscp) == 112);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, is_wan) == 116);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, pname_len) == 120);
-const _: () = assert!(core::mem::offset_of!(RoutingInput, mac_present) == 124);
+const _: () = assert!(core::mem::offset_of!(RoutingInput, flags) == 124);
 const _: () = assert!(core::mem::align_of::<RoutingDecision>() == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, outbound) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingDecision, mark) == 4);

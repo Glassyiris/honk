@@ -9,9 +9,10 @@ use aya_ebpf::bindings::__sk_buff;
 
 use aya_ebpf_cty::c_long;
 use honk_ebpf_common::{
-    DATAPATH_FLAG_TRACE_ENABLED, L4ProtoType, ROUTE_TRACE_AMBIGUOUS, ROUTE_TRACE_DNS_OVERRIDE,
-    ROUTE_TRACE_ENABLED, ROUTE_TRACE_LOST, ROUTE_TRACE_VERSION, ROUTING_FEATURE_PROCESS,
-    ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
+    DATAPATH_FLAG_OFFLOAD_RULE_DIRECT, DATAPATH_FLAG_TRACE_ENABLED, L4ProtoType,
+    ROUTE_TRACE_AMBIGUOUS, ROUTE_TRACE_DNS_OVERRIDE, ROUTE_TRACE_ENABLED, ROUTE_TRACE_LOST,
+    ROUTE_TRACE_VERSION, ROUTING_FEATURE_PROCESS, ROUTING_INPUT_ALLOW_DIRECT_FINALITY,
+    ROUTING_INPUT_MAC_PRESENT, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
 };
 use honk_ebpf_common::{KernelRouteOutput, KernelRouteWitness};
 
@@ -166,6 +167,12 @@ fn evaluate_policy(
     if trace_enabled {
         output.flags = ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED;
     }
+    input.flags = (input.flags & ROUTING_INPUT_MAC_PRESENT)
+        | if flags & DATAPATH_FLAG_OFFLOAD_RULE_DIRECT != 0 {
+            ROUTING_INPUT_ALLOW_DIRECT_FINALITY
+        } else {
+            0
+        };
     let status = match descriptor.slot {
         0 => unsafe { honk_route_slot0(input, output) },
         1 => unsafe { honk_route_slot1(input, output) },
@@ -306,7 +313,7 @@ pub fn captured_generation(trace_id: u32) -> u64 {
 ///
 /// Addresses are copied as wire bytes. Ports are host-order integers. The
 /// six-byte MAC occupies the final six bytes of the canonical 16-byte key;
-/// `mac_present` distinguishes a real L2 fact from an absent L3 header.
+/// the MAC-presence flag distinguishes a real L2 fact from an absent L3 header.
 #[inline(always)]
 pub fn build_input(
     input: &mut RoutingInput,
@@ -327,6 +334,6 @@ pub fn build_input(
     input.is_wan = is_wan as u32;
     if let Some(mac) = mac {
         input.mac[10..].copy_from_slice(mac);
-        input.mac_present = 1;
+        input.flags = ROUTING_INPUT_MAC_PRESENT;
     }
 }

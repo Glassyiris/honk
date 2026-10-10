@@ -1,4 +1,5 @@
 use super::*;
+mod direct_finality;
 mod dns_ownership;
 mod native_trace;
 mod predicate_semantics;
@@ -37,7 +38,7 @@ fn input(connection: &ConnectionInfo) -> RoutingInput {
         for (index, byte) in mac.split(':').enumerate() {
             input.mac[10 + index] = u8::from_str_radix(byte, 16).unwrap();
         }
-        input.mac_present = 1;
+        input.flags = honk_ebpf_common::ROUTING_INPUT_MAC_PRESENT;
     }
     input
 }
@@ -461,6 +462,9 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
     let mac_router = Router::new(&mac_rules, "direct").unwrap();
     let mac_plan = RoutingPushPlan::compile(&mac_router, &outbound_ids(), DialMode::Ip).unwrap();
     backend.publish_routing_plan(&mac_plan, &[]).unwrap();
+    backend
+        .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT)
+        .unwrap();
     let mut zero_mac = golden::connection();
     zero_mac.mac = Some("00:00:00:00:00:00".into());
     let absent_mac = golden::connection();
@@ -799,6 +803,9 @@ fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() 
     let integer = name("u32");
     let structure = name("RoutingDecision");
     let slot = name("honk_route_slot0");
+    let input_structure = name("RoutingInput");
+    let input_flags = name("flags");
+    let old_mac_present = name("mac_present");
     let fields = [
         "outbound",
         "mark",
@@ -829,6 +836,15 @@ fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() 
     for (index, field) in fields.into_iter().enumerate() {
         types.extend([field, 1, index as u32 * 32]);
     }
+    let input_offset = types.len();
+    types.extend([
+        input_structure,
+        (4 << 24) | 1,
+        size_of::<RoutingInput>() as u32,
+        input_flags,
+        1,
+        offset_of!(RoutingInput, flags) as u32 * 8,
+    ]);
     let output_offset = types.len();
     types.extend([
         output,
@@ -836,13 +852,18 @@ fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() 
         size_of::<KernelRouteOutput>() as u32,
     ]);
     for (index, (field, offset)) in output_fields.into_iter().enumerate() {
-        // The decision is type 2; other member types are not inspected.
-        types.extend([field, if index == 0 { 2 } else { 1 }, offset]);
+        let field_type = match index {
+            0 => 2,
+            5 => 3,
+            _ => 1,
+        };
+        types.extend([field, field_type, offset]);
     }
-    types.extend([0, 2 << 24, 3]); // pointer to the output struct
+    types.extend([0, 2 << 24, 4]);
+    types.extend([0, 2 << 24, 3]);
     let prototype_offset = types.len();
-    types.extend([0, (13 << 24) | 2, 1, 0, 4, 0, 4]);
-    types.extend([slot, (12 << 24) | 1, 5]);
+    types.extend([0, (13 << 24) | 2, 1, 0, 6, 0, 5]);
+    types.extend([slot, (12 << 24) | 1, 7]);
     let encode = |types: &[u32]| {
         let mut bytes = vec![0x9f, 0xeb, 1, 0];
         for word in [
@@ -864,9 +885,14 @@ fn routing_output_abi_rejects_old_size_wrong_offsets_and_nonpointer_parameter() 
     for (word, replacement) in [
         (structure_offset + 2, 20),
         (structure_offset + 3 + 5 * 3 + 2, 128),
+        (input_offset + 2, 124),
+        (input_offset + 3, old_mac_present),
+        (input_offset + 5, 120 * 8),
+        (input_offset + 4, 2),
         (output_offset + 2, 264),
         (output_offset + 3 + 2, 32),
         (output_offset + 3 + 1, 1),
+        (prototype_offset + 4, 5),
         (prototype_offset + 6, 3),
     ] {
         let mut incompatible = types.clone();

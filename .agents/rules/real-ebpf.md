@@ -13,6 +13,12 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
 
+`RoutingInput.flags` reuses the final 32-bit word for independent MAC presence
+and direct-finality permission captured from the caller's Rule-mode flags.
+Only domain-independent live prefixes may use that permission; Global retains
+its previous handoff/sniff authority. Keep the 128-byte input/328-byte witness
+sizes and reject old `mac_present` objects through nested-input BTF validation.
+
 Native routing keeps domain resolution in the prologue for `domain_final`.
 Complete positive/negative port conditions precede the other conditions within
 each rule; non-domain facts use per-invocation READY-guarded bitmap copy/zero-fill.
