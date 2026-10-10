@@ -344,15 +344,22 @@ impl DnsController {
     ) {
         use crate::dns::outcome::{OutcomeStatus, ResponseClass};
         use crate::dns::projection::ProjectionObservation;
+        use honk_outbound::alive::IpVersion;
 
         let domain = outcome.domain();
+        let family = match outcome.qtype() {
+            1 => Some(IpVersion::V4),
+            28 => Some(IpVersion::V6),
+            _ => None,
+        };
         let observation = if crate::dns::response::is_truncated(outcome.reusable()) {
             ProjectionObservation::Retain
         } else {
-            match (outcome.status(), outcome.response_class()) {
-                (OutcomeStatus::Accepted, ResponseClass::Positive) => {
+            match (outcome.status(), outcome.response_class(), family) {
+                (OutcomeStatus::Accepted, ResponseClass::Positive, Some(family)) => {
                     ProjectionObservation::Positive {
                         domain,
+                        family,
                         ips: outcome.answer_ips(),
                         // Uncacheable does not mean the accepted address has no routing lifetime.
                         advertised_ttl: if outcome.expiry().is_cacheable() {
@@ -364,11 +371,20 @@ impl DnsController {
                         },
                     }
                 }
-                (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {
-                    ProjectionObservation::Clear { domain }
+                (OutcomeStatus::Accepted, ResponseClass::Nodata, Some(family)) => {
+                    ProjectionObservation::Clear { domain, family }
                 }
-                (OutcomeStatus::Accepted, ResponseClass::Servfail)
-                | (OutcomeStatus::Rejected, _) => ProjectionObservation::Retain,
+                (OutcomeStatus::Accepted, ResponseClass::Nxdomain, _) => {
+                    ProjectionObservation::ClearName { domain }
+                }
+                // Other QTYPEs say nothing about the name's addresses.
+                (
+                    OutcomeStatus::Accepted,
+                    ResponseClass::Positive | ResponseClass::Nodata,
+                    None,
+                )
+                | (OutcomeStatus::Accepted, ResponseClass::Servfail, _)
+                | (OutcomeStatus::Rejected, _, _) => ProjectionObservation::Retain,
             }
         };
         self.routing_projection

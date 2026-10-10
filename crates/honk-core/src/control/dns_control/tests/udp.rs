@@ -124,6 +124,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",
+            family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
             advertised_ttl: Duration::from_secs(30),
         },
@@ -157,6 +158,78 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     assert_eq!(projected_again[0].1.bitmap, projected[0].1.bitmap);
     persister.shutdown().await.expect("persistence shutdown");
     assert!(database.load_dns().expect("persisted rows").is_empty());
+    controller.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn projection_follows_query_family_until_nxdomain() {
+    struct QtypeUpstream;
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for QtypeUpstream {
+        async fn query(&self, _name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let (_, qtype) = crate::dns::forwarder::parse_dns_question(raw).expect("question");
+            if qtype == 1 {
+                return Ok(a_response(raw, [192, 0, 2, 10]));
+            }
+            let mut reply = raw.to_vec();
+            reply[2] = 0x81;
+            reply[3] = if qtype == 16 { 0x83 } else { 0x80 };
+            Ok(reply)
+        }
+    }
+
+    let forwarder = Arc::new(DnsForwarder::new(
+        Arc::new(QtypeUpstream),
+        Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+        Arc::new(
+            crate::dns::routing::DnsRouter::new_from_dns_config(&Default::default())
+                .expect("DNS router"),
+        ),
+    ));
+    let (controller, _ebpf) = projection_controller(forwarder);
+    let snapshot = Arc::clone(
+        controller
+            .runtime_provider()
+            .try_acquire()
+            .unwrap()
+            .runtime()
+            .routing_projection(),
+    );
+    let v4 = std::net::IpAddr::from([192, 0, 2, 10]);
+    let v6 = std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
+    controller.routing_projection.submit(
+        Arc::clone(&snapshot),
+        crate::dns::projection::ProjectionObservation::Positive {
+            domain: "example.com",
+            family: honk_outbound::alive::IpVersion::V6,
+            ips: &[v6],
+            advertised_ttl: Duration::from_secs(30),
+        },
+    );
+    // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,
+    // then NXDOMAIN for an unrelated type.
+    for (qtype, rcode, expected) in [
+        (1, 0, &[v4, v6][..]),
+        (65, 0, &[v4, v6]),
+        (28, 0, &[v4]),
+        (16, 3, &[]),
+    ] {
+        let reply = controller
+            .answer_query_for_test(
+                &crate::dns::forwarder::build_dns_query("example.com", qtype),
+                DnsRequestMeta::EMPTY,
+                IngressProfile::Internal,
+            )
+            .await;
+        assert_eq!(reply[3] & 0x0f, rcode, "QTYPE {qtype} reply");
+        let projected = controller
+            .project_routes(&snapshot)
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .collect::<Vec<_>>();
+        assert_eq!(projected, expected, "after QTYPE {qtype}");
+    }
     controller.shutdown(Duration::from_secs(1)).await;
 }
 

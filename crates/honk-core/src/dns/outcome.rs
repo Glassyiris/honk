@@ -84,6 +84,7 @@ pub struct DnsOutcome {
     response_class: ResponseClass,
     provenance: Provenance,
     domain: Arc<str>,
+    qtype: u16,
     answer_ips: Vec<IpAddr>,
     expiry: EffectiveExpiry,
     logical_upstream: Option<String>,
@@ -104,6 +105,7 @@ pub(crate) struct OutcomeParts {
     pub response_class: ResponseClass,
     pub provenance: Provenance,
     pub domain: Arc<str>,
+    pub qtype: u16,
     pub answer_ips: Vec<IpAddr>,
     pub expiry: EffectiveExpiry,
     pub logical_upstream: Option<String>,
@@ -123,9 +125,12 @@ impl DnsOutcome {
         rendered: Vec<u8>,
         source: RouteSource,
     ) -> Result<Self, Vec<u8>> {
-        let Some(domain) = super::query::QueryContext::parse_with_profile(query, ingress)
+        let Some((domain, qtype)) = super::query::QueryContext::parse_with_profile(query, ingress)
             .ok()
-            .and_then(|query| query.qname().and_then(|name| name.to_domain_name()))
+            .and_then(|query| {
+                let domain = query.qname().and_then(|name| name.to_domain_name())?;
+                Some((domain, query.qtype().map_or(0, super::query::QType::get)))
+            })
         else {
             return Err(rendered);
         };
@@ -134,6 +139,7 @@ impl DnsOutcome {
             response_class: super::engine::classify_response(&rendered),
             provenance: Provenance::Fresh,
             domain: domain.into(),
+            qtype,
             answer_ips: Vec::new(),
             expiry: EffectiveExpiry::do_not_cache(),
             logical_upstream: None,
@@ -155,6 +161,7 @@ impl DnsOutcome {
             expiry: parts.expiry,
             logical_upstream: parts.logical_upstream,
             domain: parts.domain,
+            qtype: parts.qtype,
             answer_ips: parts.answer_ips,
             final_upstream: parts.final_upstream,
             requery_history: parts.requery_history,
@@ -214,6 +221,11 @@ impl DnsOutcome {
 
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// First-question QTYPE of the caller's query; 0 when it had none.
+    pub const fn qtype(&self) -> u16 {
+        self.qtype
     }
 
     pub fn answer_ips(&self) -> &[IpAddr] {
@@ -277,6 +289,7 @@ impl DnsOutcome {
             provenance,
             expiry,
             domain: "example.com".into(),
+            qtype: 1,
             answer_ips,
             logical_upstream: Some(logical_upstream.to_owned()),
             final_upstream: Some(final_upstream.to_owned()),
