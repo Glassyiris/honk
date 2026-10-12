@@ -1,17 +1,118 @@
 mod reply;
-#[cfg(test)]
+#[cfg(all(test, feature = "rprx"))]
 pub(super) use reply::SourceReplyTarget;
 use reply::{SourceReplyDisposition, deliver_source_reply};
 
 use super::driver::{REPLY_IDLE_TIMEOUT, TRANSPORT_SEND_TIMEOUT};
 use super::*;
+#[cfg(feature = "rprx")]
 use honk_config::node::VlessUdpPath;
 use honk_outbound::PacketTransport;
-use honk_outbound::proxy::PreparedUdpTransport;
+use honk_outbound::proxy::hysteria2::{Hy2UdpTransport, Hysteria2Handler};
+use honk_outbound::proxy::tuic::{TuicHandler, TuicUdpTransport};
+#[cfg(feature = "rprx")]
 use honk_outbound::proxy::vless::{VLessHandler, VlessXudpTransport};
+use honk_outbound::proxy::{PreparedUdpTransport, QuicSendAttempt};
 use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 
 const MAX_RETIRED_REPLY_PEERS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::control) enum SourcePath {
+    #[cfg(feature = "rprx")]
+    Vless(VlessUdpPath),
+    Hysteria2,
+    Tuic,
+}
+
+pub(in crate::control) enum PreparedSourceTransport {
+    #[cfg(feature = "rprx")]
+    Vless(PreparedUdpTransport<VlessXudpTransport>),
+    Hysteria2(PreparedUdpTransport<Hy2UdpTransport>),
+    Tuic(PreparedUdpTransport<TuicUdpTransport>),
+}
+
+impl PreparedSourceTransport {
+    async fn commit(self) -> anyhow::Result<SourceTransport> {
+        match self {
+            #[cfg(feature = "rprx")]
+            Self::Vless(prepared) => prepared.commit().await.map(SourceTransport::Vless),
+            Self::Hysteria2(prepared) => prepared.commit().await.map(SourceTransport::Hysteria2),
+            Self::Tuic(prepared) => prepared.commit().await.map(SourceTransport::Tuic),
+        }
+    }
+}
+
+enum SourceTransport {
+    #[cfg(feature = "rprx")]
+    Vless(Arc<VlessXudpTransport>),
+    Hysteria2(Arc<Hy2UdpTransport>),
+    Tuic(Arc<TuicUdpTransport>),
+}
+
+impl SourceTransport {
+    fn packet_transport(&self) -> &dyn PacketTransport {
+        match self {
+            #[cfg(feature = "rprx")]
+            Self::Vless(transport) => transport.as_ref(),
+            Self::Hysteria2(transport) => transport.as_ref(),
+            Self::Tuic(transport) => transport.as_ref(),
+        }
+    }
+
+    fn observe_reuse(&self) {
+        use honk_outbound::runtime::flow_observation::{self, FlowEvent, ResolutionLocation};
+
+        let Some(observer) = flow_observation::current() else {
+            return;
+        };
+        let server_addr = match self {
+            #[cfg(feature = "rprx")]
+            Self::Vless(_) => return,
+            Self::Hysteria2(transport) => transport.server_addr(),
+            Self::Tuic(transport) => transport.server_addr(),
+        };
+        observer.publish(FlowEvent::TransportAttached {
+            server_addr: Some(server_addr),
+            resolution_location: ResolutionLocation::Reused,
+        });
+    }
+
+    fn is_vless(&self) -> bool {
+        match self {
+            #[cfg(feature = "rprx")]
+            Self::Vless(_) => true,
+            Self::Hysteria2(_) | Self::Tuic(_) => false,
+        }
+    }
+
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        match self {
+            #[cfg(feature = "rprx")]
+            Self::Vless(transport) => {
+                transport
+                    .send_to(target, target_domain, data, admitted)
+                    .await
+            }
+            Self::Hysteria2(transport) => {
+                transport
+                    .send_to(target, target_domain, data, admitted)
+                    .await
+            }
+            Self::Tuic(transport) => {
+                transport
+                    .send_to(target, target_domain, data, admitted)
+                    .await
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -29,7 +130,7 @@ enum ReplyProjection {
 pub(in crate::control) struct SourceScope {
     runtime: usize,
     client: SocketAddr,
-    path: VlessUdpPath,
+    path: SourcePath,
     reply: ReplyProjection,
 }
 
@@ -37,7 +138,7 @@ impl SourceScope {
     pub(super) fn new(
         runtime: &Arc<NodeRuntime>,
         client: SocketAddr,
-        path: VlessUdpPath,
+        path: SourcePath,
         reply_destination: Option<SocketAddr>,
     ) -> Self {
         Self {
@@ -91,7 +192,7 @@ impl SourceState {
 pub(super) struct SourceOwner {
     id: u64,
     scope: SourceScope,
-    transport: Arc<VlessXudpTransport>,
+    transport: SourceTransport,
     _runtime: Arc<NodeRuntime>,
     state: Mutex<SourceState>,
     ready: AtomicBool,
@@ -119,7 +220,7 @@ impl SourceOwner {
     fn new(
         id: u64,
         scope: SourceScope,
-        transport: Arc<VlessXudpTransport>,
+        transport: SourceTransport,
         runtime: Arc<NodeRuntime>,
         pool: &Arc<UdpEndpointPool>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
@@ -173,7 +274,7 @@ impl SourceOwner {
         state.attachments = state
             .attachments
             .checked_add(1)
-            .expect("VLESS source attachment count overflow");
+            .expect("source attachment count overflow");
         Some(SourceAttachment {
             owner: Arc::clone(self),
             committed: false,
@@ -191,7 +292,7 @@ impl SourceOwner {
         state.bindings = state
             .bindings
             .checked_add(1)
-            .expect("VLESS source binding count overflow");
+            .expect("source binding count overflow");
         state.retired_reply_peers.remove(&target);
         true
     }
@@ -297,22 +398,33 @@ impl SourceOwner {
         );
     }
 
+    #[cfg(test)]
+    pub(super) async fn hold_send_gate_for_test(&self) -> impl Drop + '_ {
+        self.send_gate.lock().await
+    }
+
     pub(super) fn handle_transport_error(&self, error: &io::Error) -> bool {
-        {
-            let mut state = self.state.lock();
-            if !honk_outbound::proxy::vless::is_vless_source_post_admission_cancel(error) {
-                state.intentional_sender = 0;
-                return false;
+        #[cfg(feature = "rprx")]
+        if self.transport.is_vless() {
+            {
+                let mut state = self.state.lock();
+                if !honk_outbound::proxy::vless::is_vless_source_post_admission_cancel(error) {
+                    state.intentional_sender = 0;
+                    return false;
+                }
+                // Sender and receiver can observe the same terminal before retirement linearizes.
+                if state.intentional_sender == 0 {
+                    return false;
+                }
             }
-            // Sender and receiver can observe the same terminal before retirement linearizes.
-            if state.intentional_sender == 0 {
-                return false;
+            if let Some(pool) = self.pool.upgrade() {
+                pool.retire_interrupted_source(self);
             }
+            return true;
         }
-        if let Some(pool) = self.pool.upgrade() {
-            pool.retire_interrupted_source(self);
-        }
-        true
+        #[cfg(not(feature = "rprx"))]
+        let _ = error;
+        false
     }
     fn note_reply(&self) {
         let state = self.state.lock();
@@ -391,11 +503,11 @@ impl Drop for SourceAttachment {
     }
 }
 
-pub(in crate::control) enum VlessSourcePreparation {
+pub(in crate::control) enum SourcePreparation {
     Reused(SourceAttachment),
     Fresh {
         scope: SourceScope,
-        prepared: PreparedUdpTransport<VlessXudpTransport>,
+        prepared: PreparedSourceTransport,
         source_permit: OwnedSemaphorePermit,
         runtime: Arc<NodeRuntime>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
@@ -406,8 +518,8 @@ pub(in crate::control) enum VlessSourcePreparation {
     },
 }
 
-impl VlessSourcePreparation {
-    #[cfg(test)]
+impl SourcePreparation {
+    #[cfg(all(test, feature = "rprx"))]
     pub(super) fn attached_owner(&self) -> Option<Arc<SourceOwner>> {
         match self {
             Self::Reused(attachment) => Some(attachment.owner()),
@@ -422,6 +534,7 @@ impl VlessSourcePreparation {
         match self {
             Self::Reused(attachment) => {
                 if attachment.owner.is_ready() {
+                    attachment.owner.transport.observe_reuse();
                     Ok(attachment)
                 } else {
                     Err(honk_outbound::proxy::PacketRejection::Cancelled.into())
@@ -451,6 +564,7 @@ impl VlessSourcePreparation {
                         .map(|entry| Arc::clone(entry.value()))
                     {
                         if let Some(attachment) = owner.attach() {
+                            owner.transport.observe_reuse();
                             return Ok(attachment);
                         }
                         changed.await;
@@ -465,7 +579,7 @@ impl VlessSourcePreparation {
                         let mut tasks = pool.source_tasks.lock();
                         while let Some(result) = tasks.tasks.try_join_next() {
                             if let Err(error) = result {
-                                debug!("VLESS UDP source receiver join failed: {}", error);
+                                debug!("UDP source receiver join failed: {}", error);
                             }
                         }
                         if tasks.closed || pool.terminal.load(Ordering::Acquire) {
@@ -477,6 +591,7 @@ impl VlessSourcePreparation {
                                 drop(entry);
                                 drop(tasks);
                                 if let Some(attachment) = owner.attach() {
+                                    owner.transport.observe_reuse();
                                     return Ok(attachment);
                                 }
                             }
@@ -484,7 +599,7 @@ impl VlessSourcePreparation {
                                 let owner = SourceOwner::new(
                                     pool.next_source_owner.fetch_add(1, Ordering::Relaxed),
                                     scope.clone(),
-                                    transport.expect("prepared VLESS source transport"),
+                                    transport.expect("prepared source transport"),
                                     runtime,
                                     pool,
                                     alive_set,
@@ -575,12 +690,12 @@ impl SourceEndpoint {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rprx"))]
     pub(super) fn hold_binding_for_test(&self) -> impl Drop + '_ {
         self.binding.lock()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rprx"))]
     pub(super) fn mark_send_active_for_test(&self) {
         self.owner.state.lock().active_sender = self.view;
     }
@@ -642,29 +757,37 @@ impl SourceEndpoint {
         self.flow_tracker.add_bytes(0, len);
     }
 
-    pub(super) async fn send(
-        &self,
+    pub(super) async fn send<'a>(
+        &'a self,
         data: &[u8],
         admitted: Option<&AtomicBool>,
         record_start: bool,
+        attempt: &mut Option<QuicSendAttempt<'a>>,
     ) -> io::Result<Option<Instant>> {
         let _send = self.owner.send_gate.lock().await;
-        let reusable = self.owner.transport.source_send_usable().await;
+        let reusable = match &self.owner.transport {
+            #[cfg(feature = "rprx")]
+            SourceTransport::Vless(transport) => transport.source_send_usable().await,
+            SourceTransport::Hysteria2(_) | SourceTransport::Tuic(_) => true,
+        };
         let mut active = {
             let mut state = self.owner.state.lock();
             if self.retired.load(Ordering::Acquire) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "VLESS UDP flow retired before source send",
+                    "UDP flow retired before source send",
                 ));
             }
             if state.retirement.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "VLESS UDP source retired before send",
+                    "UDP source retired before send",
                 ));
             }
-            if !self.owner.sent.load(Ordering::Acquire) && data.is_empty() {
+            if self.owner.transport.is_vless()
+                && !self.owner.sent.load(Ordering::Acquire)
+                && data.is_empty()
+            {
                 return Err(honk_outbound::proxy::PacketRejection::InvalidSize.into());
             }
             if reusable {
@@ -677,6 +800,9 @@ impl SourceEndpoint {
                 clear_intent: false,
             }
         };
+        if !self.owner.transport.is_vless() {
+            *attempt = Some(QuicSendAttempt::new(self.packet_transport()));
+        }
         let started_at = record_start.then(Instant::now);
         self.owner.begin_receive();
         let result = self
@@ -701,7 +827,11 @@ impl SourceEndpoint {
                 return Duration::from_nanos(timeout);
             }
         }
-        TRANSPORT_SEND_TIMEOUT
+        self.packet_transport().send_timeout()
+    }
+
+    pub(super) fn packet_transport(&self) -> &dyn PacketTransport {
+        self.owner.transport.packet_transport()
     }
 
     pub(super) fn fail(&self, outcome: ScoreOutcome) {
@@ -796,7 +926,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
         tokio::select! {
             biased;
             _ = retired => return,
-            packet = owner.transport.recv_packet(&mut buf) => {
+            packet = owner.transport.packet_transport().recv_packet(&mut buf) => {
                 let (len, peer) = match packet {
                     Ok(packet) => packet,
                     Err(error) => {
@@ -839,12 +969,12 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
 
 impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::control) async fn prepare_vless_source(
+    pub(in crate::control) async fn prepare_source(
         self: &Arc<Self>,
         generation: Arc<OutboundRuntimeRegistry>,
         runtime: Arc<NodeRuntime>,
         client: SocketAddr,
-        path: VlessUdpPath,
+        path: SourcePath,
         reply_destination: Option<SocketAddr>,
         target: SocketAddr,
         target_domain: Option<&str>,
@@ -852,7 +982,8 @@ impl UdpEndpointPool {
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
         health_family: honk_outbound::alive::IpVersion,
-    ) -> anyhow::Result<VlessSourcePreparation> {
+        speculative: bool,
+    ) -> anyhow::Result<SourcePreparation> {
         let scope = SourceScope::new(&runtime, client, path, reply_destination);
         loop {
             if generation.is_shutdown() || self.terminal.load(Ordering::Acquire) {
@@ -865,7 +996,7 @@ impl UdpEndpointPool {
                 .map(|entry| Arc::clone(entry.value()))
             {
                 if let Some(attachment) = owner.attach() {
-                    return Ok(VlessSourcePreparation::Reused(attachment));
+                    return Ok(SourcePreparation::Reused(attachment));
                 }
                 changed.await;
                 continue;
@@ -875,20 +1006,53 @@ impl UdpEndpointPool {
                 self.source_slots.clone().try_acquire_owned().map_err(|_| {
                     anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
                 })?;
-            let global_id = runtime.vless_source_id(scope.client, path, reply_destination)?;
-            let prepared = generation
-                .scope_dials(VLessHandler::prepare_source_udp(
-                    Arc::clone(&runtime),
-                    target,
-                    target_domain,
-                    connect_timeout,
-                    global_id,
-                ))
-                .await?;
+            let prepared = {
+                let operation = std::pin::pin!(async {
+                    match path {
+                        #[cfg(feature = "rprx")]
+                        SourcePath::Vless(path) => {
+                            let global_id =
+                                runtime.vless_source_id(scope.client, path, reply_destination)?;
+                            VLessHandler::prepare_source_udp(
+                                Arc::clone(&runtime),
+                                target,
+                                target_domain,
+                                connect_timeout,
+                                global_id,
+                            )
+                            .await
+                            .map(PreparedSourceTransport::Vless)
+                        }
+                        SourcePath::Hysteria2 => Hysteria2Handler::new()
+                            .prepare_udp_source(
+                                Arc::clone(&runtime),
+                                target,
+                                target_domain,
+                                connect_timeout,
+                                speculative,
+                            )
+                            .await
+                            .map(PreparedSourceTransport::Hysteria2),
+                        SourcePath::Tuic => TuicHandler::new()
+                            .prepare_udp_source(
+                                Arc::clone(&runtime),
+                                target,
+                                target_domain,
+                                connect_timeout,
+                                speculative,
+                            )
+                            .await
+                            .map(PreparedSourceTransport::Tuic),
+                    }
+                });
+                generation
+                    .scope_dials(runtime.scope_tasks(runtime.transport_quality().scope(operation)))
+                    .await?
+            };
             if generation.is_shutdown() {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
             }
-            return Ok(VlessSourcePreparation::Fresh {
+            return Ok(SourcePreparation::Fresh {
                 scope,
                 prepared,
                 source_permit,
@@ -906,6 +1070,7 @@ impl UdpEndpointPool {
         self.retire_source_neutral(owner, ScoreOutcome::Timeout);
     }
 
+    #[cfg(feature = "rprx")]
     fn retire_interrupted_source(&self, owner: &SourceOwner) {
         self.retire_source_neutral(owner, ScoreOutcome::Cancelled);
     }

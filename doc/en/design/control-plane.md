@@ -106,15 +106,15 @@ Malformed controller-owned UDP53 retains compatible controller handoff facts for
 ### Transport and transaction
 
 Ordinary transports use `PacketTransport`; native handlers wrap a real socket
-and tunnels frame packets directly. Source-shared VLESS XUDP/Mux.Cool instead
-commits a typed source attachment whose endpoint views share one transport
-receiver. The control plane creates no loopback bridge for either shape.
+and tunnels frame packets directly. Source-shared VLESS XUDP/Mux.Cool,
+Hysteria2 and TUIC commit typed source attachments whose endpoint views share
+one transport receiver. The control plane creates no loopback bridge.
 
 Endpoint creation is transactional:
 
 1. Reserve `(client, original destination)` as `Initializing`; the lease owns the first datagram, queue permits, slow-path permit, token, generation, and cancellation epoch.
 2. Route, sniff, select, and prepare eligible transports. Create the transparent anyfrom reply socket before publication.
-3. Select one candidate and commit only its `PreparedUdpTransport<T>` or VLESS source preparation; the fallible commit returns the selected `Arc<T>`/attachment while dropped losers roll back.
+3. Select one candidate and commit only its `PreparedUdpTransport<T>` or source preparation; the fallible commit returns the selected `Arc<T>`/attachment while dropped losers roll back.
 4. Spawn the endpoint driver and wait for its ready barrier.
 5. Atomically replace the exact `Initializing` identity with `Ready` under the shared epoch fence.
 6. Transfer the retained first packet, send it through the committed transport, and wait for acknowledgement.
@@ -129,10 +129,10 @@ drains every started preparation before returning. Sniffing/routing precede
 this boundary; reply-socket creation, publication, and packet I/O follow under
 their existing transaction and I/O bounds. There is no automatic packet replay.
 
-For source-shared VLESS, `udp_endpoint/source.rs` indexes one owner by reused
-runtime identity, normalized client, UDP path, and `ActualPeer` or
-`RewriteTo(original destination)`. It owns one XUDP session, one receiver, and
-multiple endpoint send views. The full `(client, destination)` endpoint map is
+For source-shared VLESS, Hysteria2 and TUIC, `udp_endpoint/source.rs` indexes one
+owner by reused runtime identity, normalized client, protocol/UDP path, and
+`ActualPeer` or `RewriteTo(original destination)`. It owns one protocol
+association, one receiver and multiple endpoint send views. The full `(client, destination)` endpoint map is
 still canonical for routing, token, generation, and per-flow Score. Reply
 classification never treats an occupied wrong-owner, `Initializing`, or
 `Retiring` entry as foreign; only an absent `ActualPeer` key is eligible for
@@ -143,11 +143,16 @@ Source sharing does not merge kernel/NFQUEUE flow ownership: every canonical
 endpoint keeps its own decision token, generation, terminal transition, and
 five-tuple retirement fence.
 
-Each transparent socket consumes at most eight datagrams per readiness turn with `recvmmsg`. Every slot retains independent ORIGDST, PKTINFO, and per-packet `SO_MARK` metadata, packets remain in kernel order, and malformed metadata drops only that slot. After a drained queue, the next wake starts with one slot; a full read immediately reopens the eight-slot batch, avoiding sparse-traffic setup cost. The cap bounds scheduler fairness and payload storage to 512 KiB per socket, or 4 MiB across the current four sockets per family when both families are active. The listener loop only validates, reserves, and enqueues; it never awaits `PacketTransport` I/O. The endpoint driver owns all transport calls. First and steady sends each have a five-second timeout. A timeout or error is ambiguous because the transport may have accepted part of the packet, so the driver never replays that datagram or advances to later followers.
+Common source admission and joined shutdown remain enabled without `rprx`;
+only the VLESS alternatives are feature-gated. Hy2/TUIC preserve the real reply
+peer through bounded reassembly. Their QUIC send guard starts after source-gate
+admission and stays with the driver until the final I/O outcome is classified.
+
+Each transparent socket consumes at most eight datagrams per readiness turn with `recvmmsg`. Every slot retains independent ORIGDST, PKTINFO, and per-packet `SO_MARK` metadata, packets remain in kernel order, and malformed metadata drops only that slot. After a drained queue, the next wake starts with one slot; a full read immediately reopens the eight-slot batch, avoiding sparse-traffic setup cost. The cap bounds scheduler fairness and payload storage to 512 KiB per socket, or 4 MiB across the current four sockets per family when both families are active. The listener loop only validates, reserves, and enqueues; it never awaits `PacketTransport` I/O. The endpoint driver owns all transport calls. First and steady sends use the transport's deadline: five seconds by default, or the QUIC path's SRTT-derived deadline. Timeout or failure may follow partial acceptance, so no datagram is replayed; packet-local congestion can drop that packet and continue, while terminal failures stop the affected flow/source.
 
 SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the endpoint lifetime and treats control EOF or unexpected control data as endpoint failure. Its connected UDP socket sends to the physical server `BND.ADDR` relay, resolving a domain reply and replacing an unspecified address with the control peer IP. `PacketTransport::relay_addr()` and received source metadata expose the logical target instead, so endpoint first-reply validation does not confuse the SOCKS relay with the remote peer.
 
-Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket and cache accepted alternate full-cone sources per endpoint. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid. A reply from an alternate source has no exact `REDIRECT_TRACK` entry; `dae0_ingress` returns it to the client through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, so a restrictive forward policy does not drop it. Receiving such a reply never authorizes the client's own next packet to that source: `lan_egress` does not learn a reverse direction from packets arriving from `dae0`, and that packet takes the normal routing path.
+Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket. Ordinary flows cache accepted alternate full-cone sources per endpoint; shared sources retain one receiver-owned cache of at most seven alternate sockets across all bound views. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid. A reply from an alternate source has no exact `REDIRECT_TRACK` entry; `dae0_ingress` returns it to the client through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, so a restrictive forward policy does not drop it. Receiving such a reply never authorizes the client's own next packet to that source: `lan_egress` does not learn a reverse direction from packets arriving from `dae0`, and that packet takes the normal routing path.
 
 Reload advances a cancellation epoch before waiting. Initializers capture that epoch and an incarnation generation; a cancellation that linearizes before `commit_ready` prevents publication. Reload drains `Initializing` leases and their retained resources. A successful compiled traffic-plan change retires direct `Ready` endpoints only when the old or new policy includes direct marks, so later traffic cannot reuse their old socket marks. No-op/unrelated reloads and routing changes with no direct marks in either policy preserve them. Every retirement, including its `Retiring` tombstone and acknowledgement, names the token and generation, so delayed work cannot remove a replacement mapping. Explicitly userspace-owned WAN UDP decisions, including marked `direct(must)`, retire their token-zero conn state, handoff and redirect track together under the tuple/reader fence; native LAN direct/offloaded decisions and newer nonzero tokens survive.
 

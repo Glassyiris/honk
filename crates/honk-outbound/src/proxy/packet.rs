@@ -268,21 +268,25 @@ impl<T: ?Sized + Send + Sync + 'static> PreparedUdpTransport<T> {
         self.commit.await
     }
 }
-pub(super) async fn prepare_detached_quic_transport<T, F, Fut>(
+pub(super) async fn prepare_detached_quic_transport<T, P, F, Fut>(
     runtime: Arc<crate::runtime::NodeRuntime>,
     client: Arc<T>,
     prepare: F,
-) -> anyhow::Result<PreparedUdpTransport>
+) -> anyhow::Result<PreparedUdpTransport<P>>
 where
     T: crate::runtime::QuicRuntimeClient,
+    P: ?Sized + PacketTransport + 'static,
     F: FnOnce(Arc<T>) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Arc<dyn PacketTransport>>>,
+    Fut: Future<Output = anyhow::Result<Arc<P>>>,
 {
     if !matches!(runtime.runtime, crate::runtime::ProtocolRuntime::Quic(_)) {
         anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
     }
     let task_scope = runtime.task_scope();
-    let transport = runtime.scope_tasks(prepare(Arc::clone(&client))).await?;
+    let transport = {
+        let operation = std::pin::pin!(prepare(Arc::clone(&client)));
+        runtime.scope_tasks(operation).await?
+    };
     Ok(PreparedUdpTransport::new(task_scope.scope_owned(
         async move {
             let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {

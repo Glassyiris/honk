@@ -176,7 +176,7 @@ pub(super) async fn deliver_source_reply(
                 endpoint
                     .native
                     .dropped("client_delivery_failed", Some("client_send_failed"));
-                debug!("VLESS UDP source reply delivery failed");
+                debug!("UDP source reply delivery failed");
                 return SourceReplyDisposition::Observed;
             }
             endpoint.mark_reply();
@@ -199,7 +199,7 @@ pub(super) async fn deliver_source_reply(
                     let socket = match pool.create_reply_socket(source) {
                         Ok(socket) => socket,
                         Err(error) => {
-                            debug!("VLESS UDP foreign reply socket creation failed: {}", error);
+                            debug!("UDP foreign reply socket creation failed: {}", error);
                             return SourceReplyDisposition::Observed;
                         }
                     };
@@ -221,7 +221,7 @@ pub(super) async fn deliver_source_reply(
                 .await,
                 Ok(Ok(_))
             ) {
-                debug!("VLESS UDP foreign reply delivery failed");
+                debug!("UDP foreign reply delivery failed");
                 SourceReplyDisposition::Observed
             } else {
                 owner.node_tracker.add_bytes(0, data.len() as u64);

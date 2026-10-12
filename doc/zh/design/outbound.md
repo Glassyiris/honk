@@ -16,7 +16,7 @@ UDP 对象。
 - `ProxyStream`：已经建立、绑定目标的 TCP 字节流；或
 - `Arc<dyn PacketTransport>`：已经建立、面向一个 UDP 目标的分帧报文路径。
 
-推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享的 VLESS 路径把类型化 `VlessXudpTransport` 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用 receiver。
+推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享的 VLESS、Hysteria2 与 TUIC 把具体 transport 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用唯一 receiver。
 
 `direct` 不使用代理协议，直接连接目标。`block` 终止请求。其他每个 handler 都根据
 选定节点生成代理服务器能够理解的协议字节。
@@ -91,8 +91,8 @@ downcast 不变量；`proxy/vless/handler/stream.rs` 的 `ProxyStream::into_visi
 `PacketTransport` 暴露 relay 目标、`send_packet`、
 `send_packet_confirmed` 与 `recv_packet`。对于带队列的 tunnel，
 `send_packet_confirmed` 是更强的首包准入点。full-cone 协议还可以声明
-服务端 metadata 能够权威指定回包源地址。来源共享的 VLESS 在内部使用同一
-framing transport，但由 core 串行化各 endpoint view 的发送并持有唯一 receive loop。
+服务端 metadata 能够权威指定回包源地址。对于来源共享的 VLESS、Hysteria2 与
+TUIC，由 core 串行化各 endpoint view 的发送并持有 transport 的唯一 receive loop。
 
 生产 UDP handler 不返回裸 socket 或 loopback bridge。Direct 与 SOCKS5
 把 native socket 包装在 `PacketTransport` 后面；tunnel 协议在其真实
@@ -531,12 +531,24 @@ packet 保持 8 KiB 上限；Single XUDP 保持 7,526 字节上限。
 
 ### Source/session ownership and capacity
 
-对于 Single XUDP 与 shared/separate Mux.Cool，`honk-core` 按 reused
-`NodeRuntime` identity、规范化 client 地址、所选 UDP path 与 reply projection
-（`ActualPeer` 或 `RewriteTo(original destination)`）索引 source owner。一个
-owner 持有一条 XUDP session 与一条 receiver，多个规范五元组 endpoint entry
-提供串行 send view。Single XUDP 每 scope 使用一个 private、未池化的
+对于 Single XUDP、shared/separate Mux.Cool、Hysteria2 与 TUIC，`honk-core`
+按 reused `NodeRuntime` identity、规范化 client 地址、所选协议/UDP path 与
+reply projection（`ActualPeer` 或 `RewriteTo(original destination)`）索引
+source owner。一个 owner 持有一条协议 association 与一条 receiver，多个规范
+五元组 endpoint entry 提供串行 send view。Single XUDP 每 scope 使用一个 private、未池化的
 SID 0；Mux.Cool 为各 scope 分配不同 child SID，而这些 SID 可以共享物理 pool。
+
+Hysteria2 在 scope 的不同目的地间复用一个 Session ID，TUIC 复用一个 association
+ID。不同 scope 可以共用物理 QUIC connection，但不共用逻辑 association。
+关闭 `rprx` 时，这些 QUIC source 路径及其 shutdown join 仍可用；只有 VLESS
+分支依赖该 feature。
+
+Hysteria2 与 TUIC 的两种接收模式通过既有有界重组器保留实际回包来源。Hysteria2
+各分片的来源必须一致；TUIC 后续片可以省略地址，并等待第零片提供来源，包括
+第零片最后到达的情况。来源元数据随所属 packet entry 过期。已知请求域名与端口
+可使用捕获的目标投影，域名按 ASCII 大小写不敏感比较；未知域名不触发 DNS，
+也不伪造 foreign IP。TUIC 零长度 payload 仍是 datagram；Hysteria2 保留既有的
+空入站 payload 拒绝。来源保留不保证远端 NAT 的映射或过滤行为。
 
 完整 `(client, destination)` endpoint map 继续权威持有 route、decision token
 与逐 flow Score。Ready entry 的 reply 仅在 endpoint 属于该 source owner 时
@@ -545,7 +557,7 @@ SID 0；Mux.Cool 为各 scope 分配不同 child SID，而这些 SID 可以共�
 reply；它更新 source transport accounting，但没有 flow Score owner。domain
 route 使用 `RewriteTo(original)`，永远不会变成 foreign reply。
 
-runtime 从该 scope lazy 生成 private keyed source-ID hash。复用 runtime 时替换
+VLESS runtime 从该 scope lazy 生成 private keyed source-ID hash。复用 runtime 时替换
 carrier 保持 ID；替换 runtime 或重启进程会生成新 key。这刻意保留 honk 的
 per-source 行为，不等同于 Xray 的 source-only global identity，也不保证 NAT
 无碰撞。迟到 callback 在动作前重新检查 source owner 与 endpoint token/generation；
@@ -568,12 +580,17 @@ source 关闭前已经退役的 view，保留自己的局部结果；shutdown �
 已绑定 view 只在 pending attachment 也全部释放后才退役 source；sibling view 退役
 时，已有 attachment 仍可完成 commit。
 
-endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
+对于 VLESS，endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
 也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
 避免兄弟 flow 的发送将其重新解释为 carrier 故障。
 发送开始、完成与退役意图共用 source-state 临界区；先记录匹配 sender 的意图，
 再在同一临界区发布 endpoint 和 source-view 退役标志，之后发送或接收端才能分类
 取消原因。
+
+QUIC source 仅在通过 source gate、开始 I/O 后创建 send token，但 token 由
+endpoint driver 保留到 success/timeout/failure 分类完成。等待 gate 消耗既有
+发送 deadline，不创建 QUIC attempt。Datagram 拥塞与 TUIC stream failure
+保留各自语义；取消或部分接受都不授权重放 packet。
 
 Selector 与 UDP warm retention 独立解析：TCP 所选 pool 响应
 `WarmRequirement::Session`，UDP 所选 pool 响应 `WarmRequirement::Udp`。因此

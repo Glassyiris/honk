@@ -365,7 +365,6 @@ pub(super) fn score_driver_outcome(
 #[cfg(feature = "native-api")]
 impl UdpEndpoint {
     fn finish_native_driver(&self, result: &io::Result<()>) {
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport
             && let Some(retirement) = source.score_retirement()
         {
@@ -768,7 +767,7 @@ async fn send_one(
             .dropped("endpoint_retired", Some("send_cancelled"));
         return Err(PacketSendFailure::Transport(error));
     }
-    let attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
+    let mut attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
     let source_admitted = endpoint.is_source().then(|| AtomicBool::new(false));
     let timeout = endpoint.send_timeout().max(Duration::from_millis(1));
     send_timeout
@@ -776,7 +775,7 @@ async fn send_one(
         .reset(tokio::time::Instant::now() + timeout);
     let sent = tokio::select! {
         biased;
-        result = endpoint.send_packet_with_admission(&packet.data, first, source_admitted.as_ref()) => Ok(result),
+        result = endpoint.send_packet_with_admission(&packet.data, first, source_admitted.as_ref(), &mut attempt) => Ok(result),
         _ = send_timeout.as_mut() => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "UDP PacketTransport send timed out",
@@ -793,6 +792,10 @@ async fn send_one(
         Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
     };
     let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
+    let gate_only = attempt.is_none()
+        && source_admitted
+            .as_ref()
+            .is_some_and(|admitted| !admitted.load(Ordering::Acquire));
     if let Some(attempt) = attempt {
         match &sent {
             Ok(Ok(_)) if endpoint_retired => attempt.failure(),
@@ -811,13 +814,7 @@ async fn send_one(
         match sent {
             Ok(Ok(started_at)) => Ok(started_at),
             Ok(Err(error)) => Err(classify_send_error(endpoint, error)),
-            Err(error)
-                if source_admitted
-                    .as_ref()
-                    .is_some_and(|admitted| !admitted.load(Ordering::Acquire)) =>
-            {
-                Err(PacketSendFailure::Congestion(error))
-            }
+            Err(error) if gate_only => Err(PacketSendFailure::Congestion(error)),
             Err(error) => Err(classify_send_error(endpoint, error)),
         }
     };

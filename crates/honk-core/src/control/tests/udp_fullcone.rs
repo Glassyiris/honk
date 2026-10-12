@@ -1,0 +1,407 @@
+use super::support::{QuicUdpMode, QuicUdpPacket, QuicUdpPeer};
+use super::{
+    NETNS_TEST_TIMEOUT, configure_test_edge, fresh_test_netns, in_test_netns, udp_test_config,
+    udp_test_forwarder, wait_for_test_address,
+};
+use crate::control::{ControlCommand, ControlPlane};
+use crate::dns::DnsResolver;
+use crate::ebpf::{EbpfBackend, real::RealEbpfBackend};
+use crate::routing::Router;
+use anyhow::{Context, ensure};
+use aya::maps::{Array, HashMap, Map, MapData, MapError};
+use honk_config::node::Group;
+use honk_ebpf_common::dae_ip::In6Addr;
+use honk_ebpf_common::{ConnState, RedirectEntry, RedirectTuple, TuplesKey};
+use nix::mount::{MsFlags, mount};
+use nix::sched::{CloneFlags, unshare};
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tokio::net::UdpSocket;
+
+const CASE: &str = "control::tests::udp_fullcone::netns_udp_full_cone_source_contract";
+const CHILD: &str = "HONK_UDP_FULLCONE_CHILD";
+
+#[test]
+#[ignore = "requires Linux 6.12+, root, bpffs and eBPF TC support in an isolated VM"]
+fn netns_udp_full_cone_source_contract() -> anyhow::Result<()> {
+    if let Some(case) = std::env::var_os(CHILD) {
+        let case = case
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid child case"))?;
+        return std::thread::spawn(move || run_child(&case))
+            .join()
+            .map_err(|_| anyhow::anyhow!("full-cone child thread panicked"))?;
+    }
+    // DAENS_FD is process-lifetime state, not a fixture that can be reset.
+    for family in ["v4", "v6"] {
+        for protocol in ["hy2", "tuic-datagram", "tuic-stream"] {
+            let case = format!("{family}/{protocol}");
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    CASE,
+                    "--ignored",
+                    "--exact",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, &case)
+                .status()?;
+            ensure!(status.success(), "{case} failed: {status}");
+        }
+    }
+    Ok(())
+}
+
+fn run_child(case: &str) -> anyhow::Result<()> {
+    ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "full-cone acceptance requires root"
+    );
+    let (family, protocol) = case.split_once('/').context("missing child case family")?;
+    let mode = match protocol {
+        "hy2" => QuicUdpMode::Hysteria2,
+        "tuic-datagram" => QuicUdpMode::TuicDatagram,
+        "tuic-stream" => QuicUdpMode::TuicStream,
+        _ => anyhow::bail!("unknown protocol {protocol}"),
+    };
+    let ips: [&str; 5] = match family {
+        "v4" => [
+            "10.70.0.1",
+            "10.70.0.2",
+            "198.51.100.1",
+            "198.51.100.2",
+            "198.51.100.3",
+        ],
+        "v6" => ["fd70::1", "fd70::2", "fd71::1", "fd71::2", "fd71::3"],
+        _ => anyhow::bail!("unknown family {family}"),
+    };
+    let [lan_ip, client_ip, wan_ip, server_ip, foreign_ip] =
+        ips.map(|ip| ip.parse::<IpAddr>().unwrap());
+    unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    )?;
+    mount(
+        Some("tmpfs"),
+        "/run",
+        Some("tmpfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    )?;
+    // The backend reads interface MACs through sysfs; it must see this netns.
+    mount(
+        Some("sysfs"),
+        "/sys",
+        Some("sysfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    )?;
+    mount(
+        Some("bpf"),
+        "/sys/fs/bpf",
+        Some("bpf"),
+        MsFlags::empty(),
+        None::<&str>,
+    )?;
+    mount(
+        Some("cgroup2"),
+        "/sys/fs/cgroup",
+        Some("cgroup2"),
+        MsFlags::empty(),
+        None::<&str>,
+    )?;
+    let client_netns = fresh_test_netns();
+    let server_netns = fresh_test_netns();
+    let mut netlink = crate::netlink::NlSock::new()?;
+    let (lo, _) = netlink.get_link("lo")?;
+    netlink.set_link_up(lo, true)?;
+    for (host, edge, namespace, ip) in [
+        ("honk-lan0", "honk-c0", &client_netns, lan_ip),
+        ("honk-wan0", "honk-s0", &server_netns, wan_ip),
+    ] {
+        netlink.add_veth_pair(host, edge)?;
+        let (edge_index, _) = netlink.get_link(edge)?;
+        netlink.set_link_netns_fd(edge_index, namespace)?;
+        let (host_index, _) = netlink.get_link(host)?;
+        netlink.set_link_up(host_index, true)?;
+        add_address(&mut netlink, host_index, host, ip)?;
+    }
+    let client = configure_test_edge(&client_netns, "honk-c0", client_ip, lan_ip, &[0])
+        .pop()
+        .context("client socket")?;
+    let mut targets =
+        configure_test_edge(&server_netns, "honk-s0", server_ip, wan_ip, &[41001, 41002]);
+    let foreign = in_test_netns(&server_netns, || -> anyhow::Result<_> {
+        let mut netlink = crate::netlink::NlSock::new()?;
+        let (index, _) = netlink.get_link("honk-s0")?;
+        add_address(&mut netlink, index, "honk-s0", foreign_ip)?;
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(foreign_ip, 41003))?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    })?;
+    let target_b = targets.pop().context("target B socket")?;
+    let target_a = targets.pop().context("target A socket")?;
+    let _dae0 = crate::create_dae0_link()?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let mut peer = QuicUdpPeer::start(mode, SocketAddr::new(wan_ip, 0)).await?;
+            let scenario = async {
+                let group = Group {
+                    name: "fullcone".into(),
+                    nodes: vec![peer.node.id],
+                    ..Default::default()
+                };
+                let mut config = udp_test_config("fullcone", vec![peer.node.clone()], vec![group]);
+                config.ensure_builtin_nodes();
+                config.global.lan_interface = vec!["honk-lan0".into()];
+                config.global.wan_interface = vec!["honk-wan0".into()];
+                config.global.dial_mode = "ip".into();
+                config.global.nfqueue_enable = false;
+                config.global.preconnect_node_count = 0;
+                config.global.udp_warm_node_count = 0;
+                config.global.store_subscribe = false;
+                config.experimental.cache_file.enabled = Some(false);
+                config.global.tcp_check_url.clear();
+                config.global.udp_check_dns.clear();
+                config.dns.bind.clear();
+                let pin_root = Path::new("/sys/fs/bpf/fullcone");
+                let mut backend = RealEbpfBackend::load(
+                    crate::DEFAULT_BPF_OBJECT,
+                    pin_root,
+                    config.global.tproxy_port,
+                    Some("honk-lan0"),
+                    "honk-wan0",
+                    false,
+                )
+                .await?;
+                backend.attach_dae0_programs()?;
+                crate::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
+                backend.attach_sk_lookup()?;
+                backend.attach_dae0peer_ingress()?;
+                let ready = Array::<_, u32>::try_from(pinned_map(pin_root, "DATAPATH_STATE_MAP")?)?;
+                let exact = HashMap::<_, RedirectTuple, RedirectEntry>::try_from(pinned_map(
+                    pin_root,
+                    "REDIRECT_TRACK",
+                )?)?;
+                let clients = HashMap::<_, RedirectTuple, RedirectEntry>::try_from(pinned_map(
+                    pin_root,
+                    "CLIENT_REPLY_TRACK",
+                )?)?;
+                let states = HashMap::<_, TuplesKey, ConnState>::try_from(pinned_map(
+                    pin_root,
+                    "CONN_STATE_MAP",
+                )?)?;
+                let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+                let mut control = ControlPlane::new(
+                    config,
+                    Box::new(backend),
+                    router,
+                    Arc::new(honk_outbound::proxy::ProxyRegistry::default_resolver()?),
+                    DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+                    udp_test_forwarder(),
+                )?;
+                control.set_mode_state(Arc::new(parking_lot::RwLock::new(
+                    crate::mode::ModeState::new("Rule", "fullcone"),
+                )));
+                control.start_datapath_flags_coordinator()?;
+                // No probe traffic may create C's association or change route eligibility.
+                control.alive_set().shutdown_health_checks().await?;
+                let commands = control.command_sender();
+                let shutdown = control.shutdown_requested.clone();
+                let task = tokio::spawn(async move {
+                    let result = control.run().await;
+                    (control, result)
+                });
+                let exercise = async {
+                    tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
+                        while ready.get(&0, 0)? == 0 {
+                            ensure!(
+                                !task.is_finished(),
+                                "control stopped before listener readiness"
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await??;
+                    let client = UdpSocket::from_std(client)?;
+                    let target_a = UdpSocket::from_std(target_a)?;
+                    let target_b = UdpSocket::from_std(target_b)?;
+                    let foreign = UdpSocket::from_std(foreign)?;
+                    let client_addr = client.local_addr()?;
+                    let a = target_a.local_addr()?;
+                    let b = target_b.local_addr()?;
+                    let c = foreign.local_addr()?;
+                    let first =
+                        send_and_observe(&client, &target_a, &mut peer, b"client-to-A").await?;
+                    let second =
+                        send_and_observe(&client, &target_b, &mut peer, b"client-to-B").await?;
+                    ensure!(
+                        first.connection == second.connection && first.session == second.session,
+                        "A/B used different wire associations"
+                    );
+                    ensure!(
+                        first.mapping == second.mapping,
+                        "A/B changed remote UDP mapping"
+                    );
+                    for destination in [a, b] {
+                        exact
+                            .get(&redirect_key(client_addr, destination), 0)
+                            .context("contacted target must have exact redirect framing")?;
+                    }
+                    let mut client_key = redirect_key(client_addr, c);
+                    client_key.dst_ip = In6Addr::zero();
+                    client_key.dst_port = 0;
+                    let framing = clients.get(&client_key, 0)?;
+                    ensure!(
+                        framing.decision_token == 0 && framing.from_wan == 0,
+                        "foreign reply framing must be LAN client-only and token-free"
+                    );
+                    ensure!(framing.ifindex == crate::netlink::ifindex_of("honk-lan0")?);
+                    let c_key = redirect_key(client_addr, c);
+                    let forward = tuples_key(client_addr, c);
+                    let reverse = tuples_key(c, client_addr);
+                    for after_reply in [false, true] {
+                        if after_reply {
+                            foreign
+                                .send_to(b"uncontacted-C-to-client", first.mapping)
+                                .await?;
+                            receive(&client, c, b"uncontacted-C-to-client").await?;
+                        }
+                        ensure!(
+                            matches!(exact.get(&c_key, 0), Err(MapError::KeyNotFound)),
+                            "C unexpectedly acquired exact redirect framing"
+                        );
+                        ensure!(
+                            matches!(states.get(&forward, 0), Err(MapError::KeyNotFound)),
+                            "foreign reply learned client-to-C UDP state"
+                        );
+                        ensure!(
+                            matches!(states.get(&reverse, 0), Err(MapError::KeyNotFound)),
+                            "foreign reply learned C-to-client UDP state"
+                        );
+                    }
+                    // This is C's first client-originated packet: no reverse bypass is allowed.
+                    let third =
+                        send_and_observe(&client, &foreign, &mut peer, b"first-client-to-C")
+                            .await?;
+                    ensure!(
+                        third.connection == first.connection
+                            && third.session == first.session
+                            && third.mapping == first.mapping,
+                        "first C send did not reuse A/B's association"
+                    );
+                    foreign.send_to(b"C-after-contact", third.mapping).await?;
+                    receive(&client, c, b"C-after-contact").await?;
+                    target_a.send_to(b"A-after-C", first.mapping).await?;
+                    receive(&client, a, b"A-after-C").await?;
+                    ensure!(
+                        !task.is_finished(),
+                        "control stopped during full-cone exercise"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                shutdown.store(true, Ordering::Release);
+                let command = if task.is_finished() {
+                    Ok(())
+                } else {
+                    commands
+                        .send(ControlCommand::Shutdown)
+                        .await
+                        .map_err(anyhow::Error::from)
+                };
+                // Keep the owner alive through its ordered ingress/source/receiver drain.
+                let joined = task.await;
+                let (control, stopped) = joined.context("control task panicked")?;
+                stopped.context("control shutdown failed")?;
+                command?;
+                drop(control);
+                exercise
+            }
+            .await;
+            let closed = peer.close().await;
+            scenario?;
+            closed
+        })
+        .with_context(|| format!("full-cone scenario {case}"))
+}
+
+fn add_address(
+    netlink: &mut crate::netlink::NlSock,
+    index: u32,
+    name: &str,
+    ip: IpAddr,
+) -> anyhow::Result<()> {
+    match ip {
+        IpAddr::V4(ip) => netlink.addr_op(true, index, libc::AF_INET as u8, &ip.octets(), 24)?,
+        IpAddr::V6(ip) => {
+            std::fs::write("/proc/sys/net/ipv6/conf/all/accept_dad", "0")?;
+            std::fs::write(format!("/proc/sys/net/ipv6/conf/{name}/accept_dad"), "0")?;
+            netlink.addr_op(true, index, libc::AF_INET6 as u8, &ip.octets(), 64)?;
+        }
+    }
+    wait_for_test_address(ip);
+    Ok(())
+}
+
+fn pinned_map(root: &Path, name: &str) -> anyhow::Result<Map> {
+    Ok(Map::from_map_data(MapData::from_pin(root.join(name))?)?)
+}
+
+fn tuples_key(source: SocketAddr, destination: SocketAddr) -> TuplesKey {
+    crate::control::connection::build_tuples_key(
+        destination.ip(),
+        destination.port(),
+        source.ip(),
+        source.port(),
+        17,
+    )
+}
+
+fn redirect_key(source: SocketAddr, destination: SocketAddr) -> RedirectTuple {
+    RedirectTuple::from_tuples(&tuples_key(source, destination))
+}
+
+async fn receive(
+    socket: &UdpSocket,
+    expected_source: SocketAddr,
+    expected: &[u8],
+) -> anyhow::Result<()> {
+    let mut buffer = [0; 128];
+    let (size, source) =
+        tokio::time::timeout(NETNS_TEST_TIMEOUT, socket.recv_from(&mut buffer)).await??;
+    ensure!(
+        source == expected_source,
+        "expected source {expected_source}, got {source}"
+    );
+    ensure!(&buffer[..size] == expected, "unexpected UDP payload");
+    Ok(())
+}
+
+async fn send_and_observe(
+    client: &UdpSocket,
+    target: &UdpSocket,
+    peer: &mut QuicUdpPeer,
+    payload: &[u8],
+) -> anyhow::Result<QuicUdpPacket> {
+    let destination = target.local_addr()?;
+    client.send_to(payload, destination).await?;
+    let packet = tokio::time::timeout(NETNS_TEST_TIMEOUT, peer.packets.recv())
+        .await?
+        .context("QUIC peer stopped before observing client packet")?;
+    ensure!(
+        packet.target == destination && packet.payload == payload,
+        "fixture did not observe the exact proxied client packet"
+    );
+    receive(target, packet.mapping, payload).await?;
+    Ok(packet)
+}

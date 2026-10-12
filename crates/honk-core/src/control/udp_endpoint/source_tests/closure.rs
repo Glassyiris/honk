@@ -35,11 +35,11 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             fatal,
         );
         let attach = async |target| {
-            pool.prepare_vless_source(
+            pool.prepare_source(
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,
-                VlessUdpPath::Xudp,
+                SourcePath::Vless(VlessUdpPath::Xudp),
                 None,
                 target,
                 None,
@@ -47,6 +47,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
                 Arc::clone(&alive),
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
+                false,
             )
             .await
             .unwrap()

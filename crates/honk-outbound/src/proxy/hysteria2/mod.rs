@@ -43,11 +43,11 @@
 //! accepts both forms).
 
 use std::collections::HashMap;
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSliceMut, Write as _};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -719,7 +719,7 @@ impl Hysteria2Handler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+    ) -> anyhow::Result<Arc<Hy2UdpTransport>> {
         let (conn, state) = client.connection(connect_timeout).await?;
         if state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
@@ -743,10 +743,41 @@ impl Hysteria2Handler {
             rx: tokio::sync::Mutex::new(rx),
             defrag: tokio::sync::Mutex::new(Defragmenter::new(MAX_UDP_SIZE)),
             addr,
+            target_domain_len: target_domain.map(str::len),
             max_datagram,
             target,
             request_observer: parking_lot::Mutex::new(crate::runtime::flow_observation::current()),
         }))
+    }
+
+    pub async fn prepare_udp_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<super::PreparedUdpTransport<Hy2UdpTransport>> {
+        if !speculative {
+            let client = self.client_for_runtime(&runtime).await?;
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?;
+            *transport.request_observer.lock() = None;
+            return Ok(super::PreparedUdpTransport::ready(transport));
+        }
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?;
+            *transport.request_observer.lock() = None;
+            Ok(transport)
+        })
+        .await
     }
 }
 
@@ -798,8 +829,9 @@ impl PacketOutbound for Hysteria2Handler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.build_client(node, None).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await?)
     }
 
     async fn dial_udp_transport_runtime(
@@ -810,8 +842,9 @@ impl PacketOutbound for Hysteria2Handler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.client_for_runtime(&runtime).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await?)
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -826,8 +859,9 @@ impl PacketOutbound for Hysteria2Handler {
             .build_client(runtime.node.as_ref(), Some(profiles))
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
-            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-                .await
+            Ok(self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await? as Arc<dyn PacketTransport>)
         })
         .await
     }
@@ -852,13 +886,14 @@ impl ProbeableOutbound for Hysteria2Handler {
 /// Framed UDP transport over the shared Hysteria2 QUIC connection: UDP
 /// message datagrams go straight onto the connection and inbound datagrams
 /// arrive through the session demux queue.
-struct Hy2UdpTransport {
+pub struct Hy2UdpTransport {
     state: Arc<Hy2ConnState>,
     session_id: u32,
     packet_id: AtomicU16,
     rx: tokio::sync::Mutex<mpsc::Receiver<UdpInbound>>,
     defrag: tokio::sync::Mutex<Defragmenter>,
     addr: String,
+    target_domain_len: Option<usize>,
     max_datagram: usize,
     target: SocketAddr,
     request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
@@ -884,6 +919,9 @@ impl Drop for Hy2UdpTransport {
 impl PacketTransport for Hy2UdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
+    }
+    fn allows_full_cone_replies(&self) -> bool {
+        true
     }
     fn send_timeout(&self) -> Duration {
         self.state.path_health.send_timeout()
@@ -917,34 +955,8 @@ impl PacketTransport for Hy2UdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        if data.len() > MAX_UDP_SIZE {
-            return Err(super::PacketRejection::InvalidSize.into());
-        }
-        self.state.touch();
-        let packet_id = self
-            .packet_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let packets = fragment_udp_message(
-            self.session_id,
-            packet_id,
-            &self.addr,
-            data,
-            self.max_datagram,
-        )
-        .map_err(io::Error::other)?;
-        for packet in packets {
-            self.state
-                .conn
-                .send_datagram_wait(bytes::Bytes::from(packet))
-                .await
-                .map_err(io::Error::other)
-                .map_err(super::quic_carrier_io_error)?;
-        }
-        if let Some(observer) = self.request_observer.lock().take() {
-            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
-        }
-        Ok(())
+        self.send_to(self.target, self.target_domain(), data, None)
+            .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -961,12 +973,27 @@ impl PacketTransport for Hy2UdpTransport {
                     ),
                 )
             })?;
-            let complete =
-                self.defrag
-                    .lock()
-                    .await
-                    .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
-            if let Some(data) = complete {
+            let peer = match msg.addr {
+                super::addr::SocksAddr::V4(peer) => peer.into(),
+                super::addr::SocksAddr::V6(peer) => peer.into(),
+                super::addr::SocksAddr::Domain(domain, port)
+                    if self
+                        .target_domain()
+                        .is_some_and(|expected| domain.eq_ignore_ascii_case(expected))
+                        && port == self.target.port() =>
+                {
+                    self.target
+                }
+                super::addr::SocksAddr::Domain(_, _) => continue,
+            };
+            let complete = self.defrag.lock().await.feed(
+                msg.packet_id,
+                msg.frag_id,
+                msg.frag_total,
+                Some(peer),
+                msg.data,
+            );
+            if let Some((data, peer)) = complete {
                 if data.len() > buf.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -974,8 +1001,68 @@ impl PacketTransport for Hy2UdpTransport {
                     ));
                 }
                 buf[..data.len()].copy_from_slice(&data);
-                return Ok((data.len(), self.target));
+                return Ok((data.len(), peer));
             }
         }
+    }
+}
+
+impl Hy2UdpTransport {
+    pub fn server_addr(&self) -> SocketAddr {
+        self.state.conn.remote_address()
+    }
+
+    fn target_domain(&self) -> Option<&str> {
+        self.target_domain_len.map(|len| &self.addr[..len])
+    }
+
+    pub async fn send_to(
+        &self,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        if data.len() > MAX_UDP_SIZE {
+            return Err(super::PacketRejection::InvalidSize.into());
+        }
+        let mut address;
+        let addr = if target == self.target && target_domain == self.target_domain() {
+            self.addr.as_str()
+        } else {
+            address = [0u8; MAX_ADDRESS_LENGTH as usize];
+            let mut cursor = io::Cursor::new(address.as_mut_slice());
+            if let Some(domain) = target_domain {
+                write!(cursor, "{domain}:{}", target.port())?;
+            } else {
+                write!(cursor, "{target}")?;
+            }
+            let len = cursor.position() as usize;
+            std::str::from_utf8(&address[..len]).expect("formatted address is UTF-8")
+        };
+        self.state.touch();
+        let packet_id = self
+            .packet_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let packets =
+            fragment_udp_message(self.session_id, packet_id, addr, data, self.max_datagram)
+                .map_err(io::Error::other)?;
+        for packet in packets {
+            self.state
+                .conn
+                .send_datagram_wait(bytes::Bytes::from(packet))
+                .await
+                .map_err(io::Error::other)
+                .map_err(super::quic_carrier_io_error)?;
+            if let Some(admitted) = admitted {
+                admitted.store(true, Ordering::Release);
+            }
+        }
+        let captured = self.request_observer.lock().take();
+        if let Some(observer) = crate::runtime::flow_observation::current().or(captured) {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+        }
+        Ok(())
     }
 }

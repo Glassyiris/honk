@@ -493,10 +493,7 @@ impl UdpEndpointPool {
             let mut drivers = self.drivers.lock();
             drivers.closed = true;
         }
-        #[cfg(feature = "rprx")]
-        {
-            self.source_tasks.lock().closed = true;
-        }
+        self.source_tasks.lock().closed = true;
 
         let initializers_graceful = self.wait_for_initializers().await;
         let slow_tasks = join_registered_tasks(
@@ -540,24 +537,17 @@ impl UdpEndpointPool {
         )
         .await;
 
-        #[cfg(feature = "rprx")]
         let source_tasks = {
             let mut tasks = self.source_tasks.lock();
             std::mem::take(&mut tasks.tasks)
         };
-        #[cfg(feature = "rprx")]
         let sources = join_registered_tasks(
             source_tasks,
-            "VLESS source receiver",
+            "source receiver",
             DRIVER_SHUTDOWN_TIMEOUT,
             false,
         )
         .await;
-        #[cfg(not(feature = "rprx"))]
-        let sources = UdpShutdown {
-            joined: true,
-            graceful: true,
-        };
 
         self.drain_removal_dirty().await;
         let retirements_clean = self.wait_for_retirements().await;

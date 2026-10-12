@@ -18,7 +18,7 @@ An ordinary caller receives one of:
 - `ProxyStream`, an established target-bound TCP byte stream; or
 - `Arc<dyn PacketTransport>`, an established framed packet path for one UDP target.
 
-Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. The source-shared VLESS path commits the typed `VlessXudpTransport` into a core-owned source attachment so several five-tuple endpoints can share its receiver.
+Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. Source-shared VLESS, Hysteria2 and TUIC commit their concrete transports into core-owned source attachments so several five-tuple endpoints can share one receiver.
 
 `direct` reaches the target without a proxy protocol. `block` terminates the
 request. Every other handler turns the selected node into bytes understood by
@@ -93,8 +93,8 @@ UDP-only Xray pool therefore does not make Selector warming open that pool.
 `send_packet_confirmed`, and `recv_packet`. `send_packet_confirmed` is the
 stronger first-packet admission point for queue-backed tunnels. Full-cone
 protocols can additionally declare that server metadata authoritatively names
-the reply source. Source-shared VLESS uses the same framing transport internally,
-but core serializes sends from endpoint views and owns its single receive loop.
+the reply source. For source-shared VLESS, Hysteria2 and TUIC, core serializes
+sends from endpoint views and owns the transport's single receive loop.
 
 No production UDP handler returns a raw socket or a loopback bridge. Direct and
 SOCKS5 wrap native sockets behind `PacketTransport`; tunnel protocols implement
@@ -590,13 +590,28 @@ Single XUDP retains its 7,526-byte cap.
 
 ### Source/session ownership and capacity
 
-For Single XUDP and shared/separate Mux.Cool, `honk-core` indexes a source owner
-by reused `NodeRuntime` identity, normalized client address, selected UDP path,
-and reply projection (`ActualPeer` or `RewriteTo(original destination)`). One
-owner holds one XUDP session and one receiver while multiple canonical
-five-tuple endpoint entries expose serialized send views. Single XUDP uses one
+For Single XUDP, shared/separate Mux.Cool, Hysteria2 and TUIC, `honk-core` indexes
+a source owner by reused `NodeRuntime` identity, normalized client address,
+selected protocol/UDP path, and reply projection (`ActualPeer` or
+`RewriteTo(original destination)`). One owner holds one protocol association
+and one receiver; canonical five-tuple endpoints expose serialized send views. Single XUDP uses one
 private unpooled SID 0 per scope; Mux.Cool gives scopes separate child SIDs that
 may share physical pools.
+
+Hysteria2 shares one Session ID and TUIC one association ID across the scope's
+destinations. Different scopes can share a physical QUIC connection without
+sharing their logical association. These QUIC source paths and their shutdown
+joins remain available without `rprx`; only VLESS alternatives require it.
+
+Hysteria2 and both TUIC receive modes retain concrete reply peers through the
+existing bounded reassembler. Hysteria2 fragment addresses must agree; TUIC
+continuations may omit the address and wait for fragment zero, even if it arrives
+last. Peer metadata expires with its packet entry. A known requested domain and
+port may use the captured target projection, with ASCII case-insensitive name
+comparison; an unknown domain never triggers DNS or fabricates a foreign IP.
+TUIC zero-length payloads remain datagrams; Hysteria2 keeps its existing rejection
+of empty inbound payloads. Source preservation does not guarantee remote NAT
+mapping or filtering behavior.
 
 The full `(client, destination)` endpoint map remains authoritative for route,
 decision token, and per-flow Score. A reply for a Ready entry is delivered only
@@ -606,7 +621,7 @@ an absent key in an `ActualPeer` scope is eligible for a foreign full-cone reply
 which updates source transport accounting but has no flow Score owner. Domain
 routes use `RewriteTo(original)` and never become foreign replies.
 
-The runtime lazily creates a private keyed source-ID hash from this scope.
+The VLESS runtime lazily creates a private keyed source-ID hash from this scope.
 Carrier replacement under a reused runtime preserves the ID; runtime
 replacement or process restart creates a new key. This intentionally preserves
 honk's per-source behavior, not Xray's source-only global identity and not a
@@ -633,10 +648,16 @@ result; shutdown remains neutral.
 The last bound view retires its source only after pending attachments are also
 gone; an attachment can still commit while a sibling view retires.
 
-Intentional endpoint retirement after queue admission ends the ambiguous source
+For VLESS, intentional endpoint retirement after queue admission ends the ambiguous source
 without replay or negative transport health. Later senders and the receiver
 retain the same cancellation cause, so a sibling send cannot reinterpret it as
 a carrier failure.
+
+QUIC source send tokens begin only after the source gate admits I/O, but remain
+owned by the endpoint driver through success/timeout/failure classification.
+Waiting for that gate consumes the existing send deadline without creating a
+QUIC attempt. Datagram congestion and TUIC stream failures retain their distinct
+semantics; cancellation or partial acceptance never authorizes packet replay.
 Send start/completion and retirement intent share the source-state critical
 section. It publishes both endpoint and source-view retirement flags after the
 matching sender's intent, before either send or receive can classify cancellation.

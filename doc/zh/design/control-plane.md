@@ -103,15 +103,15 @@ UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP
 ### Transport 与事务
 
 普通 transport 使用 `PacketTransport`；原生 handler 包装真实 socket，tunnel 直接
-实现 packet framing。来源共享的 VLESS XUDP/Mux.Cool 则提交类型化 source
-attachment，让 endpoint view 共用一个 transport receiver。两种形态都不创建
-loopback bridge。
+实现 packet framing。来源共享的 VLESS XUDP/Mux.Cool、Hysteria2 与 TUIC
+提交类型化 source attachment，让 endpoint view 共用唯一 transport receiver。
+控制面不创建 loopback bridge。
 
 Endpoint 创建是事务性的：
 
 1. 把 `(client, original destination)` 预留为 `Initializing`；lease 持有首个 datagram、queue permit、slow-path permit、token、generation 和 cancellation epoch。
 2. 路由、嗅探、选择并准备合格 transport。在发布前创建透明 anyfrom reply socket。
-3. 只提交选中候选的 `PreparedUdpTransport<T>` 或 VLESS source preparation；fallible commit 返回选中的 `Arc<T>`/attachment，drop loser 会自动回滚。
+3. 只提交选中候选的 `PreparedUdpTransport<T>` 或 source preparation；fallible commit 返回选中的 `Arc<T>`/attachment，drop loser 会自动回滚。
 4. 启动 endpoint driver，并等待其 ready barrier。
 5. 在共享 epoch fence 下，把精确的 `Initializing` identity 原子替换为 `Ready`。
 6. 转移保留的首包，通过已提交 transport 发送并等待 acknowledgement。
@@ -124,10 +124,10 @@ stagger／满容量等待与 commit。到期后不再启动后续候选，并在
 已启动 preparation。嗅探／路由位于该边界之前；reply socket 创建、发布与
 packet I/O 位于其后，受已有事务及 I/O 上限约束。不会自动重放 packet。
 
-对于来源共享 VLESS，`udp_endpoint/source.rs` 按 reused runtime identity、
-规范化 client、UDP path 与 `ActualPeer` 或 `RewriteTo(original destination)`
-索引一个 owner。它持有一条 XUDP session、一条 receiver 与多个 endpoint send
-view。完整 `(client, destination)` endpoint map 仍权威持有 route、token、
+对于来源共享的 VLESS、Hysteria2 与 TUIC，`udp_endpoint/source.rs` 按 reused
+runtime identity、规范化 client、协议/UDP path 与 `ActualPeer` 或
+`RewriteTo(original destination)` 索引 owner。它持有一条协议 association、
+一条 receiver 与多个 endpoint send view。完整 `(client, destination)` endpoint map 仍权威持有 route、token、
 generation 与逐 flow Score。reply classification 不会把已占用 wrong-owner、
 `Initializing` 或 `Retiring` entry 当作 foreign；只有缺失的 `ActualPeer` key
 可做 foreign delivery，且没有逐 flow Score。domain route 保持 original
@@ -137,11 +137,15 @@ Source sharing 不会合并 kernel/NFQUEUE flow ownership：每个规范 endpoin
 继续保有独立 decision token、generation、terminal transition 与五元组
 retirement fence。
 
-每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST、PKTINFO 与逐报文 `SO_MARK` 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送各有五秒超时。超时或错误具有歧义，因为 transport 可能已接受 packet 的一部分，因此 driver 不会重放该 datagram，也不会继续后续 follower。
+关闭 `rprx` 时，共用 source 准入和 shutdown join 仍启用，只有 VLESS 分支受
+feature gate 限制。Hy2/TUIC 经有界重组保留真实来源；其 QUIC send guard 在
+source gate 准入后开始，并由 driver 保留到最终 I/O 结果分类完成。
+
+每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST、PKTINFO 与逐报文 `SO_MARK` 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送使用 transport 的 deadline：默认五秒，QUIC 使用路径的 SRTT 派生 deadline。超时或失败可能发生在部分数据已接受之后，因此不重放 datagram；单包拥塞可以丢弃该包后继续，终止性失败则结束受影响的 flow/source。
 
 SOCKS5 UDP 在 endpoint 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 endpoint 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。`PacketTransport::relay_addr()` 和接收来源元数据暴露的是逻辑目标，因此 endpoint 首回复校验不会把 SOCKS relay 与远端 peer 混淆。
 
-回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket，并按 endpoint 缓存已接受的其他 full-cone 来源。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
+回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket。普通 flow 按 endpoint 缓存已接受的其他 full-cone 来源；共享 source 则由 receiver 为全部绑定 view 共用一个最多七个其他来源 socket 的缓存。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
 
 Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 取消并排空 `Initializing` lease 及其保留资源，`Ready` endpoint 仍遵循既有生命周期。已有原始 UDP `Ready` 会话在语义分组名相同且符合该生命周期时可以保留，但 `Initializing` 不能跨 reload 存活。编译策略发布后，过期的排队路由元数据仍会被准入检查拒绝。每次 retirement（包括其 `Retiring` tombstone）和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
 编译后的流量计划成功变更，且旧策略或新策略包含直连 mark 时，才会退役直连 `Ready` endpoint，避免后续流量复用旧 socket mark；无变化、不相关重载，以及新旧策略均无直连 mark 的路由变更，都会保留这些端点。显式标记为用户态所有的 WAN UDP 决策（包括带 mark 的 `direct(must)`）会在 tuple/reader fence 下同时清理 token 为零的 conn state、handoff 与 redirect track；原生 LAN direct/offloaded 决策及更新的非零 token 保持不变。

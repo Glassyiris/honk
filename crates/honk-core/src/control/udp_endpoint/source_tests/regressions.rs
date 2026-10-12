@@ -56,7 +56,12 @@ async fn queued_source_view_timeout_is_local_congestion() {
     let owner = attachment_a.owner();
     assert!(Arc::ptr_eq(&owner, &attachment_b.owner()));
     assert!(Arc::ptr_eq(&owner, &attachment_c.owner()));
-    let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+    let scope = SourceScope::new(
+        &runtime,
+        client_addr,
+        SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
+    );
     let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
     let endpoint_b = install_source(&pool, lease_b, attachment_b, target_b, &stats, node.id);
     let endpoint_c = source_endpoint(&pool, attachment_c, target_c, &stats, node.id, None);
@@ -277,11 +282,11 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     .await;
     let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
     let stale = pool
-        .prepare_vless_source(
+        .prepare_source(
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_addr,
-            VlessUdpPath::Xudp,
+            SourcePath::Vless(VlessUdpPath::Xudp),
             None,
             target_b,
             None,
@@ -289,10 +294,16 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
             Arc::clone(&alive),
             Arc::clone(&stats),
             honk_outbound::alive::IpVersion::V4,
+            false,
         )
         .await
         .unwrap();
-    let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+    let scope = SourceScope::new(
+        &runtime,
+        client_addr,
+        SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
+    );
 
     assert_ne!(node.id, OTHER_SCORE_NODE_ID);
     let other = Node {
@@ -596,7 +607,12 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         "B must be scored before reentrant death cleanup can cancel its driver",
     );
 
-    let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+    let scope = SourceScope::new(
+        &runtime,
+        client_addr,
+        SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
+    );
     drop(endpoint_a);
     drop(endpoint_b);
     drop(owner);
@@ -632,11 +648,11 @@ async fn post_admission_view_cancel_is_health_neutral() {
         let lease_a = reserve_source(&pool, &stats, client_addr, target_a, node.id);
         let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
         let prepared_a = pool
-            .prepare_vless_source(
+            .prepare_source(
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,
-                VlessUdpPath::Xudp,
+                SourcePath::Vless(VlessUdpPath::Xudp),
                 None,
                 target_a,
                 None,
@@ -644,12 +660,13 @@ async fn post_admission_view_cancel_is_health_neutral() {
                 Arc::clone(&alive),
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
+                false,
             )
             .await
             .unwrap();
-        let VlessSourcePreparation::Fresh {
+        let SourcePreparation::Fresh {
             scope: prepared_scope,
-            prepared,
+            prepared: source::PreparedSourceTransport::Vless(prepared),
             source_permit,
             runtime: prepared_runtime,
             alive_set,
@@ -662,9 +679,11 @@ async fn post_admission_view_cancel_is_health_neutral() {
             panic!("first source preparation must be fresh");
         };
         let transport = prepared.commit().await.unwrap();
-        let attachment_a = VlessSourcePreparation::Fresh {
+        let attachment_a = SourcePreparation::Fresh {
             scope: prepared_scope,
-            prepared: honk_outbound::proxy::PreparedUdpTransport::ready(Arc::clone(&transport)),
+            prepared: source::PreparedSourceTransport::Vless(
+                honk_outbound::proxy::PreparedUdpTransport::ready(Arc::clone(&transport)),
+            ),
             source_permit,
             runtime: prepared_runtime,
             alive_set,
@@ -688,7 +707,12 @@ async fn post_admission_view_cancel_is_health_neutral() {
         .await;
         let owner = attachment_a.owner();
         assert!(Arc::ptr_eq(&owner, &attachment_b.owner()));
-        let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+        let scope = SourceScope::new(
+            &runtime,
+            client_addr,
+            SourcePath::Vless(VlessUdpPath::Xudp),
+            None,
+        );
         let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
         let endpoint_b = install_source(&pool, lease_b, attachment_b, target_b, &stats, node.id);
 
@@ -842,7 +866,12 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
     let first = next_data_frame(&mut events, &mut replies).await;
     let second = next_data_frame(&mut events, &mut replies).await;
     assert_eq!(first.connection, second.connection);
-    let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+    let scope = SourceScope::new(
+        &runtime,
+        client_addr,
+        SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
+    );
     let owner = Arc::clone(pool.sources.get(&scope).unwrap().value());
     let sweep: Vec<_> = pool
         .endpoints
