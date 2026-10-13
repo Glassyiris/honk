@@ -22,8 +22,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 
-#[cfg(feature = "rprx")]
 mod source;
+pub use source::Backend;
 
 const POOL_CAPACITY: usize = 16;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,7 +63,6 @@ pub struct IoHarness {
     client: UdpSocket,
     client_addr: SocketAddr,
     targets: Vec<SocketAddr>,
-    #[cfg(feature = "rprx")]
     source: Option<source::SourceRuntime>,
 }
 
@@ -90,7 +89,6 @@ impl IoHarness {
             client_addr: client.local_addr()?,
             client,
             targets,
-            #[cfg(feature = "rprx")]
             source: None,
         })
     }

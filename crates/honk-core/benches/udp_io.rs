@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use honk_core::control::udp_endpoint::bench_support::real_io::{Enqueue, IoHarness};
-use honk_outbound::proxy::PacketTransport;
+use honk_outbound::proxy::{MultiTargetTransport, PacketTransport};
 use nix::time::{ClockId, clock_gettime};
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 
+#[path = "udp_io/backend.rs"]
+mod backend;
 #[cfg(feature = "rprx")]
 #[path = "udp_io/source.rs"]
 mod source;
@@ -116,11 +118,13 @@ impl Gate {
     }
 }
 
-/// Allocation-free in-memory echo: `send_packet` queues, `recv_packet` pops.
+/// Allocation-free in-memory echo: sends queue, `recv_packet` pops and names
+/// the peer the datagram was sent to. As a `PacketTransport` that peer is the
+/// fixed `relay`; as a `MultiTargetTransport` it is the per-call target.
 #[derive(Debug)]
 struct EchoTransport {
     relay: SocketAddr,
-    queue: Mutex<VecDeque<(usize, [u8; PAYLOAD])>>,
+    queue: Mutex<VecDeque<(usize, [u8; PAYLOAD], SocketAddr)>>,
     ready: Notify,
     gate: Arc<Gate>,
 }
@@ -136,13 +140,9 @@ impl EchoTransport {
     }
 }
 
-#[async_trait]
-impl PacketTransport for EchoTransport {
-    fn relay_addr(&self) -> SocketAddr {
-        self.relay
-    }
-
-    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+impl EchoTransport {
+    /// The one send path of both trait entry points.
+    async fn echo(&self, peer: SocketAddr, data: &[u8]) -> std::io::Result<()> {
         self.gate.pass().await;
         let mut packet = [0u8; PAYLOAD];
         packet
@@ -152,17 +152,46 @@ impl PacketTransport for EchoTransport {
         self.queue
             .lock()
             .expect("echo queue")
-            .push_back((data.len(), packet));
+            .push_back((data.len(), packet, peer));
         self.ready.notify_one();
         Ok(())
+    }
+}
+
+#[async_trait]
+impl MultiTargetTransport for EchoTransport {
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        _domain: Option<&str>,
+        data: &[u8],
+        _confirmed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        self.echo(target, data).await?;
+        if let Some(admitted) = admitted {
+            admitted.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PacketTransport for EchoTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.echo(self.relay, data).await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         loop {
             let next = self.queue.lock().expect("echo queue").pop_front();
-            if let Some((len, packet)) = next {
+            if let Some((len, packet, peer)) = next {
                 buf[..len].copy_from_slice(&packet[..len]);
-                return Ok((len, self.relay));
+                return Ok((len, peer));
             }
             self.ready.notified().await;
         }
@@ -361,6 +390,31 @@ fn ordinary(
     }
 }
 
+/// One in-memory `MultiTargetTransport` shared by every destination of the
+/// client source: the core `Shared` path with the ordinary workloads' echo.
+fn shared_mock(name: &'static str, destinations: usize) -> Workload {
+    let rt = runtime();
+    let harness = rt.block_on(async {
+        let mut harness = IoHarness::new(destinations).await.expect("harness");
+        let transport = EchoTransport::new(harness.target(0), Arc::new(Gate::default()));
+        for destination in 0..destinations {
+            harness
+                .install_mock_source(destination, transport.clone())
+                .await
+                .expect("install mock source");
+        }
+        harness
+    });
+    Workload {
+        name,
+        harness,
+        rt,
+        measured: (0..destinations).collect(),
+        background: None,
+        gate: None,
+    }
+}
+
 fn bench_udp_io(c: &mut Criterion) {
     bench_workload(c, ordinary("ordinary_single", 1, vec![0], None));
     bench_workload(c, ordinary("ordinary_two_dest", 2, vec![0, 1], None));
@@ -368,6 +422,9 @@ fn bench_udp_io(c: &mut Criterion) {
         c,
         ordinary("ordinary_two_dest_b_blocked", 2, vec![0], Some(1)),
     );
+    bench_workload(c, shared_mock("shared_mock_single", 1));
+    bench_workload(c, shared_mock("shared_mock_two_dest", 2));
+    backend::bench(c);
     #[cfg(feature = "rprx")]
     source::bench(c);
 }

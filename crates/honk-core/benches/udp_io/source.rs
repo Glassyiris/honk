@@ -11,7 +11,7 @@
 
 use super::{Workload, bench_workload, runtime};
 use criterion::Criterion;
-use honk_core::control::udp_endpoint::bench_support::real_io::IoHarness;
+use honk_core::control::udp_endpoint::bench_support::real_io::{Backend, IoHarness};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -101,14 +101,14 @@ fn vless(
         if let Some(b) = background {
             // Sink a destination only after its first datagram is echoed.
             harness
-                .install_vless_xudp_source(b, server)
+                .install_backend_source(b, Backend::VlessXudp, server)
                 .await
                 .expect("install background source");
             sink_port.store(harness.target(b).port(), Ordering::Relaxed);
         }
         for destination in (0..destinations).filter(|d| Some(*d) != background) {
             harness
-                .install_vless_xudp_source(destination, server)
+                .install_backend_source(destination, Backend::VlessXudp, server)
                 .await
                 .expect("install source");
         }
