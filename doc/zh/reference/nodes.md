@@ -45,7 +45,9 @@ XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的
 
 **破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及 session 状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
 
-不要为了迁移 ID 而删除缓存。持久化已启用且可读时，未变更的组名、成员名可用于恢复 Selector 选择；有效且不超过 24 小时的 TCP-v4 延迟样本会在启动时按节点名关联到新 ID。这些样本只用于排名，不恢复存活状态；改名或重复名称不能保证恢复同一个叶节点。就绪流原本就随所属 generation 退役，`name`/`subtag` 筛选语义不变。
+**逐包带地址的 UDP framing：**有效 UDP 路径（53、443 或 54 端口）为 UoT v2 或 H2MUX 的 VLESS 节点（`packetEncoding=uot-v2`、`mux=h2mux`，或回退后落到这两条路径）会再次获得新 ID，因为这些路径现在每个包都携带地址；Auto、native、XUDP、Mux.Cool 与关闭 UDP 的节点 ID 不变。直连节点的 Selector 选择以节点 ID 为键，会随之丢失。结构化（JSON/YAML/TOML）配置里若在组的 `nodes` 中用旧 ID 引用这类节点，加载时会跟随到新 ID。
+
+不要为了迁移 ID 而删除缓存。持久化已启用且可读时，直连节点的 Selector 选择按节点 ID 保存，因此 ID 变化会丢失该固定选择，子组的选择按组名保存，可以保留；有效且不超过 24 小时的 TCP-v4 延迟样本会在启动时按节点名关联到新 ID。这些样本只用于排名，不恢复存活状态；改名或重复名称不能保证恢复同一个叶节点。就绪流原本就随所属 generation 退役，`name`/`subtag` 筛选语义不变。
 
 只要可拨号端点和 dial shape 不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置与运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何传入的 nil ID。
 
@@ -62,7 +64,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `host` | string | `""` | 显式服务端主机；否则 `Node::host()` 从 `address` 派生 |
 | `port` | u16 | `0` | 服务端端口；URL 形链接省略时使用 `443` |
 | `username` / `password` | string? | null | 来自 userinfo 的认证、UUID 或密钥 |
-| `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串 |
+| `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串；Shadowsocks 省略时拨号阶段回退到 `aes-128-gcm` |
 | `packet_encoding` | `VlessUdpEncoding` | VLESS 使用 `auto` | 结构化 VLESS 回退 encoding：`auto`、`native`、`xudp` 或 `uot-v2`；规范 URI 的 `packetEncoding=none` 映射为 `native` |
 | `multiplex` | `VlessMultiplex` | VLESS 使用 `{"protocol":"off"}` | 结构化 VLESS carrier 选择：`off`、`h2` 或 `xray`；精确形态见下文 |
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
@@ -87,7 +89,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 `mport` 列表与 `mhop` 秒数；有效间隔为 30 秒 |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC 接收窗口；有效默认值为 8 MiB / 8 MiB，应用读取足够快时 conn 窗口自动增长至最多 32 MiB（conn 窗口同时是每连接内存预算，慢消费者最多缓冲约 3 倍该值） |
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
-| `quic_mtu` | u16? | null | 来自 `mtu` 的 QUIC UDP payload 大小；默认 1252，接受范围 1200–65527；显式设置大于 1252 时启用 GSO，`HONK_QUIC_GSO=0` 可强制关闭 |
+| `quic_mtu` | u16? | null | 来自 `mtu` 的 QUIC UDP payload 大小；通告的接收大小默认 1252，接受范围 1200–65527，而发送 MTU 从 1200 起步并通过路径 MTU 发现增长；设置 `mtu` 时还会设定初始发送 MTU 和发现上限；显式设置大于 1252 时在常规 socket 上启用 GSO（Hysteria2 混淆/跳端口 socket 除外），`HONK_QUIC_GSO=0` 可强制关闭 |
 | `tls_pin_sha256` | string? | null | 来自 `pinSHA256` 或 `pin_sha256` 的叶证书 SHA-256 pin |
 | `tuic_uuid` / `tuic_password` | string? | null | TUIC 凭据；扁平字段须与别名 `username` / `password` 一致 |
 | `tuic_congestion` / `tuic_alpn` | string? | null | TUIC `congestion_control` 与逗号分隔的 `alpn` |
@@ -154,6 +156,17 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 
 SOCKS5 UDP ASSOCIATE 为每个客户端 source 保持一条控制 TCP 连接和一个中继 socket，该 source 的所有目的地共用它，并返回每个应答头中的真实远端 peer。从未联系过的 peer 能否到达客户端取决于服务器：Dante 默认的 `udp.connectdst: yes` 仅在只使用过单一目的地期间才会连接其出站 socket。
 
+**UDP full-cone。** 所有支持 UDP 的代理协议都让一个客户端 source 的全部目的地共用一条代理 association，并返回每个回复的真实远端 peer：Hysteria2、TUIC、Shadowsocks（AEAD 与 2022）、Juicity、SOCKS5、Trojan、AnyTLS，以及 VLESS XUDP/Mux.Cool、UoT v2 与 H2MUX。例外是选用 native UDP 的 VLESS 节点（显式 `native`，或无 Vision 时 UDP/53 与 UDP/443 上的 `auto`），其流只指定单个目标。来自客户端从未联系过的 peer 的回复，会以该 peer 的源地址送达。这是 RFC 5780 full-cone 的客户端一半；另一半取决于服务端，它必须为每个 association 使用一个未连接 socket，并转发任意 peer 的回复。honk 无法打开服务端保持关闭的过滤；`direct` 流量遵循宿主机自身的 NAT。限制：
+
+- 按域名拨号的流为每个原始目的地保留一条 association，其回复投影到该目的地，因此得不到端点无关映射。
+- 一个 source 的各目的地仅在同一节点上共用 association。组可能把新目的地或 Score 试探流送到另一节点，那里有自己的映射。
+- 使用协议回退（没有 H2MUX，也没有 Xray UDP 池）时，VLESS `packetEncoding=auto` 对无 Vision 节点的 UDP/53 与 UDP/443 使用已连接的 native UDP，其流只指定单个目标，所以这两个端口无法 full-cone；Vision 节点和其他所有端口本来就使用 Single XUDP。设置 `packetEncoding=xudp` 可显式启用。honk 不把它设为默认：在 loopback 上对 sing-box 1.12.4 测量，Single XUDP 在 1200 字节、不限速时的吞吐约为 native 的一半，每 MB 客户端 CPU 为 native 的 1.9 到 3.3 倍，p99.9 延迟尾部更重，中位数与冷启动延迟没有可测量差异。XUDP 还会拒绝超过 7,526 字节的 datagram。
+- 各端口所选路径不同的 VLESS source（例如 Xray UDP 池加 UDP/443 `skip`，443 使用 Single XUDP）即使在同一节点上，也按所选路径各有一条 association。
+- Trojan、Juicity 与 AnyTLS 把一个 source 的全部目的地放在一条可靠流上，某个目的地停滞会拖慢同流的其他目的地，写失败会终止所有目的地。datagram 载体（Hysteria2、TUIC、Shadowsocks、SOCKS5）没有这个问题。
+- 53 端口的流不在数据路径中发布客户端回复 framing，因此对 53 端口流的主动回复依赖宿主机转发。
+- 每个客户端 source 同时最多服务七个外来回复源。当第 65 个不同的 peer 即将退役、而仍在跟踪 64 个已退役 peer 时，该 source 不再接纳主动回复；重新被绑定的 peer 会从该列表移除。
+- VMess 没有 UDP 后端。
+
 对于支持 `network` 的协议，扁平结构化输入接受逗号分隔的 `tcp`/`udp`，忽略各项首尾空白和 ASCII 大小写。`tcp` 关闭 UDP；`udp` 与 `tcp,udp` 都允许 UDP。空文本或纯空白规范化为未指定，保留协议的默认能力。`quic` 等未知值，或非空列表中的空项，会使节点被拒绝。该字段只控制 UDP 准入；`udp` 不会额外禁止 TCP。
 
 没有 `rprx` Cargo feature 时，VMess 与 VLESS 节点仍能解析，但不会注册 handler，拨号以 `No handler for protocol` 失败；正常 feature-off 构建不会分配 VLESS pool 或 carrier semaphore。`honk-core` 与 `honk-tool` 默认启用 `rprx`。
@@ -195,7 +208,7 @@ node {
 
 VMess 接受 v2rayN Base64 JSON（`net`、`host`、`path`、`sni`），也接受 Shadowrocket 的 `vmess://base64(auto:UUID@host:port)?...` authority 形式。后者映射 `tls`、`peer`/`sni`、`obfs=websocket|grpc`、`obfsParam`、`path` 和 `remark`；接受 standard / URL-safe Base64，有无 padding 均可。编码 authority 的 VMess 要求 AEAD 认证及 `auto`/`aes-128-gcm`；不支持的 cipher 和 REALITY 参数会被拒绝，不会静默替换。
 
-VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，保留原有默认 UDP 能力；已有的有效空传输字段也保留原始写法。非 XHTTP 传输保留对无关导出字段 `mode`、`extra` 的旧有忽略行为；这些字段不会选择 XHTTP。显式冲突的传输声明仍会拒绝节点。
+VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，对有 UDP 后端的协议保留原有默认 UDP 能力（VMess 没有 UDP 后端）；已有的有效空传输字段也保留原始写法。非 XHTTP 传输保留对无关导出字段 `mode`、`extra` 的旧有忽略行为；这些字段不会选择 XHTTP。显式冲突的传输声明仍会拒绝节点。
 
 VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC 与下述 H2 XHTTP profile。未加密 Vision 的 direct-copy 要求使用 TLS 1.3 或 REALITY 的裸 TCP，不能使用 WS/gRPC/XHTTP；加密 Vision 遵循下文的组合规则。
 
@@ -287,11 +300,11 @@ node {
 | 协议 | 链接输入 | 节点字段 / 行为 |
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | 通用 `username` / `password`；供 `tuic_uuid` / `tuic_password` 的 handler 回退使用 |
-| TUIC | `congestion_control` | `cubic`、`new_reno` 或 `bbr`；未知值告警并回退到 cubic |
+| TUIC | `congestion_control` | `cubic`、`new_reno` 或 `bbr`；省略时为 `cubic`；未知值告警并回退到 cubic |
 | TUIC | `alpn` | 逗号分隔的 ALPN 覆盖值；默认 `tuic` |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | 接收窗口覆盖值 |
 | Juicity | `uuid:password` userinfo | 通用 `username` / `password`；供 `juicity_uuid` / `juicity_password` 的 handler 回退使用 |
-| Juicity | 协议默认值 | ALPN `h3`、BBR，以及固定的 8 MiB / 8 MiB 接收窗口 |
+| Juicity | 协议默认值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收窗口（共享自适应流控可使其增长） |
 | Juicity | UDP | 每个客户端源一条 QUIC bi stream 承载所有目的地；回复返回真实的远端对端，取决于服务端自身的 UDP socket 与出口策略 |
 | 两者 | `mtu`、`sni`、insecure 别名、pin、ECH | 共用 QUIC/TLS 参数 |
 

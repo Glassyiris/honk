@@ -16,7 +16,7 @@ UDP 对象。
 - `ProxyStream`：已经建立、绑定目标的 TCP 字节流；或
 - `Arc<dyn PacketTransport>`：已经建立、面向一个 UDP 目标的分帧报文路径。
 
-推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享的 VLESS、Hysteria2 与 TUIC 把具体 transport 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用唯一 receiver。
+推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享协议（具体的 VLESS XUDP/Mux.Cool、Hysteria2、TUIC，以及所有 `MultiTargetTransport`）把 transport 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用唯一 receiver。
 
 `direct` 不使用代理协议，直接连接目标。`block` 终止请求。其他每个 handler 都根据
 选定节点生成代理服务器能够理解的协议字节。
@@ -91,8 +91,7 @@ downcast 不变量；`proxy/vless/handler/stream.rs` 的 `ProxyStream::into_visi
 `PacketTransport` 暴露 relay 目标、`send_packet`、
 `send_packet_confirmed` 与 `recv_packet`。对于带队列的 tunnel，
 `send_packet_confirmed` 是更强的首包准入点。full-cone 协议还可以声明
-服务端 metadata 能够权威指定回包源地址。对于来源共享的 VLESS、Hysteria2 与
-TUIC，由 core 串行化各 endpoint view 的发送并持有 transport 的唯一 receive loop。
+服务端 metadata 能够权威指定回包源地址。对于来源共享协议，由 core 串行化各 endpoint view 的发送并持有 transport 的唯一 receive loop。
 
 生产 UDP handler 不返回裸 socket 或 loopback bridge。Direct 与 SOCKS5
 把 native socket 包装在 `PacketTransport` 后面；tunnel 协议在其真实
@@ -569,7 +568,7 @@ packet 保持 8 KiB 上限；Single XUDP 保持 7,526 字节上限。
 
 ### Source/session ownership and capacity
 
-对于 Single XUDP、shared/separate Mux.Cool、Hysteria2 与 TUIC，`honk-core`
+对于来源共享协议（Single XUDP、shared/separate Mux.Cool、Hysteria2、TUIC 与各 `MultiTargetTransport`），`honk-core`
 按 reused `NodeRuntime` identity、规范化 client 地址、所选协议/UDP path 与
 reply projection（`ActualPeer` 或 `RewriteTo(original destination)`）索引
 source owner。一个 owner 持有一条协议 association 与一条 receiver，多个规范
@@ -587,6 +586,26 @@ Hysteria2 与 TUIC 的两种接收模式通过既有有界重组器保留实际�
 可使用捕获的目标投影，域名按 ASCII 大小写不敏感比较；未知域名不触发 DNS，
 也不伪造 foreign IP。TUIC 零长度 payload 仍是 datagram；Hysteria2 保留既有的
 空入站 payload 拒绝。来源保留不保证远端 NAT 的映射或过滤行为。
+
+`MultiTargetTransport` 是 Shadowsocks、Juicity、SOCKS5、Trojan、AnyTLS 与 VLESS
+UoT v2/H2MUX 共用的通用 source transport（Hysteria2、TUIC 与 VLESS XUDP/Mux.Cool
+保留具体分支，使其发送路径不被装箱）。每个客户端 source 为其所有目的地持有
+一条逻辑 association：一个 Shadowsocks socket 与加密会话（SS2022 不会因目的地
+变化重置 session ID、包计数器或重放窗口）、一条 Juicity 双向流、一条 SOCKS5
+控制连接加一个中继 socket、一条 Trojan associate 流、一条 non-connect UoT v2
+流或一条 H2MUX PacketAddr 流。`recv_packet` 返回经过认证的真实 peer：IPv4 映射
+的 peer 规范化为 IPv4；域名来源仅在等于捕获的域名与端口时接受，其他域名不经
+DNS 直接丢弃，流式协议会整帧消费被丢弃的帧后再读下一帧；未知地址类型仍是终止性
+错误。`send_packet` 与 `send_to` 共用一个未装箱 helper；`confirmed` 只在各 view 的
+首个 datagram 上传给 transport，`admitted` 在 datagram 进入线路或 writer 队列时
+设置。可靠流 carrier（Trojan、Juicity、AnyTLS、UoT、H2MUX）的部分帧超时对整个
+source 保持终止性，因此共用一条流的各目的地也共享其队头阻塞与失败命运。写到一半
+被取消的帧（例如其 view 已退役）会使该流中毒：下一次发送失败并退役该 source 的
+所有目的地，而不会接在残帧后面。原生 UDP 的大小拒绝（`EMSGSIZE`）是类型化的本地
+`InvalidSize` 拒绝，不终止任何东西。最后一个 view 的 endpoint permit 保留到
+source receiver 退出或另一个 view 绑定，使退役中的 source 不超出描述符分区；这
+意味着饱和的 pool 在短时间内可能拒绝新 endpoint。core 的 send gate 是唯一的外层
+锁：后端只在其下持有自己的叶子锁，且不回调 core。
 
 完整 `(client, destination)` endpoint map 继续权威持有 route、decision token
 与逐 flow Score。Ready entry 的 reply 仅在 endpoint 属于该 source owner 时

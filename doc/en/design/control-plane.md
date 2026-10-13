@@ -106,8 +106,8 @@ Malformed controller-owned UDP53 retains compatible controller handoff facts for
 ### Transport and transaction
 
 Ordinary transports use `PacketTransport`; native handlers wrap a real socket
-and tunnels frame packets directly. Source-shared VLESS XUDP/Mux.Cool,
-Hysteria2 and TUIC commit typed source attachments whose endpoint views share
+and tunnels frame packets directly. Source-shared protocols (concrete VLESS XUDP/Mux.Cool, Hysteria2 and TUIC, and every
+`MultiTargetTransport`) commit typed source attachments whose endpoint views share
 one transport receiver. The control plane creates no loopback bridge.
 
 Endpoint creation is transactional:
@@ -129,7 +129,7 @@ drains every started preparation before returning. Sniffing/routing precede
 this boundary; reply-socket creation, publication, and packet I/O follow under
 their existing transaction and I/O bounds. There is no automatic packet replay.
 
-For source-shared VLESS, Hysteria2 and TUIC, `udp_endpoint/source.rs` indexes one
+For source-shared protocols, `udp_endpoint/source.rs` indexes one
 owner by reused runtime identity, normalized client, protocol/UDP path, and
 `ActualPeer` or `RewriteTo(original destination)`. It owns one protocol
 association, one receiver and multiple endpoint send views. The full `(client, destination)` endpoint map is
@@ -150,7 +150,7 @@ admission and stays with the driver until the final I/O outcome is classified.
 
 Each transparent socket consumes at most eight datagrams per readiness turn with `recvmmsg`. Every slot retains independent ORIGDST, PKTINFO, and per-packet `SO_MARK` metadata, packets remain in kernel order, and malformed metadata drops only that slot. After a drained queue, the next wake starts with one slot; a full read immediately reopens the eight-slot batch, avoiding sparse-traffic setup cost. The cap bounds scheduler fairness and payload storage to 512 KiB per socket, or 4 MiB across the current four sockets per family when both families are active. The listener loop only validates, reserves, and enqueues; it never awaits `PacketTransport` I/O. The endpoint driver owns all transport calls. First and steady sends use the transport's deadline: five seconds by default, or the QUIC path's SRTT-derived deadline. Timeout or failure may follow partial acceptance, so no datagram is replayed; packet-local congestion can drop that packet and continue, while terminal failures stop the affected flow/source.
 
-SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the endpoint lifetime and treats control EOF or unexpected control data as endpoint failure. Its connected UDP socket sends to the physical server `BND.ADDR` relay, resolving a domain reply and replacing an unspecified address with the control peer IP. `PacketTransport::relay_addr()` and received source metadata expose the logical target instead, so endpoint first-reply validation does not confuse the SOCKS relay with the remote peer.
+SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the source association's lifetime and treats control EOF or unexpected control data as association failure. Its connected UDP socket sends to the physical server `BND.ADDR` relay, resolving a domain reply and replacing an unspecified address with the control peer IP. Each request header names its destination and each reply returns the real source from its header, with a domain source projected only to the captured name and port. `PacketTransport::relay_addr()` is the first destination, so the relay itself is never mistaken for the remote peer.
 
 Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket. Ordinary flows cache accepted alternate full-cone sources per endpoint; shared sources retain one receiver-owned cache of at most seven alternate sockets across all bound views. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid. A reply from an alternate source has no exact `REDIRECT_TRACK` entry; `dae0_ingress` returns it to the client through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, so a restrictive forward policy does not drop it. Receiving such a reply never authorizes the client's own next packet to that source: `lan_egress` does not learn a reverse direction from packets arriving from `dae0`, and that packet takes the normal routing path.
 

@@ -103,8 +103,8 @@ UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP
 ### Transport 与事务
 
 普通 transport 使用 `PacketTransport`；原生 handler 包装真实 socket，tunnel 直接
-实现 packet framing。来源共享的 VLESS XUDP/Mux.Cool、Hysteria2 与 TUIC
-提交类型化 source attachment，让 endpoint view 共用唯一 transport receiver。
+实现 packet framing。来源共享协议（具体的 VLESS XUDP/Mux.Cool、Hysteria2 与 TUIC，以及所有
+`MultiTargetTransport`）提交类型化 source attachment，让 endpoint view 共用唯一 transport receiver。
 控制面不创建 loopback bridge。
 
 Endpoint 创建是事务性的：
@@ -124,7 +124,7 @@ stagger／满容量等待与 commit。到期后不再启动后续候选，并在
 已启动 preparation。嗅探／路由位于该边界之前；reply socket 创建、发布与
 packet I/O 位于其后，受已有事务及 I/O 上限约束。不会自动重放 packet。
 
-对于来源共享的 VLESS、Hysteria2 与 TUIC，`udp_endpoint/source.rs` 按 reused
+对于来源共享协议，`udp_endpoint/source.rs` 按 reused
 runtime identity、规范化 client、协议/UDP path 与 `ActualPeer` 或
 `RewriteTo(original destination)` 索引 owner。它持有一条协议 association、
 一条 receiver 与多个 endpoint send view。完整 `(client, destination)` endpoint map 仍权威持有 route、token、
@@ -143,7 +143,7 @@ source gate 准入后开始，并由 driver 保留到最终 I/O 结果分类完�
 
 每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST、PKTINFO 与逐报文 `SO_MARK` 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送使用 transport 的 deadline：默认五秒，QUIC 使用路径的 SRTT 派生 deadline。超时或失败可能发生在部分数据已接受之后，因此不重放 datagram；单包拥塞可以丢弃该包后继续，终止性失败则结束受影响的 flow/source。
 
-SOCKS5 UDP 在 endpoint 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 endpoint 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。`PacketTransport::relay_addr()` 和接收来源元数据暴露的是逻辑目标，因此 endpoint 首回复校验不会把 SOCKS relay 与远端 peer 混淆。
+SOCKS5 UDP 在 source association 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 association 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。每个请求头写入自己的目的地，每个应答返回其头部中的真实来源，域名来源仅投影为捕获的名称和端口。`PacketTransport::relay_addr()` 是第一个目的地，因此 SOCKS relay 本身不会被误认为远端 peer。
 
 回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket。普通 flow 按 endpoint 缓存已接受的其他 full-cone 来源；共享 source 则由 receiver 为全部绑定 view 共用一个最多七个其他来源 socket 的缓存。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
 

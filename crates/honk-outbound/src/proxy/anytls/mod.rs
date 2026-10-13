@@ -54,7 +54,7 @@ const CMD_SERVER_SETTINGS: u8 = 10;
 
 const FRAME_HEADER_LEN: usize = 7;
 
-/// sing-anytls defaults (session/client.go): values below 5s clamp to 30s.
+/// sing-anytls defaults (session/client.go). honk applies a configured timeout as given, with no clamp.
 const DEFAULT_IDLE_CHECK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 const CLIENT_NAME: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));

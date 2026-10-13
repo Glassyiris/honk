@@ -18,7 +18,7 @@ An ordinary caller receives one of:
 - `ProxyStream`, an established target-bound TCP byte stream; or
 - `Arc<dyn PacketTransport>`, an established framed packet path for one UDP target.
 
-Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. Source-shared VLESS, Hysteria2 and TUIC commit their concrete transports into core-owned source attachments so several five-tuple endpoints can share one receiver.
+Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. Source-shared protocols (concrete VLESS XUDP/Mux.Cool, Hysteria2 and TUIC, and every `MultiTargetTransport`) commit their transports into core-owned source attachments so several five-tuple endpoints can share one receiver.
 
 `direct` reaches the target without a proxy protocol. `block` terminates the
 request. Every other handler turns the selected node into bytes understood by
@@ -93,7 +93,7 @@ UDP-only Xray pool therefore does not make Selector warming open that pool.
 `send_packet_confirmed`, and `recv_packet`. `send_packet_confirmed` is the
 stronger first-packet admission point for queue-backed tunnels. Full-cone
 protocols can additionally declare that server metadata authoritatively names
-the reply source. For source-shared VLESS, Hysteria2 and TUIC, core serializes
+the reply source. For source-shared protocols, core serializes
 sends from endpoint views and owns the transport's single receive loop.
 
 No production UDP handler returns a raw socket or a loopback bridge. Direct and
@@ -646,7 +646,7 @@ Single XUDP retains its 7,526-byte cap.
 
 ### Source/session ownership and capacity
 
-For Single XUDP, shared/separate Mux.Cool, Hysteria2 and TUIC, `honk-core` indexes
+For source-shared protocols (Single XUDP, shared/separate Mux.Cool, Hysteria2, TUIC and every `MultiTargetTransport`), `honk-core` indexes
 a source owner by reused `NodeRuntime` identity, normalized client address,
 selected protocol/UDP path, and reply projection (`ActualPeer` or
 `RewriteTo(original destination)`). One owner holds one protocol association
@@ -668,6 +668,33 @@ comparison; an unknown domain never triggers DNS or fabricates a foreign IP.
 TUIC zero-length payloads remain datagrams; Hysteria2 keeps its existing rejection
 of empty inbound payloads. Source preservation does not guarantee remote NAT
 mapping or filtering behavior.
+
+`MultiTargetTransport` is the one generic source transport for Shadowsocks,
+Juicity, SOCKS5, Trojan, AnyTLS and VLESS UoT v2/H2MUX (Hysteria2, TUIC and VLESS
+XUDP/Mux.Cool keep their concrete arms so their send path is not boxed). Each
+client source owns one logical association for all destinations: one Shadowsocks
+socket and crypto session (SS2022 never resets its session ID, packet counter or
+replay windows per destination), one Juicity bidirectional stream, one SOCKS5
+control connection with one relay socket, one Trojan associate stream, one
+non-connect UoT v2 stream or one H2MUX PacketAddr stream. `recv_packet` returns
+the authenticated real peer: an IPv4-mapped peer is IPv4, a domain source is
+accepted only as the captured domain and port, any other domain is dropped
+without DNS, and stream protocols consume a dropped frame whole before reading
+the next; an unknown address type stays terminal. `send_packet` and `send_to`
+share one unboxed helper; `confirmed` reaches the transport only on each view's
+first datagram, and `admitted` is set when the datagram reached the wire path or
+the writer queue. Reliable-stream carriers (Trojan, Juicity, AnyTLS, UoT, H2MUX)
+keep a partial-frame timeout terminal for the whole source, so destinations
+sharing a stream also share its head-of-line blocking and failure fate. A frame
+write cancelled halfway (for example when its view retires) poisons the stream:
+the next send fails and the source retires every destination instead of
+appending to a torn frame. A native UDP size refusal (`EMSGSIZE`) is a typed
+local `InvalidSize` rejection and ends nothing. The last view's endpoint permit
+stays held until the source receiver exits or another view binds, which keeps
+retiring sources inside the descriptor partition; for a short window a
+saturated pool can therefore refuse a new endpoint. Core's send gate is the
+only outer lock: backends hold their own leaf locks beneath it and never call
+back into core.
 
 The full `(client, destination)` endpoint map remains authoritative for route,
 decision token, and per-flow Score. A reply for a Ready entry is delivered only
