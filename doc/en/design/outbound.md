@@ -160,7 +160,7 @@ refusal; it is not interchangeable with missing UDP support.
 | --- | --- | --- |
 | `direct` | Native marked target connect | Native marked UDP behind `PacketTransport` |
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association; greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP |
 | `vmess` | VMess stream | Unimplemented |
