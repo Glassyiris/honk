@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 use super::{AnyTlsSession, DataPermit, StreamEvent};
-use crate::proxy::uot::{UotCodec as _, UotV1};
+use crate::proxy::uot::AddrFraming;
 use crate::proxy::{MultiTargetTransport, PacketTransport};
 
 #[cfg(test)]
@@ -124,14 +124,16 @@ impl AnyTlsUotTransport {
         let mut setup = self.setup.lock().await;
         let Some(request) = setup.as_ref() else {
             drop(setup);
-            let packet = UotV1::encode(&[], target, domain, data, UOT_MAX_PACKET_SIZE)?;
+            let packet =
+                AddrFraming::UOT_V1.encode(&[], target, domain, data, UOT_MAX_PACKET_SIZE)?;
             let permit = self.session.acquire_data_permit(packet.len()).await?;
             let completed = self.enqueue(packet, permit, confirmed)?;
             admit(admitted);
             return self.flushed(completed).await;
         };
 
-        let packet = UotV1::encode(request, target, domain, data, UOT_MAX_PACKET_SIZE)?;
+        let packet =
+            AddrFraming::UOT_V1.encode(request, target, domain, data, UOT_MAX_PACKET_SIZE)?;
         let permit = self.session.acquire_data_permit(packet.len()).await?;
         let completed = self.enqueue(packet, permit, confirmed)?;
         setup.take();
@@ -205,11 +207,11 @@ impl PacketTransport for AnyTlsUotTransport {
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let mut receive = self.receive.lock().await;
         loop {
-            if let Some(frame) = UotV1::frame_bounds(&receive.buffered)? {
+            if let Some(frame) = AddrFraming::UOT_V1.frame_bounds(&receive.buffered)? {
                 // The peer is read before the frame is consumed; a frame with
                 // an unprojectable source is dropped whole, header and credit
                 // included, so the next one still decodes.
-                let source = UotV1::source(
+                let source = AddrFraming::UOT_V1.source(
                     &receive.buffered[..frame.payload_start],
                     self.target,
                     self.target_domain.as_deref(),

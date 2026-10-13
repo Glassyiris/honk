@@ -406,8 +406,8 @@ impl VlessConfig {
                 None => "none",
                 Some(VlessUdpPath::Native) => "native",
                 Some(VlessUdpPath::Xudp) => "xudp",
-                Some(VlessUdpPath::UotV2) => "uot-v2",
-                Some(VlessUdpPath::H2) => "h2",
+                Some(VlessUdpPath::UotV2) => "uot-v2-addr",
+                Some(VlessUdpPath::H2) => "h2-addr",
                 Some(VlessUdpPath::CoolShared) => "cool-shared",
                 Some(VlessUdpPath::CoolSeparate) => "cool-separate",
             });

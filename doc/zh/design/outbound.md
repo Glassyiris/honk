@@ -513,6 +513,16 @@ Xray TCP concurrency 为零表示 8，负值关闭 TCP mux。XUDP concurrency �
 或 setup preamble。发送范围为 1–8190 字节；收到的零长度 frame 是 datagram，不是
 EOF。writer 会确认 flush，不重放取消后结果不明确的写入。
 
+显式 `uot-v2` 使用 non-connect UoT v2：request 为模式字节 `0` 加第一个目的地，
+此后双向每个 datagram 都是 `[ATYP 0/1/2][地址][端口][u16 长度][payload]`（UoT v1
+编号），payload 最多 65535 字节。因此一条 stream 服务一个客户端 source 的全部
+目的地（core `Shared` source），每个回复保留真实 peer：数字 peer 直接返回（IPv4-mapped
+IPv6 规范化为 IPv4），捕获的拨号域名与端口投影回逻辑目标，其他域名不经 DNS 直接丢弃并整帧消费，
+未知 ATYP 终止该 stream。与 XUDP 不同，这里没有 empty-first 或 poisoned-child 规则。
+request 与第一个 datagram 在一次写入中发送；被中断的写入使 stream 失效且不重放。
+按域名拨号的 flow 会在每个 datagram 中发送该域名；sing-box 1.12.4 的 direct outbound
+拒绝 FQDN packet 目的地并终止整个 association，因此这类 flow 依赖会解析域名的服务端。
+
 类型化 policy、size 与 carrier-capacity 拒绝都是 terminal local result，与拥塞
 或 transport failure 分开；它们不降低健康状态或 Score。候选准入在提交协议状态前
 检查 policy；DNS、health 与 CLI 调用方保留该拒绝，不选择 fallback，也不将路径报
@@ -522,8 +532,11 @@ EOF。writer 会确认 flush，不重放取消后结果不明确的写入。
 
 `src/proxy/uot.rs` 与 `src/proxy/vless/mux.rs` 实现共享 UoT v2 framing 和
 sing-box H2MUX。H2MUX 把物理 VLESS 请求发往 `sp.mux.sing-box.arpa:444`，
-选择 backend `2`，然后在 carrier 上运行 HTTP/2。逻辑 stream 承载 TCP 或
-native connected UDP；UDP 使用共享 UoT 长度 codec，而不是 loopback bridge。
+选择 backend `2`，然后在 carrier 上运行 HTTP/2。逻辑 stream 承载 TCP 或 UDP。
+UDP stream 设置 sing-mux flags `UDP|Addr`（`3`），在命名第一个目的地的 request 之后，
+双向都携带 `[SOCKS5 地址][端口][u16 长度][payload]`（SOCKS5 ATYP，不同于 UoT v1 编号）。
+一条 stream 即客户端的共享 source，并在与 UoT 相同的投影/丢弃规则下返回真实 peer；
+被丢弃的帧同样归还其 HTTP/2 credit。不存在 loopback bridge。
 
 可选 H2 padding 为每个方向最初 16 条 record 增加 sing-mux v1 随机 preface
 与 record framing。每节点最多有两条可复用或拨号中的 H2 carrier，每条最多
@@ -534,7 +547,8 @@ HTTP/2 flow control 驱动 backpressure。GOAWAY 使 carrier 进入 draining 并
 把新工作滚动到 replacement。driver failure 向 child 扩散；half-close、reset、
 receive-window 释放与 lazy response error 仍按 stream 隔离。接收 credit 保持
 每 stream 2 MiB；connection credit 仍可为每条已准入 stream 容纳一个最大
-UoT response frame。
+response frame：状态字节、最宽地址（259 字节）、长度与 65535 字节 payload。
+credit 按每帧完整消费的 wire 长度归还，无论该帧被交付还是被丢弃。
 
 ### Mux.Cool 与 XUDP
 

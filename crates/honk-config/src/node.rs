@@ -767,6 +767,37 @@ mod tests {
         assert_eq!(reality.id, equivalent.derive_id());
     }
 
+    /// The addressed UoT v2 / H2MUX PacketAddr dial shapes replaced the
+    /// connected ones on the wire, so their IDs must not alias old nodes.
+    #[test]
+    fn test_vless_addressed_udp_shapes_have_their_own_identity_tokens() {
+        let uot = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=uot-v2",
+        )
+        .unwrap();
+        let h2 = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=h2mux",
+        )
+        .unwrap();
+        assert_eq!(
+            uot.vless().unwrap().identity_fingerprint(),
+            "off:uot-v2-addr:uot-v2-addr:uot-v2-addr"
+        );
+        assert_eq!(
+            h2.vless().unwrap().identity_fingerprint(),
+            "h2:false:h2-addr:h2-addr:h2-addr"
+        );
+        // TCP-only nodes never dial the UDP shape and keep their identity form.
+        let tcp_only = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=h2mux&udp=0",
+        )
+        .unwrap();
+        assert_eq!(
+            tcp_only.vless().unwrap().identity_fingerprint(),
+            "h2:false:udp-disabled"
+        );
+    }
+
     #[test]
     fn test_vless_packet_disable_identity_is_effective() {
         let enabled = Node::from_share_link(

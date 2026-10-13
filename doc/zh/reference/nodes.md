@@ -325,7 +325,7 @@ VLESS 有三个独立选择。`udp=0|1` 控制是否允许 packet 拨号，`pack
 
 `packetEncoding`、`mux` 与每个 mux 控制项最多出现一次。重复的 `udp` 声明仅在所有值一致时接受。
 
-`mux=off` 保留普通 VLESS TCP，UDP 使用 `packetEncoding`；`uot-v2` 为每个 UDP transport 建立一条 connected UoT v2 stream。`mux=h2mux` 通过同一个节点所有的 HTTP/2 carrier pool 承载逻辑 TCP 和原生 connected sing-mux UDP；`padding=true` 保留现有 padded H2MUX wire 格式。H2MUX 接管两类路径，因此回退 encoding 不会替换其 UDP 路径。它保留现有 pool 策略，不继承 Mux.Cool 每条 carrier 128 个 child 后 rollover 的行为。`mux=xray` 对两个并发设置启用的 pool 使用 Xray Mux.Cool。因此 TCP 与 UDP pooling 相互独立。
+`mux=off` 保留普通 VLESS TCP，UDP 使用 `packetEncoding`；`uot-v2` 为每个客户端 source 建立一条 non-connect UoT v2 stream，承载全部目的地并返回每个回复的真实源地址。`mux=h2mux` 通过同一个节点所有的 HTTP/2 carrier pool 承载逻辑 TCP 和 sing-mux PacketAddr UDP（每个客户端 source 一条 stream，同样逐 datagram 携带地址）；`padding=true` 保留现有 padded H2MUX wire 格式。H2MUX 接管两类路径，因此回退 encoding 不会替换其 UDP 路径。它保留现有 pool 策略，不继承 Mux.Cool 每条 carrier 128 个 child 后 rollover 的行为。`mux=xray` 对两个并发设置启用的 pool 使用 Xray Mux.Cool。因此 TCP 与 UDP pooling 相互独立。
 
 以下是规范示例（使用合成 UUID）：
 

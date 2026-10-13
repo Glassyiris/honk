@@ -3,43 +3,53 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::addr;
+use super::addr::{self, AtypScheme};
 
 pub(crate) const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 pub(crate) const MAX_PACKET_SIZE: usize = u16::MAX as usize;
 #[cfg(any(feature = "rprx", test))]
 const MAX_BUFFERED_BYTES: usize = 2 * (2 + MAX_PACKET_SIZE);
-pub(crate) const V1_ATYP_V4: u8 = 0x00;
-pub(crate) const V1_ATYP_V6: u8 = 0x01;
-pub(crate) const V1_ATYP_DOMAIN: u8 = 0x02;
+/// ATYP + length + 255-byte domain + port: the widest per-datagram address.
+#[cfg(any(feature = "rprx", test))]
+pub(crate) const MAX_ADDR_LEN: usize = 1 + 1 + u8::MAX as usize + 2;
+#[cfg(any(feature = "rprx", test))]
+const MAX_ADDR_BUFFERED_BYTES: usize = 2 * (MAX_ADDR_LEN + 2 + MAX_PACKET_SIZE);
 
-pub(crate) trait UotCodec {
-    fn frame_bounds(data: &[u8]) -> io::Result<Option<FrameBounds>>;
-}
+/// Per-datagram addressed framing `[ATYP][address][port][u16 len][payload]`,
+/// shared by non-connect UoT v2 (UoT v1 ATYPs: IPv4=0, IPv6=1, domain=2) and
+/// sing-mux PacketAddr (SOCKS5 ATYPs). The v2 request address is SOCKS5-encoded
+/// either way.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AddrFraming(AtypScheme);
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct UotV1;
+impl AddrFraming {
+    pub(crate) const UOT_V1: Self = Self(AtypScheme {
+        ipv4: 0x00,
+        domain: 0x02,
+        ipv6: 0x01,
+    });
+    #[cfg(any(feature = "rprx", test))]
+    pub(crate) const SOCKS5: Self = Self(addr::ATYP_SOCKS5);
 
-impl UotV1 {
-    pub(crate) fn header(data: &[u8]) -> io::Result<Option<(usize, usize)>> {
-        if data.is_empty() {
+    fn header(self, data: &[u8]) -> io::Result<Option<(usize, usize)>> {
+        let Some(&atyp) = data.first() else {
             return Ok(None);
-        }
-        let address_len = match data[0] {
-            V1_ATYP_V4 => 4,
-            V1_ATYP_V6 => 16,
-            V1_ATYP_DOMAIN => {
-                let Some(length) = data.get(1) else {
-                    return Ok(None);
-                };
-                1 + usize::from(*length)
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid UoT v1 packet header",
-                ));
-            }
+        };
+        let scheme = self.0;
+        let address_len = if atyp == scheme.ipv4 {
+            4
+        } else if atyp == scheme.ipv6 {
+            16
+        } else if atyp == scheme.domain {
+            let Some(length) = data.get(1) else {
+                return Ok(None);
+            };
+            1 + usize::from(*length)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid UoT packet address type",
+            ));
         };
         let payload_start = 1 + address_len + 2 + 2;
         if data.len() < payload_start {
@@ -50,11 +60,23 @@ impl UotV1 {
         Ok(Some((payload_start, payload_len)))
     }
 
-    /// Encode `prefix` (a pending UoT request, or empty) followed by one v1
-    /// packet `[ATYP][address][port][u16 length][payload]` into a single
-    /// buffer. Packet ATYPs (IPv4=0, IPv6=1, domain=2) differ from the SOCKS5
-    /// numbering of the request address.
+    pub(crate) fn frame_bounds(self, data: &[u8]) -> io::Result<Option<FrameBounds>> {
+        let Some((payload_start, payload_len)) = self.header(data)? else {
+            return Ok(None);
+        };
+        let frame_end = payload_start
+            .checked_add(payload_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid UoT datagram"))?;
+        Ok((data.len() >= frame_end).then_some(FrameBounds {
+            payload_start,
+            frame_end,
+        }))
+    }
+
+    /// Encode `prefix` (a pending request, or empty) followed by one packet
+    /// into a single buffer.
     pub(crate) fn encode(
+        self,
         prefix: &[u8],
         target: SocketAddr,
         target_domain: Option<&str>,
@@ -70,6 +92,7 @@ impl UotV1 {
                 "proxy target domain must contain 1..=255 bytes",
             ));
         }
+        let scheme = self.0;
         let address_len = match (target_domain, target) {
             (Some(domain), _) => 1 + domain.len(),
             (None, SocketAddr::V4(_)) => 4,
@@ -80,16 +103,16 @@ impl UotV1 {
         frame.extend_from_slice(prefix);
         match (target_domain, target) {
             (Some(domain), _) => {
-                frame.put_u8(V1_ATYP_DOMAIN);
+                frame.put_u8(scheme.domain);
                 frame.put_u8(domain.len() as u8);
                 frame.extend_from_slice(domain.as_bytes());
             }
             (None, SocketAddr::V4(target)) => {
-                frame.put_u8(V1_ATYP_V4);
+                frame.put_u8(scheme.ipv4);
                 frame.extend_from_slice(&target.ip().octets());
             }
             (None, SocketAddr::V6(target)) => {
-                frame.put_u8(V1_ATYP_V6);
+                frame.put_u8(scheme.ipv6);
                 frame.extend_from_slice(&target.ip().octets());
             }
         }
@@ -105,55 +128,36 @@ impl UotV1 {
     /// port, then projected to `target`. Anything else is `None`: the caller
     /// drops the frame without resolving the name.
     pub(crate) fn source(
+        self,
         header: &[u8],
         target: SocketAddr,
         target_domain: Option<&str>,
     ) -> Option<SocketAddr> {
         let port_at = header.len() - 4;
         let port = u16::from_be_bytes([header[port_at], header[port_at + 1]]);
-        match header[0] {
-            V1_ATYP_V4 => {
-                let ip: [u8; 4] = header[1..5].try_into().ok()?;
-                Some(SocketAddr::new(Ipv4Addr::from(ip).into(), port))
-            }
-            V1_ATYP_V6 => {
-                let ip: [u8; 16] = header[1..17].try_into().ok()?;
-                Some(SocketAddr::new(
-                    std::net::Ipv6Addr::from(ip).to_canonical(),
-                    port,
-                ))
-            }
-            _ => (port == target.port()
+        let atyp = header[0];
+        if atyp == self.0.ipv4 {
+            let ip: [u8; 4] = header[1..5].try_into().ok()?;
+            Some(SocketAddr::new(Ipv4Addr::from(ip).into(), port))
+        } else if atyp == self.0.ipv6 {
+            let ip: [u8; 16] = header[1..17].try_into().ok()?;
+            Some(SocketAddr::new(
+                std::net::Ipv6Addr::from(ip).to_canonical(),
+                port,
+            ))
+        } else {
+            (port == target.port()
                 && target_domain?
                     .as_bytes()
                     .eq_ignore_ascii_case(&header[2..port_at]))
-            .then_some(target),
+            .then_some(target)
         }
     }
 }
 
-impl UotCodec for UotV1 {
-    fn frame_bounds(data: &[u8]) -> io::Result<Option<FrameBounds>> {
-        let Some((payload_start, payload_len)) = Self::header(data)? else {
-            return Ok(None);
-        };
-        let frame_end = payload_start
-            .checked_add(payload_len)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid UoT datagram"))?;
-        Ok((data.len() >= frame_end).then_some(FrameBounds {
-            payload_start,
-            frame_end,
-        }))
-    }
-}
-
-#[cfg(any(feature = "rprx", test))]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct UotV2;
-
 /// `connect` is the UoT v2 `isConnect` bit: a connected stream carries bare
 /// `[u16 length][payload]` packets, otherwise every packet carries its own
-/// address ([`UotV1`] layout) in both directions. The request address is
+/// address ([`AddrFraming`]) in both directions. The request address is
 /// SOCKS5-encoded either way.
 pub(crate) fn request(
     connect: bool,
@@ -187,21 +191,17 @@ pub(crate) struct FrameBounds {
     pub(crate) frame_end: usize,
 }
 
+/// Bounds of one connected `[u16 length][payload]` frame.
 #[cfg(any(feature = "rprx", test))]
-impl UotCodec for UotV2 {
-    fn frame_bounds(data: &[u8]) -> io::Result<Option<FrameBounds>> {
-        if data.len() < 2 {
-            return Ok(None);
-        }
-        let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-        let frame_end = 2usize
-            .checked_add(payload_len)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid UoT datagram"))?;
-        Ok((data.len() >= frame_end).then_some(FrameBounds {
-            payload_start: 2,
-            frame_end,
-        }))
+fn connected_frame_bounds(data: &[u8]) -> Option<FrameBounds> {
+    if data.len() < 2 {
+        return None;
     }
+    let frame_end = 2 + usize::from(u16::from_be_bytes([data[0], data[1]]));
+    (data.len() >= frame_end).then_some(FrameBounds {
+        payload_start: 2,
+        frame_end,
+    })
 }
 
 pub(crate) fn copy_frame(
@@ -241,10 +241,75 @@ impl Decoder {
     }
 
     pub(crate) fn next_packet(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
-        let Some(frame) = UotV2::frame_bounds(&self.buffered)? else {
+        let Some(frame) = connected_frame_bounds(&self.buffered) else {
             return Ok(None);
         };
         copy_frame(&mut self.buffered, frame, output).map(Some)
+    }
+}
+
+/// One complete addressed frame taken off an [`AddrDecoder`].
+#[cfg(any(feature = "rprx", test))]
+pub(crate) struct AddrFrame {
+    /// Wire bytes the frame occupied, delivered or dropped.
+    pub(crate) wire_len: usize,
+    /// Payload length and real peer; `None` when the source was unprojectable
+    /// and the whole frame was dropped.
+    pub(crate) packet: Option<(usize, SocketAddr)>,
+}
+
+#[cfg(any(feature = "rprx", test))]
+pub(crate) struct AddrDecoder {
+    buffered: BytesMut,
+    framing: AddrFraming,
+}
+
+#[cfg(any(feature = "rprx", test))]
+impl AddrDecoder {
+    pub(crate) fn new(framing: AddrFraming) -> Self {
+        Self {
+            buffered: BytesMut::new(),
+            framing,
+        }
+    }
+
+    pub(crate) fn push(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.buffered.len().saturating_add(data.len()) > MAX_ADDR_BUFFERED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UoT stream frame exceeds buffer limit",
+            ));
+        }
+        self.buffered.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// An unknown ATYP is terminal (no derivable length). A frame whose source
+    /// is unprojectable is consumed whole so the next one still decodes; a
+    /// delivered frame that does not fit `output` stays buffered.
+    pub(crate) fn next_packet(
+        &mut self,
+        output: &mut [u8],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> io::Result<Option<AddrFrame>> {
+        let Some(frame) = self.framing.frame_bounds(&self.buffered)? else {
+            return Ok(None);
+        };
+        let source =
+            self.framing
+                .source(&self.buffered[..frame.payload_start], target, target_domain);
+        let packet = match source {
+            Some(source) => Some((copy_frame(&mut self.buffered, frame, output)?, source)),
+            None => {
+                self.buffered.advance(frame.frame_end);
+                None
+            }
+        };
+        Ok(Some(AddrFrame {
+            wire_len: frame.frame_end,
+            packet,
+        }))
     }
 }
 
@@ -309,15 +374,20 @@ mod tests {
 
     #[test]
     fn v1_and_v2_share_the_bounded_codec_contract() {
-        let v1 = [V1_ATYP_V4, 1, 2, 3, 4, 0, 53, 0, 3, b'a', b'b', b'c'];
-        assert!(UotV1::frame_bounds(&v1[..11]).unwrap().is_none());
-        let bounds = UotV1::frame_bounds(&v1).unwrap().unwrap();
+        let v1 = [0x00, 1, 2, 3, 4, 0, 53, 0, 3, b'a', b'b', b'c'];
+        assert!(
+            AddrFraming::UOT_V1
+                .frame_bounds(&v1[..11])
+                .unwrap()
+                .is_none()
+        );
+        let bounds = AddrFraming::UOT_V1.frame_bounds(&v1).unwrap().unwrap();
         assert_eq!(bounds.payload_start, 9);
         assert_eq!(bounds.frame_end, 12);
-        assert!(UotV1::frame_bounds(&[0xff]).is_err());
+        assert!(AddrFraming::UOT_V1.frame_bounds(&[0xff]).is_err());
 
         let v2 = encode_packet(b"abc", MAX_PACKET_SIZE).unwrap();
-        let bounds = UotV2::frame_bounds(&v2).unwrap().unwrap();
+        let bounds = connected_frame_bounds(&v2).unwrap();
         assert_eq!(bounds.payload_start, 2);
         assert_eq!(bounds.frame_end, 5);
     }

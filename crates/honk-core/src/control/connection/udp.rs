@@ -49,14 +49,15 @@ fn source_path(node: &Node, port: u16) -> Option<SourcePath> {
         honk_config::types::NodeProtocol::Tuic => Some(SourcePath::Tuic),
         #[cfg(feature = "rprx")]
         honk_config::types::NodeProtocol::VLess => {
+            use honk_config::node::VlessUdpPath;
             let path = node.vless()?.udp_path(port)?;
-            matches!(
-                path,
-                honk_config::node::VlessUdpPath::Xudp
-                    | honk_config::node::VlessUdpPath::CoolShared
-                    | honk_config::node::VlessUdpPath::CoolSeparate
-            )
-            .then_some(SourcePath::Vless(path))
+            match path {
+                VlessUdpPath::Xudp | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate => {
+                    Some(SourcePath::Vless(path))
+                }
+                VlessUdpPath::UotV2 | VlessUdpPath::H2 => Some(SourcePath::Shared),
+                VlessUdpPath::Native => None,
+            }
         }
         protocol if honk_outbound::proxy::uses_shared_source(protocol) => Some(SourcePath::Shared),
         _ => {
@@ -1181,6 +1182,66 @@ mod tests {
                 "{protocol:?}"
             );
         }
+    }
+
+    #[cfg(feature = "rprx")]
+    #[test]
+    fn vless_shares_explicit_uot_and_h2_but_keeps_xudp_and_native_apart() {
+        use honk_config::node::{
+            Udp443Policy, VlessConfig, VlessMultiplex, VlessUdpEncoding, VlessUdpPath,
+        };
+        fn vless(
+            udp_encoding: VlessUdpEncoding,
+            multiplex: VlessMultiplex,
+            network: Option<&str>,
+        ) -> Node {
+            Node {
+                outbound: OutboundConfig::Vless(VlessConfig {
+                    udp_encoding,
+                    multiplex,
+                    network: network.map(Into::into),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        let off = VlessMultiplex::Off;
+        for port in [53, 443, 5301] {
+            for node in [
+                vless(VlessUdpEncoding::UotV2, off, None),
+                vless(
+                    VlessUdpEncoding::Auto,
+                    VlessMultiplex::H2 { padding: false },
+                    None,
+                ),
+            ] {
+                assert_eq!(source_path(&node, port), Some(SourcePath::Shared), "{port}");
+            }
+        }
+        assert_eq!(
+            source_path(&vless(VlessUdpEncoding::Auto, off, None), 53),
+            None
+        );
+        assert_eq!(
+            source_path(&vless(VlessUdpEncoding::Native, off, None), 5301),
+            None
+        );
+        assert_eq!(
+            source_path(&vless(VlessUdpEncoding::Xudp, off, None), 5301),
+            Some(SourcePath::Vless(VlessUdpPath::Xudp))
+        );
+        // Reject and the capability gate keep their terminal meaning.
+        let rejecting = vless(
+            VlessUdpEncoding::UotV2,
+            VlessMultiplex::xray(-1, -1, Udp443Policy::Reject),
+            None,
+        );
+        assert_eq!(source_path(&rejecting, 443), None);
+        assert_eq!(source_path(&rejecting, 5301), Some(SourcePath::Shared));
+        assert_eq!(
+            source_path(&vless(VlessUdpEncoding::UotV2, off, Some("tcp")), 5301),
+            None
+        );
     }
 
     #[test]

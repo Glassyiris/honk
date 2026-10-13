@@ -328,7 +328,7 @@ VLESS has three independent choices. `udp=0|1` controls whether packet dialing i
 
 `packetEncoding`, `mux`, and each mux control may occur at most once. Repeated `udp` claims are accepted only when all values agree.
 
-`mux=off` keeps ordinary VLESS TCP and uses `packetEncoding` for UDP; `uot-v2` opens one connected UoT v2 stream per UDP transport. `mux=h2mux` carries logical TCP and native connected sing-mux UDP through the same node-owned HTTP/2 carrier pool; `padding=true` retains the existing padded H2MUX wire format. H2MUX owns both paths, so the fallback encoding does not replace its UDP path. It retains its existing pool policy and does not inherit Mux.Cool's 128-child carrier rollover. `mux=xray` uses Xray Mux.Cool for each pool enabled by the two concurrency settings. TCP and UDP pooling are therefore independent.
+`mux=off` keeps ordinary VLESS TCP and uses `packetEncoding` for UDP; `uot-v2` opens one non-connect UoT v2 stream per client source, carrying every destination and returning each reply's real source address. `mux=h2mux` carries logical TCP and sing-mux PacketAddr UDP (one stream per client source, same per-datagram addressing) through the same node-owned HTTP/2 carrier pool; `padding=true` retains the existing padded H2MUX wire format. H2MUX owns both paths, so the fallback encoding does not replace its UDP path. It retains its existing pool policy and does not inherit Mux.Cool's 128-child carrier rollover. `mux=xray` uses Xray Mux.Cool for each pool enabled by the two concurrency settings. TCP and UDP pooling are therefore independent.
 
 Canonical examples (with a synthetic UUID) are:
 

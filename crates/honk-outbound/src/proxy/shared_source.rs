@@ -1,8 +1,9 @@
 //! Preparation dispatch for protocols whose one association carries every
 //! destination of a client source (the core `Shared` source transport).
 //!
-//! Hysteria2, TUIC and VLESS keep their concrete source preparations: their
-//! hot send path is not boxed.
+//! Hysteria2, TUIC and VLESS XUDP/Mux.Cool keep their concrete source
+//! preparations: their hot send path is not boxed. VLESS is not in [`SHARED`]
+//! because only its explicit UoT v2 and H2MUX paths are served here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -81,6 +82,16 @@ pub async fn prepare_shared_source(
                 target_domain,
                 connect_timeout,
                 speculative,
+            )
+            .await
+        }
+        #[cfg(feature = "rprx")]
+        NodeProtocol::VLess => {
+            super::vless::VLessHandler::prepare_shared_udp(
+                runtime,
+                target,
+                target_domain,
+                connect_timeout,
             )
             .await
         }

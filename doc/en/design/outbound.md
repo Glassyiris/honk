@@ -577,6 +577,20 @@ command-UDP without the UoT magic destination or setup preamble. Sends accept
 1–8190 bytes; received zero-length frames are datagrams, not EOF. The writer is
 flush-confirmed and a cancelled ambiguous write is not replayed.
 
+Explicit `uot-v2` uses non-connect UoT v2: the request carries mode byte `0` and
+the first destination, then every datagram in both directions is
+`[ATYP 0/1/2][address][port][u16 length][payload]` (UoT v1 numbering) with up to
+65535 payload bytes. One stream therefore serves every destination of a client
+source (the core `Shared` source) and each reply keeps its real peer: numeric
+peers are returned with IPv4-mapped IPv6 canonicalized, the captured dial domain
+and port are projected back to the logical target, any other domain is dropped
+without DNS and consumed whole, and an unknown ATYP ends the stream. Unlike XUDP
+there is no empty-first or poisoned-child rule. The request and first datagram
+share one write; an interrupted write poisons the stream and is never replayed.
+A flow dialed by name sends that name per datagram; sing-box 1.12.4's direct
+outbound rejects FQDN packet destinations and ends the whole association, so such
+flows depend on a server that resolves them.
+
 Typed policy, size, and carrier-capacity refusals are terminal local results,
 distinct from congestion or transport failure. They do not demote health or
 Score. Candidate admission checks policy before committing protocol state;
@@ -588,8 +602,12 @@ fallback or reporting the path as not applicable.
 `src/proxy/uot.rs` and `src/proxy/vless/mux.rs` implement shared UoT v2 framing
 and sing-box H2MUX. H2MUX sends the physical VLESS request to
 `sp.mux.sing-box.arpa:444`, selects backend `2`, then runs HTTP/2 over that
-carrier. Logical streams carry TCP or native connected UDP. UDP uses the shared
-UoT length codec rather than a loopback bridge.
+carrier. Logical streams carry TCP or UDP. UDP streams set sing-mux flags
+`UDP|Addr` (`3`) and, after the request naming the first destination, carry
+`[SOCKS5 address][port][u16 length][payload]` in both directions (SOCKS5 ATYPs,
+unlike UoT v1 numbering). One stream is the shared source of a client and
+returns real peers under the same projection and drop rules as UoT; a dropped
+frame still releases its HTTP/2 credit. There is no loopback bridge.
 
 Optional H2 padding adds the sing-mux v1 randomized preface and record framing
 for the first 16 records in each direction. A node has at most two reusable or
@@ -601,7 +619,9 @@ HTTP/2 flow control drives backpressure. GOAWAY makes the carrier draining and
 rolls new work to a replacement. Driver failure fans out to its children;
 half-close, reset, receive-window release, and lazy response errors remain
 per-stream. Receive credit stays 2 MiB per stream and connection credit remains
-large enough for one maximum UoT response frame for each admitted stream.
+large enough for one maximum response frame for each admitted stream: status
+byte, the widest address (259 bytes), the length and 65535 payload bytes. Credit
+is released by the full consumed wire length of each frame, delivered or dropped.
 
 ### Mux.Cool and XUDP
 

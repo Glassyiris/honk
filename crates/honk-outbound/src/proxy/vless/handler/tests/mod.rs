@@ -45,5 +45,7 @@ fn cool_node(name: &str) -> Node {
 mod interop;
 mod pools;
 mod protocol;
+mod shared_source;
 mod stream_tests;
 mod udp;
+mod uot_source;

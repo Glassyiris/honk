@@ -38,7 +38,7 @@ mod stream;
 
 #[cfg(test)]
 use crate::proxy::RuntimeOwnedIo;
-use packet::VlessConnectedTransport;
+use packet::{VlessConnectedTransport, VlessUotTransport};
 
 use super::cool::VlessXudpTransport;
 #[cfg(test)]
@@ -61,8 +61,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::proxy::{
-    MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    MultiTargetTransport, MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
 use crate::session::{OpenError, SpeculativeCheckout};
 
@@ -75,6 +75,17 @@ const MAX_NATIVE_PACKET_SIZE: usize = 8190;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
+
+/// Nothing a preparation retained is published before the caller's commit.
+fn publish_on_commit<T: ?Sized + Send + Sync + 'static>(
+    transport: Arc<T>,
+    preparation: crate::proxy::transport::TransportPreparation,
+) -> PreparedUdpTransport<T> {
+    PreparedUdpTransport::new(async move {
+        preparation.commit()?;
+        Ok(transport)
+    })
+}
 
 #[derive(Debug, Default)]
 pub struct VLessHandler {
@@ -228,13 +239,51 @@ impl VLessHandler {
             VlessUdpPath::CoolSeparate => {
                 Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout).await
             }
-            VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::Xudp => {
+            VlessUdpPath::UotV2 => {
+                let (transport, preparation) = self
+                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout)
+                    .await?;
+                preparation.commit()?;
+                Ok(transport)
+            }
+            VlessUdpPath::Native | VlessUdpPath::Xudp => {
                 self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
                     .await?
                     .commit()
                     .await
             }
         }
+    }
+
+    /// Non-connect UoT v2 over the retained carrier. Nothing is published
+    /// until the returned preparation commits.
+    async fn prepare_uot_transport(
+        &self,
+        runtime: &Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Arc<VlessUotTransport>,
+        crate::proxy::transport::TransportPreparation,
+    )> {
+        let vless = runtime.node.vless().unwrap();
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid,
+            CMD_TCP,
+            Some(SocketAddr::from(([0, 0, 0, 0], 0))),
+            Some(crate::proxy::uot::MAGIC_ADDRESS),
+            vless.wire_flow(),
+        )?;
+        let request = crate::proxy::uot::request(false, target, domain)?;
+        let (stream, preparation) = self
+            .prepare_retained_carrier(runtime, uuid, header, timeout)
+            .await?;
+        Ok((
+            Arc::new(VlessUotTransport::new(stream, target, domain, request)),
+            preparation,
+        ))
     }
 
     async fn prepare_protocol_udp(
@@ -247,16 +296,10 @@ impl VLessHandler {
     ) -> anyhow::Result<PreparedUdpTransport> {
         let vless = runtime.node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
-        let (command, header_target, header_domain, setup) = match path {
-            VlessUdpPath::Native => (CMD_UDP, Some(target), domain, None),
-            VlessUdpPath::UotV2 => (
-                CMD_TCP,
-                Some(SocketAddr::from(([0, 0, 0, 0], 0))),
-                Some(crate::proxy::uot::MAGIC_ADDRESS),
-                Some(crate::proxy::uot::request(true, target, domain)?),
-            ),
-            VlessUdpPath::Xudp => (super::cool::VLESS_MUX_COMMAND, None, None, None),
-            _ => unreachable!("protocol UDP preparation excludes pooled mux paths"),
+        let (command, header_target, header_domain) = match path {
+            VlessUdpPath::Native => (CMD_UDP, Some(target), domain),
+            VlessUdpPath::Xudp => (super::cool::VLESS_MUX_COMMAND, None, None),
+            _ => unreachable!("protocol UDP preparation excludes UoT and pooled mux paths"),
         };
         let header = Self::build_request_header(
             &uuid,
@@ -274,12 +317,9 @@ impl VLessHandler {
         let transport: Arc<dyn PacketTransport> = if path == VlessUdpPath::Xudp {
             super::cool::connect_single_xudp(stream, target, domain, [0; 8]).await?
         } else {
-            Arc::new(VlessConnectedTransport::new(stream, target, setup))
+            Arc::new(VlessConnectedTransport::new(stream, target))
         };
-        Ok(PreparedUdpTransport::new(async move {
-            preparation.commit()?;
-            Ok(transport)
-        }))
+        Ok(publish_on_commit(transport, preparation))
     }
 
     fn cool_limit(node: &Node, separate: bool) -> anyhow::Result<usize> {
@@ -542,10 +582,7 @@ impl VLessHandler {
                         let transport =
                             super::cool::connect_single_xudp(stream, target, domain, global_id)
                                 .await?;
-                        Ok(PreparedUdpTransport::new(async move {
-                            preparation.commit()?;
-                            Ok(transport)
-                        }))
+                        Ok(publish_on_commit(transport, preparation))
                     }
                     path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
                         let separate = path == VlessUdpPath::CoolSeparate;
@@ -571,6 +608,54 @@ impl VLessHandler {
                         .await
                     }
                     VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::H2 => {
+                        Err(crate::proxy::PacketRejection::Policy.into())
+                    }
+                }
+            }))
+            .await
+    }
+
+    /// Prepare the one UoT v2 / H2MUX PacketAddr association of a client
+    /// source scope. Retained carriers and pooled H2 sessions follow the same
+    /// commit-only publication as [`Self::prepare_source_udp`]; the explicit
+    /// paths carry no VLESS-only empty-first or poisoned-child rules.
+    pub async fn prepare_shared_udp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        runtime
+            .scope_tasks(Box::pin(async {
+                match Self::udp_path(&runtime.node, target.port())? {
+                    VlessUdpPath::UotV2 => {
+                        let (transport, preparation) = Self::new()
+                            .prepare_uot_transport(&runtime, target, domain, timeout)
+                            .await?;
+                        Ok(publish_on_commit(
+                            transport as Arc<dyn MultiTargetTransport>,
+                            preparation,
+                        ))
+                    }
+                    VlessUdpPath::H2 => {
+                        let pool = runtime.vless_h2_pool()?;
+                        let dial_runtime = Arc::clone(&runtime);
+                        Self::prepare_mux_udp(
+                            pool,
+                            move || Self::prepare_h2_session(dial_runtime, timeout),
+                            move |session, permit| async move {
+                                let transport: Arc<dyn MultiTargetTransport> =
+                                    session.open_packet(permit, target, domain).await?;
+                                Ok(transport)
+                            },
+                            "VLESS H2 pool retired during source preparation",
+                        )
+                        .await
+                    }
+                    VlessUdpPath::Native
+                    | VlessUdpPath::Xudp
+                    | VlessUdpPath::CoolShared
+                    | VlessUdpPath::CoolSeparate => {
                         Err(crate::proxy::PacketRejection::Policy.into())
                     }
                 }
@@ -799,7 +884,16 @@ impl PacketOutbound for VLessHandler {
                 )
                 .await
             }
-            VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2 => {
+            VlessUdpPath::UotV2 => {
+                let (transport, preparation) = self
+                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout)
+                    .await?;
+                Ok(publish_on_commit(
+                    transport as Arc<dyn PacketTransport>,
+                    preparation,
+                ))
+            }
+            VlessUdpPath::Native | VlessUdpPath::Xudp => {
                 self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
                     .await
             }
