@@ -20,6 +20,7 @@ const SHARED: &[NodeProtocol] = &[
     NodeProtocol::SS,
     NodeProtocol::Socks5,
     NodeProtocol::Juicity,
+    NodeProtocol::Trojan,
 ];
 
 pub fn uses_shared_source(protocol: NodeProtocol) -> bool {
@@ -56,6 +57,15 @@ pub async fn prepare_shared_source(
                     connect_timeout,
                 )
                 .await
+        }
+        NodeProtocol::Trojan => {
+            super::trojan::TrojanHandler::prepare_udp_source(
+                &runtime,
+                target,
+                target_domain,
+                connect_timeout,
+            )
+            .await
         }
         NodeProtocol::Juicity => {
             JuicityHandler::new()

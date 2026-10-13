@@ -637,6 +637,17 @@ async fn losing_xhttp_udp_preparation_preserves_shared_warm_carrier() {
         .unwrap();
     assert_eq!(runtime.warm_counts().sessions, 1);
     drop(preparation);
+    let shared = crate::proxy::prepare_shared_source(
+        runtime.clone(),
+        "127.0.0.1:53".parse().unwrap(),
+        None,
+        Duration::from_secs(2),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime.warm_counts().sessions, 1);
+    drop(shared);
     assert_eq!(runtime.warm_counts().sessions, 1);
     assert!(matches!(
         closed.try_recv(),

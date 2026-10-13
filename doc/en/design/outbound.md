@@ -162,7 +162,7 @@ refusal; it is not interchangeable with missing UDP support.
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
 | `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing; one connected server socket and crypto state per client source, usable for every destination (see below) |
-| `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP |
+| `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP; one associate stream per client source, each frame names its peer |
 | `vmess` | VMess stream | Unimplemented |
 | `vless` | Direct, H2, or Mux.Cool from the independent multiplex policy | Available when `network` allows UDP; encoding and optional UDP multiplexing select the path |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagrams |
@@ -315,6 +315,19 @@ consistent TLS, REALITY, WS, gRPC and XHTTP setup.
 Cold and pooled-bare Trojan streams use that same complete transport stack.
 TLS batching returns bytes already read before surfacing a later I/O error on
 the next non-empty read; it never converts that error into EOF.
+
+Trojan UDP carries every destination of a client source on one UDP-associate
+stream: the request header names the first destination, and each frame
+(`address | u16 length | CRLF | payload`) then names its own peer, in both
+directions. `recv_packet` returns the frame's real peer (IPv4-mapped IPv6
+canonicalized), so the core can admit a first reply from a never-contacted
+peer. A domain-named frame is accepted only when it equals the captured dial
+domain and port, then projects to the captured target; any other domain frame is
+consumed whole (length, CRLF, payload) and dropped without DNS. An unknown ATYP
+has no derivable length and ends the stream. Frames share the stream's writer:
+a stalled partial frame is terminal for the whole source, never congestion, and
+destinations share head-of-line blocking and failure fate. Domain-target scopes
+stay per original destination.
 
 
 `transport_quality` owns advisory per-runtime carrier pressure. Common TCP/TLS/REALITY and AnyTLS use a physical-I/O adapter; Shadowsocks borrows its existing socket half. Linux `TCP_INFO` is read at most once per active second, checking each field against the returned ABI length; missing fields/errors remain unknown and never alter I/O. Vision Direct and ready-pool descriptor probing retain the socket path. Hy2/TUIC/Juicity reuse their existing one-second physical QUIC monitor, excluding pre-confirmation/pre-publication history and reseeding on peer changes. Logical mux children do not each report the same carrier event. No extra descriptor or per-TCP sampling task is retained; quiescent TCP has no new event-driven observation. See [Score pressure semantics](./groups.md#score-scoring-and-lifecycle).

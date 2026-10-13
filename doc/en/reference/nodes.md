@@ -150,7 +150,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `direct` | — | Yes | Yes | Reserved built-in bypass outbound; no share-link scheme |
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
 
-`network` may disable packet dialing for Trojan, AnyTLS, and VLESS independently of their stream transport. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. VMess UDP is not implemented.
+`network` may disable packet dialing for Trojan, AnyTLS, and VLESS independently of their stream transport. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Trojan UDP uses one associate stream per client source for all destinations and returns each reply's real source, so a cooperating server can give EIM/EIF behavior; destinations share that stream's head-of-line blocking and failure fate. VMess UDP is not implemented.
 
 SOCKS5 UDP ASSOCIATE keeps one control TCP connection and one relay socket per client source, shared by every destination of that source, and returns the real remote peer named in each reply header. Whether a peer the client never contacted can reach it depends on the server: Dante's default `udp.connectdst: yes` connects its outbound socket only while a single destination has been used.
 

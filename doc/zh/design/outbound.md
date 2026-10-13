@@ -154,7 +154,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
 | `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每个客户端 source 一个已连接的服务端 socket 与加密状态，可发往任意目的地（见下文） |
-| `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing |
+| `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing；每个客户端 source 一条 associate 流，每个 frame 自带对端地址 |
 | `vmess` | VMess stream | 未实现 |
 | `vless` | 由独立 multiplex policy 选择 direct、H2 或 Mux.Cool | `network` 允许 UDP 时可用；encoding 与可选 UDP multiplex 决定路径 |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagram |
@@ -286,6 +286,14 @@ REALITY 参数时，它使用[有界认证建立过程](#服务端认证与指�
 XHTTP 建立过程。
 
 Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
+
+Trojan UDP 让一个客户端 source 的所有目的地共用一条 UDP-associate 流：请求头
+指名首个目的地，随后每个 frame（`address | u16 length | CRLF | payload`）在两个方向上
+各自携带对端地址。`recv_packet` 返回 frame 中的真实对端（IPv4-mapped IPv6 规范化为 IPv4），
+因此核心可以接纳来自从未联系过的对端的首个回复。域名 frame 仅在与捕获的拨号域名及端口一致时
+才投影为捕获的目标；其他域名 frame 会被整帧（length、CRLF、payload）消费并丢弃，不做 DNS。
+未知 ATYP 无法推导长度，会终止该流。各 frame 共用该流的 writer：写到一半停滞的 frame 对整个
+source 是终止性的，绝不按拥塞处理，各目的地共享队头阻塞与失败命运。域名目标 scope 仍按原始目的地区分。
 TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
 错误，不会把该错误转换成 EOF。
 
