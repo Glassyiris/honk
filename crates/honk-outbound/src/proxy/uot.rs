@@ -28,7 +28,6 @@ impl AddrFraming {
         domain: 0x02,
         ipv6: 0x01,
     });
-    #[cfg(any(feature = "rprx", test))]
     pub(crate) const SOCKS5: Self = Self(addr::ATYP_SOCKS5);
 
     fn header(self, data: &[u8]) -> io::Result<Option<(usize, usize)>> {
@@ -153,6 +152,33 @@ impl AddrFraming {
             .then_some(target)
         }
     }
+
+    /// One complete addressed frame taken off the front of `buffered`. An
+    /// unknown ATYP is terminal (no derivable length). A frame whose source is
+    /// unprojectable is consumed whole so the next one still decodes; a
+    /// delivered frame that does not fit `output` stays buffered.
+    pub(crate) fn take_frame(
+        self,
+        buffered: &mut BytesMut,
+        output: &mut [u8],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> io::Result<Option<AddrFrame>> {
+        let Some(frame) = self.frame_bounds(buffered)? else {
+            return Ok(None);
+        };
+        let packet = match self.source(&buffered[..frame.payload_start], target, target_domain) {
+            Some(source) => Some((copy_frame(buffered, frame, output)?, source)),
+            None => {
+                buffered.advance(frame.frame_end);
+                None
+            }
+        };
+        Ok(Some(AddrFrame {
+            wire_len: frame.frame_end,
+            packet,
+        }))
+    }
 }
 
 /// `connect` is the UoT v2 `isConnect` bit: a connected stream carries bare
@@ -248,8 +274,7 @@ impl Decoder {
     }
 }
 
-/// One complete addressed frame taken off an [`AddrDecoder`].
-#[cfg(any(feature = "rprx", test))]
+/// One complete addressed frame taken off a buffer by [`AddrFraming::take_frame`].
 pub(crate) struct AddrFrame {
     /// Wire bytes the frame occupied, delivered or dropped.
     pub(crate) wire_len: usize,
@@ -284,32 +309,14 @@ impl AddrDecoder {
         Ok(())
     }
 
-    /// An unknown ATYP is terminal (no derivable length). A frame whose source
-    /// is unprojectable is consumed whole so the next one still decodes; a
-    /// delivered frame that does not fit `output` stays buffered.
     pub(crate) fn next_packet(
         &mut self,
         output: &mut [u8],
         target: SocketAddr,
         target_domain: Option<&str>,
     ) -> io::Result<Option<AddrFrame>> {
-        let Some(frame) = self.framing.frame_bounds(&self.buffered)? else {
-            return Ok(None);
-        };
-        let source =
-            self.framing
-                .source(&self.buffered[..frame.payload_start], target, target_domain);
-        let packet = match source {
-            Some(source) => Some((copy_frame(&mut self.buffered, frame, output)?, source)),
-            None => {
-                self.buffered.advance(frame.frame_end);
-                None
-            }
-        };
-        Ok(Some(AddrFrame {
-            wire_len: frame.frame_end,
-            packet,
-        }))
+        self.framing
+            .take_frame(&mut self.buffered, output, target, target_domain)
     }
 }
 

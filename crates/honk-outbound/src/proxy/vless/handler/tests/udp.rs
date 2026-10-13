@@ -295,7 +295,7 @@ async fn interrupted_connected_send_poison_closes_with_last_owner() {
     .await
     .expect("interrupted send poisoned the connected transport")
     .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(crate::proxy::is_frame_interrupted(&error));
     drop(transport);
     let mut remainder = Vec::new();
     tokio::time::timeout(

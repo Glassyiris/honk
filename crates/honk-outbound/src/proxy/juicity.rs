@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
-use bytes::Bytes;
 use honk_config::node::Node;
 use tracing::debug;
 
 use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
 use crate::transport_quality::TransportQuality;
 
-use super::addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, SocksAddr as JuiceAddr};
+use super::addr::SocksAddr as JuiceAddr;
+use super::uot::{AddrFraming, MAX_PACKET_SIZE};
 use super::{
     MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
     ProxyStream, SharedSourceOutbound, TcpOutbound, WarmableOutbound,
@@ -315,7 +315,7 @@ impl JuicityHandler {
                     return Ok(Arc::new(JuicityUdpTransport {
                         state,
                         send: tokio::sync::Mutex::new(send),
-                        write_interrupted: std::sync::atomic::AtomicBool::new(false),
+                        poison: super::FramePoison::default(),
                         recv: tokio::sync::Mutex::new(recv),
                         _guard: guard,
                         target,
@@ -515,7 +515,7 @@ struct JuicityUdpTransport {
     /// Set while a frame is being written, cleared once it is accepted:
     /// `write_chunk` is not cancellation safe, so a write cancelled halfway
     /// leaves it set and no sibling destination may extend the torn frame.
-    write_interrupted: std::sync::atomic::AtomicBool,
+    poison: super::FramePoison,
     recv: tokio::sync::Mutex<quinn::RecvStream>,
     /// Keeps the connection's open-stream accounting alive for the
     /// transport's lifetime (see `QuicBiStream::into_parts`).
@@ -632,6 +632,10 @@ impl MultiTargetTransport for JuicityUdpTransport {
     fn carrier_addr(&self) -> Option<SocketAddr> {
         Some(self.state._conn.remote_address())
     }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
+    }
 }
 
 impl JuicityUdpTransport {
@@ -643,55 +647,15 @@ impl JuicityUdpTransport {
         data: &[u8],
         admitted: Option<&std::sync::atomic::AtomicBool>,
     ) -> io::Result<()> {
-        if data.len() > u16::MAX as usize {
-            return Err(super::PacketRejection::InvalidSize.into());
-        }
-        let address_len = match (domain, target) {
-            (Some(domain), _) => {
-                if domain.is_empty() || domain.len() > u8::MAX as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "proxy target domain must contain 1..=255 bytes",
-                    ));
-                }
-                1 + 1 + domain.len() + 2
-            }
-            (None, SocketAddr::V4(_)) => 1 + 4 + 2,
-            (None, SocketAddr::V6(_)) => 1 + 16 + 2,
-        };
+        let frame = AddrFraming::SOCKS5.encode(&[], target, domain, data, MAX_PACKET_SIZE)?;
         self.state.touch();
-        let mut frame = Vec::with_capacity(address_len + 2 + data.len());
-        match (domain, target) {
-            (Some(domain), _) => {
-                frame.push(ATYP_DOMAIN);
-                frame.push(domain.len() as u8);
-                frame.extend_from_slice(domain.as_bytes());
-            }
-            (None, SocketAddr::V4(target)) => {
-                frame.push(ATYP_IPV4);
-                frame.extend_from_slice(&target.ip().octets());
-            }
-            (None, SocketAddr::V6(target)) => {
-                frame.push(ATYP_IPV6);
-                frame.extend_from_slice(&target.ip().octets());
-            }
-        }
-        frame.extend_from_slice(&target.port().to_be_bytes());
-        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        frame.extend_from_slice(data);
         let mut send = self.send.lock().await;
-        if self.write_interrupted.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Juicity UDP frame write was interrupted",
-            ));
-        }
-        self.write_interrupted.store(true, Ordering::Release);
-        send.write_chunk(Bytes::from(frame))
+        let write = self.poison.begin()?;
+        send.write_chunk(frame)
             .await
             .map_err(io::Error::other)
             .map_err(super::quic_carrier_io_error)?;
-        self.write_interrupted.store(false, Ordering::Release);
+        write.complete();
         if let Some(admitted) = admitted {
             admitted.store(true, Ordering::Release);
         }

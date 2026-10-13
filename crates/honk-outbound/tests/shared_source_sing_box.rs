@@ -207,6 +207,12 @@ fn protos(cert: &str, key: &str) -> Vec<Proto> {
                 VlessMultiplex::H2 { padding: false },
                 true,
             ),
+            (
+                "vless-h2mux-padded",
+                VlessUdpEncoding::Auto,
+                VlessMultiplex::H2 { padding: true },
+                true,
+            ),
         ] {
             let port = free_port();
             let mut vless = Node::from_share_link(&format!(
@@ -370,7 +376,8 @@ async fn eim_eif(
     };
     let mut results = Vec::new();
     for (index, target) in [a, b, a, b].into_iter().enumerate() {
-        results.push(exchange(transport.as_ref(), target, None, &[index as u8; 40]).await);
+        let payload = vec![index as u8; if index % 2 == 0 { 100 } else { 1200 }];
+        results.push(exchange(transport.as_ref(), target, None, &payload).await);
     }
     let mut sources: Vec<SocketAddr> = peers.a.seen.lock().clone();
     sources.extend(peers.b.seen.lock().iter().copied());

@@ -161,7 +161,7 @@ SOCKS5 UDP ASSOCIATE 为每个客户端 source 保持一条控制 TCP 连接和�
 - 按域名拨号的流为每个原始目的地保留一条 association，其回复投影到该目的地，因此得不到端点无关映射。
 - 一个 source 的各目的地仅在同一节点上共用 association。组可能把新目的地或 Score 试探流送到另一节点，那里有自己的映射。
 - 使用协议回退（没有 H2MUX，也没有 Xray UDP 池）时，VLESS `packetEncoding=auto` 对无 Vision 节点的 UDP/53 与 UDP/443 使用已连接的 native UDP，其流只指定单个目标，所以这两个端口无法 full-cone；Vision 节点和其他所有端口本来就使用 Single XUDP。设置 `packetEncoding=xudp` 可显式启用。honk 不把它设为默认：在 loopback 上对 sing-box 1.12.4 测量，Single XUDP 在 1200 字节、不限速时的吞吐约为 native 的一半，每 MB 客户端 CPU 为 native 的 1.9 到 3.3 倍，p99.9 延迟尾部更重，中位数与冷启动延迟没有可测量差异。XUDP 还会拒绝超过 7,526 字节的 datagram。
-- 各端口所选路径不同的 VLESS source（例如 Xray UDP 池加 UDP/443 `skip`，443 使用 Single XUDP）即使在同一节点上，也按所选路径各有一条 association。
+- 各端口所选路径不同的 VLESS source（例如 Xray UDP 池加 UDP/443 `skip`，443 走协议回退而不是池）即使在同一节点上，也按所选路径各有一条 association。
 - Trojan、Juicity 与 AnyTLS 把一个 source 的全部目的地放在一条可靠流上，某个目的地停滞会拖慢同流的其他目的地，写失败会终止所有目的地。datagram 载体（Hysteria2、TUIC、Shadowsocks、SOCKS5）没有这个问题。
 - 53 端口的流不在数据路径中发布客户端回复 framing，因此对 53 端口流的主动回复依赖宿主机转发。
 - 每个客户端 source 同时最多服务七个外来回复源。当第 65 个不同的 peer 即将退役、而仍在跟踪 64 个已退役 peer 时，该 source 不再接纳主动回复；重新被绑定的 peer 会从该列表移除。

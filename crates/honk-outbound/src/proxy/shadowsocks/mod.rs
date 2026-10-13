@@ -449,7 +449,11 @@ impl SharedSourceOutbound for ShadowsocksHandler {
         speculative: bool,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
         let _ = speculative;
-        Self::prepare_udp_source(&runtime.node, target, target_domain, connect_timeout).await
+        // Nothing outside the transport owns its socket, so a losing
+        // preparation closes it by dropping.
+        let transport =
+            Self::udp_transport(&runtime.node, target, target_domain, connect_timeout).await?;
+        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
     }
 }
 
@@ -472,19 +476,6 @@ impl PacketOutbound for ShadowsocksHandler {
 impl ProbeableOutbound for ShadowsocksHandler {}
 
 impl ShadowsocksHandler {
-    /// One association for a client source: cipher state plus a connected,
-    /// bypass-marked server-facing socket. Nothing outside the returned
-    /// transport owns the socket, so dropping a preparation closes it.
-    pub(crate) async fn prepare_udp_source(
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
-        let transport = Self::udp_transport(node, target, target_domain, connect_timeout).await?;
-        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
-    }
-
     async fn udp_transport(
         node: &Node,
         target: SocketAddr,

@@ -480,7 +480,7 @@ impl UdpEndpoint {
         }
     }
 
-    #[cfg(all(test, feature = "rprx"))]
+    #[cfg(test)]
     async fn send_packet(&self, data: &[u8], confirmed: bool) -> io::Result<()> {
         self.send_packet_with_admission(data, confirmed, None, &mut None)
             .await

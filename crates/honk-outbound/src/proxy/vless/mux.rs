@@ -671,7 +671,6 @@ struct MuxUdpWriter {
     send: h2::SendStream<Bytes>,
     carrier: CarrierFailure,
     setup: Option<Bytes>,
-    pending: bool,
 }
 
 struct MuxUdpReader {
@@ -686,6 +685,7 @@ struct MuxUdpReader {
 /// and the only domain a reply source may project back to.
 pub(crate) struct VlessMuxUdpTransport {
     writer: tokio::sync::Mutex<MuxUdpWriter>,
+    poison: crate::proxy::FramePoison,
     reader: tokio::sync::Mutex<MuxUdpReader>,
     target: std::net::SocketAddr,
     target_domain: Option<Box<str>>,
@@ -718,20 +718,14 @@ impl VlessMuxUdpTransport {
             data,
             crate::proxy::uot::MAX_PACKET_SIZE,
         )?;
-        if writer.pending {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "VLESS H2MUX UDP write was interrupted",
-            ));
-        }
-        writer.pending = true;
+        let write = self.poison.begin()?;
         if let Some(admitted) = admitted {
             admitted.store(true, Ordering::Release);
         }
         let writer = &mut *writer;
         send_owned(&mut writer.send, &writer.carrier, frame).await?;
         writer.setup = None;
-        writer.pending = false;
+        write.complete();
         // Each flow sharing the stream reports its own first confirmed send.
         if confirmed {
             crate::runtime::flow_observation::milestone(
@@ -816,6 +810,10 @@ impl MultiTargetTransport for VlessMuxUdpTransport {
         self.send_inner(target, domain, data, confirmed, admitted)
             .await
     }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
+    }
 }
 
 #[allow(
@@ -875,8 +873,8 @@ impl MuxSession for VlessMuxSession {
                     send: opened.send,
                     carrier: Arc::clone(&opened.failure),
                     setup: Some(setup),
-                    pending: false,
                 }),
+                poison: crate::proxy::FramePoison::default(),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
                     response: MuxResponse::new(opened.response, opened.failure),
                     decoder: AddrDecoder::new(AddrFraming::SOCKS5),

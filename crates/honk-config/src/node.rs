@@ -768,34 +768,25 @@ mod tests {
     }
 
     /// The addressed UoT v2 / H2MUX PacketAddr dial shapes replaced the
-    /// connected ones on the wire, so their IDs must not alias old nodes.
+    /// connected ones on the wire, so their IDs must not alias the native
+    /// node or each other, and disabling UDP drops the UDP shape from identity.
     #[test]
-    fn test_vless_addressed_udp_shapes_have_their_own_identity_tokens() {
-        let uot = Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=uot-v2",
-        )
-        .unwrap();
-        let h2 = Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=h2mux",
-        )
-        .unwrap();
-        assert_eq!(
-            uot.vless().unwrap().identity_fingerprint(),
-            "off:uot-v2-addr:uot-v2-addr:uot-v2-addr"
+    fn test_vless_addressed_udp_shapes_have_their_own_identities() {
+        const LINK: &str = "vless://00000000-0000-0000-0000-000000000001@example.com:443";
+        let id = |query: &str| {
+            Node::from_share_link(&format!("{LINK}?{query}"))
+                .unwrap()
+                .id
+        };
+        let (native, uot, h2) = (
+            id("packetEncoding=none"),
+            id("packetEncoding=uot-v2"),
+            id("mux=h2mux"),
         );
-        assert_eq!(
-            h2.vless().unwrap().identity_fingerprint(),
-            "h2:false:h2-addr:h2-addr:h2-addr"
-        );
-        // TCP-only nodes never dial the UDP shape and keep their identity form.
-        let tcp_only = Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443?mux=h2mux&udp=0",
-        )
-        .unwrap();
-        assert_eq!(
-            tcp_only.vless().unwrap().identity_fingerprint(),
-            "h2:false:udp-disabled"
-        );
+        assert_ne!(uot, native);
+        assert_ne!(h2, native);
+        assert_ne!(uot, h2);
+        assert_ne!(id("mux=h2mux&udp=0"), h2);
     }
 
     #[test]

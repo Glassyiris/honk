@@ -701,7 +701,6 @@ async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
 #[tokio::test]
 async fn shared_source_preparation_uses_pool_session_and_carries_many_destinations() {
     let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
-    assert!(registry.has_shared_source(honk_config::types::NodeProtocol::AnyTLS));
     let node = anytls_node("shared-source");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
@@ -853,16 +852,17 @@ async fn shared_source_confirmed_send_reports_in_caller_context_only() {
     );
     sent.unwrap();
 
-    let events = events.lock();
-    let of = |flow: &crate::runtime::flow_observation::FlowObserver| {
-        events
-            .iter()
-            .filter_map(|(id, event)| (*id == flow.context().flow_id).then_some(*event))
-            .collect::<Vec<_>>()
-    };
-    assert!(of(&opener).is_empty());
-    assert_eq!(of(&sender), ["target_request_sent"]);
-    drop(events);
+    {
+        let events = events.lock();
+        let of = |flow: &crate::runtime::flow_observation::FlowObserver| {
+            events
+                .iter()
+                .filter_map(|(id, event)| (*id == flow.context().flow_id).then_some(*event))
+                .collect::<Vec<_>>()
+        };
+        assert!(of(&opener).is_empty());
+        assert_eq!(of(&sender), ["target_request_sent"]);
+    }
     drop(transport);
     generation.shutdown().await;
 }

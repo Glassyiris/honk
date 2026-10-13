@@ -662,7 +662,7 @@ async fn cancelled_frame_write_poisons_the_shared_stream() {
         .send_to(b, None, b"b", false, None)
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(crate::proxy::is_frame_interrupted(&error));
 }
 
 #[tokio::test]

@@ -681,13 +681,16 @@ impl SharedSourceOutbound for Socks5Handler {
         speculative: bool,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
         let _ = speculative;
-        self.prepare_udp_source(
+        // Publishes no node state, so a losing preparation just drops the
+        // control stream and socket.
+        let transport = Self::open_udp(
             runtime.node.as_ref(),
             target,
             target_domain,
             connect_timeout,
         )
-        .await
+        .await?;
+        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
     }
 }
 
@@ -705,22 +708,6 @@ impl PacketOutbound for Socks5Handler {
             crate::runtime::flow_observation::Milestone::TransportReady,
         );
         Ok(Arc::new(transport))
-    }
-}
-
-impl Socks5Handler {
-    /// One association for a client source. It publishes no node state, so a
-    /// speculative preparation that loses simply drops the control stream and
-    /// socket.
-    pub async fn prepare_udp_source(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
-        let transport = Self::open_udp(node, target, target_domain, connect_timeout).await?;
-        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
     }
 }
 

@@ -111,6 +111,24 @@ impl From<PacketRejection> for std::io::Error {
     }
 }
 
+/// A frame write on a stream shared by every destination of a source was
+/// cancelled or failed partway, so the stream holds a partial frame and no
+/// further frame may follow it.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("shared stream frame write was interrupted")]
+pub struct FrameInterrupted;
+
+impl From<FrameInterrupted> for std::io::Error {
+    fn from(interrupted: FrameInterrupted) -> Self {
+        Self::new(std::io::ErrorKind::BrokenPipe, interrupted)
+    }
+}
+
+/// Whether an I/O error reports a stream already torn by an earlier frame.
+pub fn is_frame_interrupted(error: &std::io::Error) -> bool {
+    find_cause::<FrameInterrupted>(error).is_some()
+}
+
 /// Whether an error contains a terminal, health-neutral local refusal.
 pub fn is_packet_rejection(error: &anyhow::Error) -> bool {
     packet_rejection(error).is_some()

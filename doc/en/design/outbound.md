@@ -677,7 +677,7 @@ socket and crypto session (SS2022 never resets its session ID, packet counter or
 replay windows per destination), one Juicity bidirectional stream, one SOCKS5
 control connection with one relay socket, one Trojan associate stream, one
 non-connect UoT v2 stream or one H2MUX PacketAddr stream. `recv_packet` returns
-the authenticated real peer: an IPv4-mapped peer is IPv4, a domain source is
+the real peer the server reports: an IPv4-mapped peer is IPv4, a domain source is
 accepted only as the captured domain and port, any other domain is dropped
 without DNS, and stream protocols consume a dropped frame whole before reading
 the next; an unknown address type stays terminal. `send_packet` and `send_to`
@@ -686,9 +686,11 @@ first datagram, and `admitted` is set when the datagram reached the wire path or
 the writer queue. Reliable-stream carriers (Trojan, Juicity, AnyTLS, UoT, H2MUX)
 keep a partial-frame timeout terminal for the whole source, so destinations
 sharing a stream also share its head-of-line blocking and failure fate. A frame
-write cancelled halfway (for example when its view retires) poisons the stream:
-the next send fails and the source retires every destination instead of
-appending to a torn frame. A native UDP size refusal (`EMSGSIZE`) is a typed
+write cancelled halfway poisons the stream with a typed `FrameInterrupted`: the
+next send fails and the source retires every destination instead of appending to
+a torn frame. When a view's own retirement cancelled that write, the retirement
+is a neutral cancellation that charges no health or Score to the node; a
+timeout-caused tear stays a transport failure. A native UDP size refusal (`EMSGSIZE`) is a typed
 local `InvalidSize` rejection and ends nothing. The last view's endpoint permit
 stays held until the source receiver exits or another view binds, which keeps
 retiring sources inside the descriptor partition; for a short window a

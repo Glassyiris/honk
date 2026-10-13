@@ -57,6 +57,12 @@ impl<'a> QuicSendAttempt<'a> {
         }
     }
 
+    /// Whether this attempt tracks an ACK baseline; non-QUIC transports hand
+    /// out an inactive token that never outlives its send.
+    pub fn is_active(&self) -> bool {
+        self.token.is_active()
+    }
+
     pub fn success(mut self) {
         self.completed = true;
         self.transport.record_quic_send_success(self.token);
@@ -151,6 +157,43 @@ pub trait MultiTargetTransport: PacketTransport {
     /// Server address reported when a shared association is reused.
     fn carrier_addr(&self) -> Option<SocketAddr> {
         None
+    }
+    /// Whether a cancelled frame write has torn this transport's reliable
+    /// stream, so every later send fails with [`super::FrameInterrupted`].
+    fn frame_stream_torn(&self) -> bool {
+        false
+    }
+}
+
+/// Poison flag of a reliable stream that carries every destination's frames.
+///
+/// A write cancelled or failed partway leaves a partial frame, so the flag
+/// stays set until the frame completes; dropping the guard never clears it.
+/// Callers already hold the stream's writer lock, so `begin` is not a CAS.
+#[derive(Debug, Default)]
+pub(crate) struct FramePoison(std::sync::atomic::AtomicBool);
+
+impl FramePoison {
+    pub(crate) fn begin(&self) -> std::io::Result<FrameWrite<'_>> {
+        use std::sync::atomic::Ordering;
+        if self.0.load(Ordering::Acquire) {
+            return Err(super::FrameInterrupted.into());
+        }
+        self.0.store(true, Ordering::Release);
+        Ok(FrameWrite(&self.0))
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[must_use]
+pub(crate) struct FrameWrite<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl FrameWrite<'_> {
+    pub(crate) fn complete(self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

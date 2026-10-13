@@ -1,7 +1,12 @@
+mod preparation;
 mod reply;
+mod transport;
+pub(in crate::control) use preparation::SourcePreparation;
 #[cfg(all(test, feature = "rprx"))]
 pub(super) use reply::SourceReplyTarget;
 use reply::{SourceReplyDisposition, deliver_source_reply};
+use transport::SourceTransport;
+pub(in crate::control) use transport::{PreparedSourceTransport, SourcePath};
 
 use super::driver::{REPLY_IDLE_TIMEOUT, TRANSPORT_SEND_TIMEOUT};
 use super::*;
@@ -18,116 +23,6 @@ use honk_outbound::proxy::{
 use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 
 const MAX_RETIRED_REPLY_PEERS: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in crate::control) enum SourcePath {
-    #[cfg(feature = "rprx")]
-    Vless(VlessUdpPath),
-    Hysteria2,
-    Tuic,
-    /// Protocols whose registry entry has a shared-source slot.
-    Shared,
-}
-
-pub(in crate::control) enum PreparedSourceTransport {
-    #[cfg(feature = "rprx")]
-    Vless(PreparedUdpTransport<VlessXudpTransport>),
-    Hysteria2(PreparedUdpTransport<Hy2UdpTransport>),
-    Tuic(PreparedUdpTransport<TuicUdpTransport>),
-    Shared(PreparedUdpTransport<dyn MultiTargetTransport>),
-}
-
-impl PreparedSourceTransport {
-    async fn commit(self) -> anyhow::Result<SourceTransport> {
-        match self {
-            #[cfg(feature = "rprx")]
-            Self::Vless(prepared) => prepared.commit().await.map(SourceTransport::Vless),
-            Self::Hysteria2(prepared) => prepared.commit().await.map(SourceTransport::Hysteria2),
-            Self::Tuic(prepared) => prepared.commit().await.map(SourceTransport::Tuic),
-            Self::Shared(prepared) => prepared.commit().await.map(SourceTransport::Shared),
-        }
-    }
-}
-
-enum SourceTransport {
-    #[cfg(feature = "rprx")]
-    Vless(Arc<VlessXudpTransport>),
-    Hysteria2(Arc<Hy2UdpTransport>),
-    Tuic(Arc<TuicUdpTransport>),
-    Shared(Arc<dyn MultiTargetTransport>),
-}
-
-impl SourceTransport {
-    fn packet_transport(&self) -> &dyn PacketTransport {
-        match self {
-            #[cfg(feature = "rprx")]
-            Self::Vless(transport) => transport.as_ref(),
-            Self::Hysteria2(transport) => transport.as_ref(),
-            Self::Tuic(transport) => transport.as_ref(),
-            Self::Shared(transport) => transport.as_ref(),
-        }
-    }
-
-    fn observe_reuse(&self) {
-        use honk_outbound::runtime::flow_observation::{self, FlowEvent, ResolutionLocation};
-
-        let Some(observer) = flow_observation::current() else {
-            return;
-        };
-        let server_addr = match self {
-            #[cfg(feature = "rprx")]
-            Self::Vless(_) => return,
-            Self::Hysteria2(transport) => Some(transport.server_addr()),
-            Self::Tuic(transport) => Some(transport.server_addr()),
-            Self::Shared(transport) => transport.carrier_addr(),
-        };
-        observer.publish(FlowEvent::TransportAttached {
-            server_addr,
-            resolution_location: ResolutionLocation::Reused,
-        });
-    }
-
-    fn is_vless(&self) -> bool {
-        match self {
-            #[cfg(feature = "rprx")]
-            Self::Vless(_) => true,
-            Self::Hysteria2(_) | Self::Tuic(_) | Self::Shared(_) => false,
-        }
-    }
-
-    async fn send_to(
-        &self,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        data: &[u8],
-        confirmed: bool,
-        admitted: Option<&AtomicBool>,
-    ) -> io::Result<()> {
-        match self {
-            #[cfg(feature = "rprx")]
-            Self::Vless(transport) => {
-                transport
-                    .send_to(target, target_domain, data, admitted)
-                    .await
-            }
-            Self::Hysteria2(transport) => {
-                transport
-                    .send_to(target, target_domain, data, admitted)
-                    .await
-            }
-            Self::Tuic(transport) => {
-                transport
-                    .send_to(target, target_domain, data, admitted)
-                    .await
-            }
-            Self::Shared(transport) => {
-                transport
-                    .send_to(target, target_domain, data, confirmed, admitted)
-                    .await
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -338,7 +233,7 @@ impl SourceOwner {
         }
     }
 
-    fn release_binding(&self, endpoint_permit: Option<OwnedSemaphorePermit>) {
+    fn release_binding(&self, endpoint_permit: OwnedSemaphorePermit) {
         let retire = {
             let mut state = self.state.lock();
             debug_assert_ne!(state.bindings, 0);
@@ -352,7 +247,7 @@ impl SourceOwner {
             // pending attachment that may still be cancelled: the next bound view
             // brings its own permit.
             if state.bindings == 0 {
-                state.retained_endpoint_permit = endpoint_permit;
+                state.retained_endpoint_permit = Some(endpoint_permit);
             }
             retire
         };
@@ -434,27 +329,21 @@ impl SourceOwner {
     }
 
     pub(super) fn handle_transport_error(&self, error: &io::Error) -> bool {
-        #[cfg(feature = "rprx")]
-        if self.transport.is_vless() {
-            {
-                let mut state = self.state.lock();
-                if !honk_outbound::proxy::vless::is_vless_source_post_admission_cancel(error) {
-                    state.intentional_sender = 0;
-                    return false;
-                }
-                // Sender and receiver can observe the same terminal before retirement linearizes.
-                if state.intentional_sender == 0 {
-                    return false;
-                }
+        {
+            let mut state = self.state.lock();
+            if !self.transport.is_interruption(error) {
+                state.intentional_sender = 0;
+                return false;
             }
-            if let Some(pool) = self.pool.upgrade() {
-                pool.retire_interrupted_source(self);
+            // Sender and receiver can observe the same terminal before retirement linearizes.
+            if state.intentional_sender == 0 {
+                return false;
             }
-            return true;
         }
-        #[cfg(not(feature = "rprx"))]
-        let _ = error;
-        false
+        if let Some(pool) = self.pool.upgrade() {
+            pool.retire_interrupted_source(self);
+        }
+        true
     }
     fn note_reply(&self) {
         let state = self.state.lock();
@@ -533,135 +422,6 @@ impl Drop for SourceAttachment {
     }
 }
 
-pub(in crate::control) enum SourcePreparation {
-    Reused(SourceAttachment),
-    Fresh {
-        scope: SourceScope,
-        prepared: PreparedSourceTransport,
-        source_permit: OwnedSemaphorePermit,
-        runtime: Arc<NodeRuntime>,
-        alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
-        stats: Arc<StatsManager>,
-        node_id: uuid::Uuid,
-        node_name: String,
-        health_family: honk_outbound::alive::IpVersion,
-    },
-}
-
-impl SourcePreparation {
-    #[cfg(all(test, feature = "rprx"))]
-    pub(super) fn attached_owner(&self) -> Option<Arc<SourceOwner>> {
-        match self {
-            Self::Reused(attachment) => Some(attachment.owner()),
-            Self::Fresh { .. } => None,
-        }
-    }
-
-    pub(in crate::control) async fn commit(
-        self,
-        pool: &Arc<UdpEndpointPool>,
-    ) -> anyhow::Result<SourceAttachment> {
-        match self {
-            Self::Reused(attachment) => {
-                if attachment.owner.is_ready() {
-                    attachment.owner.transport.observe_reuse();
-                    Ok(attachment)
-                } else {
-                    Err(honk_outbound::proxy::PacketRejection::Cancelled.into())
-                }
-            }
-            Self::Fresh {
-                scope,
-                prepared,
-                source_permit,
-                runtime,
-                alive_set,
-                stats,
-                node_id,
-                node_name,
-                health_family,
-            } => {
-                let mut prepared = Some(prepared);
-                let mut transport = None;
-                loop {
-                    if pool.terminal.load(Ordering::Acquire) {
-                        return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
-                    }
-                    let changed = pool.source_changed.notified();
-                    if let Some(owner) = pool
-                        .sources
-                        .get(&scope)
-                        .map(|entry| Arc::clone(entry.value()))
-                    {
-                        if let Some(attachment) = owner.attach() {
-                            owner.transport.observe_reuse();
-                            return Ok(attachment);
-                        }
-                        changed.await;
-                        continue;
-                    }
-
-                    if let Some(prepared) = prepared.take() {
-                        transport = Some(prepared.commit().await?);
-                    }
-
-                    {
-                        let mut tasks = pool.source_tasks.lock();
-                        while let Some(result) = tasks.tasks.try_join_next() {
-                            if let Err(error) = result {
-                                debug!("UDP source receiver join failed: {}", error);
-                            }
-                        }
-                        if tasks.closed || pool.terminal.load(Ordering::Acquire) {
-                            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
-                        }
-                        match pool.sources.entry(scope.clone()) {
-                            dashmap::mapref::entry::Entry::Occupied(entry) => {
-                                let owner = Arc::clone(entry.get());
-                                drop(entry);
-                                drop(tasks);
-                                if let Some(attachment) = owner.attach() {
-                                    owner.transport.observe_reuse();
-                                    return Ok(attachment);
-                                }
-                            }
-                            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                                let owner = SourceOwner::new(
-                                    pool.next_source_owner.fetch_add(1, Ordering::Relaxed),
-                                    scope.clone(),
-                                    transport.expect("prepared source transport"),
-                                    runtime,
-                                    pool,
-                                    alive_set,
-                                    node_id,
-                                    health_family,
-                                    stats.outbound_tracker(
-                                        &node_name,
-                                        crate::stats::OutboundKind::Node,
-                                    ),
-                                    stats,
-                                    source_permit,
-                                );
-                                entry.insert(Arc::clone(&owner));
-                                drop(tasks.tasks.spawn(run_source_receiver(
-                                    Arc::clone(pool),
-                                    Arc::clone(&owner),
-                                )));
-                                drop(tasks);
-                                return Ok(SourceAttachment {
-                                    owner,
-                                    committed: false,
-                                });
-                            }
-                        }
-                    }
-                    changed.await;
-                }
-            }
-        }
-    }
-}
-
 pub(super) struct SourceEndpoint {
     owner: Arc<SourceOwner>,
     view: u64,
@@ -675,7 +435,6 @@ pub(super) struct SourceEndpoint {
 
 struct SourceEndpointBinding {
     attachment: Option<SourceAttachment>,
-    bound: bool,
     retirement: Option<SourceRetirement>,
     endpoint_permit: Option<OwnedSemaphorePermit>,
 }
@@ -699,7 +458,6 @@ impl SourceEndpoint {
             flow_tracker,
             binding: Mutex::new(SourceEndpointBinding {
                 attachment: Some(attachment),
-                bound: false,
                 retirement: None,
                 endpoint_permit: None,
             }),
@@ -713,7 +471,7 @@ impl SourceEndpoint {
 
     pub(super) fn score_retirement(&self) -> Option<SourceRetirement> {
         let binding = self.binding.lock();
-        if binding.bound {
+        if binding.endpoint_permit.is_some() {
             self.owner.state.lock().retirement
         } else {
             binding.retirement
@@ -739,7 +497,6 @@ impl SourceEndpoint {
             return false;
         }
         binding.attachment.take();
-        binding.bound = true;
         binding.endpoint_permit = Some(endpoint_permit);
         true
     }
@@ -758,7 +515,7 @@ impl SourceEndpoint {
                     state.foreign_replies_disabled = true;
                 }
             }
-            if binding.bound {
+            if binding.endpoint_permit.is_some() {
                 state.mark_intentional_sender(self.view);
                 binding.retirement = state.retirement;
             }
@@ -766,9 +523,8 @@ impl SourceEndpoint {
             self.retired.store(true, Ordering::Release);
             dead.store(true, Ordering::Release);
         }
-        if binding.bound {
-            binding.bound = false;
-            self.owner.release_binding(binding.endpoint_permit.take());
+        if let Some(permit) = binding.endpoint_permit.take() {
+            self.owner.release_binding(permit);
         }
     }
 
@@ -799,9 +555,8 @@ impl SourceEndpoint {
         let reusable = match &self.owner.transport {
             #[cfg(feature = "rprx")]
             SourceTransport::Vless(transport) => transport.source_send_usable().await,
-            SourceTransport::Hysteria2(_)
-            | SourceTransport::Tuic(_)
-            | SourceTransport::Shared(_) => true,
+            SourceTransport::Hysteria2(_) | SourceTransport::Tuic(_) => true,
+            SourceTransport::Shared(transport) => !transport.frame_stream_torn(),
         };
         let mut active = {
             let mut state = self.owner.state.lock();
@@ -904,10 +659,9 @@ impl Drop for SourceEndpoint {
     fn drop(&mut self) {
         let binding = self.binding.get_mut();
         binding.attachment.take();
-        if binding.bound {
+        if let Some(permit) = binding.endpoint_permit.take() {
             self.owner.state.lock().mark_intentional_sender(self.view);
-            binding.bound = false;
-            self.owner.release_binding(binding.endpoint_permit.take());
+            self.owner.release_binding(permit);
         }
     }
 }
@@ -1124,7 +878,6 @@ impl UdpEndpointPool {
         self.retire_source_neutral(owner, ScoreOutcome::Timeout);
     }
 
-    #[cfg(feature = "rprx")]
     fn retire_interrupted_source(&self, owner: &SourceOwner) {
         self.retire_source_neutral(owner, ScoreOutcome::Cancelled);
     }

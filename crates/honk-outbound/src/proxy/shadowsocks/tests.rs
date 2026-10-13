@@ -519,12 +519,11 @@ impl Shared {
     async fn new(method: &'static str, target: SocketAddr, domain: Option<&str>) -> Self {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let node = legacy_node(server.local_addr().unwrap(), method);
-        let transport = ShadowsocksHandler::prepare_udp_source(&node, target, domain, STEP)
-            .await
-            .unwrap()
-            .commit()
-            .await
-            .unwrap();
+        let transport = Arc::new(
+            ShadowsocksHandler::udp_transport(&node, target, domain, STEP)
+                .await
+                .unwrap(),
+        );
         Self {
             server,
             peer: LegacyPeer::new(method, PASSWORD),
@@ -724,7 +723,7 @@ async fn legacy_udp_max_size_boundary() {
     }
 }
 
-/// Dropping a transport or an uncommitted preparation closes its socket.
+/// Dropping a transport closes its socket.
 #[tokio::test]
 async fn legacy_udp_drop_releases_the_socket() {
     let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
@@ -738,13 +737,6 @@ async fn legacy_udp_drop_releases_the_socket() {
     let Shared { transport, .. } = shared;
     drop(transport);
     drop(std::net::UdpSocket::bind(client).expect("drop closes the transport socket"));
-
-    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let node = legacy_node(server.local_addr().unwrap(), "aes-128-gcm");
-    let prepared = ShadowsocksHandler::prepare_udp_source(&node, a, None, STEP)
-        .await
-        .unwrap();
-    drop(prepared);
 }
 
 /// The core reaches Shadowsocks only through the shared-source dispatch.

@@ -35,6 +35,10 @@ struct MemoryTransport {
     sent: Mutex<Vec<Sent>>,
     fixed_target_sends: AtomicUsize,
     fail_send: AtomicBool,
+    stall_before_admission: AtomicBool,
+    cancelled_sends: AtomicUsize,
+    stall_mid_frame: AtomicBool,
+    torn: AtomicBool,
     inject: mpsc::UnboundedSender<Reply>,
     replies: tokio::sync::Mutex<mpsc::UnboundedReceiver<Reply>>,
 }
@@ -48,6 +52,10 @@ impl MemoryTransport {
             sent: Mutex::new(Vec::new()),
             fixed_target_sends: AtomicUsize::new(0),
             fail_send: AtomicBool::new(false),
+            stall_before_admission: AtomicBool::new(false),
+            cancelled_sends: AtomicUsize::new(0),
+            stall_mid_frame: AtomicBool::new(false),
+            torn: AtomicBool::new(false),
             inject,
             replies: tokio::sync::Mutex::new(replies),
         })
@@ -120,11 +128,22 @@ impl MultiTargetTransport for MemoryTransport {
         confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> io::Result<()> {
+        if self.torn.load(Ordering::SeqCst) {
+            return Err(honk_outbound::proxy::FrameInterrupted.into());
+        }
+        if self.stall_mid_frame.load(Ordering::SeqCst) {
+            self.torn.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
         if self.fail_send.load(Ordering::SeqCst) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "memory transport closed",
             ));
+        }
+        if self.stall_before_admission.load(Ordering::SeqCst) {
+            let _cancelled = CountOnDrop(&self.cancelled_sends);
+            std::future::pending::<()>().await;
         }
         self.sent.lock().push(Sent {
             target,
@@ -140,6 +159,18 @@ impl MultiTargetTransport for MemoryTransport {
 
     fn carrier_addr(&self) -> Option<SocketAddr> {
         Some("127.0.0.1:2".parse().unwrap())
+    }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.torn.load(Ordering::SeqCst)
+    }
+}
+
+struct CountOnDrop<'a>(&'a AtomicUsize);
+
+impl Drop for CountOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -568,6 +599,87 @@ async fn shared_source_terminal_error_retires_every_view() {
         f.wait_until("endpoint removal", || f.pool.is_empty()).await;
         f.shutdown().await;
     }
+}
+
+/// A send still waiting before the transport admits its datagram is
+/// packet-local, whatever the carrier: it cannot tear down sibling views, even
+/// though a non-QUIC transport also gets an (inactive) QUIC attempt.
+#[tokio::test]
+async fn shared_source_unadmitted_send_timeout_keeps_sibling_views() {
+    let f = Fixture::new(false, 16).await;
+    let (client, a, b) = (f.client(), f.target(0), f.target(1));
+    let ea = f.flow(0, b"a").await;
+    let eb = f.flow(1, b"b").await;
+    let transport = f.transport();
+    f.pool
+        .sources
+        .iter()
+        .next()
+        .unwrap()
+        .set_send_timeout_for_test(Duration::from_millis(20));
+
+    transport
+        .stall_before_admission
+        .store(true, Ordering::SeqCst);
+    f.enqueue(client, a, b"stalls");
+    f.wait_until("stalled send to hit its deadline", || {
+        transport.cancelled_sends.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    transport
+        .stall_before_admission
+        .store(false, Ordering::SeqCst);
+    f.enqueue(client, b, b"after");
+    f.wait_until("sibling send or retirement", || {
+        transport.sent().len() == 3 || eb.dead.load(Ordering::Acquire)
+    })
+    .await;
+    assert!(!ea.dead.load(Ordering::Acquire) && !eb.dead.load(Ordering::Acquire));
+    assert_eq!(transport.sent()[2].data, b"after");
+    drop((ea, eb, transport));
+    f.shutdown().await;
+}
+
+/// A view retired while its frame write is in flight tears the stream its
+/// siblings share. The sibling's refusal echoes that local cancellation, so
+/// the source retires without charging the node.
+#[tokio::test]
+async fn shared_source_view_cancelled_mid_frame_does_not_blame_the_node() {
+    let f = Fixture::new(false, 16).await;
+    let (client, a, b) = (f.client(), f.target(0), f.target(1));
+    let ea = f.flow(0, b"a").await;
+    let eb = f.flow(1, b"b").await;
+    let transport = f.transport();
+    let node_alive = |f: &Fixture| {
+        f.alive
+            .is_alive_for(f.node.id, ProbeDomain::DataUdp, f.family)
+    };
+    for _ in 0..49 {
+        f.alive
+            .report_unavailable_traffic(f.node.id, ProbeDomain::DataUdp, f.family);
+    }
+    assert!(node_alive(&f));
+
+    transport.stall_mid_frame.store(true, Ordering::SeqCst);
+    let mut torn = Box::pin(eb.send_packet(b"torn", false));
+    let stuck = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(Future::poll(torn.as_mut(), cx).is_pending())
+    })
+    .await;
+    assert!(stuck, "the frame write must stop mid-frame");
+    f.pool.remove(client, b);
+    drop(torn);
+    transport.stall_mid_frame.store(false, Ordering::SeqCst);
+
+    f.enqueue(client, a, b"sibling");
+    f.wait_until("source to retire", || f.pool.sources.is_empty())
+        .await;
+    assert!(
+        node_alive(&f),
+        "a locally cancelled write is not evidence against the node"
+    );
+    drop((ea, eb, transport));
+    f.shutdown().await;
 }
 
 #[tokio::test]

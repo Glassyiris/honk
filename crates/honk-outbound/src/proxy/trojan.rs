@@ -180,7 +180,7 @@ impl TrojanHandler {
         let (rd, wr) = tokio::io::split(control);
         Ok(Arc::new(TrojanUdpTransport {
             writer: tokio::sync::Mutex::new(wr),
-            write_interrupted: std::sync::atomic::AtomicBool::new(false),
+            poison: super::FramePoison::default(),
             reader: tokio::sync::Mutex::new(rd),
             addr_header,
             domain: target_domain.map(Box::from),
@@ -489,10 +489,9 @@ mod tests {
 /// (`addr | u16 len | CRLF | payload`), each frame naming its own peer.
 struct TrojanUdpTransport {
     writer: tokio::sync::Mutex<WriteHalf<Box<dyn AsyncReadWrite>>>,
-    /// Set while a frame is being written, cleared once it is flushed: a write
-    /// cancelled halfway leaves it set, so no sibling destination can append a
-    /// frame to a torn one.
-    write_interrupted: std::sync::atomic::AtomicBool,
+    /// Poisoned by a write cancelled halfway, so no sibling destination can
+    /// append a frame to a torn one.
+    poison: super::FramePoison,
     reader: tokio::sync::Mutex<ReadHalf<Box<dyn AsyncReadWrite>>>,
     /// Encoded `relay_addr`/`domain`: the destination of `send_packet`.
     addr_header: Vec<u8>,
@@ -530,15 +529,6 @@ impl TrojanUdpTransport {
                 "trojan UDP writer is busy",
             ));
         };
-        if self
-            .write_interrupted
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "trojan UDP frame write was interrupted",
-            ));
-        }
         let mut frame;
         if target == self.relay_addr && domain == self.domain.as_deref() {
             frame = Vec::with_capacity(self.addr_header.len() + 4 + data.len());
@@ -551,17 +541,15 @@ impl TrojanUdpTransport {
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
+        let write = self.poison.begin()?;
         // From here a deadline can leave a partial frame on the shared
-        // stream; the next sender must fail instead of extending it.
+        // stream; the poison keeps the next sender from extending it.
         if let Some(admitted) = admitted {
             admitted.store(true, std::sync::atomic::Ordering::Release);
         }
-        self.write_interrupted
-            .store(true, std::sync::atomic::Ordering::Release);
         writer.write_all(&frame).await?;
         writer.flush().await?;
-        self.write_interrupted
-            .store(false, std::sync::atomic::Ordering::Release);
+        write.complete();
         Ok(())
     }
 }
@@ -646,396 +634,11 @@ impl MultiTargetTransport for TrojanUdpTransport {
         let domain = addr::dialed_name(self.domain.as_deref(), domain);
         self.send_frame(target, domain, data, admitted).await
     }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
+    }
 }
 
 #[cfg(test)]
-mod udp_transport_tests {
-    use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// Independent peer-side codec: addresses are spelled out byte by byte so
-    /// the production encoder and decoder are not what verifies each other.
-    fn wire_addr(peer: SocketAddr) -> Vec<u8> {
-        let mut out = Vec::new();
-        match peer {
-            SocketAddr::V4(v4) => {
-                out.push(0x01);
-                out.extend_from_slice(&v4.ip().octets());
-            }
-            SocketAddr::V6(v6) => {
-                out.push(0x04);
-                out.extend_from_slice(&v6.ip().octets());
-            }
-        }
-        out.extend_from_slice(&peer.port().to_be_bytes());
-        out
-    }
-
-    fn wire_domain(domain: &str, port: u16) -> Vec<u8> {
-        let mut out = vec![0x03, domain.len() as u8];
-        out.extend_from_slice(domain.as_bytes());
-        out.extend_from_slice(&port.to_be_bytes());
-        out
-    }
-
-    fn frame(address: Vec<u8>, payload: &[u8]) -> Vec<u8> {
-        let mut out = address;
-        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(payload);
-        out
-    }
-
-    /// Read one frame as the server would: SOCKS5 address, length, CRLF, payload.
-    async fn read_frame<R: AsyncReadExt + Unpin>(server: &mut R) -> (SocketAddr, Vec<u8>) {
-        let mut atyp = [0u8; 1];
-        server.read_exact(&mut atyp).await.unwrap();
-        let peer = match atyp[0] {
-            0x01 => {
-                let mut ip = [0u8; 4];
-                server.read_exact(&mut ip).await.unwrap();
-                let mut port = [0u8; 2];
-                server.read_exact(&mut port).await.unwrap();
-                SocketAddr::new(Ipv4Addr::from(ip).into(), u16::from_be_bytes(port))
-            }
-            0x04 => {
-                let mut ip = [0u8; 16];
-                server.read_exact(&mut ip).await.unwrap();
-                let mut port = [0u8; 2];
-                server.read_exact(&mut port).await.unwrap();
-                SocketAddr::new(Ipv6Addr::from(ip).into(), u16::from_be_bytes(port))
-            }
-            other => panic!("unexpected ATYP {other:#x}"),
-        };
-        let mut head = [0u8; 4];
-        server.read_exact(&mut head).await.unwrap();
-        assert_eq!(&head[2..], b"\r\n");
-        let mut payload = vec![0u8; u16::from_be_bytes([head[0], head[1]]) as usize];
-        server.read_exact(&mut payload).await.unwrap();
-        (peer, payload)
-    }
-
-    fn transport_over<S: AsyncReadWrite + 'static>(
-        stream: S,
-        target: SocketAddr,
-        domain: Option<&str>,
-    ) -> TrojanUdpTransport {
-        let (rd, wr) = tokio::io::split(Box::new(stream) as Box<dyn AsyncReadWrite>);
-        TrojanUdpTransport {
-            writer: tokio::sync::Mutex::new(wr),
-            write_interrupted: AtomicBool::new(false),
-            reader: tokio::sync::Mutex::new(rd),
-            addr_header: addr::encode_address(target, domain).unwrap(),
-            domain: domain.map(Box::from),
-            relay_addr: target,
-        }
-    }
-
-    /// send_packet frames `addr|len|CRLF|payload`; recv_packet unframes the
-    /// same shape back. Round-tripped over a duplex pair.
-    #[tokio::test]
-    async fn trojan_udp_transport_frame_roundtrip() {
-        let (client, mut server) = tokio::io::duplex(8192);
-        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let transport = transport_over(client, target, None);
-
-        transport.send_packet(b"hello-trojan-udp").await.unwrap();
-        assert_eq!(
-            read_frame(&mut server).await,
-            (target, b"hello-trojan-udp".to_vec())
-        );
-
-        server
-            .write_all(&frame(wire_addr(target), b"pong!"))
-            .await
-            .unwrap();
-        let mut buf = [0u8; 64];
-        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"pong!");
-        assert_eq!(src, target);
-    }
-
-    /// Two destinations share one stream; a never-contacted peer may answer
-    /// first; every reply keeps its own real source.
-    #[tokio::test]
-    async fn shared_stream_carries_each_destination_and_returns_real_sources() {
-        let (client, mut server) = tokio::io::duplex(1 << 17);
-        let a: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let b: SocketAddr = "[2001:db8::7]:443".parse().unwrap();
-        let c: SocketAddr = "198.51.100.9:3478".parse().unwrap();
-        let mapped_c: SocketAddr = "[::ffff:198.51.100.9]:3478".parse().unwrap();
-        let transport = transport_over(client, a, None);
-
-        transport
-            .send_to(a, None, b"to-a", false, None)
-            .await
-            .unwrap();
-        transport
-            .send_to(b, None, b"to-b", true, None)
-            .await
-            .unwrap();
-        transport.send_to(b, None, b"", false, None).await.unwrap();
-        let max = vec![0x5a; u16::MAX as usize];
-        transport.send_to(a, None, &max, false, None).await.unwrap();
-        assert_eq!(read_frame(&mut server).await, (a, b"to-a".to_vec()));
-        assert_eq!(read_frame(&mut server).await, (b, b"to-b".to_vec()));
-        assert_eq!(read_frame(&mut server).await, (b, Vec::new()));
-        assert_eq!(read_frame(&mut server).await, (a, max));
-        let too_big = vec![0u8; u16::MAX as usize + 1];
-        let error = transport
-            .send_to(a, None, &too_big, false, None)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-
-        let mut buf = vec![0u8; 65536];
-        for (source, wire, payload) in [
-            (c, wire_addr(c), &b"unsolicited"[..]),
-            (c, wire_addr(mapped_c), &b"mapped"[..]),
-            (a, wire_addr(a), &b"from-a"[..]),
-            (b, wire_addr(b), &b""[..]),
-        ] {
-            server.write_all(&frame(wire, payload)).await.unwrap();
-            let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
-            assert_eq!((peer, &buf[..n]), (source, payload));
-        }
-    }
-
-    /// Only the dialed name goes on the wire: a real server pins its outbound
-    /// form by the first destination, so any other name is sent numerically.
-    #[tokio::test]
-    async fn per_packet_domain_is_only_the_dialed_one() {
-        let (client, mut server) = tokio::io::duplex(8192);
-        let a: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let transport = transport_over(client, a, Some("example.com"));
-
-        transport
-            .send_to(a, Some("example.com"), b"dialed", false, None)
-            .await
-            .unwrap();
-        let expected = frame(wire_domain("example.com", 53), b"dialed");
-        let mut wire = vec![0u8; expected.len()];
-        server.read_exact(&mut wire).await.unwrap();
-        assert_eq!(wire, expected);
-
-        transport
-            .send_to(a, Some("other.example"), b"other", false, None)
-            .await
-            .unwrap();
-        assert_eq!(read_frame(&mut server).await, (a, b"other".to_vec()));
-        transport
-            .send_to(a, None, b"numeric", false, None)
-            .await
-            .unwrap();
-        assert_eq!(read_frame(&mut server).await, (a, b"numeric".to_vec()));
-    }
-
-    /// A frame named by a domain other than the captured one is consumed whole
-    /// (even when its payload exceeds the receive buffer) and the stream stays
-    /// aligned for the next frame.
-    #[tokio::test]
-    async fn unrecognised_domain_frames_are_consumed_and_the_next_decodes() {
-        let (client, mut server) = tokio::io::duplex(1 << 16);
-        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let transport = transport_over(client, target, Some("Example.com"));
-        let numeric: SocketAddr = "203.0.113.5:9".parse().unwrap();
-
-        let big = vec![0xee; 100];
-        let mut wire = frame(wire_domain("other.example", 443), &big);
-        wire.extend(frame(wire_domain("example.com", 444), b"wrong-port"));
-        wire.extend(frame(wire_domain("EXAMPLE.COM", 443), b"mine"));
-        wire.extend(frame(wire_domain("other.example", 443), b""));
-        wire.extend(frame(wire_addr(numeric), b"next"));
-        server.write_all(&wire).await.unwrap();
-
-        // An 8-byte buffer forces the discard path to chunk the 100 bytes.
-        let mut buf = [0u8; 8];
-        let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!((peer, &buf[..n]), (target, &b"mine"[..]));
-        let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!((peer, &buf[..n]), (numeric, &b"next"[..]));
-    }
-
-    /// Without a captured domain no domain-named frame can be projected.
-    #[tokio::test]
-    async fn domain_frame_without_captured_domain_is_dropped() {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let transport = transport_over(client, target, None);
-        let mut wire = frame(wire_domain("example.com", 443), b"dropped");
-        wire.extend(frame(wire_addr(target), b"kept"));
-        server.write_all(&wire).await.unwrap();
-        let mut buf = [0u8; 64];
-        let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!((peer, &buf[..n]), (target, &b"kept"[..]));
-    }
-
-    /// An unknown ATYP has no derivable length: the stream cannot be realigned.
-    #[tokio::test]
-    async fn unknown_atyp_is_terminal() {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let transport = transport_over(client, target, None);
-        server
-            .write_all(&frame(vec![0x09, 1, 2, 3, 4, 0, 53], b"x"))
-            .await
-            .unwrap();
-        let mut buf = [0u8; 16];
-        let error = transport.recv_packet(&mut buf).await.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    /// Writes that stall mid-frame are never packet-local: the datagram is
-    /// admitted before the first byte is written and a deadline is not
-    /// congestion.
-    #[tokio::test]
-    async fn stalled_partial_write_is_admitted_and_not_congestion() {
-        let (client, server) = tokio::io::duplex(16);
-        let a: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let transport = transport_over(client, a, None);
-        assert!(!transport.send_timeout_is_congestion());
-
-        let admitted = AtomicBool::new(false);
-        let payload = vec![7u8; 4096];
-        let stalled = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            transport.send_to(a, None, &payload, false, Some(&admitted)),
-        )
-        .await;
-        assert!(stalled.is_err(), "the unread stream must stall the write");
-        assert!(admitted.load(Ordering::Acquire));
-        drop(server);
-    }
-
-    /// A concurrent sender is refused instead of interleaving: the frame
-    /// boundary belongs to whoever holds the writer lock.
-    #[tokio::test]
-    async fn concurrent_sender_is_refused_while_a_frame_is_mid_write() {
-        let (client, server) = tokio::io::duplex(16);
-        let a: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let b: SocketAddr = "[2001:db8::7]:443".parse().unwrap();
-        let transport = transport_over(client, a, None);
-
-        let payload = vec![7u8; 4096];
-        let mut first = std::pin::pin!(transport.send_to(a, None, &payload, false, None));
-        assert!(
-            futures_util::poll!(first.as_mut()).is_pending(),
-            "writer must be pending on the full stream"
-        );
-        let busy_admitted = AtomicBool::new(false);
-        let error = transport
-            .send_to(b, None, b"b", false, Some(&busy_admitted))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(!busy_admitted.load(Ordering::Acquire));
-        drop(server);
-    }
-
-    /// A write cancelled halfway leaves a torn frame on the shared stream;
-    /// a sibling destination must fail rather than append to it, even when
-    /// the peer is draining again.
-    #[tokio::test]
-    async fn cancelled_partial_write_poisons_the_shared_stream() {
-        let (client, mut server) = tokio::io::duplex(16);
-        let a: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let b: SocketAddr = "[2001:db8::7]:443".parse().unwrap();
-        let transport = transport_over(client, a, None);
-        let payload = vec![7u8; 4096];
-        let stalled = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            transport.send_to(a, None, &payload, false, None),
-        )
-        .await;
-        assert!(stalled.is_err(), "the unread stream must stall the write");
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut server, &mut tokio::io::sink()).await;
-        });
-        let error = transport
-            .send_to(b, None, b"b", false, None)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-    }
-
-    /// Dropping the transport closes the logical stream.
-    #[tokio::test]
-    async fn drop_releases_the_stream() {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let transport = Arc::new(transport_over(client, target, None));
-        drop(transport);
-        let mut byte = [0u8; 1];
-        assert_eq!(server.read(&mut byte).await.unwrap(), 0);
-    }
-
-    /// Real loopback TCP through the production preparation: the associate
-    /// request names the first destination, later frames name their own, and
-    /// a third peer can answer first.
-    #[tokio::test]
-    async fn plain_tcp_association_serves_every_destination() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let first: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let second: SocketAddr = "[2001:db8::7]:443".parse().unwrap();
-        let stranger: SocketAddr = "198.51.100.9:3478".parse().unwrap();
-        let password = "udp-secret";
-        let server = tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let mut request = vec![0u8; 56 + 2 + 1 + 7 + 2];
-            tcp.read_exact(&mut request).await.unwrap();
-            let mut expected = hex_sha224(password).into_bytes();
-            expected.extend_from_slice(b"\r\n\x03");
-            expected.extend(wire_addr(first));
-            expected.extend_from_slice(b"\r\n");
-            assert_eq!(request, expected);
-            assert_eq!(read_frame(&mut tcp).await, (first, b"one".to_vec()));
-            assert_eq!(read_frame(&mut tcp).await, (second, b"two".to_vec()));
-            let mut replies = frame(wire_addr(stranger), b"hi");
-            replies.extend(frame(wire_addr(second), b"re-two"));
-            tcp.write_all(&replies).await.unwrap();
-            let mut eof = [0u8; 1];
-            assert_eq!(tcp.read(&mut eof).await.unwrap(), 0);
-        });
-
-        let mut node = Node {
-            name: "trojan-udp".into(),
-            address: server_addr.ip().to_string(),
-            host: server_addr.ip().to_string(),
-            port: server_addr.port(),
-            outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
-                password: Some(password.into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        node.tls_mut().unwrap().enabled = false;
-        let (transport, preparation) = TrojanHandler::open_udp_stream(
-            &node,
-            None,
-            first,
-            None,
-            std::time::Duration::from_secs(3),
-        )
-        .await
-        .unwrap();
-        preparation.commit().unwrap();
-        let transport: Arc<dyn MultiTargetTransport> = transport;
-        transport
-            .send_to(first, None, b"one", true, None)
-            .await
-            .unwrap();
-        transport
-            .send_to(second, None, b"two", false, None)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 64];
-        let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!((peer, &buf[..n]), (stranger, &b"hi"[..]));
-        let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!((peer, &buf[..n]), (second, &b"re-two"[..]));
-        drop(transport);
-        server.await.unwrap();
-    }
-}
+mod udp_transport_tests;

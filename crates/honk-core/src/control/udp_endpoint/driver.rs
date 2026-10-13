@@ -792,7 +792,7 @@ async fn send_one(
         Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
     };
     let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
-    let gate_only = attempt.is_none()
+    let gate_only = !attempt.as_ref().is_some_and(QuicSendAttempt::is_active)
         && source_admitted
             .as_ref()
             .is_some_and(|admitted| !admitted.load(Ordering::Acquire));
