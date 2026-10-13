@@ -627,6 +627,7 @@ impl MultiTargetTransport for TrojanUdpTransport {
         _confirmed: bool,
         admitted: Option<&std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.domain.as_deref(), domain);
         self.send_frame(target, domain, data, admitted).await
     }
 }
@@ -783,6 +784,35 @@ mod udp_transport_tests {
             let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
             assert_eq!((peer, &buf[..n]), (source, payload));
         }
+    }
+
+    /// Only the dialed name goes on the wire: a real server pins its outbound
+    /// form by the first destination, so any other name is sent numerically.
+    #[tokio::test]
+    async fn per_packet_domain_is_only_the_dialed_one() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let a: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let transport = transport_over(client, a, Some("example.com"));
+
+        transport
+            .send_to(a, Some("example.com"), b"dialed", false, None)
+            .await
+            .unwrap();
+        let expected = frame(wire_domain("example.com", 53), b"dialed");
+        let mut wire = vec![0u8; expected.len()];
+        server.read_exact(&mut wire).await.unwrap();
+        assert_eq!(wire, expected);
+
+        transport
+            .send_to(a, Some("other.example"), b"other", false, None)
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut server).await, (a, b"other".to_vec()));
+        transport
+            .send_to(a, None, b"numeric", false, None)
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut server).await, (a, b"numeric".to_vec()));
     }
 
     /// A frame named by a domain other than the captured one is consumed whole

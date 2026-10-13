@@ -734,6 +734,7 @@ impl MultiTargetTransport for SsUdpTransport {
         _confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.target_domain.as_deref(), domain);
         if target == self.target && domain == self.target_domain.as_deref() {
             return self
                 .send_sealed(&self.socks, target.port(), data, admitted)

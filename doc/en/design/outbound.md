@@ -160,7 +160,7 @@ refusal; it is not interchangeable with missing UDP support.
 | --- | --- | --- |
 | `direct` | Native marked target connect | Native marked UDP behind `PacketTransport` |
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. On send, only the dialed name is written; any other name goes out as the numeric target. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing; one connected server socket and crypto state per client source, usable for every destination (see below) |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP; one associate stream per client source, each frame names its peer |
 | `vmess` | VMess stream | Unimplemented |
@@ -180,7 +180,8 @@ returns the authenticated inner address as the peer, so a reply from a
 never-contacted host reaches the core as that host (IPv4-mapped IPv6 is
 normalized to IPv4). A domain source is accepted only as the dialed domain and
 port (ASCII case-insensitive) and is projected to the dialed target; any other
-domain is dropped without DNS. Short, wrong-key, replayed, bad-address or
+domain is dropped without DNS. On send only the dialed name is written per
+datagram; any other name goes out as the numeric target. Short, wrong-key, replayed, bad-address or
 unprojectable datagrams drop only themselves; 2022 replay state is committed
 only after the address decodes. The outer socket stays connected to the
 server, so whether an unsolicited peer can reach the client depends on the
@@ -323,8 +324,9 @@ directions. `recv_packet` returns the frame's real peer (IPv4-mapped IPv6
 canonicalized), so the core can admit a first reply from a never-contacted
 peer. A domain-named frame is accepted only when it equals the captured dial
 domain and port, then projects to the captured target; any other domain frame is
-consumed whole (length, CRLF, payload) and dropped without DNS. An unknown ATYP
-has no derivable length and ends the stream. Frames share the stream's writer:
+consumed whole (length, CRLF, payload) and dropped without DNS. On send only the
+dialed name is written per frame; any other name goes out as the numeric target.
+An unknown ATYP has no derivable length and ends the stream. Frames share the stream's writer:
 a stalled partial frame is terminal for the whole source, never congestion, and
 destinations share head-of-line blocking and failure fate. Domain-target scopes
 stay per original destination.
@@ -587,9 +589,14 @@ and port are projected back to the logical target, any other domain is dropped
 without DNS and consumed whole, and an unknown ATYP ends the stream. Unlike XUDP
 there is no empty-first or poisoned-child rule. The request and first datagram
 share one write; an interrupted write poisons the stream and is never replayed.
-A flow dialed by name sends that name per datagram; sing-box 1.12.4's direct
-outbound rejects FQDN packet destinations and ends the whole association, so such
-flows depend on a server that resolves them.
+A flow dialed by name sends that name in the request and per datagram; any other
+name (and a numeric flow) goes out as the numeric target. Real sing-box 1.12.4
+fixes its direct outbound's form by the first destination: after a domain request
+it maps the same name per datagram, but after a numeric request a per-packet FQDN
+fails with `invalid AddrPort: missing address` and ends the whole association.
+The same rule applies to H2MUX PacketAddr, AnyTLS, Trojan, SOCKS5 and Shadowsocks
+(`addr::dialed_name`); Juicity is unchanged and unverified, as no
+juicity-server is available.
 
 Typed policy, size, and carrier-capacity refusals are terminal local results,
 distinct from congestion or transport failure. They do not demote health or
@@ -1074,7 +1081,8 @@ and the server can use one unconnected socket for all of them. `recv_packet` dec
 before consuming the frame: numeric sources are returned (IPv4-mapped IPv6 as IPv4), the captured
 open-time domain and port project to the captured target, and any other domain frame is dropped
 whole, with its header and payload credit released and no name resolution. An unknown ATYP is
-terminal. The first send of each flow waits for the physical flush (`confirmed`); steady sends only
+terminal. On send, only the dialed name is written per datagram; any other name goes out as the
+numeric target. The first send of each flow waits for the physical flush (`confirmed`); steady sends only
 enqueue, and `admitted` is set when the frame is queued to the session writer. The queue and
 credit limits are those of a single transport, so queue saturation or EOF retires every
 destination sharing the SID. Domain-target flows (`RewriteTo`) keep one scope per original

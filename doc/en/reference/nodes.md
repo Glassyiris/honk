@@ -182,7 +182,9 @@ client source for all of its destinations. 2022 keeps one session ID, one
 increasing packet counter and one set of replay windows across them. Replies
 return the real remote address the server reports, so a host that was never
 contacted can still reach the client when the server forwards it; a reply naming
-a domain other than the dialed one is dropped.
+a domain other than the dialed one is dropped. A name other than the dialed one is
+never sent per datagram: real servers (sing-box 1.12.4) pin their outbound form by the first
+destination and end the association on a later different name, so it goes out as the numeric target.
 
 ### Stream transports
 

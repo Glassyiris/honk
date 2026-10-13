@@ -1067,7 +1067,8 @@ async fn udp_2022_domain_source_projects_only_the_dialed_name() {
         let (_, second) = shared.server_recv().await;
         assert_eq!(
             second.rest,
-            [addr_domain("other.example", 5300), b"o".to_vec()].concat()
+            [addr_v4_v6(a), b"o".to_vec()].concat(),
+            "a name other than the dialed one goes out numerically"
         );
 
         let session = first.session_id;

@@ -614,6 +614,7 @@ impl MultiTargetTransport for Socks5UdpTransport {
         _confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> io::Result<()> {
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
         self.send(target, domain, data, admitted).await
     }
 

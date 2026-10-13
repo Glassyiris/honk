@@ -1158,7 +1158,9 @@ async fn socks5_send_to_encodes_each_destination_in_its_own_header() {
     let expected = [
         expected_socks5_udp_datagram(v6, None, 0, b"six"),
         expected_socks5_udp_datagram(v4, None, 0, b""),
-        expected_socks5_udp_datagram(named, Some("named.example.test"), 0, b"name"),
+        // Not the dialed name: a real server pins its outbound form by the
+        // first destination, so the address goes out numerically.
+        expected_socks5_udp_datagram(named, None, 0, b"name"),
         expected_socks5_udp_datagram(default, None, 0, b"default"),
     ];
     for expected in expected {
@@ -1173,16 +1175,13 @@ async fn socks5_send_to_encodes_each_destination_in_its_own_header() {
         assert_eq!(&buf[..n], expected);
     }
 
-    // An unencodable name is a packet-local error that sends nothing.
-    let admitted = AtomicBool::new(false);
+    // Even an unencodable foreign name cannot fail the packet: only the dialed
+    // name reaches the wire.
     let long = "a".repeat(usize::from(u8::MAX) + 1);
-    let error = transport
-        .send_to(named, Some(&long), b"x", false, Some(&admitted))
+    transport
+        .send_to(named, Some(&long), b"long", false, None)
         .await
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(!admitted.load(Ordering::Acquire));
-    transport.send_packet(b"still-alive").await.unwrap();
+        .unwrap();
     let mut buf = [0u8; 1024];
     let (n, _) = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -1193,7 +1192,41 @@ async fn socks5_send_to_encodes_each_destination_in_its_own_header() {
     .unwrap();
     assert_eq!(
         &buf[..n],
-        expected_socks5_udp_datagram(default, None, 0, b"still-alive")
+        expected_socks5_udp_datagram(named, None, 0, b"long")
     );
+    server.close_control();
+}
+
+#[tokio::test]
+async fn socks5_send_to_names_only_the_dialed_destination() {
+    let mut server =
+        run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
+            .await;
+    let dialed: SocketAddr = "203.0.113.1:443".parse().unwrap();
+    let transport =
+        prepare_shared_test_transport(server.proxy_addr, dialed, Some("dialed.example.test")).await;
+
+    transport
+        .send_to(dialed, Some("dialed.example.test"), b"dialed", false, None)
+        .await
+        .unwrap();
+    transport
+        .send_to(dialed, Some("other.example.test"), b"other", false, None)
+        .await
+        .unwrap();
+    for expected in [
+        expected_socks5_udp_datagram(dialed, Some("dialed.example.test"), 0, b"dialed"),
+        expected_socks5_udp_datagram(dialed, None, 0, b"other"),
+    ] {
+        let mut buf = [0u8; 1024];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.relay.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buf[..n], expected);
+    }
     server.close_control();
 }

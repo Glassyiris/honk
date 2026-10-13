@@ -152,7 +152,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | --- | --- | --- |
 | `direct` | Native 带 mark 目标连接 | `PacketTransport` 后的 native 带 mark UDP |
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。发送时只写入拨号域名，其他名字以数值目标发出。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每个客户端 source 一个已连接的服务端 socket 与加密状态，可发往任意目的地（见下文） |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing；每个客户端 source 一条 associate 流，每个 frame 自带对端地址 |
 | `vmess` | VMess stream | 未实现 |
@@ -169,7 +169,7 @@ source 的所有目的地：一个连接到服务端的带标记 socket、一份
 `recv_packet` 返回经认证的内层地址作为对端，因此未联系过的主机的回包会以该主机
 的身份到达核心（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名与
 端口（ASCII 不区分大小写）时被接受并映射到拨号目标，其他域名一律丢弃且不做
-DNS。过短、密钥错误、重放、地址错误或无法映射的数据报只丢弃自身；2022 的重放
+DNS。发送时每个 datagram 只写入拨号域名，其他名字以数值目标发出。过短、密钥错误、重放、地址错误或无法映射的数据报只丢弃自身；2022 的重放
 状态只在地址解码成功后提交。外层 socket 仍连接服务端，因此未经请求的对端能否
 到达客户端取决于服务端自身的 NAT 行为。
 
@@ -292,6 +292,7 @@ Trojan UDP 让一个客户端 source 的所有目的地共用一条 UDP-associat
 各自携带对端地址。`recv_packet` 返回 frame 中的真实对端（IPv4-mapped IPv6 规范化为 IPv4），
 因此核心可以接纳来自从未联系过的对端的首个回复。域名 frame 仅在与捕获的拨号域名及端口一致时
 才投影为捕获的目标；其他域名 frame 会被整帧（length、CRLF、payload）消费并丢弃，不做 DNS。
+发送时每个 frame 只写入拨号域名，其他名字以数值目标发出。
 未知 ATYP 无法推导长度，会终止该流。各 frame 共用该流的 writer：写到一半停滞的 frame 对整个
 source 是终止性的，绝不按拥塞处理，各目的地共享队头阻塞与失败命运。域名目标 scope 仍按原始目的地区分。
 TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
@@ -520,8 +521,12 @@ EOF。writer 会确认 flush，不重放取消后结果不明确的写入。
 IPv6 规范化为 IPv4），捕获的拨号域名与端口投影回逻辑目标，其他域名不经 DNS 直接丢弃并整帧消费，
 未知 ATYP 终止该 stream。与 XUDP 不同，这里没有 empty-first 或 poisoned-child 规则。
 request 与第一个 datagram 在一次写入中发送；被中断的写入使 stream 失效且不重放。
-按域名拨号的 flow 会在每个 datagram 中发送该域名；sing-box 1.12.4 的 direct outbound
-拒绝 FQDN packet 目的地并终止整个 association，因此这类 flow 依赖会解析域名的服务端。
+按域名拨号的 flow 在 request 和每个 datagram 中发送该域名；其他任何名字（以及按数值拨号的 flow）
+都以数值目标发出。真实 sing-box 1.12.4 的 direct outbound 由首个目的地决定其形态：域名 request
+之后，同名的逐包 FQDN 会被映射；数值 request 之后，逐包 FQDN 报
+`invalid AddrPort: missing address` 并终止整个 association。H2MUX PacketAddr、AnyTLS、Trojan、
+SOCKS5 与 Shadowsocks 适用同一规则（`addr::dialed_name`）；Juicity 未改动且无法验证，
+因为没有 juicity-server 可用。
 
 类型化 policy、size 与 carrier-capacity 拒绝都是 terminal local result，与拥塞
 或 transport failure 分开；它们不降低健康状态或 Score。候选准入在提交协议状态前
@@ -917,7 +922,7 @@ IPv4 `0`、IPv6 `1`、域名 `2`（不同于 request 地址的 SOCKS5 编号）�
 服务端可用同一个未 connect 的 socket 承载它们。`recv_packet` 在消耗 frame 之前先解码地址：
 数值源地址直接返回（IPv4-mapped IPv6 归一为 IPv4），打开时捕获的域名加端口投影回捕获的 target，
 其他任何域名 frame 都被整体丢弃（释放其头部与 payload 的全部 credit，不做域名解析）；
-未知 ATYP 是终止错误。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
+未知 ATYP 是终止错误。发送时每个 datagram 只写入拨号域名，其他名字以数值目标发出。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
 `admitted` 在 frame 入 session writer 队列时设置。队列与 credit 上限仍是单个 transport 的上限，
 因此队列饱和或 EOF 会退役共享该 SID 的所有目的地。域名目标流（`RewriteTo`）仍按原始目的地各自成 scope。
 

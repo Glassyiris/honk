@@ -812,6 +812,7 @@ impl MultiTargetTransport for VlessMuxUdpTransport {
         confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> io::Result<()> {
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
         self.send_inner(target, domain, data, confirmed, admitted)
             .await
     }

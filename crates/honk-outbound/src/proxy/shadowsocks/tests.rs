@@ -638,7 +638,8 @@ async fn legacy_udp_domain_source_projects_only_the_dialed_name() {
     );
     assert_eq!(
         shared.server_recv().await.1,
-        [wire_domain("other.example", 443), b"other".to_vec()].concat()
+        [wire_addr(a), b"other".to_vec()].concat(),
+        "a name other than the dialed one goes out numerically"
     );
 
     shared
@@ -658,12 +659,11 @@ async fn legacy_udp_domain_source_projects_only_the_dialed_name() {
     assert_eq!(shared.client_recv().await, (b"after".to_vec(), c));
 
     let overlong = "d".repeat(256);
-    let error = shared
-        .transport
-        .send_to(a, Some(&overlong), b"x", false, None)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    shared.send(a, Some(&overlong), b"long").await;
+    assert_eq!(
+        shared.server_recv().await.1,
+        [wire_addr(a), b"long".to_vec()].concat()
+    );
 }
 
 /// Short, wrong-key, truncated, unknown-ATYP and bad-domain frames each

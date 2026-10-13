@@ -507,9 +507,8 @@ async fn official_vision_peers_switch_inner_tls_to_direct() {
 
 /// Non-connect UoT v2 and H2MUX PacketAddr against a real sing-box inbound:
 /// two destinations share one server-side UDP source and a never-contacted
-/// third peer reaches the client with its own address. Only IP destinations
-/// are exercised: sing-box 1.12.4's direct outbound cannot write a per-packet
-/// FQDN destination ("missing address") and tears the association down.
+/// third peer reaches the client with its own address. Names are covered by
+/// `tests/shared_source_sing_box.rs`.
 #[tokio::test]
 #[ignore = "requires the official sing-box executable"]
 async fn sing_box_addressed_udp_shares_one_source_and_returns_real_peers() {

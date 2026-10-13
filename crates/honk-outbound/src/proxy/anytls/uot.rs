@@ -277,6 +277,7 @@ impl MultiTargetTransport for AnyTlsUotTransport {
         confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> std::io::Result<()> {
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
         self.send_inner(target, domain, data, confirmed, admitted)
             .await?;
         // The stream's own observation belongs to whoever opened it; each
@@ -465,6 +466,20 @@ mod uot_transport_tests {
             .unwrap();
         let (_, _, data) = read_frame(&mut server).await.unwrap();
         assert_eq!(data, packet(&C6_ADDR, 5304, b"v6"));
+
+        // A name other than the dialed one never reaches the wire.
+        transport
+            .send_to(
+                sock("[2001:db8::30]:5304"),
+                Some("other.example"),
+                b"x",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, _, data) = read_frame(&mut server).await.unwrap();
+        assert_eq!(data, packet(&C6_ADDR, 5304, b"x"));
     }
 
     /// A and B share one stream; each destination is addressed per packet.

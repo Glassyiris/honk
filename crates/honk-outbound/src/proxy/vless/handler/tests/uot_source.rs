@@ -104,18 +104,44 @@ async fn uot_send_to_addresses_each_datagram_and_sends_the_request_once() {
     let v6 = packet(&C6_ADDR, 5304, b"to-6");
     assert_eq!(read_exact(&mut wire, v6.len()).await, v6);
 
-    // The dialed name rides with its flow; an empty datagram is representable.
+    // A name this association was not dialed by never reaches the wire; an
+    // empty datagram is representable.
     transport
         .send_to(sock(C), Some("Dns.Example"), b"", false, None)
         .await
         .unwrap();
-    let named = packet(&domain_address("Dns.Example"), 5303, b"");
-    assert_eq!(read_exact(&mut wire, named.len()).await, named);
+    let numeric = packet(&C_ADDR, 5303, b"");
+    assert_eq!(read_exact(&mut wire, numeric.len()).await, numeric);
 
     // The fixed-target ordinary path uses the same frame shape.
     transport.send_packet(b"dflt").await.unwrap();
     let ordinary = packet(&A_ADDR, 5301, b"dflt");
     assert_eq!(read_exact(&mut wire, ordinary.len()).await, ordinary);
+}
+
+/// A server pins its outbound form by the first destination: the dialed name
+/// is the only one a datagram may carry, so a second flow's name goes numeric.
+#[tokio::test]
+async fn uot_per_packet_domain_is_only_the_dialed_one() {
+    let (transport, mut wire) = uot_pair(C, Some("Dns.Example"), &A_REQUEST);
+    transport
+        .send_to(sock(C), Some("Dns.Example"), b"dialed", false, None)
+        .await
+        .unwrap();
+    let first = [
+        &A_REQUEST[..],
+        &packet(&domain_address("Dns.Example"), 5303, b"dialed"),
+    ]
+    .concat();
+    assert_eq!(read_exact(&mut wire, first.len()).await, first);
+    for (domain, payload) in [(Some("Other.Example"), &b"other"[..]), (None, b"none")] {
+        transport
+            .send_to(sock(C), domain, payload, false, None)
+            .await
+            .unwrap();
+        let numeric = packet(&C_ADDR, 5303, payload);
+        assert_eq!(read_exact(&mut wire, numeric.len()).await, numeric);
+    }
 }
 
 #[tokio::test]
@@ -129,13 +155,8 @@ async fn uot_uplink_boundary_and_local_rejection_leave_the_stream_usable() {
     assert!(crate::proxy::is_packet_rejection(&anyhow::Error::new(
         error
     )));
-    let error = transport
-        .send_to(sock(B), Some(&"d".repeat(256)), b"x", false, None)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 
-    // Neither rejection consumed the pending request or wrote anything.
+    // The rejection consumed neither the pending request nor wrote anything.
     let maximum = vec![0x5a; u16::MAX as usize];
     let sending = {
         let transport = Arc::clone(&transport);

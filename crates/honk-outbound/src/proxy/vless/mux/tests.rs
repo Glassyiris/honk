@@ -1094,7 +1094,8 @@ async fn consecutive_address_frames_both_directions() {
         .concat(),
         pa_frame(&pa_domain(domain), 5301, b"one"),
         pa_frame(&PA_B_ADDR, 5302, b"two"),
-        pa_frame(&pa_domain("c.example"), 5303, b""),
+        // A name other than the dialed one goes out numerically.
+        pa_frame(&PA_C_ADDR, 5303, b""),
         pa_frame(
             &[
                 4, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30,

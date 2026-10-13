@@ -236,6 +236,15 @@ pub(crate) fn encode_address(
     Ok(SocksAddr::new(target, target_domain)?.to_vec())
 }
 
+/// The name a shared association may put on the wire for one datagram: only
+/// the one it was dialed by. sing-box 1.12.4 fixes its outbound's form by the
+/// first destination, and a different name later tears the association down
+/// (or black-holes it, for Shadowsocks), so any other name goes out as the
+/// numeric `target`.
+pub(crate) fn dialed_name<'a>(dialed: Option<&str>, domain: Option<&'a str>) -> Option<&'a str> {
+    domain.filter(|name| dialed == Some(*name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
