@@ -687,8 +687,12 @@ impl Config {
     /// Re-derive every node's content-based ID ([`Node::derive_id`]) after
     /// load. Stored/serde-default IDs are discarded so identity always
     /// reflects the current content; the built-in direct/block nodes keep
-    /// their fixed IDs.
+    /// their fixed IDs. Explicit group members that named a node by its stored
+    /// ID follow it to the re-derived one, so an identity change cannot leave a
+    /// structured configuration with dangling members.
     fn derive_node_ids(&mut self) {
+        let mut renamed = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
         for node in &mut self.nodes {
             if matches!(
                 node.outbound,
@@ -696,7 +700,28 @@ impl Config {
             ) {
                 continue;
             }
-            node.id = node.derive_id();
+            let derived = node.derive_id();
+            if node.id != derived && !node.id.is_nil() && renamed.insert(node.id, derived).is_some()
+            {
+                ambiguous.insert(node.id);
+            }
+            node.id = derived;
+        }
+        for id in &ambiguous {
+            renamed.remove(id);
+        }
+        if renamed.is_empty() {
+            return;
+        }
+        for group in &mut self.groups {
+            let mut members = Vec::with_capacity(group.nodes.len());
+            for id in &group.nodes {
+                let id = renamed.get(id).copied().unwrap_or(*id);
+                if !members.contains(&id) {
+                    members.push(id);
+                }
+            }
+            group.nodes = members;
         }
     }
 

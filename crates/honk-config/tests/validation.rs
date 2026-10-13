@@ -975,3 +975,32 @@ fn subscription_entry_route_is_validated_as_download_detour() {
         "subscriptions[1].download_detour"
     );
 }
+
+mod stored_node_identity {
+    use honk_config::{Config, node::Node};
+
+    /// A structured configuration written before an identity change names its
+    /// nodes by the old stored ID; loading re-derives the ID and the group
+    /// member must follow instead of dangling.
+    #[test]
+    fn group_members_follow_a_node_to_its_rederived_id() {
+        let node = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=uot-v2#uot",
+        )
+        .unwrap();
+        let stale = uuid::Uuid::from_u128(1);
+        assert_ne!(node.id, stale);
+        let mut value = serde_json::to_value(&node).unwrap();
+        value["id"] = serde_json::json!(stale);
+        let source = serde_json::json!({
+            "nodes": [value],
+            "groups": [{"name": "pool", "nodes": [stale]}],
+        })
+        .to_string();
+
+        let config = Config::from_json_str(&source).unwrap();
+        assert_eq!(config.nodes[0].id, node.id);
+        assert_eq!(config.groups[0].nodes, vec![node.id]);
+        config.validate_detailed().unwrap();
+    }
+}
