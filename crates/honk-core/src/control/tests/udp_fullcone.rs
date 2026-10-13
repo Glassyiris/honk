@@ -1,4 +1,4 @@
-use super::support::{QuicUdpMode, QuicUdpPacket, QuicUdpPeer};
+use super::support::{QuicUdpMode, QuicUdpPeer};
 use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, fresh_test_netns, in_test_netns, udp_test_config,
     udp_test_forwarder, wait_for_test_address,
@@ -14,11 +14,14 @@ use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::{ConnState, RedirectEntry, RedirectTuple, TuplesKey};
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
+use shared_peers::{SharedUdpMode, SharedUdpPeer};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::net::UdpSocket;
+
+mod shared_peers;
 
 const CASE: &str = "control::tests::udp_fullcone::netns_udp_full_cone_source_contract";
 const CHILD: &str = "HONK_UDP_FULLCONE_CHILD";
@@ -36,7 +39,14 @@ fn netns_udp_full_cone_source_contract() -> anyhow::Result<()> {
     }
     // DAENS_FD is process-lifetime state, not a fixture that can be reset.
     for family in ["v4", "v6"] {
-        for protocol in ["hy2", "tuic-datagram", "tuic-stream"] {
+        for protocol in [
+            "hy2",
+            "tuic-datagram",
+            "tuic-stream",
+            "ss",
+            "socks5",
+            "trojan",
+        ] {
             let case = format!("{family}/{protocol}");
             let status = std::process::Command::new(std::env::current_exe()?)
                 .args([
@@ -60,12 +70,6 @@ fn run_child(case: &str) -> anyhow::Result<()> {
         "full-cone acceptance requires root"
     );
     let (family, protocol) = case.split_once('/').context("missing child case family")?;
-    let mode = match protocol {
-        "hy2" => QuicUdpMode::Hysteria2,
-        "tuic-datagram" => QuicUdpMode::TuicDatagram,
-        "tuic-stream" => QuicUdpMode::TuicStream,
-        _ => anyhow::bail!("unknown protocol {protocol}"),
-    };
     let ips: [&str; 5] = match family {
         "v4" => [
             "10.70.0.1",
@@ -152,14 +156,15 @@ fn run_child(case: &str) -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(async {
-            let mut peer = QuicUdpPeer::start(mode, SocketAddr::new(wan_ip, 0)).await?;
+            let mut peer = Peer::start(protocol, SocketAddr::new(wan_ip, 0)).await?;
             let scenario = async {
                 let group = Group {
                     name: "fullcone".into(),
-                    nodes: vec![peer.node.id],
+                    nodes: vec![peer.node().id],
                     ..Default::default()
                 };
-                let mut config = udp_test_config("fullcone", vec![peer.node.clone()], vec![group]);
+                let mut config =
+                    udp_test_config("fullcone", vec![peer.node().clone()], vec![group]);
                 config.ensure_builtin_nodes();
                 config.global.lan_interface = vec!["honk-lan0".into()];
                 config.global.wan_interface = vec!["honk-wan0".into()];
@@ -245,7 +250,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     let second =
                         send_and_observe(&client, &target_b, &mut peer, b"client-to-B").await?;
                     ensure!(
-                        first.connection == second.connection && first.session == second.session,
+                        first.association == second.association,
                         "A/B used different wire associations"
                     );
                     ensure!(
@@ -294,9 +299,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                         send_and_observe(&client, &foreign, &mut peer, b"first-client-to-C")
                             .await?;
                     ensure!(
-                        third.connection == first.connection
-                            && third.session == first.session
-                            && third.mapping == first.mapping,
+                        third.association == first.association && third.mapping == first.mapping,
                         "first C send did not reuse A/B's association"
                     );
                     foreign.send_to(b"C-after-contact", third.mapping).await?;
@@ -390,18 +393,85 @@ async fn receive(
 async fn send_and_observe(
     client: &UdpSocket,
     target: &UdpSocket,
-    peer: &mut QuicUdpPeer,
+    peer: &mut Peer,
     payload: &[u8],
-) -> anyhow::Result<QuicUdpPacket> {
+) -> anyhow::Result<Observed> {
     let destination = target.local_addr()?;
     client.send_to(payload, destination).await?;
-    let packet = tokio::time::timeout(NETNS_TEST_TIMEOUT, peer.packets.recv())
+    let packet = tokio::time::timeout(NETNS_TEST_TIMEOUT, peer.next())
         .await?
-        .context("QUIC peer stopped before observing client packet")?;
+        .context("peer stopped before observing client packet")?;
     ensure!(
         packet.target == destination && packet.payload == payload,
         "fixture did not observe the exact proxied client packet"
     );
     receive(target, packet.mapping, payload).await?;
     Ok(packet)
+}
+
+/// What every fixture reports for one relayed client datagram.
+struct Observed {
+    /// Equal values mean one wire association (QUIC connection and session, or
+    /// the shared protocol's UDP source / control stream).
+    association: (u64, u32),
+    target: SocketAddr,
+    mapping: SocketAddr,
+    payload: Vec<u8>,
+}
+
+enum Peer {
+    Quic(QuicUdpPeer),
+    Shared(SharedUdpPeer),
+}
+
+impl Peer {
+    async fn start(protocol: &str, bind: SocketAddr) -> anyhow::Result<Self> {
+        let quic = match protocol {
+            "hy2" => Some(QuicUdpMode::Hysteria2),
+            "tuic-datagram" => Some(QuicUdpMode::TuicDatagram),
+            "tuic-stream" => Some(QuicUdpMode::TuicStream),
+            _ => None,
+        };
+        if let Some(mode) = quic {
+            return Ok(Self::Quic(QuicUdpPeer::start(mode, bind).await?));
+        }
+        let mode = match protocol {
+            "ss" => SharedUdpMode::Shadowsocks,
+            "socks5" => SharedUdpMode::Socks5,
+            "trojan" => SharedUdpMode::Trojan,
+            _ => anyhow::bail!("unknown protocol {protocol}"),
+        };
+        Ok(Self::Shared(SharedUdpPeer::start(mode, bind).await?))
+    }
+
+    fn node(&self) -> &honk_config::node::Node {
+        match self {
+            Self::Quic(peer) => &peer.node,
+            Self::Shared(peer) => &peer.node,
+        }
+    }
+
+    async fn next(&mut self) -> Option<Observed> {
+        match self {
+            Self::Quic(peer) => peer.packets.recv().await.map(|packet| Observed {
+                association: (packet.connection, packet.session),
+                target: packet.target,
+                mapping: packet.mapping,
+                payload: packet.payload,
+            }),
+            Self::Shared(peer) => peer.packets.recv().await.map(|packet| Observed {
+                association: (packet.association, 0),
+                target: packet.target,
+                mapping: packet.mapping,
+                payload: packet.payload,
+            }),
+        }
+    }
+
+    async fn close(self) -> anyhow::Result<()> {
+        match self {
+            Self::Quic(peer) => peer.close().await,
+            Self::Shared(peer) => peer.close().await,
+        }
+    }
 }
