@@ -161,7 +161,7 @@ refusal; it is not interchangeable with missing UDP support.
 | `direct` | Native marked target connect | Native marked UDP behind `PacketTransport` |
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
 | `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
-| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
+| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing; one connected server socket and crypto state per client source, usable for every destination (see below) |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP |
 | `vmess` | VMess stream | Unimplemented |
 | `vless` | Direct, H2, or Mux.Cool from the independent multiplex policy | Available when `network` allows UDP; encoding and optional UDP multiplexing select the path |
@@ -169,6 +169,22 @@ refusal; it is not interchangeable with missing UDP support.
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream |
+
+Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
+from one `MultiTargetTransport`: one marked socket connected to the server, one
+set of crypto state, and, for 2022, one client session ID, one monotonically
+increasing packet counter and one pair of server-session replay windows that
+never reset per destination. The default target's address header is
+pre-encoded; other destinations are encoded into a stack buffer. `recv_packet`
+returns the authenticated inner address as the peer, so a reply from a
+never-contacted host reaches the core as that host (IPv4-mapped IPv6 is
+normalized to IPv4). A domain source is accepted only as the dialed domain and
+port (ASCII case-insensitive) and is projected to the dialed target; any other
+domain is dropped without DNS. Short, wrong-key, replayed, bad-address or
+unprojectable datagrams drop only themselves; 2022 replay state is committed
+only after the address decodes. The outer socket stays connected to the
+server, so whether an unsolicited peer can reach the client depends on the
+server's own NAT behavior.
 
 VMess and VLESS entries are compiled only with the `rprx` feature. The default
 `honk-core` and `honk-tool` feature sets enable it. Without `rprx`, these node

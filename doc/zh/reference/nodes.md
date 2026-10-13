@@ -176,6 +176,11 @@ UDP 重放保护分别保留当前和前一个服务端 session 的窗口。前�
 连续 60 秒没有活动后才接受第三个 session。只有认证及响应 header 校验
 成功后才修改接收 session 状态，无效包不能重置重放历史。
 
+Shadowsocks UDP（传统 AEAD 与 2022）为每个客户端 source 的所有目的地只保留一个
+面向服务端的 socket；2022 在这些目的地之间共用一个 session ID、一个递增的包计数器
+和一组重放窗口。回包返回服务端报告的真实远端地址，因此服务端转发时，从未联系过的
+主机也能到达客户端；声明为非拨号域名的回包会被丢弃。
+
 ### 流传输
 
 支持流传输的分享链接用 `type=` 或其 `network=` 别名选择传输。空文本和 `tcp` 表示裸 TCP；`ws`、`grpc`、`xhttp` 分别选择 WebSocket、gRPC、XHTTP；`splithttp` 是 XHTTP 输入别名。赋值前比较所有已提供的别名，包括兼容的 `obfs` 声明和重复查询键；不一致则拒绝链接。`h2`、`kcp` 等名称在解析时拒绝。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。除 XHTTP 外，分享链接 `alpn` 仍只为兼容而接受，不会存储。

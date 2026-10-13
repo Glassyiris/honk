@@ -153,7 +153,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | `direct` | Native 带 mark 目标连接 | `PacketTransport` 后的 native 带 mark UDP |
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
 | `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
-| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
+| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每个客户端 source 一个已连接的服务端 socket 与加密状态，可发往任意目的地（见下文） |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing |
 | `vmess` | VMess stream | 未实现 |
 | `vless` | 由独立 multiplex policy 选择 direct、H2 或 Mux.Cool | `network` 允许 UDP 时可用；encoding 与可选 UDP multiplex 决定路径 |
@@ -161,6 +161,17 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 一条长度分帧 QUIC bi stream |
+
+Shadowsocks（传统 AEAD 与 2022）用一个 `MultiTargetTransport` 承载同一客户端
+source 的所有目的地：一个连接到服务端的带标记 socket、一份加密状态；2022 还
+包含一个客户端 session ID、一个单调递增的包计数器和一对服务端 session 重放
+窗口，且不会随目的地重置。默认目标的地址头预先编码，其他目的地编码到栈缓冲。
+`recv_packet` 返回经认证的内层地址作为对端，因此未联系过的主机的回包会以该主机
+的身份到达核心（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名与
+端口（ASCII 不区分大小写）时被接受并映射到拨号目标，其他域名一律丢弃且不做
+DNS。过短、密钥错误、重放、地址错误或无法映射的数据报只丢弃自身；2022 的重放
+状态只在地址解码成功后提交。外层 socket 仍连接服务端，因此未经请求的对端能否
+到达客户端取决于服务端自身的 NAT 行为。
 
 VMess 与 VLESS entry 只在 `rprx` feature 下编译。`honk-core` 与 `honk-tool`
 默认 feature 集启用它。不带 `rprx` 时，这些节点形式仍能解析，但 registry

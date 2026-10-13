@@ -177,6 +177,13 @@ windows. A third session is admitted only after the previous session has been
 inactive for 60 seconds. Authentication and response-header validation precede
 all receive-session state changes, so an invalid packet cannot reset replay history.
 
+Shadowsocks UDP, legacy AEAD and 2022 alike, keeps one server-facing socket per
+client source for all of its destinations. 2022 keeps one session ID, one
+increasing packet counter and one set of replay windows across them. Replies
+return the real remote address the server reports, so a host that was never
+contacted can still reach the client when the server forwards it; a reply naming
+a domain other than the dialed one is dropped.
+
 ### Stream transports
 
 Stream-capable share links select transport with `type=` or its `network=` alias. Empty text and `tcp` mean raw TCP; `ws`, `grpc`, and `xhttp` select WebSocket, gRPC, and XHTTP. `splithttp` is an XHTTP input alias. All supplied aliases, including compatible `obfs` declarations and repeated query keys, must agree before assignment. Unsupported names such as `h2` and `kcp` reject the link during parsing. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. Outside XHTTP, share-link `alpn` remains compatibility-only and is not stored.

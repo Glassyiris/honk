@@ -236,38 +236,6 @@ pub(crate) fn encode_address(
     Ok(SocksAddr::new(target, target_domain)?.to_vec())
 }
 
-/// Length in bytes of the SOCKS5-ATYP address at the start of `buf`.
-pub(crate) fn socks_addr_len(buf: &[u8]) -> anyhow::Result<usize> {
-    match buf.first() {
-        Some(&ATYP_IPV4) => {
-            if buf.len() < 7 {
-                anyhow::bail!("truncated IPv4 socks address");
-            }
-            Ok(7)
-        }
-        Some(&ATYP_DOMAIN) => {
-            if buf.len() < 2 {
-                anyhow::bail!("truncated domain socks address");
-            }
-            let len = buf[1] as usize;
-            if len == 0 {
-                anyhow::bail!("empty domain socks address");
-            }
-            if buf.len() < 2 + len + 2 {
-                anyhow::bail!("truncated domain socks address");
-            }
-            Ok(2 + len + 2)
-        }
-        Some(&ATYP_IPV6) => {
-            if buf.len() < 19 {
-                anyhow::bail!("truncated IPv6 socks address");
-            }
-            Ok(19)
-        }
-        other => anyhow::bail!("invalid socks address type {:?}", other),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,16 +375,5 @@ mod tests {
         // Unknown ATYP fails.
         let mut bad = &[0x05u8, 1, 2][..];
         assert!(SocksAddr::read_from_stream(&mut bad).await.is_err());
-    }
-
-    #[test]
-    fn test_socks_addr_len() {
-        let v4 = encode_address("1.2.3.4:53".parse().unwrap(), None).unwrap();
-        assert_eq!(socks_addr_len(&v4).unwrap(), 7);
-        let domain = encode_address("127.0.0.1:443".parse().unwrap(), Some("example.com")).unwrap();
-        assert_eq!(socks_addr_len(&domain).unwrap(), 15);
-        assert!(socks_addr_len(&[0x05, 1, 2]).is_err());
-        assert!(socks_addr_len(&[0x01, 1]).is_err());
-        assert!(socks_addr_len(&[0x03, 0, 0, 0]).is_err());
     }
 }
