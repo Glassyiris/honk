@@ -957,14 +957,18 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
 
     let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
     tokio::pin!(reply_idle_timeout);
+    // Created before the first readiness check and kept across packets: a retirement
+    // that publishes `ready = false` and then notifies is seen by the flag or the
+    // future, without re-registering a waiter for every reply.
+    let retired = owner.retire_notify.notified();
+    tokio::pin!(retired);
     loop {
-        let retired = owner.retire_notify.notified();
         if !owner.is_ready() {
             return;
         }
         tokio::select! {
             biased;
-            _ = retired => return,
+            _ = retired.as_mut() => return,
             packet = owner.transport.packet_transport().recv_packet(&mut buf) => {
                 let (len, peer) = match packet {
                     Ok(packet) => packet,
