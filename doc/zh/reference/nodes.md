@@ -291,6 +291,7 @@ node {
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | 接收窗口覆盖值 |
 | Juicity | `uuid:password` userinfo | 通用 `username` / `password`；供 `juicity_uuid` / `juicity_password` 的 handler 回退使用 |
 | Juicity | 协议默认值 | ALPN `h3`、BBR，以及固定的 8 MiB / 8 MiB 接收窗口 |
+| Juicity | UDP | 每个客户端源一条 QUIC bi stream 承载所有目的地；回复返回真实的远端对端，取决于服务端自身的 UDP socket 与出口策略 |
 | 两者 | `mtu`、`sni`、insecure 别名、pin、ECH | 共用 QUIC/TLS 参数 |
 
 ### AnyTLS

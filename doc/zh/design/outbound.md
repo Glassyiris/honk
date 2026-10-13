@@ -160,7 +160,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagram |
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
-| `juicity` | Juicity QUIC stream | 一条长度分帧 QUIC bi stream |
+| `juicity` | Juicity QUIC stream | 每个客户端源一条长度分帧 QUIC bi stream，承载所有目的地 |
 
 Shadowsocks（传统 AEAD 与 2022）用一个 `MultiTargetTransport` 承载同一客户端
 source 的所有目的地：一个连接到服务端的带标记 socket、一份加密状态；2022 还
@@ -741,13 +741,23 @@ client 槽，因此 warm 释放、重建与 speculative client 会复用同一�
 | 协议 | 认证与 TCP | UDP | Transport 策略 |
 | --- | --- | --- | --- |
 | TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB，可由节点覆盖 |
-| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB |
+| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 每个客户端源一条 bi stream；打开时写一次 `[network=3][metadata]`，之后双向均为 `[metadata][u16 length][payload]` record，每条各自标明目的地或来源 | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB |
 | Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口，connection 窗口同样自动调整 |
 
 Go `juicity-server` v0.4.3 有实现层面的 UDP relay 限制：它申请的 1,500 字节
 buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包。互操作实测
 8,192 字节 payload 只返回 2,048 字节，而 2,048 字节回显正常。这不是 Juicity
 线协议限制，因此 honk 不会对其他服务端任意施加 2,048 字节上限。
+
+Juicity UDP 使用已部署的 trojanc ATYP 编号（IPv4 为 1、域名为 3、IPv6 为 4），而非
+Juicity 规范示意的不同编号，也不增加会话字节。同一客户端源的所有目的地共用一条
+UDP stream，合作的服务端因此可以用同一个 socket 转发；`recv_packet` 返回每个回复帧
+所标明的对端（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅当与 stream 打开时使用的
+名称相等（ASCII 不区分大小写）且端口相同才被接受，并投影为该 stream 的目标；其余
+域名帧被整帧消费并丢弃，不做 DNS。未知 ATYP 为终止性错误。以改写域名拨出的目的地
+仍按原始目的地分别建立 scope。所有目的地共享该 stream 的队头阻塞与失败命运；写入
+超时可能留下半个帧，因此会退役整个源，而不是按拥塞处理。QUIC send-attempt hook 保留
+在该源路径上。
 
 Hysteria2 HTTP/3 层刻意保持本地且最小：control/QPACK uni stream、静态表
 QPACK，以及认证所需的 HEADERS 处理。它不得宣告

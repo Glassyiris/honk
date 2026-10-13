@@ -38,11 +38,11 @@ pub use outbound::{
     PacketOutbound, ProbeableOutbound, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
 };
 use packet::prepare_detached_quic_transport;
-pub(crate) use packet::{MuxSession, packet_transport_with_owner};
 pub use packet::{
     MultiTargetTransport, PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken,
     UdpSocketTransport,
 };
+pub(crate) use packet::{MuxSession, packet_transport_with_owner};
 pub use registry::{ProtocolEntry, ProxyRegistry};
 pub use shared_source::{prepare_shared_source, uses_shared_source};
 

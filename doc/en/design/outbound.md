@@ -168,7 +168,7 @@ refusal; it is not interchangeable with missing UDP support.
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagrams |
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
-| `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream |
+| `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server, one
@@ -855,7 +855,7 @@ protocol heartbeat datagrams are unavailable.
 | Protocol | Authentication and TCP | UDP | Transport policy |
 | --- | --- | --- | --- |
 | TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB, with node overrides |
-| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB |
+| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream per client source; opened once with `[network=3][metadata]`, then `[metadata][u16 length][payload]` records in both directions, each naming its own destination or source | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB |
 | Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows with the same connection auto-tuning |
 
 The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
@@ -863,6 +863,20 @@ its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed
 packets are truncated by the server. Interop observed 8,192-byte payloads returning
 2,048 bytes; 2,048-byte echoes passed. This is not a Juicity wire limit, so honk
 does not impose an arbitrary 2,048-byte cap on other servers.
+
+Juicity UDP uses the deployed trojanc ATYP numbering (IPv4 1, domain 3, IPv6 4),
+not the differing numbers illustrated in the Juicity specification, and adds no
+session bytes. A client source shares one UDP stream across all destinations, so a
+cooperating server can relay them through one socket, and `recv_packet` returns the
+peer named by each reply frame (IPv4-mapped IPv6 normalized to IPv4). A domain
+source is accepted only when it equals, ASCII case-insensitively, the name the
+stream was opened with and carries the same port; it projects to that stream's
+target. Any other domain frame is consumed and dropped without DNS. An unknown
+ATYP is terminal. Destinations dialed by a rewritten domain scope per original
+destination. Every destination shares the stream's head-of-line blocking and
+failure fate; a write that times out may leave a partial frame, so it retires the
+whole source rather than counting as congestion. The QUIC send-attempt hooks stay
+on the source path.
 
 Hysteria2's HTTP/3 layer is deliberately local and minimal: control/QPACK
 unidirectional streams, static-table QPACK, and enough HEADERS handling for

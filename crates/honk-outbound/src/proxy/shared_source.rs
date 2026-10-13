@@ -10,12 +10,17 @@ use std::time::Duration;
 
 use honk_config::types::NodeProtocol;
 
+use super::juicity::JuicityHandler;
 use super::shadowsocks::ShadowsocksHandler;
 use super::{MultiTargetTransport, PacketRejection, PreparedUdpTransport};
 use crate::runtime::NodeRuntime;
 
 /// Protocols served by [`prepare_shared_source`].
-const SHARED: &[NodeProtocol] = &[NodeProtocol::SS, NodeProtocol::Socks5];
+const SHARED: &[NodeProtocol] = &[
+    NodeProtocol::SS,
+    NodeProtocol::Socks5,
+    NodeProtocol::Juicity,
+];
 
 pub fn uses_shared_source(protocol: NodeProtocol) -> bool {
     SHARED.contains(&protocol)
@@ -30,10 +35,9 @@ pub async fn prepare_shared_source(
     connect_timeout: Duration,
     speculative: bool,
 ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
-    // SS and SOCKS5 own only a socket (and SOCKS5 a control stream): nothing is
-    // published at commit, so speculative preparation needs no separate path.
-    let _ = speculative;
     match runtime.node.protocol() {
+        // These own only a socket or a stream whose preparation already defers
+        // publication to commit, so speculative needs no separate path.
         NodeProtocol::SS => {
             ShadowsocksHandler::prepare_udp_source(
                 &runtime.node,
@@ -51,6 +55,11 @@ pub async fn prepare_shared_source(
                     target_domain,
                     connect_timeout,
                 )
+                .await
+        }
+        NodeProtocol::Juicity => {
+            JuicityHandler::new()
+                .prepare_udp_source(runtime, target, target_domain, connect_timeout, speculative)
                 .await
         }
         _ => Err(PacketRejection::Policy.into()),

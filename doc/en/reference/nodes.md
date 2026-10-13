@@ -294,6 +294,7 @@ node {
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | Receive-window overrides |
 | Juicity | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `juicity_uuid` / `juicity_password` |
 | Juicity | protocol defaults | ALPN `h3`, BBR, and fixed 8 MiB / 8 MiB receive windows |
+| Juicity | UDP | One QUIC bi stream per client source carries every destination; replies return the real remote peer, subject to the server's own UDP socket and egress policy |
 | Both | `mtu`, `sni`, insecure aliases, pin, ECH | Shared QUIC/TLS parameters |
 
 ### AnyTLS
