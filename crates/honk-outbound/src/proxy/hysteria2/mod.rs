@@ -1026,28 +1026,32 @@ impl Hy2UdpTransport {
         if data.len() > MAX_UDP_SIZE {
             return Err(super::PacketRejection::InvalidSize.into());
         }
-        let mut address;
-        let addr = if target == self.target && target_domain == self.target_domain() {
-            self.addr.as_str()
-        } else {
-            address = [0u8; MAX_ADDRESS_LENGTH as usize];
-            let mut cursor = io::Cursor::new(address.as_mut_slice());
-            if let Some(domain) = target_domain {
-                write!(cursor, "{domain}:{}", target.port())?;
+        // Scoped so the 2 KiB address buffer is not kept in the future across
+        // the send awaits: the enclosing driver future is shared by every
+        // ordinary UDP transport and is moved on every packet.
+        let packets = {
+            let mut address;
+            let addr = if target == self.target && target_domain == self.target_domain() {
+                self.addr.as_str()
             } else {
-                write!(cursor, "{target}")?;
-            }
-            let len = cursor.position() as usize;
-            std::str::from_utf8(&address[..len]).expect("formatted address is UTF-8")
-        };
-        self.state.touch();
-        let packet_id = self
-            .packet_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let packets =
+                address = [0u8; MAX_ADDRESS_LENGTH as usize];
+                let mut cursor = io::Cursor::new(address.as_mut_slice());
+                if let Some(domain) = target_domain {
+                    write!(cursor, "{domain}:{}", target.port())?;
+                } else {
+                    write!(cursor, "{target}")?;
+                }
+                let len = cursor.position() as usize;
+                std::str::from_utf8(&address[..len]).expect("formatted address is UTF-8")
+            };
+            self.state.touch();
+            let packet_id = self
+                .packet_id
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
             fragment_udp_message(self.session_id, packet_id, addr, data, self.max_datagram)
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other)?
+        };
         for packet in packets {
             self.state
                 .conn
