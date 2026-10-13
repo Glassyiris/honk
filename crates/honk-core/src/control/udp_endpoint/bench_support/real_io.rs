@@ -201,9 +201,14 @@ impl IoHarness {
         driver.wait_first_ack().await?;
         drop(lease);
         let mut buf = [0u8; 64];
-        tokio::time::timeout(SETUP_TIMEOUT, self.client.recv_from(&mut buf))
+        let (n, from) = tokio::time::timeout(SETUP_TIMEOUT, self.client.recv_from(&mut buf))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "first reply timed out"))??;
+        if from != target || buf[..n] != *FIRST_PAYLOAD {
+            return Err(io::Error::other(
+                "first reply did not come from the destination with the echoed payload",
+            ));
+        }
         Ok(())
     }
 }

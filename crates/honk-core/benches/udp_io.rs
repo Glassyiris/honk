@@ -240,6 +240,7 @@ impl Workload {
         let mut buf = [0u8; 2048];
         let background = self.background.map(|b| self.harness.target(b));
         let (mut sent, mut delivered, mut admitted) = (0usize, 0usize, 0usize);
+        let mut per_destination = vec![0usize; self.measured.len()];
         while delivered < packets {
             while sent < packets && sent - delivered < WINDOW {
                 let destination = self.measured[sent % self.measured.len()];
@@ -260,12 +261,32 @@ impl Workload {
                 .readable()
                 .await
                 .expect("client readable");
-            while let Ok((_, from)) = self.harness.client().try_recv_from(&mut buf) {
-                if Some(from) != background {
-                    delivered += 1;
+            while let Ok((n, from)) = self.harness.client().try_recv_from(&mut buf) {
+                if Some(from) == background {
+                    continue;
                 }
+                assert_eq!(
+                    &buf[..n],
+                    &payload[..],
+                    "reply payload differs from the echo"
+                );
+                let slot = self
+                    .measured
+                    .iter()
+                    .position(|destination| self.harness.target(*destination) == from)
+                    .expect("reply from an unmeasured source");
+                per_destination[slot] += 1;
+                delivered += 1;
             }
         }
+        let destinations = self.measured.len();
+        let expected: Vec<usize> = (0..destinations)
+            .map(|slot| (0..packets).filter(|n| n % destinations == slot).count())
+            .collect();
+        assert_eq!(
+            per_destination, expected,
+            "every measured destination must answer exactly its own packets"
+        );
         admitted
     }
 
