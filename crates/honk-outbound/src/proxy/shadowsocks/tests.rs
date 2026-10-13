@@ -746,13 +746,14 @@ async fn legacy_udp_drop_releases_the_socket() {
 /// The core reaches Shadowsocks only through the shared-source dispatch.
 #[tokio::test]
 async fn shared_source_dispatch_builds_a_shadowsocks_association() {
-    use crate::proxy::{prepare_shared_source, uses_shared_source};
-    assert!(uses_shared_source(honk_config::types::NodeProtocol::SS));
+    let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+    assert!(registry.has_shared_source(honk_config::types::NodeProtocol::SS));
     let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
     let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let node = legacy_node(server.local_addr().unwrap(), "aes-128-gcm");
     let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
-    let transport = prepare_shared_source(runtime, a, None, STEP, true)
+    let transport = registry
+        .prepare_shared_source(runtime, a, None, STEP, true)
         .await
         .unwrap()
         .commit()

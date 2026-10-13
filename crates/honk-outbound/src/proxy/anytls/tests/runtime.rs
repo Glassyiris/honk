@@ -700,9 +700,8 @@ async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
 /// several destinations, and Drop unregisters the stream.
 #[tokio::test]
 async fn shared_source_preparation_uses_pool_session_and_carries_many_destinations() {
-    use crate::proxy::{prepare_shared_source, uses_shared_source};
-
-    assert!(uses_shared_source(honk_config::types::NodeProtocol::AnyTLS));
+    let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+    assert!(registry.has_shared_source(honk_config::types::NodeProtocol::AnyTLS));
     let node = anytls_node("shared-source");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
@@ -716,15 +715,16 @@ async fn shared_source_preparation_uses_pool_session_and_carries_many_destinatio
     let b: SocketAddr = "203.0.113.20:5302".parse().unwrap();
 
     for speculative in [false, true] {
-        let prepared = prepare_shared_source(
-            Arc::clone(&runtime),
-            a,
-            None,
-            Duration::from_secs(1),
-            speculative,
-        )
-        .await
-        .unwrap();
+        let prepared = registry
+            .prepare_shared_source(
+                Arc::clone(&runtime),
+                a,
+                None,
+                Duration::from_secs(1),
+                speculative,
+            )
+            .await
+            .unwrap();
         assert_eq!(session.streams.lock().unwrap().len(), 1);
         let transport = prepared.commit().await.unwrap();
         assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);

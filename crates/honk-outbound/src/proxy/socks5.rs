@@ -12,7 +12,7 @@ use tracing::debug;
 
 use super::{
     MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound,
+    ProxyStream, SharedSourceOutbound, TcpOutbound,
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -664,6 +664,27 @@ impl TcpOutbound for Socks5Handler {
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for Socks5Handler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        self.prepare_udp_source(
+            runtime.node.as_ref(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
     }
 }
 

@@ -1,6 +1,6 @@
 //! Shared-source UDP against REAL sing-box inbounds (Shadowsocks legacy and
 //! 2022, Trojan, SOCKS5, AnyTLS, VLESS UoT v2 and H2MUX), through the public
-//! `prepare_shared_source` entry. Needs only `sing-box` (`HONK_SING_BOX_BIN`
+//! `ProxyRegistry::prepare_shared_source` entry. Needs only `sing-box` (`HONK_SING_BOX_BIN`
 //! or PATH); every listener and peer is loopback.
 //!
 //! `cargo test -p honk-outbound --features rprx --test shared_source_sing_box -- --ignored --nocapture`
@@ -14,7 +14,7 @@ use std::time::Duration;
 use honk_config::node::{
     AnyTlsConfig, Node, OutboundConfig, ShadowsocksConfig, Socks5Config, TlsOptions, TrojanConfig,
 };
-use honk_outbound::proxy::{MultiTargetTransport, prepare_shared_source};
+use honk_outbound::proxy::{MultiTargetTransport, ProxyRegistry};
 use honk_outbound::runtime::OutboundRuntimeRegistry;
 use tokio::net::UdpSocket;
 
@@ -309,7 +309,9 @@ async fn open(
     target: SocketAddr,
     domain: Option<&str>,
 ) -> Result<Arc<dyn MultiTargetTransport>, String> {
-    prepare_shared_source(Arc::clone(runtime), target, domain, SETUP_TIMEOUT, false)
+    ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(runtime), target, domain, SETUP_TIMEOUT, false)
         .await
         .map_err(|error| format!("prepare: {error:#}"))?
         .commit()

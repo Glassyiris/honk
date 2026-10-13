@@ -143,6 +143,7 @@ impl Fixture {
     ) -> SourcePreparation {
         self.pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&self.generation),
                 Arc::clone(&self.runtime),
                 client,
@@ -403,6 +404,7 @@ async fn quic_source_partitions_clients_runtimes_and_rewrites() {
         let attachment = f
             .pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&replacement),
                 runtime,
                 f.client(),
@@ -504,6 +506,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
         let attachment = f
             .pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&replacement),
                 runtime,
                 f.client(),

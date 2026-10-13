@@ -264,6 +264,7 @@ async fn attach_source(
     stats: &Arc<StatsManager>,
 ) -> SourceAttachment {
     pool.prepare_source(
+        &honk_outbound::proxy::ProxyRegistry::new(),
         Arc::clone(generation),
         Arc::clone(runtime),
         client,
@@ -526,7 +527,9 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
 
     let lease_a = reserve_source(&pool, &stats, client_addr, target_a, node.id);
     let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
+    let registry = honk_outbound::proxy::ProxyRegistry::new();
     let prepare_a = pool.prepare_source(
+        &registry,
         Arc::clone(&generation),
         Arc::clone(&runtime),
         client_addr,
@@ -541,6 +544,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         false,
     );
     let prepare_b = pool.prepare_source(
+        &registry,
         Arc::clone(&generation),
         Arc::clone(&runtime),
         client_addr,
@@ -638,6 +642,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_two = reserve_source(&pool, &stats, client_two_addr, target_c, node.id);
     let prepared_two = pool
         .prepare_source(
+            &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_two_addr,
@@ -712,6 +717,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
 
     let cancelled = pool
         .prepare_source(
+            &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_addr,
@@ -829,6 +835,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_d = reserve_source(&pool, &stats, client_addr, target_d, node.id);
     let prepared_d = pool
         .prepare_source(
+            &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_addr,
@@ -894,6 +901,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let lease_c = reserve_source(&pool, &stats, client_addr, target_c, node.id);
     let prepared_c = pool
         .prepare_source(
+            &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_addr,
@@ -984,6 +992,7 @@ async fn pending_attachment_survives_last_binding_retirement() {
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
     let attach = async |target| {
         pool.prepare_source(
+            &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_addr,

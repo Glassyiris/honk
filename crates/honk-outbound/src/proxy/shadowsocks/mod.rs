@@ -44,7 +44,7 @@ use tracing::debug;
 use super::addr;
 use super::{
     MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound,
+    ProxyStream, SharedSourceOutbound, TcpOutbound,
 };
 use aead2022::{Ss2022Method, Ss2022UdpSession};
 
@@ -435,6 +435,21 @@ impl TcpOutbound for ShadowsocksHandler {
         let header = addr::encode_address(target, target_domain)?;
         self.start_relay(method, password, server, header, target, target_domain)
             .await
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for ShadowsocksHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        Self::prepare_udp_source(&runtime.node, target, target_domain, connect_timeout).await
     }
 }
 

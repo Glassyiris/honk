@@ -17,7 +17,8 @@ use tracing::{debug, warn};
 use super::addr;
 use super::{
     MultiTargetTransport, MuxSession as _, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement,
+    WarmableOutbound,
 };
 use crate::session::SpeculativeCheckout;
 
@@ -1939,6 +1940,20 @@ impl TcpOutbound for AnyTlsHandler {
             target_addr: target,
             target_domain: target_domain.map(str::to_string),
         })
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for AnyTlsHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        Self::prepare_udp_source(runtime, target, target_domain, connect_timeout, speculative).await
     }
 }
 

@@ -75,6 +75,7 @@ impl IoHarness {
         let attachment = self
             .pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&source.generation),
                 Arc::clone(&source.runtime),
                 self.client_addr,

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{DirectMark, PacketTransport, PreparedUdpTransport, ProxyStream};
+use super::{DirectMark, MultiTargetTransport, PacketTransport, PreparedUdpTransport, ProxyStream};
 
 /// Result of requesting reusable protocol state. `Ready` means the state is
 /// usable after the call; `NotApplicable` means the protocol owns no
@@ -133,6 +133,22 @@ pub trait PacketOutbound: Send + Sync {
             .await
             .map(PreparedUdpTransport::ready)
     }
+}
+
+/// One association carrying every destination of a client source (the core
+/// `Shared` source transport). Registered only by protocols whose
+/// [`PacketOutbound`] slot also exists; `speculative` preparations must not
+/// publish carrier state until committed.
+#[async_trait]
+pub trait SharedSourceOutbound: Send + Sync {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>>;
 }
 
 /// Which property a warm request must establish. Selector ownership needs

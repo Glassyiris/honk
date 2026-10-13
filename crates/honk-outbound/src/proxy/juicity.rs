@@ -18,7 +18,7 @@ use crate::transport_quality::TransportQuality;
 use super::addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, SocksAddr as JuiceAddr};
 use super::{
     MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound, WarmableOutbound,
+    ProxyStream, SharedSourceOutbound, TcpOutbound, WarmableOutbound,
 };
 
 const JUICITY_VERSION: u8 = 0x00;
@@ -423,6 +423,21 @@ impl TcpOutbound for JuicityHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         anyhow::bail!("Juicity runs over QUIC; a bare TCP connection cannot be reused")
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for JuicityHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        self.prepare_udp_source(runtime, target, target_domain, connect_timeout, speculative)
+            .await
     }
 }
 

@@ -23,7 +23,6 @@ mod error;
 mod outbound;
 mod packet;
 mod registry;
-mod shared_source;
 
 pub use direct::DirectMark;
 pub use error::{
@@ -35,7 +34,8 @@ pub(crate) use error::{
     quic_carrier_io_error,
 };
 pub use outbound::{
-    PacketOutbound, ProbeableOutbound, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
+    PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, WarmOutcome,
+    WarmRequirement, WarmableOutbound,
 };
 use packet::prepare_detached_quic_transport;
 pub use packet::{
@@ -44,7 +44,6 @@ pub use packet::{
 };
 pub(crate) use packet::{MuxSession, packet_transport_with_owner};
 pub use registry::{ProtocolEntry, ProxyRegistry};
-pub use shared_source::{prepare_shared_source, uses_shared_source};
 
 #[cfg(test)]
 use anytls::AnyTlsHandler;

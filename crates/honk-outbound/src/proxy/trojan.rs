@@ -12,7 +12,8 @@ use tokio::net::TcpStream;
 use super::addr;
 use super::{
     AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement,
+    WarmableOutbound,
 };
 
 const CRLF: &[u8] = b"\r\n";
@@ -235,6 +236,21 @@ impl TcpOutbound for TrojanHandler {
             connect_timeout,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for TrojanHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        Self::prepare_udp_source(&runtime, target, target_domain, connect_timeout).await
     }
 }
 

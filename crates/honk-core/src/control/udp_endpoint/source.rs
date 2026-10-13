@@ -13,7 +13,7 @@ use honk_outbound::proxy::tuic::{TuicHandler, TuicUdpTransport};
 #[cfg(feature = "rprx")]
 use honk_outbound::proxy::vless::{VLessHandler, VlessXudpTransport};
 use honk_outbound::proxy::{
-    MultiTargetTransport, PreparedUdpTransport, QuicSendAttempt, prepare_shared_source,
+    MultiTargetTransport, PreparedUdpTransport, ProxyRegistry, QuicSendAttempt,
 };
 use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 
@@ -25,7 +25,7 @@ pub(in crate::control) enum SourcePath {
     Vless(VlessUdpPath),
     Hysteria2,
     Tuic,
-    /// Protocols listed in `honk_outbound::proxy::uses_shared_source`.
+    /// Protocols whose registry entry has a shared-source slot.
     Shared,
 }
 
@@ -1009,6 +1009,7 @@ impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) async fn prepare_source(
         self: &Arc<Self>,
+        registry: &ProxyRegistry,
         generation: Arc<OutboundRuntimeRegistry>,
         runtime: Arc<NodeRuntime>,
         client: SocketAddr,
@@ -1081,15 +1082,16 @@ impl UdpEndpointPool {
                             )
                             .await
                             .map(PreparedSourceTransport::Tuic),
-                        SourcePath::Shared => prepare_shared_source(
-                            Arc::clone(&runtime),
-                            target,
-                            target_domain,
-                            connect_timeout,
-                            speculative,
-                        )
-                        .await
-                        .map(PreparedSourceTransport::Shared),
+                        SourcePath::Shared => registry
+                            .prepare_shared_source(
+                                Arc::clone(&runtime),
+                                target,
+                                target_domain,
+                                connect_timeout,
+                                speculative,
+                            )
+                            .await
+                            .map(PreparedSourceTransport::Shared),
                     }
                 });
                 generation

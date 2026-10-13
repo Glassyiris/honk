@@ -227,7 +227,7 @@ impl Fixture {
     }
 
     /// A fresh preparation around its own in-memory transport, as a protocol's
-    /// `prepare_shared_source` would return.
+    /// the registered shared-source capability would return.
     fn fresh(&self, client: SocketAddr, rewrite: Option<SocketAddr>) -> SourcePreparation {
         let transport = MemoryTransport::new(&self.live);
         self.built.lock().push(Arc::downgrade(&transport));
@@ -256,6 +256,7 @@ impl Fixture {
         let preparation = if self.pool.sources.contains_key(&scope) {
             self.pool
                 .prepare_source(
+                    &honk_outbound::proxy::ProxyRegistry::new(),
                     Arc::clone(&self.generation),
                     Arc::clone(&self.runtime),
                     client,

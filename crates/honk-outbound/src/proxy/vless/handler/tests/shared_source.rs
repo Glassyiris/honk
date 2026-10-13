@@ -115,10 +115,11 @@ async fn shared_uot_source_serves_two_destinations_and_releases_the_carrier() {
         honk_config::node::VlessMultiplex::Off,
     );
 
-    let prepared =
-        crate::proxy::prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
-            .await
-            .unwrap();
+    let prepared = crate::proxy::ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
+        .await
+        .unwrap();
     assert_capacity(&runtime);
     let transport = prepared.commit().await.unwrap();
     // The one stream serves both destinations; the request went out once.
@@ -162,10 +163,11 @@ async fn dropped_uot_preparation_sends_nothing_and_releases_the_carrier() {
         honk_config::node::VlessUdpEncoding::UotV2,
         honk_config::node::VlessMultiplex::Off,
     );
-    let prepared =
-        crate::proxy::prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
-            .await
-            .unwrap();
+    let prepared = crate::proxy::ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
+        .await
+        .unwrap();
     assert_capacity(&runtime);
     drop(prepared);
     assert!(server.await.unwrap().is_empty(), "no datagram bytes yet");
@@ -175,9 +177,11 @@ async fn dropped_uot_preparation_sends_nothing_and_releases_the_carrier() {
 
 #[tokio::test]
 async fn only_explicit_uot_and_h2_paths_are_shared_for_vless() {
-    assert!(!crate::proxy::uses_shared_source(
-        honk_config::types::NodeProtocol::VLess
-    ));
+    assert!(
+        crate::proxy::ProxyRegistry::default_resolver()
+            .unwrap()
+            .has_shared_source(honk_config::types::NodeProtocol::VLess)
+    );
     let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = unused.local_addr().unwrap().port();
     for (encoding, multiplex, target) in [
@@ -198,15 +202,17 @@ async fn only_explicit_uot_and_h2_paths_are_shared_for_vless() {
         ),
     ] {
         let (generation, runtime) = runtime_for(port, encoding, multiplex);
-        let error = crate::proxy::prepare_shared_source(
-            runtime,
-            sock(target),
-            None,
-            std::time::Duration::from_millis(500),
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = crate::proxy::ProxyRegistry::default_resolver()
+            .unwrap()
+            .prepare_shared_source(
+                runtime,
+                sock(target),
+                None,
+                std::time::Duration::from_millis(500),
+                false,
+            )
+            .await
+            .unwrap_err();
         assert!(is_packet_rejection(&error), "{encoding:?}");
         generation.shutdown().await;
     }
@@ -293,10 +299,11 @@ async fn shared_h2_source_publishes_on_commit_and_shares_the_pooled_carrier() {
         honk_config::node::VlessMultiplex::H2 { padding: false },
     );
     let pool = runtime.vless_h2_pool().unwrap();
-    let first =
-        crate::proxy::prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
-            .await
-            .unwrap();
+    let first = crate::proxy::ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
+        .await
+        .unwrap();
     assert_eq!(
         pool.live_session_count(),
         0,
@@ -304,13 +311,14 @@ async fn shared_h2_source_publishes_on_commit_and_shares_the_pooled_carrier() {
     );
     let first = first.commit().await.unwrap();
     assert_eq!(pool.live_session_count(), 1);
-    let second =
-        crate::proxy::prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, false)
-            .await
-            .unwrap()
-            .commit()
-            .await
-            .unwrap();
+    let second = crate::proxy::ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, false)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
     assert_eq!(
         pool.live_session_count(),
         1,
@@ -356,10 +364,11 @@ async fn dropped_h2_preparation_leaves_the_pool_empty() {
         honk_config::node::VlessMultiplex::H2 { padding: false },
     );
     let pool = runtime.vless_h2_pool().unwrap();
-    let prepared =
-        crate::proxy::prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
-            .await
-            .unwrap();
+    let prepared = crate::proxy::ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(&runtime), sock(A), None, TIMEOUT, true)
+        .await
+        .unwrap();
     assert_eq!(pool.live_session_count(), 0);
     drop(prepared);
     assert_eq!(pool.live_session_count(), 0);

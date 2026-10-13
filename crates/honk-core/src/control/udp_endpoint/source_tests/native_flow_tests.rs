@@ -34,6 +34,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
         let mut lease = reserve_source(&pool, &stats, client_addr, target, node.id);
         let attachment = pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,

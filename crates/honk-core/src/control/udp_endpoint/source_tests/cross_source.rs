@@ -52,6 +52,7 @@ async fn different_sources_share_only_aggregated_carriers() {
             let lease = reserve_source(&pool, &stats, client, target, node.id);
             let attachment = pool
                 .prepare_source(
+                    &honk_outbound::proxy::ProxyRegistry::new(),
                     Arc::clone(&generation),
                     Arc::clone(&runtime),
                     client,
@@ -136,6 +137,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
         let mut lease = reserve_source(&pool, &stats, client_addr, original, node.id);
         let attachment = pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,

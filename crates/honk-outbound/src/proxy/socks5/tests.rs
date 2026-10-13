@@ -1020,18 +1020,20 @@ async fn prepare_shared_test_transport(
     let mut node = socks5_test_node(proxy_addr);
     node.id = node.derive_id();
     let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
-    super::super::prepare_shared_source(
-        runtime,
-        target,
-        target_domain,
-        std::time::Duration::from_secs(1),
-        true,
-    )
-    .await
-    .unwrap()
-    .commit()
-    .await
-    .unwrap()
+    super::super::ProxyRegistry::default_resolver()
+        .unwrap()
+        .prepare_shared_source(
+            runtime,
+            target,
+            target_domain,
+            std::time::Duration::from_secs(1),
+            true,
+        )
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap()
 }
 
 async fn recv_within(
@@ -1062,7 +1064,11 @@ async fn peer_recv(socket: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
 
 #[test]
 fn socks5_is_a_shared_source_protocol() {
-    assert!(super::super::uses_shared_source(NodeProtocol::Socks5));
+    assert!(
+        super::super::ProxyRegistry::default_resolver()
+            .unwrap()
+            .has_shared_source(NodeProtocol::Socks5)
+    );
 }
 
 #[tokio::test]

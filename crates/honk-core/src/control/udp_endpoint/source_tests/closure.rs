@@ -36,6 +36,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         );
         let attach = async |target| {
             pool.prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,

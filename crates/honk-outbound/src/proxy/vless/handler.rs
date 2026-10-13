@@ -62,7 +62,8 @@ use tokio::net::TcpStream;
 
 use crate::proxy::{
     MultiTargetTransport, MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement,
+    WarmableOutbound,
 };
 use crate::session::{OpenError, SpeculativeCheckout};
 
@@ -797,6 +798,21 @@ impl TcpOutbound for VLessHandler {
                 Self::open_cool_tcp(runtime, target, target_domain, connect_timeout).await
             }
         }
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for VLessHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        Self::prepare_shared_udp(runtime, target, target_domain, connect_timeout).await
     }
 }
 

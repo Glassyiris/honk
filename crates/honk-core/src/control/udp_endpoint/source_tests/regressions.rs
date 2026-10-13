@@ -283,6 +283,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
     let stale = pool
         .prepare_source(
+            &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
             client_addr,
@@ -649,6 +650,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
         let prepared_a = pool
             .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,

@@ -615,7 +615,9 @@ async fn sing_box_addressed_udp_shares_one_source_and_returns_real_peers() {
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
         let runtime = generation.get(&node.id).unwrap();
-        let transport = crate::proxy::prepare_shared_source(runtime, a, None, timeout, false)
+        let transport = crate::proxy::ProxyRegistry::default_resolver()
+            .unwrap()
+            .prepare_shared_source(runtime, a, None, timeout, false)
             .await
             .unwrap()
             .commit()
