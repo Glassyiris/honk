@@ -691,8 +691,12 @@ impl Config {
     /// ID follow it to the re-derived one, so an identity change cannot leave a
     /// structured configuration with dangling members.
     fn derive_node_ids(&mut self) {
-        let mut renamed = std::collections::HashMap::new();
-        let mut ambiguous = std::collections::HashSet::new();
+        // `None` marks a stored ID shared by several nodes, which no member can
+        // follow: it names whichever node already holds it as much as the one
+        // being re-derived away from it.
+        let mut stored: std::collections::HashMap<uuid::Uuid, Option<uuid::Uuid>> =
+            std::collections::HashMap::new();
+        let mut changed = false;
         for node in &mut self.nodes {
             if matches!(
                 node.outbound,
@@ -701,22 +705,25 @@ impl Config {
                 continue;
             }
             let derived = node.derive_id();
-            if node.id != derived && !node.id.is_nil() && renamed.insert(node.id, derived).is_some()
-            {
-                ambiguous.insert(node.id);
+            if !node.id.is_nil() {
+                stored
+                    .entry(node.id)
+                    .and_modify(|followed| *followed = None)
+                    .or_insert(Some(derived));
             }
+            changed |= node.id != derived;
             node.id = derived;
         }
-        for id in &ambiguous {
-            renamed.remove(id);
-        }
-        if renamed.is_empty() {
+        if !changed {
             return;
         }
         for group in &mut self.groups {
             let mut members = Vec::with_capacity(group.nodes.len());
             for id in &group.nodes {
-                let id = renamed.get(id).copied().unwrap_or(*id);
+                let id = match stored.get(id) {
+                    Some(Some(derived)) => *derived,
+                    _ => *id,
+                };
                 if !members.contains(&id) {
                     members.push(id);
                 }
