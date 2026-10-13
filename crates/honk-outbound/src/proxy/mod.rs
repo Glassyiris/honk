@@ -23,6 +23,7 @@ mod error;
 mod outbound;
 mod packet;
 mod registry;
+mod shared_source;
 
 pub use direct::DirectMark;
 pub use error::{
@@ -39,9 +40,11 @@ pub use outbound::{
 use packet::prepare_detached_quic_transport;
 pub(crate) use packet::{MuxSession, packet_transport_with_owner};
 pub use packet::{
-    PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken, UdpSocketTransport,
+    MultiTargetTransport, PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken,
+    UdpSocketTransport,
 };
 pub use registry::{ProtocolEntry, ProxyRegistry};
+pub use shared_source::{prepare_shared_source, uses_shared_source};
 
 #[cfg(test)]
 use anytls::AnyTlsHandler;

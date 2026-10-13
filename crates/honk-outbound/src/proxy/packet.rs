@@ -129,6 +129,31 @@ pub trait PacketTransport: Send + Sync + Debug {
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
 
+/// One logical UDP association that can address any destination, the unit a
+/// core source scope shares across a client's destinations. Replies must carry
+/// the real peer from [`PacketTransport::recv_packet`], never a captured target.
+///
+/// Implementors give `send_packet` and `send_to` one unboxed inherent helper so
+/// the ordinary path pays no second `async_trait` boxing.
+#[async_trait]
+pub trait MultiTargetTransport: PacketTransport {
+    /// `domain` is the name the flow was dialed by, when any. `confirmed`
+    /// requests the first-datagram admission of [`PacketTransport::send_packet_confirmed`];
+    /// `admitted` is set once the datagram reached the wire path.
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        confirmed: bool,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()>;
+    /// Server address reported when a shared association is reused.
+    fn carrier_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+}
+
 pub(crate) trait MuxSession: crate::session::ManagedSession + Sized + 'static {
     type Stream: AsyncReadWrite + 'static;
     type Packet: PacketTransport + 'static;
