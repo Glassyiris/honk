@@ -706,6 +706,7 @@ impl SourceEndpoint {
         }
     }
 
+    #[cfg(all(test, feature = "native-api"))]
     pub(super) fn owner_id(&self) -> u64 {
         self.owner.id
     }

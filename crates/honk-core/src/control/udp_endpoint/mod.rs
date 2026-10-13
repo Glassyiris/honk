@@ -530,6 +530,7 @@ impl UdpEndpoint {
         }
     }
 
+    #[cfg(all(test, feature = "native-api"))]
     fn source_owner_id(&self) -> Option<u64> {
         match &self.transport {
             EndpointTransport::Source(source) => Some(source.owner_id()),

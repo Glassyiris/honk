@@ -2,9 +2,6 @@ use super::*;
 
 pub(in crate::control::udp_endpoint) enum SourceReplyTarget {
     Flow {
-        key: EndpointKey,
-        generation: u64,
-        token: u32,
         endpoint: Arc<UdpEndpoint>,
         source: SocketAddr,
     },
@@ -21,6 +18,10 @@ impl Drop for ForeignReplyGuard<'_> {
 }
 
 impl UdpEndpointPool {
+    /// Admits a reply to the bound flow in one endpoint-map observation: the
+    /// entry must be a live `Ready` view of this owner whose source is still
+    /// attached. Nothing awaits between lookup and delivery, so there is no
+    /// second lookup to revalidate generation, token, or endpoint identity.
     pub(in crate::control::udp_endpoint) fn classify_source_reply(
         &self,
         owner: &SourceOwner,
@@ -51,12 +52,9 @@ impl UdpEndpointPool {
             EndpointEntry::Ready(ready)
                 if ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire)
-                    && ready.endpoint.source_owner_id() == Some(owner.id) =>
+                    && ready.endpoint.begin_source_reply(owner.id) =>
             {
                 SourceReplyTarget::Flow {
-                    key,
-                    generation: ready.generation,
-                    token: ready.decision_token,
                     endpoint: Arc::clone(&ready.endpoint),
                     source: match owner.scope.reply {
                         ReplyProjection::ActualPeer => peer,
@@ -68,27 +66,6 @@ impl UdpEndpointPool {
             | EndpointEntry::Ready(_)
             | EndpointEntry::Retiring { .. } => SourceReplyTarget::Drop,
         }
-    }
-
-    fn source_flow_reply_admitted(
-        &self,
-        owner: &SourceOwner,
-        key: EndpointKey,
-        generation: u64,
-        token: u32,
-        endpoint: &Arc<UdpEndpoint>,
-    ) -> bool {
-        self.endpoints.get(&key).is_some_and(|entry| {
-            matches!(
-                entry.value(),
-                EndpointEntry::Ready(ready)
-                    if ready.generation == generation
-                        && ready.decision_token == token
-                        && ready.alive.load(Ordering::Acquire)
-                        && Arc::ptr_eq(&ready.endpoint, endpoint)
-                        && ready.endpoint.source_owner_id() == Some(owner.id)
-            ) && endpoint.begin_source_reply(owner.id)
-        })
     }
 
     fn admit_foreign_source_reply<'a>(
@@ -138,16 +115,7 @@ pub(super) async fn deliver_source_reply(
     alternate_reply_sockets: &mut Vec<(SocketAddr, ReplySocket)>,
 ) -> SourceReplyDisposition {
     match pool.classify_source_reply(owner, peer) {
-        SourceReplyTarget::Flow {
-            key,
-            generation,
-            token,
-            endpoint,
-            source,
-        } => {
-            if !pool.source_flow_reply_admitted(owner, key, generation, token, &endpoint) {
-                return SourceReplyDisposition::Drop;
-            }
+        SourceReplyTarget::Flow { endpoint, source } => {
             endpoint.native.reply_received();
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 endpoint
