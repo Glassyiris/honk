@@ -150,7 +150,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `direct` | — | 是 | 是 | 保留的内置直连出站；没有分享链接 scheme |
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接 scheme |
 
-`network` 可独立于流 transport 关闭 Trojan、AnyTLS 和 VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。Trojan UDP 为每个客户端 source 使用一条 associate 流承载所有目的地，并返回每个回复的真实来源，配合服务端可获得 EIM/EIF 行为；各目的地共享该流的队头阻塞与失败命运。VMess UDP 尚未实现。
+`network` 可独立于流 transport 关闭 Trojan、AnyTLS 和 VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。AnyTLS UDP 使用 non-connect UoT v2：每个 datagram 都携带目的地和服务端的真实源地址，因此一条 stream 服务一个客户端 source 的全部目的地，主动到达的回包也保留真实源地址。Trojan UDP 为每个客户端 source 使用一条 associate 流承载所有目的地，并返回每个回复的真实来源，配合服务端可获得 EIM/EIF 行为；各目的地共享该流的队头阻塞与失败命运。VMess UDP 尚未实现。
 
 SOCKS5 UDP ASSOCIATE 为每个客户端 source 保持一条控制 TCP 连接和一个中继 socket，该 source 的所有目的地共用它，并返回每个应答头中的真实远端 peer。从未联系过的 peer 能否到达客户端取决于服务器：Dante 默认的 `udp.connectdst: yes` 仅在只使用过单一目的地期间才会连接其出站 socket。
 

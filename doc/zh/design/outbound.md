@@ -889,11 +889,23 @@ UoT delivery 使用非阻塞 `try_send`。UoT sink 满时会移除该 sink 并�
 
 ### Lazy UoT 创建
 
-通过 `open_uot_stream` 打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT connect request。
-connect request 与第一条编码后 datagram 作为一个有序 PSH 一起发送。payload
+通过 `open_uot_stream` 打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT request。
+AnyTLS 使用 non-connect UoT v2：request 为 `0x00` 加第一个目的地的 SOCKS5 地址，
+仅用于服务端路由与地址族选择；request 与第一条编码后 datagram 作为一个有序 PSH
+一起发送。此后双向每个 datagram 都用 UoT v1 布局
+`[ATYP][address][port][u16 length][payload]` 携带自己的地址，packet ATYP 为
+IPv4 `0`、IPv6 `1`、域名 `2`（不同于 request 地址的 SOCKS5 编号）。payload
 上限为 16 KiB，与 anytls-go 0.0.13 及 sing v0.5.1 的 relay buffer 一致；
 更大的输入会在消耗 lazy setup 或破坏逻辑 stream 之前失败。这样既避免原本
 空的 setup round trip，也不允许首包重放。
+
+因此一条 stream 服务一个客户端 source 的全部目的地（`Shared` source transport），
+服务端可用同一个未 connect 的 socket 承载它们。`recv_packet` 在消耗 frame 之前先解码地址：
+数值源地址直接返回（IPv4-mapped IPv6 归一为 IPv4），打开时捕获的域名加端口投影回捕获的 target，
+其他任何域名 frame 都被整体丢弃（释放其头部与 payload 的全部 credit，不做域名解析）；
+未知 ATYP 是终止错误。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
+`admitted` 在 frame 入 session writer 队列时设置。队列与 credit 上限仍是单个 transport 的上限，
+因此队列饱和或 EOF 会退役共享该 SID 的所有目的地。域名目标流（`RewriteTo`）仍按原始目的地各自成 scope。
 
 ## 冷 URLTest speculative preparation
 

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use honk_config::types::NodeProtocol;
 
+use super::anytls::AnyTlsHandler;
 use super::juicity::JuicityHandler;
 use super::shadowsocks::ShadowsocksHandler;
 use super::{MultiTargetTransport, PacketRejection, PreparedUdpTransport};
@@ -21,6 +22,7 @@ const SHARED: &[NodeProtocol] = &[
     NodeProtocol::Socks5,
     NodeProtocol::Juicity,
     NodeProtocol::Trojan,
+    NodeProtocol::AnyTLS,
 ];
 
 pub fn uses_shared_source(protocol: NodeProtocol) -> bool {
@@ -71,6 +73,16 @@ pub async fn prepare_shared_source(
             JuicityHandler::new()
                 .prepare_udp_source(runtime, target, target_domain, connect_timeout, speculative)
                 .await
+        }
+        NodeProtocol::AnyTLS => {
+            AnyTlsHandler::prepare_udp_source(
+                runtime,
+                target,
+                target_domain,
+                connect_timeout,
+                speculative,
+            )
+            .await
         }
         _ => Err(PacketRejection::Policy.into()),
     }

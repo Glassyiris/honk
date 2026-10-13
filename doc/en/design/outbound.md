@@ -1038,12 +1038,27 @@ chunk and continuing a corrupted length-delimited byte stream.
 
 ### Lazy UoT creation
 
-Opening an AnyTLS UDP transport through `open_uot_stream` reserves a stream but defers its UoT connect
-request. The connect request and first encoded datagram are emitted together as
-one ordered PSH. Payloads are limited to 16 KiB, matching anytls-go 0.0.13's
-sing v0.5.1 relay buffer; larger inputs fail before consuming the lazy setup or
-poisoning the logical stream. This avoids an otherwise empty setup round trip
-without permitting first-packet replay.
+Opening an AnyTLS UDP transport through `open_uot_stream` reserves a stream but defers its UoT
+request. AnyTLS uses non-connect UoT v2: the request is `0x00` followed by the SOCKS5 address of
+the first destination, which only informs server routing and address-family selection. The
+request and the first encoded datagram are emitted together as one ordered PSH. Every datagram in
+both directions then carries its own address in the UoT v1 layout
+`[ATYP][address][port][u16 length][payload]`, with packet ATYP IPv4 `0`, IPv6 `1` and domain `2`
+(not the SOCKS5 numbering of the request address). Payloads are limited to 16 KiB, matching
+anytls-go 0.0.13's sing v0.5.1 relay buffer; larger inputs fail before consuming the lazy setup or
+poisoning the logical stream. This avoids an otherwise empty setup round trip without permitting
+first-packet replay.
+
+One stream therefore serves every destination of a client source (the `Shared` source transport),
+and the server can use one unconnected socket for all of them. `recv_packet` decodes the address
+before consuming the frame: numeric sources are returned (IPv4-mapped IPv6 as IPv4), the captured
+open-time domain and port project to the captured target, and any other domain frame is dropped
+whole, with its header and payload credit released and no name resolution. An unknown ATYP is
+terminal. The first send of each flow waits for the physical flush (`confirmed`); steady sends only
+enqueue, and `admitted` is set when the frame is queued to the session writer. The queue and
+credit limits are those of a single transport, so queue saturation or EOF retires every
+destination sharing the SID. Domain-target flows (`RewriteTo`) keep one scope per original
+destination.
 
 ## Cold URLTest speculative preparation
 

@@ -253,7 +253,7 @@ impl VLessHandler {
                 CMD_TCP,
                 Some(SocketAddr::from(([0, 0, 0, 0], 0))),
                 Some(crate::proxy::uot::MAGIC_ADDRESS),
-                Some(crate::proxy::uot::connect_request(target, domain)?),
+                Some(crate::proxy::uot::request(true, target, domain)?),
             ),
             VlessUdpPath::Xudp => (super::cool::VLESS_MUX_COMMAND, None, None, None),
             _ => unreachable!("protocol UDP preparation excludes pooled mux paths"),
