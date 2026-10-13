@@ -107,6 +107,20 @@ pub(super) enum SourceReplyDisposition {
     Drop,
 }
 
+/// Sends one reply within `TRANSPORT_SEND_TIMEOUT`. An immediately writable
+/// socket completes synchronously, so the timer is armed only when the send
+/// would block.
+async fn send_reply(socket: &UdpSocket, data: &[u8], client: SocketAddr) -> bool {
+    match socket.try_send_to(data, client) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => matches!(
+            tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, socket.send_to(data, client)).await,
+            Ok(Ok(_))
+        ),
+        Err(_) => false,
+    }
+}
+
 pub(super) async fn deliver_source_reply(
     pool: &UdpEndpointPool,
     owner: &SourceOwner,
@@ -131,16 +145,7 @@ pub(super) async fn deliver_source_reply(
                     hook.release.notified().await;
                 }
             }
-            if !matches!(
-                tokio::time::timeout(
-                    TRANSPORT_SEND_TIMEOUT,
-                    endpoint
-                        .source_reply_socket()
-                        .send_to(data, owner.scope.client)
-                )
-                .await,
-                Ok(Ok(_))
-            ) {
+            if !send_reply(endpoint.source_reply_socket(), data, owner.scope.client).await {
                 endpoint
                     .native
                     .dropped("client_delivery_failed", Some("client_send_failed"));
@@ -187,16 +192,7 @@ pub(super) async fn deliver_source_reply(
                     hook.release.notified().await;
                 }
             }
-            if !matches!(
-                tokio::time::timeout(
-                    TRANSPORT_SEND_TIMEOUT,
-                    alternate_reply_sockets[index]
-                        .1
-                        .send_to(data, owner.scope.client)
-                )
-                .await,
-                Ok(Ok(_))
-            ) {
+            if !send_reply(&alternate_reply_sockets[index].1, data, owner.scope.client).await {
                 debug!("UDP foreign reply delivery failed");
                 SourceReplyDisposition::Observed
             } else {
