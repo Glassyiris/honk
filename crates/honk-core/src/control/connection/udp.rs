@@ -58,6 +58,7 @@ fn source_path(node: &Node, port: u16) -> Option<SourcePath> {
             )
             .then_some(SourcePath::Vless(path))
         }
+        protocol if honk_outbound::proxy::uses_shared_source(protocol) => Some(SourcePath::Shared),
         _ => {
             let _ = port;
             None
@@ -1146,5 +1147,51 @@ impl ControlPlaneHandle {
             }
         }
         (outcome, collected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use honk_config::node::OutboundConfig;
+    use honk_config::types::NodeProtocol;
+
+    fn node(protocol: NodeProtocol) -> Node {
+        Node {
+            outbound: OutboundConfig::from_protocol(protocol),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn source_path_selects_shared_exactly_for_the_shared_list() {
+        for protocol in [
+            NodeProtocol::SS,
+            NodeProtocol::Trojan,
+            NodeProtocol::VMess,
+            NodeProtocol::Socks5,
+            NodeProtocol::Juicity,
+            NodeProtocol::AnyTLS,
+            NodeProtocol::Direct,
+            NodeProtocol::Block,
+        ] {
+            assert_eq!(
+                source_path(&node(protocol), 443),
+                honk_outbound::proxy::uses_shared_source(protocol).then_some(SourcePath::Shared),
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quic_sources_keep_their_concrete_paths() {
+        assert_eq!(
+            source_path(&node(NodeProtocol::Hysteria2), 443),
+            Some(SourcePath::Hysteria2)
+        );
+        assert_eq!(
+            source_path(&node(NodeProtocol::Tuic), 443),
+            Some(SourcePath::Tuic)
+        );
     }
 }

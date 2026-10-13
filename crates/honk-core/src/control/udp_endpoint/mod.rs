@@ -118,6 +118,8 @@ mod retirement;
 mod source;
 #[cfg(test)]
 mod source_quic_tests;
+#[cfg(test)]
+mod source_shared_tests;
 #[cfg(all(test, feature = "rprx"))]
 mod source_tests;
 use retirement::{EndpointIoGuard, RetirementIo};
@@ -504,7 +506,9 @@ impl UdpEndpoint {
                     let record_start = self.score_reporter.is_some()
                         && !data.is_empty()
                         && self.upload.load(Ordering::Relaxed) == 0;
-                    source.send(data, admitted, record_start, attempt).await
+                    source
+                        .send(data, confirmed, admitted, record_start, attempt)
+                        .await
                 }
             }
         };

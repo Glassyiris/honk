@@ -12,7 +12,9 @@ use honk_outbound::proxy::hysteria2::{Hy2UdpTransport, Hysteria2Handler};
 use honk_outbound::proxy::tuic::{TuicHandler, TuicUdpTransport};
 #[cfg(feature = "rprx")]
 use honk_outbound::proxy::vless::{VLessHandler, VlessXudpTransport};
-use honk_outbound::proxy::{PreparedUdpTransport, QuicSendAttempt};
+use honk_outbound::proxy::{
+    MultiTargetTransport, PreparedUdpTransport, QuicSendAttempt, prepare_shared_source,
+};
 use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 
 const MAX_RETIRED_REPLY_PEERS: usize = 64;
@@ -23,6 +25,8 @@ pub(in crate::control) enum SourcePath {
     Vless(VlessUdpPath),
     Hysteria2,
     Tuic,
+    /// Protocols listed in `honk_outbound::proxy::uses_shared_source`.
+    Shared,
 }
 
 pub(in crate::control) enum PreparedSourceTransport {
@@ -30,6 +34,7 @@ pub(in crate::control) enum PreparedSourceTransport {
     Vless(PreparedUdpTransport<VlessXudpTransport>),
     Hysteria2(PreparedUdpTransport<Hy2UdpTransport>),
     Tuic(PreparedUdpTransport<TuicUdpTransport>),
+    Shared(PreparedUdpTransport<dyn MultiTargetTransport>),
 }
 
 impl PreparedSourceTransport {
@@ -39,6 +44,7 @@ impl PreparedSourceTransport {
             Self::Vless(prepared) => prepared.commit().await.map(SourceTransport::Vless),
             Self::Hysteria2(prepared) => prepared.commit().await.map(SourceTransport::Hysteria2),
             Self::Tuic(prepared) => prepared.commit().await.map(SourceTransport::Tuic),
+            Self::Shared(prepared) => prepared.commit().await.map(SourceTransport::Shared),
         }
     }
 }
@@ -48,6 +54,7 @@ enum SourceTransport {
     Vless(Arc<VlessXudpTransport>),
     Hysteria2(Arc<Hy2UdpTransport>),
     Tuic(Arc<TuicUdpTransport>),
+    Shared(Arc<dyn MultiTargetTransport>),
 }
 
 impl SourceTransport {
@@ -57,6 +64,7 @@ impl SourceTransport {
             Self::Vless(transport) => transport.as_ref(),
             Self::Hysteria2(transport) => transport.as_ref(),
             Self::Tuic(transport) => transport.as_ref(),
+            Self::Shared(transport) => transport.as_ref(),
         }
     }
 
@@ -69,11 +77,12 @@ impl SourceTransport {
         let server_addr = match self {
             #[cfg(feature = "rprx")]
             Self::Vless(_) => return,
-            Self::Hysteria2(transport) => transport.server_addr(),
-            Self::Tuic(transport) => transport.server_addr(),
+            Self::Hysteria2(transport) => Some(transport.server_addr()),
+            Self::Tuic(transport) => Some(transport.server_addr()),
+            Self::Shared(transport) => transport.carrier_addr(),
         };
         observer.publish(FlowEvent::TransportAttached {
-            server_addr: Some(server_addr),
+            server_addr,
             resolution_location: ResolutionLocation::Reused,
         });
     }
@@ -82,7 +91,7 @@ impl SourceTransport {
         match self {
             #[cfg(feature = "rprx")]
             Self::Vless(_) => true,
-            Self::Hysteria2(_) | Self::Tuic(_) => false,
+            Self::Hysteria2(_) | Self::Tuic(_) | Self::Shared(_) => false,
         }
     }
 
@@ -91,6 +100,7 @@ impl SourceTransport {
         target: SocketAddr,
         target_domain: Option<&str>,
         data: &[u8],
+        confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> io::Result<()> {
         match self {
@@ -108,6 +118,11 @@ impl SourceTransport {
             Self::Tuic(transport) => {
                 transport
                     .send_to(target, target_domain, data, admitted)
+                    .await
+            }
+            Self::Shared(transport) => {
+                transport
+                    .send_to(target, target_domain, data, confirmed, admitted)
                     .await
             }
         }
@@ -179,6 +194,9 @@ struct SourceState {
     retired_reply_peers: HashSet<SocketAddr>,
     foreign_replies_disabled: bool,
     active_foreign_reply: Option<SocketAddr>,
+    /// The last view's endpoint slot, kept until the receiver and transport drop so
+    /// retiring sources cannot overlap new endpoints beyond the descriptor partition.
+    retained_endpoint_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl SourceState {
@@ -213,6 +231,8 @@ pub(super) struct SourceOwner {
     _source_permit: OwnedSemaphorePermit,
     #[cfg(test)]
     send_timeout_nanos: AtomicU64,
+    #[cfg(test)]
+    pub(super) foreign_reply_hook: Mutex<Option<Arc<ReplyAdmissionHook>>>,
 }
 
 impl SourceOwner {
@@ -244,6 +264,7 @@ impl SourceOwner {
                 retired_reply_peers: HashSet::new(),
                 foreign_replies_disabled: false,
                 active_foreign_reply: None,
+                retained_endpoint_permit: None,
             }),
             ready: AtomicBool::new(true),
             retire_notify: Notify::new(),
@@ -263,6 +284,8 @@ impl SourceOwner {
             _source_permit: source_permit,
             #[cfg(test)]
             send_timeout_nanos: AtomicU64::new(0),
+            #[cfg(test)]
+            foreign_reply_hook: Mutex::new(None),
         })
     }
 
@@ -294,6 +317,7 @@ impl SourceOwner {
             .checked_add(1)
             .expect("source binding count overflow");
         state.retired_reply_peers.remove(&target);
+        state.retained_endpoint_permit = None;
         true
     }
 
@@ -314,17 +338,23 @@ impl SourceOwner {
         }
     }
 
-    fn release_binding(&self) {
+    fn release_binding(&self, endpoint_permit: Option<OwnedSemaphorePermit>) {
         let retire = {
             let mut state = self.state.lock();
             debug_assert_ne!(state.bindings, 0);
             state.bindings -= 1;
-            if state.retirement.is_none() && state.bindings == 0 && state.attachments == 0 {
+            let retire =
+                state.retirement.is_none() && state.bindings == 0 && state.attachments == 0;
+            if retire {
                 state.retirement = Some(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
-                true
-            } else {
-                false
             }
+            // Covers the source's descriptors while no view is bound, including a
+            // pending attachment that may still be cancelled: the next bound view
+            // brings its own permit.
+            if state.bindings == 0 {
+                state.retained_endpoint_permit = endpoint_permit;
+            }
+            retire
         };
         if retire {
             self.signal_retiring();
@@ -647,7 +677,7 @@ struct SourceEndpointBinding {
     attachment: Option<SourceAttachment>,
     bound: bool,
     retirement: Option<SourceRetirement>,
-    _endpoint_permit: Option<OwnedSemaphorePermit>,
+    endpoint_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl SourceEndpoint {
@@ -671,7 +701,7 @@ impl SourceEndpoint {
                 attachment: Some(attachment),
                 bound: false,
                 retirement: None,
-                _endpoint_permit: None,
+                endpoint_permit: None,
             }),
         }
     }
@@ -682,7 +712,6 @@ impl SourceEndpoint {
 
     pub(super) fn score_retirement(&self) -> Option<SourceRetirement> {
         let binding = self.binding.lock();
-        binding._endpoint_permit.as_ref()?;
         if binding.bound {
             self.owner.state.lock().retirement
         } else {
@@ -710,7 +739,7 @@ impl SourceEndpoint {
         }
         binding.attachment.take();
         binding.bound = true;
-        binding._endpoint_permit = Some(endpoint_permit);
+        binding.endpoint_permit = Some(endpoint_permit);
         true
     }
 
@@ -738,7 +767,7 @@ impl SourceEndpoint {
         }
         if binding.bound {
             binding.bound = false;
-            self.owner.release_binding();
+            self.owner.release_binding(binding.endpoint_permit.take());
         }
     }
 
@@ -760,6 +789,7 @@ impl SourceEndpoint {
     pub(super) async fn send<'a>(
         &'a self,
         data: &[u8],
+        confirmed: bool,
         admitted: Option<&AtomicBool>,
         record_start: bool,
         attempt: &mut Option<QuicSendAttempt<'a>>,
@@ -768,7 +798,9 @@ impl SourceEndpoint {
         let reusable = match &self.owner.transport {
             #[cfg(feature = "rprx")]
             SourceTransport::Vless(transport) => transport.source_send_usable().await,
-            SourceTransport::Hysteria2(_) | SourceTransport::Tuic(_) => true,
+            SourceTransport::Hysteria2(_)
+            | SourceTransport::Tuic(_)
+            | SourceTransport::Shared(_) => true,
         };
         let mut active = {
             let mut state = self.owner.state.lock();
@@ -808,7 +840,13 @@ impl SourceEndpoint {
         let result = self
             .owner
             .transport
-            .send_to(self.target, self.target_domain.as_deref(), data, admitted)
+            .send_to(
+                self.target,
+                self.target_domain.as_deref(),
+                data,
+                confirmed,
+                admitted,
+            )
             .await;
         if result.is_ok() {
             active.clear_intent = true;
@@ -868,7 +906,7 @@ impl Drop for SourceEndpoint {
         if binding.bound {
             self.owner.state.lock().mark_intentional_sender(self.view);
             binding.bound = false;
-            self.owner.release_binding();
+            self.owner.release_binding(binding.endpoint_permit.take());
         }
     }
 }
@@ -1043,6 +1081,15 @@ impl UdpEndpointPool {
                             )
                             .await
                             .map(PreparedSourceTransport::Tuic),
+                        SourcePath::Shared => prepare_shared_source(
+                            Arc::clone(&runtime),
+                            target,
+                            target_domain,
+                            connect_timeout,
+                            speculative,
+                        )
+                        .await
+                        .map(PreparedSourceTransport::Shared),
                     }
                 });
                 generation

@@ -13,8 +13,8 @@ const MODES: [QuicUdpMode; 3] = [
     QuicUdpMode::TuicDatagram,
     QuicUdpMode::TuicStream,
 ];
-const TEST_TIMEOUT: Duration = Duration::from_secs(2);
-const SHORT_WAIT: Duration = Duration::from_millis(20);
+pub(super) const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const SHORT_WAIT: Duration = Duration::from_millis(20);
 const TEST_TARGETS: usize = 8;
 const TEST_ENDPOINTS: usize = 16;
 const TEST_PACKET_SIZE: usize = 256;
@@ -46,7 +46,7 @@ fn run_metrics_in_child(name: &str) -> bool {
 }
 
 #[derive(Debug)]
-struct BoundReplies(HashMap<SocketAddr, std::net::UdpSocket>);
+pub(super) struct BoundReplies(pub(super) HashMap<SocketAddr, std::net::UdpSocket>);
 
 impl UdpReplySocketFactory for BoundReplies {
     fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
@@ -265,7 +265,7 @@ impl Fixture {
     }
 }
 
-async fn received(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+pub(super) async fn received(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0; TEST_PACKET_SIZE];
     let (n, source) = tokio::time::timeout(TEST_TIMEOUT, socket.recv_from(&mut buf))
         .await
@@ -274,7 +274,7 @@ async fn received(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     (buf[..n].to_vec(), source)
 }
 
-async fn no_reply(socket: &UdpSocket) {
+pub(super) async fn no_reply(socket: &UdpSocket) {
     let mut buf = [0; TEST_PACKET_SIZE];
     assert!(
         tokio::time::timeout(SHORT_WAIT, socket.recv_from(&mut buf))

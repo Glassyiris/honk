@@ -211,6 +211,14 @@ pub(super) async fn deliver_source_reply(
             let Some(_reply) = pool.admit_foreign_source_reply(owner, source) else {
                 return SourceReplyDisposition::Drop;
             };
+            #[cfg(test)]
+            {
+                let hook = owner.foreign_reply_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook.entered.notify_one();
+                    hook.release.notified().await;
+                }
+            }
             if !matches!(
                 tokio::time::timeout(
                     TRANSPORT_SEND_TIMEOUT,
