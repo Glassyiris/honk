@@ -633,7 +633,11 @@ impl SsUdpTransport {
             .seal(socks, target_port, data)
             .map_err(std::io::Error::other)?;
         drop(crypto);
-        let sent = self.socket.send(&packet).await?;
+        let sent = self
+            .socket
+            .send(&packet)
+            .await
+            .map_err(crate::proxy::send_size_refusal)?;
         if sent != packet.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,

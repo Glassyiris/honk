@@ -526,7 +526,10 @@ impl Socks5UdpTransport {
         }
         packet.extend_from_slice(&target.port().to_be_bytes());
         packet.extend_from_slice(data);
-        self.socket.send(&packet).await?;
+        self.socket
+            .send(&packet)
+            .await
+            .map_err(super::send_size_refusal)?;
         if let Some(admitted) = admitted {
             admitted.store(true, Ordering::Release);
         }

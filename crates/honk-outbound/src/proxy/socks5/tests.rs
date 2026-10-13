@@ -525,6 +525,18 @@ async fn socks5_udp_transport_carries_empty_and_maximum_payloads() {
         assert_eq!(&received[..n], payload);
         assert_eq!(source, target);
     }
+
+    // One byte past the datagram limit is a local size refusal; the shared
+    // association must keep serving its other destinations.
+    let error = transport
+        .send_packet(&vec![0x5a; 65_507 - 10 + 1])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        crate::proxy::io_packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::InvalidSize)
+    );
+    transport.send_packet(b"alive").await.unwrap();
 }
 
 #[tokio::test]

@@ -714,7 +714,11 @@ async fn legacy_udp_max_size_boundary() {
             .send_to(a, None, &vec![0; max + 1], false, None)
             .await
             .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
+        assert_eq!(
+            crate::proxy::io_packet_rejection(&error),
+            Some(crate::proxy::PacketRejection::InvalidSize),
+            "a socket size refusal is local, not a dead tunnel"
+        );
         shared.send(a, None, b"alive").await;
         assert_eq!(shared.server_recv().await.1[7..], b"alive"[..]);
     }

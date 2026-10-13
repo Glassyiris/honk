@@ -1178,7 +1178,11 @@ async fn udp_2022_max_size_boundary() {
             .send_to(a, None, &vec![0; up.len() + 1], false, None)
             .await
             .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
+        assert_eq!(
+            crate::proxy::io_packet_rejection(&error),
+            Some(crate::proxy::PacketRejection::InvalidSize),
+            "a socket size refusal is local, not a dead tunnel"
+        );
         shared.send(a, b"alive").await;
         let (_, alive) = shared.server_recv().await;
         assert_eq!(alive.rest[7..], b"alive"[..]);

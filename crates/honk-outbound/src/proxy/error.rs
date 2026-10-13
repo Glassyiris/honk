@@ -126,6 +126,16 @@ pub(crate) fn io_packet_rejection(error: &std::io::Error) -> Option<PacketReject
     find_cause::<PacketRejection>(error).copied()
 }
 
+/// A datagram the native UDP send refuses as too large is a local size refusal
+/// that must not end a shared association or demote the node.
+pub(crate) fn send_size_refusal(error: std::io::Error) -> std::io::Error {
+    if error.raw_os_error() == Some(libc::EMSGSIZE) {
+        PacketRejection::InvalidSize.into()
+    } else {
+        error
+    }
+}
+
 /// Coarse classification for packet-send failures shared with the control plane.
 ///
 /// Congestion is deliberately separate from a dead tunnel: dropping one UDP
