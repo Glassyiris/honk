@@ -164,6 +164,10 @@ name = "udp"
 harness = false
 
 [[bench]]
+name = "udp_io"
+harness = false
+
+[[bench]]
 name = "reload"
 harness = false
 required-features = ["reload-bench"]

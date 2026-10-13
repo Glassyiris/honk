@@ -63,6 +63,8 @@ Read with: `AGENTS.md` (Testing instructions); `real-ebpf.md` for the root-gated
 
 Benchmarks kept on `main`: `benches/dns.rs` (criterion, `harness = false`) covers DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, and TcpPool/UpstreamPool exchange; run `cargo bench -p honk-core --features dns-bench --bench dns`. `benches/udp.rs` is the candidate-only UDP Criterion suite; run `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`. Lab/deployment harnesses, raw evidence, and their documentation live only on branch `bench`; use `git worktree add ../honk-bench bench` when benchmarking so they never enter the `main` worktree.
 
+`benches/udp_io.rs` drives the production UDP endpoint driver over real loopback I/O (enqueue, driver send, echo peer, receive, anyfrom-style reply socket) and reports packets/s, allocations per packet and process CPU per packet for ordinary and VLESS XUDP source workloads; harness constructors live in `control/udp_endpoint/bench_support/real_io.rs`. Run `cargo bench -p honk-core --bench udp_io -- --save-baseline <sha>`; Criterion's noise threshold is not a regression gate, compare per-run means and confidence intervals.
+
 `benches/reload.rs` measures an unchanged-effective-config runtime reload's wall/CPU time, allocations, and mock eBPF writes; run `cargo bench -p honk-core --bench reload --no-default-features --features reload-alloc-bench`. `.github/workflows/reload-benchmark.yml` compiles the candidate's copy of this file against `main`, so it may only use APIs present on both revisions (or extend that workflow's adapter).
 
 `cargo bench -p honk-outbound --features rprx --bench vless_vision` covers the Vision transport.
