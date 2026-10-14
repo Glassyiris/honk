@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
-use super::{SubscriptionManager, SubscriptionStore};
+use super::{SubscriptionManager, SubscriptionStore, SubscriptionUserinfo};
 use crate::control::ControlCommand;
 use crate::control::ReloadOutcome;
 use tokio::time::Instant;
@@ -27,6 +27,7 @@ pub(crate) struct SubscriptionMergeReply {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ProviderLoad {
     pub(crate) updated_at: Option<SystemTime>,
+    pub(crate) userinfo: SubscriptionUserinfo,
     pub(crate) cached: bool,
     pub(crate) error: Option<&'static str>,
     /// The configuration diagnostic code behind a `publication_rejected` error.
@@ -179,7 +180,7 @@ pub(crate) fn validate_subscription_ids(subscriptions: &[Subscription]) -> anyho
 
 struct FetchCompletion {
     authorized: AuthorizedSubscription,
-    result: Option<anyhow::Result<Vec<Node>>>,
+    result: Option<anyhow::Result<(Vec<Node>, SubscriptionUserinfo)>>,
     diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
 }
 
@@ -200,7 +201,7 @@ async fn fetch_once(
         }
     };
     let result = match fetched {
-        Some(Ok((nodes, content))) => {
+        Some(Ok((nodes, content, userinfo))) => {
             // Once a blocking cache write starts, its owner must join it even on pause/shutdown.
             SubscriptionManager::persist_content(
                 &authorized.subscription,
@@ -210,7 +211,7 @@ async fn fetch_once(
                 0,
             )
             .await;
-            Some(Ok(nodes))
+            Some(Ok((nodes, userinfo)))
         }
         Some(Err(error)) => Some(Err(error)),
         None => None,
@@ -224,6 +225,7 @@ async fn fetch_once(
 }
 struct Flight {
     authorized: AuthorizedSubscription,
+    userinfo: SubscriptionUserinfo,
     #[cfg(feature = "native-api")]
     operation: Option<Box<dyn RefreshReport>>,
 }
@@ -311,6 +313,7 @@ impl SupervisorState {
             id,
             Flight {
                 authorized: provider.authorized.clone(),
+                userinfo: SubscriptionUserinfo::default(),
                 #[cfg(feature = "native-api")]
                 operation: None,
             },
@@ -434,6 +437,7 @@ impl SupervisorState {
                     "Subscription runtime publication acknowledged"
                 );
                 observed.load.updated_at = Some(SystemTime::now());
+                observed.load.userinfo = flight.userinfo;
                 observed.load.cached = false;
                 observed.load.error =
                     matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
@@ -455,6 +459,7 @@ impl SupervisorState {
             }
             (Ok(reply), None) if reply.outcome.accepted() => ProviderLoad {
                 updated_at: Some(SystemTime::now()),
+                userinfo: flight.userinfo,
                 cached: false,
                 error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
                     .then_some("publication_degraded"),
@@ -477,7 +482,8 @@ impl SupervisorState {
     fn fetched(&mut self, completion: FetchCompletion, command_tx: &mpsc::Sender<ControlCommand>) {
         let id = completion.authorized.subscription.id;
         match completion.result {
-            Some(Ok(nodes)) => {
+            Some(Ok((nodes, userinfo))) => {
+                self.flights.get_mut(&id).unwrap().userinfo = userinfo;
                 let command_tx = command_tx.clone();
                 let task = self.publications.spawn(async move {
                     let (result, wait) = oneshot::channel();
@@ -537,6 +543,7 @@ impl SupervisorState {
             id,
             Flight {
                 authorized: provider.authorized.clone(),
+                userinfo: SubscriptionUserinfo::default(),
                 operation: Some(operation),
             },
         );

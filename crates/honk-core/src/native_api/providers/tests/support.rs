@@ -65,7 +65,7 @@ pub(super) async fn respond(mut socket: TcpStream, body: &str) {
     socket
         .write_all(
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nsubscription-userinfo: upload=422986054; download=5198408536; total=214748364800; expire=1796712849\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
