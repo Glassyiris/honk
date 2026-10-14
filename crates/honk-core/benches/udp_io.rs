@@ -11,7 +11,7 @@
 //! the summed CPU cost of the production path plus the (constant) peer. Each
 //! workload also prints allocations per packet and process CPU per packet.
 //!
-//! Run: `cargo bench -p honk-core --bench udp_io -- --save-baseline <sha>`.
+//! Run: `cargo bench -p honk-core --features udp-bench --bench udp_io -- --save-baseline <sha>`.
 //! A new transport shape adds one workload fn that builds an [`IoHarness`]
 //! through an `install_*` constructor and returns a [`Workload`].
 

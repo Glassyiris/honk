@@ -1,5 +1,5 @@
-use super::UdpTerminal;
 use super::*;
+use super::{UdpTerminal, UplinkStall};
 use honk_outbound::proxy::QuicSendAttempt;
 
 /// How long the endpoint driver waits for proxy data before giving up.
@@ -792,10 +792,9 @@ async fn send_one(
         Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
     };
     let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
-    let gate_only = !attempt.as_ref().is_some_and(QuicSendAttempt::is_active)
-        && source_admitted
-            .as_ref()
-            .is_some_and(|admitted| !admitted.load(Ordering::Acquire));
+    let source_admitted = source_admitted.map(|admitted| admitted.load(Ordering::Acquire));
+    let gate_only =
+        !attempt.as_ref().is_some_and(QuicSendAttempt::is_active) && source_admitted == Some(false);
     if let Some(attempt) = attempt {
         match &sent {
             Ok(Ok(_)) if endpoint_retired => attempt.failure(),
@@ -814,8 +813,27 @@ async fn send_one(
         match sent {
             Ok(Ok(started_at)) => Ok(started_at),
             Ok(Err(error)) => Err(classify_send_error(endpoint, error)),
-            Err(error) if gate_only => Err(PacketSendFailure::Congestion(error)),
-            Err(error) => Err(classify_send_error(endpoint, error)),
+            Err(error) if gate_only => {
+                let stalled = endpoint
+                    .source_uplink_stall()
+                    .is_some_and(UplinkStall::unadmitted_deadline);
+                Err(if stalled {
+                    PacketSendFailure::Transport(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "UDP source uplink admitted no datagram within the stall limit",
+                    ))
+                } else {
+                    PacketSendFailure::Congestion(error)
+                })
+            }
+            Err(error) => {
+                if source_admitted == Some(true)
+                    && let Some(stall) = endpoint.source_uplink_stall()
+                {
+                    stall.admitted();
+                }
+                Err(classify_send_error(endpoint, error))
+            }
         }
     };
     if endpoint.is_source()

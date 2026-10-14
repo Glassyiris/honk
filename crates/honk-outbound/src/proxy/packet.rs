@@ -174,12 +174,26 @@ pub trait MultiTargetTransport: PacketTransport {
 pub(crate) struct FramePoison(std::sync::atomic::AtomicBool);
 
 impl FramePoison {
-    pub(crate) fn begin(&self) -> std::io::Result<FrameWrite<'_>> {
-        use std::sync::atomic::Ordering;
-        if self.0.load(Ordering::Acquire) {
+    /// Fails fast on a torn stream without marking a new write in flight.
+    pub(crate) fn check(&self) -> std::io::Result<()> {
+        if self.is_set() {
             return Err(super::FrameInterrupted.into());
         }
-        self.0.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Marks a frame write in flight. From here the write can leave a partial
+    /// frame, so the datagram is `admitted`: a later deadline tears the stream
+    /// rather than staying packet-local congestion.
+    pub(crate) fn begin(
+        &self,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<FrameWrite<'_>> {
+        self.check()?;
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(admitted) = admitted {
+            admitted.store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(FrameWrite(&self.0))
     }
 

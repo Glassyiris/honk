@@ -596,18 +596,17 @@ impl PacketTransport for JuicityUdpTransport {
             let peer = match addr {
                 JuiceAddr::V4(peer) => peer.into(),
                 JuiceAddr::V6(peer) => SocketAddr::new(peer.ip().to_canonical(), peer.port()),
-                JuiceAddr::Domain(domain, port)
-                    if self
-                        .target_domain
-                        .as_deref()
-                        .is_some_and(|expected| domain.eq_ignore_ascii_case(expected))
-                        && port == self.target.port() =>
-                {
-                    self.target
-                }
                 // The frame is already consumed; an unprojectable name is
                 // not resolved and does not end the stream.
-                JuiceAddr::Domain(..) => continue,
+                JuiceAddr::Domain(domain, port) => match super::addr::dialed_domain_peer(
+                    self.target_domain.as_deref(),
+                    self.target,
+                    domain,
+                    port,
+                ) {
+                    Some(peer) => peer,
+                    None => continue,
+                },
             };
             return Ok((payload_len, peer));
         }
@@ -650,15 +649,12 @@ impl JuicityUdpTransport {
         let frame = AddrFraming::SOCKS5.encode(&[], target, domain, data, MAX_PACKET_SIZE)?;
         self.state.touch();
         let mut send = self.send.lock().await;
-        let write = self.poison.begin()?;
+        let write = self.poison.begin(admitted)?;
         send.write_chunk(frame)
             .await
             .map_err(io::Error::other)
             .map_err(super::quic_carrier_io_error)?;
         write.complete();
-        if let Some(admitted) = admitted {
-            admitted.store(true, Ordering::Release);
-        }
         Ok(())
     }
 }

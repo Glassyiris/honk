@@ -864,11 +864,8 @@ impl PacketTransport for TuicUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        let domain = match &self.target_addr {
-            TuicAddr::Addr(SocksAddr::Domain(domain, _)) => Some(domain.as_str()),
-            _ => None,
-        };
-        self.send_to(self.target, domain, data, None).await
+        self.send_to(self.target, self.target_domain(), data, None)
+            .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -888,13 +885,16 @@ impl PacketTransport for TuicUdpTransport {
             let peer = match &msg.addr {
                 TuicAddr::Addr(SocksAddr::V4(peer)) => Some((*peer).into()),
                 TuicAddr::Addr(SocksAddr::V6(peer)) => Some((*peer).into()),
-                TuicAddr::Addr(SocksAddr::Domain(domain, port))
-                    if matches!(&self.target_addr,
-                        TuicAddr::Addr(SocksAddr::Domain(expected, expected_port))
-                            if domain.eq_ignore_ascii_case(expected) && port == expected_port
-                    ) =>
-                {
-                    Some(self.target)
+                TuicAddr::Addr(SocksAddr::Domain(domain, port)) => {
+                    let Some(peer) = super::addr::dialed_domain_peer(
+                        self.target_domain(),
+                        self.target,
+                        domain,
+                        *port,
+                    ) else {
+                        continue;
+                    };
+                    Some(peer)
                 }
                 TuicAddr::None if msg.frag_id != 0 => None,
                 _ => continue,
@@ -925,6 +925,13 @@ impl TuicUdpTransport {
         self.state.conn.remote_address()
     }
 
+    fn target_domain(&self) -> Option<&str> {
+        match &self.target_addr {
+            TuicAddr::Addr(SocksAddr::Domain(domain, _)) => Some(domain),
+            _ => None,
+        }
+    }
+
     pub async fn send_to(
         &self,
         target: SocketAddr,
@@ -935,10 +942,7 @@ impl TuicUdpTransport {
         if data.len() > u16::MAX as usize {
             return Err(super::PacketRejection::InvalidSize.into());
         }
-        let stored_domain = match &self.target_addr {
-            TuicAddr::Addr(SocksAddr::Domain(domain, _)) => Some(domain.as_str()),
-            _ => None,
-        };
+        let stored_domain = self.target_domain();
         let address;
         let addr = if target == self.target && target_domain == stored_domain {
             &self.target_addr

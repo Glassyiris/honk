@@ -105,6 +105,12 @@ impl PacketTransport for MemoryTransport {
         "127.0.0.1:1".parse().unwrap()
     }
 
+    /// Datagrams, like Hy2 and TUIC: an admitted write that times out is
+    /// packet-local congestion, not a torn frame.
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
+    }
+
     async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
         self.fixed_target_sends.fetch_add(1, Ordering::SeqCst);
         Err(io::Error::other("shared source must use send_to"))
@@ -154,6 +160,7 @@ impl MultiTargetTransport for MemoryTransport {
         if let Some(admitted) = admitted {
             admitted.store(true, Ordering::Release);
         }
+
         Ok(())
     }
 
@@ -637,6 +644,139 @@ async fn shared_source_unadmitted_send_timeout_keeps_sibling_views() {
     assert!(!ea.dead.load(Ordering::Acquire) && !eb.dead.load(Ordering::Acquire));
     assert_eq!(transport.sent()[2].data, b"after");
     drop((ea, eb, transport));
+    f.shutdown().await;
+}
+
+/// Unadmitted deadlines stay packet-local only while the uplink still admits
+/// datagrams: once a run of them has lasted the stall limit, the next one fails
+/// the source and charges the node, so replies cannot keep it alive.
+#[tokio::test]
+async fn shared_source_uplink_stalled_past_the_limit_fails_the_node() {
+    let f = Fixture::new(false, 16).await;
+    let (client, a) = (f.client(), f.target(0));
+    let ea = f.flow(0, b"a").await;
+    let transport = f.transport();
+    let owner = f
+        .pool
+        .sources
+        .iter()
+        .next()
+        .map(|entry| Arc::clone(entry.value()))
+        .unwrap();
+    owner.set_send_timeout_for_test(Duration::from_millis(20));
+    let node_alive = |f: &Fixture| {
+        f.alive
+            .is_alive_for(f.node.id, ProbeDomain::DataUdp, f.family)
+    };
+    for _ in 0..49 {
+        f.alive
+            .report_unavailable_traffic(f.node.id, ProbeDomain::DataUdp, f.family);
+    }
+    assert!(node_alive(&f));
+
+    transport
+        .stall_before_admission
+        .store(true, Ordering::SeqCst);
+    owner.uplink_stall.backdate_for_test();
+    drop(owner);
+    f.enqueue(client, a, b"stalls");
+    f.wait_until("source to retire", || f.pool.sources.is_empty())
+        .await;
+    assert!(
+        !node_alive(&f),
+        "an uplink that admits nothing is evidence against the node"
+    );
+    drop((ea, transport));
+    f.shutdown().await;
+}
+
+/// An admitted datagram ends the stall run, so the deadline after it starts a
+/// new run instead of failing the source.
+#[tokio::test]
+async fn shared_source_uplink_stall_restarts_after_progress() {
+    let f = Fixture::new(false, 16).await;
+    let (client, a) = (f.client(), f.target(0));
+    let ea = f.flow(0, b"a").await;
+    let transport = f.transport();
+    let owner = f
+        .pool
+        .sources
+        .iter()
+        .next()
+        .map(|entry| Arc::clone(entry.value()))
+        .unwrap();
+    owner.set_send_timeout_for_test(Duration::from_millis(20));
+    let node_alive = |f: &Fixture| {
+        f.alive
+            .is_alive_for(f.node.id, ProbeDomain::DataUdp, f.family)
+    };
+    for _ in 0..49 {
+        f.alive
+            .report_unavailable_traffic(f.node.id, ProbeDomain::DataUdp, f.family);
+    }
+
+    owner.uplink_stall.backdate_for_test();
+    f.enqueue(client, a, b"progress");
+    transport.wait_sent(2).await;
+    transport
+        .stall_before_admission
+        .store(true, Ordering::SeqCst);
+    f.enqueue(client, a, b"after progress");
+    f.wait_until("deadline after progress", || {
+        transport.cancelled_sends.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(!ea.dead.load(Ordering::Acquire) && !f.pool.sources.is_empty());
+    assert!(node_alive(&f));
+    drop((ea, transport, owner));
+    f.shutdown().await;
+}
+
+/// The stall run only counts deadlines the transport never admitted: a
+/// datagram the driver admitted is progress, so a deadline past the limit
+/// that follows an admitted send leaves the source and its node alive.
+#[tokio::test]
+async fn shared_source_admitted_progress_clears_the_stall_run() {
+    let f = Fixture::new(false, 16).await;
+    let (client, a) = (f.client(), f.target(0));
+    let ea = f.flow(0, b"a").await;
+    let transport = f.transport();
+    let owner = f
+        .pool
+        .sources
+        .iter()
+        .next()
+        .map(|entry| Arc::clone(entry.value()))
+        .unwrap();
+    owner.set_send_timeout_for_test(Duration::from_millis(20));
+    for _ in 0..49 {
+        f.alive
+            .report_unavailable_traffic(f.node.id, ProbeDomain::DataUdp, f.family);
+    }
+
+    // A run is already due; the admitted send lands in it before the next
+    // deadline is charged.
+    owner.uplink_stall.backdate_for_test();
+    f.enqueue(client, a, b"admitted");
+    transport.wait_sent(2).await;
+    transport
+        .stall_before_admission
+        .store(true, Ordering::SeqCst);
+    f.enqueue(client, a, b"stalls");
+    f.wait_until("the unadmitted deadline", || {
+        transport.cancelled_sends.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(
+        !ea.dead.load(Ordering::Acquire) && !f.pool.sources.is_empty(),
+        "the admitted send cleared the run, so this one is a fresh start"
+    );
+    assert!(
+        f.alive
+            .is_alive_for(f.node.id, ProbeDomain::DataUdp, f.family),
+        "a fresh run does not charge the node"
+    );
+    drop((ea, transport, owner));
     f.shutdown().await;
 }
 

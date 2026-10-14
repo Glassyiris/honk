@@ -14,6 +14,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use honk_outbound::group::{ScoreOutcome, ScoreReporter};
 use parking_lot::Mutex;
+pub(in crate::control) use source::UplinkStall;
 use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
@@ -521,6 +522,13 @@ impl UdpEndpoint {
     fn fail_source(&self, outcome: ScoreOutcome) {
         if let EndpointTransport::Source(source) = &self.transport {
             source.fail(outcome);
+        }
+    }
+
+    fn source_uplink_stall(&self) -> Option<&UplinkStall> {
+        match &self.transport {
+            EndpointTransport::Flow(_) => None,
+            EndpointTransport::Source(source) => Some(source.uplink_stall()),
         }
     }
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -28,10 +28,7 @@ impl VlessPacketWriter {
         observed: bool,
         admitted: Option<&AtomicBool>,
     ) -> std::io::Result<()> {
-        let write = poison.begin()?;
-        if let Some(admitted) = admitted {
-            admitted.store(true, Ordering::Release);
-        }
+        let write = poison.begin(admitted)?;
         let stream = &mut self.stream;
         let write_all = async {
             stream.write_all(frame).await?;

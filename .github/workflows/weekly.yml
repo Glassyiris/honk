@@ -83,7 +83,7 @@ jobs:
           bpf-linker --version
       # Floating selectors deliberately bypass the repository pins to expose drift.
       - run: cargo +stable fmt --all -- --check
-      - run: cargo +stable clippy --all --all-targets -- -D warnings
+      - run: cargo +stable clippy --all --all-targets --features honk-core/udp-bench -- -D warnings
       - run: cargo +stable nextest run --workspace --profile ci
       - name: Upload preview JUnit
         if: failure()
@@ -99,7 +99,7 @@ jobs:
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
 
   public-vless-loopback:
-    name: Public VLESS loopback interop (3 cases)
+    name: Public VLESS and shared-source loopback interop (4 cases)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -159,31 +159,20 @@ jobs:
           set -euo pipefail
           test -x "$HONK_XRAY_BIN"
           test -x "$HONK_SING_BOX_BIN"
-          udp_test=official_xray_and_sing_box_vless_udp_loopback_interop
-          reality_test=reality::official_xray_reality_authenticates_first_connection_and_rejects_wrong_key
-          filter="test(=$udp_test) or test(=$reality_test)"
-          cargo nextest list -p honk-outbound --features rprx --test vless_udp --profile ci \
-            --run-ignored only -E "$filter" --message-format json > "$RUNNER_TEMP/public-vless-tests.json"
-          jq -e --arg udp "$udp_test" --arg reality "$reality_test" '
-            [."rust-suites"[].testcases | to_entries[]
-              | select(.value["filter-match"].status == "matches" and .value.ignored) | .key]
-            | sort == ([$udp, $reality] | sort)
-          ' "$RUNNER_TEMP/public-vless-tests.json"
-          cargo nextest run -p honk-outbound --features rprx --test vless_udp --profile ci \
-            --run-ignored only -E "$filter" --no-tests fail
+          ci/run-exact-ignored-tests.sh --test vless_udp \
+            official_xray_and_sing_box_vless_udp_loopback_interop \
+            'reality::official_xray_reality_authenticates_first_connection_and_rejects_wrong_key'
       - name: Run the official Vision uplink Direct case
         run: |
           set -euo pipefail
-          vision_test=proxy::vless::handler::tests::interop::official_vision_peers_switch_inner_tls_to_direct
-          cargo nextest list -p honk-outbound --features rprx --lib --profile ci \
-            --run-ignored only -E "test(=$vision_test)" --message-format json > "$RUNNER_TEMP/public-vision-tests.json"
-          jq -e --arg vision "$vision_test" '
-            [."rust-suites"[].testcases | to_entries[]
-              | select(.value["filter-match"].status == "matches" and .value.ignored) | .key]
-            == [$vision]
-          ' "$RUNNER_TEMP/public-vision-tests.json"
-          cargo nextest run -p honk-outbound --features rprx --lib --profile ci \
-            --run-ignored only -E "test(=$vision_test)" --no-tests fail
+          ci/run-exact-ignored-tests.sh --lib \
+            proxy::vless::handler::tests::interop::official_vision_peers_switch_inner_tls_to_direct
+      - name: Run the shared-source sing-box interop matrix
+        run: |
+          set -euo pipefail
+          test -x "$HONK_SING_BOX_BIN"
+          ci/run-exact-ignored-tests.sh --test shared_source_sing_box \
+            sing_box_shared_source_eim_eif_and_domain_matrix
       - name: Upload public loopback JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

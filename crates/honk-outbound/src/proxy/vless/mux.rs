@@ -307,19 +307,30 @@ async fn send_owned(
     mut data: Bytes,
 ) -> io::Result<()> {
     while !data.is_empty() {
-        send.reserve_capacity(data.len());
+        let capacity = reserve(send, carrier, data.len()).await?;
+        send.send_data(data.split_to(capacity.min(data.len())), false)
+            .map_err(|error| h2_io(carrier, error))?;
+    }
+    Ok(())
+}
+
+/// Waits for flow-control capacity toward `wanted` bytes. h2 reports a grant
+/// only once, so the caller queues against it before waiting again.
+async fn reserve(
+    send: &mut h2::SendStream<Bytes>,
+    carrier: &CarrierFailure,
+    wanted: usize,
+) -> io::Result<usize> {
+    loop {
+        send.reserve_capacity(wanted);
         let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "H2MUX stream closed"))?
             .map_err(|error| h2_io(carrier, error))?;
-        if capacity == 0 {
-            continue;
+        if capacity != 0 {
+            return Ok(capacity);
         }
-        let chunk = data.split_to(capacity.min(data.len()));
-        send.send_data(chunk, false)
-            .map_err(|error| h2_io(carrier, error))?;
     }
-    Ok(())
 }
 
 struct MuxSendStream {
@@ -711,18 +722,25 @@ impl VlessMuxUdpTransport {
         admitted: Option<&AtomicBool>,
     ) -> io::Result<()> {
         let mut writer = self.writer.lock().await;
-        let frame = AddrFraming::SOCKS5.encode(
+        let mut frame = AddrFraming::SOCKS5.encode(
             writer.setup.as_deref().unwrap_or_default(),
             target,
             domain,
             data,
             crate::proxy::uot::MAX_PACKET_SIZE,
         )?;
-        let write = self.poison.begin()?;
-        if let Some(admitted) = admitted {
-            admitted.store(true, Ordering::Release);
-        }
+        self.poison.check()?;
         let writer = &mut *writer;
+        // A flow-control wait before the first chunk has written nothing, so
+        // admission and poisoning start once capacity is granted: a deadline
+        // during the wait is packet-local and the stream stays usable, while a
+        // later chunk can leave a partial frame.
+        let capacity = reserve(&mut writer.send, &writer.carrier, frame.len()).await?;
+        let write = self.poison.begin(admitted)?;
+        writer
+            .send
+            .send_data(frame.split_to(capacity.min(frame.len())), false)
+            .map_err(|error| h2_io(&writer.carrier, error))?;
         send_owned(&mut writer.send, &writer.carrier, frame).await?;
         writer.setup = None;
         write.complete();
