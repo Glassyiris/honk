@@ -82,10 +82,20 @@ impl Defragmenter {
         }
         let frag_total = usize::from(frag_total);
         if self.map.len() >= DEFRAG_MAX_PENDING && !self.map.contains_key(&packet_key) {
+            let now = Instant::now();
             self.map
-                .retain(|_, buffer| buffer.updated.elapsed() < DEFRAG_MAX_AGE);
-            if self.map.len() >= DEFRAG_MAX_PENDING {
-                return None;
+                .retain(|_, buffer| now.duration_since(buffer.updated) < DEFRAG_MAX_AGE);
+            // One table serves every destination of a source, so groups whose
+            // fragments were lost must not pin it for the full age and starve
+            // the other destinations' multi-fragment replies.
+            if self.map.len() >= DEFRAG_MAX_PENDING
+                && let Some(oldest) = self
+                    .map
+                    .iter()
+                    .min_by_key(|(_, buffer)| buffer.updated)
+                    .map(|(key, _)| *key)
+            {
+                self.map.remove(&oldest);
             }
         }
         let entry = self.map.entry(packet_key).or_insert_with(|| DefragBuffer {
@@ -316,9 +326,7 @@ mod tests {
         for packet in 0..DEFRAG_MAX_PENDING as u16 {
             assert!(defrag.feed(packet, 0, 2, Some(PEER), vec![1]).is_none());
         }
-        assert!(defrag.feed(100, 0, 2, Some(PEER), vec![1]).is_none());
         assert_eq!(defrag.map.len(), DEFRAG_MAX_PENDING);
-        assert!(!defrag.map.contains_key(&((1 << 16) | 100)));
         for entry in defrag.map.values_mut() {
             entry.updated = Instant::now() - DEFRAG_MAX_AGE;
         }
@@ -328,6 +336,54 @@ mod tests {
             defrag.feed(100, 0, 2, Some(PEER), vec![1]),
             Some((vec![1, 2], PEER))
         );
+    }
+
+    #[test]
+    fn full_table_evicts_the_oldest_pending_group_for_a_new_datagram() {
+        let mut defrag = Defragmenter::new(4);
+        for packet in 0..DEFRAG_MAX_PENDING as u16 {
+            assert!(defrag.feed(packet, 0, 2, Some(PEER), vec![1]).is_none());
+        }
+        let stale = (1 << 16) | 17;
+        defrag.map.get_mut(&stale).unwrap().updated = Instant::now() - Duration::from_secs(5);
+
+        assert!(defrag.feed(100, 0, 2, Some(PEER), vec![1]).is_none());
+        assert_eq!(defrag.map.len(), DEFRAG_MAX_PENDING);
+        assert!(!defrag.map.contains_key(&stale));
+        assert!(defrag.map.contains_key(&(1 << 16)));
+        assert_eq!(
+            defrag.feed(100, 1, 2, None, vec![2]),
+            Some((vec![1, 2], PEER))
+        );
+    }
+
+    #[test]
+    fn full_table_spares_live_groups_when_a_group_continues_or_a_slot_frees() {
+        let fill = || {
+            let mut defrag = Defragmenter::new(4);
+            for packet in 0..DEFRAG_MAX_PENDING as u16 {
+                assert!(defrag.feed(packet, 0, 2, Some(PEER), vec![1]).is_none());
+            }
+            defrag
+        };
+
+        // The oldest group's own continuation completes it rather than evicting it.
+        let mut defrag = fill();
+        let oldest = (1 << 16) | 5;
+        defrag.map.get_mut(&oldest).unwrap().updated = Instant::now() - Duration::from_secs(5);
+        assert_eq!(
+            defrag.feed(5, 1, 2, None, vec![2]),
+            Some((vec![1, 2], PEER))
+        );
+        assert_eq!(defrag.map.len(), DEFRAG_MAX_PENDING - 1);
+
+        // An expired group frees the slot, so no live group is evicted.
+        let mut defrag = fill();
+        let expired = (1 << 16) | 9;
+        defrag.map.get_mut(&expired).unwrap().updated = Instant::now() - DEFRAG_MAX_AGE;
+        assert!(defrag.feed(100, 0, 2, Some(PEER), vec![1]).is_none());
+        assert_eq!(defrag.map.len(), DEFRAG_MAX_PENDING);
+        assert!(!defrag.map.contains_key(&expired));
     }
 
     #[test]
