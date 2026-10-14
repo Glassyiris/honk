@@ -677,7 +677,7 @@ async fn shared_source_uplink_stalled_past_the_limit_fails_the_node() {
     transport
         .stall_before_admission
         .store(true, Ordering::SeqCst);
-    owner.uplink_stall.backdate_for_test(false);
+    owner.uplink_stall.backdate_for_test();
     drop(owner);
     f.enqueue(client, a, b"stalls");
     f.wait_until("source to retire", || f.pool.sources.is_empty())
@@ -690,11 +690,10 @@ async fn shared_source_uplink_stalled_past_the_limit_fails_the_node() {
     f.shutdown().await;
 }
 
-/// The stall run is about a continuously wedged uplink: an admitted datagram
-/// ends it, and a deadline after a quiet gap longer than the limit starts a
-/// new one instead of failing a source that was merely idle.
+/// An admitted datagram ends the stall run, so the deadline after it starts a
+/// new run instead of failing the source.
 #[tokio::test]
-async fn shared_source_uplink_stall_restarts_after_progress_or_a_quiet_gap() {
+async fn shared_source_uplink_stall_restarts_after_progress() {
     let f = Fixture::new(false, 16).await;
     let (client, a) = (f.client(), f.target(0));
     let ea = f.flow(0, b"a").await;
@@ -716,7 +715,7 @@ async fn shared_source_uplink_stall_restarts_after_progress_or_a_quiet_gap() {
             .report_unavailable_traffic(f.node.id, ProbeDomain::DataUdp, f.family);
     }
 
-    owner.uplink_stall.backdate_for_test(false);
+    owner.uplink_stall.backdate_for_test();
     f.enqueue(client, a, b"progress");
     transport.wait_sent(2).await;
     transport
@@ -725,14 +724,6 @@ async fn shared_source_uplink_stall_restarts_after_progress_or_a_quiet_gap() {
     f.enqueue(client, a, b"after progress");
     f.wait_until("deadline after progress", || {
         transport.cancelled_sends.load(Ordering::SeqCst) == 1
-    })
-    .await;
-    assert!(!ea.dead.load(Ordering::Acquire) && !f.pool.sources.is_empty());
-
-    owner.uplink_stall.backdate_for_test(true);
-    f.enqueue(client, a, b"after a quiet gap");
-    f.wait_until("deadline after a quiet gap", || {
-        transport.cancelled_sends.load(Ordering::SeqCst) == 2
     })
     .await;
     assert!(!ea.dead.load(Ordering::Acquire) && !f.pool.sources.is_empty());
@@ -765,7 +756,7 @@ async fn shared_source_admitted_progress_clears_the_stall_run() {
 
     // A run is already due; the admitted send lands in it before the next
     // deadline is charged.
-    owner.uplink_stall.backdate_for_test(false);
+    owner.uplink_stall.backdate_for_test();
     f.enqueue(client, a, b"admitted");
     transport.wait_sent(2).await;
     transport
