@@ -68,7 +68,9 @@ impl SourceTransport {
         });
     }
 
-    pub(super) fn is_vless(&self) -> bool {
+    /// VLESS refuses an empty datagram before anything was sent; Hy2, TUIC and
+    /// the shared carriers send zero-length datagrams.
+    pub(super) fn rejects_empty_first_datagram(&self) -> bool {
         match self {
             #[cfg(feature = "rprx")]
             Self::Vless(_) => true,

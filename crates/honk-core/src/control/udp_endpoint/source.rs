@@ -572,7 +572,7 @@ impl SourceEndpoint {
                     "UDP source retired before send",
                 ));
             }
-            if self.owner.transport.is_vless()
+            if self.owner.transport.rejects_empty_first_datagram()
                 && !self.owner.sent.load(Ordering::Acquire)
                 && data.is_empty()
             {
@@ -588,9 +588,8 @@ impl SourceEndpoint {
                 clear_intent: false,
             }
         };
-        if !self.owner.transport.is_vless() {
-            *attempt = Some(QuicSendAttempt::new(self.packet_transport()));
-        }
+        // Transports without QUIC path health hand out an inactive attempt.
+        *attempt = Some(QuicSendAttempt::new(self.packet_transport()));
         let started_at = record_start.then(Instant::now);
         self.owner.begin_receive();
         let result = self
