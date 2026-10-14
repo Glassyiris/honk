@@ -3,9 +3,10 @@
 //! These helpers exercise the production reservation and Ready fast-path
 //! state machines without duplicating them. They create no socket, runtime,
 //! or task; all resources are dropped and checked before a batch returns.
-//! [`real_io`] is the exception: it owns loopback sockets and spawns the
-//! production driver for the real-I/O benchmark.
+//! `real_io` (feature `udp-bench`) is the exception: it owns loopback sockets
+//! and spawns the production driver for the real-I/O benchmark.
 
+#[cfg(feature = "udp-bench")]
 pub mod real_io;
 
 use super::{

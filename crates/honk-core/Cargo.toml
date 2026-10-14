@@ -127,6 +127,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
 dns-bench = []
+udp-bench = []
 reload-bench = []
 reload-alloc-bench = ["reload-bench"]
 reload-bench-counters = ["reload-bench"]
@@ -169,6 +170,7 @@ harness = false
 [[bench]]
 name = "udp_io"
 harness = false
+required-features = ["udp-bench"]
 
 [[bench]]
 name = "reload"
