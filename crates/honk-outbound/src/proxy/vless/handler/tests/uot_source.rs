@@ -268,3 +268,32 @@ async fn dropping_a_uot_transport_closes_its_stream() {
     .unwrap();
     assert!(rest.is_empty());
 }
+
+/// A frame write cancelled halfway leaves a torn frame on the shared stream;
+/// a sibling destination must fail rather than append to it, even once the
+/// peer drains again.
+#[tokio::test]
+async fn uot_cancelled_partial_write_poisons_the_shared_stream() {
+    let (client, mut wire) = tokio::io::duplex(16);
+    let transport = VlessUotTransport::new(
+        Box::new(client),
+        sock(A),
+        None,
+        bytes::Bytes::from_static(&A_REQUEST),
+    );
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        transport.send_to(sock(A), None, &[7; 4096], false, None),
+    )
+    .await;
+    assert!(stalled.is_err(), "the unread stream must stall the write");
+    assert!(transport.frame_stream_torn());
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut wire, &mut tokio::io::sink()).await;
+    });
+    let error = transport
+        .send_to(sock(B), None, b"b", false, None)
+        .await
+        .unwrap_err();
+    assert!(crate::proxy::is_frame_interrupted(&error));
+}

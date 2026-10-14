@@ -244,6 +244,48 @@ async fn uplink_boundaries_and_unknown_reply_atyp() {
     server.abort();
 }
 
+/// A write cancelled while the peer's window is closed leaves the shared
+/// stream poisoned; a sibling destination must fail instead of appending.
+#[tokio::test]
+async fn cancelled_write_poisons_the_shared_stream() {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let server = tokio::spawn(serve_with(server, |request, mut respond| async move {
+        let _send = respond
+            .send_response(http::Response::new(()), false)
+            .unwrap();
+        // Never reading the body keeps the default 64 KiB window closed.
+        let _recv = request.into_body();
+        std::future::pending::<()>().await;
+    }));
+    let session = connect(Box::new(client), false).await.unwrap();
+    let udp = pa_open(&session, PA_A, None).await;
+    let maximum = vec![0x77; crate::proxy::uot::MAX_PACKET_SIZE];
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        udp.send_to(
+            "203.0.113.20:5302".parse().unwrap(),
+            None,
+            &maximum,
+            false,
+            None,
+        ),
+    )
+    .await;
+    assert!(stalled.is_err(), "the closed window must stall the write");
+    assert!(udp.frame_stream_torn());
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        udp.send_to(PA_A.parse().unwrap(), None, b"x", false, None),
+    )
+    .await
+    .expect("a poisoned stream refuses the next frame instead of queueing it")
+    .unwrap_err();
+    assert!(crate::proxy::is_frame_interrupted(&error));
+    drop(udp);
+    session.close();
+    server.abort();
+}
+
 /// Dropped (foreign-domain) frames must return their H2 credit: this server
 /// sends ~10 MB of them, far above any receive window, before one real frame.
 #[tokio::test]
