@@ -593,7 +593,9 @@ impl SourceEndpoint {
                 clear_intent: false,
             }
         };
-        // Transports without QUIC path health hand out an inactive attempt.
+        // Present for every carrier so the driver reads one admission rule:
+        // QUIC carriers hand out an active token, the others an inactive one,
+        // and the token decides which path classifies the deadline.
         *attempt = Some(QuicSendAttempt::new(self.packet_transport()));
         let started_at = record_start.then(Instant::now);
         self.owner.begin_receive();
