@@ -366,10 +366,38 @@ fn subscription_client() -> anyhow::Result<crate::marked_http::Client> {
     crate::marked_http::Client::new()
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SubscriptionUserinfo {
+    pub(crate) upload: Option<u64>,
+    pub(crate) download: Option<u64>,
+    pub(crate) total: Option<u64>,
+    pub(crate) expire: Option<u64>,
+}
+
+fn parse_subscription_userinfo(header: &str) -> SubscriptionUserinfo {
+    let mut userinfo = SubscriptionUserinfo::default();
+    for pair in header.split(';') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        match key.trim() {
+            "upload" => userinfo.upload = Some(value),
+            "download" => userinfo.download = Some(value),
+            "total" => userinfo.total = (value != 0).then_some(value),
+            "expire" => userinfo.expire = (value != 0).then_some(value),
+            _ => {}
+        }
+    }
+    userinfo
+}
+
 async fn fetch_body(
     client: &crate::marked_http::Client,
     sub: &Subscription,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(Vec<u8>, SubscriptionUserinfo)> {
     fetch_following(sub, route::Hop::Direct(client)).await
 }
 
@@ -392,7 +420,10 @@ fn subscription_request_headers(sub: &Subscription) -> anyhow::Result<http::Head
 /// Fetches the subscription over `hop`, direct or routed alike. Redirects
 /// are followed here, not by the client, so each hop is checked against the
 /// original origin and cross-origin hops drop credentials.
-async fn fetch_following(sub: &Subscription, hop: route::Hop<'_>) -> anyhow::Result<Vec<u8>> {
+async fn fetch_following(
+    sub: &Subscription,
+    hop: route::Hop<'_>,
+) -> anyhow::Result<(Vec<u8>, SubscriptionUserinfo)> {
     let deadline = tokio::time::Instant::now() + SUBSCRIPTION_TIMEOUT;
     let mut url = reqwest::Url::parse(&sub.url)?;
     let mut headers = subscription_request_headers(sub)?;
@@ -426,7 +457,13 @@ async fn fetch_following(sub: &Subscription, hop: route::Hop<'_>) -> anyhow::Res
             "subscription server answered HTTP {}",
             reply.status
         );
-        return Ok(reply.body.to_vec());
+        let userinfo = reply
+            .subscription_userinfo
+            .as_ref()
+            .and_then(|header| header.to_str().ok())
+            .map(parse_subscription_userinfo)
+            .unwrap_or_default();
+        return Ok((reply.body.to_vec(), userinfo));
     }
     unreachable!("redirect bound checked before following");
 }
@@ -500,7 +537,7 @@ impl SubscriptionManager {
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Vec<Node>> {
         let start = diagnostics.len();
-        let (nodes, content) = self.fetch_content(sub, diagnostics).await?;
+        let (nodes, content, _) = self.fetch_content(sub, diagnostics).await?;
         Self::persist_content(sub, store, content, diagnostics, start).await;
         Ok(nodes)
     }
@@ -509,8 +546,8 @@ impl SubscriptionManager {
         &self,
         sub: &Subscription,
         diagnostics: &mut Vec<DetailedDiagnostic>,
-    ) -> anyhow::Result<(Vec<Node>, String)> {
-        let body = if route::direct(sub) {
+    ) -> anyhow::Result<(Vec<Node>, String, SubscriptionUserinfo)> {
+        let (body, userinfo) = if route::direct(sub) {
             match &self.http {
                 SubscriptionHttp::Shared(client) => fetch_body(client, sub).await?,
                 #[cfg(feature = "native-api")]
@@ -532,7 +569,7 @@ impl SubscriptionManager {
             diagnostics,
         )?;
         let nodes = parse_subscription_content_with_diagnostics(sub, &content, diagnostics)?;
-        Ok((nodes, content))
+        Ok((nodes, content, userinfo))
     }
 
     async fn persist_content(

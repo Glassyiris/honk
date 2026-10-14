@@ -278,6 +278,7 @@ async fn shutdown_joins_fetches_and_keeps_the_accepted_load() {
         .unwrap()
         .load = ProviderLoad {
         updated_at: Some(accepted_at),
+        userinfo: SubscriptionUserinfo::default(),
         cached: true,
         error: Some("cache_load_failed"),
         rejection: None,
@@ -356,7 +357,7 @@ fn shutdown_joins_queued_blocking_persistence() {
             }
             FetchCompletion {
                 authorized: fetched,
-                result: Some(Ok(Vec::new())),
+                result: Some(Ok((Vec::new(), SubscriptionUserinfo::default()))),
                 diagnostics,
             }
         });
@@ -854,6 +855,7 @@ async fn startup_fetch_replaces_the_providers_own_nodes() {
         .unwrap()
         .load = ProviderLoad {
         updated_at: None,
+        userinfo: SubscriptionUserinfo::default(),
         cached: true,
         error: Some("publication_rejected"),
         rejection: Some("duplicate-node-id"),

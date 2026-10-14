@@ -1,4 +1,4 @@
-use super::{Subscription, fetch_body, subscription_client};
+use super::{Subscription, SubscriptionUserinfo, fetch_body, subscription_client};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -10,7 +10,7 @@ type ThreadResult = Result<(), &'static str>;
 
 struct Request {
     subscription: Subscription,
-    reply: oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    reply: oneshot::Sender<anyhow::Result<(Vec<u8>, SubscriptionUserinfo)>>,
 }
 
 struct NetworkThread {
@@ -148,7 +148,10 @@ impl SubscriptionNetwork {
         Self::await_ready(&mut *self.state.lock().await).await
     }
 
-    pub(super) async fn fetch(&self, subscription: &Subscription) -> anyhow::Result<Vec<u8>> {
+    pub(super) async fn fetch(
+        &self,
+        subscription: &Subscription,
+    ) -> anyhow::Result<(Vec<u8>, SubscriptionUserinfo)> {
         let sender = {
             let mut state = self.state.lock().await;
             Self::await_ready(&mut state).await?;

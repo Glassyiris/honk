@@ -44,7 +44,7 @@ async fn completed_request_leaves_no_keepalive_before_pause() {
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")
         .await
         .unwrap();
-    assert_eq!(fetch.await.unwrap().unwrap(), b"body");
+    assert_eq!(fetch.await.unwrap().unwrap().0, b"body");
     // The marked client owns one connection per request and keeps no idle pool.
     peer_eof(&mut socket).await;
     network.pause().await.unwrap();
@@ -104,7 +104,7 @@ async fn held_resolver() -> (
     Arc<SubscriptionNetwork>,
     Arc<BlockingResolver>,
     std::sync::mpsc::Sender<()>,
-    JoinHandle<anyhow::Result<Vec<u8>>>,
+    JoinHandle<anyhow::Result<(Vec<u8>, super::super::SubscriptionUserinfo)>>,
 ) {
     let (entered, started) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
