@@ -599,7 +599,9 @@ DNS 直接丢弃，流式协议会整帧消费被丢弃的帧后再读下一帧�
 错误。`send_packet` 与 `send_to` 共用一个未装箱 helper；`confirmed` 只在各 view 的
 首个 datagram 上传给 transport，`admitted` 在 datagram 进入线路或 writer 队列时
 设置。可靠流 carrier（Trojan、Juicity、AnyTLS、UoT、H2MUX）的部分帧超时对整个
-source 保持终止性，因此共用一条流的各目的地也共享其队头阻塞与失败命运。写到一半
+source 保持终止性，因此共用一条流的各目的地也共享其队头阻塞与失败命运。H2MUX
+只在第一个分块交给 h2 时才 admit 该 datagram 并开始中毒标记，因此任何字节入队前
+的流控等待超时属于包局部拥塞，流仍可继续使用。写到一半
 被取消的帧会使该流带着类型化的 `FrameInterrupted` 中毒：下一次发送失败并退役该
 source 的所有目的地，而不会接在残帧后面。若该写入是被其 view 自身的退役所取消，
 这次退役是中性取消，不向节点记入健康或 Score；因超时造成的撕裂仍是传输失败。

@@ -685,7 +685,10 @@ share one unboxed helper; `confirmed` reaches the transport only on each view's
 first datagram, and `admitted` is set when the datagram reached the wire path or
 the writer queue. Reliable-stream carriers (Trojan, Juicity, AnyTLS, UoT, H2MUX)
 keep a partial-frame timeout terminal for the whole source, so destinations
-sharing a stream also share its head-of-line blocking and failure fate. A frame
+sharing a stream also share its head-of-line blocking and failure fate. H2MUX
+admits a datagram and starts its poison only when the first chunk is queued to
+h2, so a flow-control wait before any byte is queued times out as packet-local
+congestion and leaves the stream usable. A frame
 write cancelled halfway poisons the stream with a typed `FrameInterrupted`: the
 next send fails and the source retires every destination instead of appending to
 a torn frame. When a view's own retirement cancelled that write, the retirement

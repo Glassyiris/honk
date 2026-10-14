@@ -260,6 +260,7 @@ async fn cancelled_write_poisons_the_shared_stream() {
     let session = connect(Box::new(client), false).await.unwrap();
     let udp = pa_open(&session, PA_A, None).await;
     let maximum = vec![0x77; crate::proxy::uot::MAX_PACKET_SIZE];
+    let admitted = std::sync::atomic::AtomicBool::new(false);
     let stalled = tokio::time::timeout(
         std::time::Duration::from_millis(200),
         udp.send_to(
@@ -267,11 +268,13 @@ async fn cancelled_write_poisons_the_shared_stream() {
             None,
             &maximum,
             false,
-            None,
+            Some(&admitted),
         ),
     )
     .await;
     assert!(stalled.is_err(), "the closed window must stall the write");
+    // The first chunk was queued, so a partial frame is on the stream.
+    assert!(admitted.load(std::sync::atomic::Ordering::Acquire));
     assert!(udp.frame_stream_torn());
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -281,6 +284,83 @@ async fn cancelled_write_poisons_the_shared_stream() {
     .expect("a poisoned stream refuses the next frame instead of queueing it")
     .unwrap_err();
     assert!(crate::proxy::is_frame_interrupted(&error));
+    drop(udp);
+    session.close();
+    server.abort();
+}
+
+/// A flow-control wait before any byte is queued writes nothing: the deadline
+/// is packet-local (unadmitted), no partial frame is left, and the next send
+/// goes out whole once the peer reads again.
+#[tokio::test]
+async fn unqueued_window_stall_is_packet_local_and_leaves_the_stream_usable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let reopen = Arc::new(tokio::sync::Notify::new());
+    let received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+    let server = tokio::spawn(serve_with(server, {
+        let (reopen, received) = (Arc::clone(&reopen), Arc::clone(&received));
+        move |request, mut respond| {
+            let (reopen, received) = (Arc::clone(&reopen), Arc::clone(&received));
+            async move {
+                let _send = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let mut recv = request.into_body();
+                reopen.notified().await;
+                while let Some(Ok(data)) = recv.data().await {
+                    received.lock().extend_from_slice(&data);
+                    if recv.flow_control().release_capacity(data.len()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }));
+    let session = connect(Box::new(client), false).await.unwrap();
+    let udp = pa_open(&session, PA_A, None).await;
+    let (a, b) = (PA_A.parse().unwrap(), "203.0.113.20:5302".parse().unwrap());
+
+    // Request (9) + address (5) + port (2) + length (2) + payload fill the
+    // default 64 KiB window exactly, and the frame is queued whole.
+    let filler = vec![0x11; 65_535 - 18];
+    udp.send_to(a, None, &filler, false, None).await.unwrap();
+
+    let admitted = AtomicBool::new(false);
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        udp.send_to(b, None, b"x", false, Some(&admitted)),
+    )
+    .await;
+    assert!(stalled.is_err(), "the exhausted window must stall the send");
+    assert!(!admitted.load(Ordering::Acquire));
+    assert!(!udp.frame_stream_torn());
+
+    reopen.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        udp.send_to(b, None, b"y", false, None),
+    )
+    .await
+    .expect("the stream must accept a frame once the peer reads")
+    .unwrap();
+    let tail = pa_frame(&PA_B_ADDR, 5302, b"y");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while received.lock().len() < 65_535 + tail.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server must receive both frames");
+    let received = received.lock();
+    assert_eq!(received.len(), 65_535 + tail.len());
+    assert_eq!(
+        received[65_535..],
+        tail[..],
+        "no partial frame from the cancelled send"
+    );
+    drop(received);
     drop(udp);
     session.close();
     server.abort();
