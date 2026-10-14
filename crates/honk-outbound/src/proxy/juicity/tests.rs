@@ -629,10 +629,13 @@ async fn stream_failure_ends_the_transport() {
 }
 
 /// `write_chunk` is not cancellation safe: a frame cancelled while QUIC flow
-/// control holds it back may be torn, so a sibling destination must fail
-/// instead of extending it, even once the server reads again.
+/// control holds it back may be torn, so the stalled datagram counts as
+/// admitted (a terminal deadline) and a sibling destination must fail instead
+/// of extending it, even once the server reads again.
 #[tokio::test]
 async fn cancelled_frame_write_poisons_the_shared_stream() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let (server, mut streams) = start_wire_server().await;
     let a: SocketAddr = "192.0.2.1:53".parse().unwrap();
     let b: SocketAddr = "192.0.2.2:53".parse().unwrap();
@@ -644,9 +647,11 @@ async fn cancelled_frame_write_poisons_the_shared_stream() {
     let stream = streams.recv().await.unwrap();
     stream.cmd.send(Cmd::Pause(true)).unwrap();
     let frame = vec![0u8; 60_000];
+    let admitted = AtomicBool::new(false);
     let mut stalled = false;
     for _ in 0..400 {
-        let write = transport.send_to(a, None, &frame, false, None);
+        admitted.store(false, Ordering::SeqCst);
+        let write = transport.send_to(a, None, &frame, false, Some(&admitted));
         if tokio::time::timeout(Duration::from_millis(100), write)
             .await
             .is_err()
@@ -656,6 +661,7 @@ async fn cancelled_frame_write_poisons_the_shared_stream() {
         }
     }
     assert!(stalled, "flow control must eventually hold a frame back");
+    assert!(admitted.load(Ordering::SeqCst));
     stream.cmd.send(Cmd::Pause(false)).unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let error = transport

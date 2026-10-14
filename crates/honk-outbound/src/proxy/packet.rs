@@ -182,9 +182,18 @@ impl FramePoison {
         Ok(())
     }
 
-    pub(crate) fn begin(&self) -> std::io::Result<FrameWrite<'_>> {
+    /// Marks a frame write in flight. From here the write can leave a partial
+    /// frame, so the datagram is `admitted`: a later deadline tears the stream
+    /// rather than staying packet-local congestion.
+    pub(crate) fn begin(
+        &self,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<FrameWrite<'_>> {
         self.check()?;
         self.0.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(admitted) = admitted {
+            admitted.store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(FrameWrite(&self.0))
     }
 

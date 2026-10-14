@@ -736,10 +736,7 @@ impl VlessMuxUdpTransport {
         // during the wait is packet-local and the stream stays usable, while a
         // later chunk can leave a partial frame.
         let capacity = reserve(&mut writer.send, &writer.carrier, frame.len()).await?;
-        let write = self.poison.begin()?;
-        if let Some(admitted) = admitted {
-            admitted.store(true, Ordering::Release);
-        }
+        let write = self.poison.begin(admitted)?;
         writer
             .send
             .send_data(frame.split_to(capacity.min(frame.len())), false)

@@ -541,12 +541,7 @@ impl TrojanUdpTransport {
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
-        let write = self.poison.begin()?;
-        // From here a deadline can leave a partial frame on the shared
-        // stream; the poison keeps the next sender from extending it.
-        if let Some(admitted) = admitted {
-            admitted.store(true, std::sync::atomic::Ordering::Release);
-        }
+        let write = self.poison.begin(admitted)?;
         writer.write_all(&frame).await?;
         writer.flush().await?;
         write.complete();

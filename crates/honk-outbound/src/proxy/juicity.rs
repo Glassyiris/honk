@@ -649,15 +649,12 @@ impl JuicityUdpTransport {
         let frame = AddrFraming::SOCKS5.encode(&[], target, domain, data, MAX_PACKET_SIZE)?;
         self.state.touch();
         let mut send = self.send.lock().await;
-        let write = self.poison.begin()?;
+        let write = self.poison.begin(admitted)?;
         send.write_chunk(frame)
             .await
             .map_err(io::Error::other)
             .map_err(super::quic_carrier_io_error)?;
         write.complete();
-        if let Some(admitted) = admitted {
-            admitted.store(true, Ordering::Release);
-        }
         Ok(())
     }
 }
