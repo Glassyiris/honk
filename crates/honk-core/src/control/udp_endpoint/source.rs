@@ -1,12 +1,14 @@
 mod preparation;
 mod reply;
 mod transport;
+mod uplink_stall;
 pub(in crate::control) use preparation::SourcePreparation;
 #[cfg(all(test, feature = "rprx"))]
 pub(super) use reply::SourceReplyTarget;
 use reply::{SourceReplyDisposition, deliver_source_reply};
 use transport::SourceTransport;
 pub(in crate::control) use transport::{PreparedSourceTransport, SourcePath};
+pub(in crate::control) use uplink_stall::UplinkStall;
 
 use super::driver::{REPLY_IDLE_TIMEOUT, TRANSPORT_SEND_TIMEOUT};
 use super::*;
@@ -117,6 +119,7 @@ pub(super) struct SourceOwner {
     next_view: AtomicU64,
     receive_notify: Notify,
     next_alive_report_at: AtomicI64,
+    pub(super) uplink_stall: UplinkStall,
     pool: std::sync::Weak<UdpEndpointPool>,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     node_id: uuid::Uuid,
@@ -168,6 +171,7 @@ impl SourceOwner {
             has_reply: AtomicBool::new(false),
             receive_notify: Notify::new(),
             next_alive_report_at: AtomicI64::new(0),
+            uplink_stall: UplinkStall::default(),
             pool: Arc::downgrade(pool),
             send_gate: tokio::sync::Mutex::new(()),
             next_view: AtomicU64::new(1),
@@ -308,6 +312,7 @@ impl SourceOwner {
 
     fn note_sent(&self) {
         self.sent.store(true, Ordering::Release);
+        self.uplink_stall.admitted();
     }
 
     pub(super) fn fail(&self, outcome: ScoreOutcome) {
@@ -629,6 +634,10 @@ impl SourceEndpoint {
 
     pub(super) fn fail(&self, outcome: ScoreOutcome) {
         self.owner.fail(outcome);
+    }
+
+    pub(super) fn uplink_stall(&self) -> &UplinkStall {
+        &self.owner.uplink_stall
     }
 
     pub(super) fn flow_idle_expired(&self) {

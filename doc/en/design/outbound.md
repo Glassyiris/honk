@@ -688,7 +688,11 @@ keep a partial-frame timeout terminal for the whole source, so destinations
 sharing a stream also share its head-of-line blocking and failure fate. H2MUX
 admits a datagram and starts its poison only when the first chunk is queued to
 h2, so a flow-control wait before any byte is queued times out as packet-local
-congestion and leaves the stream usable. A frame
+congestion and leaves the stream usable. Packet-local congestion lasts only while
+the source still admits datagrams: a run of unadmitted deadlines that no admitted
+datagram interrupts and no gap over 30 s separates fails the source like any
+transport failure once it has lasted 30 s, so replies cannot keep a wedged uplink
+alive while an idle source is not blamed. A frame
 write cancelled halfway poisons the stream with a typed `FrameInterrupted`: the
 next send fails and the source retires every destination instead of appending to
 a torn frame. When a view's own retirement cancelled that write, the retirement
