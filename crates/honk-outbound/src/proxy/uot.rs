@@ -145,11 +145,7 @@ impl AddrFraming {
                 port,
             ))
         } else {
-            (port == target.port()
-                && target_domain?
-                    .as_bytes()
-                    .eq_ignore_ascii_case(&header[2..port_at]))
-            .then_some(target)
+            crate::proxy::addr::dialed_domain_peer(target_domain, target, &header[2..port_at], port)
         }
     }
 

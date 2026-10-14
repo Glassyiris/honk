@@ -94,15 +94,17 @@ impl PacketTransport for Hy2UdpTransport {
             let peer = match msg.addr {
                 crate::proxy::addr::SocksAddr::V4(peer) => peer.into(),
                 crate::proxy::addr::SocksAddr::V6(peer) => peer.into(),
-                crate::proxy::addr::SocksAddr::Domain(domain, port)
-                    if self
-                        .target_domain()
-                        .is_some_and(|expected| domain.eq_ignore_ascii_case(expected))
-                        && port == self.target.port() =>
-                {
-                    self.target
+                crate::proxy::addr::SocksAddr::Domain(domain, port) => {
+                    match crate::proxy::addr::dialed_domain_peer(
+                        self.target_domain(),
+                        self.target,
+                        domain,
+                        port,
+                    ) {
+                        Some(peer) => peer,
+                        None => continue,
+                    }
                 }
-                crate::proxy::addr::SocksAddr::Domain(_, _) => continue,
             };
             let complete = self.defrag.lock().await.feed(
                 msg.packet_id,

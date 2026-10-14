@@ -571,18 +571,17 @@ impl PacketTransport for Socks5UdpTransport {
                         WireSource::Addr(peer) => {
                             SocketAddr::new(peer.ip().to_canonical(), peer.port())
                         }
-                        // Only the dialed name projects back; any other name
-                        // would need DNS, so the datagram is dropped.
-                        WireSource::Domain(domain, port)
-                            if port == self.target_addr.port()
-                                && self
-                                    .target_domain
-                                    .as_deref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(domain)) =>
-                        {
-                            self.target_addr
+                        WireSource::Domain(domain, port) => {
+                            let Some(peer) = super::addr::dialed_domain_peer(
+                                self.target_domain.as_deref(),
+                                self.target_addr,
+                                domain,
+                                port,
+                            ) else {
+                                continue;
+                            };
+                            peer
                         }
-                        WireSource::Domain(..) => continue,
                     };
                     let payload = &packet[payload_start..n];
                     if payload.len() > buf.len() {

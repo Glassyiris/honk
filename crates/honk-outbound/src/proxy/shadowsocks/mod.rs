@@ -650,16 +650,9 @@ impl SsUdpTransport {
                 Some(ip) => SocketAddr::new(ip.into(), peer.port()),
                 None => SocketAddr::V6(*peer),
             }),
-            addr::SocksAddr::Domain(domain, port)
-                if *port == self.target.port()
-                    && self
-                        .target_domain
-                        .as_deref()
-                        .is_some_and(|dialed| dialed.eq_ignore_ascii_case(domain)) =>
-            {
-                Some(self.target)
+            addr::SocksAddr::Domain(domain, port) => {
+                addr::dialed_domain_peer(self.target_domain.as_deref(), self.target, domain, *port)
             }
-            addr::SocksAddr::Domain(..) => None,
         }
     }
 }

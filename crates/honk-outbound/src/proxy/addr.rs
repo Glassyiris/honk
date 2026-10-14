@@ -245,6 +245,21 @@ pub(crate) fn dialed_name<'a>(dialed: Option<&str>, domain: Option<&'a str>) -> 
     domain.filter(|name| dialed == Some(*name))
 }
 
+/// The real peer a reply naming `domain:port` stands for: `target` when that
+/// is the name the association was dialed by, otherwise `None` and the caller
+/// drops the frame, since any other name would need DNS. The match is
+/// ASCII-case-insensitive, unlike the exact [`dialed_name`] on the send side,
+/// because servers may fold the case of a name they echo.
+pub(crate) fn dialed_domain_peer(
+    dialed: Option<&str>,
+    target: SocketAddr,
+    domain: impl AsRef<[u8]>,
+    port: u16,
+) -> Option<SocketAddr> {
+    (port == target.port() && dialed?.as_bytes().eq_ignore_ascii_case(domain.as_ref()))
+        .then_some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +399,22 @@ mod tests {
         // Unknown ATYP fails.
         let mut bad = &[0x05u8, 1, 2][..];
         assert!(SocksAddr::read_from_stream(&mut bad).await.is_err());
+    }
+
+    #[test]
+    fn dialed_domain_peer_projects_only_the_dialed_name_and_port() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let project = |dialed, domain: &str, port| dialed_domain_peer(dialed, target, domain, port);
+        assert_eq!(
+            project(Some("Example.COM"), "example.com", 443),
+            Some(target)
+        );
+        assert_eq!(project(Some("example.com"), "other.example", 443), None);
+        assert_eq!(project(Some("example.com"), "example.com", 80), None);
+        assert_eq!(project(None, "example.com", 443), None);
+        assert_eq!(
+            dialed_domain_peer(Some("example.com"), target, b"EXAMPLE.com", 443),
+            Some(target)
+        );
     }
 }
