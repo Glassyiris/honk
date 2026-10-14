@@ -767,6 +767,28 @@ mod tests {
         assert_eq!(reality.id, equivalent.derive_id());
     }
 
+    /// The addressed UoT v2 / H2MUX PacketAddr dial shapes replaced the
+    /// connected ones on the wire, so their IDs must not alias the native
+    /// node or each other, and disabling UDP drops the UDP shape from identity.
+    #[test]
+    fn test_vless_addressed_udp_shapes_have_their_own_identities() {
+        const LINK: &str = "vless://00000000-0000-0000-0000-000000000001@example.com:443";
+        let id = |query: &str| {
+            Node::from_share_link(&format!("{LINK}?{query}"))
+                .unwrap()
+                .id
+        };
+        let (native, uot, h2) = (
+            id("packetEncoding=none"),
+            id("packetEncoding=uot-v2"),
+            id("mux=h2mux"),
+        );
+        assert_ne!(uot, native);
+        assert_ne!(h2, native);
+        assert_ne!(uot, h2);
+        assert_ne!(id("mux=h2mux&udp=0"), h2);
+    }
+
     #[test]
     fn test_vless_packet_disable_identity_is_effective() {
         let enabled = Node::from_share_link(

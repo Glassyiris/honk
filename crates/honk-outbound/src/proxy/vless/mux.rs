@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -14,7 +14,8 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
 
-use crate::proxy::{AsyncReadWrite, MuxSession, PacketTransport};
+use crate::proxy::uot::{AddrDecoder, AddrFraming};
+use crate::proxy::{AsyncReadWrite, MultiTargetTransport, MuxSession, PacketTransport};
 use crate::session::{
     IdleClock, ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig,
     SessionState,
@@ -29,13 +30,17 @@ const MAX_ERROR_MESSAGE: usize = 64 * 1024;
 // Let long-fat TCP streams grow without allowing one unread child to monopolize
 // the carrier; aggregate credit still covers one maximum response frame per slot.
 const H2_STREAM_RECV_WINDOW: u32 = 2 * 1024 * 1024;
-const H2_CONNECTION_RECV_WINDOW: u32 =
-    ((1 + 2 + crate::proxy::uot::MAX_PACKET_SIZE) * MAX_STREAMS_PER_SESSION) as u32;
+/// Status byte, widest PacketAddr address, u16 length and a full payload.
+const MAX_RESPONSE_FRAME: usize =
+    1 + crate::proxy::uot::MAX_ADDR_LEN + 2 + crate::proxy::uot::MAX_PACKET_SIZE;
+const H2_CONNECTION_RECV_WINDOW: u32 = (MAX_RESPONSE_FRAME * MAX_STREAMS_PER_SESSION) as u32;
 #[cfg(feature = "rprx")]
 const MUX_MAGIC_ADDRESS: &str = "sp.mux.sing-box.arpa";
 #[cfg(feature = "rprx")]
 const MUX_MAGIC_PORT: u16 = 444;
 const FLAG_UDP: u16 = 1;
+/// sing-mux `flagAddr`: every datagram carries its own SOCKS address.
+const FLAG_ADDR: u16 = 2;
 
 pub(crate) type VlessMuxPool = SessionPool<VlessMuxSession>;
 
@@ -666,19 +671,24 @@ struct MuxUdpWriter {
     send: h2::SendStream<Bytes>,
     carrier: CarrierFailure,
     setup: Option<Bytes>,
-    pending: bool,
-    request_observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 struct MuxUdpReader {
     response: MuxResponse,
-    decoder: crate::proxy::uot::Decoder,
+    decoder: AddrDecoder,
 }
 
+/// sing-mux PacketAddr stream: the request names the first destination, then
+/// every datagram in both directions is `[SOCKS address][u16 length][payload]`,
+/// so one stream serves all destinations of a client source and replies keep
+/// their real source. The open-time target is the default for ordinary sends
+/// and the only domain a reply source may project back to.
 pub(crate) struct VlessMuxUdpTransport {
     writer: tokio::sync::Mutex<MuxUdpWriter>,
+    poison: crate::proxy::FramePoison,
     reader: tokio::sync::Mutex<MuxUdpReader>,
     target: std::net::SocketAddr,
+    target_domain: Option<Box<str>>,
     _permit: SessionPermit<VlessMuxSession>,
 }
 
@@ -691,31 +701,37 @@ impl std::fmt::Debug for VlessMuxUdpTransport {
 }
 
 impl VlessMuxUdpTransport {
-    async fn send(&self, data: &[u8]) -> io::Result<()> {
-        let packet = crate::proxy::uot::encode_packet(data, crate::proxy::uot::MAX_PACKET_SIZE)?;
+    /// The one send path of `send_packet`, `send_packet_confirmed` and `send_to`.
+    async fn send_inner(
+        &self,
+        target: std::net::SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        confirmed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> io::Result<()> {
         let mut writer = self.writer.lock().await;
-        if writer.pending {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "VLESS H2MUX UDP write was interrupted",
-            ));
+        let frame = AddrFraming::SOCKS5.encode(
+            writer.setup.as_deref().unwrap_or_default(),
+            target,
+            domain,
+            data,
+            crate::proxy::uot::MAX_PACKET_SIZE,
+        )?;
+        let write = self.poison.begin()?;
+        if let Some(admitted) = admitted {
+            admitted.store(true, Ordering::Release);
         }
-        let frame = if let Some(setup) = writer.setup.as_ref() {
-            let mut frame = BytesMut::with_capacity(setup.len() + packet.len());
-            frame.extend_from_slice(setup);
-            frame.extend_from_slice(&packet);
-            frame.freeze()
-        } else {
-            packet
-        };
-        writer.pending = true;
         let writer = &mut *writer;
         send_owned(&mut writer.send, &writer.carrier, frame).await?;
-        if let Some(observer) = writer.request_observer.take() {
-            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
-        }
         writer.setup = None;
-        writer.pending = false;
+        write.complete();
+        // Each flow sharing the stream reports its own first confirmed send.
+        if confirmed {
+            crate::runtime::flow_observation::milestone(
+                crate::runtime::flow_observation::Milestone::TargetRequestSent,
+            );
+        }
         Ok(())
     }
 }
@@ -732,20 +748,40 @@ impl PacketTransport for VlessMuxUdpTransport {
         self.target
     }
 
+    fn allows_full_cone_replies(&self) -> bool {
+        true
+    }
+
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        self.send(data).await
+        self.send_inner(
+            self.target,
+            self.target_domain.as_deref(),
+            data,
+            false,
+            None,
+        )
+        .await
     }
 
     async fn send_packet_confirmed(&self, data: &[u8]) -> io::Result<()> {
-        self.send(data).await
+        self.send_inner(self.target, self.target_domain.as_deref(), data, true, None)
+            .await
     }
 
     async fn recv_packet(&self, output: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
         let mut reader = self.reader.lock().await;
         loop {
-            if let Some(size) = reader.decoder.next_packet(output)? {
-                reader.response.release(size + 2)?;
-                return Ok((size, self.target));
+            if let Some(frame) =
+                reader
+                    .decoder
+                    .next_packet(output, self.target, self.target_domain.as_deref())?
+            {
+                // Dropped frames return their credit too, or the window leaks.
+                reader.response.release(frame.wire_len)?;
+                if let Some(packet) = frame.packet {
+                    return Ok(packet);
+                }
+                continue;
             }
             let chunk = std::future::poll_fn(|cx| reader.response.poll_take_chunk(cx))
                 .await?
@@ -757,6 +793,26 @@ impl PacketTransport for VlessMuxUdpTransport {
                 })?;
             reader.decoder.push(&chunk)?;
         }
+    }
+}
+
+#[async_trait]
+impl MultiTargetTransport for VlessMuxUdpTransport {
+    async fn send_to(
+        &self,
+        target: std::net::SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        confirmed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
+        self.send_inner(target, domain, data, confirmed, admitted)
+            .await
+    }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
     }
 }
 
@@ -809,7 +865,7 @@ impl MuxSession for VlessMuxSession {
         target_domain: Option<&str>,
     ) -> impl Future<Output = Result<Arc<Self::Packet>, OpenError>> + Send {
         async move {
-            let setup = stream_request(FLAG_UDP, target, target_domain)
+            let setup = stream_request(FLAG_UDP | FLAG_ADDR, target, target_domain)
                 .map_err(|error| OpenError::Refused(anyhow::Error::new(error)))?;
             let opened = open_h2_stream(self, permit).await?;
             Ok(Arc::new(VlessMuxUdpTransport {
@@ -817,14 +873,14 @@ impl MuxSession for VlessMuxSession {
                     send: opened.send,
                     carrier: Arc::clone(&opened.failure),
                     setup: Some(setup),
-                    pending: false,
-                    request_observer: crate::runtime::flow_observation::current(),
                 }),
+                poison: crate::proxy::FramePoison::default(),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
                     response: MuxResponse::new(opened.response, opened.failure),
-                    decoder: crate::proxy::uot::Decoder::default(),
+                    decoder: AddrDecoder::new(AddrFraming::SOCKS5),
                 }),
                 target,
+                target_domain: target_domain.map(Box::from),
                 _permit: opened.permit,
             }))
         }

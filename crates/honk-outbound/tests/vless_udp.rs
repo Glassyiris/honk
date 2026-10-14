@@ -746,15 +746,9 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
     ] {
         let node = canonical_node(sing_box_port, name, &format!("&security=none&{options}"));
         tcp_echo(&registry, name, &node, echoes.tcp).await;
-        udp_echo(
-            &registry,
-            name,
-            &node,
-            echoes.domain,
-            Some("localhost"),
-            512,
-        )
-        .await;
+        // Per-datagram addressing cannot carry a name: sing-box's direct
+        // outbound rejects FQDN packet destinations.
+        udp_echo(&registry, name, &node, echoes.native_v4_53, None, 512).await;
     }
     let cool = canonical_node(
         xray_plain_port,

@@ -1,7 +1,9 @@
 use super::overall_dial_timeout;
 use super::routing::{RoutingDecision, build_connection_info, connection_chains};
 use crate::control::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
-use crate::control::udp_endpoint::{RawDnsRoute, UdpEndpoint, UdpInitLease, UdpTerminal};
+use crate::control::udp_endpoint::{
+    RawDnsRoute, SourcePath, UdpEndpoint, UdpInitLease, UdpTerminal,
+};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
@@ -33,26 +35,43 @@ struct PreparedEndpoint {
 
 enum PreparedEndpointTransport {
     Flow(honk_outbound::proxy::PreparedUdpTransport),
-    #[cfg(feature = "rprx")]
-    Source(crate::control::udp_endpoint::VlessSourcePreparation),
+    Source(crate::control::udp_endpoint::SourcePreparation),
 }
 
 enum CommittedEndpointTransport {
     Flow(Arc<dyn honk_outbound::proxy::PacketTransport>),
-    #[cfg(feature = "rprx")]
     Source(crate::control::udp_endpoint::SourceAttachment),
 }
 
-#[cfg(feature = "rprx")]
-fn vless_source_path(node: &Node, port: u16) -> Option<honk_config::node::VlessUdpPath> {
-    let path = node.vless()?.udp_path(port)?;
-    matches!(
-        path,
-        honk_config::node::VlessUdpPath::Xudp
-            | honk_config::node::VlessUdpPath::CoolShared
-            | honk_config::node::VlessUdpPath::CoolSeparate
-    )
-    .then_some(path)
+/// The registry decides which protocols share one association per source: a
+/// protocol joins by registering a shared-source slot, not by a core list.
+fn source_path(registry: &ProxyRegistry, node: &Node, port: u16) -> Option<SourcePath> {
+    let protocol = node.protocol();
+    let shared = || {
+        registry
+            .has_shared_source(protocol)
+            .then_some(SourcePath::Shared)
+    };
+    match protocol {
+        honk_config::types::NodeProtocol::Hysteria2 => Some(SourcePath::Hysteria2),
+        honk_config::types::NodeProtocol::Tuic => Some(SourcePath::Tuic),
+        #[cfg(feature = "rprx")]
+        honk_config::types::NodeProtocol::VLess => {
+            use honk_config::node::VlessUdpPath;
+            let path = node.vless()?.udp_path(port)?;
+            match path {
+                VlessUdpPath::Xudp | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate => {
+                    Some(SourcePath::Vless(path))
+                }
+                VlessUdpPath::UotV2 | VlessUdpPath::H2 => shared(),
+                VlessUdpPath::Native => None,
+            }
+        }
+        _ => {
+            let _ = port;
+            shared()
+        }
+    }
 }
 
 impl ControlPlaneHandle {
@@ -587,9 +606,7 @@ impl ControlPlaneHandle {
             let registry = self.proxy_registry.clone();
             let stats = self.stats.clone();
             let feedback = score_feedback.clone();
-            #[cfg(feature = "rprx")]
             let udp_pool = Arc::clone(&self.udp_pool);
-            #[cfg(feature = "rprx")]
             let alive_set = Arc::clone(&self.alive_set);
             let target_domain = target_domain.clone();
             #[cfg(feature = "native-api")]
@@ -600,9 +617,7 @@ impl ControlPlaneHandle {
                 let runtime_generation = Arc::clone(&prepare_generation);
                 let feedback = feedback.get(index).cloned().flatten();
                 let selection_chain = selection_chains.get(index).cloned().unwrap_or_default();
-                #[cfg(feature = "rprx")]
                 let udp_pool = Arc::clone(&udp_pool);
-                #[cfg(feature = "rprx")]
                 let alive_set = Arc::clone(&alive_set);
                 let target_domain = target_domain.clone();
                 #[cfg(feature = "native-api")]
@@ -653,8 +668,7 @@ impl ControlPlaneHandle {
                         .map(PreparedEndpointTransport::Flow)
                     };
                     let operation = async {
-                        #[cfg(feature = "rprx")]
-                        if let Some(path) = vless_source_path(&node, original_dst.port()) {
+                        if let Some(path) = source_path(&registry, &node, original_dst.port()) {
                             let runtime = runtime_generation.get(&node.id).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "node {} is not in the captured runtime generation",
@@ -662,7 +676,8 @@ impl ControlPlaneHandle {
                                 )
                             })?;
                             udp_pool
-                                .prepare_vless_source(
+                                .prepare_source(
+                                    &registry,
                                     Arc::clone(&runtime_generation),
                                     runtime,
                                     client_addr,
@@ -674,25 +689,11 @@ impl ControlPlaneHandle {
                                     Arc::clone(&alive_set),
                                     Arc::clone(&stats),
                                     scheduler_ipver,
+                                    plan_mode == SelectionPlanMode::ColdUrlTest,
                                 )
                                 .await
                                 .map(PreparedEndpointTransport::Source)
                         } else if plan_mode == SelectionPlanMode::ColdUrlTest {
-                            registry
-                                .dial_udp_transport_speculative(
-                                    Arc::clone(&runtime_generation),
-                                    node.id,
-                                    original_dst,
-                                    target_domain.as_deref(),
-                                    connect_timeout,
-                                )
-                                .await
-                                .map(PreparedEndpointTransport::Flow)
-                        } else {
-                            flow_transport.await
-                        }
-                        #[cfg(not(feature = "rprx"))]
-                        if plan_mode == SelectionPlanMode::ColdUrlTest {
                             registry
                                 .dial_udp_transport_speculative(
                                     Arc::clone(&runtime_generation),
@@ -869,7 +870,6 @@ impl ControlPlaneHandle {
         }
         // Final promotion remains pre-publication and inside the unchanged
         // absolute preparation deadline.
-        #[cfg(feature = "rprx")]
         let source_pool = Arc::clone(&self.udp_pool);
         #[cfg(feature = "native-api")]
         let commit_observer = target_observer.clone();
@@ -894,7 +894,6 @@ impl ControlPlaneHandle {
                         .commit()
                         .await
                         .map(CommittedEndpointTransport::Flow),
-                    #[cfg(feature = "rprx")]
                     PreparedEndpointTransport::Source(prepared) => prepared
                         .commit(&source_pool)
                         .await
@@ -971,7 +970,6 @@ impl ControlPlaneHandle {
                 endpoint.record_pending_reply_peer(relay_addr);
                 endpoint
             }
-            #[cfg(feature = "rprx")]
             CommittedEndpointTransport::Source(attachment) => UdpEndpoint::new_source_scored(
                 attachment,
                 original_dst,
@@ -1160,3 +1158,6 @@ impl ControlPlaneHandle {
         (outcome, collected)
     }
 }
+
+#[cfg(test)]
+mod tests;

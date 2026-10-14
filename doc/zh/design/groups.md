@@ -231,7 +231,7 @@ Go dae 的 TCP=1 会使短暂的探测丢包在 URLTest 选择前将当前节点
 | Score QUIC 质量 | 每次周期性 UDP 探测都通过每个 Score 叶节点独立执行 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个配置的 `global.tcp_check_url`，且必须是有效的 HTTPS URL。测得时长提供独立 `DataUdp` 探测质量，不增加业务成功或虚构吞吐；DNS 探测失败而握手成功时仍可恢复 `DataUdp` 活性。缺少 URL 或 URL 不是 HTTPS 时禁用此探测；非 Score 叶节点既不创建此握手，也不创建 Score cell。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
-`has_udp_state(node)` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享 VLESS，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
+`has_udp_state(node)` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享协议，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
 
 类型化 policy、size 与 `PacketRejection::Capacity` refusal 对候选是 terminal，但不影响 health 或 Score；CLI 调用方收到 capacity error，而不是 `NotApplicable`。单包拥塞、已有 reply 后的 idle expiry、主动退役、节点死亡取消和进程关闭也不影响健康。alive→dead 转换调用带 `(NodeId, name)` 的控制面回调，清除 pool connection 与 UDP endpoint。若 sibling UDP domain 明确存活，则跳过该 UDP domain 的死亡清理，避免被阻断的 `:53` 探测清除正常 flow。
 

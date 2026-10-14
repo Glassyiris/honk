@@ -1,96 +1,96 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::MAX_NATIVE_PACKET_SIZE;
-use crate::proxy::{AsyncReadWrite, PacketTransport};
+use super::*;
+use crate::proxy::uot::{AddrDecoder, AddrFraming, Decoder, MAX_PACKET_SIZE};
+use crate::proxy::vless::cool;
+use crate::proxy::{AsyncReadWrite, FramePoison, MultiTargetTransport, PacketTransport};
 
-struct VlessPacketReader {
-    stream: tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>,
-    decoder: crate::proxy::uot::Decoder,
-}
+type Reader = tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>;
 
 struct VlessPacketWriter {
     stream: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
+    /// UoT request, sent in front of the first datagram.
     setup: Option<bytes::Bytes>,
-    pending: bool,
-    observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
+impl VlessPacketWriter {
+    /// A partially written frame cannot be resumed, so an interrupted write
+    /// poisons the stream. `observed` publishes the sending flow's first
+    /// request milestone once the frame is delivered; `admitted` is set when
+    /// the frame starts onto the wire.
+    async fn write_frame(
+        &mut self,
+        poison: &FramePoison,
+        frame: &[u8],
+        observed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        let write = poison.begin()?;
+        if let Some(admitted) = admitted {
+            admitted.store(true, Ordering::Release);
+        }
+        let stream = &mut self.stream;
+        let write_all = async {
+            stream.write_all(frame).await?;
+            stream.flush().await
+        };
+        if observed {
+            crate::runtime::flow_observation::request_write(std::pin::pin!(write_all)).await?;
+        } else {
+            write_all.await?;
+        }
+        self.setup = None;
+        write.complete();
+        Ok(())
+    }
+}
+
+async fn read_chunk(stream: &mut Reader, chunk: &mut [u8]) -> std::io::Result<usize> {
+    let size = stream.read(chunk).await?;
+    if size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "VLESS packet stream closed",
+        ));
+    }
+    Ok(size)
+}
+
+/// Native command-UDP: one fixed target, bare `[u16 length][payload]` frames.
 pub(super) struct VlessConnectedTransport {
-    reader: tokio::sync::Mutex<VlessPacketReader>,
+    reader: tokio::sync::Mutex<(Reader, Decoder)>,
     writer: tokio::sync::Mutex<VlessPacketWriter>,
+    poison: FramePoison,
     target: SocketAddr,
-    native: bool,
 }
 
 impl VlessConnectedTransport {
-    pub(super) fn new(
-        stream: Box<dyn AsyncReadWrite>,
-        target: SocketAddr,
-        setup: Option<bytes::Bytes>,
-    ) -> Self {
+    pub(super) fn new(stream: Box<dyn AsyncReadWrite>, target: SocketAddr) -> Self {
         let (reader, writer) = tokio::io::split(stream);
-        let native = setup.is_none();
         Self {
-            reader: tokio::sync::Mutex::new(VlessPacketReader {
-                stream: reader,
-                decoder: crate::proxy::uot::Decoder::default(),
-            }),
+            reader: tokio::sync::Mutex::new((reader, Decoder::default())),
             writer: tokio::sync::Mutex::new(VlessPacketWriter {
                 stream: writer,
-                setup,
-                pending: false,
-                observer: if native {
-                    None
-                } else {
-                    crate::runtime::flow_observation::current()
-                },
+                setup: None,
             }),
+            poison: FramePoison::default(),
             target,
-            native,
         }
     }
 
     async fn send(&self, data: &[u8]) -> std::io::Result<()> {
-        if self.native && (data.is_empty() || data.len() > MAX_NATIVE_PACKET_SIZE) {
+        if data.is_empty() || data.len() > MAX_NATIVE_PACKET_SIZE {
             return Err(crate::proxy::PacketRejection::InvalidSize.into());
         }
-        let packet = crate::proxy::uot::encode_packet(data, crate::proxy::uot::MAX_PACKET_SIZE)?;
-        let mut writer = self.writer.lock().await;
-        if writer.pending {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "VLESS packet write was interrupted",
-            ));
-        }
-        let frame = if let Some(setup) = writer.setup.as_ref() {
-            let mut frame = bytes::BytesMut::with_capacity(setup.len() + packet.len());
-            frame.extend_from_slice(setup);
-            frame.extend_from_slice(&packet);
-            frame.freeze()
-        } else {
-            packet
-        };
-        writer.pending = true;
-        let observer = writer.observer.take();
-        let write = async {
-            writer.stream.write_all(&frame).await?;
-            writer.stream.flush().await
-        };
-        match observer {
-            Some(observer) => {
-                observer
-                    .scope(crate::runtime::flow_observation::request_write(
-                        std::pin::pin!(write),
-                    ))
-                    .await?
-            }
-            None => write.await?,
-        }
-        writer.setup = None;
-        writer.pending = false;
-        Ok(())
+        let packet = crate::proxy::uot::encode_packet(data, MAX_PACKET_SIZE)?;
+        self.writer
+            .lock()
+            .await
+            .write_frame(&self.poison, &packet, false, None)
+            .await
     }
 }
 
@@ -118,19 +118,488 @@ impl PacketTransport for VlessConnectedTransport {
 
     async fn recv_packet(&self, output: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let mut reader = self.reader.lock().await;
+        let (stream, decoder) = &mut *reader;
         loop {
-            if let Some(size) = reader.decoder.next_packet(output)? {
+            if let Some(size) = decoder.next_packet(output)? {
                 return Ok((size, self.target));
             }
             let mut chunk = [0; 16 * 1024];
-            let size = reader.stream.read(&mut chunk).await?;
-            if size == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "VLESS packet stream closed",
-                ));
+            let size = read_chunk(stream, &mut chunk).await?;
+            decoder.push(&chunk[..size])?;
+        }
+    }
+}
+
+/// Non-connect UoT v2 over a VLESS TCP command stream: the request names the
+/// first destination, then every datagram in both directions carries its own
+/// address, so one stream serves all destinations of a client source and
+/// replies keep their real source. The request and first datagram share one
+/// write; the open-time target is the default for ordinary sends and the only
+/// domain a reply source may project back to.
+pub(crate) struct VlessUotTransport {
+    reader: tokio::sync::Mutex<(Reader, AddrDecoder)>,
+    writer: tokio::sync::Mutex<VlessPacketWriter>,
+    poison: FramePoison,
+    target: SocketAddr,
+    target_domain: Option<Box<str>>,
+}
+
+impl VlessUotTransport {
+    pub(super) fn new(
+        stream: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        request: bytes::Bytes,
+    ) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self {
+            reader: tokio::sync::Mutex::new((reader, AddrDecoder::new(AddrFraming::UOT_V1))),
+            writer: tokio::sync::Mutex::new(VlessPacketWriter {
+                stream: writer,
+                setup: Some(request),
+            }),
+            poison: FramePoison::default(),
+            target,
+            target_domain: target_domain.map(Box::from),
+        }
+    }
+
+    /// The one send path of `send_packet`, `send_packet_confirmed` and `send_to`.
+    async fn send_inner(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        confirmed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().await;
+        let frame = AddrFraming::UOT_V1.encode(
+            writer.setup.as_deref().unwrap_or_default(),
+            target,
+            domain,
+            data,
+            MAX_PACKET_SIZE,
+        )?;
+        writer
+            .write_frame(&self.poison, &frame, confirmed, admitted)
+            .await
+    }
+}
+
+impl std::fmt::Debug for VlessUotTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VlessUotTransport")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for VlessUotTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    fn allows_full_cone_replies(&self) -> bool {
+        true
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_inner(
+            self.target,
+            self.target_domain.as_deref(),
+            data,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_inner(self.target, self.target_domain.as_deref(), data, true, None)
+            .await
+    }
+
+    async fn recv_packet(&self, output: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let mut reader = self.reader.lock().await;
+        let (stream, decoder) = &mut *reader;
+        loop {
+            if let Some(frame) =
+                decoder.next_packet(output, self.target, self.target_domain.as_deref())?
+            {
+                match frame.packet {
+                    Some(packet) => return Ok(packet),
+                    None => continue,
+                }
             }
-            reader.decoder.push(&chunk[..size])?;
+            let mut chunk = [0; 16 * 1024];
+            let size = read_chunk(stream, &mut chunk).await?;
+            decoder.push(&chunk[..size])?;
+        }
+    }
+}
+
+#[async_trait]
+impl MultiTargetTransport for VlessUotTransport {
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        confirmed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
+        self.send_inner(target, domain, data, confirmed, admitted)
+            .await
+    }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
+    }
+}
+
+impl VLessHandler {
+    /// Non-connect UoT v2 over the retained carrier. Nothing is published
+    /// until the returned preparation commits.
+    pub(super) async fn prepare_uot_transport(
+        &self,
+        runtime: &Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Arc<VlessUotTransport>,
+        crate::proxy::transport::TransportPreparation,
+    )> {
+        let vless = runtime.node.vless().unwrap();
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid,
+            CMD_TCP,
+            Some(SocketAddr::from(([0, 0, 0, 0], 0))),
+            Some(crate::proxy::uot::MAGIC_ADDRESS),
+            vless.wire_flow(),
+        )?;
+        let request = crate::proxy::uot::request(false, target, domain)?;
+        let (stream, preparation) = self
+            .prepare_retained_carrier(runtime, uuid, header, timeout)
+            .await?;
+        Ok((
+            Arc::new(VlessUotTransport::new(stream, target, domain, request)),
+            preparation,
+        ))
+    }
+
+    pub(super) async fn prepare_protocol_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        path: VlessUdpPath,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        let vless = runtime.node.vless().unwrap();
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let (command, header_target, header_domain) = match path {
+            VlessUdpPath::Native => (CMD_UDP, Some(target), domain),
+            VlessUdpPath::Xudp => (cool::VLESS_MUX_COMMAND, None, None),
+            _ => unreachable!("protocol UDP preparation excludes UoT and pooled mux paths"),
+        };
+        let header = Self::build_request_header(
+            &uuid,
+            command,
+            header_target,
+            header_domain,
+            vless.wire_flow(),
+        )?;
+        let operation = self.prepare_retained_carrier(&runtime, uuid, header, timeout);
+        let (stream, preparation) = if path == VlessUdpPath::Native {
+            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?
+        } else {
+            operation.await?
+        };
+        let transport: Arc<dyn PacketTransport> = if path == VlessUdpPath::Xudp {
+            cool::connect_single_xudp(stream, target, domain, [0; 8]).await?
+        } else {
+            Arc::new(VlessConnectedTransport::new(stream, target))
+        };
+        Ok(publish_on_commit(transport, preparation))
+    }
+
+    async fn prepare_mux_udp<S, T, Dial, DialFuture, Open, OpenFuture>(
+        pool: Arc<crate::session::SessionPool<S>>,
+        dial: Dial,
+        open: Open,
+        retired_error: &'static str,
+    ) -> anyhow::Result<PreparedUdpTransport<T>>
+    where
+        S: MuxSession,
+        T: PacketTransport + ?Sized + 'static,
+        Dial: FnOnce() -> DialFuture + Send,
+        DialFuture: Future<Output = anyhow::Result<(Arc<S>, crate::proxy::transport::TransportPreparation)>>
+            + Send,
+        Open: Fn(Arc<S>, crate::session::SessionPermit<S>) -> OpenFuture + Send,
+        OpenFuture: Future<Output = Result<Arc<T>, OpenError>> + Send,
+    {
+        let mut dial = Some(dial);
+        let mut last_error = None;
+        for _ in 0..2 {
+            match pool.checkout_speculative().await? {
+                SpeculativeCheckout::Shared { session, permit } => {
+                    let observation = crate::session::ObservedSessionOpen::start();
+                    let result = open(Arc::clone(&session), permit).await;
+                    observation.finish_open(&result);
+                    match result {
+                        Ok(transport) => return Ok(PreparedUdpTransport::ready(transport)),
+                        Err(OpenError::Refused(error)) => return Err(error),
+                        Err(OpenError::Draining(error)) => {
+                            crate::session::ManagedSession::begin_drain(session.as_ref());
+                            last_error = Some(error);
+                        }
+                        Err(OpenError::Session(error)) => {
+                            pool.invalidate(&session);
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                SpeculativeCheckout::Detached(mut reservation) => {
+                    let dial = dial.take().expect("speculative dial runs at most once");
+                    let (session, preparation) = tokio::select! {
+                        result = dial() => result?,
+                        _ = reservation.cancelled() => anyhow::bail!(retired_error),
+                    };
+                    let permit = reservation.attach(&session)?;
+                    let observation = crate::session::ObservedSessionOpen::start();
+                    let result = open(session, permit).await;
+                    observation.finish_open(&result);
+                    let transport = result.map_err(Self::open_error)?;
+                    return Ok(PreparedUdpTransport::new(async move {
+                        preparation.commit()?;
+                        // Mux rejection may leave valid warm carriers in the capped XHTTP pool.
+                        reservation.commit()?;
+                        Ok(transport)
+                    }));
+                }
+            }
+        }
+        Err(last_error.expect("shared mux open attempts record an error"))
+    }
+
+    /// Prepare a concrete source-scoped XUDP child without sending NEW; commit
+    /// promotes only a detached physical carrier after the caller wins admission.
+    pub async fn prepare_source_udp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+        global_id: [u8; 8],
+    ) -> anyhow::Result<PreparedUdpTransport<VlessXudpTransport>> {
+        // This large cold handshake must not inflate each task-scope poll frame.
+        runtime
+            .scope_tasks(Box::pin(async {
+                match Self::udp_path(&runtime.node, target.port())? {
+                    VlessUdpPath::Xudp => {
+                        let (stream, preparation) = Self::new()
+                            .prepare_retained_mux_carrier(&runtime, timeout)
+                            .await?;
+                        let transport =
+                            cool::connect_single_xudp(stream, target, domain, global_id).await?;
+                        Ok(publish_on_commit(transport, preparation))
+                    }
+                    path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
+                        let separate = path == VlessUdpPath::CoolSeparate;
+                        let pool = if separate {
+                            runtime.vless_separate_cool_pool()?
+                        } else {
+                            runtime.vless_shared_cool_pool()?
+                        };
+                        let active_limit = Self::cool_limit(&runtime.node, separate)?;
+                        let dial_runtime = Arc::clone(&runtime);
+                        Self::prepare_mux_udp(
+                            pool,
+                            move || Self::prepare_cool_session(dial_runtime, active_limit, timeout),
+                            move |session, permit| {
+                                cool::open_xudp(session, permit, target, domain, global_id)
+                            },
+                            if separate {
+                                "VLESS separate Cool pool retired during source preparation"
+                            } else {
+                                "VLESS shared Cool pool retired during source preparation"
+                            },
+                        )
+                        .await
+                    }
+                    VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::H2 => {
+                        Err(crate::proxy::PacketRejection::Policy.into())
+                    }
+                }
+            }))
+            .await
+    }
+
+    /// Prepare the one UoT v2 / H2MUX PacketAddr association of a client
+    /// source scope. Retained carriers and pooled H2 sessions follow the same
+    /// commit-only publication as [`Self::prepare_source_udp`]; the explicit
+    /// paths carry no VLESS-only empty-first or poisoned-child rules.
+    pub async fn prepare_shared_udp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        runtime
+            .scope_tasks(Box::pin(async {
+                match Self::udp_path(&runtime.node, target.port())? {
+                    VlessUdpPath::UotV2 => {
+                        let (transport, preparation) = Self::new()
+                            .prepare_uot_transport(&runtime, target, domain, timeout)
+                            .await?;
+                        Ok(publish_on_commit(
+                            transport as Arc<dyn MultiTargetTransport>,
+                            preparation,
+                        ))
+                    }
+                    VlessUdpPath::H2 => {
+                        let pool = runtime.vless_h2_pool()?;
+                        let dial_runtime = Arc::clone(&runtime);
+                        Self::prepare_mux_udp(
+                            pool,
+                            move || Self::prepare_h2_session(dial_runtime, timeout),
+                            move |session, permit| async move {
+                                let transport: Arc<dyn MultiTargetTransport> =
+                                    session.open_packet(permit, target, domain).await?;
+                                Ok(transport)
+                            },
+                            "VLESS H2 pool retired during source preparation",
+                        )
+                        .await
+                    }
+                    VlessUdpPath::Native
+                    | VlessUdpPath::Xudp
+                    | VlessUdpPath::CoolShared
+                    | VlessUdpPath::CoolSeparate => {
+                        Err(crate::proxy::PacketRejection::Policy.into())
+                    }
+                }
+            }))
+            .await
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for VLessHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        Self::prepare_shared_udp(runtime, target, target_domain, connect_timeout).await
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for VLessHandler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let path = Self::udp_path(node, target.port())?;
+        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
+        let transport = self
+            .open_udp(
+                owner.runtime(),
+                path,
+                target,
+                target_domain,
+                connect_timeout,
+            )
+            .await?;
+        Ok(crate::proxy::packet_transport_with_owner(transport, owner))
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let path = Self::udp_path(&runtime.node, target.port())?;
+        self.open_udp(runtime, path, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        let path = Self::udp_path(&runtime.node, target.port())?;
+        match path {
+            VlessUdpPath::H2 => {
+                let pool = runtime.vless_h2_pool()?;
+                let dial_runtime = Arc::clone(&runtime);
+                Self::prepare_mux_udp(
+                    pool,
+                    move || Self::prepare_h2_session(dial_runtime, connect_timeout),
+                    move |session, permit| async move {
+                        let transport: Arc<dyn PacketTransport> =
+                            session.open_packet(permit, target, target_domain).await?;
+                        Ok(transport)
+                    },
+                    "VLESS H2 pool retired during speculative dial",
+                )
+                .await
+            }
+            path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
+                let separate = path == VlessUdpPath::CoolSeparate;
+                let pool = if separate {
+                    runtime.vless_separate_cool_pool()?
+                } else {
+                    runtime.vless_shared_cool_pool()?
+                };
+                let active_limit = Self::cool_limit(&runtime.node, separate)?;
+                let dial_runtime = Arc::clone(&runtime);
+                Self::prepare_mux_udp(
+                    pool,
+                    move || Self::prepare_cool_session(dial_runtime, active_limit, connect_timeout),
+                    move |session, permit| async move {
+                        let transport: Arc<dyn PacketTransport> =
+                            session.open_packet(permit, target, target_domain).await?;
+                        Ok(transport)
+                    },
+                    if separate {
+                        "VLESS separate Cool pool retired during speculative dial"
+                    } else {
+                        "VLESS shared Cool pool retired during speculative dial"
+                    },
+                )
+                .await
+            }
+            VlessUdpPath::UotV2 => {
+                let (transport, preparation) = self
+                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout)
+                    .await?;
+                Ok(publish_on_commit(
+                    transport as Arc<dyn PacketTransport>,
+                    preparation,
+                ))
+            }
+            VlessUdpPath::Native | VlessUdpPath::Xudp => {
+                self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
+                    .await
+            }
         }
     }
 }

@@ -452,11 +452,19 @@ fn test_fragmentation_and_defrag() {
     // Feed out of order; only the last missing fragment completes it.
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(&pkt[2..]).unwrap();
+        let peer = match msg.addr {
+            TuicAddr::Addr(SocksAddr::V4(peer)) => Some(peer.into()),
+            TuicAddr::None => None,
+            _ => panic!("unexpected fragment address"),
+        };
         out = defrag
-            .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data)
+            .feed(msg.packet_id, msg.frag_id, msg.frag_total, peer, msg.data)
             .or(out);
     }
-    assert_eq!(out.expect("reassembled payload"), data);
+    assert_eq!(
+        out.expect("reassembled payload"),
+        (data, "8.8.8.8:53".parse().unwrap())
+    );
 }
 
 #[test]
@@ -470,3 +478,5 @@ fn test_fragmentation_small_packet_not_fragmented() {
     assert_eq!(msg.addr, addr);
     assert_eq!(msg.data, data);
 }
+
+mod source_udp;

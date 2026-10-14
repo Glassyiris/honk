@@ -74,22 +74,17 @@ async fn direct_uot_is_lazy_and_preserves_datagrams() {
         );
         lazy_tx.send(()).unwrap();
 
+        // Non-connect request, then the first datagram in UoT v1 address form.
         let mut request = [0; 8];
         stream.read_exact(&mut request).await.unwrap();
-        assert_eq!(request, [1, ATYP_IPV4, 8, 8, 8, 8, 0, 53]);
-        let mut packet = [0; 5];
+        assert_eq!(request, [0, ATYP_IPV4, 8, 8, 8, 8, 0, 53]);
+        let mut packet = [0; 12];
         stream.read_exact(&mut packet).await.unwrap();
-        assert_eq!(&packet, b"\0\x03dns");
+        assert_eq!(&packet, b"\0\x08\x08\x08\x08\0\x35\0\x03dns");
 
         let mut response = vec![0, 0];
-        response.extend_from_slice(
-            &super::super::uot::encode_packet(b"first", super::super::uot::MAX_PACKET_SIZE)
-                .unwrap(),
-        );
-        response.extend_from_slice(
-            &super::super::uot::encode_packet(b"second", super::super::uot::MAX_PACKET_SIZE)
-                .unwrap(),
-        );
+        response.extend_from_slice(b"\0\x08\x08\x08\x08\0\x35\0\x05first");
+        response.extend_from_slice(b"\0\xc0\0\x02\x09\x14\xe9\0\x06second");
         stream.write_all(&response).await.unwrap();
     });
 
@@ -124,7 +119,7 @@ async fn direct_uot_is_lazy_and_preserves_datagrams() {
     assert_eq!(&output[..5], b"first");
     assert_eq!(
         transport.recv_packet(&mut output).await.unwrap(),
-        (6, target)
+        (6, "192.0.2.9:5353".parse().unwrap())
     );
     assert_eq!(&output[..6], b"second");
     server.await.unwrap();
@@ -272,7 +267,7 @@ async fn packet_policy_precedes_every_vless_dial_path() {
 async fn interrupted_connected_send_poison_closes_with_last_owner() {
     let (client, mut wire) = tokio::io::duplex(4);
     let target = "8.8.8.8:53".parse().unwrap();
-    let transport = Arc::new(VlessConnectedTransport::new(Box::new(client), target, None));
+    let transport = Arc::new(VlessConnectedTransport::new(Box::new(client), target));
     let sending = {
         let transport = Arc::clone(&transport);
         tokio::spawn(async move {
@@ -300,7 +295,7 @@ async fn interrupted_connected_send_poison_closes_with_last_owner() {
     .await
     .expect("interrupted send poisoned the connected transport")
     .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(crate::proxy::is_frame_interrupted(&error));
     drop(transport);
     let mut remainder = Vec::new();
     tokio::time::timeout(

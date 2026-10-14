@@ -26,20 +26,23 @@ mod registry;
 
 pub use direct::DirectMark;
 pub use error::{
-    NodeFailure, PacketErrorClass, PacketRejection, TargetFailure, is_packet_rejection,
-    node_failure, packet_error_class, packet_rejection, target_failure,
+    FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection, TargetFailure,
+    is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class, packet_rejection,
+    target_failure,
 };
 pub(crate) use error::{
     io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,
-    quic_carrier_io_error,
+    quic_carrier_io_error, send_size_refusal,
 };
 pub use outbound::{
-    PacketOutbound, ProbeableOutbound, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
+    PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, WarmOutcome,
+    WarmRequirement, WarmableOutbound,
 };
 use packet::prepare_detached_quic_transport;
-pub(crate) use packet::{MuxSession, packet_transport_with_owner};
+pub(crate) use packet::{FramePoison, MuxSession, packet_transport_with_owner};
 pub use packet::{
-    PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken, UdpSocketTransport,
+    MultiTargetTransport, PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken,
+    UdpSocketTransport,
 };
 pub use registry::{ProtocolEntry, ProxyRegistry};
 

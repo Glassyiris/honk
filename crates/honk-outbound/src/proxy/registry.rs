@@ -18,8 +18,9 @@ use super::vless::VLessHandler;
 #[cfg(feature = "rprx")]
 use super::vmess::VmessHandler;
 use super::{
-    DirectMark, PacketOutbound, PacketRejection, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
+    DirectMark, MultiTargetTransport, PacketOutbound, PacketRejection, PacketTransport,
+    PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound,
+    WarmOutcome, WarmRequirement, WarmableOutbound,
 };
 
 /// One registered protocol: its descriptor plus the capability objects it
@@ -31,6 +32,7 @@ pub struct ProtocolEntry {
     pub packet: Option<Arc<dyn PacketOutbound>>,
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
+    pub shared: Option<Arc<dyn SharedSourceOutbound>>,
 }
 
 impl ProtocolEntry {
@@ -41,6 +43,7 @@ impl ProtocolEntry {
             packet: None,
             warmable: None,
             probeable: None,
+            shared: None,
         }
     }
 
@@ -59,6 +62,11 @@ impl ProtocolEntry {
         self
     }
 
+    pub fn with_shared<T: SharedSourceOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
+        self.shared = Some(handler);
+        self
+    }
+
     /// Every capability enabled by the descriptor's default node must have an
     /// implementation slot. Node-dependent descriptors may keep an extra slot;
     /// dispatch checks the concrete node before calling it.
@@ -71,6 +79,12 @@ impl ProtocolEntry {
         if (self.descriptor.supports_udp)(&default_node) && self.packet.is_none() {
             panic!(
                 "protocol {} declares UDP without a packet handler",
+                protocol.as_str()
+            );
+        }
+        if self.shared.is_some() && self.packet.is_none() {
+            panic!(
+                "protocol {} declares a shared source without a packet handler",
                 protocol.as_str()
             );
         }
@@ -103,6 +117,7 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::Socks5, socks5.clone())
                 .with_packet(socks5.clone())
+                .with_shared(socks5.clone())
                 .with_probeable(socks5),
         );
         let direct = Arc::new(DirectHandler::new());
@@ -121,6 +136,7 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::Trojan, trojan.clone())
                 .with_packet(trojan.clone())
+                .with_shared(trojan.clone())
                 .with_warmable(trojan.clone())
                 .with_probeable(trojan),
         );
@@ -135,6 +151,7 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::SS, shadowsocks.clone())
                 .with_packet(shadowsocks.clone())
+                .with_shared(shadowsocks.clone())
                 .with_probeable(shadowsocks),
         );
         #[cfg(feature = "rprx")]
@@ -143,6 +160,7 @@ impl ProxyRegistry {
             registry.register(
                 ProtocolEntry::new(NodeProtocol::VLess, vless.clone())
                     .with_packet(vless.clone())
+                    .with_shared(vless.clone())
                     .with_warmable(vless.clone())
                     .with_probeable(vless),
             );
@@ -157,6 +175,7 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::AnyTLS, anytls.clone())
                 .with_packet(anytls.clone())
+                .with_shared(anytls.clone())
                 .with_warmable(anytls.clone())
                 .with_probeable(anytls),
         );
@@ -171,6 +190,7 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::Juicity, juicity.clone())
                 .with_packet(juicity.clone())
+                .with_shared(juicity.clone())
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
@@ -470,6 +490,40 @@ impl ProxyRegistry {
             anyhow::bail!("outbound runtime generation shut down during UDP preparation");
         }
         Ok(prepared)
+    }
+
+    /// Whether `protocol`'s registered entry serves the core `Shared` source
+    /// transport, so one association carries every destination of a source.
+    pub fn has_shared_source(&self, protocol: NodeProtocol) -> bool {
+        self.find(protocol)
+            .is_some_and(|entry| entry.shared.is_some())
+    }
+
+    /// Shared-source association for a captured runtime. The caller owns the
+    /// generation dial scope (see `dial_udp_transport_speculative`); this
+    /// applies the packet capability and policy checks of ordinary UDP dials.
+    pub async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let protocol = runtime.node.protocol();
+        let entry = self
+            .find(protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+        Self::packet_for_runtime(&runtime, entry, target.port())?;
+        let shared = entry.shared.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "shared UDP source not supported for protocol {}",
+                protocol.as_str()
+            )
+        })?;
+        shared
+            .prepare_shared_source(runtime, target, target_domain, connect_timeout, speculative)
+            .await
     }
 
     fn packet_runtime(

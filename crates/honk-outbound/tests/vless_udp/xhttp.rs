@@ -197,7 +197,7 @@ async fn independent_xhttp_h2_peer_preserves_uot_v2_datagrams() {
             let mut upload_bodies = Vec::new();
             let mut upload_responses = Vec::new();
             let mut received = Vec::new();
-            let expected = 23 + MAGIC.len() + 13;
+            let expected = 23 + MAGIC.len() + 20;
             let mut packet_inputs = std::collections::BTreeMap::new();
             let mut next_sequence = 0_u64;
             while received.len() < expected || download.is_none() {
@@ -277,9 +277,13 @@ async fn independent_xhttp_h2_peer_preserves_uot_v2_datagrams() {
             assert_eq!(&received[23..23 + MAGIC.len()], MAGIC);
             assert_eq!(
                 &received[23 + MAGIC.len()..],
-                &[1, 1, 8, 8, 8, 8, 0, 53, 0, 3, b'd', b'n', b's']
+                // Non-connect request, then the first datagram with its own UoT v1 address.
+                &[
+                    0, 1, 8, 8, 8, 8, 0, 53, 0, 8, 8, 8, 8, 0, 53, 0, 3, b'd', b'n', b's'
+                ]
             );
-            let reply = b"\0\0\0\x05first\0\x06second";
+            let reply =
+                b"\0\0\0\x08\x08\x08\x08\0\x35\0\x05first\0\xc0\0\x02\x09\x14\xe9\0\x06second";
             let mut download = download.unwrap();
             for chunk in reply.chunks(3) {
                 download
@@ -314,8 +318,9 @@ async fn independent_xhttp_h2_peer_preserves_uot_v2_datagrams() {
             let (size, peer) = transport.recv_packet(&mut output).await.unwrap();
             assert_eq!(&output[..size], b"first");
             assert_eq!(peer, "8.8.8.8:53".parse::<SocketAddr>().unwrap());
-            let (size, _) = transport.recv_packet(&mut output).await.unwrap();
+            let (size, peer) = transport.recv_packet(&mut output).await.unwrap();
             assert_eq!(&output[..size], b"second");
+            assert_eq!(peer, "192.0.2.9:5353".parse::<SocketAddr>().unwrap());
             drop(transport);
             finished_tx.send(()).unwrap();
         };

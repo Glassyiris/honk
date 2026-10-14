@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 
 use super::addr;
 use super::{
-    MuxSession as _, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    MuxSession as _, PacketOutbound, PreparedUdpTransport, ProbeableOutbound, ProxyStream,
+    SharedSourceOutbound, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
 use crate::session::SpeculativeCheckout;
 
@@ -27,6 +27,8 @@ mod padding;
 mod uot;
 mod writer;
 
+#[cfg(test)]
+use super::PacketTransport;
 use inbound::{
     INBOUND_PAYLOAD_BUDGET, InboundPayload, InboundPayloadBudget, TcpInbound, TcpReceiveState,
     session_demux,
@@ -53,7 +55,7 @@ const CMD_SERVER_SETTINGS: u8 = 10;
 
 const FRAME_HEADER_LEN: usize = 7;
 
-/// sing-anytls defaults (session/client.go): values below 5s clamp to 30s.
+/// sing-anytls defaults (session/client.go). honk applies a configured timeout as given, with no clamp.
 const DEFAULT_IDLE_CHECK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 const CLIENT_NAME: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));
@@ -618,29 +620,6 @@ impl AnyTlsSession {
             .map_err(|_| self.writer_queue_error())
     }
 
-    /// Enqueue a payload PSH for a stream: bounded by the writer-queue
-    /// data permits, so a fast stream backpressures here instead of
-    /// growing memory. Uncancellable once queued.
-    async fn enqueue_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
-        if self.is_closed() {
-            return Err(self.session_error(
-                std::io::ErrorKind::ConnectionAborted,
-                "AnyTLS session is closed",
-            ));
-        }
-        let permit = self.acquire_data_permit(payload.len()).await?;
-        self.enqueue_data_with_permit(sid, payload, permit)
-    }
-
-    /// Enqueue one frame and wait until the session writer flushes its batch.
-    /// Used where an enqueue acknowledgement would turn writer loss into a
-    /// false successful send.
-    async fn enqueue_confirmed_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
-        let permit = self.acquire_data_permit(payload.len()).await?;
-        let completed = self.enqueue_confirmed_data_with_permit(sid, payload, permit)?;
-        self.wait_for_confirmed_data(completed).await
-    }
-
     fn enqueue_confirmed_data_with_permit(
         &self,
         sid: u32,
@@ -779,20 +758,6 @@ impl AnyTlsSession {
             }])
         };
         queued.map_err(|_| self.writer_queue_error())
-    }
-
-    async fn write_uot_datagram(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
-        self.ensure_stream_registered(sid)?;
-        self.enqueue_data(sid, payload).await
-    }
-
-    async fn write_uot_datagram_confirmed(
-        &self,
-        sid: u32,
-        payload: bytes::Bytes,
-    ) -> std::io::Result<()> {
-        self.ensure_stream_registered(sid)?;
-        self.enqueue_confirmed_data(sid, payload).await
     }
 
     async fn register_and_open(
@@ -1322,7 +1287,7 @@ impl super::MuxSession for AnyTlsSession {
         target_domain: Option<&str>,
     ) -> impl Future<Output = Result<Arc<Self::Packet>, crate::session::OpenError>> + Send {
         async move {
-            let setup = crate::proxy::uot::connect_request(target, target_domain)
+            let setup = crate::proxy::uot::request(false, target, target_domain)
                 .map_err(|error| crate::session::OpenError::Refused(anyhow::Error::new(error)))?;
             let magic = addr::encode_address(
                 "0.0.0.0:0".parse().unwrap(),
@@ -1502,62 +1467,6 @@ impl AnyTlsHandler {
         };
         let warm = crate::runtime::flow_observation::without(warm);
         warm.await
-    }
-
-    /// Prepare an AnyTLS UoT transport on an explicitly captured pool without
-    /// publishing a detached session or starting the janitor. The injected
-    /// dial seam keeps cancellation observable in tests.
-    async fn dial_udp_transport_speculative_for_pool_with<F, Fut>(
-        node: &Node,
-        pool: Arc<AnyTlsPool>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        runtime: Option<Arc<crate::runtime::NodeRuntime>>,
-        dial: F,
-    ) -> anyhow::Result<PreparedUdpTransport>
-    where
-        F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
-    {
-        if !crate::descriptor::network_allows_udp(node) {
-            anyhow::bail!("node '{}' does not allow UDP", node.name);
-        }
-        pool.sessions.bind_current_dial_admission_if_unbound();
-
-        let (session, permit, detached) = match pool.checkout_speculative().await? {
-            SpeculativeCheckout::Shared { session, permit } => (session, permit, None),
-            SpeculativeCheckout::Detached(mut reservation) => {
-                let session = tokio::select! {
-                    result = dial() => result?,
-                    _ = reservation.cancelled() => {
-                        anyhow::bail!("AnyTLS speculative dial cancelled by pool shutdown")
-                    }
-                };
-                let permit = reservation.attach(&session)?;
-                (session, permit, Some(reservation))
-            }
-        };
-
-        let transport = session
-            .open_packet(permit, target, target_domain)
-            .await
-            .map_err(|error| match error {
-                crate::session::OpenError::Session(error)
-                | crate::session::OpenError::Draining(error)
-                | crate::session::OpenError::Refused(error) => error,
-            })?;
-        let transport: Arc<dyn PacketTransport> = transport;
-
-        let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(async move {
-            if let Some(reservation) = detached {
-                reservation.commit()?;
-            }
-            if runtime.is_some() {
-                Self::ensure_janitor(&commit_node, &pool, runtime);
-            }
-            Ok(transport)
-        }))
     }
 }
 
@@ -1845,119 +1754,6 @@ impl TcpOutbound for AnyTlsHandler {
             target_addr: target,
             target_domain: target_domain.map(str::to_string),
         })
-    }
-}
-
-#[async_trait]
-impl PacketOutbound for AnyTlsHandler {
-    async fn dial_udp_transport(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
-        let transport = self
-            .dial_udp_transport_runtime(owner.runtime(), target, target_domain, connect_timeout)
-            .await?;
-        Ok(super::packet_transport_with_owner(transport, owner))
-    }
-
-    async fn dial_udp_transport_runtime(
-        &self,
-        runtime: Arc<crate::runtime::NodeRuntime>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let pool = runtime.anytls_pool()?;
-        let node = Arc::clone(&runtime.node);
-        if !crate::descriptor::network_allows_udp(&node) {
-            anyhow::bail!("node '{}' does not allow UDP", node.name);
-        }
-
-        if !runtime.is_ephemeral() {
-            Self::ensure_janitor(&node, &pool, Some(Arc::clone(&runtime)));
-        }
-        let dial_node = Arc::clone(&node);
-        let dial_runtime = Arc::clone(&runtime);
-        let dial_addr = format!("{}:{}", node.host(), node.port);
-        let padding_state = pool.padding_state();
-        let inbound_payload_budget = pool.inbound_payload_budget();
-        let transport = pool
-            .open_with(
-                move || {
-                    let node = Arc::clone(&dial_node);
-                    let runtime = Arc::clone(&dial_runtime);
-                    let addr = dial_addr.clone();
-                    let padding_state = Arc::clone(&padding_state);
-                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
-                    async move {
-                        let tls_connector = runtime.anytls_tls_connector()?;
-                        runtime
-                            .transport_quality()
-                            .scope(dial_session(
-                                &node,
-                                &addr,
-                                connect_timeout,
-                                Some(tls_connector),
-                                padding_state,
-                                inbound_payload_budget,
-                            ))
-                            .await
-                    }
-                },
-                move |session, permit| {
-                    let domain = target_domain.map(str::to_string);
-                    async move { session.open_packet(permit, target, domain.as_deref()).await }
-                },
-            )
-            .await?;
-
-        let transport: Arc<dyn PacketTransport> = transport;
-        Ok(transport)
-    }
-
-    async fn dial_udp_transport_speculative_runtime(
-        &self,
-        runtime: Arc<crate::runtime::NodeRuntime>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<PreparedUdpTransport> {
-        let pool = runtime.anytls_pool()?;
-        let node = Arc::clone(&runtime.node);
-        let dial_node = Arc::clone(&node);
-        let dial_runtime = Arc::clone(&runtime);
-        let dial_addr = format!("{}:{}", node.host(), node.port);
-        let padding_state = pool.padding_state();
-        let inbound_payload_budget = pool.inbound_payload_budget();
-        runtime
-            .scope_tasks(Self::dial_udp_transport_speculative_for_pool_with(
-                node.as_ref(),
-                pool,
-                target,
-                target_domain,
-                Some(Arc::clone(&runtime)),
-                move || async move {
-                    let tls_connector = dial_runtime.anytls_tls_connector()?;
-                    let padding_state = Arc::clone(&padding_state);
-                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
-                    dial_runtime
-                        .transport_quality()
-                        .scope(dial_session(
-                            dial_node.as_ref(),
-                            &dial_addr,
-                            connect_timeout,
-                            Some(tls_connector),
-                            padding_state,
-                            inbound_payload_budget,
-                        ))
-                        .await
-                },
-            ))
-            .await
     }
 }
 

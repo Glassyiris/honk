@@ -111,6 +111,24 @@ impl From<PacketRejection> for std::io::Error {
     }
 }
 
+/// A frame write on a stream shared by every destination of a source was
+/// cancelled or failed partway, so the stream holds a partial frame and no
+/// further frame may follow it.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("shared stream frame write was interrupted")]
+pub struct FrameInterrupted;
+
+impl From<FrameInterrupted> for std::io::Error {
+    fn from(interrupted: FrameInterrupted) -> Self {
+        Self::new(std::io::ErrorKind::BrokenPipe, interrupted)
+    }
+}
+
+/// Whether an I/O error reports a stream already torn by an earlier frame.
+pub fn is_frame_interrupted(error: &std::io::Error) -> bool {
+    find_cause::<FrameInterrupted>(error).is_some()
+}
+
 /// Whether an error contains a terminal, health-neutral local refusal.
 pub fn is_packet_rejection(error: &anyhow::Error) -> bool {
     packet_rejection(error).is_some()
@@ -124,6 +142,16 @@ pub fn packet_rejection(error: &anyhow::Error) -> Option<PacketRejection> {
 /// Recover a typed packet rejection retained inside an I/O error chain.
 pub(crate) fn io_packet_rejection(error: &std::io::Error) -> Option<PacketRejection> {
     find_cause::<PacketRejection>(error).copied()
+}
+
+/// A datagram the native UDP send refuses as too large is a local size refusal
+/// that must not end a shared association or demote the node.
+pub(crate) fn send_size_refusal(error: std::io::Error) -> std::io::Error {
+    if error.raw_os_error() == Some(libc::EMSGSIZE) {
+        PacketRejection::InvalidSize.into()
+    } else {
+        error
+    }
 }
 
 /// Coarse classification for packet-send failures shared with the control plane.

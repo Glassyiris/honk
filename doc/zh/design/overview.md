@@ -107,7 +107,7 @@ flowchart TB
 5. [控制面](./control-plane.md)恢复原始目的地址（TCP 使用 `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST`，回退到透明套接字的 `local_addr`；UDP 使用 IPv4 `IP_ORIGDSTADDR` / IPv6 `IPV6_ORIGDSTADDR` cmsg）；普通流消费 eBPF 路由 handoff，缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。端口 53 流量遵循不同的[TCP handoff 与 UDP 逐报文准入规则](./control-plane.md#透明代理入口)。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。匹配 must 规则、配置 `dial_mode: ip` 或命中负缓存时跳过嗅探；`dial_mode: domain` 执行 DNS reality check。
 7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再由 `SharedGroupManager` 将权威策略选择解析为叶节点。Score 只用逐目标 TCP/UDP 证据在健康合格成员中排名。TCP/UDP 通常只采用一个权威叶节点；只有冷启动顶层 URLTest 会先错开候选的启动时间，且只有胜出候选提交 endpoint 或 source transport。
-8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；XUDP/Mux.Cool 可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source session。嗅探得到的 TCP 字节先于后续流量转发；普通 TCP 使用 splice，包装流使用 copy；未启用 Encryption 的 Vision TLS/REALITY carrier 在两个方向都进入 Direct 后可把 socket 借给 splice。
+8. [出站层](./outbound.md)通过 `TcpOutbound` 或 fallible prepared UDP commit 拨号该叶节点。普通 packet path 为 endpoint 绑定一条 `PacketTransport`；来源共享协议（XUDP/Mux.Cool、Hysteria2、TUIC 与各 `MultiTargetTransport`）可以改为提交由 core 所有、供多个规范五元组 endpoint view 共用的 source association。嗅探得到的 TCP 字节先于后续流量转发；普通 TCP 使用 splice，包装流使用 copy；未启用 Encryption 的 Vision TLS/REALITY carrier 在两个方向都进入 Direct 后可把 socket 借给 splice。
 9. 控制面出口使用 `global.so_mark_from_dae`（零值选择默认 `0x100`）；带 mark 的直连使用规则 mark 加 `CLASSIFIED_MARK`。WAN TC 识别这两类标记，不再额外叠加默认旁路位。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
 ## 运行时不变量
@@ -115,7 +115,7 @@ flowchart TB
 - **旁路标记纪律：** 拨号、探测、DNS 上游、HTTP 下载、QUIC endpoint 和透明监听器携带进程配置的旁路 mark。非零直连规则 mark 替换其低 30 位，并携带 `CLASSIFIED_MARK`；策略路由须使用 `0x3fffffff` 掩码。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。来自其他 full-cone 来源的回复通过仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息返回，而不经过主机转发，也不会让数据路径为客户端随后发往该来源的包学到原生反向方向。
 - **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
-- **VLESS source 边界：** 共享 XUDP/Mux.Cool 按 reused runtime、规范化 client、UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source session 持有唯一 receiver 与 transport health。
+- **UDP source 边界：** 来源共享协议按 reused runtime、规范化 client、协议/UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source association 持有唯一 receiver 与 transport health。关闭 `rprx` 时，除 VLESS 外各协议的 source ownership 仍可用。
 - **网络命名空间纪律：** 进程常驻 host netns。它只通过有作用域且完全同步的 `with_daens_netns` 调用进入 `daens`；`setns` 跨度内不得出现 `.await`，恢复原命名空间失败时进程必须中止。
 - **数据路径准入：** `DATAPATH_STATE_MAP[0]` 在全部监听 FD 已发布且全部接收循环已运行前保持关闭，并在拆除监听器前关闭。gate 关闭期间，TC 原样放行流量。
 - **NFQUEUE 就绪与所有权：** 启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；ready 变更必须经过 fence，生命周期歧义为致命错误，同一 netns 的防火墙管理器不得修改这些对象。

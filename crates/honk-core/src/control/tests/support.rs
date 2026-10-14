@@ -734,3 +734,6 @@ impl NativeFlowApi {
         self.server.shutdown().await;
     }
 }
+
+mod quic;
+pub(in crate::control) use quic::{QuicStreamHold, QuicUdpMode, QuicUdpPacket, QuicUdpPeer};

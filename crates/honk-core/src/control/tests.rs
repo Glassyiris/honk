@@ -19,6 +19,8 @@ mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;
 mod health;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod udp_fullcone;
 
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
@@ -4703,13 +4705,47 @@ fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+const NETNS_TEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn wait_for_test_address(address: std::net::IpAddr) {
+    let std::net::IpAddr::V6(address) = address else {
+        return;
+    };
+    // Disabling DAD does not make RTM_NEWADDR's readiness publication synchronous.
+    let expected = format!("{:032x}", u128::from(address));
+    let deadline = std::time::Instant::now() + NETNS_TEST_TIMEOUT;
+    loop {
+        let addresses = std::fs::read_to_string("/proc/thread-self/net/if_inet6")
+            .expect("read namespace IPv6 addresses");
+        if addresses.lines().any(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            fields.next() == Some(expected.as_str())
+                && u32::from_str_radix(fields.nth(3).expect("IPv6 address flags"), 16)
+                    .expect("hexadecimal IPv6 address flags")
+                    & (libc::IFA_F_TENTATIVE | libc::IFA_F_DADFAILED)
+                    == 0
+        }) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "IPv6 address {address} is not ready"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn configure_test_edge(
     netns: &std::os::fd::OwnedFd,
     interface: &str,
-    address: [u8; 4],
-    gateway: [u8; 4],
+    address: impl Into<std::net::IpAddr>,
+    gateway: impl Into<std::net::IpAddr>,
     ports: &[u16],
 ) -> Vec<std::net::UdpSocket> {
+    let address = address.into();
+    let gateway = gateway.into();
     in_test_netns(netns, || {
         let mut netlink = crate::netlink::NlSock::new().expect("edge netlink");
         let (loopback, _) = netlink.get_link("lo").expect("edge loopback");
@@ -4720,18 +4756,48 @@ fn configure_test_edge(
         netlink
             .set_link_up(ifindex, true)
             .expect("edge interface up");
+        let (family, prefix, offset, address_bytes, gateway_bytes) = match (address, gateway) {
+            (std::net::IpAddr::V4(address), std::net::IpAddr::V4(gateway)) => (
+                libc::AF_INET as u8,
+                24,
+                12,
+                address.to_ipv6_mapped().octets(),
+                gateway.to_ipv6_mapped().octets(),
+            ),
+            (std::net::IpAddr::V6(address), std::net::IpAddr::V6(gateway)) => {
+                // Linux selects DAD using max(all, interface).
+                std::fs::write("/proc/sys/net/ipv6/conf/all/accept_dad", "0")
+                    .expect("disable namespace duplicate address detection");
+                std::fs::write(
+                    format!("/proc/sys/net/ipv6/conf/{interface}/accept_dad"),
+                    "0",
+                )
+                .expect("disable edge duplicate address detection");
+                (
+                    libc::AF_INET6 as u8,
+                    64,
+                    0,
+                    address.octets(),
+                    gateway.octets(),
+                )
+            }
+            _ => panic!("edge and gateway address families differ"),
+        };
+        let address_bytes = &address_bytes[offset..];
+        let gateway_bytes = &gateway_bytes[offset..];
         netlink
-            .addr_op(true, ifindex, libc::AF_INET as u8, &address, 24)
+            .addr_op(true, ifindex, family, address_bytes, prefix)
             .expect("edge address");
+        wait_for_test_address(address);
         netlink
             .add_route(
-                libc::AF_INET as u8,
+                family,
                 254,
                 1,
                 0,
                 4,
                 None,
-                Some(&gateway),
+                Some(gateway_bytes),
                 Some(ifindex),
             )
             .expect("edge default route");
