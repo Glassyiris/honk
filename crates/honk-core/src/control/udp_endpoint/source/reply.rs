@@ -179,7 +179,14 @@ pub(super) async fn deliver_source_reply(
                     alternate_reply_sockets.push((source, socket));
                     alternate_reply_sockets.len() - 1
                 }
-                None => return SourceReplyDisposition::Observed,
+                None => {
+                    crate::logging::warn_throttled!(
+                        node = %owner.node_id,
+                        limit = MAX_REPLY_SOCKETS_PER_ENDPOINT - 1,
+                        "UDP source reached its foreign reply socket limit; replies from further unbound peers are not delivered for this source's lifetime"
+                    );
+                    return SourceReplyDisposition::Observed;
+                }
             };
             let Some(_reply) = pool.admit_foreign_source_reply(owner, source) else {
                 return SourceReplyDisposition::Drop;
