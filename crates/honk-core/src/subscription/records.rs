@@ -52,7 +52,9 @@ pub(super) fn parse_record_subscription(
             let result = split_fields(line)
                 .ok_or("malformed subscription record")
                 .and_then(|fields| parse_record(&fields))
-                .and_then(|mapping| super::clash::parse_clash_proxy(&mapping, subscription_id));
+                .and_then(|mapping| {
+                    super::clash::parse_clash_proxy(&mapping, subscription_id, None)
+                });
             match result {
                 Ok(node) => IndexedOutcome::node(ordinal, "entries", node),
                 Err(reason) if reason.contains("unsupported") => {

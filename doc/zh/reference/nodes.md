@@ -301,12 +301,16 @@ node {
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | 通用 `username` / `password`；供 `tuic_uuid` / `tuic_password` 的 handler 回退使用 |
 | TUIC | `congestion_control` | `cubic`、`new_reno` 或 `bbr`；省略时为 `cubic`；未知值告警并回退到 cubic |
-| TUIC | `alpn` | 逗号分隔的 ALPN 覆盖值；默认 `tuic` |
+| TUIC | `alpn` | 逗号分隔的 ALPN 覆盖值；分享链接默认 `tuic`；原始 Clash/Mihomo 导入使用下述来源默认值 |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | 接收窗口覆盖值 |
 | Juicity | `uuid:password` userinfo | 通用 `username` / `password`；供 `juicity_uuid` / `juicity_password` 的 handler 回退使用 |
 | Juicity | 协议默认值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收窗口（共享自适应流控可使其增长） |
 | Juicity | UDP | 每个客户端源一条 QUIC bi stream 承载所有目的地；回复返回真实的远端对端，取决于服务端自身的 UDP socket 与出口策略 |
 | 两者 | `mtu`、`sni`、insecure 别名、pin、ECH | 共用 QUIC/TLS 参数 |
+
+原始 Clash/Mihomo `proxies` 条目中的 TUIC `alpn` 缺失或为 null 时，会补为 `h3`。显式非空列表保留顺序；显式空列表或空白字符串继续使用 honk 既有的 `tuic` 回退，并不表示不发送 ALPN。该来源默认值不适用于原生分享链接、扁平节点、sing-box `outbounds` 或文本记录格式。
+
+**升级注意：** 依赖此前 `tuic` 回退的导入节点须显式设置 `alpn: [tuic]` 才能保留旧行为。协议专用 ALPN 不改变节点 UUID，但有效配置变化会为新请求重建运行时；已有流继续遵循正常的代际退休机制。
 
 ### AnyTLS
 
