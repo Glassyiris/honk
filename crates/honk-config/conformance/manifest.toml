@@ -1766,7 +1766,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-nodes-02"
-source = { file = "doc/en/reference/nodes.md", lines = "183-186" }
+source = { file = "doc/en/reference/nodes.md", lines = "207-210" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1777,7 +1777,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-03"
-source = { file = "doc/en/reference/nodes.md", lines = "273-275" }
+source = { file = "doc/en/reference/nodes.md", lines = "297-299" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1788,7 +1788,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-04"
-source = { file = "doc/en/reference/nodes.md", lines = "326-331" }
+source = { file = "doc/en/reference/nodes.md", lines = "351-356" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1799,7 +1799,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-05"
-source = { file = "doc/en/reference/nodes.md", lines = "206-208" }
+source = { file = "doc/en/reference/nodes.md", lines = "230-232" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2083,7 +2083,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-02"
-source = { file = "doc/zh/reference/nodes.md", lines = "182-185" }
+source = { file = "doc/zh/reference/nodes.md", lines = "203-206" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2094,7 +2094,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-03"
-source = { file = "doc/zh/reference/nodes.md", lines = "272-274" }
+source = { file = "doc/zh/reference/nodes.md", lines = "293-295" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2105,7 +2105,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-04"
-source = { file = "doc/zh/reference/nodes.md", lines = "325-330" }
+source = { file = "doc/zh/reference/nodes.md", lines = "347-352" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2116,7 +2116,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-05"
-source = { file = "doc/zh/reference/nodes.md", lines = "205-207" }
+source = { file = "doc/zh/reference/nodes.md", lines = "226-228" }
 wrap = ""
 layer = "structure"
 honk = "accept"
