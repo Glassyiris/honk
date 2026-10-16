@@ -100,7 +100,7 @@ impl PendingUdpVerdicts {
             .await
     }
 
-    pub(super) async fn ingest_held_wait(
+    pub(in crate::control) async fn ingest_held_wait(
         &self,
         packet: QueuedPacket,
         held: HeldVerdict,
@@ -427,18 +427,18 @@ impl PendingUdpVerdicts {
             self.drop_one(held, DropOutcome::Other);
             return NfqueueIngest::Dropped;
         };
-        let (retained, kernel_incarnation) = match backend.udp_conn_state_lookup(&key.tuples()) {
-            Ok(Some(state))
-                if state.decision_token == decision_token
-                    && (state.incarnation != 0
-                        || backend.observe_datapath().kind == crate::ebpf::DatapathKind::Mock) =>
-            {
-                (
-                    retained_state(&state),
-                    (state.incarnation != 0).then_some(state.incarnation),
-                )
-            }
-            Ok(Some(_)) | Ok(None) => {
+        let tuples = key.tuples();
+        let inspected = backend.udp_conn_state_lookup(&tuples).and_then(|state| {
+            let Some(state) = state.filter(|state| state.decision_token == decision_token) else {
+                return Ok(None);
+            };
+            backend
+                .udp_flow_incarnation(&tuples, decision_token)
+                .map(|incarnation| Some((retained_state(&state), incarnation)))
+        });
+        let (retained, kernel_incarnation) = match inspected {
+            Ok(Some(retained)) => retained,
+            Ok(None) => {
                 drop(vacant);
                 self.stats.record_udp_nfqueue_token_mismatch();
                 self.drop_one(held, DropOutcome::Other);

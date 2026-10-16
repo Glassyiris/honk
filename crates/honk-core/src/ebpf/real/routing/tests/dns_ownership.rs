@@ -20,6 +20,7 @@ use std::time::Duration;
 mod direct_mode;
 mod failures;
 mod network;
+mod refresh;
 mod retirement;
 mod trace;
 
@@ -143,6 +144,7 @@ struct Run {
     mark: u32,
     cb: [u32; 5],
     priority: u32,
+    data: Vec<u8>,
 }
 
 fn isolated(f: impl FnOnce() + Send + 'static) {
@@ -278,6 +280,7 @@ fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) ->
         mark: returned.mark,
         cb: returned.cb,
         priority: returned.priority,
+        data: output,
     }
 }
 

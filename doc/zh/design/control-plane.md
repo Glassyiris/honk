@@ -22,7 +22,7 @@
     - `quic.rs`、`packet_sniffer.rs`、`tcp_sniff.rs` — 分别负责 QUIC 解密/重组、逐流嗅探会话与 TCP 负缓存。
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`；[endpoint 事务](#udp-endpoint-流水线)。
     - `probers.rs` — `ProxyHttpProber`、`ProxyUdpProber`；[健康探测](./groups.md#健康状态与探测)。
-    - `janitor.rs` — `BpfJanitor`；[map 维护](./datapath.md#用户空间维护与计数)。
+    - `janitor.rs` — `BpfJanitor` 的调度与压力策略；`janitor/sweep.rs` 持有 [map 维护](./datapath.md#用户空间维护与计数)的有界扫描与 fenced retirement。
     - `drain.rs` — `DrainTracker`；[已接受流的排空](#reload-与运行时-generation)。
 
 ## 启动与关闭
@@ -79,7 +79,7 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 
 `connection/` 是每流 route/sniff/mode/selection 的规范边界。Socket UDP 入口与 NFQUEUE 持有的 payload 都在同一个 `UdpEndpointPool` 中预留相同的 `UdpInitLease`；NFQUEUE 没有第二套 Router 或拨号器，也没有克隆报文、重放或主动重传路径。暂存流在 token 校验的终态转换前计算唯一最终出站与 mark。
 
-`build_tuples_key` 必须用 `mem::zeroed()` 初始化 `TuplesKey`。这个 `#[repr(C)]` key 在 40 字节布局中只有 37 字节字段，内核会散列包括三个 padding 字节在内的全部 40 字节。因此逐字段初始化可能产生用户态无法可靠查询或删除的 key。
+`TuplesKey` 的 40 字节 `#[repr(C)]` 布局包含显式的三字节 `padding` 字段。内核会散列全部 40 字节，因此每个构造入口都必须把该字段置零；`build_tuples_key` 零初始化规范 key，retirement 会拒绝非零 padding。
 
 权威 URLTest 建立失败保留按延迟前三候选的一轮重赛。Score 所属失败可顺序尝试一个不同的合格叶节点，在排名前排除失败身份，即使普通评分仍把它排在第一。Score 两次尝试共享绝对 deadline，并保留固定 generation、Selector 选择和首选真正经过的 final 边。类型化拒绝、本地拨号容量耗尽、取消和关闭均为终态，包括排空竞速时发现的已完成拒绝；应用写入和已建立 relay 从不重放。
 
@@ -223,6 +223,8 @@ Janitor 收集阶段在消耗 candidate budget 前排除 pinned TCP，并在 bac
 I/O 完成后，joined removal worker 持有已准入 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。它在 fenced 退役前分别尝试释放 local 与精确 native pin；释放失败不能确认清理成功。准入前取消同步 Drop native pin，物理 tuple 回收交给原子 janitor，不声称已确认；native Drop 错误发往当前 worker epoch 的 critical channel。Worker 和 janitor 在关闭告警后仍 join 已准入工作，不执行 abort。
 
 普通 UDP 只在冷 endpoint 准入、异步准备前捕获 kernel incarnation；Ready enqueue 不增加 backend 查询。身份贯穿 initializer、endpoint 与 tombstone。Token-zero UDP 任一方向端口为 53 都保持无 conn-state；源端口 53 的 transport 流量不会因此变成控制器 DNS。畸形目的端口 53 回退也保持无状态。模型执行不声称具有原生 socket 证明。
+
+NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并调用 backend 自有的 UDP 准入校验。无法解决的 retirement 所有权或超出 allocator 范围的身份不能重建 ActiveDirect 放行；已准入的 fast follower 仍保留既有无查询路径。
 
 真实 relay 完成后，TCP owner 先按实际结果恰一次结算 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。
 

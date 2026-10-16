@@ -5,9 +5,8 @@
 //! HashMap storage.
 
 use super::retirement::{
-    HANDOFF_TIMEOUT_NS, REDIRECT_TIMEOUT_NS, auxiliaries_match, conn_expired, handoff_matches,
-    hint_auxiliary_tokens_match, redirect_matches, request_matches, tuple_matches,
-    validate_conn_retirement,
+    auxiliaries_match, expiry_hint_auxiliary_removal, expiry_hint_conn_expired, handoff_matches,
+    redirect_matches, request_matches, tuple_matches, validate_conn_retirement,
 };
 #[cfg(test)]
 use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
@@ -309,48 +308,41 @@ impl MockEbpfBackend {
                 } else {
                     &self.udp_conn_states
                 }
-                .get(&raw)
-                .copied();
-                if current.is_some_and(|state| state.incarnation != incarnation) {
-                    return UdpDecisionCommitResult::Superseded;
-                }
-                let expired =
-                    current.is_some_and(|state| conn_expired(request.key.l4proto, &state, now_ns));
-                let handoff = self.routing_handoffs.get_mut().get(&raw).copied();
-                let track = self.redirect_tracks.get(&track_raw).copied();
+                .get(&raw);
+                let expired = match expiry_hint_conn_expired(
+                    request.key.l4proto,
+                    incarnation,
+                    now_ns,
+                    current,
+                ) {
+                    Ok(expired) => expired,
+                    Err(result) => return result,
+                };
                 if !expired {
-                    if !hint_auxiliary_tokens_match(
+                    let handoff = self.routing_handoffs.get_mut().get(&raw);
+                    let track = self.redirect_tracks.get(&track_raw);
+                    let removal = match expiry_hint_auxiliary_removal(
                         incarnation,
-                        current.as_ref(),
-                        handoff.as_ref(),
-                        track.as_ref(),
+                        now_ns,
+                        current,
+                        handoff,
+                        track,
                     ) {
-                        return UdpDecisionCommitResult::TokenMismatch;
-                    }
+                        Ok(removal) => removal,
+                        Err(result) => return result,
+                    };
                     let mut removed = false;
-                    if handoff.is_some_and(|entry| {
-                        entry.incarnation == incarnation
-                            && now_ns.saturating_sub(entry.last_seen_ns) > HANDOFF_TIMEOUT_NS
-                    }) {
+                    if removal.handoff {
                         let deleted = self.routing_handoffs.get_mut().remove(&raw).is_some();
                         counts.handoff += u64::from(deleted);
                         removed |= deleted;
                     }
-                    if track.is_some_and(|entry| {
-                        entry.incarnation == incarnation
-                            && now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TIMEOUT_NS
-                    }) {
+                    if removal.redirect {
                         let deleted = self.redirect_tracks.remove(&track_raw).is_some();
                         counts.redirect += u64::from(deleted);
                         removed |= deleted;
                     }
-                    return if removed {
-                        UdpDecisionCommitResult::Applied
-                    } else if current.is_none() && handoff.is_none() && track.is_none() {
-                        UdpDecisionCommitResult::Missing
-                    } else {
-                        UdpDecisionCommitResult::StateMismatch
-                    };
+                    return removal.outcome(removed);
                 }
                 self.retire_owned_flow(&request.key, request.kind, counts)
             }

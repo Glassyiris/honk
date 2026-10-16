@@ -127,6 +127,10 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 既有 tuple element 只原地更新、不替换：Linux 普通 hash 替换可在 RCU 读者仍持有旧指针时复用其存储。内核在原生锁内取得一致快照或窄投影，修改时在同一锁内比较捕获的身份；持锁时除 unlock 外不调用 helper。物理删除仍必须经过 tuple fence、成功的内核 grace 与事后所有权复验。外部工具使用 bucket 保护的 batch 与加锁 value copy，不回退到不安全的单项读取。
 
+无状态 UDP tuple 元数据使用 token/incarnation `0/0`：每个新求值报文只在另一个 `0/0` 项上原地更新完整 handoff/redirect payload，不能覆盖普通或 staged owner。原始 must 目的端口 53 仍使用逐报文 carrier，不使用 tuple handoff。无状态 redirect 更新在既有刷新间隔到期前保留原时间戳。
+
+`auxiliary.rs` 统一持有客户端帧信息的首次发布与按间隔续期。目的端口非 53 的精确 LAN UDP 流量，包括源端口 53，可在任一方向沿用既有一秒时间戳刷新节奏补回被淘汰的客户端记录。先在原生锁内复制当前保存的 MAC/接口 payload，解锁后再投影；未知对端 fallback 不续期该缓存，也不取得出站归属。该操作仍为 best effort，不增加 timer 或逐包 LRU 写入。
+
 `RoutingMeta` bit 58 仍表示 WAN UDP 用户态所有权，bit 57（`OFFLOAD`）区分原生直连。未发布 UDP claim 失败时，在原地记录精确 owner 的 `Aborted` 及实际已分配 token，辅助项保留到 fenced 用户态清理。Preparing/Aborted 报文不能续期 claim；Aborted 立即满足过期清理条件，但不能转发或激活。Advisory hint 丢失仍由既有 janitor 兜底。
 
 新对象校验成功后，启动只删除四个已废弃的 honk pin（`COOKIE_PID_MAP`、`UDP_DECISION_EPOCH`、`UDP_DECISION_INFLIGHT`、`UDP_DECISION_RETIRE_FENCE`），不清扫无关 pin，也不删除持久化 UDP allocator。

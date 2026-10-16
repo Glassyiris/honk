@@ -20,6 +20,8 @@ mod dns_tcp_ownership;
 mod dns_udp_ownership;
 mod health;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod nfqueue_retirement;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod tcp_binding;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod tcp_tuple_reuse;

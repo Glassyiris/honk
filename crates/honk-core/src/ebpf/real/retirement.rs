@@ -1,9 +1,8 @@
 //! One backend-exclusive retirement protocol for every tuple-map deletion.
 use super::*;
 use crate::ebpf::retirement::{
-    HANDOFF_TIMEOUT_NS, REDIRECT_TIMEOUT_NS, auxiliaries_match, conn_expired, handoff_matches,
-    hint_auxiliary_tokens_match, redirect_matches, request_matches, tuple_matches,
-    validate_conn_retirement,
+    auxiliaries_match, expiry_hint_auxiliary_removal, expiry_hint_conn_expired, handoff_matches,
+    redirect_matches, request_matches, tuple_matches, validate_conn_retirement,
 };
 use aya::maps::ArrayOfMaps;
 use honk_ebpf_common::conn::{MAX_CONN_STATE_NUM, RetirementFence};
@@ -461,27 +460,31 @@ impl RealEbpfBackend {
         } = request.kind
         {
             let current = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?;
-            if current.is_some_and(|state| state.incarnation != incarnation) {
-                return Ok(Superseded);
-            }
-            let expired = current.is_some_and(|state| conn_expired(key.l4proto, &state, now_ns));
+            let expired = match expiry_hint_conn_expired(
+                key.l4proto,
+                incarnation,
+                now_ns,
+                current.as_ref(),
+            ) {
+                Ok(expired) => expired,
+                Err(result) => return Ok(result),
+            };
             if !expired {
                 let handoff =
                     self.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
                 let track = self.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-                if !hint_auxiliary_tokens_match(
+                let removal = match expiry_hint_auxiliary_removal(
                     incarnation,
+                    now_ns,
                     current.as_ref(),
                     handoff.as_ref(),
                     track.as_ref(),
                 ) {
-                    return Ok(TokenMismatch);
-                }
+                    Ok(removal) => removal,
+                    Err(result) => return Ok(result),
+                };
                 let mut removed = false;
-                if handoff.is_some_and(|entry| {
-                    entry.incarnation == incarnation
-                        && now_ns.saturating_sub(entry.last_seen_ns) > HANDOFF_TIMEOUT_NS
-                }) {
+                if removal.handoff {
                     let deleted = self
                         .hash_remove_present::<_, FlowMapValue<RoutingHandoffEntry>>(
                             "ROUTING_HANDOFF_MAP",
@@ -490,10 +493,7 @@ impl RealEbpfBackend {
                     counts.handoff += u64::from(deleted);
                     removed |= deleted;
                 }
-                if track.is_some_and(|entry| {
-                    entry.incarnation == incarnation
-                        && now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TIMEOUT_NS
-                }) {
+                if removal.redirect {
                     let deleted = self.hash_remove_present::<_, FlowMapValue<RedirectEntry>>(
                         "REDIRECT_TRACK",
                         &track_key,
@@ -501,13 +501,7 @@ impl RealEbpfBackend {
                     counts.redirect += u64::from(deleted);
                     removed |= deleted;
                 }
-                return Ok(if removed {
-                    Applied
-                } else if current.is_none() && handoff.is_none() && track.is_none() {
-                    Missing
-                } else {
-                    StateMismatch
-                });
+                return Ok(removal.outcome(removed));
             }
         }
         let Some(state) = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {

@@ -1,6 +1,11 @@
+use super::super::connection::TcpFlowKey;
 use super::*;
 use crate::ebpf::mock::MockEbpfBackend;
-use honk_ebpf_common::{RedirectEntry, RedirectTuple};
+use crate::ebpf::{RetireCounts, RetireError};
+use honk_ebpf_common::conn::{
+    ConnState, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+};
+use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
 
 #[test]
 fn aux_pressure_uses_current_scan_result() {

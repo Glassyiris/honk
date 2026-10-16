@@ -46,7 +46,7 @@ use network_types::{
 use crate::{
     maps::{
         CLIENT_REPLY_TRACK, PARAM, PKT_SCRATCH_KEY, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP,
-        UdpDecisionScratch, increment_bpf_stat,
+        increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT},
     sk,
@@ -213,11 +213,6 @@ fn redirect_lan_packet_to_control_plane(
             handoff_mode == HANDOFF_WRITE_ALWAYS,
         )
         .map_err(|_| TC_ACT_SHOT)?;
-        // Destination-53 queries need only exact replies; source port 53 does
-        // not make a transport flow DNS or remove its foreign-reply framing.
-        if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port != 53 {
-            publish_client_reply(scratch);
-        }
     }
 
     if dns_fragment {
@@ -239,20 +234,6 @@ fn redirect_lan_packet_to_control_plane(
     } else {
         Ok(unsafe { bpf_redirect(param.dae0_ifindex, 0) } as c_long)
     }
-}
-
-/// Record the client's LAN framing so a reply from a peer it never contacted
-/// can still reach it; see `CLIENT_REPLY_TRACK`. Rewrites the scratch copy of
-/// the exact record in place, because the callers have no stack left to build
-/// another. Best effort: a failed insert must not fail the flow, it only leaves
-/// the previous reply behaviour.
-#[inline(always)]
-fn publish_client_reply(scratch: &mut UdpDecisionScratch) {
-    scratch.redirect_key.dst_ip.u6_addr64 = [0, 0];
-    scratch.redirect_key.dst_port = 0;
-    scratch.redirect.decision_token = 0;
-    scratch.redirect.incarnation = 0;
-    let _ = CLIENT_REPLY_TRACK.insert(&scratch.redirect_key, &scratch.redirect, 0);
 }
 
 /// The client record for a UDP reply with no exact flow record. Replies from
@@ -317,7 +298,6 @@ fn stage_udp_decision(
         crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, decision_token);
         return Err(TC_ACT_SHOT);
     }
-    publish_client_reply(scratch);
 
     scratch.handoff.last_seen_ns = now;
     scratch.handoff.routing_generation = routing_generation;

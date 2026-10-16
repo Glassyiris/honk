@@ -242,17 +242,72 @@ pub(crate) fn auxiliaries_match(
         .is_none_or(|entry| entry.incarnation == incarnation && entry.decision_token == token)
 }
 
-pub(crate) fn hint_auxiliary_tokens_match(
+pub(crate) fn expiry_hint_conn_expired(
+    proto: u8,
     incarnation: u64,
+    now_ns: u64,
+    current: Option<&ConnState>,
+) -> Result<bool, super::UdpDecisionCommitResult> {
+    let Some(state) = current else {
+        return Ok(false);
+    };
+    match validate_conn_retirement(
+        state,
+        proto,
+        RetireKind::ExpiryHint {
+            incarnation,
+            now_ns,
+        },
+    ) {
+        Ok(()) => Ok(true),
+        Err(super::UdpDecisionCommitResult::StateMismatch) => Ok(false),
+        Err(result) => Err(result),
+    }
+}
+
+pub(crate) struct ExpiryHintAuxiliaryRemoval {
+    pub(crate) handoff: bool,
+    pub(crate) redirect: bool,
+    unchanged: super::UdpDecisionCommitResult,
+}
+
+impl ExpiryHintAuxiliaryRemoval {
+    pub(crate) fn outcome(self, removed: bool) -> super::UdpDecisionCommitResult {
+        if removed {
+            super::UdpDecisionCommitResult::Applied
+        } else {
+            self.unchanged
+        }
+    }
+}
+
+pub(crate) fn expiry_hint_auxiliary_removal(
+    incarnation: u64,
+    now_ns: u64,
     current: Option<&ConnState>,
     handoff: Option<&RoutingHandoffEntry>,
     track: Option<&RedirectEntry>,
-) -> bool {
+) -> Result<ExpiryHintAuxiliaryRemoval, super::UdpDecisionCommitResult> {
+    use super::UdpDecisionCommitResult::*;
+    let unchanged = if current.is_none() && handoff.is_none() && track.is_none() {
+        Missing
+    } else {
+        StateMismatch
+    };
     let handoff = handoff.filter(|entry| entry.incarnation == incarnation);
     let track = track.filter(|entry| entry.incarnation == incarnation);
     let token = current
         .map(|state| state.decision_token)
         .or_else(|| handoff.map(|entry| entry.result.decision_token))
         .or_else(|| track.map(|entry| entry.decision_token));
-    token.is_none_or(|token| auxiliaries_match(incarnation, token, handoff, track))
+    if token.is_some_and(|token| !auxiliaries_match(incarnation, token, handoff, track)) {
+        return Err(TokenMismatch);
+    }
+    Ok(ExpiryHintAuxiliaryRemoval {
+        handoff: handoff
+            .is_some_and(|entry| now_ns.saturating_sub(entry.last_seen_ns) > HANDOFF_TIMEOUT_NS),
+        redirect: track
+            .is_some_and(|entry| now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TIMEOUT_NS),
+        unchanged,
+    })
 }

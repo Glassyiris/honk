@@ -22,7 +22,7 @@ Module map:
     - `quic.rs`, `packet_sniffer.rs`, `tcp_sniff.rs` — QUIC decryption/reassembly, per-flow sniff sessions, and TCP negative cache, respectively.
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`; [endpoint transactions](#udp-endpoint-pipeline).
     - `probers.rs` — `ProxyHttpProber`, `ProxyUdpProber`; [health probes](./groups.md#health-state-and-probes).
-    - `janitor.rs` — `BpfJanitor`; [map maintenance](./datapath.md#userspace-maintenance-and-accounting).
+    - `janitor.rs` — `BpfJanitor` scheduling and pressure policy; `janitor/sweep.rs` owns bounded scans and fenced retirement for [map maintenance](./datapath.md#userspace-maintenance-and-accounting).
     - `drain.rs` — `DrainTracker`; [accepted-flow drain](#reload-and-runtime-generations).
 
 ## Startup and shutdown
@@ -80,7 +80,7 @@ The sniffers feed the canonical initializer and may resolve a staged decision, b
 
 `connection/` is the canonical per-flow route/sniff/mode/selection boundary. Socket UDP ingress and NFQUEUE-owned payloads both reserve the same `UdpInitLease` in the same `UdpEndpointPool`; NFQUEUE has no second router, dialer, cloned packet, replay, or deliberate retransmission path. A staged flow computes one final outbound and mark before its token-checked terminal transition.
 
-`build_tuples_key` must initialize `TuplesKey` with `mem::zeroed()`. The `#[repr(C)]` key has 37 field bytes in a 40-byte layout, and the kernel hashes all 40 bytes, including its three padding bytes. Field-wise initialization can therefore create keys that userspace cannot look up or delete reliably.
+`TuplesKey` has an explicit three-byte `padding` field in its 40-byte `#[repr(C)]` layout. Every constructor must keep that field zero because the kernel hashes all 40 bytes; `build_tuples_key` zero-initializes the canonical key, and retirement rejects nonzero padding.
 
 An authoritative URLTest setup failure retains one retry round over its latency-ordered top three. A Score-owned failure can try one different permitted leaf sequentially, excluding the failed identity before ranking even if its ordinary score remains highest. Score attempts share one absolute deadline; request-local recovery preserves the pinned generation, Selector choices and actual primary final-edge provenance. Typed refusal, local admission-capacity exhaustion, cancellation and shutdown remain terminal, including completed refusals found while draining a race. Application writes and established relays are never replayed.
 
@@ -237,6 +237,8 @@ Janitor collection excludes pinned TCP before spending its candidate budget and 
 After I/O completes, the joined removal worker owns admitted TCP retirement, its socket, tracker/close completion and outbound statistics guard even if the waiter is cancelled. It attempts both local and exact native pin release before fenced retirement; a release failure cannot acknowledge cleanup. Cancellation before admission drops the native pin synchronously and leaves physical tuple reclamation to the atomic janitor, without claiming confirmation. Native Drop errors reach the current worker epoch's critical channel. Worker and janitor shutdown join admitted work beyond warnings rather than aborting it.
 
 Ordinary UDP captures its kernel incarnation only on cold endpoint admission, before asynchronous preparation; Ready enqueue adds no backend query. The captured identity survives initializer, endpoint and tombstone lifetimes. Token-zero UDP with either source or destination port 53 remains stateless; source-port-53 transport traffic is not reclassified as controller DNS. Malformed destination-53 fallback also remains stateless. Model execution never claims native socket proof.
+
+Cold NFQUEUE cell reconstruction retains its conn-state snapshot and invokes backend-owned UDP admission validation under the same read guard. Unresolved retirement ownership or an invalid allocator-domain identity cannot reconstruct an ActiveDirect acceptance; already admitted fast followers keep their existing no-lookup path.
 
 After a real relay completes, the TCP owner settles its actual Score outcome and relay-error statistics once before propagating any retirement failure. Successful relay evidence is not changed to cancellation by failed retirement. TCP pool replenishment still requires both relay success and confirmed retirement; intentional cancellation retains its separate neutral path.
 

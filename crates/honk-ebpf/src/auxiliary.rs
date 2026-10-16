@@ -26,12 +26,38 @@ use crate::{
         AuxiliaryIdentity, copy_payload, handoff_identity, redirect_identity, redirect_snapshot,
     },
     maps::{
-        REDIRECT_TRACK, ROUTING_HANDOFF_MAP, TCP_PUBLISHING, UdpDecisionScratch,
-        increment_bpf_stat, tuple_retiring,
+        CLIENT_REPLY_TRACK, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, TCP_PUBLISHING,
+        UdpDecisionScratch, increment_bpf_stat, tuple_retiring,
     },
 };
 
 pub const IDENTITY_MISMATCH: i32 = -2;
+
+#[inline(always)]
+fn stateless_publication(key: &TuplesKey, token: u32, incarnation: u64) -> bool {
+    token == 0 && incarnation == 0 && crate::contrack::is_short_lived_udp_traffic(key)
+}
+
+// Project through existing scratch to avoid another key/value pair on the TC stack.
+#[inline(always)]
+fn publish_client_reply(key: &TuplesKey, scratch: &mut UdpDecisionScratch) {
+    if key.l4proto != crate::transport::IPPROTO_UDP
+        || key.dst_port == 53
+        || scratch.redirect.from_wan != 0
+    {
+        return;
+    }
+    let token = scratch.redirect.decision_token;
+    let incarnation = scratch.redirect.incarnation;
+    scratch.redirect_key.dst_ip.u6_addr64 = [0, 0];
+    scratch.redirect_key.dst_port = 0;
+    scratch.redirect.decision_token = 0;
+    scratch.redirect.incarnation = 0;
+    let _ = CLIENT_REPLY_TRACK.insert(&scratch.redirect_key, &scratch.redirect, 0);
+    scratch.redirect_key = RedirectTuple::from_tuples(key);
+    scratch.redirect.decision_token = token;
+    scratch.redirect.incarnation = incarnation;
+}
 
 const _: () = {
     assert!(
@@ -64,6 +90,16 @@ fn touch_redirect(
     if now.saturating_sub(snapshot.last_seen_ns) < AUXILIARY_MAP_REFRESH_INTERVAL_NS {
         return Ok(());
     }
+    let scratch = if key.l4proto == crate::transport::IPPROTO_UDP && key.dst_port != 53 {
+        let mut zero = 0u32;
+        unsafe { core::ptr::write_volatile(&mut zero, 0) };
+        UDP_DECISION_SCRATCH_MAP.get_ptr_mut(unsafe { core::ptr::read_volatile(&zero) })
+    } else {
+        None
+    };
+    if let Some(scratch) = scratch {
+        unsafe { (*scratch).redirect_key = *redirect_key };
+    }
     let ptr = REDIRECT_TRACK
         .get_ptr_mut(redirect_key)
         .ok_or(IDENTITY_MISMATCH)?;
@@ -71,10 +107,19 @@ fn touch_redirect(
     let current = unsafe { &mut (*ptr).value };
     let owned = current.incarnation == snapshot.incarnation
         && current.decision_token == snapshot.decision_token;
-    if owned && now.saturating_sub(current.last_seen_ns) >= AUXILIARY_MAP_REFRESH_INTERVAL_NS {
+    let refreshed =
+        owned && now.saturating_sub(current.last_seen_ns) >= AUXILIARY_MAP_REFRESH_INTERVAL_NS;
+    let renew_client = refreshed && current.from_wan == 0;
+    if refreshed {
         current.last_seen_ns = now;
+        if renew_client && let Some(scratch) = scratch {
+            unsafe { copy_payload(&raw mut (*scratch).redirect, current) };
+        }
     }
     unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+    if renew_client && let Some(scratch) = scratch {
+        publish_client_reply(key, unsafe { &mut *scratch });
+    }
     if owned {
         Ok(())
     } else {
@@ -93,6 +138,9 @@ pub fn refresh_redirect(
 ) -> Result<bool, i32> {
     if tuple_retiring(key) {
         return Err(IDENTITY_MISMATCH);
+    }
+    if stateless_publication(key, token, incarnation) {
+        return Ok(false);
     }
     let Some(snapshot) = redirect_identity(redirect_key) else {
         return Ok(false);
@@ -134,6 +182,9 @@ pub fn refresh_handoff(
 ) -> Result<bool, i32> {
     if tuple_retiring(key) {
         return Err(IDENTITY_MISMATCH);
+    }
+    if stateless_publication(key, token, incarnation) {
+        return Ok(false);
     }
     let Some(snapshot) = handoff_identity(key) else {
         return Ok(false);
@@ -179,7 +230,7 @@ fn syn_publisher(key: &TuplesKey, incarnation: u64) -> bool {
             .is_some_and(|owner| unsafe { *owner } == incarnation)
 }
 
-/// Only an admitted SYN publisher can replace an existing payload in place.
+/// Fresh SYN and stateless per-packet authority publish payloads without replacing elements.
 #[inline(always)]
 pub fn publish_redirect(
     key: &TuplesKey,
@@ -188,6 +239,36 @@ pub fn publish_redirect(
 ) -> Result<(), i32> {
     if tuple_retiring(key) {
         return Err(IDENTITY_MISMATCH);
+    }
+    if stateless_publication(
+        key,
+        scratch.redirect.decision_token,
+        scratch.redirect.incarnation,
+    ) && let Some(ptr) = REDIRECT_TRACK.get_ptr_mut(&scratch.redirect_key)
+    {
+        unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+        let current = unsafe { &mut (*ptr).value };
+        let owned = current.incarnation == 0 && current.decision_token == 0;
+        let mut refreshed = false;
+        if owned {
+            refreshed = scratch
+                .redirect
+                .last_seen_ns
+                .saturating_sub(current.last_seen_ns)
+                >= AUXILIARY_MAP_REFRESH_INTERVAL_NS;
+            if !refreshed {
+                scratch.redirect.last_seen_ns = current.last_seen_ns;
+            }
+            unsafe { copy_payload(current, &scratch.redirect) };
+        }
+        unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+        if !owned {
+            return Err(IDENTITY_MISMATCH);
+        }
+        if refreshed {
+            publish_client_reply(key, scratch);
+        }
+        return Ok(());
     }
     if replace {
         let publisher = syn_publisher(key, scratch.redirect.incarnation);
@@ -224,7 +305,9 @@ pub fn publish_redirect(
         .map_err(|_| {
             increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
             -1
-        })
+        })?;
+    publish_client_reply(key, scratch);
+    Ok(())
 }
 
 #[inline(always)]
@@ -235,6 +318,25 @@ pub fn publish_handoff(
 ) -> Result<(), i32> {
     if tuple_retiring(key) {
         return Err(IDENTITY_MISMATCH);
+    }
+    if stateless_publication(
+        key,
+        scratch.handoff.result.decision_token,
+        scratch.handoff.incarnation,
+    ) && let Some(ptr) = ROUTING_HANDOFF_MAP.get_ptr_mut(key)
+    {
+        unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+        let current = unsafe { &mut (*ptr).value };
+        let owned = current.incarnation == 0 && current.result.decision_token == 0;
+        if owned {
+            unsafe { copy_payload(current, &scratch.handoff) };
+        }
+        unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+        return if owned {
+            Ok(())
+        } else {
+            Err(IDENTITY_MISMATCH)
+        };
     }
     if replace {
         let publisher = syn_publisher(key, scratch.handoff.incarnation);
@@ -280,8 +382,8 @@ pub fn publish_handoff(
 /// a new Ethernet header is prepended.  `outbound` is recorded in the entry so
 /// `dae0_ingress` can attribute reply traffic in `OUTBOUND_STATS`.
 ///
-/// Cached flows refresh only their captured owner; only SYN publishers may
-/// replace an existing entry, and then only by a locked in-place write.
+/// Ordinary owners refresh lazily; SYN and stateless payloads are published
+/// in place under the native value lock.
 ///
 /// Returns 0 on success, non-zero on failure.
 #[inline(always)]
