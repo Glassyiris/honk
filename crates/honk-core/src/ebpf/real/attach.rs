@@ -140,6 +140,19 @@ impl RealEbpfBackend {
         validate_socket_identity_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         retirement::validate_flow_lifetime_layout(&bpf)?;
+        for name in [
+            "COOKIE_PID_MAP",
+            "UDP_DECISION_EPOCH",
+            "UDP_DECISION_INFLIGHT",
+            "UDP_DECISION_RETIRE_FENCE",
+        ] {
+            if let Err(error) = std::fs::remove_file(pin_root.join(name))
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("remove obsolete eBPF map pin {name}")));
+            }
+        }
         let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
         let mut pinned_maps = Vec::new();
         for (name, map) in bpf.maps() {
@@ -524,6 +537,7 @@ impl RealEbpfBackend {
         };
         let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
         let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
+        let tcp_live_pins = take_tcp_live_pins(&mut bpf)?;
 
         Ok(Self {
             bpf: Some(bpf),
@@ -547,6 +561,8 @@ impl RealEbpfBackend {
             retirement_faults: Default::default(),
             tcp_bindings: Some(tcp_bindings),
             cap_lookup_batch: BatchCapability::new(),
+            cap_flow_lookup_batch: BatchCapability::new(),
+            tcp_live_pins,
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,

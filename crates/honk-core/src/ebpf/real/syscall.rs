@@ -36,6 +36,29 @@ pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(),
     }
 }
 
+pub(super) fn insert_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow::Result<()> {
+    let value = 1u8;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = map.fd().as_fd().as_raw_fd() as u32;
+    attr.__bindgen_anon_2.key = (&incarnation as *const u64) as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = (&value as *const u8) as u64;
+    attr.__bindgen_anon_2.flags = aya_obj::generated::BPF_NOEXIST as u64;
+    unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
+            .context("TCP_LIVE_PINS no-exist insert")
+    })
+}
+
+pub(super) fn remove_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow::Result<()> {
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = map.fd().as_fd().as_raw_fd() as u32;
+    attr.__bindgen_anon_2.key = (&incarnation as *const u64) as u64;
+    unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
+            .context(format!("TCP_LIVE_PINS release {incarnation}"))
+    })
+}
+
 fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
     use aya::maps::Map;
     let data: &aya::maps::MapData = match map {
@@ -274,67 +297,21 @@ fn append_initialized<K: Pod, V: Pod>(
     }
 }
 
-/// Scan a hash-family map with `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+).
-/// Returns `false` without changing `out` when the command is unsupported.
-pub fn bpf_lookup_batch_scan<K: Pod, V: Pod>(
-    bpf: &Ebpf,
-    cap: &BatchCapability,
-    map: &str,
-    out: &mut Vec<(K, V)>,
-) -> anyhow::Result<bool> {
-    if cap.is_unsupported() {
-        return Ok(false);
-    }
-    let fd = map_fd(bpf, map)?;
-    let initial_len = out.len();
-    let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
-    let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
-    let mut next_key = MaybeUninit::<K>::uninit();
-    let mut previous_key: Option<K> = None;
-    loop {
-        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-        attr.batch.map_fd = fd as u32;
-        attr.batch.in_batch = previous_key
-            .as_ref()
-            .map_or(0, |key| key as *const K as u64);
-        attr.batch.out_batch = next_key.as_mut_ptr() as u64;
-        attr.batch.keys = keys.as_mut_ptr() as u64;
-        attr.batch.values = values.as_mut_ptr() as u64;
-        attr.batch.count = BPF_BATCH_CHUNK as u32;
-        let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
-        if !cap.observe(result) {
-            out.truncate(initial_len);
-            debug!(
-                "bpf lookup_batch({}) unsupported, using Aya map iteration",
-                map
-            );
-            return Ok(false);
-        }
-        let (count, terminal) = match lookup_batch_result(result, unsafe { attr.batch.count }) {
-            Ok(result) => result,
-            Err(error) => {
-                out.truncate(initial_len);
-                return Err(anyhow::anyhow!("bpf lookup_batch({map}) errno={error}"));
-            }
-        };
-        append_initialized(&keys, &values, count, out);
-        // A successful batch may be short; only ENOENT marks the final batch.
-        if terminal {
-            return Ok(true);
-        }
-        if count == 0 {
-            out.truncate(initial_len);
-            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
-        }
-        previous_key = Some(unsafe { next_key.assume_init() });
-    }
-}
-
 /// Streaming lookup-batch variant that keeps memory bounded to one chunk.
 pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
+    visit: &mut BatchVisitor<'_, K, V>,
+) -> anyhow::Result<bool> {
+    bpf_lookup_batch_scan_cb_flags(bpf, cap, map, 0, visit)
+}
+
+pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
+    bpf: &Ebpf,
+    cap: &BatchCapability,
+    map: &str,
+    elem_flags: u64,
     visit: &mut BatchVisitor<'_, K, V>,
 ) -> anyhow::Result<bool> {
     if cap.is_unsupported() {
@@ -343,23 +320,34 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     let fd = map_fd(bpf, map)?;
     let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
     let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
-    let mut next_key = MaybeUninit::<K>::uninit();
-    let mut previous_key: Option<K> = None;
+    // Hash maps return a four-byte opaque bucket cursor, not a key.
+    let mut next_cursor = [0u8; 4];
+    let mut previous_cursor = [0u8; 4];
+    let mut has_cursor = false;
     let mut chunk = Vec::with_capacity(BPF_BATCH_CHUNK);
     loop {
         let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
         attr.batch.map_fd = fd as u32;
-        attr.batch.in_batch = previous_key
-            .as_ref()
-            .map_or(0, |key| key as *const K as u64);
-        attr.batch.out_batch = next_key.as_mut_ptr() as u64;
+        attr.batch.in_batch = if has_cursor {
+            previous_cursor.as_ptr() as u64
+        } else {
+            0
+        };
+        attr.batch.out_batch = next_cursor.as_mut_ptr() as u64;
         attr.batch.keys = keys.as_mut_ptr() as u64;
         attr.batch.values = values.as_mut_ptr() as u64;
         attr.batch.count = BPF_BATCH_CHUNK as u32;
+        attr.batch.elem_flags = elem_flags;
         let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
+        if let Err(error) = result {
+            anyhow::ensure!(
+                !has_cursor || error == ENOENT,
+                "bpf lookup_batch({map}) failed after a partial scan: errno={error}"
+            );
+        }
         if !cap.observe(result) {
             debug!(
-                "bpf lookup_batch({}) unsupported, using Aya map iteration",
+                "bpf lookup_batch({}) unsupported; caller must select a safe fallback",
                 map
             );
             return Ok(false);
@@ -378,7 +366,8 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
         if count == 0 {
             anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
         }
-        previous_key = Some(unsafe { next_key.assume_init() });
+        previous_cursor.copy_from_slice(&next_cursor);
+        has_cursor = true;
     }
 }
 

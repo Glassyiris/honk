@@ -1,9 +1,7 @@
 //! Bind a SYN incarnation to its request object, then to the actual child socket.
 
-use crate::maps::{
-    CONN_STATE_MAP, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, TCP_REQUEST_BINDINGS, TCP_SOCKET_BINDING,
-    tuple_retiring,
-};
+use crate::flow::{conn_incarnation, handoff_incarnation, handoff_snapshot, redirect_incarnation};
+use crate::maps::{TCP_REQUEST_BINDINGS, TCP_SOCKET_BINDING, request_retiring, tuple_retiring};
 use aya_ebpf::{
     Global,
     bindings::BPF_SK_STORAGE_GET_F_CREATE,
@@ -128,23 +126,9 @@ fn current(tuples: &TuplesKey, incarnation: u64) -> bool {
     if incarnation == 0 || tuple_retiring(tuples) {
         return false;
     }
-    let Some(conn) = (unsafe { CONN_STATE_MAP.get(tuples) }) else {
-        return false;
-    };
-    if conn.incarnation != incarnation {
-        return false;
-    }
-    let Some(handoff) = (unsafe { ROUTING_HANDOFF_MAP.get(tuples) }) else {
-        return false;
-    };
-    if handoff.incarnation != incarnation {
-        return false;
-    }
-    let Some(redirect) = (unsafe { REDIRECT_TRACK.get(&RedirectTuple::from_tuples(tuples)) })
-    else {
-        return false;
-    };
-    redirect.incarnation == incarnation
+    conn_incarnation(tuples) == Some(incarnation)
+        && handoff_incarnation(tuples) == Some(incarnation)
+        && redirect_incarnation(&RedirectTuple::from_tuples(tuples)) == Some(incarnation)
 }
 
 #[inline(always)]
@@ -158,10 +142,9 @@ fn route_request(sk: *mut c_void, skb: *const u8, request: *mut c_void, ipv6: bo
     if !current(&tuples, incarnation) {
         return;
     }
-    let Some(handoff) = (unsafe { ROUTING_HANDOFF_MAP.get(&tuples) }) else {
+    let Some(handoff) = handoff_snapshot(&tuples) else {
         return;
     };
-    let handoff = *handoff;
     if handoff.incarnation != incarnation {
         return;
     }
@@ -181,6 +164,9 @@ fn route_request(sk: *mut c_void, skb: *const u8, request: *mut c_void, ipv6: bo
         padding: 0,
     };
     // Retransmissions cannot rewrite a proof belonging to this exact request.
+    if request_retiring(&key) {
+        return;
+    }
     let _ = TCP_REQUEST_BINDINGS.insert(&key, &binding, 1);
 }
 
@@ -212,6 +198,9 @@ pub fn honk_tcp_create_openreq_child(ctx: FExitContext) -> u32 {
         address: request as u64,
         cookie,
     };
+    if request_retiring(&key) {
+        return 0;
+    }
     let Some(binding) = (unsafe { TCP_REQUEST_BINDINGS.get(&key) }) else {
         return 0;
     };
@@ -253,10 +242,15 @@ fn destroy_request(request: *mut c_void) {
         return;
     };
     if cookie != 0 {
-        let _ = TCP_REQUEST_BINDINGS.remove(&TcpRequestKey {
+        let key = TcpRequestKey {
             address: request as u64,
             cookie,
-        });
+        };
+        // A fenced request belongs to the janitor's post-grace cleanup.
+        if request_retiring(&key) {
+            return;
+        }
+        let _ = TCP_REQUEST_BINDINGS.remove(&key);
     }
 }
 

@@ -75,6 +75,8 @@ pub(crate) enum RemovalReason {
     /// A userspace endpoint (or its uncommitted reservation) is gone; the
     /// flow's conntrack entries are retired with it.
     UserspaceEndpointRetired,
+    /// Stateless token-zero UDP in either port-53 direction, regardless of payload.
+    /// This reason exempts conn-state lifetime, not transport routing or DNS parsing.
     RawDnsEndpointRetired,
     #[cfg(any(feature = "ebpf", test))]
     /// The flow was handed to the kernel; its terminal conn_state must remain.
@@ -339,14 +341,15 @@ impl UdpEndpointPool {
             _ => return false,
         };
         let kernel_incarnation = entry.kernel_incarnation();
-        let raw_dns = key.dst_port == 53;
+        let stateless = token == 0
+            && honk_ebpf_common::conn::is_stateless_udp_ports(key.client_port, key.dst_port);
         let conn_id = entry.retire();
         drop(entry);
         self.notify_removed(EndpointRemoval {
             client: SocketAddr::new(key.client_ip(), key.client_port),
             dst: SocketAddr::new(key.dst_ip(), key.dst_port),
             conn_id,
-            reason: if raw_dns {
+            reason: if stateless {
                 RemovalReason::RawDnsEndpointRetired
             } else {
                 RemovalReason::UserspaceEndpointRetired

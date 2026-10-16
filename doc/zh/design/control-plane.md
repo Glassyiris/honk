@@ -216,11 +216,13 @@ copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的
 
 客户端不发 FIN 或 RST 就消失的情况单独限制：TPROXY TCP listener 启用 TCP keepalive（空闲 3600 秒、间隔 15 秒、4 次探测），accepted socket 继承该设置。静默的客户端约一小时后结束其 relay；仍在线的空闲客户端会应答探测，因此长时间空闲的连接保持打开。该错误是客户端侧的 `TimedOut`，按取消结算 Score。
 
-Accepted TCP FD 在 tuple 路由、pin 或取得清理权限前，必须携带原始 SYN/request 的有效证明。其不可变 handoff 与 incarnation 必须匹配当前 conn/handoff/redirect 所有权。证明缺失、过期或被替代时，关闭 socket 而不删除当前 tuple 状态。`TcpFlowPins` 对 accepted owner 引用计数；准入在同一个 backend 读 guard 内完成校验与 pin retain。Janitor 在 backend 排他 guard 内检查当前 pin，不采用旧扫描快照。退役使用 guard 捕获的 incarnation，不在 teardown 时选择恰好占据 tuple 的条目。
+Accepted TCP FD 在 tuple 路由、pin 或取得清理权限前，必须携带原始 SYN/request 的有效证明；不可变 handoff 与 incarnation 必须匹配当前 conn/handoff/redirect 所有权。证明缺失、过期或被替代时关闭 socket，不删除当前 tuple。准入在同一 backend 读 guard 内完成校验，保留 tuple-local `TcpFlowPins` 引用与精确 `TCP_LIVE_PINS` incarnation。内核 Closing/redirect 老化检查只查询该 incarnation 的原生 pin，使存活的空闲或半关闭 owner 能恢复传输，而不靠 timer 伪造时间戳。新的 SYN 不继承旧 pin。
 
-I/O 完成后，joined removal worker 持有已准入的 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。准入前取消则使用 Drop 与后续原子 janitor 清理，不声称退役已确认。Worker 和 janitor 关闭在宽限告警后仍 join 实际已准入工作，不执行 abort。
+Janitor 收集阶段在消耗 candidate budget 前排除 pinned TCP，并在 backend 写所有权下再次检查当前 pin。Request 证明过期独立处理：child 的 socket storage 保留自己的证明。退役只使用 guard 捕获的 incarnation，不选择 tuple 的后继占用者。
 
-普通 UDP 只在冷 endpoint 准入、异步准备之前捕获 kernel incarnation；Ready enqueue 不增加 backend 查询。捕获的身份贯穿 initializer、endpoint 与 tombstone。全部 UDP/53 路径保持无 conn-state，包括没有解码 route 的畸形 DNS 回退。Mock 明确使用模型语义，不声称具有内核 socket 证明。
+I/O 完成后，joined removal worker 持有已准入 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。它在 fenced 退役前分别尝试释放 local 与精确 native pin；释放失败不能确认清理成功。准入前取消同步 Drop native pin，物理 tuple 回收交给原子 janitor，不声称已确认；native Drop 错误发往当前 worker epoch 的 critical channel。Worker 和 janitor 在关闭告警后仍 join 已准入工作，不执行 abort。
+
+普通 UDP 只在冷 endpoint 准入、异步准备前捕获 kernel incarnation；Ready enqueue 不增加 backend 查询。身份贯穿 initializer、endpoint 与 tombstone。Token-zero UDP 任一方向端口为 53 都保持无 conn-state；源端口 53 的 transport 流量不会因此变成控制器 DNS。畸形目的端口 53 回退也保持无状态。模型执行不声称具有原生 socket 证明。
 
 真实 relay 完成后，TCP owner 先按实际结果恰一次结算 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。
 
@@ -254,7 +256,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./groups.md#预热与所有权)。
 
-- `src/mode.rs` — `DatapathFlagsHandle` 在同一异步互斥锁下串行更新 `ModeState` 与 `DATAPATH_FLAGS_MAP`。Initialize/mode/GLOBAL/static 更新与 NFQUEUE fence/reopen/disable 协同，避免并发 API 更新在 reload 中重新发布 ready。Fence 完成前须发布 READY=false、成功完成同步内核 grace barrier，并在 fence 内移除全部未交付的 Preparing/Pending 状态。
+- `src/mode.rs` — `DatapathFlagsHandle` 在同一异步互斥锁下串行更新 `ModeState` 与 `DATAPATH_FLAGS_MAP`。Initialize/mode/GLOBAL/static 更新与 NFQUEUE fence/reopen/disable 协同，避免 API 更新在 reload 中重新发布 ready。Fence 完成要求 READY=false、成功的同步内核 grace，以及 fenced 清理全部未交付 Preparing/Pending/Aborted 状态。
 
 ### 需要重启的变更
 

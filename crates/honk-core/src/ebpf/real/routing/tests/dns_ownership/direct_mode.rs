@@ -54,7 +54,7 @@ fn direct_mode_normalizes_nonmust_proxy_in_lan_and_wan_tcp_udp() {
                     (false, true) => (TC_ACT_OK, Some(0)),
                 };
                 let before_handoff =
-                    hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
+                    flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
                 let source_port = 42000 + index as u16;
                 for (label, packet) in [
                     (
@@ -82,7 +82,7 @@ fn direct_mode_normalizes_nonmust_proxy_in_lan_and_wan_tcp_udp() {
                     }
                 }
                 assert_eq!(
-                    hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
+                    flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
                     before_handoff,
                     "{side} {destination} must={must}: no userspace handoff"
                 );
@@ -129,7 +129,7 @@ fn rule_direct_prefix_offload_preserves_global_handoffs() {
                 let source = IpAddr::V4(Ipv4Addr::new(10 + wan as u8, 0, 0, 2));
                 for protocol in [IPPROTO_TCP, IPPROTO_UDP] {
                     let source_port = base_port + protocol as u16;
-                    let before_handoff = hash_count::<TuplesKey, RoutingHandoffEntry>(
+                    let before_handoff = flow_count::<TuplesKey, RoutingHandoffEntry>(
                         &backend,
                         "ROUTING_HANDOFF_MAP",
                     );
@@ -166,7 +166,7 @@ fn rule_direct_prefix_offload_preserves_global_handoffs() {
                                 "{context}"
                             );
                             assert_eq!(
-                                hash_count::<TuplesKey, RoutingHandoffEntry>(
+                                flow_count::<TuplesKey, RoutingHandoffEntry>(
                                     &backend,
                                     "ROUTING_HANDOFF_MAP"
                                 ),

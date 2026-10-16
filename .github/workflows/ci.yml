@@ -88,6 +88,8 @@ jobs:
               - 'crates/honk-core/src/ebpf/**'
               - 'crates/honk-core/src/control/routing_matcher/**'
               - 'crates/honk-core/src/control/routing_matcher.rs'
+              - 'crates/honk-core/src/control/tests.rs'
+              - 'crates/honk-core/src/control/tests/**'
               - 'crates/honk-core/src/routing/**'
               - 'crates/honk-config/src/routing.rs'
               - 'crates/honk-config/src/parser/routing.rs'
@@ -99,6 +101,7 @@ jobs:
               - 'crates/honk-nfqueue/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'Justfile'
               - '.github/ci/**'
               - '.github/workflows/ci.yml'
       - name: Record lane selection

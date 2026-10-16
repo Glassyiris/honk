@@ -472,9 +472,9 @@ impl BpfJanitor {
     }
 
     /// Clean up unowned conn-state entries with state-based timeouts (TCP
-    /// closing: 10 s, TCP active: 120 s, UDP: 120 s). Current TCP pins are
-    /// checked under the backend writer lock before retirement. Returns
-    /// `(deleted, total_scanned)` and recalibrates only after a complete scan.
+    /// closing: 10 s, TCP active: 120 s). Current TCP pins are excluded before
+    /// candidate budgeting, then rechecked under the backend writer lock.
+    /// Returns `(deleted, total_scanned)` and recalibrates only after a complete scan.
     async fn cleanup_conn_state(
         &self,
         gauge: &mut OccupancyGauge,
@@ -499,6 +499,7 @@ impl BpfJanitor {
         occ_counters: ((u64, u64), u64),
         tuning: ScanTuning,
     ) -> anyhow::Result<(u64, usize)> {
+        let pins = Arc::clone(&self.tcp_flow_pins);
         let scanned = self
             .run_blocking_read("conn-state", move |ebpf| {
                 let deadline = Instant::now() + tuning.budget;
@@ -514,9 +515,10 @@ impl BpfJanitor {
                                 || (state.state != TcpState::TcpStateClosing as u8
                                     && age > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS)
                         } else {
-                            age > UDP_CONN_STATE_TIMEOUT_NS
+                            state.state == honk_ebpf_common::UdpDecisionState::Aborted as u8
+                                || age > UDP_CONN_STATE_TIMEOUT_NS
                         };
-                        if stale {
+                        if stale && (key.l4proto != IPPROTO_TCP || !pins.contains(key)) {
                             expired.push((*key, *state));
                         }
                     }
@@ -548,7 +550,11 @@ impl BpfJanitor {
         } else {
             self.run_blocking_chunked_delete(expired, gauge, move |(key, expected)| {
                 let timeout = if key.l4proto != IPPROTO_TCP {
-                    UDP_CONN_STATE_TIMEOUT_NS
+                    if expected.state == honk_ebpf_common::UdpDecisionState::Aborted as u8 {
+                        0
+                    } else {
+                        UDP_CONN_STATE_TIMEOUT_NS
+                    }
                 } else if expected.state == TcpState::TcpStateClosing as u8 {
                     honk_ebpf_common::conn::TCP_CONN_STATE_CLOSING_TIMEOUT_NS
                 } else {
@@ -606,6 +612,7 @@ impl BpfJanitor {
         tuning: ScanTuning,
         gauge: &mut OccupancyGauge,
     ) -> anyhow::Result<AuxScanResult> {
+        let pins = Arc::clone(&self.tcp_flow_pins);
         let scanned = self
             .run_blocking_read("redirect-track", move |ebpf| {
                 let deadline = Instant::now() + tuning.budget;
@@ -616,17 +623,17 @@ impl BpfJanitor {
                     total += chunk.len();
                     for (key, entry) in chunk {
                         if now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS {
-                            expired.push((
-                                TuplesKey {
-                                    src_ip: key.src_ip,
-                                    dst_ip: key.dst_ip,
-                                    src_port: key.src_port,
-                                    dst_port: key.dst_port,
-                                    l4proto: key.l4proto,
-                                    padding: [0; 3],
-                                },
-                                *entry,
-                            ));
+                            let key = TuplesKey {
+                                src_ip: key.src_ip,
+                                dst_ip: key.dst_ip,
+                                src_port: key.src_port,
+                                dst_port: key.dst_port,
+                                l4proto: key.l4proto,
+                                padding: [0; 3],
+                            };
+                            if key.l4proto != IPPROTO_TCP || !pins.contains(&key) {
+                                expired.push((key, *entry));
+                            }
                         }
                     }
                     complete = expired.len() < tuning.candidates && Instant::now() < deadline;
@@ -696,6 +703,16 @@ impl BpfJanitor {
                 return Ok(AuxScanResult::default());
             }
         };
+        self.cleanup_routing_handoff_at(now_ns, tuning, gauge).await
+    }
+
+    async fn cleanup_routing_handoff_at(
+        &self,
+        now_ns: u64,
+        tuning: ScanTuning,
+        gauge: &mut OccupancyGauge,
+    ) -> anyhow::Result<AuxScanResult> {
+        let pins = Arc::clone(&self.tcp_flow_pins);
         let scanned = self
             .run_blocking_read("routing-handoff", move |ebpf| {
                 let deadline = Instant::now() + tuning.budget;
@@ -705,7 +722,9 @@ impl BpfJanitor {
                 ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
                     total += chunk.len();
                     for (key, entry) in chunk {
-                        if now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS {
+                        if now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
+                            && (key.l4proto != IPPROTO_TCP || !pins.contains(key))
+                        {
                             expired.push((*key, *entry));
                         }
                     }

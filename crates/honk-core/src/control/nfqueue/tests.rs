@@ -989,7 +989,10 @@ async fn staged_admission_keeps_captured_incarnation_through_cancel() {
         state.incarnation = 62;
         backend.udp_conn_state_store(&key.tuples(), &state).unwrap();
     }
-    pending.cancel(identity).await.unwrap();
+    assert!(matches!(
+        pending.cancel(identity).await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
     assert_eq!(*sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
     assert_eq!(
         backend

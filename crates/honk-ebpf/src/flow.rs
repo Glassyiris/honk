@@ -1,0 +1,145 @@
+//! Native value-lock boundaries for stable tuple elements.
+
+use aya_ebpf_bindings::helpers::{bpf_spin_lock, bpf_spin_unlock};
+use honk_ebpf_common::{
+    ConnState, FlowMapValue, RedirectEntry, RedirectTuple, RoutingHandoffEntry, TuplesKey,
+};
+
+use crate::maps::{CONN_STATE_MAP, REDIRECT_TRACK, ROUTING_HANDOFF_MAP};
+
+/// Copy only fixed-size, eight-byte-aligned payloads without emitting memcpy under a lock.
+#[inline(always)]
+pub unsafe fn copy_payload<T: Copy>(dst: *mut T, src: *const T) {
+    const {
+        assert!(core::mem::size_of::<T>() % 8 == 0);
+    }
+    const {
+        assert!(core::mem::align_of::<T>() >= 8);
+    }
+    let dst = dst.cast::<u64>();
+    let src = src.cast::<u64>();
+    let mut i = 0;
+    while i < core::mem::size_of::<T>() / 8 {
+        unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
+        i += 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn snapshot<T: Copy>(ptr: *mut FlowMapValue<T>) -> T {
+    let mut result = core::mem::MaybeUninit::<T>::uninit();
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        copy_payload(result.as_mut_ptr(), &raw const (*ptr).value);
+        bpf_spin_unlock(&mut (*ptr).lock);
+        result.assume_init()
+    }
+}
+
+#[inline(always)]
+pub fn conn_snapshot(key: &TuplesKey) -> Option<ConnState> {
+    Some(unsafe { snapshot(CONN_STATE_MAP.get_ptr_mut(key)?) })
+}
+
+#[inline(always)]
+pub fn handoff_snapshot(key: &TuplesKey) -> Option<RoutingHandoffEntry> {
+    Some(unsafe { snapshot(ROUTING_HANDOFF_MAP.get_ptr_mut(key)?) })
+}
+
+#[inline(always)]
+pub fn redirect_snapshot(key: &RedirectTuple) -> Option<RedirectEntry> {
+    Some(unsafe { snapshot(REDIRECT_TRACK.get_ptr_mut(key)?) })
+}
+
+pub struct ConnLifecycle {
+    pub incarnation: u64,
+    pub last_seen_ns: u64,
+    pub state: u8,
+}
+
+pub struct AuxiliaryIdentity {
+    pub incarnation: u64,
+    pub last_seen_ns: u64,
+    pub decision_token: u32,
+}
+
+#[inline(always)]
+pub fn conn_lifecycle(key: &TuplesKey) -> Option<ConnLifecycle> {
+    let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let value = &raw const (*ptr).value;
+        let result = ConnLifecycle {
+            incarnation: (&raw const (*value).incarnation).read_volatile(),
+            last_seen_ns: (&raw const (*value).last_seen_ns).read_volatile(),
+            state: (&raw const (*value).state).read_volatile(),
+        };
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(result)
+    }
+}
+
+#[inline(always)]
+pub fn redirect_identity(key: &RedirectTuple) -> Option<AuxiliaryIdentity> {
+    let ptr = REDIRECT_TRACK.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let value = &raw const (*ptr).value;
+        let result = AuxiliaryIdentity {
+            incarnation: (&raw const (*value).incarnation).read_volatile(),
+            last_seen_ns: (&raw const (*value).last_seen_ns).read_volatile(),
+            decision_token: (&raw const (*value).decision_token).read_volatile(),
+        };
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(result)
+    }
+}
+
+#[inline(always)]
+pub fn handoff_identity(key: &TuplesKey) -> Option<AuxiliaryIdentity> {
+    let ptr = ROUTING_HANDOFF_MAP.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let value = &raw const (*ptr).value;
+        let result = AuxiliaryIdentity {
+            incarnation: (&raw const (*value).incarnation).read_volatile(),
+            last_seen_ns: (&raw const (*value).last_seen_ns).read_volatile(),
+            decision_token: (&raw const (*value).result.decision_token).read_volatile(),
+        };
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(result)
+    }
+}
+
+#[inline(always)]
+pub fn conn_incarnation(key: &TuplesKey) -> Option<u64> {
+    let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let incarnation = (&raw const (*ptr).value.incarnation).read_volatile();
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(incarnation)
+    }
+}
+
+#[inline(always)]
+pub fn handoff_incarnation(key: &TuplesKey) -> Option<u64> {
+    let ptr = ROUTING_HANDOFF_MAP.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let incarnation = (&raw const (*ptr).value.incarnation).read_volatile();
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(incarnation)
+    }
+}
+
+#[inline(always)]
+pub fn redirect_incarnation(key: &RedirectTuple) -> Option<u64> {
+    let ptr = REDIRECT_TRACK.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let incarnation = (&raw const (*ptr).value.incarnation).read_volatile();
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(incarnation)
+    }
+}

@@ -6,9 +6,9 @@ use crate::dns::DnsResolver;
 use crate::ebpf::{EbpfBackend, real::RealEbpfBackend};
 use crate::routing::Router;
 use anyhow::{Context, ensure};
-use aya::maps::{Array, HashMap, MapError};
+use aya::maps::{Array, HashMap};
 use honk_ebpf_common::dae_ip::In6Addr;
-use honk_ebpf_common::{ConnState, RedirectEntry, RedirectTuple, TuplesKey};
+use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
 use shared_peers::{SharedUdpMode, SharedUdpPeer};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -41,6 +41,7 @@ fn netns_udp_full_cone_source_contract() -> anyhow::Result<()> {
             "ss",
             "socks5",
             "trojan",
+            "socks5-source53",
         ] {
             let case = format!("{family}/{protocol}");
             let status = std::process::Command::new(std::env::current_exe()?)
@@ -65,6 +66,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
         "full-cone acceptance requires root"
     );
     let (family, protocol) = case.split_once('/').context("missing child case family")?;
+    let source53 = protocol == "socks5-source53";
+    let protocol = if source53 { "socks5" } else { protocol };
     let ips: [&str; 5] = match family {
         "v4" => [
             "10.70.0.1",
@@ -79,9 +82,15 @@ fn run_child(case: &str) -> anyhow::Result<()> {
     let [lan_ip, client_ip, wan_ip, server_ip, foreign_ip] =
         ips.map(|ip| ip.parse::<IpAddr>().unwrap());
     let (client_netns, server_netns) = build_lab(lan_ip, wan_ip)?;
-    let client = configure_test_edge(&client_netns, "honk-c0", client_ip, lan_ip, &[0])
-        .pop()
-        .context("client socket")?;
+    let client = configure_test_edge(
+        &client_netns,
+        "honk-c0",
+        client_ip,
+        lan_ip,
+        &[if source53 { 53 } else { 0 }],
+    )
+    .pop()
+    .context("client socket")?;
     let mut targets =
         configure_test_edge(&server_netns, "honk-s0", server_ip, wan_ip, &[41001, 41002]);
     let foreign = in_test_netns(&server_netns, || -> anyhow::Result<_> {
@@ -117,17 +126,9 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 backend.attach_sk_lookup()?;
                 backend.attach_dae0peer_ingress()?;
                 let ready = Array::<_, u32>::try_from(pinned_map(pin_root, "DATAPATH_STATE_MAP")?)?;
-                let exact = HashMap::<_, RedirectTuple, RedirectEntry>::try_from(pinned_map(
-                    pin_root,
-                    "REDIRECT_TRACK",
-                )?)?;
                 let clients = HashMap::<_, RedirectTuple, RedirectEntry>::try_from(pinned_map(
                     pin_root,
                     "CLIENT_REPLY_TRACK",
-                )?)?;
-                let states = HashMap::<_, TuplesKey, ConnState>::try_from(pinned_map(
-                    pin_root,
-                    "CONN_STATE_MAP",
                 )?)?;
                 let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
                 let mut control = ControlPlane::new(
@@ -142,6 +143,33 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     crate::mode::ModeState::new("Rule", "fullcone"),
                 )));
                 control.start_datapath_flags_coordinator()?;
+                if source53 {
+                    // Real ownership lookup must refuse an ordinary socket datagram
+                    // with no kernel conn-state, even though port 53 is exempt.
+                    let ingress = crate::control::udp_ingress::UdpLoopState::new(&control, true);
+                    let destination = SocketAddr::new(server_ip, 41001);
+                    ingress
+                        .dispatch_datagram_at(
+                            b"unowned ordinary UDP",
+                            SocketAddr::new(client_ip, 40053),
+                            &crate::control::sockets::UdpRecvMeta {
+                                original_dst_cmsg: Some(destination),
+                                packet_dst_ip: Some(server_ip),
+                                packet_ifindex: None,
+                                packet_mark: None,
+                                packet_priority: None,
+                                local_addr: destination,
+                            },
+                            crate::control::udp_endpoint::queue_now(),
+                        )
+                        .await;
+                    ensure!(
+                        control.udp_pool.is_empty(),
+                        "unowned ordinary UDP was admitted"
+                    );
+                }
+                let udp_pool = Arc::clone(&control.udp_pool);
+                let ebpf = Arc::clone(&control.spawn_handle().ebpf);
                 // No probe traffic may create C's association or change route eligibility.
                 control.alive_set().shutdown_health_checks().await?;
                 let commands = control.command_sender();
@@ -183,8 +211,9 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                         "A/B changed remote UDP mapping"
                     );
                     for destination in [a, b] {
-                        exact
-                            .get(&redirect_key(client_addr, destination), 0)
+                        ebpf.read()
+                            .await
+                            .redirect_track_lookup(&redirect_key(client_addr, destination))?
                             .context("contacted target must have exact redirect framing")?;
                     }
                     let mut client_key = redirect_key(client_addr, c);
@@ -207,22 +236,26 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                             receive(&client, c, b"uncontacted-C-to-client").await?;
                         }
                         ensure!(
-                            matches!(exact.get(&c_key, 0), Err(MapError::KeyNotFound)),
+                            ebpf.read().await.redirect_track_lookup(&c_key)?.is_none(),
                             "C unexpectedly acquired exact redirect framing"
                         );
                         ensure!(
-                            matches!(states.get(&forward, 0), Err(MapError::KeyNotFound)),
+                            ebpf.read().await.udp_conn_state_lookup(&forward)?.is_none(),
                             "foreign reply learned client-to-C UDP state"
                         );
                         ensure!(
-                            matches!(states.get(&reverse, 0), Err(MapError::KeyNotFound)),
+                            ebpf.read().await.udp_conn_state_lookup(&reverse)?.is_none(),
                             "foreign reply learned C-to-client UDP state"
                         );
                     }
                     // This is C's first client-originated packet: no reverse bypass is allowed.
+                    let cold_payload = if source53 {
+                        super::support::dns_query_payload()
+                    } else {
+                        b"first-client-to-C".to_vec()
+                    };
                     let third =
-                        send_and_observe(&client, &foreign, &mut peer, b"first-client-to-C")
-                            .await?;
+                        send_and_observe(&client, &foreign, &mut peer, &cold_payload).await?;
                     ensure!(
                         third.association == first.association && third.mapping == first.mapping,
                         "first C send did not reuse A/B's association"
@@ -231,6 +264,49 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     receive(&client, c, b"C-after-contact").await?;
                     target_a.send_to(b"A-after-C", first.mapping).await?;
                     receive(&client, a, b"A-after-C").await?;
+                    if source53 {
+                        ensure!(client_addr.port() == 53);
+                        // DNS-shaped bytes on a non-53 destination still belong to
+                        // the SOCKS transport, never the controller DNS parser.
+                        let dns = super::support::dns_query_payload();
+                        let packet = send_and_observe(&client, &target_a, &mut peer, &dns).await?;
+                        ensure!(packet.association == first.association);
+                        for destination in [a, b, c] {
+                            for tuple in [
+                                tuples_key(client_addr, destination),
+                                tuples_key(destination, client_addr),
+                            ] {
+                                ensure!(
+                                    ebpf.read().await.udp_conn_state_lookup(&tuple)?.is_none(),
+                                    "stateless source53 traffic created ordinary conn-state"
+                                );
+                            }
+                            ensure!(udp_pool.get(client_addr, destination).is_some());
+                            udp_pool.remove(client_addr, destination);
+                        }
+                        tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
+                            while !udp_pool.is_empty() {
+                                ensure!(
+                                    !task.is_finished(),
+                                    "control failed retiring stateless UDP"
+                                );
+                                tokio::task::yield_now().await;
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await??;
+                        for destination in [a, b, c] {
+                            for tuple in [
+                                tuples_key(client_addr, destination),
+                                tuples_key(destination, client_addr),
+                            ] {
+                                ensure!(
+                                    ebpf.read().await.udp_conn_state_lookup(&tuple)?.is_none(),
+                                    "stateless retirement acquired ordinary conn-state"
+                                );
+                            }
+                        }
+                    }
                     ensure!(
                         !task.is_finished(),
                         "control stopped during full-cone exercise"

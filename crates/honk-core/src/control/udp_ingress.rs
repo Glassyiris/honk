@@ -462,11 +462,13 @@ impl UdpLoopState {
             return UdpSlowPathWork::Done;
         }
         let expected_epoch = expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch());
-        let backend = if original_dst.port() == 53 {
-            None
-        } else {
-            Some(self.handle.ebpf.read().await)
-        };
+        let backend =
+            if honk_ebpf_common::conn::is_stateless_udp_ports(src_addr.port(), original_dst.port())
+            {
+                None
+            } else {
+                Some(self.handle.ebpf.read().await)
+            };
         let kernel_incarnation = if let Some(backend) = backend.as_ref() {
             let key = crate::control::connection::build_tuples_key(
                 original_dst.ip(),

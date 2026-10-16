@@ -9,19 +9,20 @@ use crate::{
     event::{send_dae_event, send_flow_expired},
     maps::{
         BPF_STATS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY, CONNTRACK_ARGS_MAP,
-        FLOW_INCARNATION_SEQUENCE, UDP_DECISION_SEQUENCE, tuple_retiring,
+        CONNTRACK_SNAPSHOT_MAP, FLOW_INCARNATION_SEQUENCE, TCP_LIVE_PINS, UDP_DECISION_SEQUENCE,
+        tuple_retiring,
     },
 };
 use aya_ebpf_bindings::{
-    bindings::{BPF_EXIST, BPF_NOEXIST},
+    bindings::BPF_NOEXIST,
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
 };
 use honk_ebpf_common::{
     NFQUEUE_TOKEN_MASK, RoutingMeta, UDP_DECISION_SEQUENCE_MASK,
     conn::{
-        BpfStatsKey, ConnState, ConntrackArgs, FLOW_INCARNATION_MAX, OCCUPANCY_EBPF_DELETES,
-        OCCUPANCY_INSERTS, TcpState, UDP_CONN_STATE_TIMEOUT_NS, UdpDecisionState,
-        tcp_conn_state_expired,
+        BpfStatsKey, ConnState, ConntrackArgs, FLOW_INCARNATION_MAX, FlowMapValue,
+        OCCUPANCY_INSERTS, TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+        UdpDecisionState, tcp_conn_state_expired,
     },
     redirect_need::TuplesKey,
 };
@@ -32,8 +33,8 @@ pub const UDP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
 
 /// Refresh interval for `REDIRECT_TRACK` and `ROUTING_HANDOFF_MAP`:
 /// cached packets skip timestamp writes while an entry
-/// is fresher than one second. Time comparisons use `wrapping_sub` for
-/// verifier-friendly monotonic arithmetic.
+/// is fresher than one second. A concurrent writer may publish a later timestamp
+/// after this invocation reads the clock, so flow ages saturate at zero.
 pub const AUXILIARY_MAP_REFRESH_INTERVAL_NS: u64 = 1_000_000_000;
 
 pub const TCP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
@@ -121,7 +122,7 @@ pub fn claim_udp_preparing(key: &TuplesKey, mac: &[u8; 6]) -> Option<u64> {
     state.mac.copy_from_slice(mac);
 
     if CONN_STATE_MAP
-        .insert(key, state, BPF_NOEXIST as u64)
+        .insert(key, FlowMapValue::new(state), BPF_NOEXIST as u64)
         .is_ok()
     {
         occupancy_add(OCCUPANCY_INSERTS);
@@ -150,43 +151,48 @@ pub fn claim_udp_preparing(key: &TuplesKey, mac: &[u8; 6]) -> Option<u64> {
     None
 }
 
-/// Replace only the Preparing claim; followers can never publish a decision.
+/// Publish only the captured unpublished claim; followers cannot complete it.
 #[inline(always)]
 pub fn publish_claimed_udp_state(key: &TuplesKey, state: &ConnState) -> bool {
     if tuple_retiring(key) || state.incarnation == 0 {
         return false;
     }
-    let Some(current) = CONN_STATE_MAP.get_ptr(key) else {
+    let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
         return false;
     };
-    if unsafe {
-        (*current).state != UdpDecisionState::Preparing as u8
-            || (*current).decision_token != 0
-            || (*current).incarnation != state.incarnation
-    } {
-        return false;
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let current = unsafe { &mut (*ptr).value };
+    let owned = current.state == UdpDecisionState::Preparing as u8
+        && current.decision_token == 0
+        && current.incarnation == state.incarnation;
+    if owned {
+        unsafe { crate::flow::copy_payload(current, state) };
     }
-    CONN_STATE_MAP.insert(key, state, BPF_EXIST as u64).is_ok()
+    unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+    owned
 }
 
-/// Remove only this unpublished claim and account for its successful insertion.
+/// An admitted unpublished producer may cancel through a subsequently installed fence.
 #[inline(always)]
-pub fn remove_udp_preparing(key: &TuplesKey, incarnation: u64) {
-    if tuple_retiring(key) {
+pub fn abort_udp_preparing(key: &TuplesKey, incarnation: u64, actual_token: u32) {
+    if incarnation == 0 {
         return;
     }
-    let Some(current) = CONN_STATE_MAP.get_ptr(key) else {
+    let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
         return;
     };
-    if unsafe {
-        (*current).state != UdpDecisionState::Preparing as u8
-            || (*current).decision_token != 0
-            || (*current).incarnation != incarnation
-    } {
-        return;
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let current = unsafe { &mut (*ptr).value };
+    let owned = current.state == UdpDecisionState::Preparing as u8
+        && current.decision_token == 0
+        && current.incarnation == incarnation;
+    if owned {
+        current.decision_token = actual_token;
+        current.state = UdpDecisionState::Aborted as u8;
     }
-    if CONN_STATE_MAP.remove(key).is_ok() {
-        occupancy_add(OCCUPANCY_EBPF_DELETES);
+    unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+    if owned {
+        send_flow_expired(key, incarnation);
     }
 }
 
@@ -298,30 +304,6 @@ pub fn build_routing_meta_with_offload(
     RoutingMeta { raw }
 }
 
-/// BPF-compatible compiler barrier.
-/// Equivalent to C's `barrier()`.
-/// Uses volatile pointer read to avoid LLVM AtomicFence instructions
-/// which crash the BPF backend.
-#[inline(always)]
-fn bpf_barrier() {
-    let dummy: u8 = 0;
-    unsafe {
-        core::ptr::read_volatile(&dummy);
-    }
-}
-
-/// Publish a [`RoutingMeta`] with a compiler fence, mimicking C's
-/// `barrier() + volatile` write so side fields (mac/pname/pid) are
-/// visible before routing.
-#[inline(always)]
-pub fn publish_routing_meta(dst: &mut RoutingMeta, meta: RoutingMeta) {
-    bpf_barrier();
-    unsafe {
-        dst.raw = meta.raw;
-    }
-    bpf_barrier();
-}
-
 /// Copy a [`TuplesKey`] with src↔dst and sport↔dport swapped,
 /// preserving `l4proto`.  Zero-initialises `dst` first.
 #[inline(always)]
@@ -348,10 +330,11 @@ pub fn is_new_tcp_connection(tcph: &TcpHdr) -> bool {
     tcph.syn() != 0 && tcph.ack() == 0
 }
 
-/// UDP connection state expiry: 120 s backstop.
+/// Unpublished aborts are immediately eligible; other UDP entries retain the age backstop.
 #[inline(always)]
 fn udp_conn_state_expired(state: &ConnState, now: u64) -> bool {
-    now.wrapping_sub(state.last_seen_ns) > UDP_CONN_STATE_TIMEOUT_NS
+    state.state == UdpDecisionState::Aborted as u8
+        || now.saturating_sub(state.last_seen_ns) > UDP_CONN_STATE_TIMEOUT_NS
 }
 
 /// Expiry refuses this invocation rather than masquerading as a lookup miss.
@@ -363,20 +346,24 @@ pub fn tuple_unavailable(key: &TuplesKey, new_tcp_syn: bool) -> bool {
     if new_tcp_syn {
         return false;
     }
-    let Some(ptr) = CONN_STATE_MAP.get_ptr(key) else {
+    let Some(state) = crate::flow::conn_lifecycle(key) else {
         return false;
     };
-    let state = unsafe { &*ptr };
     let now = unsafe { bpf_ktime_get_ns() };
     let expired = if key.l4proto == crate::transport::IPPROTO_TCP {
-        tcp_conn_state_expired(state, now.wrapping_sub(state.last_seen_ns))
+        state.state == TcpState::TcpStateClosing as u8
+            && now.saturating_sub(state.last_seen_ns) > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
+            && !tcp_live_pinned(state.incarnation)
     } else {
-        udp_conn_state_expired(state, now)
+        state.state == UdpDecisionState::Aborted as u8
+            || now.saturating_sub(state.last_seen_ns) > UDP_CONN_STATE_TIMEOUT_NS
     };
     if expired {
         send_flow_expired(key, state.incarnation);
     }
     expired
+        || (key.l4proto == crate::transport::IPPROTO_UDP
+            && state.state == UdpDecisionState::Preparing as u8)
 }
 
 #[inline(always)]
@@ -392,27 +379,71 @@ pub fn auxiliary_expired(
         } else {
             120_000_000_000
         };
+    let expired = expired
+        && !(!handoff
+            && key.l4proto == crate::transport::IPPROTO_TCP
+            && tcp_live_pinned(incarnation));
     if expired {
         send_flow_expired(key, incarnation);
     }
     expired
 }
 
-/// Noinline core for TCP connection tracking.
-///
-/// `tcp_flags` encoding (same as C):
-///   - bit 0: SYN && !ACK (new connection)
-///   - bit 1: FIN || RST   (connection closing)
-///
-/// Returns a mutable reference to the [`ConnState`] entry on success,
-/// or `None` when allocation fails or a non-SYN packet has no cached state.
-///
-/// # Safety
-///
-/// The returned `'static` reference aliases the map entry living in the
-/// static `CONN_STATE_MAP`.  Callers must use the reference within the
-/// current BPF program invocation — the map may be mutated by concurrent
-/// per-CPU access or a later lookup on the same key.
+#[inline(always)]
+fn conntrack_output() -> Option<*mut ConnState> {
+    // Keep array keys on stack, away from overridable zero-valued globals.
+    let mut zero = 0u32;
+    unsafe { core::ptr::write_volatile(&mut zero, 0) };
+    CONNTRACK_SNAPSHOT_MAP.get_ptr_mut(unsafe { core::ptr::read_volatile(&zero) })
+}
+
+#[inline(always)]
+fn tcp_live_pinned(incarnation: u64) -> bool {
+    incarnation != 0 && TCP_LIVE_PINS.get_ptr(incarnation).is_some()
+}
+
+#[inline(always)]
+fn update_tcp_locked(state: &mut ConnState, args: &ConntrackArgs, now: u64, fin_rst: bool) {
+    if now.saturating_sub(state.last_seen_ns) > TCP_CONN_STATE_UPDATE_INTERVAL_NS {
+        state.last_seen_ns = now;
+    }
+    if fin_rst {
+        state.state = TcpState::TcpStateClosing as u8;
+    }
+    if args.has_routing() {
+        if args.has_mac() {
+            let mut i = 0;
+            while i < 6 {
+                unsafe {
+                    state
+                        .mac
+                        .as_mut_ptr()
+                        .add(i)
+                        .write_volatile(args.mac.as_ptr().add(i).read_volatile())
+                };
+                i += 1;
+            }
+        }
+        if args.has_pname() {
+            let mut i = 0;
+            while i < 16 {
+                unsafe {
+                    state
+                        .pname
+                        .as_mut_ptr()
+                        .add(i)
+                        .write_volatile(args.pname.as_ptr().add(i).read_volatile())
+                };
+                i += 1;
+            }
+        }
+        state.pid = args.pid;
+        state.trace_id = args.trace_id;
+        state.meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
+    }
+}
+
+/// Returns invocation-local scratch, never a borrowed map payload.
 fn __mark_tcp_seen(
     key: *const TuplesKey,
     is_wan_ingress_direction: u8,
@@ -425,119 +456,133 @@ fn __mark_tcp_seen(
         return core::ptr::null_mut();
     }
     let now = unsafe { bpf_ktime_get_ns() };
-
-    let new_conn_syn = (tcp_flags & 1) != 0;
-    let is_fin_rst = (tcp_flags & 2) != 0;
-
+    let Some(output) = conntrack_output() else {
+        return core::ptr::null_mut();
+    };
     let ptr_opt = CONN_STATE_MAP.get_ptr_mut(key);
-
-    if !new_conn_syn {
+    let fin_rst = tcp_flags & 2 != 0;
+    if tcp_flags & 1 == 0 {
         let Some(ptr) = ptr_opt else {
             return core::ptr::null_mut();
         };
-        // Non-SYN fast path borrows once and mutates only that lifecycle.
-        let state = unsafe { &mut *ptr };
-        if tcp_conn_state_expired(state, now.wrapping_sub(state.last_seen_ns)) {
-            send_flow_expired(key, state.incarnation);
-            // Non-SYN packets without valid state must never allocate.
-            return core::ptr::null_mut();
+        unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+        let state = unsafe { &mut (*ptr).value };
+        let expired = tcp_conn_state_expired(state, now.saturating_sub(state.last_seen_ns));
+        if !expired {
+            update_tcp_locked(state, args, now, fin_rst);
         }
-
-        if now.wrapping_sub(state.last_seen_ns) > TCP_CONN_STATE_UPDATE_INTERVAL_NS {
-            state.last_seen_ns = now;
+        unsafe {
+            crate::flow::copy_payload(output, state);
+            bpf_spin_unlock(&mut (*ptr).lock);
         }
-
-        if is_fin_rst {
-            state.state = TcpState::TcpStateClosing as u8;
-        }
-
-        // Update routing if provided (rare: routing decision changed)
-        if args.has_routing() {
-            let meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
-
-            if args.has_mac() {
-                state.mac.copy_from_slice(&args.mac);
+        let incarnation = unsafe { (*output).incarnation };
+        if expired {
+            if !tcp_live_pinned(incarnation) {
+                send_flow_expired(key, incarnation);
+                return core::ptr::null_mut();
             }
-            if args.has_pname() {
-                state.pname.copy_from_slice(&args.pname);
+            unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+            let state = unsafe { &mut (*ptr).value };
+            let owned = state.incarnation == incarnation;
+            if owned {
+                update_tcp_locked(state, args, now, fin_rst);
+                unsafe { crate::flow::copy_payload(output, state) };
             }
-            state.pid = args.pid;
-            state.trace_id = args.trace_id;
-            publish_routing_meta(&mut state.meta, meta);
+            unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+            if !owned {
+                return core::ptr::null_mut();
+            }
         }
-
-        return state as *mut ConnState;
+        args.incarnation = incarnation;
+        return output;
     }
 
-    // Only SYN reaches this point (the non-SYN paths all return early above).
-    if new_conn_syn {
-        let has_rt = args.has_routing();
-
-        let mut new_state: ConnState = unsafe { core::mem::zeroed() };
-        let incarnation = args.incarnation;
-        if incarnation == 0 {
-            return core::ptr::null_mut();
-        }
-        new_state.incarnation = incarnation;
-        new_state.is_wan_ingress_direction = (is_wan_ingress_direction != 0) as u8;
-        new_state.state = TcpState::TcpStateActive as u8;
-        new_state.last_seen_ns = now;
-        new_state.pid = args.pid;
-        // A replacement cannot prove which SYN was accepted, even after sidecar eviction.
-        new_state.trace_id = if has_rt {
-            args.trace_id
-        } else if ptr_opt.is_some() {
-            u32::MAX
-        } else {
-            0
-        };
-
-        if has_rt {
-            new_state.meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
-            if args.has_mac() {
-                new_state.mac.copy_from_slice(&args.mac);
-            }
-            if args.has_pname() {
-                new_state.pname.copy_from_slice(&args.pname);
-            }
-        }
-
-        let ret = CONN_STATE_MAP.insert(key, new_state, 0u64);
-        if ret.is_err() {
-            let stats_key: u32 = BpfStatsKey::TcpConnOverflow as u32;
-            if let Some(overflow_count) = BPF_STATS_MAP.get_ptr_mut(stats_key) {
-                unsafe {
-                    *overflow_count += 1;
-                }
-            }
-            send_dae_event(
-                honk_ebpf_common::event::DaeEventType::TcpConnOverflow as u32,
-                args.pid,
-                args.pname_or_null(),
-                0,
-                key.l4proto,
-                Some(unsafe { &key.src_ip.u6_addr32 }),
-                Some(unsafe { &key.dst_ip.u6_addr32 }),
-                key.src_port,
-                key.dst_port,
-            );
-            warn!((), target: "honk", "tcp conn state map overflow, key: {:i}:{} -> {:i}:{}", unsafe { key.src_ip.u6_addr8 }, key.src_port, unsafe { key.dst_ip.u6_addr8 }, key.dst_port);
-            return core::ptr::null_mut();
-        }
-        if ptr_opt.is_none() {
-            occupancy_add(OCCUPANCY_INSERTS);
-        }
-        let Some(current) = CONN_STATE_MAP.get_ptr_mut(key) else {
-            return core::ptr::null_mut();
-        };
-        if unsafe { (*current).incarnation } != incarnation {
-            return core::ptr::null_mut();
-        }
-        current
+    let incarnation = args.incarnation;
+    if incarnation == 0
+        || crate::maps::TCP_PUBLISHING
+            .get_ptr(key)
+            .is_none_or(|owner| unsafe { *owner } != incarnation)
+    {
+        return core::ptr::null_mut();
+    }
+    let new_state = unsafe { &mut *output };
+    *new_state = unsafe { core::mem::zeroed() };
+    new_state.incarnation = incarnation;
+    new_state.is_wan_ingress_direction = (is_wan_ingress_direction != 0) as u8;
+    new_state.state = TcpState::TcpStateActive as u8;
+    new_state.last_seen_ns = now;
+    new_state.pid = args.pid;
+    new_state.trace_id = if args.has_routing() {
+        args.trace_id
+    } else if ptr_opt.is_some() {
+        u32::MAX
     } else {
-        // Non-SYN packets without existing state must never allocate new state.
-        core::ptr::null_mut()
+        0
+    };
+    if args.has_routing() {
+        update_tcp_locked(new_state, args, now, false);
     }
+    if let Some(ptr) = ptr_opt {
+        unsafe {
+            bpf_spin_lock(&mut (*ptr).lock);
+            crate::flow::copy_payload(&raw mut (*ptr).value, new_state);
+            bpf_spin_unlock(&mut (*ptr).lock);
+        }
+    } else if CONN_STATE_MAP
+        .insert(key, FlowMapValue::new(*new_state), BPF_NOEXIST as u64)
+        .is_ok()
+    {
+        occupancy_add(OCCUPANCY_INSERTS);
+    } else {
+        let stats_key = BpfStatsKey::TcpConnOverflow as u32;
+        if let Some(counter) = BPF_STATS_MAP.get_ptr_mut(stats_key) {
+            unsafe { *counter += 1 };
+        }
+        send_dae_event(
+            honk_ebpf_common::event::DaeEventType::TcpConnOverflow as u32,
+            args.pid,
+            args.pname_or_null(),
+            0,
+            key.l4proto,
+            Some(unsafe { &key.src_ip.u6_addr32 }),
+            Some(unsafe { &key.dst_ip.u6_addr32 }),
+            key.src_port,
+            key.dst_port,
+        );
+        return core::ptr::null_mut();
+    }
+    output
+}
+
+/// Commit only this captured SYN's routing fields; preserve concurrent lifecycle refreshes.
+#[inline(always)]
+pub fn publish_tcp_routing(key: &TuplesKey, snapshot: &ConnState) -> bool {
+    if tuple_retiring(key) || snapshot.incarnation == 0 {
+        return false;
+    }
+    let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
+        return false;
+    };
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let current = unsafe { &mut (*ptr).value };
+    let owned = current.incarnation == snapshot.incarnation;
+    if owned {
+        current.meta = snapshot.meta;
+        current.trace_id = snapshot.trace_id;
+        let mut i = 0;
+        while i < 6 {
+            unsafe {
+                current
+                    .mac
+                    .as_mut_ptr()
+                    .add(i)
+                    .write_volatile(snapshot.mac.as_ptr().add(i).read_volatile())
+            };
+            i += 1;
+        }
+    }
+    unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+    owned
 }
 
 /// Thin inline wrapper: populates the per-CPU `CONNTRACK_ARGS_MAP` scratch
@@ -599,16 +644,26 @@ fn lookup_udp_seen_at(key: &TuplesKey, now: u64) -> Option<&'static mut ConnStat
     if tuple_retiring(key) {
         return None;
     }
+    let output = conntrack_output()?;
     let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
-    if udp_conn_state_expired(unsafe { &*ptr }, now) {
-        send_flow_expired(key, unsafe { (*ptr).incarnation });
-        return None;
-    }
-    let state = unsafe { &mut *ptr };
-    if now.wrapping_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS {
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let state = unsafe { &mut (*ptr).value };
+    let expired = udp_conn_state_expired(state, now);
+    if !expired
+        && state.state != UdpDecisionState::Preparing as u8
+        && now.saturating_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS
+    {
         state.last_seen_ns = now;
     }
-    Some(state)
+    unsafe {
+        crate::flow::copy_payload(output, state);
+        bpf_spin_unlock(&mut (*ptr).lock);
+    }
+    if expired {
+        send_flow_expired(key, unsafe { (*output).incarnation });
+        return None;
+    }
+    Some(unsafe { &mut *output })
 }
 
 /// Look up an existing live UDP entry and lazily refresh its timestamp.
@@ -618,10 +673,7 @@ pub fn lookup_udp_seen(key: &TuplesKey) -> Option<&'static mut ConnState> {
     lookup_udp_seen_at(key, unsafe { bpf_ktime_get_ns() })
 }
 
-/// Noinline core for UDP connection tracking.
-///
-/// Returns a mutable reference to the [`ConnState`] entry on success,
-/// or `None` when the map is full.
+/// Returns an invocation-local snapshot after publication, never a map payload pointer.
 fn __mark_udp_seen(
     key: *const TuplesKey,
     is_wan_ingress_direction: u8,
@@ -669,7 +721,7 @@ fn __mark_udp_seen(
     }
 
     if !publish_claimed_udp_state(key, &new_state) {
-        remove_udp_preparing(key, incarnation);
+        abort_udp_preparing(key, incarnation, 0);
         let stats_key: u32 = BpfStatsKey::UdpConnOverflow as u32;
         if let Some(overflow_count) = BPF_STATS_MAP.get_ptr_mut(stats_key) {
             unsafe {
@@ -690,13 +742,12 @@ fn __mark_udp_seen(
         warn!((), target: "honk", "udp conn state map overflow, key: {:i}:{} -> {:i}:{}", unsafe { key.src_ip.u6_addr8 }, key.src_port, unsafe { key.dst_ip.u6_addr8 }, key.dst_port);
         return core::ptr::null_mut();
     }
-    let Some(current) = CONN_STATE_MAP.get_ptr_mut(key) else {
+    let Some(output) = conntrack_output() else {
         return core::ptr::null_mut();
     };
-    if unsafe { (*current).incarnation } != incarnation {
-        return core::ptr::null_mut();
-    }
-    current
+    // Publication copied these exact immutable contents under the element lock.
+    unsafe { crate::flow::copy_payload(output, &new_state) };
+    output
 }
 
 /// Thin inline wrapper: populates the per-CPU `CONNTRACK_ARGS_MAP` scratch

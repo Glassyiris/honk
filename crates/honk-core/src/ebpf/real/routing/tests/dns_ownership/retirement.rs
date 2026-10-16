@@ -1,8 +1,10 @@
 use super::*;
 use crate::ebpf::{RetireCounts, RetireKind, RetireRequest, UdpDecisionCommitResult};
 use aya::maps::RingBuf;
-use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence};
+use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_STATE_TIMEOUT_NS};
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
+
+mod stable_values;
 
 const TC_ACT_PIPE: u32 = 3;
 const LAST_INCARNATION: u64 = 0x00ff_ffff_ffff_ffff;
@@ -57,7 +59,7 @@ fn age_auxiliaries(backend: &mut RealEbpfBackend, key: &TuplesKey, last_seen_ns:
     let mut entry = handoff(backend, key);
     entry.last_seen_ns = last_seen_ns;
     backend
-        .hash_insert("ROUTING_HANDOFF_MAP", key, &entry)
+        .flow_insert("ROUTING_HANDOFF_MAP", key, &entry)
         .unwrap();
     let track_key = RedirectTuple::from_tuples(key);
     let mut track = backend.redirect_track_lookup(&track_key).unwrap().unwrap();
@@ -453,13 +455,16 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
                 }
                 // Delay one hint across an actual new kernel admission.
                 backend
-                    .hash_remove::<_, ConnState>("CONN_STATE_MAP", &keys[1])
+                    .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &keys[1])
                     .unwrap();
                 backend
-                    .hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", &keys[1])
+                    .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                        "ROUTING_HANDOFF_MAP",
+                        &keys[1],
+                    )
                     .unwrap();
                 backend
-                    .hash_remove::<_, RedirectEntry>(
+                    .hash_remove::<_, FlowMapValue<RedirectEntry>>(
                         "REDIRECT_TRACK",
                         &RedirectTuple::from_tuples(&keys[1]),
                     )
@@ -538,6 +543,391 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
                 );
                 seed(&backend, side, &keys[0], src, dst);
                 assert_ne!(handoff(&backend, &keys[0]).incarnation, owners[0]);
+            }
+        }
+    });
+}
+
+fn controlled_claim(
+    backend: &mut RealEbpfBackend,
+    key: &TuplesKey,
+    bytes: &[u8],
+    mode: u32,
+) -> (u64, Run) {
+    set_array(backend, "PREPARING_TEST_KEY", 0, *key);
+    load_classifier(backend, "preparing_claim_interleaving_test");
+    let result = run(
+        backend,
+        "preparing_claim_interleaving_test",
+        bytes,
+        SkbInput {
+            cb: [mode, 0, 0, 0, 0],
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.verdict, TC_ACT_OK, "controlled claim mode {mode}");
+    let incarnation = u64::from(result.cb[1]) | (u64::from(result.cb[2]) << 32);
+    assert_ne!(incarnation, 0);
+    if mode != 0 {
+        // Controlled admitted completion followed by the real barrier, not a
+        // claim that this invocation overlapped a parallel retirement reader.
+        backend.grace_barrier().unwrap();
+        assert_claim_fence(backend, key);
+    }
+    (incarnation, result)
+}
+
+fn assert_claim_fence(backend: &RealEbpfBackend, key: &TuplesKey) {
+    assert_eq!(
+        backend
+            .hash_lookup::<_, RetirementFence>("RETIRE_FENCE", key)
+            .unwrap(),
+        Some(RetirementFence {
+            owner: 901,
+            decision_token: 0,
+            padding: 0,
+        })
+    );
+    assert_eq!(
+        Array::<_, u32>::try_from(backend.bpf().unwrap().map("RETIRE_ACTIVE").unwrap())
+            .unwrap()
+            .get(&0, 0)
+            .unwrap(),
+        1
+    );
+}
+
+fn assert_fenced_claim_unchanged(backend: &RealEbpfBackend, key: &TuplesKey, bytes: &[u8]) {
+    let before = owned_values(backend, key);
+    assert_eq!(
+        run(backend, "lan_ingress_l2", bytes, SkbInput::default()).verdict,
+        TC_ACT_SHOT
+    );
+    assert_eq!(owned_values(backend, key), before);
+    assert_claim_fence(backend, key);
+    let refused = run(
+        backend,
+        "preparing_claim_interleaving_test",
+        bytes,
+        SkbInput::default(),
+    );
+    assert_eq!(refused.verdict, TC_ACT_SHOT);
+    assert_eq!((refused.cb[1], refused.cb[2]), (0, 0));
+    assert_eq!(owned_values(backend, key), before);
+    assert_claim_fence(backend, key);
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republishes() {
+    isolated(|| {
+        let (mut backend, _, _listeners) = proxy_fixture();
+        for (src, dst) in PEERS {
+            let key = tuple(src, dst, 45500, 443, IPPROTO_UDP);
+            let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+            let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 1);
+            let published = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+            assert_eq!(published.incarnation, incarnation);
+            assert_eq!(published.decision_token, 0);
+            assert_eq!(result.cb[3], published.state as u32);
+            assert_eq!(
+                published.state,
+                if result.cb[4] == 0 {
+                    UdpDecisionState::Aborted as u8
+                } else {
+                    UdpDecisionState::Block as u8
+                },
+                "pre-fence completion left an orphan Preparing claim"
+            );
+            assert_fenced_claim_unchanged(&backend, &key, &bytes);
+            unfence(&mut backend, &key);
+            let before = owned_values(&backend, &key);
+            assert_eq!(
+                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
+                TC_ACT_SHOT
+            );
+            assert_eq!(
+                owned_values(&backend, &key),
+                before,
+                "terminal follower rewrote captured ownership"
+            );
+            // Aborted is eligible immediately. For a successful publication,
+            // advance only the supplied expiry clock past its normal timeout.
+            let expiry_clock = if published.state == UdpDecisionState::Aborted as u8 {
+                now_ns()
+            } else {
+                published.last_seen_ns + UDP_CONN_STATE_TIMEOUT_NS + 1
+            };
+            let mut outcomes = [None];
+            assert_eq!(
+                backend
+                    .retire_batch(
+                        &[RetireRequest {
+                            key,
+                            kind: RetireKind::ExpiryHint {
+                                incarnation,
+                                now_ns: expiry_clock
+                            },
+                        }],
+                        &mut outcomes
+                    )
+                    .unwrap(),
+                RetireCounts {
+                    conn: 1,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+            assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+            assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+            assert!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                    .unwrap()
+                    .is_none()
+            );
+            seed(&backend, "lan_ingress_l2", &key, src, dst);
+            let republished = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+            assert_ne!(republished.incarnation, incarnation);
+            assert_ne!(republished.state, UdpDecisionState::Preparing as u8);
+            assert_ne!(republished.state, UdpDecisionState::Aborted as u8);
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_republishes() {
+    isolated(|| {
+        let (mut backend, _, _listeners) = proxy_fixture();
+        for (src, dst) in PEERS {
+            let key = tuple(src, dst, 45501, 443, IPPROTO_UDP);
+            let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+            let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 2);
+            assert_eq!(
+                result.cb[3], 1,
+                "abort must preserve both owned auxiliaries"
+            );
+            let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+            assert_eq!(aborted.incarnation, incarnation);
+            assert_eq!(aborted.state, UdpDecisionState::Aborted as u8);
+            assert_eq!(aborted.decision_token, 41);
+            assert_eq!(handoff(&backend, &key).incarnation, incarnation);
+            assert_eq!(handoff(&backend, &key).result.decision_token, 41);
+            let track = backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .unwrap();
+            assert_eq!((track.incarnation, track.decision_token), (incarnation, 41));
+            assert_fenced_claim_unchanged(&backend, &key, &bytes);
+            unfence(&mut backend, &key);
+            let before = owned_values(&backend, &key);
+            assert_eq!(
+                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
+                TC_ACT_SHOT
+            );
+            assert_eq!(
+                owned_values(&backend, &key),
+                before,
+                "Aborted follower renewed the marker"
+            );
+            let mut outcomes = [None];
+            let counts = backend
+                .retire_batch(
+                    &[RetireRequest {
+                        key,
+                        kind: RetireKind::ExpiryHint {
+                            incarnation,
+                            now_ns: now_ns(),
+                        },
+                    }],
+                    &mut outcomes,
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                RetireCounts {
+                    conn: 1,
+                    handoff: 1,
+                    redirect: 1,
+                    request: 0
+                }
+            );
+            assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+            assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+            assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+            assert!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                    .unwrap()
+                    .is_none()
+            );
+            seed(&backend, "lan_ingress_l2", &key, src, dst);
+            let state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+            assert_ne!(state.incarnation, incarnation);
+            assert_ne!(state.state, UdpDecisionState::Preparing as u8);
+            assert_ne!(state.state, UdpDecisionState::Aborted as u8);
+            assert_eq!(handoff(&backend, &key).incarnation, state.incarnation);
+            assert_eq!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                    .unwrap()
+                    .unwrap()
+                    .incarnation,
+                state.incarnation
+            );
+            assert_eq!(
+                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
+                TC_ACT_REDIRECT
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
+    isolated(|| {
+        let (mut backend, _, _listeners) = proxy_fixture();
+        for (src, dst) in PEERS {
+            for mode in 3..=5 {
+                let key = tuple(src, dst, 45500 + mode as u16, 443, IPPROTO_UDP);
+                let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+                let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, mode);
+                assert_eq!(result.cb[3], if mode == 5 { 0 } else { 1 });
+                assert_eq!(result.cb[4], 0, "old claim published over a newer owner");
+                let entry = handoff(&backend, &key);
+                let token = if mode == 3 { 42 } else { 41 };
+                let aux_incarnation = if mode == 3 {
+                    incarnation
+                } else {
+                    assert!(entry.incarnation > incarnation);
+                    entry.incarnation
+                };
+                let expected_handoff = RoutingHandoffEntry {
+                    last_seen_ns: 77,
+                    incarnation: aux_incarnation,
+                    result: RoutingResult {
+                        decision_token: token,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                assert_eq!(format!("{entry:?}"), format!("{expected_handoff:?}"));
+                let track = backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                    .unwrap()
+                    .unwrap();
+                let expected_track = RedirectEntry {
+                    last_seen_ns: 99,
+                    decision_token: token,
+                    incarnation: aux_incarnation,
+                    ..Default::default()
+                };
+                assert_eq!(format!("{track:?}"), format!("{expected_track:?}"));
+                if mode == 5 {
+                    let newer = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                    let expected = ConnState {
+                        state: UdpDecisionState::Preparing as u8,
+                        incarnation: aux_incarnation,
+                        last_seen_ns: newer.last_seen_ns,
+                        ..Default::default()
+                    };
+                    assert_eq!(format!("{newer:?}"), format!("{expected:?}"));
+                } else {
+                    let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                    assert_eq!(
+                        (aborted.incarnation, aborted.decision_token, aborted.state),
+                        (incarnation, 41, UdpDecisionState::Aborted as u8)
+                    );
+                }
+                assert_fenced_claim_unchanged(&backend, &key, &bytes);
+                unfence(&mut backend, &key);
+                let before = owned_values(&backend, &key);
+                let mut outcomes = [None];
+                assert_eq!(
+                    backend
+                        .retire_batch(
+                            &[RetireRequest {
+                                key,
+                                kind: RetireKind::ExpiryHint {
+                                    incarnation,
+                                    now_ns: now_ns()
+                                },
+                            }],
+                            &mut outcomes
+                        )
+                        .unwrap(),
+                    RetireCounts::default()
+                );
+                assert_eq!(
+                    outcomes,
+                    [Some(if mode == 5 {
+                        UdpDecisionCommitResult::Superseded
+                    } else {
+                        UdpDecisionCommitResult::TokenMismatch
+                    })]
+                );
+                assert_eq!(
+                    owned_values(&backend, &key),
+                    before,
+                    "retirement destroyed foreign authority"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn udp_preparing_and_aborted_followers_do_not_renew_claim_timestamp() {
+    isolated(|| {
+        // Keep the age strictly above lazy refresh and below UDP expiry, even
+        // in a guest booted immediately before this exact test selection.
+        let wait_ns = 3_000_000_000u64.saturating_sub(now_ns());
+        if wait_ns != 0 {
+            std::thread::sleep(Duration::from_nanos(wait_ns));
+        }
+        let (mut backend, _, _listeners) = proxy_fixture();
+        for (src, dst) in PEERS {
+            for (index, (side, verdict)) in [
+                ("lan_ingress_l2", TC_ACT_SHOT),
+                ("wan_egress_l2", TC_ACT_SHOT),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let key = tuple(src, dst, 45510 + index as u16, 443, IPPROTO_UDP);
+                seed(&backend, side, &key, src, dst);
+                let mut preparing = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+                for state in [UdpDecisionState::Preparing, UdpDecisionState::Aborted] {
+                    preparing.state = state as u8;
+                    preparing.decision_token = if state == UdpDecisionState::Aborted {
+                        41
+                    } else {
+                        0
+                    };
+                    preparing.last_seen_ns = now_ns() - 2_000_000_000;
+                    backend.udp_conn_state_store(&key, &preparing).unwrap();
+                    for _ in 0..3 {
+                        assert_eq!(
+                            run(&backend, side, &bytes, SkbInput::default()).verdict,
+                            if state == UdpDecisionState::Aborted {
+                                TC_ACT_SHOT
+                            } else {
+                                verdict
+                            },
+                            "{side} {src} {state:?}"
+                        );
+                        let followed = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                        assert_eq!(
+                            format!("{followed:?}"),
+                            format!("{preparing:?}"),
+                            "{side} follower renewed or rewrote the unpublished claim"
+                        );
+                    }
+                }
             }
         }
     });

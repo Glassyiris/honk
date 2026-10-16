@@ -449,19 +449,153 @@ async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()> {
-    for redirect in [false, true] {
-        let key = test_tuple(30_001, IPPROTO_TCP);
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
-            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
-        {
-            let mut backend = backend.write().await;
-            backend.tcp_conn_state_store(&key, &test_state(TcpState::TcpStateActive, 0))?;
-            backend.redirect_track_store(
+async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result<()> {
+    use honk_ebpf_common::RoutingHandoffEntry;
+
+    let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
+    for map in ["conn", "redirect", "handoff"] {
+        let mut model = MockEbpfBackend::new();
+        for port in 1..=(JANITOR_BASE_CANDIDATES as u16 + 2) {
+            let key = test_tuple(port, IPPROTO_TCP);
+            let mut state = test_state(TcpState::TcpStateActive, 0);
+            state.incarnation = u64::from(port);
+            model.tcp_conn_state_store(&key, &state)?;
+            model.redirect_track_store(
                 &RedirectTuple::from_tuples(&key),
-                &RedirectEntry::default(),
+                &RedirectEntry {
+                    incarnation: state.incarnation,
+                    ..Default::default()
+                },
             )?;
         }
+        for (key, state) in &model.tcp_conn_states {
+            model.routing_handoffs.lock().insert(
+                *key,
+                RoutingHandoffEntry {
+                    incarnation: state.incarnation,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Discover this map's stable traversal order, not HashMap's random seed.
+        // Replacing values below does not insert/remove keys or reorder buckets.
+        let mut order = Vec::new();
+        match map {
+            "conn" => model.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                order.extend(chunk.iter().map(|(key, _)| *key));
+                true
+            })?,
+            "redirect" => {
+                model.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                    order.extend(
+                        chunk
+                            .iter()
+                            .map(|(key, _)| test_tuple(key.src_port, IPPROTO_TCP)),
+                    );
+                    true
+                })?
+            }
+            "handoff" => {
+                model.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                    order.extend(chunk.iter().map(|(key, _)| *key));
+                    true
+                })?
+            }
+            _ => unreachable!(),
+        }
+        let stale = order[JANITOR_BASE_CANDIDATES];
+        let fresh = order[JANITOR_BASE_CANDIDATES + 1];
+        let mut fresh_state = test_state(TcpState::TcpStateActive, now_ns);
+        fresh_state.incarnation = u64::from(fresh.src_port);
+        model.tcp_conn_state_store(&fresh, &fresh_state)?;
+        model.redirect_track_store(
+            &RedirectTuple::from_tuples(&fresh),
+            &RedirectEntry {
+                last_seen_ns: now_ns,
+                incarnation: fresh_state.incarnation,
+                ..Default::default()
+            },
+        )?;
+        model
+            .routing_handoffs
+            .get_mut()
+            .values_mut()
+            .find(|entry| entry.incarnation == fresh_state.incarnation)
+            .expect("fresh handoff fixture exists")
+            .last_seen_ns = now_ns;
+        let pins = Arc::new(TcpFlowPins::default());
+        for key in &order[..JANITOR_BASE_CANDIDATES] {
+            pins.retain_for_test(TcpFlowKey::from_tuples(key));
+        }
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+        let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
+        let mut gauge = OccupancyGauge::default();
+        let tuning = ScanTuning {
+            candidates: JANITOR_BASE_CANDIDATES,
+            budget: Duration::from_secs(1),
+        };
+        match map {
+            "conn" => {
+                let (deleted, scanned) = janitor
+                    .cleanup_conn_state_at(now_ns, &mut gauge, ((0, 0), 0), tuning)
+                    .await?;
+                assert_eq!((deleted, scanned), (1, order.len()));
+                assert_eq!(gauge.estimate(0, 0, 0), order.len() as u64 - 1);
+            }
+            "redirect" | "handoff" => {
+                let result = if map == "redirect" {
+                    janitor
+                        .cleanup_redirect_track_at(now_ns, tuning, &mut gauge)
+                        .await?
+                } else {
+                    janitor
+                        .cleanup_routing_handoff_at(now_ns, tuning, &mut gauge)
+                        .await?
+                };
+                assert_eq!(result.deleted, 1);
+                assert_eq!(result.scanned, order.len());
+                assert!(result.complete);
+            }
+            _ => unreachable!(),
+        }
+        let backend = backend.read().await;
+        for key in &order {
+            let retained = match map {
+                "conn" => backend.tcp_conn_state_lookup(key)?.is_some(),
+                "redirect" => backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(key))?
+                    .is_some(),
+                "handoff" => backend.routing_handoff_lookup(key)?.is_some(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                retained,
+                key.src_port != stale.src_port,
+                "{map}: port {}",
+                key.src_port,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()> {
+    for map in ["conn", "redirect", "handoff"] {
+        let key = test_tuple(30_001, IPPROTO_TCP);
+        let mut model = MockEbpfBackend::new();
+        model.tcp_conn_state_store(&key, &test_state(TcpState::TcpStateActive, 0))?;
+        model.redirect_track_store(&RedirectTuple::from_tuples(&key), &RedirectEntry::default())?;
+        model.routing_handoffs.get_mut().insert(
+            *model
+                .tcp_conn_states
+                .keys()
+                .next()
+                .expect("conn fixture exists"),
+            honk_ebpf_common::RoutingHandoffEntry::default(),
+        );
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
         let pins = Arc::new(TcpFlowPins::default());
         let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
         let adopt_backend = Arc::clone(&backend);
@@ -472,10 +606,20 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
             adopt_pins.retain_for_test(TcpFlowKey::from_tuples(&key));
         }));
         let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
-        let result = if redirect {
-            janitor.cleanup_redirect_track_for_test(now_ns).await
-        } else {
-            janitor.cleanup_conn_state_for_test(now_ns).await
+        let result = match map {
+            "conn" => janitor.cleanup_conn_state_for_test(now_ns).await,
+            "redirect" => janitor.cleanup_redirect_track_for_test(now_ns).await,
+            "handoff" => {
+                let result = janitor
+                    .cleanup_routing_handoff_at(
+                        now_ns,
+                        scan_tuning(0.0),
+                        &mut OccupancyGauge::default(),
+                    )
+                    .await?;
+                (result.deleted, result.scanned)
+            }
+            _ => unreachable!(),
         };
         assert_eq!(result, (0, 1));
         {
@@ -486,18 +630,40 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
                     .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
                     .is_some()
             );
+            assert!(backend.routing_handoff_lookup(&key)?.is_some());
         }
         janitor.before_delete_hook = None;
         assert_eq!(
             pins.release_for_test(TcpFlowKey::from_tuples(&key)),
             Some(true)
         );
-        let result = if redirect {
-            janitor.cleanup_redirect_track_for_test(now_ns).await
-        } else {
-            janitor.cleanup_conn_state_for_test(now_ns).await
+        let result = match map {
+            "conn" => janitor.cleanup_conn_state_for_test(now_ns).await,
+            "redirect" => janitor.cleanup_redirect_track_for_test(now_ns).await,
+            "handoff" => {
+                let result = janitor
+                    .cleanup_routing_handoff_at(
+                        now_ns,
+                        scan_tuning(0.0),
+                        &mut OccupancyGauge::default(),
+                    )
+                    .await?;
+                (result.deleted, result.scanned)
+            }
+            _ => unreachable!(),
         };
         assert_eq!(result, (1, 1));
+        let backend = backend.read().await;
+        match map {
+            "conn" => assert!(backend.tcp_conn_state_lookup(&key)?.is_none()),
+            "redirect" => assert!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
+                    .is_none()
+            ),
+            "handoff" => assert!(backend.routing_handoff_lookup(&key)?.is_none()),
+            _ => unreachable!(),
+        }
     }
     Ok(())
 }

@@ -150,6 +150,27 @@ impl<'a> Btf<'a> {
         self.composite_member_offset(self.find_type(4, type_name)?, member_name, 0, Some(width))
     }
 
+    /// Direct, non-bitfield member: its type id and byte offset.
+    pub(super) fn direct_member(&self, cursor: usize, name: &str) -> Option<(u32, u32)> {
+        let info = self.u32_at(cursor.checked_add(4)?)?;
+        if self.kind(cursor)? != 4 || info >> 31 != 0 {
+            return None;
+        }
+        for index in 0..(info & 0xffff) as usize {
+            let member = cursor
+                .checked_add(12)?
+                .checked_add(index.checked_mul(12)?)?;
+            if self.string(self.u32_at(member)?) == Some(name) {
+                let bits = self.u32_at(member.checked_add(8)?)?;
+                if bits % 8 != 0 {
+                    return None;
+                }
+                return Some((self.u32_at(member.checked_add(4)?)?, bits / 8));
+            }
+        }
+        None
+    }
+
     fn composite_member_offset(
         &self,
         cursor: usize,

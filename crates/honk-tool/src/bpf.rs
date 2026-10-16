@@ -15,12 +15,12 @@ use honk_ebpf_common::conn::ConnState;
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::redirect_need::{DomainRouting, RoutingHandoffEntry, TuplesKey};
 use honk_ebpf_common::{
-    OUTBOUND_STATS_MAP_LEN, OutboundStatsCounters, ROUTING_FACT_CAPACITY, ROUTING_POLICY_ROOT_NAME,
-    RedirectEntry, RedirectTuple, RoutingPolicyDescriptor,
+    FlowMapValue, OUTBOUND_STATS_MAP_LEN, OutboundStatsCounters, ROUTING_FACT_CAPACITY,
+    ROUTING_POLICY_ROOT_NAME, RedirectEntry, RedirectTuple, RoutingPolicyDescriptor,
 };
 
 // ---------------------------------------------------------------------------
-// Minimal bpf(2) layer (BPF_OBJ_GET / LOOKUP_ELEM / GET_NEXT_KEY).
+// Minimal bpf(2) layer (object metadata, singleton reads and batch snapshots).
 // ---------------------------------------------------------------------------
 
 const BPF_OBJ_GET: i64 = 7;
@@ -28,6 +28,9 @@ const BPF_MAP_LOOKUP_ELEM: i64 = 1;
 const BPF_MAP_GET_NEXT_KEY: i64 = 4;
 const BPF_MAP_GET_FD_BY_ID: i64 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: i64 = 15;
+const BPF_MAP_LOOKUP_BATCH: i64 = 24;
+const BPF_F_LOCK: u64 = 4;
+const BPF_BATCH_CHUNK: usize = 64;
 
 #[repr(C)]
 #[derive(Default)]
@@ -41,19 +44,32 @@ struct BpfAttr {
 
 #[repr(C)]
 #[derive(Default)]
+struct BpfBatchAttr {
+    in_batch: u64,
+    out_batch: u64,
+    keys: u64,
+    values: u64,
+    count: u32,
+    map_fd: u32,
+    elem_flags: u64,
+    flags: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
 struct BpfObjGetAttr {
     pathname: u64,
     bpf_fd: u32,
     file_flags: u32,
 }
 
-fn bpf(cmd: i64, attr: &mut BpfAttr) -> io::Result<i64> {
+fn bpf<T>(cmd: i64, attr: &mut T) -> io::Result<i64> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
             cmd,
-            attr as *mut BpfAttr,
-            std::mem::size_of::<BpfAttr>() as u32,
+            attr as *mut T,
+            std::mem::size_of::<T>() as u32,
         )
     };
     if ret < 0 {
@@ -128,6 +144,92 @@ fn map_entries(fd: RawFd, key_len: usize, value_len: usize) -> io::Result<Vec<(V
         prev = Some(key);
     }
     Ok(out)
+}
+
+fn map_entries_batch(
+    fd: RawFd,
+    key_len: usize,
+    value_len: usize,
+    elem_flags: u64,
+) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    map_entries_batch_with(fd, key_len, value_len, elem_flags, bpf)
+}
+
+fn map_entries_batch_with(
+    fd: RawFd,
+    key_len: usize,
+    value_len: usize,
+    elem_flags: u64,
+    mut lookup: impl FnMut(i64, &mut BpfBatchAttr) -> io::Result<i64>,
+) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut keys = vec![0u8; key_len * BPF_BATCH_CHUNK];
+    let mut values = vec![0u8; value_len * BPF_BATCH_CHUNK];
+    // Hash cursors are opaque bucket positions, not keys; the kernel may write only four bytes.
+    let mut previous = vec![0u8; key_len.max(4)];
+    let mut next = vec![0u8; previous.len()];
+    let mut has_previous = false;
+    loop {
+        let mut attr = BpfBatchAttr {
+            in_batch: if has_previous {
+                previous.as_ptr() as u64
+            } else {
+                0
+            },
+            out_batch: next.as_mut_ptr() as u64,
+            keys: keys.as_mut_ptr() as u64,
+            values: values.as_mut_ptr() as u64,
+            count: BPF_BATCH_CHUNK as u32,
+            map_fd: fd as u32,
+            elem_flags,
+            ..Default::default()
+        };
+        let terminal = match lookup(BPF_MAP_LOOKUP_BATCH, &mut attr) {
+            Ok(_) => false,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => true,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "safe external map snapshot requires BPF_MAP_LOOKUP_BATCH with elem_flags={elem_flags:#x}: {error}"
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let count = attr.count as usize;
+        if count > BPF_BATCH_CHUNK || (count == 0 && !terminal) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BPF_MAP_LOOKUP_BATCH returned invalid count {count} (terminal={terminal})"
+                ),
+            ));
+        }
+        for index in 0..count {
+            out.push((
+                keys[index * key_len..(index + 1) * key_len].to_vec(),
+                values[index * value_len..(index + 1) * value_len].to_vec(),
+            ));
+        }
+        // Short successful batches are not terminal; ENOENT can carry the final entries.
+        if terminal {
+            return Ok(out);
+        }
+        std::mem::swap(&mut previous, &mut next);
+        next.fill(0);
+        has_previous = true;
+    }
+}
+
+fn flow_payload<T: Copy>(bytes: &[u8]) -> T {
+    assert_eq!(bytes.len(), std::mem::size_of::<FlowMapValue<T>>());
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const FlowMapValue<T>).value }
 }
 
 fn read_value<T: Copy>(fd: RawFd, key: &[u8]) -> io::Result<Option<T>> {
@@ -486,17 +588,18 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                 "CONN_STATE_MAP",
                 1,
                 std::mem::size_of::<TuplesKey>() as u32,
-                std::mem::size_of::<ConnState>() as u32,
+                std::mem::size_of::<FlowMapValue<ConnState>>() as u32,
             )?;
-            let entries = map_entries(
+            let entries = map_entries_batch(
                 fd,
                 std::mem::size_of::<TuplesKey>(),
-                std::mem::size_of::<ConnState>(),
+                std::mem::size_of::<FlowMapValue<ConnState>>(),
+                BPF_F_LOCK,
             )?;
             let mut shown = 0usize;
             for (kb, vb) in &entries {
                 let k: TuplesKey = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: ConnState = unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                let v: ConnState = flow_payload(vb);
                 if !matches_ip(&k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
                     continue;
                 }
@@ -525,17 +628,18 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                 "REDIRECT_TRACK",
                 1,
                 std::mem::size_of::<RedirectTuple>() as u32,
-                std::mem::size_of::<RedirectEntry>() as u32,
+                std::mem::size_of::<FlowMapValue<RedirectEntry>>() as u32,
             )?;
-            let entries = map_entries(
+            let entries = map_entries_batch(
                 fd,
                 std::mem::size_of::<RedirectTuple>(),
-                std::mem::size_of::<RedirectEntry>(),
+                std::mem::size_of::<FlowMapValue<RedirectEntry>>(),
+                BPF_F_LOCK,
             )?;
             let mut shown = 0usize;
             for (kb, vb) in &entries {
                 let k: RedirectTuple = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: RedirectEntry = unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                let v: RedirectEntry = flow_payload(vb);
                 if let Some(want) = &args.ip
                     && ip_of(&k.src_ip) != *want
                     && ip_of(&k.dst_ip) != *want
@@ -590,18 +694,18 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
                 "ROUTING_HANDOFF_MAP",
                 1,
                 std::mem::size_of::<TuplesKey>() as u32,
-                std::mem::size_of::<RoutingHandoffEntry>() as u32,
+                std::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>() as u32,
             )?;
-            let entries = map_entries(
+            let entries = map_entries_batch(
                 fd,
                 std::mem::size_of::<TuplesKey>(),
-                std::mem::size_of::<RoutingHandoffEntry>(),
+                std::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>(),
+                BPF_F_LOCK,
             )?;
             let mut shown = 0usize;
             for (kb, vb) in &entries {
                 let k: TuplesKey = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: RoutingHandoffEntry =
-                    unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                let v: RoutingHandoffEntry = flow_payload(vb);
                 if !matches_ip(&k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
                     continue;
                 }
@@ -687,220 +791,4 @@ pub(crate) fn stats(args: StatsArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct SysfsFixture(tempfile::TempDir);
-
-    impl SysfsFixture {
-        fn new(possible: Option<&str>, present: &[u32]) -> Self {
-            let fixture = Self(tempfile::tempdir().unwrap());
-            if let Some(possible) = possible {
-                std::fs::write(fixture.root().join("possible"), possible).unwrap();
-            }
-            for cpu in present {
-                std::fs::create_dir(fixture.root().join(format!("cpu{cpu}"))).unwrap();
-            }
-            fixture
-        }
-
-        fn root(&self) -> &Path {
-            self.0.path()
-        }
-    }
-
-    fn stats_metadata_fixture(name: &str) -> [u32; 6] {
-        let mut info = [0; 6];
-        info[0] = 6;
-        info[2] = 4;
-        info[3] = match name {
-            "CONN_STATE_OCCUPANCY" => 8,
-            "OUTBOUND_STATS" => 32,
-            _ => panic!("unexpected statistics map {name}"),
-        };
-        info
-    }
-
-    fn open_stats_fixture(name: &str) -> anyhow::Result<(OwnedFd, [u32; 6])> {
-        Ok((
-            std::fs::File::open("/dev/null")?.into(),
-            stats_metadata_fixture(name),
-        ))
-    }
-
-    fn prepared(root: &Path) -> PerCpuStats {
-        prepare_percpu_stats(root, || Ok(()), open_stats_fixture).unwrap()
-    }
-
-    fn assert_source_error(fixture: &SysfsFixture) {
-        let mut opened = 0;
-        let result = prepare_percpu_stats(
-            fixture.root(),
-            || Ok(()),
-            |name| {
-                opened += 1;
-                open_stats_fixture(name)
-            },
-        );
-        let error = result.err().expect("invalid CPU source was accepted");
-        assert!(
-            error
-                .to_string()
-                .contains(&fixture.root().join("possible").display().to_string())
-        );
-        assert_eq!(opened, 0, "CPU source failure must precede map opening");
-    }
-
-    #[test]
-    fn prepare_percpu_stats_uses_possible_population_not_present_directories() {
-        let fixture = SysfsFixture::new(Some("0-63\n"), &(0..32).collect::<Vec<_>>());
-        let stats = prepared(fixture.root());
-        assert_eq!((stats.occupancy.len(), stats.outbound.len()), (512, 2048));
-    }
-
-    #[test]
-    fn prepare_percpu_stats_counts_sparse_possible_members() {
-        for (mask, present, lengths) in [
-            ("0,2-3\n", &[0, 2, 3][..], (24, 96)),
-            ("0,2-3,8\n", &[0, 2, 3, 8][..], (32, 128)),
-            ("7\n", &[7][..], (8, 32)),
-        ] {
-            let fixture = SysfsFixture::new(Some(mask), present);
-            let stats = prepared(fixture.root());
-            assert_eq!(
-                (stats.occupancy.len(), stats.outbound.len()),
-                lengths,
-                "{mask}"
-            );
-        }
-    }
-
-    #[test]
-    fn prepare_percpu_stats_rejects_missing_or_unreadable_possible_before_opening() {
-        for possible_is_directory in [false, true] {
-            let fixture = SysfsFixture::new(None, &[0, 1, 2]);
-            if possible_is_directory {
-                std::fs::create_dir(fixture.root().join("possible")).unwrap();
-            }
-            assert_source_error(&fixture);
-        }
-    }
-
-    #[test]
-    fn prepare_percpu_stats_rejects_noncanonical_possible_lists() {
-        for input in [
-            "", ",", "0,", ",0", "x", "+1", "01", "-1", "2-1", "0,0", "0-2,2-3", "1,0", "0-1-2",
-        ] {
-            let fixture = SysfsFixture::new(Some(input), &[0]);
-            assert_source_error(&fixture);
-        }
-    }
-
-    #[test]
-    fn checked_possible_parser_and_percpu_size_reject_overflow_without_allocating() {
-        let half = usize::MAX / 2;
-        for input in [
-            format!("{}0", usize::MAX),
-            format!("0-{}", usize::MAX),
-            format!("0-{half},{}-{}", half + 1, usize::MAX),
-        ] {
-            assert!(parse_possible_cpus(&input).is_err(), "{input}");
-        }
-        assert_eq!(percpu_buffer_len(1, 9).unwrap(), 16);
-        for (count, value_size) in [
-            ((usize::MAX / 8) + 1, 8),
-            (1, usize::MAX),
-            ((isize::MAX as usize / 8) + 1, 8),
-        ] {
-            assert!(
-                percpu_buffer_len(count, value_size).is_err(),
-                "{count} x {value_size}"
-            );
-        }
-    }
-
-    #[test]
-    fn prepare_percpu_stats_rejects_each_percpu_map_layout_field() {
-        let fixture = SysfsFixture::new(Some("0\n"), &[0]);
-        for map in ["CONN_STATE_OCCUPANCY", "OUTBOUND_STATS"] {
-            for (field, value) in [(0, 1), (2, 8), (3, 16)] {
-                let expected = stats_metadata_fixture(map);
-                let mut actual = expected;
-                actual[field] = value;
-                let result = prepare_percpu_stats(
-                    fixture.root(),
-                    || Ok(()),
-                    |name| {
-                        let (fd, info) = open_stats_fixture(name)?;
-                        Ok((fd, if name == map { actual } else { info }))
-                    },
-                );
-                let error = result
-                    .err()
-                    .expect("invalid per-CPU layout was accepted")
-                    .to_string();
-                assert!(error.contains(map), "{error}");
-                for (label, info) in [("expected", expected), ("actual", actual)] {
-                    assert!(
-                        error.contains(&format!(
-                            "{label} type={} key={} value={}",
-                            info[0], info[2], info[3]
-                        )),
-                        "{error}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn prepare_percpu_stats_propagates_metadata_query_errors_for_each_map() {
-        let fixture = SysfsFixture::new(Some("0\n"), &[0]);
-        for failed_map in ["CONN_STATE_OCCUPANCY", "OUTBOUND_STATS"] {
-            let result = prepare_percpu_stats(
-                fixture.root(),
-                || Ok(()),
-                |name| {
-                    anyhow::ensure!(name != failed_map, "synthetic metadata query failure");
-                    open_stats_fixture(name)
-                },
-            );
-            let error = result.err().expect("metadata query failure was ignored");
-            let text = format!("{error:#}");
-            assert!(text.contains(failed_map), "{text}");
-            assert!(text.contains("synthetic metadata query failure"), "{text}");
-        }
-    }
-
-    fn encode(counters: OutboundStatsCounters) -> Vec<u8> {
-        [
-            counters.tx_packets.to_ne_bytes(),
-            counters.tx_bytes.to_ne_bytes(),
-            counters.rx_packets.to_ne_bytes(),
-            counters.rx_bytes.to_ne_bytes(),
-        ]
-        .concat()
-    }
-
-    #[test]
-    fn sums_packed_outbound_counters_across_cpus() {
-        let mut values = encode(OutboundStatsCounters {
-            tx_packets: 1,
-            tx_bytes: 20,
-            rx_packets: 3,
-            rx_bytes: 40,
-        });
-        values.extend(encode(OutboundStatsCounters {
-            tx_packets: 5,
-            tx_bytes: 60,
-            rx_packets: 7,
-            rx_bytes: 80,
-        }));
-
-        let total = sum_percpu_outbound(&values);
-        assert_eq!(total.tx_packets, 6);
-        assert_eq!(total.tx_bytes, 80);
-        assert_eq!(total.rx_packets, 10);
-        assert_eq!(total.rx_bytes, 120);
-    }
-}
+mod tests;

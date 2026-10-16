@@ -95,9 +95,9 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 | Map | 形状与职责 |
 | --- | --- |
-| `CONN_STATE_MAP` | 不预分配的普通 hash，最多 524,288 项。保存每流 TCP/UDP 状态和已发布路由元数据；用户空间负责压力驱逐。 |
-| `REDIRECT_TRACK` | 不预分配的 65,536 项 hash。把有方向的五元组映射到原始 MAC/接口、出站、时间戳和决策身份，用于恢复回复路径。 |
-| `CLIENT_REPLY_TRACK` | 16,384 项 LRU hash。把非 DNS UDP 客户端地址和端口（目的字段清零）映射到与 `REDIRECT_TRACK` 相同的帧信息记录（token 已清除），使未联系过的对端的回复无需经过主机转发即可到达客户端。内核 LRU 淘汰是近似的：接近容量时（CPU 越多越明显），近期未发包的客户端可能在表满之前就被淘汰。该客户端的这类回复随后退回主机转发；不会造成错误路由，也没有用户空间清扫。 |
+| `CONN_STATE_MAP` | 不预分配的普通 hash，最多 524,288 项。原生 value lock 保护每流 TCP/UDP 状态及已发布路由元数据；用户态负责物理回收。 |
+| `REDIRECT_TRACK` | 不预分配的 65,536 项 token-bound hash。加锁的有方向五元组 payload 保存原始 MAC/接口、出站、时间戳与决策身份，用于恢复回复路径。 |
+| `CLIENT_REPLY_TRACK` | 16,384 项 LRU hash。对目的端口非 53 的 UDP，包括客户端源端口为 53 的流量，把客户端地址与端口映射到 `REDIRECT_TRACK` 的帧信息 payload，目的字段清零，不含 lock header，且 token 清零，使未联系对端的回复无需主机转发即可到达客户端。内核淘汰是近似的，尤其在 CPU 较多时，近期未发送的客户端可能在表满前被淘汰，这类回复随后退回主机转发。该缓存不持有 flow attribution，也不由用户态清扫。 |
 | `ROUTING_HANDOFF_MAP` | 不预分配的 65,536 项 hash；TCP SYN handoff 包含已提交策略代际，暂存 UDP 携带 decision token。原始 must UDP/53 不发布 tuple handoff，所有权使用逐报文 mark；非 must UDP/53 保留供畸形 payload 回退使用的事实。 |
 | `ROUTING_POLICY_ROOT` | 单项 map-in-map，选择不可变 policy descriptor 和两个同步生成函数槽之一。root 成功替换返回后，旧 non-sleepable 读者已完成 grace。 |
 | 按代持有的 IP/MAC 索引 | 分离的目的/源 IPv4、IPv6 LPM maps 及 MAC LPM。value 是完整的本代谓词 bitmap，更具体前缀继承祖先位。 |
@@ -108,28 +108,35 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `DATAPATH_STATE_MAP` | 单槽准入数组。零值不改动地放行流量；非零值启用分类与重定向。 |
 | `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
 | `SOCKET_IDENTITY` | 不克隆的 `SK_STORAGE`，保存 socket 首次捕获的 PID/可执行文件 basename。存储跟随实际 socket 生命周期，不受固定 hash 项数或用户态过期清理约束。WAN TC 只查询；cgroup create/connect/sendmsg 同步捕获缺失的身份。 |
-| `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 累计插入/eBPF 删除计数；结合用户空间删除计数估算占用率。 |
+| `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 插入/内核删除计数，结合实际用户态删除计数估算占用。此路径不再由内核删除 tuple，故内核删除计数保持零。 |
 | `BPF_STATS_MAP` | 五个计数器：UDP/TCP conn-state overflow、redirect/handoff 插入失败，以及 socket 身份捕获拒绝。 |
 | `EVENT_RINGBUF` | 262,144 字节 ring，记录为 80 字节，包含功能性的 tuple/incarnation 过期提示。Producer 直接预留并初始化 ring 存储，不再经有界 TC 栈复制事件。 |
 | `UDP_DECISION_SEQUENCE` | NFQUEUE 决策身份的单槽 pinned allocator 状态；协议细节见 [NFQUEUE](./nfqueue.md)。 |
 | `FLOW_INCARNATION_SEQUENCE` | 按代持有、spin-lock 保护、不可回绕的 56 位身份域，以 `u64` 表示；独立于持久化 UDP decision token。 |
 | `RETIRE_FENCE`、`RETIRE_ACTIVE` | 不预分配的 65,536 项规范 tuple fence 加单槽 active 标志；每个 fence 保存独立的操作 owner 与 decision token。 |
+| `REQUEST_FENCE` | 不预分配的 65,536 项 request 地址/cookie fence。Janitor 在同一次 grace 前同时安装它与 tuple fence；request hook 在借用证明存储之前检查它。 |
 | `RETIRE_GRACE_ROOT` | 私有单项 map-in-map；成功重装同一个 inner map 会同步排空 fence 前的 non-sleepable 内核读者。 |
 | `TCP_PUBLISHING` | 不预分配的 65,536 项同键 SYN 发布互斥；owner 只持续一个 TC invocation，竞争 SYN 在修改前拒绝。无用户态清扫，已建立包不取得此 claim。 |
 | `TCP_REQUEST_BINDINGS` | 不预分配的 65,536 项 request 地址/cookie hash，保存不可变 SYN 证明；缺失或过期时不能从当前 tuple 重建。 |
 | `TCP_SOCKET_BINDING` | 不克隆的 socket storage：自有 listener 标记或已证明 child 的原始 tuple/handoff。用户态在接管前用 accepted FD 读取。 |
+| `TCP_LIVE_PINS` | 不预分配的 65,536 项 incarnation 到 presence 的 hash。已验证的 accepted owner 取得精确 pin；只有老化 TCP 查询读取它。每个 guard 独立释放自己的 incarnation，不依赖 tuple-local 引用计数是否归零。 |
 
 内核/用户空间共用的 map key 和 value 是 `#[repr(C)]` ABI。共享流结构中的 IPv4 地址都以网络字节序的 IPv4-mapped IPv6 值保存。
 
-`ConnState`、`RedirectEntry`、`RoutingHandoffEntry` 尾部追加独立 `incarnation: u64`，大小分别为 64、40、72 字节，既有 decision token 偏移不变。`TuplesKey` 仍为 40 字节，尾部 padding 显式清零；`TcpRequestKey` 为 16 字节，`TcpSocketBinding` 为 120 字节。持久化 `UDP_DECISION_SEQUENCE` 严格保留 12 字节。Core 在 attach 前拒绝不兼容对象，工具在原始读取前验证 map 布局；须使用匹配版本，不提供兼容 shim。
+`ConnState`、`RedirectEntry`、`RoutingHandoffEntry` payload 分别为 64、40、72 字节，含独立的 `incarnation: u64`。对应 tuple map 使用 `FlowMapValue<T>`：原生 lock 位于 offset 0，payload 位于 offset 8，实际 value 大小为 72、48、80 字节。Payload 内的 decision token 偏移不变。`TuplesKey` 仍为 40 字节，尾部 padding 显式清零；`TcpRequestKey` 为 16 字节，不可变 `TcpSocketBinding` payload 为 120 字节。持久化 `UDP_DECISION_SEQUENCE` 严格保留 12 字节。Core 在 attach 前验证实际 map 的 BTF/value 布局，工具在解码前验证存储布局；须使用匹配版本，不提供兼容 shim。
 
-`RoutingMeta` 的 bit 58 仍表示 WAN UDP 用户态所有权；bit 57（`OFFLOAD`）仍区分原生直连与 endpoint-owned state。TCP 和普通 UDP 的按代 incarnation 独立于 decision token。相关正向、反向和回复 invocation 在借用 map value 前检查规范 tuple fence。既有辅助项只原地刷新匹配的借用 value 的时间戳，不会先比较再覆盖新 value。
+既有 tuple element 只原地更新、不替换：Linux 普通 hash 替换可在 RCU 读者仍持有旧指针时复用其存储。内核在原生锁内取得一致快照或窄投影，修改时在同一锁内比较捕获的身份；持锁时除 unlock 外不调用 helper。物理删除仍必须经过 tuple fence、成功的内核 grace 与事后所有权复验。外部工具使用 bucket 保护的 batch 与加锁 value copy，不回退到不安全的单项读取。
+
+`RoutingMeta` bit 58 仍表示 WAN UDP 用户态所有权，bit 57（`OFFLOAD`）区分原生直连。未发布 UDP claim 失败时，在原地记录精确 owner 的 `Aborted` 及实际已分配 token，辅助项保留到 fenced 用户态清理。Preparing/Aborted 报文不能续期 claim；Aborted 立即满足过期清理条件，但不能转发或激活。Advisory hint 丢失仍由既有 janitor 兜底。
+
+新对象校验成功后，启动只删除四个已废弃的 honk pin（`COOKIE_PID_MAP`、`UDP_DECISION_EPOCH`、`UDP_DECISION_INFLIGHT`、`UDP_DECISION_RETIRE_FENCE`），不清扫无关 pin，也不删除持久化 UDP allocator。
 
 `crates/honk-ebpf-common/src/lib.rs` — 共享 mark、NFQUEUE token 编码、`OutboundIndex`、`RoutingMeta`、`DaeParam`、`OutboundStatsCounters` 与 map 常量。
 `crates/honk-ebpf-common/src/routing_policy.rs` — 固定 `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI（128/24/24 字节）、feature bit 与进程名归一化限制。`RoutingDecision` 含直连 mark 索引（未指定时为 `u32::MAX`）；loader 检查 slot 的 BTF 输出布局并拒绝旧外部对象。
 `crates/honk-ebpf-common/src/redirect_need.rs` — `TuplesKey`、`Tuples`、携带 token 的 `RoutingResult`/`RoutingHandoffEntry`、256 位 `DomainRouting` 与 `SocketIdentity`。
 `crates/honk-ebpf-common/src/conn.rs` — `ConnState`（含 `UdpDecisionState` 与 `decision_token`）、`ConntrackArgs`、`ParseTransportCtx`、`BpfStatsKey` 与 `TcpState`。
 `crates/honk-ebpf/src/maps.rs` — 静态 TC map 声明与内核侧容量。
+`crates/honk-ebpf/src/flow.rs` 持有加锁快照/投影；`auxiliary.rs` 持有身份匹配的辅助项刷新与稳定发布。
 `crates/honk-ebpf/src/route.rs` — 静态 root/slot facade 与固定 ABI dispatch；生成的 policy code 由用户态加载。
 `crates/honk-ebpf/src/tcp_binding.rs` 与 `honk-core/src/ebpf/real/tcp_binding.rs` 持有必需的 SYN/request/child 绑定与运行内核 BTF 校验。Peer ingress 恢复后，SYN 使用 mark 低 24 位与 priority 的 32 位携带 56 位身份；创建 request 时 TCP 已复用 `skb->cb`。身份耗尽后拒绝发布，不回绕。
 

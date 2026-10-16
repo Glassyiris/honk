@@ -21,11 +21,12 @@ fn fill_hash_map<K: Pod, V: Pod>(
     value: &V,
 ) {
     let map = backend.bpf_mut().unwrap().map_mut(name).unwrap();
-    let mut map = HashMap::<_, K, V>::try_from(map).unwrap();
+    let mut map = HashMap::<_, K, FlowMapValue<V>>::try_from(map).unwrap();
+    let value = FlowMapValue::new(*value);
     for index in 0..AUX_MAP_CAPACITY {
-        map.insert(key(index), value, 0).unwrap();
+        map.insert(key(index), value, 1 | 4).unwrap();
     }
-    let error = map.insert(key(AUX_MAP_CAPACITY), value, 0).unwrap_err();
+    let error = map.insert(key(AUX_MAP_CAPACITY), value, 1 | 4).unwrap_err();
     assert!(
         matches!(
             &error,

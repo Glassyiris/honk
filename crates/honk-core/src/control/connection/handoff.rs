@@ -40,7 +40,7 @@ pub(crate) fn build_tuples_key(
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
-pub(super) struct HandoffResult {
+pub(in crate::control) struct HandoffResult {
     pub(super) outbound: u8,
     pub(super) mark: u32,
     pub(super) must: u8,
@@ -97,7 +97,13 @@ impl HandoffResult {
             let mut handoff = handoff;
             match backend.capture_kernel_route(key, (&entry).into()) {
                 Ok(mut capture) => {
-                    if key.dst_port != 53 {
+                    if key.dst_port != 53
+                        && !(key.l4proto == 17
+                            && honk_ebpf_common::conn::is_stateless_udp_ports(
+                                key.src_port,
+                                key.dst_port,
+                            ))
+                    {
                         let state = if key.l4proto == 6 {
                             backend.tcp_conn_state_lookup(key)
                         } else {
@@ -214,6 +220,8 @@ pub(in crate::control) struct TcpFlowPins {
     pub(in crate::control) expiry_hints: parking_lot::Mutex<
         Option<Arc<tokio::sync::Mutex<mpsc::Receiver<crate::ebpf::FlowExpiryHint>>>>,
     >,
+    #[cfg(feature = "ebpf")]
+    pub(in crate::control) kernel_pin_errors: crate::ebpf::TcpPinErrorSink,
 }
 
 impl TcpFlowPins {
@@ -260,6 +268,8 @@ pub(in crate::control) struct TcpFlowGuard {
     pub(in crate::control) tuples: TuplesKey,
     pub(in crate::control) incarnation: u64,
     pin_key: Option<TcpFlowKey>,
+    #[cfg(feature = "ebpf")]
+    kernel_pin: Option<crate::ebpf::TcpKernelPin>,
     pins: Arc<TcpFlowPins>,
     tracker: Arc<ConnectionTracker>,
     tracker_id: Option<String>,
@@ -282,6 +292,8 @@ impl TcpFlowGuard {
             tuples,
             incarnation,
             pin_key: Some(pin_key),
+            #[cfg(feature = "ebpf")]
+            kernel_pin: None,
             pins,
             tracker,
             tracker_id: None,
@@ -290,7 +302,7 @@ impl TcpFlowGuard {
         }
     }
 
-    pub(super) fn stream_mut(&mut self) -> &mut TcpStream {
+    pub(in crate::control) fn stream_mut(&mut self) -> &mut TcpStream {
         &mut self.stream
     }
 
@@ -326,14 +338,27 @@ impl TcpFlowGuard {
         }
     }
 
-    pub(in crate::control) fn release_pin(&mut self) -> Option<bool> {
-        let key = self.pin_key.take()?;
-        match self.pins.release(key) {
-            Some(last_owner) => Some(last_owner),
-            None => {
-                error!(?key, "TCP flow pin release found no owner");
-                None
+    pub(in crate::control) fn release_pin(&mut self) -> anyhow::Result<()> {
+        let local = self
+            .pin_key
+            .take()
+            .and_then(|key| self.pins.release(key))
+            .map(|_| ())
+            .ok_or_else(|| anyhow::anyhow!("TCP retirement lost its local pin"));
+        #[cfg(feature = "ebpf")]
+        let native = self
+            .kernel_pin
+            .take()
+            .map(crate::ebpf::TcpKernelPin::release)
+            .unwrap_or(Ok(()));
+        #[cfg(not(feature = "ebpf"))]
+        let native: anyhow::Result<()> = Ok(());
+        match (local, native) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(local), Err(native)) => {
+                Err(local.context(format!("native TCP pin release also failed: {native:#}")))
             }
+            (Err(error), _) | (_, Err(error)) => Err(error),
         }
     }
 
@@ -384,7 +409,11 @@ impl TcpFlowGuard {
 impl Drop for TcpFlowGuard {
     fn drop(&mut self) {
         self.untrack();
-        self.release_pin();
+        if let Some(key) = self.pin_key.take()
+            && self.pins.release(key).is_none()
+        {
+            error!(?key, "TCP flow pin release found no owner");
+        }
     }
 }
 
@@ -424,7 +453,9 @@ impl ControlPlaneHandle {
     ) -> anyhow::Result<Option<HandoffResult>> {
         let backend = self.ebpf.read().await;
         let entry = backend.routing_handoff_lookup(tuples)?;
-        if tuples.dst_port != 53 || decision_token != 0 {
+        if !honk_ebpf_common::conn::is_stateless_udp_ports(tuples.src_port, tuples.dst_port)
+            || decision_token != 0
+        {
             let current_incarnation = backend.udp_flow_incarnation(tuples, decision_token)?;
             if let Some(incarnation) = kernel_incarnation {
                 anyhow::ensure!(
@@ -473,7 +504,7 @@ impl ControlPlaneHandle {
             }))
     }
 
-    pub(super) async fn adopt_tcp_flow(
+    pub(in crate::control) async fn adopt_tcp_flow(
         &self,
         stream: TcpStream,
         tuples: TuplesKey,
@@ -509,6 +540,20 @@ impl ControlPlaneHandle {
             }
             crate::ebpf::TcpSocketOwnership::Model => backend.routing_handoff_lookup(&tuples)?,
         };
+        #[cfg(feature = "ebpf")]
+        let kernel_pin = if matches!(ownership, crate::ebpf::TcpSocketOwnership::Kernel(_)) {
+            Some(backend.retain_tcp_flow(
+                current.incarnation,
+                Arc::clone(&self.tcp_flow_pins.kernel_pin_errors),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "ebpf"))]
+        anyhow::ensure!(
+            matches!(ownership, crate::ebpf::TcpSocketOwnership::Model),
+            "native TCP pin ownership requires the real eBPF backend"
+        );
         // Verification and pin retention share the continuous backend read lock:
         // retirement cannot observe an unpinned accepted owner in between.
         let flow = TcpFlowGuard::new(
@@ -518,6 +563,12 @@ impl ControlPlaneHandle {
             Arc::clone(&self.tcp_flow_pins),
             Arc::clone(&self.connection_tracker),
         );
+        #[cfg(feature = "ebpf")]
+        let flow = {
+            let mut flow = flow;
+            flow.kernel_pin = kernel_pin;
+            flow
+        };
         let handoff = entry.map(|entry| {
             HandoffResult::captured(
                 backend.as_ref(),

@@ -182,7 +182,10 @@ fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
                 if protocol == IPPROTO_UDP {
                     // Inject missing tuple metadata to exercise cached recovery.
                     backend
-                        .hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", &key)
+                        .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                            "ROUTING_HANDOFF_MAP",
+                            &key,
+                        )
                         .unwrap();
                     let cached = run(&backend, side, &bytes, SkbInput::default());
                     assert_eq!(cached.cb[3], recorded.trace_id);
@@ -209,7 +212,7 @@ fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_cha
             let original = backend.routing_handoff_lookup(&key).unwrap().unwrap();
             // Inject missing tuple metadata; ordinary admission never consumes it.
             backend
-                .hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", &key)
+                .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", &key)
                 .unwrap();
             assert_ne!(original.trace_id, 0);
             assert_ne!(original.trace_id, ROUTE_TRACE_LOST);
@@ -387,7 +390,7 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
             .expect("bounded sidecar must evict a witness");
         // Inject missing tuple metadata after its witness has been evicted.
         backend
-            .hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)
+            .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", key)
             .unwrap();
         let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 7, 0);
         assert_eq!(
@@ -433,13 +436,16 @@ fn delayed_token_zero_udp_keeps_its_packet_reference_after_conn_recreation() {
                 assert_eq!(a.cb[3], old.trace_id);
                 // Inject lost tuple metadata while retaining the delayed packet/witness.
                 backend
-                    .hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", &key)
+                    .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                        "ROUTING_HANDOFF_MAP",
+                        &key,
+                    )
                     .unwrap();
                 backend
-                    .hash_remove::<_, ConnState>("CONN_STATE_MAP", &key)
+                    .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &key)
                     .unwrap();
                 backend
-                    .hash_remove::<_, RedirectEntry>(
+                    .hash_remove::<_, FlowMapValue<RedirectEntry>>(
                         "REDIRECT_TRACK",
                         &RedirectTuple::from_tuples(&key),
                     )

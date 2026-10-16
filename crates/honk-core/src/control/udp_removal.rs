@@ -29,6 +29,10 @@ pub(in crate::control) fn spawn_udp_removal_worker(
     let (tcp_tx, mut tcp_rx) = mpsc::channel::<TcpRetirement>(REMOVAL_QUEUE_CAPACITY);
     udp_pool.set_remove_sink(remove_tx);
     *tcp_flow_pins.retirement_sink.lock() = Some(tcp_tx);
+    #[cfg(feature = "ebpf")]
+    {
+        *tcp_flow_pins.kernel_pin_errors.lock() = Some(fatal_tx.clone());
+    }
     tokio::spawn(async move {
         let mut exit = super::runtime::CriticalTaskExit {
             name: "flow_retirement_worker",
@@ -137,10 +141,10 @@ pub(in crate::control) fn spawn_udp_removal_worker(
             // pins under W, then examine current external owners without a gap.
             for (index, job) in jobs.iter_mut().enumerate() {
                 if let Retirement::Tcp(retirement) = job
-                    && retirement.flow.release_pin().is_none()
+                    && let Err(error) = retirement.flow.release_pin()
                 {
                     confirmed[index] = false;
-                    let _ = fatal_tx.send(anyhow::anyhow!("TCP retirement lost its owned pin"));
+                    let _ = fatal_tx.send(error.context("TCP retirement pin release failed"));
                 }
             }
             let mut request_indices = [None; RETIRE_BATCH_CAPACITY];

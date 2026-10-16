@@ -4,8 +4,8 @@ use aya_ebpf::btf_maps::{
 };
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
-    BpfStatsKey, ConnState, ConntrackArgs, FlowIncarnationSequence, MAX_CONN_STATE_NUM,
-    ParseTransportCtx, RetirementFence, UdpDecisionSequence,
+    BpfStatsKey, ConnState, ConntrackArgs, FlowIncarnationSequence, FlowMapValue,
+    MAX_CONN_STATE_NUM, ParseTransportCtx, RetirementFence, UdpDecisionSequence,
 };
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
@@ -24,7 +24,9 @@ pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
 #[repr(C)]
 pub struct UdpDecisionScratch {
     pub redirect_key: RedirectTuple,
+    pub redirect_header: u64,
     pub redirect: RedirectEntry,
+    pub handoff_header: u64,
     pub handoff: RoutingHandoffEntry,
     pub state: ConnState,
 }
@@ -90,6 +92,22 @@ pub static TCP_REQUEST_BINDINGS: HashMap<TcpRequestKey, TcpSocketBinding, 65536,
     HashMap::new();
 
 #[btf_map]
+pub static REQUEST_FENCE: HashMap<TcpRequestKey, u64, 65536, 1> = HashMap::new();
+
+#[btf_map]
+pub static TCP_LIVE_PINS: HashMap<u64, u8, 65536, 1> = HashMap::new();
+
+#[inline(always)]
+pub fn request_retiring(key: &TcpRequestKey) -> bool {
+    let mut zero = 0u32;
+    unsafe { core::ptr::write_volatile(&mut zero, 0) };
+    RETIRE_ACTIVE
+        .get(unsafe { core::ptr::read_volatile(&zero) })
+        .is_none_or(|active| *active != 0)
+        && unsafe { REQUEST_FENCE.get(key).is_some() }
+}
+
+#[btf_map]
 pub static TCP_SOCKET_BINDING: SkStorage<TcpSocketBinding> = SkStorage::new();
 
 /// Exclusive non-sleepable SYN publishers; no userspace mutation or expiry.
@@ -108,7 +126,8 @@ pub fn tuple_retiring(key: &TuplesKey) -> bool {
 /// ~8 MB per 64K capacity).  Eviction is owned by the userspace janitor
 /// (state-based timeouts), never by silent kernel LRU eviction — an evicted
 /// entry here breaks reply rewriting for live flows.
-pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = HashMap::new();
+pub static REDIRECT_TRACK: HashMap<RedirectTuple, FlowMapValue<RedirectEntry>, 65536, 1> =
+    HashMap::new();
 
 #[btf_map]
 /// LAN framing of the client side of a redirected non-DNS UDP flow, keyed by the
@@ -125,7 +144,7 @@ pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> =
 /// timeout).
 pub static ROUTING_HANDOFF_MAP: HashMap<
     TuplesKey,
-    RoutingHandoffEntry,
+    FlowMapValue<RoutingHandoffEntry>,
     MAX_ROUTING_HANDOFF_NUM,
     1,
 > = HashMap::new();
@@ -171,14 +190,16 @@ pub static SOCKET_IDENTITY: SkStorage<SocketIdentity> = SkStorage::new();
 // the common tuple fence and kernel grace period. The kernel never evicts.
 // Inserts under memory pressure fail closed and increment the overflow counter.
 #[btf_map]
-pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as usize }, 1> =
-    HashMap::new();
+pub static CONN_STATE_MAP: HashMap<
+    TuplesKey,
+    FlowMapValue<ConnState>,
+    { MAX_CONN_STATE_NUM as usize },
+    1,
+> = HashMap::new();
 
-/// Occupancy gauge for CONN_STATE_MAP (per-CPU to keep the insert path
-/// contention-free): slot `OCCUPANCY_INSERTS` counts successful inserts,
-/// slot `OCCUPANCY_EBPF_DELETES` counts datapath-side deletes.  Userspace
-/// combines these with its own janitor-delete accounting to estimate live
-/// occupancy between sweeps.
+/// Successful insertions remain counted through Aborted; only fenced userspace
+/// reclamation removes tuple elements. The second slot is retained, always zero,
+/// for the existing occupancy ABI.
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
@@ -219,3 +240,6 @@ pub static PARSE_CTX_MAP: PerCpuArray<ParseTransportCtx, 1> = PerCpuArray::new()
 
 #[btf_map]
 pub static UDP_DECISION_SCRATCH_MAP: PerCpuArray<UdpDecisionScratch, 1> = PerCpuArray::new();
+
+#[btf_map]
+pub static CONNTRACK_SNAPSHOT_MAP: PerCpuArray<ConnState, 1> = PerCpuArray::new();

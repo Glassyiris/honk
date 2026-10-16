@@ -111,7 +111,7 @@ A watchdog checks held cells independently and enforces the hard hold bound. Sta
 Reload and shutdown share the same producer fence:
 
 1. Publish `DATAPATH_FLAG_NFQ_READY=false`. New flows that require staging now fail closed.
-2. Complete the synchronous `RETIRE_GRACE_ROOT` barrier, then remove residual `Preparing` and `Pending` state in bounded, incarnation-checked tuple-fence batches. A delayed queue delivery subsequently fails token lookup; descriptor-generation publication still fences queued DNS fragments.
+2. Complete the synchronous `RETIRE_GRACE_ROOT` barrier, then remove residual `Preparing`, `Pending` and `Aborted` state in bounded, incarnation-checked tuple-fence batches. A delayed queue delivery subsequently fails token lookup; descriptor-generation publication still fences queued DNS fragments.
 3. Close correlator admission and drain or cancel verdict guards, initializer leases, scheduled token cleanups, endpoint tombstones, and retirement work before changing runtime ownership.
 4. A successful reload publishes the replacement runtime generation and reopens correlator admission and readiness last. Shutdown detaches producers, closes queue ownership, and deletes `inet honk_nfqueue` last.
 
@@ -121,7 +121,9 @@ Failure or ambiguity in listener, queue, watchdog, cleanup, verdict, or retireme
 
 Retirement publishes `RETIRE_ACTIVE` and inserts each `RETIRE_FENCE[tuple]` with `BPF_NOEXIST`. The value keeps a unique retirement-operation owner separate from its decision token. A successful same-inner update of the private `RETIRE_GRACE_ROOT` synchronously drains pre-fence non-sleepable readers. Under exclusion, the backend revalidates captured incarnation, token, state, handoff and redirect authority before deleting owned entries. A batch deduplicates tuple fences but retains each request's outcome. Every acquired fence is owner-checked on release; partial deletion counts and both operation/release failures are retained. Unresolved ownership inhibits further admission. Staged commits use this same fence/grace protocol.
 
-WAN userspace UDP shares this fence even with token zero: the endpoint retains the incarnation captured at admission, and its explicit `RoutingMeta` ownership bit distinguishes marked direct/must from native direct state. Auxiliary token and incarnation must match before deletion; missing or superseded conn state preserves auxiliaries. Explicit legacy LAN token-zero retirement remains conn-state-only. Kernel aging emits advisory hints instead of deleting by key; all physical expiry reclamation uses the same backend protocol.
+WAN and LAN userspace UDP share this fence even with token zero: the endpoint retains its admission incarnation, and the WAN ownership bit distinguishes marked direct/must from native direct state. Matching auxiliaries are reclaimed before conn-state in the same transaction, including expired-conn cleanup, so a new incarnation can reuse the tuple. Foreign token/incarnation metadata is preserved and the operation refuses; missing or superseded conn ownership is not permission to delete another owner.
+
+Before successful publication, a failed kernel producer records terminal `Aborted` with its captured incarnation and actual allocated token (zero if none was allocated). It does not delete tuple entries or convert a completed Pending/native/proxy/block decision. Preparing and Aborted followers cannot renew timestamps; Aborted cannot activate or forward and is immediately eligible for exact fenced hint/janitor cleanup. All physical tuple reclamation stays in the shared backend protocol.
 
 ## Sequence exhaustion and rotation
 

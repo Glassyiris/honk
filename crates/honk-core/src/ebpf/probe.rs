@@ -2,13 +2,13 @@
 //!
 //! aya 0.14 does not expose `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+), so
 //! `ebpf::real` issues it as a raw syscall. Availability is detected at runtime instead of
-//! relying on kernel version parsing. A capability failure sends subsequent
-//! calls to the per-element fallback; an already-in-flight successful call
-//! can still record support afterwards.
+//! relying on kernel version parsing. On capability failure the storage adapter
+//! either selects its proven-safe fallback or returns an explicit unsupported
+//! error. An already-in-flight successful call can still record support later.
 //!
-//! The observation is per command, not per (command, map): the scanned tuple
-//! maps and `TCP_REQUEST_BINDINGS` are ordinary hashes, so one verdict covers
-//! their batched lookup operations. Retirement deletion remains owner-checked.
+//! Keep separate observations for plain and BPF_F_LOCK batch copies: support
+//! for ordinary hashes does not prove support for locked flow values. Request
+//! enumeration requires plain batch support rather than an unsafe fallback.
 
 use std::ffi::c_long;
 use std::sync::atomic::{AtomicBool, Ordering};

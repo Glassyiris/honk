@@ -7,6 +7,12 @@ mod retirement;
 pub use retirement::*;
 #[cfg(feature = "ebpf")]
 pub mod real;
+#[cfg(feature = "ebpf")]
+pub use real::TcpKernelPin;
+
+#[cfg(feature = "ebpf")]
+pub type TcpPinErrorSink =
+    std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<anyhow::Error>>>>;
 
 use async_trait::async_trait;
 use honk_ebpf_common::*;
@@ -147,6 +153,7 @@ pub(crate) fn apply_udp_decision_transition(
 pub(crate) fn udp_state_is_userspace_owned(state: u8) -> bool {
     state == UdpDecisionState::Preparing as u8
         || state == UdpDecisionState::Pending as u8
+        || state == UdpDecisionState::Aborted as u8
         || state == UdpDecisionState::Proxy as u8
 }
 
@@ -599,6 +606,13 @@ pub trait EbpfBackend: Send + Sync {
         &self,
         fd: std::os::fd::BorrowedFd<'_>,
     ) -> anyhow::Result<TcpSocketOwnership>;
+    /// Retain the exact verified TCP incarnation until its real owner releases it.
+    #[cfg(feature = "ebpf")]
+    fn retain_tcp_flow(
+        &self,
+        incarnation: u64,
+        errors: TcpPinErrorSink,
+    ) -> anyhow::Result<TcpKernelPin>;
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>>;
     fn tcp_request_for_each_chunk(
         &self,

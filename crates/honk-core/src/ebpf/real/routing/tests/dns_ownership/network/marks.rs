@@ -291,7 +291,7 @@ fn direct_socket_marks_route_v4_v6_tcp_udp_without_socket_identity_or_recapture(
             }
         });
         assert_eq!(
-            hash_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
+            flow_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
             0
         );
         fixture.assert_no_redirects();
@@ -700,14 +700,14 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                         // Inject absent authoritative state while retaining auxiliaries.
                         fixture
                             .backend
-                            .hash_remove::<_, ConnState>("CONN_STATE_MAP", &key)
+                            .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &key)
                             .unwrap();
                     }
                     let mut entry = selected;
                     entry.result.decision_token = handoff_token;
                     fixture
                         .backend
-                        .hash_insert("ROUTING_HANDOFF_MAP", &key, &entry)
+                        .flow_insert("ROUTING_HANDOFF_MAP", &key, &entry)
                         .unwrap();
                     fixture
                         .backend
@@ -748,7 +748,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                 fixture.backend.udp_conn_state_store(&key, &state).unwrap();
                 fixture
                     .backend
-                    .hash_insert("ROUTING_HANDOFF_MAP", &key, &selected)
+                    .flow_insert("ROUTING_HANDOFF_MAP", &key, &selected)
                     .unwrap();
                 fixture
                     .backend
@@ -862,11 +862,11 @@ fn wan_direct_dns_same_tuple_keeps_each_datagrams_mark_before_userspace_reads() 
             }
         }
         assert_eq!(
-            hash_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
+            flow_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
             0
         );
         assert_eq!(
-            hash_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP"),
+            flow_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP"),
             0
         );
         fixture.assert_no_redirects();

@@ -4,8 +4,9 @@ use aya::maps::{Map, MapData};
 use honk_config::node::Group;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
+use std::mem::size_of;
 use std::net::IpAddr;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
 
 /// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
@@ -139,4 +140,75 @@ pub(in crate::control::tests) fn add_address(
 
 pub(in crate::control::tests) fn pinned_map(root: &Path, name: &str) -> anyhow::Result<Map> {
     Ok(Map::from_map_data(MapData::from_pin(root.join(name))?)?)
+}
+
+/// Bucket-protected copies for external readers that cannot exclude native
+/// request destruction or userspace tuple retirement. Never fall back to
+/// GET_NEXT_KEY plus singleton LOOKUP_ELEM, even for immutable request values.
+pub(in crate::control::tests) fn pinned_hash_snapshot<K: aya::Pod, V: aya::Pod>(
+    root: &Path,
+    name: &str,
+    elem_flags: u64,
+) -> anyhow::Result<Vec<(K, V)>> {
+    const CHUNK: usize = 128;
+    let data = MapData::from_pin(root.join(name))?;
+    let info = data.info()?;
+    anyhow::ensure!(
+        info.map_type()? == aya::maps::MapType::Hash
+            && info.key_size() as usize == size_of::<K>()
+            && info.value_size() as usize == size_of::<V>(),
+        "unexpected pinned hash layout for {name}"
+    );
+    // Hash cursors are opaque bucket positions; the kernel may write only four
+    // bytes even when the map key is larger. Initialize every byte up front.
+    let mut cursor = vec![0u8; size_of::<K>().max(4)];
+    let mut previous = cursor.clone();
+    let mut has_previous = false;
+    let mut keys = vec![std::mem::MaybeUninit::<K>::uninit(); CHUNK];
+    let mut values = vec![std::mem::MaybeUninit::<V>::uninit(); CHUNK];
+    let mut snapshot = Vec::new();
+    loop {
+        let mut attr: aya_obj::generated::bpf_attr = unsafe { std::mem::zeroed() };
+        attr.batch.map_fd = data.fd().as_fd().as_raw_fd() as u32;
+        attr.batch.in_batch = if has_previous {
+            previous.as_ptr() as u64
+        } else {
+            0
+        };
+        attr.batch.out_batch = cursor.as_mut_ptr() as u64;
+        attr.batch.keys = keys.as_mut_ptr() as u64;
+        attr.batch.values = values.as_mut_ptr() as u64;
+        attr.batch.count = CHUNK as u32;
+        attr.batch.elem_flags = elem_flags;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                aya_obj::generated::bpf_cmd::BPF_MAP_LOOKUP_BATCH as libc::c_long,
+                &mut attr as *mut aya_obj::generated::bpf_attr,
+                size_of::<aya_obj::generated::bpf_attr>(),
+            )
+        };
+        let error = (result < 0).then(std::io::Error::last_os_error);
+        let terminal = error
+            .as_ref()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOENT));
+        if let Some(error) = error.filter(|_| !terminal) {
+            return Err(anyhow::Error::new(error).context(format!(
+                "safe pinned snapshot of {name} requires BPF_MAP_LOOKUP_BATCH (elem_flags={elem_flags})"
+            )));
+        }
+        let count = unsafe { attr.batch.count } as usize;
+        anyhow::ensure!(count <= CHUNK, "invalid batch count for {name}: {count}");
+        for index in 0..count {
+            // Success/ENOENT initializes exactly count elements; other errors,
+            // including EFAULT, return above without touching output storage.
+            snapshot.push(unsafe { (keys[index].assume_init(), values[index].assume_init()) });
+        }
+        if terminal {
+            return Ok(snapshot);
+        }
+        anyhow::ensure!(count != 0, "empty nonterminal batch for {name}");
+        previous.copy_from_slice(&cursor);
+        has_previous = true;
+    }
 }

@@ -3,10 +3,88 @@ use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
 pub(super) fn validate_flow_lifetime_object_layout(obj: &[u8]) -> anyhow::Result<()> {
-    let btf = aya_obj::Object::parse(obj)?
+    let object = aya_obj::Object::parse(obj)?;
+    let data = object
         .btf
-        .ok_or_else(|| anyhow::anyhow!("required flow lifetime object BTF not found"))?;
-    validate_flow_lifetime_btf(&btf.to_bytes())
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("required flow lifetime object BTF not found"))?
+        .to_bytes();
+    validate_flow_lifetime_btf(&data)?;
+    let btf = btf::Btf::parse(&data).ok_or_else(|| anyhow::anyhow!("invalid flow map BTF"))?;
+    for (map, payload, size) in [
+        (
+            "CONN_STATE_MAP",
+            "ConnState",
+            core::mem::size_of::<FlowMapValue<ConnState>>(),
+        ),
+        (
+            "REDIRECT_TRACK",
+            "RedirectEntry",
+            core::mem::size_of::<FlowMapValue<RedirectEntry>>(),
+        ),
+        (
+            "ROUTING_HANDOFF_MAP",
+            "RoutingHandoffEntry",
+            core::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>(),
+        ),
+    ] {
+        let value = object_map_value_type(&object, &btf, map)?;
+        anyhow::ensure!(
+            flow_value_btf_matches(&btf, value, payload, size),
+            "incompatible locked value BTF for {map}; rebuild the eBPF object"
+        );
+    }
+    for map in ["TCP_SOCKET_BINDING", "TCP_REQUEST_BINDINGS"] {
+        let value = object_map_value_type(&object, &btf, map)?;
+        anyhow::ensure!(
+            tcp_proof_btf_matches(&btf, value),
+            "incompatible native proof BTF for {map}; rebuild the eBPF object"
+        );
+    }
+    Ok(())
+}
+
+fn object_map_value_type(
+    object: &aya_obj::Object,
+    btf: &btf::Btf<'_>,
+    name: &str,
+) -> anyhow::Result<usize> {
+    let Some(aya_obj::maps::Map::Btf(map)) = object.maps.get(name) else {
+        anyhow::bail!("required BTF map {name} missing");
+    };
+    btf.resolve_composite(map.def.btf_value_type_id)
+        .ok_or_else(|| anyhow::anyhow!("required BTF value type for {name} missing"))
+}
+
+fn flow_value_btf_matches(btf: &btf::Btf<'_>, value: usize, payload: &str, size: usize) -> bool {
+    (|| {
+        let (lock, lock_offset) = btf.direct_member(value, "lock")?;
+        let lock = btf.resolve_modifiers(lock)?;
+        let (padding, padding_offset) = btf.direct_member(value, "padding")?;
+        let (inner, payload_offset) = btf.direct_member(value, "value")?;
+        Some(
+            btf.u32_at(value + 8)? == size as u32
+                && lock_offset == 0
+                && btf.kind(lock)? == 4
+                && btf.string(btf.u32_at(lock)?)? == "bpf_spin_lock"
+                && btf.u32_at(lock + 8)? == 4
+                && btf.sized_member_offset("bpf_spin_lock", "val", 4) == Some(0)
+                && padding_offset == 4
+                && btf.unsigned_integer_width(padding, 4)
+                && payload_offset == 8
+                && Some(btf.resolve_modifiers(inner)?) == btf.find_type(4, payload),
+        )
+    })()
+    .unwrap_or(false)
+}
+
+fn tcp_proof_btf_matches(btf: &btf::Btf<'_>, value: usize) -> bool {
+    Some(value) == btf.find_type(4, "TcpSocketBinding")
+        && btf.u32_at(value + 8) == Some(120)
+        && btf.sized_member_offset("TcpSocketBinding", "tuples", 40) == Some(0)
+        && btf.sized_member_offset("TcpSocketBinding", "handoff", 72) == Some(40)
+        && btf.sized_member_offset("TcpSocketBinding", "kind", 4) == Some(112)
+        && btf.sized_member_offset("TcpSocketBinding", "padding", 4) == Some(116)
 }
 
 fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
@@ -14,48 +92,111 @@ fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
 
     let btf =
         btf::Btf::parse(data).ok_or_else(|| anyhow::anyhow!("invalid flow lifetime object BTF"))?;
-    for (name, size, member, width, offset) in [
+    for (name, size, fields) in [
         (
             "TuplesKey",
             size_of::<TuplesKey>(),
-            "padding",
-            3,
-            offset_of!(TuplesKey, padding),
+            &[("padding", 3, offset_of!(TuplesKey, padding))][..],
         ),
         (
             "ConnState",
             size_of::<ConnState>(),
-            "incarnation",
-            8,
-            offset_of!(ConnState, incarnation),
+            &[
+                (
+                    "is_wan_ingress_direction",
+                    1,
+                    offset_of!(ConnState, is_wan_ingress_direction),
+                ),
+                ("state", 1, offset_of!(ConnState, state)),
+                ("decision_token", 4, offset_of!(ConnState, decision_token)),
+                ("last_seen_ns", 8, offset_of!(ConnState, last_seen_ns)),
+                ("meta", 8, offset_of!(ConnState, meta)),
+                ("mac", 6, offset_of!(ConnState, mac)),
+                ("padding", 2, offset_of!(ConnState, padding)),
+                ("pname", 16, offset_of!(ConnState, pname)),
+                ("pid", 4, offset_of!(ConnState, pid)),
+                ("trace_id", 4, offset_of!(ConnState, trace_id)),
+                ("incarnation", 8, offset_of!(ConnState, incarnation)),
+            ][..],
         ),
         (
             "RoutingHandoffEntry",
             size_of::<RoutingHandoffEntry>(),
-            "incarnation",
-            8,
-            offset_of!(RoutingHandoffEntry, incarnation),
+            &[
+                (
+                    "last_seen_ns",
+                    8,
+                    offset_of!(RoutingHandoffEntry, last_seen_ns),
+                ),
+                ("result", 40, offset_of!(RoutingHandoffEntry, result)),
+                (
+                    "routing_generation",
+                    8,
+                    offset_of!(RoutingHandoffEntry, routing_generation),
+                ),
+                ("trace_id", 4, offset_of!(RoutingHandoffEntry, trace_id)),
+                (
+                    "trace_padding",
+                    4,
+                    offset_of!(RoutingHandoffEntry, trace_padding),
+                ),
+                (
+                    "incarnation",
+                    8,
+                    offset_of!(RoutingHandoffEntry, incarnation),
+                ),
+            ][..],
+        ),
+        (
+            "RoutingResult",
+            size_of::<RoutingResult>(),
+            &[
+                ("mark", 4, offset_of!(RoutingResult, mark)),
+                ("must", 1, offset_of!(RoutingResult, must)),
+                ("mac", 6, offset_of!(RoutingResult, mac)),
+                ("outbound", 1, offset_of!(RoutingResult, outbound)),
+                ("pname", 16, offset_of!(RoutingResult, pname)),
+                ("pid", 4, offset_of!(RoutingResult, pid)),
+                ("dscp", 1, offset_of!(RoutingResult, dscp)),
+                (
+                    "decision_token",
+                    4,
+                    offset_of!(RoutingResult, decision_token),
+                ),
+            ][..],
         ),
         (
             "RedirectEntry",
             size_of::<RedirectEntry>(),
-            "incarnation",
-            8,
-            offset_of!(RedirectEntry, incarnation),
+            &[
+                ("last_seen_ns", 8, offset_of!(RedirectEntry, last_seen_ns)),
+                ("dmac", 6, offset_of!(RedirectEntry, dmac)),
+                ("smac", 6, offset_of!(RedirectEntry, smac)),
+                ("from_wan", 1, offset_of!(RedirectEntry, from_wan)),
+                ("outbound", 1, offset_of!(RedirectEntry, outbound)),
+                ("padding", 2, offset_of!(RedirectEntry, padding)),
+                ("ifindex", 4, offset_of!(RedirectEntry, ifindex)),
+                (
+                    "decision_token",
+                    4,
+                    offset_of!(RedirectEntry, decision_token),
+                ),
+                ("incarnation", 8, offset_of!(RedirectEntry, incarnation)),
+            ][..],
         ),
         (
             "DaeEvent",
             size_of::<DaeEvent>(),
-            "incarnation",
-            8,
-            offset_of!(DaeEvent, incarnation),
+            &[("incarnation", 8, offset_of!(DaeEvent, incarnation))][..],
         ),
     ] {
         anyhow::ensure!(
             btf.find_type(4, name)
                 .and_then(|record| btf.u32_at(record + 8))
                 == Some(size as u32)
-                && btf.sized_member_offset(name, member, width) == Some(offset as u32),
+                && fields.iter().all(|(member, width, offset)| btf
+                    .sized_member_offset(name, member, *width)
+                    == Some(*offset as u32)),
             "incompatible {name} ABI; rebuild the eBPF object"
         );
     }
@@ -221,26 +362,135 @@ mod tests {
             3,
         ];
         let mut records = [0; 5];
-        for (index, (name, size, member, type_id, offset)) in [
-            ("TuplesKey", 40, "padding", 3, 37),
-            ("ConnState", 64, "incarnation", 2, 56),
-            ("RoutingHandoffEntry", 72, "incarnation", 2, 64),
-            ("RedirectEntry", 40, "incarnation", 2, 32),
-            ("DaeEvent", 80, "incarnation", 2, 72),
+        for (index, (name, size, members)) in [
+            ("TuplesKey", 40, &[("padding", 3, 37)][..]),
+            (
+                "ConnState",
+                64,
+                &[
+                    ("is_wan_ingress_direction", 1, 0),
+                    ("state", 1, 1),
+                    ("decision_token", 9, 4),
+                    ("last_seen_ns", 2, 8),
+                    ("meta", 2, 16),
+                    ("mac", 15, 24),
+                    ("padding", 18, 30),
+                    ("pname", 16, 32),
+                    ("pid", 9, 48),
+                    ("trace_id", 9, 52),
+                    ("incarnation", 2, 56),
+                ][..],
+            ),
+            (
+                "RoutingHandoffEntry",
+                72,
+                &[
+                    ("last_seen_ns", 2, 0),
+                    ("result", 17, 8),
+                    ("routing_generation", 2, 48),
+                    ("trace_id", 9, 56),
+                    ("trace_padding", 9, 60),
+                    ("incarnation", 2, 64),
+                ][..],
+            ),
+            (
+                "RedirectEntry",
+                40,
+                &[
+                    ("last_seen_ns", 2, 0),
+                    ("dmac", 15, 8),
+                    ("smac", 15, 14),
+                    ("from_wan", 1, 20),
+                    ("outbound", 1, 21),
+                    ("padding", 18, 22),
+                    ("ifindex", 9, 24),
+                    ("decision_token", 9, 28),
+                    ("incarnation", 2, 32),
+                ][..],
+            ),
+            ("DaeEvent", 80, &[("incarnation", 2, 72)][..]),
         ]
         .into_iter()
         .enumerate()
         {
             records[index] = btf::BTF_HEADER_LEN + types.len() * 4;
+            types.extend_from_slice(&[add_name(name), (4 << 24) | members.len() as u32, size]);
+            for (member, type_id, offset) in members {
+                types.extend_from_slice(&[add_name(member), *type_id, offset * 8]);
+            }
+        }
+        // IDs 9/10: native u32 and the actual lock type, not a same-size integer.
+        types.extend_from_slice(&[add_name("u32"), 1 << 24, 4, 32]);
+        types.extend_from_slice(&[
+            add_name("bpf_spin_lock"),
+            (4 << 24) | 1,
+            4,
+            add_name("val"),
+            9,
+            0,
+        ]);
+        let mut wrappers = [0; 3];
+        for (index, (name, payload, size)) in [
+            ("ConnValue", 5, 72),
+            ("RedirectValue", 7, 48),
+            ("HandoffValue", 6, 80),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            wrappers[index] = btf::BTF_HEADER_LEN + types.len() * 4;
             types.extend_from_slice(&[
                 add_name(name),
-                (4 << 24) | 1,
+                (4 << 24) | 3,
                 size,
-                add_name(member),
-                type_id,
-                offset * 8,
+                add_name("lock"),
+                10,
+                0,
+                add_name("padding"),
+                9,
+                32,
+                add_name("value"),
+                payload,
+                64,
             ]);
         }
+        let proof = btf::BTF_HEADER_LEN + types.len() * 4;
+        types.extend_from_slice(&[
+            add_name("TcpSocketBinding"),
+            (4 << 24) | 4,
+            120,
+            add_name("tuples"),
+            4,
+            0,
+            add_name("handoff"),
+            6,
+            320,
+            add_name("kind"),
+            9,
+            896,
+            add_name("padding"),
+            9,
+            928,
+        ]);
+        // IDs 15/16: byte arrays used by the unchanged payloads.
+        for length in [6, 16] {
+            types.extend_from_slice(&[0, 3 << 24, 0, 1, 1, length]);
+        }
+        // ID 17: the unwrapped routing result nested in handoff/proof payloads.
+        types.extend_from_slice(&[add_name("RoutingResult"), (4 << 24) | 8, 40]);
+        for (name, type_id, offset) in [
+            ("mark", 9, 0),
+            ("must", 1, 4),
+            ("mac", 15, 5),
+            ("outbound", 1, 11),
+            ("pname", 16, 12),
+            ("pid", 9, 28),
+            ("dscp", 1, 32),
+            ("decision_token", 9, 36),
+        ] {
+            types.extend_from_slice(&[add_name(name), type_id, offset * 8]);
+        }
+        types.extend_from_slice(&[0, 3 << 24, 0, 1, 1, 2]);
         let type_len = (types.len() * 4) as u32;
         let mut data = vec![0x9f, 0xeb, 1, 0];
         for word in [
@@ -256,22 +506,58 @@ mod tests {
             data.extend_from_slice(&word.to_le_bytes());
         }
         data.extend_from_slice(&strings);
-        assert!(validate_flow_lifetime_btf(&data).is_ok());
+        let validate = |data: &[u8]| -> anyhow::Result<()> {
+            validate_flow_lifetime_btf(data)?;
+            let btf = btf::Btf::parse(data).unwrap();
+            for ((record, payload), size) in wrappers
+                .iter()
+                .zip(["ConnState", "RedirectEntry", "RoutingHandoffEntry"])
+                .zip([72, 48, 80])
+            {
+                anyhow::ensure!(
+                    flow_value_btf_matches(&btf, *record, payload, size),
+                    "wrapper rejected"
+                );
+            }
+            anyhow::ensure!(tcp_proof_btf_matches(&btf, proof), "proof rejected");
+            Ok(())
+        };
+        assert!(validate(&data).is_ok());
 
         let padding_name = records[0] + 12;
         let name: [u8; 4] = data[padding_name..padding_name + 4].try_into().unwrap();
         data[padding_name..padding_name + 4].copy_from_slice(&0u32.to_le_bytes());
-        assert!(validate_flow_lifetime_btf(&data).is_err());
+        assert!(validate(&data).is_err());
         data[padding_name..padding_name + 4].copy_from_slice(&name);
 
         let size_offset = records[4] + 8;
         data[size_offset..size_offset + 4].copy_from_slice(&72u32.to_le_bytes());
-        assert!(validate_flow_lifetime_btf(&data).is_err());
+        assert!(validate(&data).is_err());
         data[size_offset..size_offset + 4].copy_from_slice(&80u32.to_le_bytes());
         let incarnation_offset = records[4] + 20;
         data[incarnation_offset..incarnation_offset + 4]
             .copy_from_slice(&(64u32 * 8).to_le_bytes());
-        assert!(validate_flow_lifetime_btf(&data).is_err());
+        assert!(validate(&data).is_err());
+        data[incarnation_offset..incarnation_offset + 4]
+            .copy_from_slice(&(72u32 * 8).to_le_bytes());
+        assert!(validate(&data).is_ok());
+        for wrapper in wrappers {
+            for (offset, invalid) in [
+                (wrapper + 16, 9u32),
+                (wrapper + 20, 32),
+                (wrapper + 32, 0),
+                (wrapper + 44, 0),
+            ] {
+                let original: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
+                data[offset..offset + 4].copy_from_slice(&invalid.to_le_bytes());
+                assert!(validate(&data).is_err());
+                data[offset..offset + 4].copy_from_slice(&original);
+                assert!(validate(&data).is_ok());
+            }
+        }
+        let handoff_offset = proof + 32;
+        data[handoff_offset..handoff_offset + 4].copy_from_slice(&328u32.to_le_bytes());
+        assert!(validate(&data).is_err());
     }
 
     #[test]

@@ -9,7 +9,35 @@ use network_types::{
     udp::UdpHdr,
 };
 
-/// Unified connection state stored in CONN_STATE_MAP (hash map).
+/// Stable tuple-map element; payload snapshots and mutations hold the native lock.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlowMapValue<T> {
+    pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
+    pub padding: u32,
+    pub value: T,
+}
+
+impl<T> FlowMapValue<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            lock: aya_ebpf_bindings::bindings::bpf_spin_lock { val: 0 },
+            padding: 0,
+            value,
+        }
+    }
+}
+
+impl<T: Default> Default for FlowMapValue<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl<T: aya::Pod> aya::Pod for FlowMapValue<T> {}
+
+/// Connection-state payload stored inside [`FlowMapValue`] in CONN_STATE_MAP.
 /// Used by both eBPF programs (for conntrack/lifecycle) and userspace janitor
 /// (for cleanup).  All fields are repr(C) so the binary layout is identical
 /// regardless of compiler or target triple.
@@ -58,6 +86,13 @@ const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid)
 const _: () = assert!(core::mem::offset_of!(ConnState, trace_id) == 52);
 const _: () = assert!(core::mem::offset_of!(ConnState, incarnation) == 56);
 
+const _: () = assert!(core::mem::offset_of!(FlowMapValue<ConnState>, lock) == 0);
+const _: () = assert!(core::mem::offset_of!(FlowMapValue<ConnState>, value) == 8);
+const _: () = assert!(core::mem::size_of::<FlowMapValue<ConnState>>() == 72);
+const _: () = assert!(core::mem::size_of::<FlowMapValue<crate::RedirectEntry>>() == 48);
+const _: () =
+    assert!(core::mem::size_of::<FlowMapValue<crate::redirect_need::RoutingHandoffEntry>>() == 80);
+
 // Matches the C enum bpf_stats_key.
 // The C enum's underlying type defaults to int (32-bit); use u32 for compatibility.
 #[repr(u32)]
@@ -79,6 +114,12 @@ pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;
 pub const TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s
 pub const TCP_CONN_STATE_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10 s
 pub const UDP_CONN_STATE_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s backstop
+
+/// UDP traffic in either port-53 direction does not own ordinary conn-state.
+#[inline(always)]
+pub const fn is_stateless_udp_ports(src_port: u16, dst_port: u16) -> bool {
+    src_port == 53 || dst_port == 53
+}
 
 /// Slots of the `CONN_STATE_OCCUPANCY` per-CPU array: the datapath's
 /// cumulative successful inserts / deletes into CONN_STATE_MAP.  Userspace
@@ -105,6 +146,7 @@ pub enum UdpDecisionState {
     DirectArmed = 3,
     Proxy = 4,
     Block = 5,
+    Aborted = 6,
 }
 
 const _UDP_DECISION_STATE_SIZE: () = assert!(core::mem::size_of::<UdpDecisionState>() == 1);
@@ -115,6 +157,7 @@ const _UDP_DECISION_STATE_VALUES: () = assert!(
         && UdpDecisionState::DirectArmed as u8 == 3
         && UdpDecisionState::Proxy as u8 == 4
         && UdpDecisionState::Block as u8 == 5
+        && UdpDecisionState::Aborted as u8 == 6
 );
 
 /// Persistent allocator value shared by the BPF sequence map and userspace.

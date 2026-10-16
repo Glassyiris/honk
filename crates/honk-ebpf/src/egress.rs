@@ -10,15 +10,15 @@
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::__sk_buff,
-    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_store_bytes},
+    helpers::{bpf_ktime_get_ns, bpf_redirect},
 };
 use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
     CLASSIFIED_MARK, IpVersionType, L4ProtoType, ROUTING_META_FLAG_OFFLOAD,
-    ROUTING_META_FLAG_WAN_USERSPACE, RedirectEntry, RedirectTuple, SKB_MARK_RESERVED_MASK,
-    TASK_COMM_LEN, TPROXY_MARK, UdpDnsRoute,
-    conn::BpfStatsKey,
+    ROUTING_META_FLAG_WAN_USERSPACE, SKB_MARK_RESERVED_MASK, TASK_COMM_LEN, TPROXY_MARK,
+    UdpDnsRoute,
+    conn::{BpfStatsKey, UdpDecisionState},
     redirect_need::{RoutingHandoffEntry, Tuples, TuplesKey},
 };
 use network_types::eth::EthHdr;
@@ -29,7 +29,7 @@ use crate::{
         mark_tcp_seen, mark_udp_seen,
     },
     maps::{
-        OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTING_HANDOFF_MAP,
+        OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, ROUTING_HANDOFF_MAP,
         UDP_DECISION_SCRATCH_MAP, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
@@ -41,16 +41,13 @@ use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict,
 
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
-const TOKEN_IDENTITY_MISMATCH: i32 = -2;
+use crate::auxiliary::{
+    IDENTITY_MISMATCH as TOKEN_IDENTITY_MISMATCH, prep_redirect_to_control_plane,
+};
 
 #[inline(always)]
 fn skb_ingress_ifindex(ctx: &TcContext) -> u32 {
     unsafe { (*ctx.skb.skb).ingress_ifindex }
-}
-
-#[inline(always)]
-fn skb_ifindex(ctx: &TcContext) -> u32 {
-    unsafe { (*ctx.skb.skb).ifindex }
 }
 
 #[inline(always)]
@@ -118,147 +115,6 @@ pub fn is_control_plane(ctx: &TcContext) -> bool {
     }
 
     false
-}
-
-/// Prepare a packet for redirection to the control plane.
-///
-/// Stores the original source/dest MAC in `REDIRECT_TRACK` so the dae0 ingress
-/// handler can reverse the tuple later.  For L3-only packets (no Ethernet header)
-/// a new Ethernet header is prepended.  `outbound` is recorded in the entry so
-/// `dae0_ingress` can attribute reply traffic in `OUTBOUND_STATS`.
-///
-/// When `refresh_if_stale` is true (cached-flow packets, where every packet
-/// would otherwise rewrite the same entry) the `REDIRECT_TRACK` update is
-/// skipped while the existing entry is fresher than
-/// [`crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS`]. New flows pass false
-/// and always write.
-///
-/// Returns 0 on success, non-zero on failure.
-#[inline(always)]
-pub fn prep_redirect_to_control_plane(
-    ctx: &TcContext,
-    link_h_len: u32,
-    tuples: &Tuples,
-    ethh: &EthHdr,
-    from_wan: u8,
-    refresh_if_stale: bool,
-    outbound: u8,
-    decision_token: u32,
-    incarnation: u64,
-) -> i32 {
-    let param = PARAM.load();
-
-    // bpf_redirect_peer is NOT supported in egress direction;
-    // only use for ingress (from_wan == 0).
-    let use_redirect_peer = param.use_redirect_peer != 0 && from_wan == 0;
-
-    if !use_redirect_peer {
-        if link_h_len == 0 {
-            let l3proto = ctx.skb.protocol() as u16;
-            let zero_mac: [u8; 6] = [0; 6];
-            let ret =
-                unsafe { bpf_skb_change_head(ctx.skb.skb, mem::size_of::<EthHdr>() as u32, 0) };
-            if ret != 0 {
-                return ret as i32;
-            }
-            unsafe {
-                bpf_skb_store_bytes(
-                    ctx.skb.skb,
-                    12, // offsetof(struct ethhdr, h_proto)
-                    &l3proto as *const u16 as *const _,
-                    mem::size_of::<u16>() as u32,
-                    0,
-                );
-                bpf_skb_store_bytes(
-                    ctx.skb.skb,
-                    6, // offsetof(struct ethhdr, h_source)
-                    zero_mac.as_ptr() as *const _,
-                    6,
-                    0,
-                );
-            }
-        }
-
-        unsafe {
-            bpf_skb_store_bytes(
-                ctx.skb.skb,
-                0, // offsetof(struct ethhdr, h_dest)
-                param.dae0peer_mac.as_ptr() as *const _,
-                6,
-                0,
-            );
-        }
-    }
-
-    let redirect_tuple = RedirectTuple::from_tuples(&tuples.five);
-
-    // Cached-flow throttle: skip the update while the existing entry is
-    // fresh.  The header rewrite above is per-packet and must stay
-    // unconditional; only the map write is throttled.
-    if refresh_if_stale {
-        let now = unsafe { bpf_ktime_get_ns() };
-        let stale = match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
-            Some(old) => unsafe {
-                if crate::contrack::auxiliary_expired(
-                    &tuples.five,
-                    (*old).incarnation,
-                    now.wrapping_sub((*old).last_seen_ns),
-                    false,
-                ) {
-                    return TOKEN_IDENTITY_MISMATCH;
-                }
-                if (*old).decision_token != decision_token || (*old).incarnation != incarnation {
-                    return TOKEN_IDENTITY_MISMATCH;
-                }
-                if now.wrapping_sub((*old).last_seen_ns)
-                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-                {
-                    (*old).last_seen_ns = now;
-                }
-                false
-            },
-            None => true,
-        };
-        if !stale {
-            return 0;
-        }
-    }
-
-    let mut redirect_entry: RedirectEntry = unsafe { mem::zeroed() };
-
-    redirect_entry.ifindex = skb_ifindex(ctx);
-    redirect_entry.from_wan = from_wan;
-    redirect_entry.last_seen_ns = unsafe { bpf_ktime_get_ns() };
-    // Record the final outbound so dae0_ingress can attribute replies.
-    redirect_entry.outbound = outbound;
-    redirect_entry.decision_token = decision_token;
-    redirect_entry.incarnation = incarnation;
-
-    if link_h_len == ETH_HLEN {
-        redirect_entry.smac.copy_from_slice(&ethh.src_addr);
-        redirect_entry.dmac.copy_from_slice(&ethh.dst_addr);
-    }
-    // else: L3-only — MACs stay zero.
-
-    if REDIRECT_TRACK
-        .insert(
-            redirect_tuple,
-            redirect_entry,
-            if refresh_if_stale {
-                aya_ebpf_bindings::bindings::BPF_NOEXIST as u64
-            } else {
-                0
-            },
-        )
-        .is_err()
-    {
-        increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
-        // A redirect without its reverse-path state blackholes replies.
-        // Preserve the caller's documented direct-pass safety path instead.
-        return -1;
-    }
-
-    0
 }
 
 /// Egress redirect to the control plane (dae0 interface).
@@ -613,12 +469,10 @@ fn do_tproxy_wan_egress_tcp(
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
         }
-        if ROUTING_HANDOFF_MAP
-            .insert(tuples.five, handoff, 0u64)
-            .is_err()
+        if let Err(error) =
+            crate::auxiliary::publish_handoff(&tuples.five, unsafe { &mut *scratch }, true)
         {
-            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-            if dns || mark != 0 {
+            if dns || mark != 0 || error == TOKEN_IDENTITY_MISMATCH {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -706,30 +560,9 @@ fn fast_path_decision(
     // per-packet. A tuple handoff could be overwritten before this skb arrives.
     if !(dns_route_mark != 0 && must) {
         let now = unsafe { bpf_ktime_get_ns() };
-        let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
-            Some(old) => unsafe {
-                if crate::contrack::auxiliary_expired(
-                    &tuples.five,
-                    (*old).incarnation,
-                    now.wrapping_sub((*old).last_seen_ns),
-                    true,
-                ) {
-                    return Err(TC_ACT_SHOT);
-                }
-                if (*old).result.decision_token != decision_token
-                    || (*old).incarnation != incarnation
-                {
-                    return Err(TC_ACT_SHOT);
-                }
-                if now.wrapping_sub((*old).last_seen_ns)
-                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-                {
-                    (*old).last_seen_ns = now;
-                }
-                false
-            },
-            None => true,
-        };
+        let write_handoff =
+            !crate::auxiliary::refresh_handoff(&tuples.five, decision_token, incarnation, now)
+                .map_err(|_| TC_ACT_SHOT)?;
         if write_handoff {
             let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
                 increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
@@ -755,16 +588,10 @@ fn fast_path_decision(
             if let Some(pname) = handoff_pname {
                 handoff.result.pname.copy_from_slice(pname);
             }
-            if ROUTING_HANDOFF_MAP
-                .insert(
-                    tuples.five,
-                    handoff,
-                    aya_ebpf_bindings::bindings::BPF_NOEXIST as u64,
-                )
-                .is_err()
+            if let Err(error) =
+                crate::auxiliary::publish_handoff(&tuples.five, unsafe { &mut *scratch }, false)
             {
-                increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-                if dns || mark != 0 {
+                if dns || mark != 0 || error == TOKEN_IDENTITY_MISMATCH {
                     return Err(TC_ACT_SHOT);
                 }
             }
@@ -813,6 +640,11 @@ fn do_tproxy_wan_egress_udp(
     if !is_short_lived_udp_traffic(&tuples.five)
         && let Some(conn_state) = lookup_udp_seen(&tuples.five)
     {
+        if conn_state.state == UdpDecisionState::Preparing as u8
+            || conn_state.state == UdpDecisionState::Aborted as u8
+        {
+            return Err(TC_ACT_SHOT);
+        }
         if conn_state.is_wan_ingress_direction != 0 {
             return Err(TC_ACT_OK);
         }

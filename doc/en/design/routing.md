@@ -340,10 +340,12 @@ Implementation is accepted only with all existing matchers supported and with:
 The current CI real-kernel baseline is the pinned Ubuntu Linux
 `6.12.0-061200-generic` VM. CI builds the test executables on the hosted runner
 and runs those exact artifacts in the VM; it does not compile again in the guest.
-The VM runs the root-only routing and integration gates, while `just test-routing`
-also exercises the generated policy through the root/slot path, including
-precedence, complete decision metadata, capacity failures, and failed-publication
-preservation. `just test-netns` includes that routing gate.
+`just test-routing` and dependent `just test-netns` share that complete
+pre-provisioned disposable-VM gate. It exercises the real root/slot path,
+including precedence, complete decision metadata, capacity failures and
+failed-publication preservation, followed by the ownership/netns suites.
+Toolchain, both objects and VM environment prerequisites are documented in
+the `honk-real-ebpf-tests` skill; protected fixtures never run on a shared host.
 
 Performance measurements and historical prototype/lab records are intentionally
 not kept on this design page. The reload benchmark definition lives in

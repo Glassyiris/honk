@@ -12,7 +12,8 @@ pub mod tcp_binding;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
 pub use crate::conn::{
-    ConnState, FlowIncarnationSequence, RetirementFence, UdpDecisionSequence, UdpDecisionState,
+    ConnState, FlowIncarnationSequence, FlowMapValue, RetirementFence, UdpDecisionSequence,
+    UdpDecisionState,
 };
 pub use crate::redirect_need::{
     DomainRouting, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult, SocketIdentity,

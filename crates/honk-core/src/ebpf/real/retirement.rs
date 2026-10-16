@@ -1,14 +1,12 @@
 //! One backend-exclusive retirement protocol for every tuple-map deletion.
 use super::*;
 use crate::ebpf::retirement::{
-    conn_matches, handoff_matches, redirect_matches, request_matches, tuple_matches,
+    HANDOFF_TIMEOUT_NS, REDIRECT_TIMEOUT_NS, auxiliaries_match, conn_expired, handoff_matches,
+    hint_auxiliary_tokens_match, redirect_matches, request_matches, tuple_matches,
+    validate_conn_retirement,
 };
 use aya::maps::ArrayOfMaps;
-use honk_ebpf_common::conn::TcpState;
-use honk_ebpf_common::conn::{
-    MAX_CONN_STATE_NUM, RetirementFence, TCP_CONN_STATE_CLOSING_TIMEOUT_NS,
-    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, UDP_CONN_STATE_TIMEOUT_NS,
-};
+use honk_ebpf_common::conn::{MAX_CONN_STATE_NUM, RetirementFence};
 use honk_ebpf_common::redirect_need::TcpSocketBinding;
 
 const IPPROTO_TCP: u8 = libc::IPPROTO_TCP as u8;
@@ -43,14 +41,16 @@ pub(super) fn validate_flow_lifetime_layout(bpf: &Ebpf) -> anyhow::Result<()> {
             "CONN_STATE_MAP",
             BPF_MAP_TYPE_HASH,
             40,
-            64,
+            72,
             MAX_CONN_STATE_NUM,
             1,
         ),
-        ("REDIRECT_TRACK", BPF_MAP_TYPE_HASH, 40, 40, 65536, 1),
-        ("ROUTING_HANDOFF_MAP", BPF_MAP_TYPE_HASH, 40, 72, 65536, 1),
+        ("REDIRECT_TRACK", BPF_MAP_TYPE_HASH, 40, 48, 65536, 1),
+        ("ROUTING_HANDOFF_MAP", BPF_MAP_TYPE_HASH, 40, 80, 65536, 1),
         ("RETIRE_ACTIVE", BPF_MAP_TYPE_ARRAY, 4, 4, 1, 0),
         ("RETIRE_FENCE", BPF_MAP_TYPE_HASH, 40, 16, 65536, 1),
+        ("REQUEST_FENCE", BPF_MAP_TYPE_HASH, 16, 8, 65536, 1),
+        ("TCP_LIVE_PINS", BPF_MAP_TYPE_HASH, 8, 1, 65536, 1),
         ("FLOW_INCARNATION_SEQUENCE", BPF_MAP_TYPE_ARRAY, 4, 16, 1, 0),
         ("RETIRE_GRACE_ROOT", BPF_MAP_TYPE_ARRAY_OF_MAPS, 4, 4, 1, 0),
         ("TCP_REQUEST_BINDINGS", BPF_MAP_TYPE_HASH, 16, 120, 65536, 1),
@@ -111,12 +111,21 @@ impl RealEbpfBackend {
         keys: &[(TuplesKey, u32)],
         operation: impl FnOnce(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.with_retirement_fences_and_requests(keys, &[], operation)
+    }
+
+    pub(super) fn with_retirement_fences_and_requests<T>(
+        &mut self,
+        keys: &[(TuplesKey, u32)],
+        requests: &[honk_ebpf_common::redirect_need::TcpRequestKey],
+        operation: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         anyhow::ensure!(
             !self.retirement_failed,
             "retirement ownership is unresolved"
         );
         anyhow::ensure!(
-            keys.len() <= RETIRE_BATCH_CAPACITY,
+            keys.len() <= RETIRE_BATCH_CAPACITY && requests.len() <= RETIRE_BATCH_CAPACITY,
             "retirement batch exceeds capacity"
         );
         anyhow::ensure!(
@@ -131,6 +140,9 @@ impl RealEbpfBackend {
         // Backend W serializes operation ownership; fixed storage avoids per-key allocation.
         let mut acquired = [None; RETIRE_BATCH_CAPACITY];
         let mut count = 0;
+        let mut acquired_requests: [Option<honk_ebpf_common::redirect_need::TcpRequestKey>;
+            RETIRE_BATCH_CAPACITY] = [None; RETIRE_BATCH_CAPACITY];
+        let mut request_count = 0;
         let mut failure = None;
         let mut value = None;
         let mut unresolved = false;
@@ -175,12 +187,55 @@ impl RealEbpfBackend {
             }
         }
         if failure.is_none() {
+            for key in requests {
+                if acquired_requests[..request_count]
+                    .iter()
+                    .flatten()
+                    .any(|previous| {
+                        previous.address == key.address && previous.cookie == key.cookie
+                    })
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                let acquisition =
+                    inject_indexed_fault(&mut self.retirement_faults.acquire, "request acquire")
+                        .and_then(|()| self.hash_insert_noexist("REQUEST_FENCE", key, &owner));
+                #[cfg(not(test))]
+                let acquisition = self.hash_insert_noexist("REQUEST_FENCE", key, &owner);
+                match acquisition {
+                    Ok(()) => {
+                        acquired_requests[request_count] = Some(*key);
+                        request_count += 1;
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        match self.hash_lookup::<_, u64>("REQUEST_FENCE", key) {
+                            Ok(None) => {}
+                            Ok(Some(_)) => unresolved = true,
+                            Err(error) => {
+                                unresolved = true;
+                                combine_error(&mut failure, error);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if failure.is_none() {
             match self.grace_barrier().and_then(|()| {
                 for key in acquired[..count].iter().flatten() {
                     let current = self.hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, key)?;
                     anyhow::ensure!(
                         current.is_some_and(|fence| fence.owner == owner),
                         "retirement fence owner {owner} changed before mutation"
+                    );
+                }
+                for key in acquired_requests[..request_count].iter().flatten() {
+                    anyhow::ensure!(
+                        self.hash_lookup::<_, u64>("REQUEST_FENCE", key)? == Some(owner),
+                        "request fence owner {owner} changed before mutation"
                     );
                 }
                 operation(self)
@@ -201,6 +256,25 @@ impl RealEbpfBackend {
                 anyhow::ensure!(
                     self.hash_remove_present::<_, RetirementFence>(RETIRE_FENCE_MAP, key)?,
                     "retirement fence owner {owner} disappeared during release"
+                );
+                Ok(())
+            })();
+            if let Err(error) = release {
+                unresolved = true;
+                combine_error(&mut failure, error);
+            }
+        }
+        for key in acquired_requests[..request_count].iter().flatten() {
+            let release = (|| {
+                #[cfg(test)]
+                inject_indexed_fault(&mut self.retirement_faults.release, "request release")?;
+                anyhow::ensure!(
+                    self.hash_lookup::<_, u64>("REQUEST_FENCE", key)? == Some(owner),
+                    "request fence owner {owner} disappeared or changed"
+                );
+                anyhow::ensure!(
+                    self.hash_remove_present::<_, u64>("REQUEST_FENCE", key)?,
+                    "request fence owner {owner} disappeared during release"
                 );
                 Ok(())
             })();
@@ -241,6 +315,11 @@ impl RealEbpfBackend {
                 return Ok(());
             }
             let mut keys = [(TuplesKey::default(), 0); RETIRE_BATCH_CAPACITY];
+            let mut request_keys = [honk_ebpf_common::redirect_need::TcpRequestKey {
+                address: 0,
+                cookie: 0,
+            }; RETIRE_BATCH_CAPACITY];
+            let mut request_count = 0;
             for (index, request) in requests.iter().enumerate() {
                 anyhow::ensure!(
                     request.key.padding == [0; 3]
@@ -269,11 +348,17 @@ impl RealEbpfBackend {
                     RetireKind::ExpiredConn { expected, .. } => expected.decision_token,
                     RetireKind::ExpiredRedirect { expected, .. } => expected.decision_token,
                     RetireKind::ExpiredHandoff { expected, .. } => expected.result.decision_token,
-                    RetireKind::ExpiredRequest { expected, .. } => {
+                    RetireKind::ExpiredRequest {
+                        expected,
+                        request: request_key,
+                        ..
+                    } => {
                         anyhow::ensure!(
                             tuple_matches(&request.key, &expected.tuples),
                             "request proof tuple mismatch"
                         );
+                        request_keys[request_count] = *request_key;
+                        request_count += 1;
                         expected.handoff.result.decision_token
                     }
                     RetireKind::ExpiryHint { incarnation, .. } => {
@@ -283,12 +368,16 @@ impl RealEbpfBackend {
                 };
                 keys[index] = (request.key, token);
             }
-            self.with_retirement_fences(&keys[..requests.len()], |backend| {
-                for (request, outcome) in requests.iter().zip(outcomes) {
-                    *outcome = Some(backend.retire_one(request, &mut counts)?);
-                }
-                Ok(())
-            })
+            self.with_retirement_fences_and_requests(
+                &keys[..requests.len()],
+                &request_keys[..request_count],
+                |backend| {
+                    for (request, outcome) in requests.iter().zip(outcomes) {
+                        *outcome = Some(backend.retire_one(request, &mut counts)?);
+                    }
+                    Ok(())
+                },
+            )
         })();
         match run {
             Ok(()) => Ok(counts),
@@ -330,16 +419,18 @@ impl RealEbpfBackend {
                 expired_before_ns,
             } => {
                 let Some(current) =
-                    self.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?
+                    self.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?
                 else {
                     return Ok(Missing);
                 };
                 if !redirect_matches(&current, expected, expired_before_ns) {
                     return Ok(Superseded);
                 }
-                counts.redirect += u64::from(
-                    self.hash_remove_present::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?,
-                );
+                counts.redirect +=
+                    u64::from(self.hash_remove_present::<_, FlowMapValue<RedirectEntry>>(
+                        "REDIRECT_TRACK",
+                        &track_key,
+                    )?);
                 return Ok(Applied);
             }
             RetireKind::ExpiredHandoff {
@@ -347,7 +438,7 @@ impl RealEbpfBackend {
                 expired_before_ns,
             } => {
                 let Some(current) =
-                    self.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?
+                    self.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?
                 else {
                     return Ok(Missing);
                 };
@@ -355,7 +446,10 @@ impl RealEbpfBackend {
                     return Ok(Superseded);
                 }
                 counts.handoff += u64::from(
-                    self.hash_remove_present::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?,
+                    self.hash_remove_present::<_, FlowMapValue<RoutingHandoffEntry>>(
+                        "ROUTING_HANDOFF_MAP",
+                        key,
+                    )?,
                 );
                 return Ok(Applied);
             }
@@ -366,59 +460,44 @@ impl RealEbpfBackend {
             now_ns,
         } = request.kind
         {
-            let current = self.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?;
+            let current = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?;
             if current.is_some_and(|state| state.incarnation != incarnation) {
                 return Ok(Superseded);
             }
-            let expired = current.is_some_and(|state| {
-                let timeout = if key.l4proto == IPPROTO_UDP {
-                    UDP_CONN_STATE_TIMEOUT_NS
-                } else if state.state == TcpState::TcpStateClosing as u8 {
-                    TCP_CONN_STATE_CLOSING_TIMEOUT_NS
-                } else {
-                    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-                };
-                now_ns.saturating_sub(state.last_seen_ns) > timeout
-            });
+            let expired = current.is_some_and(|state| conn_expired(key.l4proto, &state, now_ns));
             if !expired {
                 let handoff =
-                    self.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-                let track = self.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-                if let Some(state) = current {
-                    if handoff.is_some_and(|entry| {
-                        entry.incarnation == incarnation
-                            && entry.result.decision_token != state.decision_token
-                    }) || track.is_some_and(|entry| {
-                        entry.incarnation == incarnation
-                            && entry.decision_token != state.decision_token
-                    }) {
-                        return Ok(TokenMismatch);
-                    }
-                } else if let (Some(handoff), Some(track)) = (handoff, track)
-                    && handoff.incarnation == incarnation
-                    && track.incarnation == incarnation
-                    && handoff.result.decision_token != track.decision_token
-                {
+                    self.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+                let track = self.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+                if !hint_auxiliary_tokens_match(
+                    incarnation,
+                    current.as_ref(),
+                    handoff.as_ref(),
+                    track.as_ref(),
+                ) {
                     return Ok(TokenMismatch);
                 }
                 let mut removed = false;
                 if handoff.is_some_and(|entry| {
                     entry.incarnation == incarnation
-                        && now_ns.saturating_sub(entry.last_seen_ns) > 30_000_000_000
+                        && now_ns.saturating_sub(entry.last_seen_ns) > HANDOFF_TIMEOUT_NS
                 }) {
-                    let deleted = self.hash_remove_present::<_, RoutingHandoffEntry>(
-                        "ROUTING_HANDOFF_MAP",
-                        key,
-                    )?;
+                    let deleted = self
+                        .hash_remove_present::<_, FlowMapValue<RoutingHandoffEntry>>(
+                            "ROUTING_HANDOFF_MAP",
+                            key,
+                        )?;
                     counts.handoff += u64::from(deleted);
                     removed |= deleted;
                 }
                 if track.is_some_and(|entry| {
                     entry.incarnation == incarnation
-                        && now_ns.saturating_sub(entry.last_seen_ns) > 120_000_000_000
+                        && now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TIMEOUT_NS
                 }) {
-                    let deleted =
-                        self.hash_remove_present::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+                    let deleted = self.hash_remove_present::<_, FlowMapValue<RedirectEntry>>(
+                        "REDIRECT_TRACK",
+                        &track_key,
+                    )?;
                     counts.redirect += u64::from(deleted);
                     removed |= deleted;
                 }
@@ -431,102 +510,42 @@ impl RealEbpfBackend {
                 });
             }
         }
-        let Some(state) = self.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
+        let Some(state) = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
             return Ok(Missing);
         };
-        let remove_aux = match request.kind {
-            RetireKind::Tcp { incarnation } => {
-                if state.incarnation != incarnation {
-                    return Ok(Superseded);
-                }
-                true
-            }
-            RetireKind::Udp {
-                token,
-                incarnation,
-                pending_only,
-            } => {
-                if state.decision_token != token
-                    || incarnation.is_some_and(|id| id != state.incarnation)
-                {
-                    return Ok(if pending_only {
-                        TokenMismatch
-                    } else {
-                        Superseded
-                    });
-                }
-                anyhow::ensure!(state.incarnation != 0, "UDP conn has no lifetime identity");
-                if pending_only {
-                    if state.state != UdpDecisionState::Preparing as u8
-                        && state.state != UdpDecisionState::Pending as u8
-                    {
-                        return Ok(StateMismatch);
-                    }
-                } else if token != 0 {
-                    if !udp_state_is_userspace_owned(state.state) {
-                        return Ok(StateMismatch);
-                    }
-                } else if !udp_state_is_legacy_userspace_owned(&state) {
-                    return Ok(Superseded);
-                }
-                token != 0
-                    || pending_only
-                    || unsafe { state.meta.raw } & ROUTING_META_FLAG_WAN_USERSPACE != 0
-            }
-            RetireKind::ExpiredConn {
-                expected,
-                expired_before_ns,
-            } => {
-                if !conn_matches(&state, expected, expired_before_ns) {
-                    return Ok(Superseded);
-                }
-                false
-            }
-            RetireKind::ExpiryHint {
-                incarnation,
-                now_ns,
-            } => {
-                if state.incarnation != incarnation {
-                    return Ok(Superseded);
-                }
-                let timeout = if key.l4proto == IPPROTO_UDP {
-                    UDP_CONN_STATE_TIMEOUT_NS
-                } else if state.state == TcpState::TcpStateClosing as u8 {
-                    TCP_CONN_STATE_CLOSING_TIMEOUT_NS
-                } else {
-                    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-                };
-                if now_ns.saturating_sub(state.last_seen_ns) <= timeout {
-                    return Ok(StateMismatch);
-                }
-                true
-            }
-            _ => unreachable!("auxiliary expiry handled above"),
-        };
-        if remove_aux {
-            let handoff = self.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-            let track = self.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-            if handoff.is_some_and(|entry| {
-                entry.incarnation != state.incarnation
-                    || entry.result.decision_token != state.decision_token
-            }) || track.is_some_and(|entry| {
-                entry.incarnation != state.incarnation
-                    || entry.decision_token != state.decision_token
-            }) {
-                return Ok(TokenMismatch);
-            }
-            if handoff.is_some() {
-                counts.handoff += u64::from(
-                    self.hash_remove_present::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?,
-                );
-            }
-            if track.is_some() {
-                counts.redirect += u64::from(
-                    self.hash_remove_present::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?,
-                );
-            }
+        if let Err(result) = validate_conn_retirement(&state, key.l4proto, request.kind) {
+            return Ok(result);
         }
-        let removed = self.hash_remove_present::<_, ConnState>("CONN_STATE_MAP", key)?;
+        if matches!(request.kind, RetireKind::Udp { .. }) {
+            anyhow::ensure!(state.incarnation != 0, "UDP conn has no lifetime identity");
+        }
+        let handoff = self.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+        let track = self.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+        if !auxiliaries_match(
+            state.incarnation,
+            state.decision_token,
+            handoff.as_ref(),
+            track.as_ref(),
+        ) {
+            return Ok(TokenMismatch);
+        }
+        if handoff.is_some() {
+            counts.handoff += u64::from(
+                self.hash_remove_present::<_, FlowMapValue<RoutingHandoffEntry>>(
+                    "ROUTING_HANDOFF_MAP",
+                    key,
+                )?,
+            );
+        }
+        if track.is_some() {
+            counts.redirect +=
+                u64::from(self.hash_remove_present::<_, FlowMapValue<RedirectEntry>>(
+                    "REDIRECT_TRACK",
+                    &track_key,
+                )?);
+        }
+        let removed =
+            self.hash_remove_present::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", key)?;
         counts.conn += u64::from(removed);
         Ok(if removed { Applied } else { Missing })
     }
@@ -545,11 +564,11 @@ impl RealEbpfBackend {
         if token == 0 {
             return Ok(UdpDecisionCommitResult::TokenMismatch);
         }
-        let Some(captured) = self.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
+        let Some(captured) = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         self.with_retirement_fences(&[(*key, token)], |backend| {
-            let Some(mut state) = backend.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
+            let Some(mut state) = backend.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
             else {
                 return Ok(UdpDecisionCommitResult::Missing);
             };
@@ -564,14 +583,10 @@ impl RealEbpfBackend {
                 return Ok(result);
             }
             let handoff =
-                backend.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+                backend.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
             let track_key = RedirectTuple::from_tuples(key);
-            let track = backend.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-            if handoff.is_some_and(|entry| {
-                entry.result.decision_token != token || entry.incarnation != state.incarnation
-            }) || track.is_some_and(|entry| {
-                entry.decision_token != token || entry.incarnation != state.incarnation
-            }) {
+            let track = backend.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+            if !auxiliaries_match(state.incarnation, token, handoff.as_ref(), track.as_ref()) {
                 return Ok(UdpDecisionCommitResult::TokenMismatch);
             }
             let initial = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
@@ -579,21 +594,27 @@ impl RealEbpfBackend {
                 return Ok(UdpDecisionCommitResult::Missing);
             }
             if handoff.is_some() {
-                backend.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+                backend.hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                    "ROUTING_HANDOFF_MAP",
+                    key,
+                )?;
             }
             match transition {
                 UdpDecisionTransition::ActivateProxy(outbound, _) => {
                     let mut track = track.expect("proxy track validated");
                     track.outbound = outbound;
-                    backend.hash_insert("REDIRECT_TRACK", &track_key, &track)?;
+                    backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
                 }
                 _ => {
                     if track.is_some() {
-                        backend.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+                        backend.hash_remove::<_, FlowMapValue<RedirectEntry>>(
+                            "REDIRECT_TRACK",
+                            &track_key,
+                        )?;
                     }
                 }
             }
-            backend.hash_insert("CONN_STATE_MAP", key, &state)?;
+            backend.flow_insert("CONN_STATE_MAP", key, &state)?;
             Ok(UdpDecisionCommitResult::Applied)
         })
     }

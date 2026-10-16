@@ -996,18 +996,36 @@ fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
 }
 
 #[test]
-fn raw_dns_retirement_has_no_kernel_flow_identity() {
-    for route in [Some(RawDnsRoute::Direct(0)), None] {
+fn stateless_udp_retirement_has_no_kernel_flow_identity() {
+    for (client_port, dst_port, route) in [
+        (12345, 53, Some(RawDnsRoute::Direct(0))),
+        (12345, 53, None),
+        (53, 443, None),
+    ] {
         let pool = Arc::new(UdpEndpointPool::new());
         let stats = StatsManager::new();
-        let client = make_addr("10.0.0.1", 12345);
-        let dst = make_addr("8.8.8.8", 53);
+        let client = make_addr("10.0.0.1", client_port);
+        let dst = make_addr("8.8.8.8", dst_port);
         let (tx, mut rx) = mpsc::channel(1);
         pool.set_remove_sink(tx);
+        assert!(matches!(
+            pool.reserve_or_enqueue_at(
+                client,
+                dst,
+                b"malformed DNS",
+                route,
+                Some(41),
+                pool.initialization_epoch(),
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+                queue_now(),
+                &stats,
+            ),
+            EndpointReservation::IdentityMismatch
+        ));
         let lease = match pool.reserve_or_enqueue_at(
             client,
             dst,
-            b"dns",
+            b"malformed DNS",
             route,
             None,
             pool.initialization_epoch(),
@@ -1016,7 +1034,7 @@ fn raw_dns_retirement_has_no_kernel_flow_identity() {
             &stats,
         ) {
             EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("raw DNS must reserve without conn-state authority"),
+            _ => panic!("stateless UDP must reserve without conn-state authority"),
         };
         assert_eq!(lease.kernel_incarnation(), None);
         drop(lease);
@@ -1025,6 +1043,53 @@ fn raw_dns_retirement_has_no_kernel_flow_identity() {
         assert_eq!(removal.reason, RemovalReason::RawDnsEndpointRetired);
         pool.finish_removal(&removal, true);
     }
+}
+
+#[test]
+fn source53_staged_udp_keeps_token_and_incarnation_proof() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = StatsManager::new();
+    let client = make_addr("10.0.0.1", 53);
+    let dst = make_addr("8.8.8.8", 443);
+    let (tx, mut rx) = mpsc::channel(1);
+    pool.set_remove_sink(tx);
+    let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let lease = match pool.reserve_owned_or_enqueue_at(
+        client,
+        dst,
+        Bytes::from_static(b"first"),
+        47,
+        Some(41),
+        None,
+        permit(),
+        std::time::Instant::now(),
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("staged source53 must retain its proven ownership"),
+    };
+    for (token, incarnation) in [(48, Some(41)), (47, Some(42)), (47, None)] {
+        assert!(matches!(
+            pool.reserve_owned_or_enqueue_at(
+                client,
+                dst,
+                Bytes::from_static(b"foreign"),
+                token,
+                incarnation,
+                Some(lease.generation()),
+                permit(),
+                std::time::Instant::now(),
+                &stats,
+            ),
+            EndpointReservation::IdentityMismatch
+        ));
+    }
+    drop(lease);
+    let removal = rx.try_recv().unwrap();
+    assert_eq!(removal.decision_token, 47);
+    assert_eq!(removal.kernel_incarnation, Some(41));
+    assert_eq!(removal.reason, RemovalReason::UserspaceEndpointRetired);
+    pool.finish_removal(&removal, true);
 }
 
 #[test]

@@ -607,6 +607,7 @@ impl RealEbpfBackend {
         validate_routing_handoff_layout(&bpf)?;
         retirement::validate_flow_lifetime_layout(&bpf)?;
         let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
+        let tcp_live_pins = take_tcp_live_pins(&mut bpf)?;
         Ok(Self {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),
@@ -628,6 +629,8 @@ impl RealEbpfBackend {
             retirement_faults: Default::default(),
             tcp_bindings: None,
             cap_lookup_batch: BatchCapability::new(),
+            cap_flow_lookup_batch: BatchCapability::new(),
+            tcp_live_pins,
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,

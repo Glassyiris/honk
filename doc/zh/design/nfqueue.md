@@ -107,7 +107,7 @@ Watchdog 独立检查被持有的 cell，并强制执行硬持有上限。Token�
 Reload 和 shutdown 共用同一 producer fence：
 
 1. 发布 `DATAPATH_FLAG_NFQ_READY=false`。现在需要暂存的新流会 fail closed。
-2. 完成同步 `RETIRE_GRACE_ROOT` barrier，再以有界、检查 incarnation 的 tuple-fence batch 移除残留 `Preparing`、`Pending` 状态。延迟 queue delivery 随后因 token lookup 失败而终止；descriptor generation 发布仍对排队 DNS fragment 实施 fence。
+2. 完成同步 `RETIRE_GRACE_ROOT` barrier，再以有界、检查 incarnation 的 tuple-fence batch 移除残留 `Preparing`、`Pending`、`Aborted` 状态。延迟 queue delivery 随后因 token lookup 失败而终止；descriptor generation 发布仍对排队 DNS fragment 实施 fence。
 3. 关闭 correlator admission；在改变 runtime 所有权前 drain 或 cancel verdict guard、initializer lease、scheduled token cleanup、endpoint tombstone 和 retirement work。
 4. 成功 reload 会发布 replacement runtime generation，最后再重开 correlator admission 和 readiness。Shutdown 会 detach producer、关闭 queue 所有权，并最后删除 `inet honk_nfqueue`。
 
@@ -117,7 +117,9 @@ Listener、queue、watchdog、cleanup、verdict 或 retirement 生命周期中�
 
 Retirement 先发布 `RETIRE_ACTIVE`，再用 `BPF_NOEXIST` 插入各 `RETIRE_FENCE[tuple]`，value 中独立保存唯一退役操作 owner 与 decision token。成功重装私有 `RETIRE_GRACE_ROOT` 的同一个 inner map 会同步排空 fence 前的 non-sleepable 读者。排他期间重新验证捕获的 incarnation、token、state、handoff 与 redirect 所有权后才删除。Batch 对 tuple fence 去重，但保留每个请求的结果。释放时逐一验证 owner；保留实际部分删除计数及操作/释放两类错误。无法解决的所有权禁止继续准入。暂存 commit 也使用同一 fence/grace 协议。
 
-WAN 用户态 UDP 即使 token 为零也使用同一 fence：endpoint 保留准入时捕获的 incarnation，显式 `RoutingMeta` 所有权 bit 区分带 mark 的 direct/must 与原生直连状态。删除前须匹配辅助项的 token 和 incarnation；conn state 缺失或被替代时保留辅助项。显式 legacy LAN token-zero 退役仍只删除 conn state。内核过期只发 advisory hint，不按 key 删除；全部物理过期回收共用后端协议。
+WAN 与 LAN 用户态 UDP 即使 token 为零也使用同一 fence：endpoint 保留准入时捕获的 incarnation，WAN ownership bit 区分带 mark 的 direct/must 与原生直连。事务内先回收匹配的辅助项，再回收 conn-state，过期 conn 清理也相同，使新 incarnation 能复用 tuple。遇到外来 token/incarnation 元数据时保留原项并拒绝操作；conn 所有权缺失或被替代，不授权删除其他 owner。
+
+内核 producer 在成功发布前失败时，记录捕获 incarnation 和实际已分配 token 的终态 `Aborted`（尚未分配则为零），不删除 tuple 项，也不把已完成的 Pending/native/proxy/block 改成 Aborted。Preparing 与 Aborted follower 都不能续期时间戳；Aborted 不得激活或转发，立即满足精确 fenced hint/janitor 清理条件。全部物理 tuple 回收仍共用后端协议。
 
 ## Sequence 耗尽与 generation 轮转
 

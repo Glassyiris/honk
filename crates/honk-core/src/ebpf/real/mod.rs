@@ -16,7 +16,6 @@ use super::{
     RetireError, RetireKind, RetireRequest, TcpSocketOwnership, UDP_DECISION_SEQUENCE_MAP,
     USERSPACE_CONN_STATE_DELETES, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
     UdpDecisionTransition, apply_udp_decision_transition, probe::BatchCapability,
-    udp_state_is_legacy_userspace_owned, udp_state_is_userspace_owned,
     validate_udp_decision_transition,
 };
 
@@ -42,10 +41,10 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
 pub(super) fn validate_routing_handoff_sizes(key_size: u32, value_size: u32) -> anyhow::Result<()> {
     anyhow::ensure!(
         key_size == core::mem::size_of::<TuplesKey>() as u32
-            && value_size == core::mem::size_of::<RoutingHandoffEntry>() as u32,
+            && value_size == core::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>() as u32,
         "map 'ROUTING_HANDOFF_MAP' has incompatible layout: expected key={} value={}, actual key={key_size} value={value_size}",
         core::mem::size_of::<TuplesKey>(),
-        core::mem::size_of::<RoutingHandoffEntry>()
+        core::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>()
     );
     Ok(())
 }
@@ -124,6 +123,8 @@ pub struct RealEbpfBackend {
     tcp_bindings: Option<tcp_binding::TcpBindings>,
     /// Runtime probe for `BPF_MAP_LOOKUP_BATCH` (janitor map scans).
     cap_lookup_batch: BatchCapability,
+    cap_flow_lookup_batch: BatchCapability,
+    tcp_live_pins: std::sync::Arc<AyaMapData>,
     /// Active compiled program, links, descriptor, and generation-owned maps.
     routing_generation: Option<routing::RoutingGeneration>,
     routing_slot: u32,
@@ -139,6 +140,49 @@ pub struct RealEbpfBackend {
     #[cfg(feature = "native-api")]
     receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
+}
+
+/// An exact native lifetime pin; clones only the backend's shared map handle.
+pub struct TcpKernelPin {
+    map: std::sync::Arc<AyaMapData>,
+    incarnation: Option<u64>,
+    errors: super::TcpPinErrorSink,
+}
+
+impl TcpKernelPin {
+    fn release_once(&mut self) -> anyhow::Result<()> {
+        if let Some(incarnation) = self.incarnation.take() {
+            syscall::remove_tcp_live_pin(&self.map, incarnation)?;
+        }
+        Ok(())
+    }
+
+    pub fn release(mut self) -> anyhow::Result<()> {
+        self.release_once()
+    }
+}
+
+impl Drop for TcpKernelPin {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_once() {
+            let sink = self.errors.lock();
+            match sink.as_ref() {
+                Some(sender) => {
+                    if let Err(error) = sender.send(error) {
+                        tracing::error!(error = %error.0, "TCP pin release error channel closed");
+                    }
+                }
+                None => tracing::error!(%error, "TCP pin release error channel unavailable"),
+            }
+        }
+    }
+}
+
+fn take_tcp_live_pins(bpf: &mut Ebpf) -> anyhow::Result<std::sync::Arc<AyaMapData>> {
+    match bpf.take_map("TCP_LIVE_PINS") {
+        Some(aya::maps::Map::HashMap(map)) => Ok(std::sync::Arc::new(map)),
+        _ => anyhow::bail!("TCP_LIVE_PINS unavailable or has an incompatible map type"),
+    }
 }
 
 /// Find cgroup2 in the calling thread's mount namespace, not its thread-group leader's.
@@ -187,7 +231,7 @@ mod tests;
 pub use events::*;
 pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
 use syscall::{
-    bpf_lookup_batch_scan, bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
+    bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
     validate_loaded_udp_decision_sequence,
 };
 
@@ -240,6 +284,7 @@ impl RealEbpfBackend {
         AyaHashMap::try_from(map).map_err(|error| anyhow::anyhow!("map '{name}': {error}"))
     }
 
+    #[cfg(test)]
     fn hash_insert<K: Pod, V: Pod>(
         &mut self,
         name: &str,
@@ -271,6 +316,79 @@ impl RealEbpfBackend {
         }
     }
 
+    pub(crate) fn flow_lookup<K: Pod, V: Pod>(
+        &self,
+        name: &str,
+        key: &K,
+    ) -> anyhow::Result<Option<V>> {
+        match self
+            .hash_map::<K, FlowMapValue<V>>(name)?
+            .get(key, aya_obj::generated::BPF_F_LOCK as u64)
+        {
+            Ok(value) => Ok(Some(value.value)),
+            Err(error) if Self::map_error_is_missing(&error) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("map '{name}' locked lookup: {error}")),
+        }
+    }
+
+    pub(crate) fn flow_insert<K: Pod, V: Pod>(
+        &mut self,
+        name: &str,
+        key: &K,
+        value: &V,
+    ) -> anyhow::Result<()> {
+        self.hash_map_mut::<K, FlowMapValue<V>>(name)?
+            .insert(
+                key,
+                FlowMapValue::new(*value),
+                aya_obj::generated::BPF_F_LOCK as u64,
+            )
+            .map_err(|error| anyhow::anyhow!("map '{name}' locked insert: {error}"))
+    }
+
+    pub(crate) fn flow_for_each_chunk<K: Pod, V: Pod>(
+        &self,
+        name: &str,
+        chunk_size: usize,
+        visit: &mut ChunkVisitor<'_, K, V>,
+    ) -> anyhow::Result<()> {
+        let mut projected = Vec::with_capacity(syscall::BPF_BATCH_CHUNK);
+        if syscall::bpf_lookup_batch_scan_cb_flags::<K, FlowMapValue<V>>(
+            self.bpf()?,
+            &self.cap_flow_lookup_batch,
+            name,
+            aya_obj::generated::BPF_F_LOCK as u64,
+            &mut |chunk| {
+                projected.clear();
+                projected.extend(chunk.iter().map(|(key, value)| (*key, value.value)));
+                visit(&projected)
+            },
+        )? {
+            return Ok(());
+        }
+        // backend R excludes userspace reclamation; kernel never deletes tuple
+        // elements. Enumerate keys only, then copy each payload under its lock.
+        let map = self.hash_map::<K, FlowMapValue<V>>(name)?;
+        projected.clear();
+        for key in map.keys() {
+            let key =
+                key.map_err(|error| anyhow::anyhow!("map '{name}' key iteration: {error}"))?;
+            if let Some(value) = self.flow_lookup(name, &key)? {
+                projected.push((key, value));
+                if projected.len() == chunk_size.max(1) {
+                    if !visit(&projected) {
+                        return Ok(());
+                    }
+                    projected.clear();
+                }
+            }
+        }
+        if !projected.is_empty() {
+            visit(&projected);
+        }
+        Ok(())
+    }
+
     fn hash_remove<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<()> {
         match self.hash_map_mut::<K, V>(name)?.remove(key) {
             Ok(()) => Ok(()),
@@ -281,7 +399,7 @@ impl RealEbpfBackend {
 
     fn hash_remove_present<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<bool> {
         #[cfg(test)]
-        if name != RETIRE_FENCE_MAP {
+        if name != RETIRE_FENCE_MAP && name != "REQUEST_FENCE" {
             retirement::inject_indexed_fault(&mut self.retirement_faults.delete, "delete")?;
         }
         match self.hash_map_mut::<K, V>(name)?.remove(key) {
@@ -324,23 +442,6 @@ impl RealEbpfBackend {
             Err(MapError::KeyNotFound) => Ok(None),
             Err(error) => Err(anyhow::anyhow!("map '{name}' get[{index}]: {error}")),
         }
-    }
-
-    /// Snapshot all entries of a hash-family map. Batch commands remain an
-    /// optimization; Aya iteration is the compatibility fallback.
-    fn map_snapshot<K: Pod, V: Pod>(
-        &self,
-        name: &str,
-        out: &mut Vec<(K, V)>,
-    ) -> anyhow::Result<()> {
-        let bpf = self.bpf()?;
-        if bpf_lookup_batch_scan(bpf, &self.cap_lookup_batch, name, out)? {
-            return Ok(());
-        }
-        for entry in self.hash_map(name)?.iter() {
-            out.push(entry.map_err(|error| anyhow::anyhow!("map '{name}' iteration: {error}"))?);
-        }
-        Ok(())
     }
 
     fn for_each_map_chunk<K: Pod, V: Pod>(
@@ -460,11 +561,12 @@ impl EbpfBackend for RealEbpfBackend {
         self.grace_barrier()?;
 
         let mut staged = Vec::new();
-        self.for_each_map_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
+        self.flow_for_each_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
             staged.extend(chunk.iter().filter_map(|(key, state)| {
                 (key.l4proto == libc::IPPROTO_UDP as u8
                     && (state.state == UdpDecisionState::Preparing as u8
-                        || state.state == UdpDecisionState::Pending as u8))
+                        || state.state == UdpDecisionState::Pending as u8
+                        || state.state == UdpDecisionState::Aborted as u8))
                     .then_some((*key, state.decision_token, state.incarnation))
             }));
             true
@@ -582,17 +684,17 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn tcp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
-        self.hash_lookup("CONN_STATE_MAP", k)
+        self.flow_lookup("CONN_STATE_MAP", k)
     }
     fn tcp_conn_state_store(&mut self, k: &TuplesKey, s: &ConnState) -> anyhow::Result<()> {
-        self.hash_insert("CONN_STATE_MAP", k, s)
+        self.flow_insert("CONN_STATE_MAP", k, s)
     }
 
     fn udp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
-        self.hash_lookup("CONN_STATE_MAP", k)
+        self.flow_lookup("CONN_STATE_MAP", k)
     }
     fn udp_conn_state_store(&mut self, k: &TuplesKey, s: &ConnState) -> anyhow::Result<()> {
-        self.hash_insert("CONN_STATE_MAP", k, s)
+        self.flow_insert("CONN_STATE_MAP", k, s)
     }
 
     fn udp_flow_incarnation(&self, key: &TuplesKey, token: u32) -> anyhow::Result<Option<u64>> {
@@ -601,7 +703,7 @@ impl EbpfBackend for RealEbpfBackend {
             "retirement ownership is unresolved"
         );
         let state = self
-            .hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
+            .flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
             .ok_or_else(|| anyhow::anyhow!("UDP admission has no current conn state"))?;
         anyhow::ensure!(state.decision_token == token, "UDP admission token changed");
         anyhow::ensure!(
@@ -640,16 +742,46 @@ impl EbpfBackend for RealEbpfBackend {
         )?))
     }
 
+    fn retain_tcp_flow(
+        &self,
+        incarnation: u64,
+        errors: super::TcpPinErrorSink,
+    ) -> anyhow::Result<TcpKernelPin> {
+        anyhow::ensure!(
+            !self.retirement_failed && self.bpf.is_some(),
+            "BPF backend closed or retirement ownership unresolved"
+        );
+        anyhow::ensure!(
+            incarnation != 0 && incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX,
+            "invalid TCP lifetime identity"
+        );
+        syscall::insert_tcp_live_pin(&self.tcp_live_pins, incarnation)?;
+        Ok(TcpKernelPin {
+            map: std::sync::Arc::clone(&self.tcp_live_pins),
+            incarnation: Some(incarnation),
+            errors,
+        })
+    }
+
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>> {
         self.expiry_hints.take()
     }
 
     fn tcp_request_for_each_chunk(
         &self,
-        chunk_size: usize,
+        _chunk_size: usize,
         visit: &mut super::TcpRequestChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.for_each_map_chunk("TCP_REQUEST_BINDINGS", chunk_size, visit)
+        anyhow::ensure!(
+            bpf_lookup_batch_scan_cb(
+                self.bpf()?,
+                &self.cap_lookup_batch,
+                "TCP_REQUEST_BINDINGS",
+                visit
+            )?,
+            "safe TCP request enumeration requires BPF_MAP_LOOKUP_BATCH support"
+        );
+        Ok(())
     }
 
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
@@ -675,7 +807,7 @@ impl EbpfBackend for RealEbpfBackend {
         let conflicts_with_rollback =
             |token| token != 0 && udp_decision_token_generation(token) >= generation;
         let mut live = false;
-        self.for_each_map_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
+        self.flow_for_each_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
             live = chunk
                 .iter()
                 .any(|(_, state)| conflicts_with_rollback(state.decision_token));
@@ -695,7 +827,7 @@ impl EbpfBackend for RealEbpfBackend {
         }
 
         if !live {
-            self.for_each_map_chunk::<TuplesKey, RoutingHandoffEntry>(
+            self.flow_for_each_chunk::<TuplesKey, RoutingHandoffEntry>(
                 "ROUTING_HANDOFF_MAP",
                 256,
                 &mut |chunk| {
@@ -707,7 +839,7 @@ impl EbpfBackend for RealEbpfBackend {
             )?;
         }
         if !live {
-            self.for_each_map_chunk::<RedirectTuple, RedirectEntry>(
+            self.flow_for_each_chunk::<RedirectTuple, RedirectEntry>(
                 "REDIRECT_TRACK",
                 256,
                 &mut |chunk| {
@@ -729,14 +861,14 @@ impl EbpfBackend for RealEbpfBackend {
         &self,
         key: &TuplesKey,
     ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
-        self.hash_lookup("ROUTING_HANDOFF_MAP", key)
+        self.flow_lookup("ROUTING_HANDOFF_MAP", key)
     }
 
     fn redirect_track_lookup(&self, k: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>> {
-        self.hash_lookup("REDIRECT_TRACK", k)
+        self.flow_lookup("REDIRECT_TRACK", k)
     }
     fn redirect_track_store(&mut self, k: &RedirectTuple, e: &RedirectEntry) -> anyhow::Result<()> {
-        self.hash_insert("REDIRECT_TRACK", k, e)
+        self.flow_insert("REDIRECT_TRACK", k, e)
     }
 
     #[cfg(feature = "native-api")]
@@ -802,7 +934,7 @@ impl EbpfBackend for RealEbpfBackend {
         chunk_size: usize,
         visit: &mut crate::ebpf::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.for_each_map_chunk("REDIRECT_TRACK", chunk_size, visit)
+        self.flow_for_each_chunk("REDIRECT_TRACK", chunk_size, visit)
     }
 
     fn routing_handoff_for_each_chunk(
@@ -810,11 +942,14 @@ impl EbpfBackend for RealEbpfBackend {
         chunk_size: usize,
         visit: &mut crate::ebpf::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.for_each_map_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
+        self.flow_for_each_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
     }
 
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
-        self.map_snapshot("CONN_STATE_MAP", out)
+        self.flow_for_each_chunk("CONN_STATE_MAP", syscall::BPF_BATCH_CHUNK, &mut |chunk| {
+            out.extend_from_slice(chunk);
+            true
+        })
     }
 
     fn conn_state_for_each_chunk(
@@ -822,7 +957,7 @@ impl EbpfBackend for RealEbpfBackend {
         chunk_size: usize,
         visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.for_each_map_chunk("CONN_STATE_MAP", chunk_size, visit)
+        self.flow_for_each_chunk("CONN_STATE_MAP", chunk_size, visit)
     }
 
     fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {

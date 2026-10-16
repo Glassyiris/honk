@@ -825,7 +825,12 @@ impl UdpEndpointPool {
         stats: &StatsManager,
     ) -> EndpointReservation {
         if kernel_incarnation == Some(0)
-            || ((raw_dns_route.is_some() || vacant.key().dst_port == 53)
+            || ((raw_dns_route.is_some()
+                || (decision_token == 0
+                    && honk_ebpf_common::conn::is_stateless_udp_ports(
+                        vacant.key().client_port,
+                        vacant.key().dst_port,
+                    )))
                 && kernel_incarnation.is_some())
         {
             return EndpointReservation::IdentityMismatch;

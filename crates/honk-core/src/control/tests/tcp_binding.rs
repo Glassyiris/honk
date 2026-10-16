@@ -2,7 +2,7 @@
 //! the original SYN and final ACK traverse the production TC and request hooks.
 
 use super::support::TestRetirement;
-use super::support::netns::{build_lab, lab_config, pinned_map};
+use super::support::netns::{build_lab, lab_config, pinned_hash_snapshot, pinned_map};
 use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
 };
@@ -16,7 +16,7 @@ use anyhow::{Context, ensure};
 use aya::maps::{Array, HashMap};
 use honk_config::node::Node;
 use honk_ebpf_common::{
-    RedirectTuple,
+    FlowMapValue, RedirectTuple,
     conn::{ConnState, FlowIncarnationSequence},
     redirect_need::{RoutingHandoffEntry, TcpRequestKey, TcpSocketBinding, TuplesKey},
 };
@@ -29,7 +29,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
+
 use tokio::net::{TcpListener, TcpSocket};
+
+mod lifetime;
 
 const CHILD: &str = "HONK_TCP_BINDING_CHILD";
 const ROOT: &str = "/sys/fs/bpf/tcp-binding";
@@ -101,7 +104,51 @@ kernel_case!(
     netns_tcp_request_destruction_removes_exact_proof,
     "destroyed"
 );
+// Controlled ordering: hold the exact request fence across final ACK and accept,
+// not a claim that a reader was paused concurrently inside a kernel hook.
+kernel_case!(
+    netns_tcp_request_fence_refuses_child_and_preserves_proof,
+    "request-fenced"
+);
 
+// Ablate the cold native-pin consult in auxiliary/Closing age refusal.
+kernel_case!(netns_tcp_live_pin_survives_redirect_age, "lifetime-idle");
+kernel_case!(
+    netns_tcp_client_half_close_survives_closing_age,
+    "lifetime-client-fin"
+);
+kernel_case!(
+    netns_tcp_server_half_close_survives_redirect_age,
+    "lifetime-server-fin"
+);
+kernel_case!(
+    netns_tcp_unowned_redirect_age_refuses_without_deletion,
+    "lifetime-unowned-redirect"
+);
+kernel_case!(
+    netns_tcp_unowned_closing_age_refuses_without_deletion,
+    "lifetime-unowned-closing"
+);
+kernel_case!(
+    netns_tcp_other_incarnation_pin_cannot_rescue_aged_tuple,
+    "lifetime-other-incarnation"
+);
+kernel_case!(
+    netns_tcp_duplicate_admission_and_cancel_release_exact_pin,
+    "lifetime-cancel"
+);
+kernel_case!(
+    netns_tcp_superseding_syn_cannot_inherit_old_live_pin,
+    "lifetime-new-syn"
+);
+kernel_case!(
+    netns_tcp_native_pin_drop_error_reaches_current_worker_epoch,
+    "lifetime-pin-drop-error"
+);
+kernel_case!(
+    netns_tcp_native_pin_retirement_error_is_unconfirmed_once,
+    "lifetime-pin-retire-error"
+);
 #[derive(Debug)]
 struct CountDial(Arc<AtomicUsize>);
 
@@ -180,7 +227,11 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
             plane.start_datapath_flags_coordinator()?;
             plane.alive_set().shutdown_health_checks().await?;
             let handle = plane.spawn_handle();
-            let retirement = TestRetirement::start(&handle);
+            let retirement = (!matches!(
+                case,
+                "lifetime-pin-drop-error" | "lifetime-pin-retire-error"
+            ))
+            .then(|| TestRetirement::start(&handle));
             if case == "accepted" {
                 let _backend = handle.ebpf.write().await;
                 let mut sequence = Array::<_, FlowIncarnationSequence>::try_from(pinned_map(
@@ -208,7 +259,10 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
             )
             .await;
             handle.ebpf.write().await.set_datapath_ready(false)?;
-            let joined = retirement.join(&handle).await;
+            let joined = match retirement {
+                Some(retirement) => retirement.join(&handle).await,
+                None => Ok(()),
+            };
             let cleaned = handle.ebpf.write().await.cleanup().await;
             exercise?;
             joined?;
@@ -232,7 +286,13 @@ async fn exercise(
         root,
         "TCP_REQUEST_BINDINGS",
     )?)?;
-    if matches!(case, "expired" | "reclaimed") {
+    if matches!(case, "expired" | "reclaimed")
+        || (case.starts_with("lifetime-")
+            && !matches!(
+                case,
+                "lifetime-pin-drop-error" | "lifetime-pin-retire-error"
+            ))
+    {
         // A real boot clock cannot represent a 120s-old proof before uptime120s.
         let now = monotonic_ns()?;
         let age = honk_ebpf_common::conn::TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
@@ -268,6 +328,9 @@ async fn exercise(
         } else {
             TcpSocket::new_v6()?
         };
+        if case == "lifetime-new-syn" {
+            socket.set_reuseaddr(true)?;
+        }
         socket.bind(SocketAddr::new(client, 0))?;
         hold_synack(socket.as_raw_fd(), true)?;
         Ok(socket)
@@ -295,19 +358,9 @@ async fn exercise(
         source.port(),
         6,
     );
-    let proof = requests
-        .iter()
-        .find_map(|item| match item {
-            Ok((request, binding))
-                if binding.tuples.src_port == source.port()
-                    && binding.tuples.dst_port == target.port() =>
-            {
-                Some(Ok((request, binding)))
-            }
-            Err(error) => Some(Err(error)),
-            _ => None,
-        })
-        .transpose()?;
+    let proof = request_snapshot()?.into_iter().find(|(_, binding)| {
+        binding.tuples.src_port == source.port() && binding.tuples.dst_port == target.port()
+    });
     let original = handle
         .ebpf
         .read()
@@ -359,7 +412,7 @@ async fn exercise(
                         "age fallback did not remove the actual request proof"
                     );
                     ensure!(
-                        requests.get(&request, 0).is_err(),
+                        request_snapshot()?.iter().all(|(key, _)| *key != request),
                         "age fallback retained request proof"
                     );
                 }
@@ -369,12 +422,13 @@ async fn exercise(
                 drop(gate);
                 wire.replay(&synack)?;
                 tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
-                    while requests.get(&request, 0).is_ok() {
+                    while request_snapshot()?.iter().any(|(key, _)| *key == request) {
                         tokio::task::yield_now().await;
                     }
+                    Ok::<_, anyhow::Error>(())
                 })
                 .await
-                .context("RST did not destroy exact request proof")?;
+                .context("RST did not destroy exact request proof")??;
                 ensure!(
                     dials.load(Ordering::SeqCst) == 0,
                     "destroyed request reached outbound"
@@ -401,6 +455,19 @@ async fn exercise(
     } else {
         None
     };
+    let mut request_fence = if case == "request-fenced" {
+        let request = proof.context("fenced fixture lost native request")?.0;
+        let mut fences =
+            HashMap::<_, TcpRequestKey, u64>::try_from(pinned_map(root, "REQUEST_FENCE")?)?;
+        let mut active = Array::<_, u32>::try_from(pinned_map(root, "RETIRE_ACTIVE")?)?;
+        // No tuple fence: the real final ACK may complete, but its request-map
+        // readers and destructor must leave immutable proof to the fence owner.
+        active.set(0, 1, 0)?;
+        fences.insert(request, 0x7465_7374_u64, 1)?;
+        Some((request, fences, active))
+    } else {
+        None
+    };
     hold_synack(gate.as_raw_fd(), false)?;
     wire.replay(&synack)?;
     drop(gate);
@@ -419,11 +486,49 @@ async fn exercise(
         peer == source && accepted.local_addr()? == target,
         "wrong transparent socket endpoints"
     );
+    if let Some((request, fences, active)) = request_fence.as_mut() {
+        ensure!(
+            request_snapshot()?.iter().any(|(key, _)| key == request),
+            "fenced completed accept lost native request proof"
+        );
+        ensure!(
+            handle
+                .ebpf
+                .read()
+                .await
+                .tcp_socket_ownership(accepted.as_fd())
+                .is_err(),
+            "request fence allowed child proof publication"
+        );
+        fences.remove(request)?;
+        active.set(0, 0, 0)?;
+    } else if case == "accepted" {
+        let request = proof.context("accepted fixture lost native request")?.0;
+        ensure!(
+            request_snapshot()?.iter().all(|(key, _)| *key != request),
+            "unfenced completed accept retained native request proof"
+        );
+    }
     if case == "cookie" {
         ensure!(
             crate::with_daens_netns("observe forced cookie child", cookie_count)? > cookies_before,
             "fixture did not send a SYN cookie"
         );
+    }
+    if case.starts_with("lifetime-") {
+        return lifetime::exercise(
+            handle,
+            listener,
+            client_ns,
+            accepted,
+            client_stream,
+            peer,
+            target,
+            key,
+            original.incarnation,
+            case,
+        )
+        .await;
     }
     if matches!(case, "accepted" | "superseded") {
         let ownership = handle
@@ -708,21 +813,36 @@ fn checksum_sum(bytes: &[u8]) -> u32 {
         .sum()
 }
 
+fn request_snapshot() -> anyhow::Result<Vec<(TcpRequestKey, TcpSocketBinding)>> {
+    pinned_hash_snapshot(Path::new(ROOT), "TCP_REQUEST_BINDINGS", 0)
+}
+
 async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Result<u64> {
     let root = Path::new(ROOT);
-    let mut conns =
-        HashMap::<_, TuplesKey, ConnState>::try_from(pinned_map(root, "CONN_STATE_MAP")?)?;
-    let mut handoffs = HashMap::<_, TuplesKey, RoutingHandoffEntry>::try_from(pinned_map(
+    let mut conns = HashMap::<_, TuplesKey, FlowMapValue<ConnState>>::try_from(pinned_map(
         root,
-        "ROUTING_HANDOFF_MAP",
+        "CONN_STATE_MAP",
     )?)?;
+    let mut handoffs = HashMap::<_, TuplesKey, FlowMapValue<RoutingHandoffEntry>>::try_from(
+        pinned_map(root, "ROUTING_HANDOFF_MAP")?,
+    )?;
     let mut backend = handle.ebpf.write().await;
-    let mut next = conns.get(key, 0)?;
+    let mut next = conns.get(key, aya_obj::generated::BPF_F_LOCK as u64)?.value;
     next.incarnation += 1;
-    conns.insert(*key, next, 2)?;
-    let mut handoff = handoffs.get(key, 0)?;
+    conns.insert(
+        *key,
+        FlowMapValue::new(next),
+        2 | aya_obj::generated::BPF_F_LOCK as u64,
+    )?;
+    let mut handoff = handoffs
+        .get(key, aya_obj::generated::BPF_F_LOCK as u64)?
+        .value;
     handoff.incarnation = next.incarnation;
-    handoffs.insert(*key, handoff, 2)?;
+    handoffs.insert(
+        *key,
+        FlowMapValue::new(handoff),
+        2 | aya_obj::generated::BPF_F_LOCK as u64,
+    )?;
     let redirect_key = RedirectTuple::from_tuples(key);
     let mut redirect = backend
         .redirect_track_lookup(&redirect_key)?
