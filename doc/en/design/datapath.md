@@ -65,11 +65,14 @@ A changed link/address/route/interface role updates topology observations, clear
 | `lan_egress_l2`, `lan_egress_l3` | TC egress on LAN | Refresh reverse connection state, except that a UDP packet arriving from `dae0` only refreshes an existing entry and never creates one, and suppress locally generated ICMPv6 Redirect packets; skipped on the shared interface in a single-homed topology. |
 | `wan_egress_l2`, `wan_egress_l3` | TC egress on WAN | Route host-originated TCP/UDP, apply process-name and control-plane bypass data, check outbound connectivity, cache decisions, and redirect proxy traffic. |
 | `dae0_ingress` | TC ingress on host `dae0` | Reverse `REDIRECT_TRACK`, restore original MAC/interface delivery, and count RX traffic. A UDP reply with no exact record falls back to its client's `CLIENT_REPLY_TRACK` framing, uncounted. |
-| `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Validate redirected packets, restore per-packet UDP53 route/generation marks across link scrub, apply `TPROXY_MARK` to ordinary redirects, and use `bpf_sk_assign` for UDP and new TCP listener delivery. |
+| `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Restore UDP53 provenance and the SYN incarnation after link scrub; assign only UDP at TC. TCP retains native established/TIME_WAIT lookup before listener selection. |
 | `tproxy_sk_lookup` | `sk_lookup` in `daens` | Override ordinary socket lookup with a transparent listener from `LISTEN_SOCKET_MAP`. |
-| `tproxy_wan_cg_sock_create`, `tproxy_wan_cg_sock_release` | cgroup `sock_create`, `sock_release` | Create/refresh or remove socket-cookie to PID/`comm` entries. |
-| `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | Refresh cookie-to-process metadata for connected sockets. |
-| `tproxy_wan_cg_sendmsg4`, `tproxy_wan_cg_sendmsg6` | cgroup `sendmsg4`, `sendmsg6` | Refresh cookie-to-process metadata for datagram sends. |
+| `tproxy_wan_cg_sock_create` | cgroup `sock_create` | Retain the socket's first process identity; refuse creation if capture fails. |
+| `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | Preserve existing identity or capture it before connect; refuse connect if capture fails. |
+| `tproxy_wan_cg_sendmsg4`, `tproxy_wan_cg_sendmsg6` | cgroup `sendmsg4`, `sendmsg6` | Preserve existing identity or capture it before sending; refuse the send if capture fails. |
+| `honk_tcp_v4_route_req`, `honk_tcp_v6_route_req` | Required fentry on TCP request routing | Bind the actual SYN skb's tuple/incarnation and immutable handoff to its actual request socket. |
+| `honk_tcp_create_openreq_child` | Required fexit on child creation | Verify the request/child cookie lineage and install the proven handoff in the actual child's socket storage. |
+| `honk_tcp_v4_reqsk_destructor`, `honk_tcp_v6_reqsk_destructor` | Required fentry on request destruction | Remove the exact request-address/cookie proof; bounded janitor expiry backs up missed tracing invocations. |
 
 `LISTEN_SOCKET_MAP` keys are fixed: `0` TCP4, `1` TCP6, `2..=5` UDP4, and `6..=9` UDP6. UDP chooses one of four listeners per family with a flow-stable hash. The IPv4 and IPv6 key readers in `tproxy_sk_lookup` remain separate `#[inline(never)]` subprograms. At optimization level 2, inlining lets LLVM turn the family branch into a computed-offset read from the lookup context; the verifier rejects that as a dereference of a modified context pointer.
 
@@ -77,12 +80,12 @@ A changed link/address/route/interface role updates topology observations, clear
   `src/sk.rs`: `sk_assign_by_index` is TC's counterpart to aya `SockMap::redirect_sk_lookup` (which accepts only `SkLookupContext`); `probe_udp_socket` looks up non-DNS local UDP sockets. All helpers release implicit lookup references. Programs:
     - `lan_ingress_l2/l3` — LAN classify/route/redirect, ordered-policy DNS ownership, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous non-DNS UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
     - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped single-homed).
-    - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`) — reverse conn state; locally-originated traffic routing (pname via `COOKIE_PID_MAP`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane). Live non-DNS WAN UDP entries take a lookup-only cached-route path; misses route once and then publish complete conntrack metadata.
+    - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`) — reverse conn state; locally-originated traffic routing (pname via the actual skb socket's `SOCKET_IDENTITY`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane). Live non-DNS WAN UDP entries take a lookup-only cached-route path; misses route once and then publish complete conntrack metadata.
     - `dae0_ingress` — reply path: rx stats from `RedirectEntry.outbound`, MAC rewrite, redirect to original LAN iface. UDP replies from a peer the client never contacted use the client-only record and are not attributed to an outbound; replies from honk's own link addresses never do.
     - LAN egress suppresses only locally originated ICMPv6 Redirects, using the parser's ICMPv6 header after extension traversal; forwarded Redirects and other ICMPv6 remain pass-through. `honk-core/tests/ebpf_datapath_test.rs` checks L2 through `BPF_PROG_TEST_RUN` and L3 on isolated TUN interfaces, alongside exact-tuple RX accounting and cached-route policy.
-    - `dae0peer_ingress` — mandatory restoration of UDP53 route/generation provenance and `bpf_sk_assign` of the TPROXY listener via `LISTEN_SOCKET_MAP` inside `daens`.
+    - `dae0peer_ingress` — restores UDP53 route/generation provenance and the TCP SYN incarnation inside `daens`; only UDP uses TC `bpf_sk_assign`. TCP reaches the existing `sk_lookup` listener hook after native established/TIME_WAIT processing.
     - `tproxy_sk_lookup` (`src/sk_lookup.rs`) — transparent listeners: keys 0/1 TCP4/TCP6, 2..5 UDP4, 6..9 UDP6. Keep v4/v6 UDP listener-key reads in `#[inline(never)]` subprograms. At opt-level=2, LLVM if-converts family branches to a load through computed ctx offset, rejected as "dereference of modified ctx ptr". New branch-selected ctx reads must preserve this shape.
-    - cgroup sock_create/sock_release/connect4/6/sendmsg4/6 (`src/cgroup.rs`) — cookie → `PIDName{pid, pname}` for process-name rules + control-plane bypass; `pname` is the 15-byte `argv[0]` executable basename read through runtime kernel-BTF offsets, with thread `comm` as the unavailable/read-failure fallback.
+    - cgroup sock_create/connect4/6/sendmsg4/6 (`src/cgroup.rs`) — first-captured `SocketIdentity{pid, pname}` retained in native socket storage for process-name rules and control-plane bypass. `pname` is the 15-byte `argv[0]` executable basename read through runtime kernel-BTF offsets, with thread `comm` as the unavailable/read-failure fallback. Kernel socket destruction reclaims the storage; there is no release hook or cookie janitor. Missing required cgroup/storage support aborts startup. Capture failure refuses the operation with `EPERM`, rather than allowing traffic with lost identity.
 
 ## Map inventory
 
@@ -102,27 +105,34 @@ A changed link/address/route/interface role updates topology observations, clear
 | `LISTEN_SOCKET_MAP` | 16-slot `SockMap`; keys `0..=9` hold the two TCP and eight UDP transparent listeners. |
 | `DATAPATH_STATE_MAP` | One-slot admission array. Zero passes traffic untouched; nonzero enables classification and redirect. |
 | `DATAPATH_FLAGS_MAP` | One-slot runtime policy word: Rule/Direct offload properties plus `global.nfqueue_enable` and NFQUEUE ready fencing. New-flow classification reads it; established direct offload uses cached metadata. |
-| `COOKIE_PID_MAP` | Non-preallocated 65,536-entry socket-cookie to PID/executable-basename hash for `pname` routing and control-plane recognition; kernel BTF offsets capture argv[0] when verifier-safe, otherwise the cgroup hook captures thread `comm` synchronously. |
+| `SOCKET_IDENTITY` | Non-cloned `SK_STORAGE` containing the socket's first PID/executable basename. Storage follows the actual socket lifetime, without a fixed hash-entry ceiling or userspace expiry. WAN TC performs lookup only; cgroup create/connect/sendmsg capture missing identity synchronously. |
 | `CONN_STATE_OCCUPANCY` | Two-slot per-CPU cumulative insert/eBPF-delete counters used with userspace delete accounting to estimate occupancy. |
-| `BPF_STATS_MAP` | Five counters for UDP/TCP conn-state overflow and redirect, handoff, and cookie-map insertion failures. |
-| `EVENT_RINGBUF` | 262,144-byte ring buffer for fixed-layout blocked, conntrack-overflow, and UDP-token-exhaustion events. |
+| `BPF_STATS_MAP` | Five counters for UDP/TCP conn-state overflow, redirect/handoff insertion failures, and socket-identity capture refusal. |
+| `EVENT_RINGBUF` | 262,144-byte ring of 80-byte events, including functional tuple/incarnation expiry hints. Producers reserve and initialize ring storage directly instead of copying an event through the bounded TC stack. |
 | `UDP_DECISION_SEQUENCE` | Persistent one-slot pinned, spin-locked allocator state for NFQUEUE decision identities; protocol details live in [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_EPOCH` | One-slot grace-period selector for NFQUEUE decisions and WAN UDP ownership; see [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_INFLIGHT` | Two-slot per-CPU reader counts for those decision paths; see [NFQUEUE](./nfqueue.md). |
-| `UDP_DECISION_RETIRE_FENCE` | 65,536-entry tuple fence map used during NFQUEUE and WAN userspace UDP retirement; see [NFQUEUE](./nfqueue.md). |
+| `FLOW_INCARNATION_SEQUENCE` | Generation-owned, spin-locked, nonwrapping 56-bit identity domain represented as `u64`; independent of persistent UDP decision tokens. |
+| `RETIRE_FENCE`, `RETIRE_ACTIVE` | Non-preallocated 65,536-entry canonical-tuple fence plus one active flag. Each fence retains its unique operation owner and separate decision token. |
+| `RETIRE_GRACE_ROOT` | Private one-entry map-in-map; successful same-inner replacement synchronously drains pre-fence non-sleepable kernel readers. |
+| `TCP_PUBLISHING` | Non-preallocated 65,536-entry same-key SYN publisher exclusion. Ownership lasts one TC invocation; a competing SYN refuses before mutation. No userspace sweep or established-packet acquisition. |
+| `TCP_REQUEST_BINDINGS` | Non-preallocated 65,536-entry request-address/cookie hash of immutable SYN proofs. Missing or expired proof cannot be reconstructed from a current tuple. |
+| `TCP_SOCKET_BINDING` | Non-cloned socket storage: owned-listener marker or proven child's original tuple/handoff. Userspace reads it by accepted FD before adoption. |
 
 Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in shared flow structures are IPv4-mapped IPv6 values in network byte order.
 
-`RoutingHandoffEntry` appends `routing_generation: u64` and is 56 bytes; `result` remains at offset 8 and the UDP decision token at offset 44. The generated-slot `RoutingInput`, `ConnState`, and `UDP_DECISION_SEQUENCE` ABIs are unchanged. Old explicit BPF objects and incompatible pinned handoff layouts are rejected before raw reads; `honk-tool` validates the layout too. Use matching core/tool/object versions, not a compatibility shim.
+`ConnState`, `RedirectEntry`, and `RoutingHandoffEntry` append independent `incarnation: u64` fields and occupy 64, 40, and 72 bytes. Existing decision-token offsets remain unchanged. `TuplesKey` stays 40 bytes with explicit zeroed trailing padding; `TcpRequestKey` is 16 bytes and `TcpSocketBinding` is 120 bytes. The persistent `UDP_DECISION_SEQUENCE` stays exactly 12 bytes. Core rejects incompatible objects before attachment; the toolbox validates map layouts before raw reads. Use matching core/tool/object versions, not a compatibility shim.
 
-`RoutingMeta` bit 58 explicitly marks WAN UDP userspace ownership without changing its layout. Marked WAN direct decisions need a userspace socket even with `must`; the bit distinguishes their retirement from native LAN direct/must and offloaded state. Unmarked native WAN UDP direct decisions instead carry bit 57 (`OFFLOAD`), preserving them against stale endpoint callbacks without changing forwarding. WAN UDP cached readers and conn/handoff/redirect writers participate in the shared reader epoch and reject a fenced tuple before touching its state.
+`RoutingMeta` bit 58 still marks WAN UDP userspace ownership; bit 57 (`OFFLOAD`) still distinguishes native direct state from endpoint-owned state. TCP and ordinary UDP retain generation-owned incarnations separately from decision tokens. Every relevant forward/reverse/reply invocation checks the canonical tuple fence before borrowing map values. Existing auxiliary refresh changes only the matching borrowed timestamp; it never compares then overwrites a newer value.
 
 `crates/honk-ebpf-common/src/lib.rs` — shared marks and NFQUEUE token packing, `OutboundIndex`, `RoutingMeta`, `DaeParam`, and `OutboundStatsCounters`/map constants.
 `crates/honk-ebpf-common/src/routing_policy.rs` — fixed `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI (128/24/24 bytes), feature bits, and process-name normalization limits. `RoutingDecision` includes a direct-mark index (`u32::MAX` when absent); the loader rejects older external objects by checking the slot's BTF output layout.
-`crates/honk-ebpf-common/src/redirect_need.rs` — `TuplesKey`, `Tuples`, token-carrying `RoutingResult`/`RoutingHandoffEntry`, 256-bit `DomainRouting`, and `PIDName`.
+`crates/honk-ebpf-common/src/redirect_need.rs` — `TuplesKey`, `Tuples`, token-carrying `RoutingResult`/`RoutingHandoffEntry`, 256-bit `DomainRouting`, and `SocketIdentity`.
 `crates/honk-ebpf-common/src/conn.rs` — `ConnState` (including `UdpDecisionState` and `decision_token`), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, and `TcpState`.
 `crates/honk-ebpf/src/maps.rs` — static TC map declarations and their kernel-side capacities.
 `crates/honk-ebpf/src/route.rs` — static root/slot facade and fixed-ABI dispatch; generated policy code is loaded by userspace.
+`crates/honk-ebpf/src/tcp_binding.rs` and `honk-core/src/ebpf/real/tcp_binding.rs` own the required SYN/request/child bridge and running-kernel BTF validation. The SYN's low 24 mark bits and 32 priority bits carry its 56-bit identity only after peer ingress restores them; TCP has already reused `skb->cb` by request creation. Exhaustion refuses identity publication instead of wrapping.
+
+Owned `daens` disables and verifies SYN cookies, request migration and Fast Open. Missing BTF targets/offsets/attachments refuse startup. Missing, expired, allocation-failed or retransmission-superseded child proof closes the accepted socket without authorizing tuple deletion. Request proofs expire after 120 seconds; an already proven child's socket storage follows its actual lifetime. Backlog overflow relies on client retry, not guessed cookie attribution.
+
 `crates/honk-ebpf-common/src/event.rs`: fixed-layout ring events including conntrack overflow and UDP decision-token exhaustion. `crates/honk-ebpf-common/src/dae_ip.rs`: `In6Addr` union and v4-mapped helpers.
 `crates/honk-core/src/routing/ir.rs` — canonical `CompiledPredicate` and userspace `PortRange`; `crates/honk-core/src/control/routing_matcher.rs` lowers them into the generated function ABI.
 
@@ -184,7 +194,7 @@ For non-DNS traffic, the decision to keep a non-`must` flow in kernel direct rou
 
 ### Host-originated WAN UDP
 
-`wan_egress` only classifies locally generated traffic; forwarded packets have a real ingress ifindex and pass untouched. Honk-owned marked sockets and matching control-plane cookie/PID metadata also bypass it. For a live non-DNS UDP flow with published connection state, the program uses a lookup-only cached-route path. A miss runs routing once and publishes complete state before subsequent packets use the cache. DNS remains short-lived and does not create this UDP cache entry.
+`wan_egress` only classifies locally generated traffic; forwarded packets have a real ingress ifindex and pass untouched. Honk-owned marked sockets and matching control-plane socket identity also bypass it. For a live non-DNS UDP flow with published connection state, the program uses a lookup-only cached-route path. A miss runs routing once and publishes complete state before subsequent packets use the cache. DNS remains short-lived and does not create this UDP cache entry.
 
 ## Admission sequencing
 
@@ -196,7 +206,11 @@ Shutdown fences new NFQUEUE staging where applicable, closes `DATAPATH_STATE_MAP
 
 `BpfJanitor` wakes every two seconds. Accepted TCP relays pin their `CONN_STATE_MAP` and `REDIRECT_TRACK` entries for the relay lifetime. Unpinned TCP closing state expires after 10 seconds; unpinned active TCP and UDP state use a 120-second backstop.
 
-Conn-state sweeps normally run every 60 seconds. At 70% occupancy the interval falls to 15 seconds; at 85% it enters pressure mode and sweeps every two-second tick. Growth in kernel overflow counters also activates pressure mode as the fail-closed last resort. `CONN_STATE_OCCUPANCY` combines per-CPU kernel inserts/deletes with userspace delete accounting and exact sweep recalibration. Bounded auxiliary-map scans (`REDIRECT_TRACK`, `COOKIE_PID_MAP`, `ROUTING_HANDOFF_MAP`) use the aggressive 8-second cleanup cadence when the latest scan is incomplete or covers at least 85% of the 65,536-entry map.
+Conn-state sweeps normally run every 60 seconds. At 70% occupancy the interval falls to 15 seconds; at 85% it enters pressure mode and sweeps every two-second tick. Growth in kernel overflow counters also activates pressure mode as the fail-closed last resort. `CONN_STATE_OCCUPANCY` combines per-CPU kernel inserts/deletes with userspace delete accounting and exact sweep recalibration. Bounded auxiliary-map scans (`REDIRECT_TRACK`, `ROUTING_HANDOFF_MAP`) use the aggressive 8-second cleanup cadence when the latest scan is incomplete or covers at least 85% of the 65,536-entry map. Socket identity is never swept.
+
+Kernel expiry emits an advisory hint and refuses the triggering packet; it no longer performs lookup-then-delete. The existing removal worker multiplexes TCP, UDP and expiry work in bounded batches of at most 128. It acquires each tuple fence once, completes one kernel grace period, revalidates captured ownership/expiry, and releases only its own fences. Hints bypass diagnostic log throttling; ring/queue pressure can lose hints, with the ordinary sweep as backstop. No universal prompt-recovery bound is claimed under overload.
+
+Janitor conn/redirect/handoff/request-proof cleanup and staged UDP commits use the same exclusion. Current TCP pins are checked under the backend write lock, which also excludes new adoption. Partial deletions remain accounted even on error; unresolved fence ownership inhibits admission and is fatal. Admitted worker/janitor cleanup is joined beyond the shutdown warning, never abandoned by a timeout.
 
 Per-outbound traffic counters are per CPU. TX packets and bytes are counted at `lan_ingress` when the route lands, for both redirect and direct-offload outcomes. RX packets and bytes are counted at `dae0_ingress` after `REDIRECT_TRACK` identifies the returning outbound; a reply delivered from `CLIENT_REPLY_TRACK` has no returning outbound and is not counted. Unclassified pass-through traffic and drops have no outbound counter.
 

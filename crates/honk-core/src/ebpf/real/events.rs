@@ -1,5 +1,66 @@
 use super::*;
+use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
+
+pub(super) fn validate_flow_lifetime_object_layout(obj: &[u8]) -> anyhow::Result<()> {
+    let btf = aya_obj::Object::parse(obj)?
+        .btf
+        .ok_or_else(|| anyhow::anyhow!("required flow lifetime object BTF not found"))?;
+    validate_flow_lifetime_btf(&btf.to_bytes())
+}
+
+fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
+    use core::mem::{offset_of, size_of};
+
+    let btf =
+        btf::Btf::parse(data).ok_or_else(|| anyhow::anyhow!("invalid flow lifetime object BTF"))?;
+    for (name, size, member, width, offset) in [
+        (
+            "TuplesKey",
+            size_of::<TuplesKey>(),
+            "padding",
+            3,
+            offset_of!(TuplesKey, padding),
+        ),
+        (
+            "ConnState",
+            size_of::<ConnState>(),
+            "incarnation",
+            8,
+            offset_of!(ConnState, incarnation),
+        ),
+        (
+            "RoutingHandoffEntry",
+            size_of::<RoutingHandoffEntry>(),
+            "incarnation",
+            8,
+            offset_of!(RoutingHandoffEntry, incarnation),
+        ),
+        (
+            "RedirectEntry",
+            size_of::<RedirectEntry>(),
+            "incarnation",
+            8,
+            offset_of!(RedirectEntry, incarnation),
+        ),
+        (
+            "DaeEvent",
+            size_of::<DaeEvent>(),
+            "incarnation",
+            8,
+            offset_of!(DaeEvent, incarnation),
+        ),
+    ] {
+        anyhow::ensure!(
+            btf.find_type(4, name)
+                .and_then(|record| btf.u32_at(record + 8))
+                == Some(size as u32)
+                && btf.sized_member_offset(name, member, width) == Some(offset as u32),
+            "incompatible {name} ABI; rebuild the eBPF object"
+        );
+    }
+    Ok(())
+}
 
 /// Format a `DaeEvent` IP field — four u32 chunks of a 16-byte address in
 /// network order, IPv4-mapped for v4 flows — as an `IpAddr` for logging.
@@ -20,9 +81,42 @@ pub fn event_ip(chunks: &[u32; 4]) -> std::net::IpAddr {
 /// so a conntrack overflow burst cannot storm the log.
 pub const EVENT_LOG_MAX_PER_SEC: u32 = 32;
 
-/// Drain `EVENT_RINGBUF` into rate-limited structured logs.
+fn dispatch_expiry_event(
+    event: &DaeEvent,
+    expiry_hints: &tokio::sync::mpsc::Sender<FlowExpiryHint>,
+) -> bool {
+    if event.type_ != DaeEventType::FlowExpired as u32 {
+        return false;
+    }
+    if matches!(event.l4proto, 6 | 17)
+        && event.incarnation != 0
+        && event.incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX
+    {
+        let hint = FlowExpiryHint {
+            key: TuplesKey {
+                src_ip: In6Addr {
+                    u6_addr32: event.sip,
+                },
+                dst_ip: In6Addr {
+                    u6_addr32: event.dip,
+                },
+                src_port: event.sport,
+                dst_port: event.dport,
+                l4proto: event.l4proto,
+                padding: [0; 3],
+            },
+            incarnation: event.incarnation,
+        };
+        // Advisory only: the ordinary janitor backs up a full hint queue.
+        let _ = expiry_hints.try_send(hint);
+    }
+    true
+}
+
+/// Drain functional expiry hints before rate-limiting diagnostic events.
 pub async fn consume_dae_events(
     mut async_fd: tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>,
+    expiry_hints: tokio::sync::mpsc::Sender<FlowExpiryHint>,
 ) {
     let mut window = std::time::Instant::now();
     let mut emitted: u32 = 0;
@@ -44,6 +138,9 @@ pub async fn consume_dae_events(
                 }
                 let ev: DaeEvent =
                     unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DaeEvent) };
+                if dispatch_expiry_event(&ev, &expiry_hints) {
+                    continue;
+                }
                 if window.elapsed() >= std::time::Duration::from_secs(1) {
                     if suppressed > 0 {
                         warn!(
@@ -91,5 +188,141 @@ pub async fn consume_dae_events(
             }
         }
         guard.clear_ready();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifetime_layout_rejects_implicit_padding_and_stale_incarnation() {
+        let mut strings = vec![0];
+        let mut add_name = |name: &str| {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            offset
+        };
+        let mut types = vec![
+            0u32,
+            1 << 24,
+            1,
+            8,
+            0,
+            1 << 24,
+            8,
+            64,
+            0,
+            3 << 24,
+            0,
+            1,
+            1,
+            3,
+        ];
+        let mut records = [0; 5];
+        for (index, (name, size, member, type_id, offset)) in [
+            ("TuplesKey", 40, "padding", 3, 37),
+            ("ConnState", 64, "incarnation", 2, 56),
+            ("RoutingHandoffEntry", 72, "incarnation", 2, 64),
+            ("RedirectEntry", 40, "incarnation", 2, 32),
+            ("DaeEvent", 80, "incarnation", 2, 72),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            records[index] = btf::BTF_HEADER_LEN + types.len() * 4;
+            types.extend_from_slice(&[
+                add_name(name),
+                (4 << 24) | 1,
+                size,
+                add_name(member),
+                type_id,
+                offset * 8,
+            ]);
+        }
+        let type_len = (types.len() * 4) as u32;
+        let mut data = vec![0x9f, 0xeb, 1, 0];
+        for word in [
+            btf::BTF_HEADER_LEN as u32,
+            0,
+            type_len,
+            type_len,
+            strings.len() as u32,
+        ] {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        for word in types {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        data.extend_from_slice(&strings);
+        assert!(validate_flow_lifetime_btf(&data).is_ok());
+
+        let padding_name = records[0] + 12;
+        let name: [u8; 4] = data[padding_name..padding_name + 4].try_into().unwrap();
+        data[padding_name..padding_name + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(validate_flow_lifetime_btf(&data).is_err());
+        data[padding_name..padding_name + 4].copy_from_slice(&name);
+
+        let size_offset = records[4] + 8;
+        data[size_offset..size_offset + 4].copy_from_slice(&72u32.to_le_bytes());
+        assert!(validate_flow_lifetime_btf(&data).is_err());
+        data[size_offset..size_offset + 4].copy_from_slice(&80u32.to_le_bytes());
+        let incarnation_offset = records[4] + 20;
+        data[incarnation_offset..incarnation_offset + 4]
+            .copy_from_slice(&(64u32 * 8).to_le_bytes());
+        assert!(validate_flow_lifetime_btf(&data).is_err());
+    }
+
+    #[test]
+    fn expiry_dispatch_preserves_tuple_and_drops_only_advisory_overflow() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut event: DaeEvent = unsafe { core::mem::zeroed() };
+        event.type_ = DaeEventType::FlowExpired as u32;
+        event.l4proto = 6;
+        event.incarnation = 42;
+        event.sip = unsafe { In6Addr::from_ipv4_bytes([192, 0, 2, 1]).u6_addr32 };
+        event.dip = unsafe { In6Addr::from_ipv4_bytes([198, 51, 100, 2]).u6_addr32 };
+        event.sport = 49152;
+        event.dport = 443;
+
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.incarnation = 43;
+        assert!(dispatch_expiry_event(&event, &tx));
+        let hint = rx.try_recv().unwrap();
+        assert_eq!(hint.incarnation, 42);
+        assert_eq!(unsafe { hint.key.src_ip.u6_addr32 }, event.sip);
+        assert_eq!(unsafe { hint.key.dst_ip.u6_addr32 }, event.dip);
+        assert_eq!(hint.key.src_port, 49152);
+        assert_eq!(hint.key.dst_port, 443);
+        assert_eq!(hint.key.l4proto, 6);
+        assert_eq!(hint.key.padding, [0; 3]);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        event.l4proto = 17;
+        assert!(dispatch_expiry_event(&event, &tx));
+        assert_eq!(rx.try_recv().unwrap().key.l4proto, 17);
+        event.incarnation = 0;
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.incarnation = honk_ebpf_common::conn::FLOW_INCARNATION_MAX + 1;
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.incarnation = 44;
+        event.l4proto = 1;
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.type_ = DaeEventType::Blocked as u32;
+        assert!(!dispatch_expiry_event(&event, &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 }

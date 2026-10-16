@@ -18,6 +18,8 @@ impl RealEbpfBackend {
             version.1,
             version.2
         );
+        events::validate_flow_lifetime_object_layout(obj)?;
+        let prepared_binding = tcp_binding::prepare()?;
         let process_name_offsets = process_name::detect();
         let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
 
@@ -118,6 +120,7 @@ impl RealEbpfBackend {
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
+            .override_global("TCP_BINDING_OFFSETS", &prepared_binding.offsets, true)
             .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
         if matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
             && let Some(offsets) = process_name_offsets.as_ref()
@@ -134,7 +137,10 @@ impl RealEbpfBackend {
         }
         let mut bpf = loader.load(obj)?;
         validate_routing_handoff_layout(&bpf)?;
+        validate_socket_identity_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
+        retirement::validate_flow_lifetime_layout(&bpf)?;
+        let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
         let mut pinned_maps = Vec::new();
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
@@ -161,6 +167,17 @@ impl RealEbpfBackend {
                 debug!("pinned '{}'", name);
             }
         }
+        let event_map = bpf
+            .take_map("EVENT_RINGBUF")
+            .ok_or_else(|| anyhow::anyhow!("required EVENT_RINGBUF map not found"))?;
+        let event_ring = aya::maps::RingBuf::try_from(event_map)
+            .map_err(|error| anyhow::anyhow!("required EVENT_RINGBUF open: {error}"))?;
+        let event_fd =
+            tokio::io::unix::AsyncFd::with_interest(event_ring, tokio::io::Interest::READABLE)
+                .map_err(|error| {
+                    anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}")
+                })?;
+        let tcp_bindings = prepared_binding.attach(&mut bpf)?;
         match pname_mode {
             process_name::PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")
@@ -169,64 +186,67 @@ impl RealEbpfBackend {
                 warn!("kernel argv capture unavailable; using thread comm")
             }
         }
-        // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
-        // This enables pname routing and control-plane traffic bypass (Go dae parity).
-        // The links must stay owned by the backend: a dropped link fd detaches
-        // the program, which once silently disabled COOKIE_PID_MAP (pname
-        // routing) from the first microseconds of every run.
+        // Required socket-lifetime identity capture. Keep every link owned by
+        // the backend; missing support or a partial attachment is fatal.
         let mut cgroup_sock_links = Vec::new();
         let mut cgroup_sock_addr_links = Vec::new();
-        match detect_cgroup_path() {
-            Ok(cgroup_path) => {
-                let cgroup_file = std::fs::File::open(&cgroup_path)
-                    .map_err(|e| anyhow::anyhow!("open cgroup {}: {}", cgroup_path, e))?;
-                let (create_name, cg_addr_names) = match pname_mode {
-                    process_name::PnameCaptureMode::Argv0 => (
-                        "tproxy_wan_cg_sock_create",
-                        [
-                            "tproxy_wan_cg_connect4",
-                            "tproxy_wan_cg_connect6",
-                            "tproxy_wan_cg_sendmsg4",
-                            "tproxy_wan_cg_sendmsg6",
-                        ],
-                    ),
-                    process_name::PnameCaptureMode::Comm => (
-                        "tproxy_wan_cg_sock_create_comm",
-                        [
-                            "tproxy_wan_cg_connect4_comm",
-                            "tproxy_wan_cg_connect6_comm",
-                            "tproxy_wan_cg_sendmsg4_comm",
-                            "tproxy_wan_cg_sendmsg6_comm",
-                        ],
-                    ),
-                };
-                let cg_sock_names = [create_name, "tproxy_wan_cg_sock_release"];
-                for name in &cg_sock_names {
-                    let p: &mut aya::programs::CgroupSock = bpf
-                        .program_mut(name)
-                        .and_then(|p| p.try_into().ok())
-                        .ok_or_else(|| anyhow::anyhow!("{} program not found", name))?;
-                    p.load()?;
-                    let link_id =
-                        p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
-                    cgroup_sock_links.push(p.take_link(link_id)?);
-                }
-                for name in &cg_addr_names {
-                    let p: &mut aya::programs::CgroupSockAddr = bpf
-                        .program_mut(name)
-                        .and_then(|p| p.try_into().ok())
-                        .ok_or_else(|| anyhow::anyhow!("{} program not found", name))?;
-                    p.load()?;
-                    let link_id =
-                        p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
-                    cgroup_sock_addr_links.push(p.take_link(link_id)?);
-                }
-                info!("Attached 6 cgroup programs to {}", cgroup_path);
-            }
-            Err(e) => {
-                warn!("cgroup2 not available; pname routing disabled: {}", e);
-            }
+        let cgroup_path = detect_cgroup_path()
+            .map_err(|error| anyhow::anyhow!("required socket identity capture: {error}"))?;
+        let cgroup_file = std::fs::File::open(&cgroup_path)
+            .map_err(|e| anyhow::anyhow!("open cgroup {}: {}", cgroup_path, e))?;
+        let (create_name, cg_addr_names) = match pname_mode {
+            process_name::PnameCaptureMode::Argv0 => (
+                "tproxy_wan_cg_sock_create",
+                [
+                    "tproxy_wan_cg_connect4",
+                    "tproxy_wan_cg_connect6",
+                    "tproxy_wan_cg_sendmsg4",
+                    "tproxy_wan_cg_sendmsg6",
+                ],
+            ),
+            process_name::PnameCaptureMode::Comm => (
+                "tproxy_wan_cg_sock_create_comm",
+                [
+                    "tproxy_wan_cg_connect4_comm",
+                    "tproxy_wan_cg_connect6_comm",
+                    "tproxy_wan_cg_sendmsg4_comm",
+                    "tproxy_wan_cg_sendmsg6_comm",
+                ],
+            ),
+        };
+        let p: &mut aya::programs::CgroupSock = bpf
+            .program_mut(create_name)
+            .and_then(|p| p.try_into().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("required socket identity program {} not found", create_name)
+            })?;
+        p.load().map_err(|error| {
+            anyhow::anyhow!("required socket identity program {create_name} load: {error}")
+        })?;
+        let link_id = p
+            .attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)
+            .map_err(|error| {
+                anyhow::anyhow!("required socket identity program {create_name} attach: {error}")
+            })?;
+        cgroup_sock_links.push(p.take_link(link_id)?);
+        for name in &cg_addr_names {
+            let p: &mut aya::programs::CgroupSockAddr = bpf
+                .program_mut(name)
+                .and_then(|p| p.try_into().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("required socket identity program {} not found", name)
+                })?;
+            p.load().map_err(|error| {
+                anyhow::anyhow!("required socket identity program {name} load: {error}")
+            })?;
+            let link_id = p
+                .attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)
+                .map_err(|error| {
+                    anyhow::anyhow!("required socket identity program {name} attach: {error}")
+                })?;
+            cgroup_sock_addr_links.push(p.take_link(link_id)?);
         }
+        info!("Attached 5 required cgroup programs to {}", cgroup_path);
         // Initialize outbound connectivity map: all entries are alive by default.
         // This map is updated by health checks; until then we must not drop
         // proxy-bound traffic. Skipping entries here marks every outbound
@@ -502,37 +522,8 @@ impl RealEbpfBackend {
                 None
             }
         };
-        // Spawn the DaeEvent consumer for diagnostics.
-        let event_flush_handle = match bpf.take_map("EVENT_RINGBUF") {
-            Some(map) => match aya::maps::RingBuf::try_from(map) {
-                Ok(ring_buf) => {
-                    match tokio::io::unix::AsyncFd::with_interest(
-                        ring_buf,
-                        tokio::io::Interest::READABLE,
-                    ) {
-                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(async_fd))),
-                        Err(e) => {
-                            warn!(
-                                "DaeEvent ringbuf AsyncFd setup failed (events will not be drained): {}",
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "EVENT_RINGBUF open failed (events will not be drained): {}",
-                        e
-                    );
-                    None
-                }
-            },
-            None => {
-                debug!("EVENT_RINGBUF not present in eBPF object");
-                None
-            }
-        };
+        let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
+        let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
 
         Ok(Self {
             bpf: Some(bpf),
@@ -548,7 +539,13 @@ impl RealEbpfBackend {
             listeners_published: false,
             log_flush_handle,
             event_flush_handle,
-            cap_lookup_and_delete: BatchCapability::new(),
+            expiry_hints: Some(expiry_rx),
+            retirement_grace_inner,
+            retirement_owner: 0,
+            retirement_failed: false,
+            #[cfg(test)]
+            retirement_faults: Default::default(),
+            tcp_bindings: Some(tcp_bindings),
             cap_lookup_batch: BatchCapability::new(),
             routing_generation: None,
             routing_slot: 0,

@@ -20,6 +20,7 @@ use std::time::Duration;
 mod direct_mode;
 mod failures;
 mod network;
+mod retirement;
 mod trace;
 
 const TC_ACT_OK: u32 = 0;

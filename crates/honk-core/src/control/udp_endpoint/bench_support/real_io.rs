@@ -149,6 +149,7 @@ impl IoHarness {
             target,
             FIRST_PAYLOAD,
             None,
+            None,
             self.pool.initialization_epoch(),
             slow,
             queue_now(),

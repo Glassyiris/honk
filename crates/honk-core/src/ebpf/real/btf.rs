@@ -104,13 +104,43 @@ impl<'a> Btf<'a> {
         }
         None
     }
+    pub(super) fn function_proto(&self, name: &str) -> Option<usize> {
+        let function = self.find_type(12, name)?;
+        let prototype = self.resolve_modifiers(self.u32_at(function.checked_add(8)?)?)?;
+        (self.kind(prototype)? == 13).then_some(prototype)
+    }
+
+    pub(super) fn pointer_to(&self, type_id: u32, name: &str) -> bool {
+        let Some(pointer) = self.resolve_modifiers(type_id) else {
+            return false;
+        };
+        if self.kind(pointer) != Some(2) {
+            return false;
+        }
+        let Some(target) = self
+            .u32_at(pointer + 8)
+            .and_then(|id| self.resolve_modifiers(id))
+        else {
+            return false;
+        };
+        self.kind(target) == Some(4)
+            && self.u32_at(target).and_then(|offset| self.string(offset)) == Some(name)
+    }
+
+    pub(super) fn unsigned_integer_width(&self, type_id: u32, width: u32) -> bool {
+        let Some(cursor) = self.resolve_modifiers(type_id) else {
+            return false;
+        };
+        self.kind(cursor) == Some(1)
+            && self.u32_at(cursor + 8) == Some(width)
+            && self.u32_at(cursor + 12) == width.checked_mul(8)
+    }
 
     pub(super) fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
         self.composite_member_offset(self.find_type(4, type_name)?, member_name, 0, None)
     }
 
     /// Offset of a complete, non-bitfield member of exactly `width` bytes.
-    #[cfg(any(feature = "native-api", test))]
     pub(super) fn sized_member_offset(
         &self,
         type_name: &str,
@@ -184,12 +214,18 @@ impl<'a> Btf<'a> {
     }
 
     fn type_size(&self, mut type_id: u32) -> Option<u32> {
+        let mut elements = 1u32;
         for _ in 0..8 {
             let cursor = self.type_by_id(type_id)?;
-            let info = read_u32(self.data, cursor.checked_add(4)?, self.endian)?;
-            let size = read_u32(self.data, cursor.checked_add(8)?, self.endian)?;
+            let info = self.u32_at(cursor.checked_add(4)?)?;
+            let size = self.u32_at(cursor.checked_add(8)?)?;
             match (info >> 24) & 0x1f {
-                1 | 4 | 5 | 6 | 16 | 19 => return Some(size),
+                1 | 4 | 5 | 6 | 16 | 19 => return size.checked_mul(elements),
+                2 => return 8u32.checked_mul(elements),
+                3 => {
+                    elements = elements.checked_mul(self.u32_at(cursor.checked_add(20)?)?)?;
+                    type_id = self.u32_at(cursor.checked_add(12)?)?;
+                }
                 8..=11 | 18 => type_id = size,
                 _ => return None,
             }
@@ -257,6 +293,62 @@ fn type_extra_len(kind: u32, vlen: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::Btf;
+
+    #[test]
+    fn array_members_require_exact_bounded_nonoverflowing_width() {
+        let strings = b"\0holder\0padding\0u8\0";
+        let make = |count: u32, element: u32| {
+            let types: Vec<u8> = [
+                1,
+                (4 << 24) | 1,
+                3,
+                8,
+                3,
+                0,
+                16,
+                1 << 24,
+                1,
+                8,
+                0,
+                3 << 24,
+                0,
+                element,
+                2,
+                count,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+            let mut data = Vec::from([0x9f, 0xeb, 1, 0]);
+            for value in [
+                24,
+                0,
+                types.len() as u32,
+                types.len() as u32,
+                strings.len() as u32,
+            ] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            data.extend_from_slice(&types);
+            data.extend_from_slice(strings);
+            data
+        };
+        let data = make(3, 2);
+        let btf = Btf::parse(&data).unwrap();
+        assert_eq!(btf.sized_member_offset("holder", "padding", 3), Some(0));
+        assert_eq!(btf.sized_member_offset("holder", "padding", 2), None);
+        let outside = make(4, 2);
+        assert_eq!(
+            Btf::parse(&outside)
+                .unwrap()
+                .sized_member_offset("holder", "padding", 3),
+            None
+        );
+        let recursive = make(2, 3);
+        assert_eq!(Btf::parse(&recursive).unwrap().type_size(3), None);
+        let overflow = make(u32::MAX, 1);
+        assert_eq!(Btf::parse(&overflow).unwrap().type_size(3), None);
+    }
 
     #[test]
     fn receive_fields_require_complete_sized_non_bitfield_members() {

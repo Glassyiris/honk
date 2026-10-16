@@ -280,6 +280,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                 removed.client,
                 removed.dst,
                 removed.decision_token,
+                removed.kernel_incarnation,
                 removed.generation
             ));
             if removed.dst == f.target(0) {
@@ -309,6 +310,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                     removed.client,
                     removed.dst,
                     removed.decision_token,
+                    removed.kernel_incarnation,
                     removed.generation,
                 ));
             }

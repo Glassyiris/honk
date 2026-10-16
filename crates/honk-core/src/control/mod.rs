@@ -227,7 +227,7 @@ pub struct ControlPlane {
     iface_watcher: Option<crate::ebpf::real::IfaceWatcher>,
 }
 
-pub(crate) use udp_removal::spawn_udp_removal_worker;
+pub(in crate::control) use udp_removal::spawn_udp_removal_worker;
 
 impl ControlPlane {
     #[cfg(feature = "native-api")]

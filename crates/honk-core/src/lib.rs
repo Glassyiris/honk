@@ -1946,6 +1946,24 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
         ] {
             let _ = set_sysctl(key, val);
         }
+
+        // Stateless cookies, request migration and early children cannot retain this SYN's proof.
+        for (key, path) in [
+            (
+                "net.ipv4.tcp_syncookies",
+                "/proc/sys/net/ipv4/tcp_syncookies",
+            ),
+            (
+                "net.ipv4.tcp_migrate_req",
+                "/proc/sys/net/ipv4/tcp_migrate_req",
+            ),
+            ("net.ipv4.tcp_fastopen", "/proc/sys/net/ipv4/tcp_fastopen"),
+        ] {
+            set_sysctl(key, "0").with_context(|| format!("disable {key} in daens"))?;
+            let actual =
+                std::fs::read_to_string(path).with_context(|| format!("verify {key} in daens"))?;
+            anyhow::ensure!(actual.trim() == "0", "{key} remains enabled in daens");
+        }
         Ok(peer_mac)
     })?;
 

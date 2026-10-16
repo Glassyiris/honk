@@ -6,6 +6,7 @@ pub enum DaeEventType {
     UdpConnOverflow = 1, // DAE_EVENT_UDP_CONN_OVERFLOW
     TcpConnOverflow = 2, // DAE_EVENT_TCP_CONN_OVERFLOW
     UdpDecisionTokenExhausted = 3,
+    FlowExpired = 4,
 }
 
 const _DAE_EVENT_TYPE_SIZE: () = assert!(core::mem::size_of::<DaeEventType>() == 4);
@@ -13,7 +14,7 @@ const _UDP_DECISION_TOKEN_EXHAUSTED_EVENT_VALUE: () =
     assert!(DaeEventType::UdpDecisionTokenExhausted as u32 == 3);
 
 // Matches the C struct dae_event.
-// Total size 72 bytes, alignment 8 bytes.
+// Total size 80 bytes, alignment 8 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DaeEvent {
@@ -28,9 +29,10 @@ pub struct DaeEvent {
     pub dip: [u32; 4],   // __u32 dip[4]
     pub sport: u16,      // __u16 sport
     pub dport: u16,      // __u16 dport
+    pub incarnation: u64,
 }
 
-const _DAE_EVENT_SIZE: () = assert!(core::mem::size_of::<DaeEvent>() == 72);
+const _DAE_EVENT_SIZE: () = assert!(core::mem::size_of::<DaeEvent>() == 80);
 const _DAE_EVENT_ALIGN: () = assert!(core::mem::align_of::<DaeEvent>() == 8);
 const _DAE_EVENT_TIMESTAMP_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, timestamp) == 0);
 const _DAE_EVENT_TYPE_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, type_) == 8);
@@ -42,3 +44,4 @@ const _DAE_EVENT_SIP_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, sip) =
 const _DAE_EVENT_DIP_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, dip) == 52);
 const _DAE_EVENT_SPORT_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, sport) == 68);
 const _DAE_EVENT_DPORT_OFFSET: () = assert!(core::mem::offset_of!(DaeEvent, dport) == 70);
+const _: () = assert!(core::mem::offset_of!(DaeEvent, incarnation) == 72);

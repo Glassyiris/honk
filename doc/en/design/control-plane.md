@@ -62,7 +62,7 @@ Original destinations are recovered as follows:
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | Transparent socket `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | Guarded provenance rules described below |
 
-For ordinary flows, userspace forms the canonical tuple and consumes `ROUTING_HANDOFF_MAP` with `routing_handoff_take`. A missing handoff, or an outbound of `ControlPlaneRouting`, falls back to `Router::route_action`. Final `must` and `block` results cannot be overridden by Clash mode. This fallback is not the transparent DNS ownership boundary.
+Real TCP first validates accepted-FD ownership and uses that socket's immutable SYN handoff; missing or superseded proof closes the socket instead of selecting current tuple metadata. Ordinary UDP reads handoff metadata non-destructively against its captured incarnation and decision token. An owned `ControlPlaneRouting` result, or an eligible token-zero UDP flow without a handoff, can still use `Router::route_action`. Final `must` and `block` results cannot be overridden by Clash mode. Transparent DNS keeps its separate ownership boundary.
 
 Port-53 controller versus raw-transport ownership follows the [ordered traffic-rule contract](../reference/routing.md#outbound-targets-and-must), including the malformed non-`must` UDP fallback.
 
@@ -209,7 +209,7 @@ Admission ceilings are distinct:
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
 
-There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The endpoint-removal channel is bounded to 1024 messages and drains in batches of 128. If nonblocking delivery finds it full, a deduplicating `removal_dirty` set retains compensation; the worker flushes that set after each batch before acknowledging exact endpoint tombstones.
+There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The existing removal worker multiplexes bounded TCP, UDP and expiry-hint inputs into batches of at most 128 with one kernel grace period per batch. UDP removal retains its 1024-message channel and deduplicating `removal_dirty` compensation; exact tombstones are acknowledged only after owned I/O and backend retirement finish.
 
 Transparent TCP waits for either IP-family listener to become readable before reserving a shared flow permit, then completes the accept with a nonblocking syscall. An idle listener therefore consumes no flow capacity, while connections that arrive at the limit remain in the kernel listen backlog. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
 
@@ -230,7 +230,11 @@ After the first EOF, both relay paths bound only idle drain time: `DRAIN_DEADLIN
 
 A client that disappears without FIN or RST is bounded separately: the TPROXY TCP listeners enable TCP keepalive (3600 s idle, 15 s interval, 4 probes) and accepted sockets inherit it. A silent client ends its relay after about an hour; a live idle client answers the probes, so long idle connections stay open. Its error is a client-side `TimedOut`, which settles Score as cancellation.
 
-An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP` entry still exists. `TcpFlowPins` reference-counts that directional tuple for every accepted owner. The BPF janitor skips pinned conn-state and matching redirect metadata. When the final owner retires, it reads the current entry and conditionally removes it only if the state and timestamp still match the observed incarnation; an older relay cannot delete a reused tuple.
+An accepted TCP FD must carry a proven original SYN/request binding before tuple routing, pinning or cleanup authority. Its immutable handoff and incarnation must agree with current conn/handoff/redirect ownership. Missing, expired or superseded proof closes the socket without deleting current tuple state. `TcpFlowPins` reference-counts accepted owners; admission retains the pin under the same backend read guard as validation. The janitor checks current pins under the exclusive backend guard, not a stale scan snapshot. Retirement uses the guard's captured incarnation, never whichever entry happens to occupy the tuple at teardown.
+
+After I/O completes, the joined removal worker owns an admitted TCP retirement, its socket, tracker/close completion and outbound statistics guard even if the waiter is cancelled. Cancellation before admission falls back to Drop and later atomic janitor cleanup, without claiming confirmed retirement. Worker and janitor shutdown warn after their grace interval but join real admitted work rather than aborting it.
+
+Ordinary UDP captures its kernel incarnation only on cold endpoint admission, before asynchronous preparation. Ready enqueue does not add a backend query. The captured identity survives initializer, endpoint and tombstone lifetimes; all UDP/53 paths remain stateless, including malformed DNS fallback without a decoded route. Mock execution is explicitly model-only and does not claim kernel socket proof.
 
 After a real relay completes, the TCP owner settles its actual Score outcome and relay-error statistics once before propagating any retirement failure. Successful relay evidence is not changed to cancellation by failed retirement. TCP pool replenishment still requires both relay success and confirmed retirement; intentional cancellation retains its separate neutral path.
 
@@ -242,7 +246,7 @@ SIGHUP uses an attempt-local diagnostic list. Load and operator-validation warni
 
 `apply_runtime_config` first builds the replacement router, group manager, outbound registry, DNS runtime, and routing plan without mutating live state. Commit ordering is:
 
-1. Fence NFQUEUE readiness and wait for the kernel reader-epoch grace period.
+1. Fence NFQUEUE readiness and complete the synchronous kernel grace barrier.
 2. Reject new transparent admission.
 3. Cancel correlator cells and token-bound originals, advance the UDP initializer epoch, drain `Initializing` leases, wait for the correlator to become empty, and drain exact endpoint retirements.
 4. Under the publication guards below, call `EbpfBackend::publish_routing_plan(&plan, learned_domains)` when the compiled plan or learned facts changed, or datapath health requires recovery. The backend stages the inactive slot's generation-owned facts and generated functions and switches `ROUTING_POLICY_ROOT` last. A native explicit activation then resets mode using the already-owned backend, before publishing the replacement registry, DNS pointer, router, config, groups and projection. A post-root mode-reset failure commits the new generation as degraded and leaves admission fenced.
@@ -264,7 +268,7 @@ Selector and UDP warm ownership stay generation-bound; see [warm-up ownership](.
 
 `DrainTracker` is the process-wide accepted-flow gate. Reload and shutdown set reject-new before a drain and wait up to five seconds; shutdown then continues teardown with the remaining count.
 
-- `src/mode.rs` — `DatapathFlagsHandle` serializes `ModeState` and `DATAPATH_FLAGS_MAP` updates under one async mutex. Initialize/mode/GLOBAL/static updates compose with NFQUEUE fence/reopen/disable so a concurrent API update cannot republish ready during reload. Fence completion follows READY=false publication, a kernel reader-epoch grace period, and removal of every undelivered Preparing/Pending state.
+- `src/mode.rs` — `DatapathFlagsHandle` serializes `ModeState` and `DATAPATH_FLAGS_MAP` updates under one async mutex. Initialize/mode/GLOBAL/static updates compose with NFQUEUE fence/reopen/disable so a concurrent API update cannot republish ready during reload. Fence completion follows READY=false publication, a successful synchronous kernel grace barrier, and fenced removal of every undelivered Preparing/Pending state.
 
 ### Restart-required changes
 

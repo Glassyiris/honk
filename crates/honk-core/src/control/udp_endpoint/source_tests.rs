@@ -694,6 +694,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         client_two_addr,
         target_c,
         removed_two.decision_token,
+        removed_two.kernel_incarnation,
         removed_two.generation,
     ));
     drop(endpoint_two);
@@ -759,6 +760,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         client_addr,
         target_a,
         removed_a.decision_token,
+        removed_a.kernel_incarnation,
         removed_a.generation
     ));
     drop(endpoint_a);
@@ -829,6 +831,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         client_addr,
         target_a,
         removed_flow.decision_token,
+        removed_flow.kernel_incarnation,
         removed_flow.generation
     ));
 
@@ -891,6 +894,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
             removed.client,
             removed.dst,
             removed.decision_token,
+            removed.kernel_incarnation,
             removed.generation,
         ));
     }
@@ -949,6 +953,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         client_addr,
         target_c,
         removed_c.decision_token,
+        removed_c.kernel_incarnation,
         removed_c.generation
     ));
     drop(endpoint_c);

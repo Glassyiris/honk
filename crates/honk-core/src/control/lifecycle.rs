@@ -415,6 +415,7 @@ impl ControlPlane {
                 self.ebpf.clone(),
                 self.connection_tracker.clone(),
                 removal_tx,
+                self.tcp_flow_pins.clone(),
             ));
             epoch.janitor = Some(
                 BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone()).spawn_supervised(
@@ -589,6 +590,27 @@ pub(super) async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> an
     };
     task.take();
     result
+}
+
+async fn join_retirement_owner(
+    task: &mut Option<tokio::task::JoinHandle<()>>,
+    owner: &'static str,
+) -> anyhow::Result<()> {
+    let Some(handle) = task.as_mut() else {
+        return Ok(());
+    };
+    let result = match tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                owner,
+                "Retirement owner exceeded its stop deadline; waiting for admitted cleanup"
+            );
+            handle.await
+        }
+    };
+    task.take();
+    result.map_err(anyhow::Error::from)
 }
 
 async fn abort_and_join(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
@@ -819,5 +841,30 @@ mod reap_tests {
         let cancelled = tasks.join_next().await;
         assert!(matches!(&cancelled, Some(Err(error)) if error.is_cancelled()));
         assert!(matches!(reap_tcp(cancelled), EpochEvent::Reaped));
+    }
+}
+
+#[cfg(test)]
+mod retirement_join_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_join_outlives_warning_and_cancelled_waiter() -> anyhow::Result<()> {
+        for owner in ["flow retirement worker", "BPF janitor"] {
+            let (release, waiting) = tokio::sync::oneshot::channel();
+            let mut task = Some(tokio::spawn(async move { waiting.await.unwrap() }));
+            let mut joining = Box::pin(join_retirement_owner(&mut task, owner));
+            assert!(futures::poll!(&mut joining).is_pending());
+            tokio::time::advance(STAGE_TIMEOUT + Duration::from_secs(1)).await;
+            assert!(futures::poll!(&mut joining).is_pending());
+            drop(joining);
+            assert!(!task.as_ref().unwrap().is_finished());
+            let mut joining = Box::pin(join_retirement_owner(&mut task, owner));
+            assert!(futures::poll!(&mut joining).is_pending());
+            release.send(()).unwrap();
+            joining.await?;
+            assert!(task.is_none());
+        }
+        Ok(())
     }
 }

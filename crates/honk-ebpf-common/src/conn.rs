@@ -14,7 +14,7 @@ use network_types::{
 /// (for cleanup).  All fields are repr(C) so the binary layout is identical
 /// regardless of compiler or target triple.
 ///
-/// Layout (repr(C), total 56 bytes):
+/// Layout (repr(C), total 64 bytes):
 ///   offset 0:  is_wan_ingress_direction: u8
 ///   offset 1:  state: u8 (`TcpState` for TCP, `UdpDecisionState` for UDP)
 ///   offset 4:  decision_token: u32 (nonzero only for staged UDP flows)
@@ -25,6 +25,7 @@ use network_types::{
 ///   offset 32: pname: [u8; TASK_COMM_LEN] (process name)
 ///   offset 48: pid: u32
 ///   offset 52: trace_id: u32 (immutable route witness, independent of decision_token)
+///   offset 56: incarnation: u64 (generation-owned identity, independent of UDP tokens)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnState {
@@ -38,9 +39,10 @@ pub struct ConnState {
     pub pname: [u8; TASK_COMM_LEN],
     pub pid: u32,
     pub trace_id: u32,
+    pub incarnation: u64,
 }
 
-const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 56);
+const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 64);
 const _CONN_STATE_ALIGN: () = assert!(core::mem::align_of::<ConnState>() == 8);
 const _CONN_STATE_DIRECTION_OFFSET: () =
     assert!(core::mem::offset_of!(ConnState, is_wan_ingress_direction) == 0);
@@ -54,6 +56,7 @@ const _CONN_STATE_PADDING_OFFSET: () = assert!(core::mem::offset_of!(ConnState, 
 const _CONN_STATE_PNAME_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pname) == 32);
 const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid) == 48);
 const _: () = assert!(core::mem::offset_of!(ConnState, trace_id) == 52);
+const _: () = assert!(core::mem::offset_of!(ConnState, incarnation) == 56);
 
 // Matches the C enum bpf_stats_key.
 // The C enum's underlying type defaults to int (32-bit); use u32 for compatibility.
@@ -64,12 +67,10 @@ pub enum BpfStatsKey {
     TcpConnOverflow = 1,
     RedirectTrackInsertFailure = 2,
     RoutingHandoffInsertFailure = 3,
-    CookiePidInsertFailure = 4,
+    SocketIdentityCaptureFailure = 4,
 }
 
-/// CONN_STATE_MAP capacity, shared by the eBPF map definition and the
-/// userspace janitor's pressure gauge.  ~68 MB kernel memory at 524,288
-/// entries.
+/// CONN_STATE_MAP capacity, shared by the eBPF map and userspace pressure gauge.
 pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;
 
 /// Conn-state entry timeouts used by the eBPF datapath and userspace janitor.
@@ -146,6 +147,47 @@ const _UDP_DECISION_SEQUENCE_NEXT_OFFSET: () =
 const _UDP_DECISION_SEQUENCE_EXHAUSTED_OFFSET: () =
     assert!(core::mem::offset_of!(UdpDecisionSequence, exhausted) == 8);
 
+/// The SYN skb carrier has 56 bits; never truncate a wider allocation domain.
+pub const FLOW_INCARNATION_MAX: u64 = (1 << 56) - 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FlowIncarnationSequence {
+    pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
+    pub padding: u32,
+    pub next: u64,
+}
+
+impl Default for FlowIncarnationSequence {
+    fn default() -> Self {
+        Self {
+            lock: aya_ebpf_bindings::bindings::bpf_spin_lock { val: 0 },
+            padding: 0,
+            next: 0,
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<FlowIncarnationSequence>() == 16);
+const _: () = assert!(core::mem::align_of::<FlowIncarnationSequence>() == 8);
+const _: () = assert!(core::mem::offset_of!(FlowIncarnationSequence, lock) == 0);
+const _: () = assert!(core::mem::offset_of!(FlowIncarnationSequence, padding) == 4);
+const _: () = assert!(core::mem::offset_of!(FlowIncarnationSequence, next) == 8);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetirementFence {
+    pub owner: u64,
+    pub decision_token: u32,
+    pub padding: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<RetirementFence>() == 16);
+const _: () = assert!(core::mem::align_of::<RetirementFence>() == 8);
+const _: () = assert!(core::mem::offset_of!(RetirementFence, owner) == 0);
+const _: () = assert!(core::mem::offset_of!(RetirementFence, decision_token) == 8);
+const _: () = assert!(core::mem::offset_of!(RetirementFence, padding) == 12);
+
 #[inline(always)]
 pub fn tcp_conn_state_expired(state: &ConnState, elapsed_ns: u64) -> bool {
     state.state == TcpState::TcpStateClosing as u8 && elapsed_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
@@ -184,10 +226,12 @@ pub struct ConntrackArgs {
     pub padding: [u8; 2],
     pub pname: [u8; TASK_COMM_LEN],
     pub trace_id: u32,
+    pub incarnation: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 40);
+const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 48);
 const _: () = assert!(core::mem::offset_of!(ConntrackArgs, trace_id) == 36);
+const _: () = assert!(core::mem::offset_of!(ConntrackArgs, incarnation) == 40);
 
 impl ConntrackArgs {
     #[inline(always)]
@@ -250,6 +294,10 @@ impl ConntrackArgs {
 unsafe impl aya::Pod for ConnState {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for UdpDecisionSequence {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FlowIncarnationSequence {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for RetirementFence {}
 
 #[cfg(test)]
 mod tests {

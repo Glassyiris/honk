@@ -15,6 +15,42 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(super) mod netns;
+
+pub(in crate::control) struct TestRetirement {
+    task: tokio::task::JoinHandle<()>,
+    fatal: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
+}
+
+impl TestRetirement {
+    pub(in crate::control) fn start(handle: &ControlPlaneHandle) -> Self {
+        let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
+        let task = crate::control::spawn_udp_removal_worker(
+            Arc::clone(&handle.udp_pool),
+            Arc::clone(&handle.ebpf),
+            Arc::clone(&handle.connection_tracker),
+            fatal_tx,
+            Arc::clone(&handle.tcp_flow_pins),
+        );
+        Self { task, fatal }
+    }
+
+    pub(in crate::control) async fn join(
+        mut self,
+        handle: &ControlPlaneHandle,
+    ) -> anyhow::Result<()> {
+        let shutdown = handle.udp_pool.shutdown().await;
+        handle.tcp_flow_pins.retirement_sink.lock().take();
+        self.task.await?;
+        anyhow::ensure!(shutdown.joined, "test UDP retirement did not join");
+        if let Ok(error) = self.fatal.try_recv() {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 /// A minimal DNS query payload for "a.com" (A record).
 pub(in crate::control) fn dns_query_payload() -> Vec<u8> {
     let mut q = vec![

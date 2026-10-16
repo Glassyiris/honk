@@ -1,6 +1,6 @@
 use super::*;
 use aya::Pod;
-use aya::maps::{HashMap, MapError, PerCpuArray};
+use aya::maps::{HashMap, MapError};
 
 const AUX_MAP_CAPACITY: u32 = 65_536;
 
@@ -84,23 +84,6 @@ fn fragmented_dns_packet(source_port: u16, dscp: u8) -> Vec<u8> {
     frame
 }
 
-fn assert_staging_readers_released(backend: &RealEbpfBackend) {
-    let readers = PerCpuArray::<_, u32>::try_from(
-        backend.bpf().unwrap().map("UDP_DECISION_INFLIGHT").unwrap(),
-    )
-    .unwrap();
-    for slot in [0, 1] {
-        assert!(
-            readers
-                .get(&slot, 0)
-                .unwrap()
-                .iter()
-                .all(|count| *count == 0),
-            "failed publication must not strand a reload-fence reader"
-        );
-    }
-}
-
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn routing_handoff_map_exhaustion_preserves_raw_udp_dns_carriers_and_fails_closed_required_handoffs()
@@ -131,7 +114,6 @@ fn routing_handoff_map_exhaustion_preserves_raw_udp_dns_carriers_and_fails_close
                     UdpDnsRoute::new(2, generation)
                 );
             }
-            assert_staging_readers_released(&backend);
         }
 
         for (side_index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
@@ -192,7 +174,6 @@ fn redirect_track_exhaustion_fails_closed_redirected_dns_but_preserves_native_di
                 SkbInput::default(),
             );
             assert_eq!(result.verdict, expected);
-            assert_staging_readers_released(&backend);
         }
 
         for (side_index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {

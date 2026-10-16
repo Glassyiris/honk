@@ -2,7 +2,9 @@
 use super::observation::ConnectionObservation;
 use super::routing::RoutingDecision;
 use crate::control::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 /// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
 /// addresses, ports in host byte order, `l4proto` as the IANA number.
@@ -13,13 +15,7 @@ pub(crate) fn build_tuples_key(
     src_port: u16,
     l4proto: u8,
 ) -> TuplesKey {
-    // mem::zeroed, NOT TuplesKey::default(): the struct has 3 implicit
-    // padding bytes after l4proto (37 field bytes in a 40-byte repr(C)
-    // layout), and Rust does not guarantee padding is zeroed on field-wise
-    // initialization.  The kernel hashes all 40 key bytes, and the datapath
-    // writes keys from a zeroed scratch buffer — a garbage-padded userspace
-    // key never matches (lookups/deletes silently ENOENT).
-    let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+    let mut key = TuplesKey::default();
     match dst_ip {
         std::net::IpAddr::V4(ip) => {
             key.dst_ip[10] = 0xff;
@@ -89,7 +85,6 @@ impl HandoffResult {
         backend: &dyn crate::ebpf::EbpfBackend,
         key: &TuplesKey,
         entry: RoutingHandoffEntry,
-        atomic: bool,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> Self {
         let handoff = Self::from(entry);
@@ -102,10 +97,6 @@ impl HandoffResult {
             let mut handoff = handoff;
             match backend.capture_kernel_route(key, (&entry).into()) {
                 Ok(mut capture) => {
-                    if !atomic {
-                        capture.gap = Some("kernel_handoff_nonatomic_take");
-                        capture.ambiguous = true;
-                    }
                     if key.dst_port != 53 {
                         let state = if key.l4proto == 6 {
                             backend.tcp_conn_state_lookup(key)
@@ -113,7 +104,8 @@ impl HandoffResult {
                             backend.udp_conn_state_lookup(key)
                         };
                         if !state.ok().flatten().is_some_and(|state| {
-                            state.trace_id == entry.trace_id
+                            state.incarnation == entry.incarnation
+                                && state.trace_id == entry.trace_id
                                 && state.decision_token == entry.result.decision_token
                         }) {
                             capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
@@ -124,17 +116,13 @@ impl HandoffResult {
                     handoff.capture = Some(capture);
                 }
                 Err(gap) => {
-                    handoff.capture_gap = Some(if atomic {
-                        gap
-                    } else {
-                        "kernel_handoff_nonatomic_take"
-                    })
+                    handoff.capture_gap = Some(gap);
                 }
             }
             handoff
         };
         #[cfg(not(feature = "native-api"))]
-        let _ = (backend, key, atomic);
+        let _ = (backend, key);
         handoff
     }
     /// Convert the eBPF process name byte array to an optional string: bytes
@@ -206,6 +194,7 @@ impl TcpFlowKey {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::control) fn from_redirect(tuple: &RedirectTuple) -> Self {
         Self {
             src_ip: *tuple.src_ip.as_bytes(),
@@ -220,9 +209,20 @@ impl TcpFlowKey {
 #[derive(Default)]
 pub(in crate::control) struct TcpFlowPins {
     inner: parking_lot::Mutex<HashMap<TcpFlowKey, usize>>,
+    pub(in crate::control) retirement_sink:
+        parking_lot::Mutex<Option<mpsc::Sender<crate::control::udp_removal::TcpRetirement>>>,
+    pub(in crate::control) expiry_hints: parking_lot::Mutex<
+        Option<Arc<tokio::sync::Mutex<mpsc::Receiver<crate::ebpf::FlowExpiryHint>>>>,
+    >,
 }
 
 impl TcpFlowPins {
+    pub(in crate::control) fn contains(&self, tuples: &TuplesKey) -> bool {
+        self.inner
+            .lock()
+            .contains_key(&TcpFlowKey::from_tuples(tuples))
+    }
+
     fn retain(&self, key: TcpFlowKey) {
         *self.inner.lock().entry(key).or_default() += 1;
     }
@@ -239,6 +239,7 @@ impl TcpFlowPins {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::control) fn snapshot(&self) -> HashSet<TcpFlowKey> {
         self.inner.lock().keys().copied().collect()
     }
@@ -254,22 +255,24 @@ impl TcpFlowPins {
     }
 }
 
-pub(super) struct TcpFlowGuard {
+pub(in crate::control) struct TcpFlowGuard {
     stream: TcpStream,
-    tuples: TuplesKey,
+    pub(in crate::control) tuples: TuplesKey,
+    pub(in crate::control) incarnation: u64,
     pin_key: Option<TcpFlowKey>,
     pins: Arc<TcpFlowPins>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tracker: Arc<ConnectionTracker>,
     tracker_id: Option<String>,
+    outbound_guard: Option<crate::stats::ActiveConnectionGuard>,
+    close_completion: Option<crate::connection_tracker::CloseCompletion>,
 }
 
 impl TcpFlowGuard {
-    fn new(
+    pub(in crate::control) fn new(
         stream: TcpStream,
         tuples: TuplesKey,
+        incarnation: u64,
         pins: Arc<TcpFlowPins>,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         tracker: Arc<ConnectionTracker>,
     ) -> Self {
         let pin_key = TcpFlowKey::from_tuples(&tuples);
@@ -277,11 +280,13 @@ impl TcpFlowGuard {
         Self {
             stream,
             tuples,
+            incarnation,
             pin_key: Some(pin_key),
             pins,
-            ebpf,
             tracker,
             tracker_id: None,
+            outbound_guard: None,
+            close_completion: None,
         }
     }
 
@@ -290,7 +295,7 @@ impl TcpFlowGuard {
     }
 
     #[cfg(test)]
-    pub(super) fn track(&mut self, entry: crate::connection_tracker::ConnectionEntry) {
+    pub(in crate::control) fn track(&mut self, entry: crate::connection_tracker::ConnectionEntry) {
         assert!(
             self.tracker_id.is_none(),
             "TCP flow tracker attached more than once"
@@ -321,7 +326,7 @@ impl TcpFlowGuard {
         }
     }
 
-    fn release_pin(&mut self) -> Option<bool> {
+    pub(in crate::control) fn release_pin(&mut self) -> Option<bool> {
         let key = self.pin_key.take()?;
         match self.pins.release(key) {
             Some(last_owner) => Some(last_owner),
@@ -332,45 +337,47 @@ impl TcpFlowGuard {
         }
     }
 
-    pub(super) async fn retire(mut self) -> bool {
-        let now_ns = match crate::control::janitor::monotonic_now_ns() {
-            Ok(now_ns) => now_ns,
-            Err(error) => {
-                error!(%error, "TCP flow retirement could not read monotonic clock");
-                return false;
-            }
-        };
-        let retire_cutoff_ns = now_ns.saturating_sub(1);
-        let ebpf = Arc::clone(&self.ebpf);
-        let mut backend = ebpf.write().await;
-        match self.release_pin() {
-            Some(false) => return true,
-            Some(true) => {}
-            None => return false,
-        }
+    pub(in crate::control) fn retain_close_completion(
+        &mut self,
+        close: Option<crate::connection_tracker::CloseCompletion>,
+    ) {
+        self.close_completion = close;
+    }
 
-        let current = match backend.tcp_conn_state_lookup(&self.tuples) {
-            Ok(Some(current)) => current,
-            Ok(None) => return true,
-            Err(error) => {
-                error!(%error, ?self.tuples, "TCP flow retirement lookup failed");
-                return false;
-            }
-        };
-        match backend.conn_state_remove_if_unchanged(&[(self.tuples, current)], retire_cutoff_ns) {
-            Ok(removed) => {
-                if removed != 0 {
-                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                        .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
-                }
-                debug!(removed, ?self.tuples, "TCP flow conn-state retired");
-                true
-            }
-            Err(error) => {
-                error!(%error, ?self.tuples, "TCP flow conditional retirement failed");
-                false
-            }
+    pub(in crate::control) fn finish_retirement(mut self, success: bool) {
+        let close = self.close_completion.take();
+        drop(self);
+        if let Some(close) = close {
+            close.0.finish(success);
         }
+    }
+
+    pub(super) async fn retire_with_outbound(
+        mut self,
+        outbound_guard: crate::stats::ActiveConnectionGuard,
+    ) -> bool {
+        self.outbound_guard = Some(outbound_guard);
+        self.retire().await
+    }
+
+    pub(in crate::control) async fn retire(self) -> bool {
+        let sender = self.pins.retirement_sink.lock().clone();
+        let Some(sender) = sender else {
+            error!(?self.tuples, "TCP retirement worker is unavailable");
+            return false;
+        };
+        // Before this admission point cancellation only drops the guard. After
+        // it, the joined worker owns the socket, pins and tracker to completion.
+        let Ok(permit) = sender.reserve_owned().await else {
+            error!(?self.tuples, "TCP retirement worker closed admission");
+            return false;
+        };
+        let (completion, result) = tokio::sync::oneshot::channel();
+        permit.send(crate::control::udp_removal::TcpRetirement {
+            flow: self,
+            completion,
+        });
+        result.await.unwrap_or(false)
     }
 }
 
@@ -406,120 +413,120 @@ impl ControlPlaneHandle {
             }
         });
     }
-    /// Look up the eBPF routing handoff entry for a connection, consuming it.
-    ///
-    /// Only a read lock is taken: `routing_handoff_take` performs raw bpf()
-    /// map operations, which the kernel serializes internally — no userspace
-    /// backend state is touched.  The lock's sole role here is to keep the
-    /// backend (and its map fds) alive against `cleanup()`, which takes the
-    /// write lock.
-    pub(super) async fn lookup_handoff(
-        &self,
-        tuples: &TuplesKey,
-        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
-    ) -> Option<HandoffResult> {
-        let backend = self.ebpf.read().await;
-        backend
-            .routing_handoff_take_observed(tuples)
-            .ok()
-            .flatten()
-            .map(|(entry, atomic)| {
-                HandoffResult::captured(
-                    backend.as_ref(),
-                    tuples,
-                    entry,
-                    atomic,
-                    #[cfg(feature = "native-api")]
-                    observation,
-                )
-            })
-    }
-
-    /// Staged UDP transitions consume their handoff atomically at commit, so
-    /// initialization may only inspect it. Legacy socket ingress consumes the
-    /// tuple once; UDP/53 retains only the non-must controller handoff.
+    /// Read immutable UDP admission metadata without consuming tuple ownership.
+    /// The caller carries its original incarnation through deferred admission.
     pub(super) async fn lookup_udp_handoff(
         &self,
         tuples: &TuplesKey,
         decision_token: u32,
+        kernel_incarnation: Option<u64>,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<Option<HandoffResult>> {
-        if decision_token == 0 {
-            let handoff = self
-                .lookup_handoff(
+        let backend = self.ebpf.read().await;
+        let entry = backend.routing_handoff_lookup(tuples)?;
+        if tuples.dst_port != 53 || decision_token != 0 {
+            let current_incarnation = backend.udp_flow_incarnation(tuples, decision_token)?;
+            if let Some(incarnation) = kernel_incarnation {
+                anyhow::ensure!(
+                    incarnation != 0 && current_incarnation == Some(incarnation),
+                    "UDP admission conn-state incarnation mismatch"
+                );
+            } else {
+                anyhow::ensure!(
+                    decision_token != 0 || current_incarnation.is_none(),
+                    "ordinary UDP admission has no captured incarnation"
+                );
+            }
+            if let Some(entry) = entry {
+                anyhow::ensure!(
+                    entry.result.decision_token == decision_token
+                        && entry.incarnation == current_incarnation.unwrap_or(0),
+                    "UDP admission handoff ownership mismatch"
+                );
+            } else {
+                anyhow::ensure!(
+                    decision_token == 0,
+                    "staged UDP flow has no routing handoff"
+                );
+            }
+        } else if let Some(entry) = entry {
+            anyhow::ensure!(
+                entry.result.decision_token == 0,
+                "raw DNS handoff token mismatch"
+            );
+        }
+        Ok(entry
+            .filter(|entry| {
+                tuples.dst_port != 53
+                    || decision_token != 0
+                    || (entry.result.outbound == OutboundIndex::ControlPlaneRouting as u8
+                        && entry.result.must == 0)
+            })
+            .map(|entry| {
+                HandoffResult::captured(
+                    backend.as_ref(),
                     tuples,
+                    entry,
                     #[cfg(feature = "native-api")]
                     observation,
                 )
-                .await;
-            return Ok(if tuples.dst_port == 53 {
-                handoff.filter(|handoff| {
-                    handoff.outbound == OutboundIndex::ControlPlaneRouting as u8
-                        && handoff.must == 0
-                })
-            } else {
-                handoff
-            });
-        }
-        let backend = self.ebpf.read().await;
-        let entry = backend
-            .routing_handoff_lookup(tuples)?
-            .ok_or_else(|| anyhow::anyhow!("staged UDP flow has no routing handoff"))?;
-        if entry.result.decision_token != decision_token {
-            anyhow::bail!(
-                "staged UDP handoff token mismatch: expected {}, found {}",
-                decision_token,
-                entry.result.decision_token
-            );
-        }
-        Ok(Some(HandoffResult::captured(
-            backend.as_ref(),
-            tuples,
-            entry,
-            true,
-            #[cfg(feature = "native-api")]
-            observation,
-        )))
+            }))
     }
 
     pub(super) async fn adopt_tcp_flow(
         &self,
         stream: TcpStream,
         tuples: TuplesKey,
+        ownership: crate::ebpf::TcpSocketOwnership,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
         let backend = self.ebpf.read().await;
-        match backend.tcp_conn_state_lookup(&tuples) {
-            Ok(Some(_)) => {}
-            Ok(None) => anyhow::bail!("accepted TCP flow has no conn-state: {tuples:?}"),
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "accepted TCP flow conn-state lookup failed for {tuples:?}: {error}"
-                ));
+        let current = backend
+            .tcp_conn_state_lookup(&tuples)?
+            .ok_or_else(|| anyhow::anyhow!("accepted TCP flow has no conn-state: {tuples:?}"))?;
+        let entry = match ownership {
+            crate::ebpf::TcpSocketOwnership::Kernel(binding) => {
+                anyhow::ensure!(
+                    binding.kind == honk_ebpf_common::redirect_need::TCP_BINDING_CHILD
+                        && TcpFlowKey::from_tuples(&binding.tuples)
+                            == TcpFlowKey::from_tuples(&tuples)
+                        && binding.handoff.incarnation != 0
+                        && binding.handoff.incarnation == current.incarnation,
+                    "accepted TCP child is unproven or superseded"
+                );
+                let handoff = backend
+                    .routing_handoff_lookup(&tuples)?
+                    .ok_or_else(|| anyhow::anyhow!("accepted TCP child has no current handoff"))?;
+                let redirect = backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&tuples))?
+                    .ok_or_else(|| anyhow::anyhow!("accepted TCP child has no current redirect"))?;
+                anyhow::ensure!(
+                    handoff.incarnation == current.incarnation
+                        && redirect.incarnation == current.incarnation,
+                    "accepted TCP child auxiliary ownership is superseded"
+                );
+                Some(binding.handoff)
             }
-        }
-
+            crate::ebpf::TcpSocketOwnership::Model => backend.routing_handoff_lookup(&tuples)?,
+        };
+        // Verification and pin retention share the continuous backend read lock:
+        // retirement cannot observe an unpinned accepted owner in between.
         let flow = TcpFlowGuard::new(
             stream,
             tuples,
+            current.incarnation,
             Arc::clone(&self.tcp_flow_pins),
-            Arc::clone(&self.ebpf),
             Arc::clone(&self.connection_tracker),
         );
-        let handoff = backend
-            .routing_handoff_take_observed(&tuples)
-            .ok()
-            .flatten()
-            .map(|(entry, atomic)| {
-                HandoffResult::captured(
-                    backend.as_ref(),
-                    &tuples,
-                    entry,
-                    atomic,
-                    #[cfg(feature = "native-api")]
-                    observation,
-                )
-            });
+        let handoff = entry.map(|entry| {
+            HandoffResult::captured(
+                backend.as_ref(),
+                &tuples,
+                entry,
+                #[cfg(feature = "native-api")]
+                observation,
+            )
+        });
         Ok((flow, handoff))
     }
 
@@ -672,16 +679,8 @@ fn handoff_capture_follows_admission_without_changing_authority() {
             "127.0.0.1:443".parse().unwrap(),
         );
         native.core.flows.set_recording(!admitted);
-        let result =
-            HandoffResult::captured(&backend, &TuplesKey::default(), entry, false, &observation);
-        assert_eq!(
-            result.capture_gap,
-            Some(if admitted {
-                "kernel_handoff_nonatomic_take"
-            } else {
-                "kernel_trace_not_captured"
-            })
-        );
+        let result = HandoffResult::captured(&backend, &TuplesKey::default(), entry, &observation);
+        assert_eq!(result.capture_gap, Some("kernel_trace_not_captured"));
         assert_eq!(
             (
                 result.outbound,

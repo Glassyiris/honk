@@ -28,11 +28,13 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let (fatal, mut failures) = mpsc::unbounded_channel();
+        let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
         let worker = crate::control::udp_removal::spawn_udp_removal_worker(
             Arc::clone(&pool),
             backend,
             Arc::clone(&tracker),
             fatal,
+            Arc::clone(&pins),
         );
         let attach = async |target| {
             pool.prepare_source(
@@ -165,6 +167,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         drop(endpoint_b);
         assert!(pool.shutdown().await.joined);
         assert!(failures.try_recv().is_err());
+        pins.retirement_sink.lock().take();
         worker.await.unwrap();
         drop(owner);
         generation.shutdown().await;

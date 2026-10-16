@@ -1,12 +1,16 @@
 use aya_ebpf::Global;
-use aya_ebpf::btf_maps::{Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SockMap};
+use aya_ebpf::btf_maps::{
+    Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SkStorage, SockMap,
+};
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
-    BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
-    UdpDecisionSequence,
+    BpfStatsKey, ConnState, ConntrackArgs, FlowIncarnationSequence, MAX_CONN_STATE_NUM,
+    ParseTransportCtx, RetirementFence, UdpDecisionSequence,
 };
 use honk_ebpf_common::event::DaeEvent;
-use honk_ebpf_common::redirect_need::{PIDName, RoutingHandoffEntry, TuplesKey};
+use honk_ebpf_common::redirect_need::{
+    RoutingHandoffEntry, SocketIdentity, TcpRequestKey, TcpSocketBinding, TuplesKey,
+};
 use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, RoutingPolicyDescriptor};
 #[cfg(feature = "routing-test")]
 use honk_ebpf_common::{RoutingInput, RoutingTestResult};
@@ -16,7 +20,6 @@ use crate::transport::ParsedPacket;
 /// LPM tries are generation-owned by userspace and bound to the generated
 /// routing extension; no legacy fact map is present in the static datapath.
 pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
-pub const MAX_COOKIE_PID_PNAME_MAPPING_NUM: usize = 65536;
 
 #[repr(C)]
 pub struct UdpDecisionScratch {
@@ -68,65 +71,35 @@ pub fn datapath_flags() -> u32 {
 #[btf_map]
 pub static UDP_DECISION_SEQUENCE: Array<UdpDecisionSequence, 1, 0> = Array::new();
 
-/// Active grace-period slot for token-bound decisions and WAN UDP routing.
-/// Userspace flips this before waiting on the previous per-CPU slot.
+/// Generation-local ownership IDs, independent of the persistent UDP allocator.
 #[btf_map]
-pub static UDP_DECISION_EPOCH: Array<u32, 1, 0> = Array::new();
+pub static FLOW_INCARNATION_SEQUENCE: Array<FlowIncarnationSequence, 1> = Array::new();
 
-/// Per-CPU readers for the two decision grace-period slots.
 #[btf_map]
-pub static UDP_DECISION_INFLIGHT: PerCpuArray<u32, 2> = PerCpuArray::new();
+pub static RETIRE_ACTIVE: Array<u32, 1> = Array::new();
 
-/// Tuple fence installed by userspace before token-conditioned retirement.
-/// New claims and cached followers fail closed while an entry exists.
 #[btf_map]
-pub static UDP_DECISION_RETIRE_FENCE: HashMap<TuplesKey, u32, 65536, 1> = HashMap::new();
+pub static RETIRE_FENCE: HashMap<TuplesKey, RetirementFence, 65536, 1> = HashMap::new();
+
+/// Private map-in-map publication supplies the synchronous kernel grace period.
+#[btf_map]
+pub static RETIRE_GRACE_ROOT: ArrayOfMaps<Array<u32, 1>, 1> = ArrayOfMaps::new();
+
+#[btf_map]
+pub static TCP_REQUEST_BINDINGS: HashMap<TcpRequestKey, TcpSocketBinding, 65536, 1> =
+    HashMap::new();
+
+#[btf_map]
+pub static TCP_SOCKET_BINDING: SkStorage<TcpSocketBinding> = SkStorage::new();
+
+/// Exclusive non-sleepable SYN publishers; no userspace mutation or expiry.
+#[btf_map]
+pub static TCP_PUBLISHING: HashMap<TuplesKey, u64, 65536, 1> = HashMap::new();
 
 #[inline(always)]
-fn try_begin_udp_decision(slot: u32) -> bool {
-    let Some(counter) = UDP_DECISION_INFLIGHT.get_ptr_mut(slot) else {
-        return false;
-    };
-    unsafe {
-        *counter = (*counter).wrapping_add(1);
-    }
-    if UDP_DECISION_EPOCH
-        .get(0)
-        .is_some_and(|epoch| *epoch & 1 == slot)
-    {
-        return true;
-    }
-    unsafe {
-        *counter = (*counter).wrapping_sub(1);
-    }
-    false
-}
-
-#[inline(always)]
-pub fn begin_udp_decision() -> Option<u32> {
-    let first = UDP_DECISION_EPOCH.get(0).map_or(0, |epoch| *epoch & 1);
-    if try_begin_udp_decision(first) {
-        return Some(first);
-    }
-    let second = UDP_DECISION_EPOCH.get(0).map_or(0, |epoch| *epoch & 1);
-    if try_begin_udp_decision(second) {
-        return Some(second);
-    }
-    None
-}
-
-#[inline(always)]
-pub fn end_udp_decision(slot: u32) {
-    if let Some(counter) = UDP_DECISION_INFLIGHT.get_ptr_mut(slot & 1) {
-        unsafe {
-            *counter = (*counter).wrapping_sub(1);
-        }
-    }
-}
-
-#[inline(always)]
-pub fn udp_decision_retiring(key: &TuplesKey) -> bool {
-    unsafe { UDP_DECISION_RETIRE_FENCE.get(key).is_some() }
+pub fn tuple_retiring(key: &TuplesKey) -> bool {
+    RETIRE_ACTIVE.get(0).is_none_or(|active| *active != 0)
+        && unsafe { RETIRE_FENCE.get(key).is_some() }
 }
 
 #[btf_map]
@@ -189,17 +162,14 @@ pub static ROUTING_TEST_INPUT: Array<RoutingInput, 1> = Array::new();
 pub static ROUTING_TEST_OUTPUT: Array<RoutingTestResult, 1> = Array::new();
 
 #[btf_map]
-pub static COOKIE_PID_MAP: HashMap<u64, PIDName, MAX_COOKIE_PID_PNAME_MAPPING_NUM, 1> =
-    HashMap::new();
+pub static SOCKET_IDENTITY: SkStorage<SocketIdentity> = SkStorage::new();
 
 // Must be pinned in userspace.
 // Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live entries
-// instead of pinning ~84 MB for 512K capacity up front.  The datapath
-// expires entries lazily on hit and the userspace janitor sweeps with
-// state-based timeouts; the kernel never evicts on its own (silent LRU
-// eviction could re-route or break live flows mid-flight).  Inserts under
-// kernel memory pressure can fail — the overflow counter + fail-closed
-// path covers that.
+// instead of pinning ~84 MB for 512K capacity up front. Expired hits emit
+// advisory hints; the userspace retirement worker and janitor reclaim under
+// the common tuple fence and kernel grace period. The kernel never evicts.
+// Inserts under memory pressure fail closed and increment the overflow counter.
 #[btf_map]
 pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as usize }, 1> =
     HashMap::new();
@@ -212,7 +182,7 @@ pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
-/// Insert failures: conn UDP/TCP, redirect-track, routing-handoff, cookie-PID.
+/// Conn UDP/TCP, redirect/handoff insertion, and socket identity capture failures.
 #[btf_map]
 pub static BPF_STATS_MAP: Array<u64, 5> = Array::new();
 

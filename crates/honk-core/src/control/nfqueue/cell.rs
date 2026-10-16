@@ -29,6 +29,7 @@ impl FlowKey {
 pub(in crate::control) struct PendingUdpIdentity {
     pub(super) key: FlowKey,
     pub(super) decision_token: u32,
+    pub(super) kernel_incarnation: Option<u64>,
     pub(super) endpoint_generation: u64,
 }
 
@@ -37,6 +38,7 @@ impl PendingUdpIdentity {
         Self {
             key,
             decision_token,
+            kernel_incarnation: None,
             endpoint_generation,
         }
     }

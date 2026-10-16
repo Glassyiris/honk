@@ -245,14 +245,18 @@ fn routing_meta(outbound: u8, mark: u32, must: bool, offload: bool) -> RoutingMe
     RoutingMeta { raw }
 }
 
-fn cached_state(outbound: u8, state: u8, token: u32, must: bool, offload: bool) -> ConnState {
-    let mut value: ConnState = unsafe { mem::zeroed() };
+fn monotonic_now_ns() -> u64 {
     let mut now: libc::timespec = unsafe { mem::zeroed() };
     assert_eq!(
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
         0
     );
-    value.last_seen_ns = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+}
+
+fn cached_state(outbound: u8, state: u8, token: u32, must: bool, offload: bool) -> ConnState {
+    let mut value: ConnState = unsafe { mem::zeroed() };
+    value.last_seen_ns = monotonic_now_ns();
     value.state = state;
     value.decision_token = token;
     value.meta = routing_meta(outbound, 0, must, offload);
@@ -516,6 +520,8 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
             smac: [0x02, 0, 0, 0, 0, 2],
             outbound: TEST_OUTBOUND,
             ifindex: 1,
+            last_seen_ns: monotonic_now_ns(),
+            incarnation: 1,
             ..Default::default()
         },
     )

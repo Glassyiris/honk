@@ -785,6 +785,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
                 removed.client,
                 removed.dst,
                 removed.decision_token,
+                removed.kernel_incarnation,
                 removed.generation,
             ));
         }

@@ -309,6 +309,7 @@ impl PendingUdpVerdicts {
                     cell.identity.destination(),
                     payload,
                     decision_token,
+                    cell.identity.kernel_incarnation,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
                     held.received_at,
@@ -359,6 +360,7 @@ impl PendingUdpVerdicts {
                     cell.identity.destination(),
                     payload,
                     decision_token,
+                    cell.identity.kernel_incarnation,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
                     held.received_at,
@@ -425,8 +427,17 @@ impl PendingUdpVerdicts {
             self.drop_one(held, DropOutcome::Other);
             return NfqueueIngest::Dropped;
         };
-        let retained = match backend.udp_conn_state_lookup(&key.tuples()) {
-            Ok(Some(state)) if state.decision_token == decision_token => retained_state(&state),
+        let (retained, kernel_incarnation) = match backend.udp_conn_state_lookup(&key.tuples()) {
+            Ok(Some(state))
+                if state.decision_token == decision_token
+                    && (state.incarnation != 0
+                        || backend.observe_datapath().kind == crate::ebpf::DatapathKind::Mock) =>
+            {
+                (
+                    retained_state(&state),
+                    (state.incarnation != 0).then_some(state.incarnation),
+                )
+            }
             Ok(Some(_)) | Ok(None) => {
                 drop(vacant);
                 self.stats.record_udp_nfqueue_token_mismatch();
@@ -461,6 +472,7 @@ impl PendingUdpVerdicts {
                     key.destination,
                     payload,
                     decision_token,
+                    kernel_incarnation,
                     None,
                     slow_permit,
                     held.received_at,
@@ -513,7 +525,10 @@ impl PendingUdpVerdicts {
             RetainedState::ActiveDirect(final_mark) => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity::new(key, decision_token, 0);
+                let identity = PendingUdpIdentity {
+                    kernel_incarnation,
+                    ..PendingUdpIdentity::new(key, decision_token, 0)
+                };
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::ActiveDirect {
@@ -533,11 +548,15 @@ impl PendingUdpVerdicts {
                     key.destination,
                     payload,
                     decision_token,
+                    kernel_incarnation,
                     held.received_at,
                     &self.stats,
                 ) {
                     Ok(generation) => {
-                        let identity = PendingUdpIdentity::new(key, decision_token, generation);
+                        let identity = PendingUdpIdentity {
+                            kernel_incarnation,
+                            ..PendingUdpIdentity::new(key, decision_token, generation)
+                        };
                         vacant.insert(Arc::new(FlowCell::terminal(
                             identity,
                             CellState::Proxy {
@@ -565,7 +584,10 @@ impl PendingUdpVerdicts {
             RetainedState::Block => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity::new(key, decision_token, 0);
+                let identity = PendingUdpIdentity {
+                    kernel_incarnation,
+                    ..PendingUdpIdentity::new(key, decision_token, 0)
+                };
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::Block {

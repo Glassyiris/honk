@@ -10,12 +10,8 @@
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::__sk_buff,
-    helpers::{
-        bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head,
-        bpf_skb_store_bytes,
-    },
+    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_store_bytes},
 };
-use aya_ebpf_cty::c_void;
 use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
@@ -23,24 +19,22 @@ use honk_ebpf_common::{
     ROUTING_META_FLAG_WAN_USERSPACE, RedirectEntry, RedirectTuple, SKB_MARK_RESERVED_MASK,
     TASK_COMM_LEN, TPROXY_MARK, UdpDnsRoute,
     conn::BpfStatsKey,
-    redirect_need::{PIDName, RoutingHandoffEntry, Tuples, TuplesKey},
+    redirect_need::{RoutingHandoffEntry, Tuples, TuplesKey},
 };
 use network_types::eth::EthHdr;
 
 use crate::{
     contrack::{
-        AUXILIARY_MAP_REFRESH_INTERVAL_NS, copy_reversed_tuples, is_new_tcp_connection,
-        is_short_lived_udp_traffic, lookup_udp_seen, mark_tcp_seen, mark_udp_seen,
+        copy_reversed_tuples, is_new_tcp_connection, is_short_lived_udp_traffic, lookup_udp_seen,
+        mark_tcp_seen, mark_udp_seen,
     },
     maps::{
-        COOKIE_PID_MAP, OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK,
-        ROUTING_HANDOFF_MAP, increment_bpf_stat,
+        OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTING_HANDOFF_MAP,
+        UDP_DECISION_SCRATCH_MAP, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
-    transport::{
-        ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PASS_NDP_REDIRECT, parse_packet,
-        tcp_listener_l4proto,
-    },
+    socket_identity,
+    transport::{ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PASS_NDP_REDIRECT, parse_packet},
 };
 
 use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
@@ -105,32 +99,11 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
     }
 }
 
-/// Look up the socket cookie in `COOKIE_PID_MAP` to determine whether this
-/// packet originated from the control-plane daemon process. A hit refreshes
-/// `last_seen_ns` only after the shared one-second auxiliary-map interval.
-/// Returns `None` when no PID mapping exists.
-///
-/// The caller must additionally check:
-/// - `pid_name.pid == PARAM.control_plane_pid` to detect the control plane
-/// - `PARAM.dae_socket_mark && skb_mark == PARAM.dae_socket_mark`
-///   to determine whether the packet should be allowed to pass.
-#[inline(always)]
-pub fn pid_is_control_plane(ctx: &TcContext) -> Option<&PIDName> {
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.skb.skb as *mut c_void) };
-    let ptr = COOKIE_PID_MAP.get_ptr_mut(cookie)?;
-    let now = unsafe { bpf_ktime_get_ns() };
-    let entry = unsafe { &mut *ptr };
-    if now.wrapping_sub(entry.last_seen_ns) >= AUXILIARY_MAP_REFRESH_INTERVAL_NS {
-        entry.last_seen_ns = now;
-    }
-    Some(entry)
-}
-
 /// Convenience: true when the packet is from the control plane (any detection
 /// method).
 #[inline(always)]
 pub fn is_control_plane(ctx: &TcContext) -> bool {
-    if let Some(pid_pname) = pid_is_control_plane(ctx) {
+    if let Some(pid_pname) = socket_identity::lookup(ctx) {
         let param = PARAM.load();
         if param.control_plane_pid != 0 && pid_pname.pid == param.control_plane_pid {
             return true;
@@ -171,6 +144,7 @@ pub fn prep_redirect_to_control_plane(
     refresh_if_stale: bool,
     outbound: u8,
     decision_token: u32,
+    incarnation: u64,
 ) -> i32 {
     let param = PARAM.load();
 
@@ -225,11 +199,23 @@ pub fn prep_redirect_to_control_plane(
         let now = unsafe { bpf_ktime_get_ns() };
         let stale = match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
             Some(old) => unsafe {
-                if (*old).decision_token != decision_token {
+                if crate::contrack::auxiliary_expired(
+                    &tuples.five,
+                    (*old).incarnation,
+                    now.wrapping_sub((*old).last_seen_ns),
+                    false,
+                ) {
                     return TOKEN_IDENTITY_MISMATCH;
                 }
-                now.wrapping_sub((*old).last_seen_ns)
+                if (*old).decision_token != decision_token || (*old).incarnation != incarnation {
+                    return TOKEN_IDENTITY_MISMATCH;
+                }
+                if now.wrapping_sub((*old).last_seen_ns)
                     >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+                {
+                    (*old).last_seen_ns = now;
+                }
+                false
             },
             None => true,
         };
@@ -246,6 +232,7 @@ pub fn prep_redirect_to_control_plane(
     // Record the final outbound so dae0_ingress can attribute replies.
     redirect_entry.outbound = outbound;
     redirect_entry.decision_token = decision_token;
+    redirect_entry.incarnation = incarnation;
 
     if link_h_len == ETH_HLEN {
         redirect_entry.smac.copy_from_slice(&ethh.src_addr);
@@ -254,7 +241,15 @@ pub fn prep_redirect_to_control_plane(
     // else: L3-only — MACs stay zero.
 
     if REDIRECT_TRACK
-        .insert(redirect_tuple, redirect_entry, 0u64)
+        .insert(
+            redirect_tuple,
+            redirect_entry,
+            if refresh_if_stale {
+                aya_ebpf_bindings::bindings::BPF_NOEXIST as u64
+            } else {
+                0
+            },
+        )
         .is_err()
     {
         increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
@@ -307,6 +302,17 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         IPPROTO_TCP => {
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
+            if crate::contrack::tuple_unavailable(&reversed_key, is_new_tcp_connection(&pkt.tcph)) {
+                return Err(TC_ACT_SHOT);
+            }
+            let _tcp_publisher = if is_new_tcp_connection(&pkt.tcph) {
+                let publisher =
+                    crate::contrack::TcpPublisher::acquire(&reversed_key).ok_or(TC_ACT_SHOT)?;
+                pkt.incarnation = publisher.incarnation;
+                Some(publisher)
+            } else {
+                None
+            };
             mark_tcp_seen(
                 &reversed_key,
                 &pkt.tcph,
@@ -319,7 +325,11 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 None, // pname
                 0,    // pid
                 0,
+                &mut pkt.incarnation,
             );
+            if crate::contrack::tuple_unavailable(&reversed_key, false) {
+                return Err(TC_ACT_SHOT);
+            }
         }
         IPPROTO_UDP => {
             // Pure L2 bridging can skip inet prerouting: queued DNS must never escape natively.
@@ -334,6 +344,9 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             }
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
+            if crate::contrack::tuple_unavailable(&reversed_key, false) {
+                return Err(TC_ACT_SHOT);
+            }
             // A reply leaving dae0 answers a flow honk already owns. Creating a
             // WAN-direction entry for a peer the client never contacted would
             // make the client's first packet to that peer bypass the proxy.
@@ -354,6 +367,9 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                     0,    // trace_id
                     0,    // routing_meta_flags
                 );
+            }
+            if crate::contrack::tuple_unavailable(&reversed_key, false) {
+                return Err(TC_ACT_SHOT);
             }
         }
         _ => {}
@@ -394,9 +410,7 @@ fn do_tproxy_wan_egress_tcp(
             IpVersionType::V6 as u8
         };
 
-        // Look up PID info for process-name routing; also check
-        // control-plane traffic (single cookie lookup).
-        let pid_pname_opt = pid_is_control_plane(ctx);
+        let pid_pname_opt = socket_identity::lookup(ctx);
         if let Some(pid_pname) = pid_pname_opt {
             let param = PARAM.load();
             if pid_pname.pid == param.control_plane_pid {
@@ -473,9 +487,13 @@ fn do_tproxy_wan_egress_tcp(
             pname_bytes,
             handoff_pid,
             trace_id,
+            &mut pkt.incarnation,
         );
 
         if tcp_conn.is_none() {
+            if crate::maps::tuple_retiring(&tuples.five) {
+                return Err(TC_ACT_SHOT);
+            }
             if outbound == OUTBOUND_DIRECT && mark == 0 {
                 return Err(TC_ACT_OK);
             }
@@ -496,6 +514,7 @@ fn do_tproxy_wan_egress_tcp(
             None, // pname
             0,    // pid
             0,
+            &mut pkt.incarnation,
         );
 
         if let Some(conn) = tcp_conn {
@@ -508,11 +527,15 @@ fn do_tproxy_wan_egress_tcp(
                 handoff_pname = Some(&conn.pname);
                 handoff_pid = conn.pid;
                 mac.copy_from_slice(&conn.mac);
+                pkt.incarnation = conn.incarnation;
             } else {
                 // No cached routing — direct connection, pass through.
                 return Err(TC_ACT_OK);
             }
         } else {
+            if crate::contrack::tuple_unavailable(&tuples.five, false) {
+                return Err(TC_ACT_SHOT);
+            }
             // No state at all — pass through.
             return Err(TC_ACT_OK);
         }
@@ -540,6 +563,7 @@ fn do_tproxy_wan_egress_tcp(
         !tcp_state_syn,
         outbound,
         0,
+        pkt.incarnation,
     );
     if prepare_result != 0 {
         if dns || mark != 0 || prepare_result == TOKEN_IDENTITY_MISMATCH {
@@ -552,20 +576,33 @@ fn do_tproxy_wan_egress_tcp(
     // Set cb marks for dae0peer_ingress.
     unsafe {
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
-        (*ctx.skb.skb).cb[1] = tcp_listener_l4proto(tcph) as u32;
+        (*ctx.skb.skb).cb[1] = 0;
         (*ctx.skb.skb).cb[2] = 0;
-        (*ctx.skb.skb).cb[3] = 0;
+        (*ctx.skb.skb).cb[3] = if tcp_state_syn {
+            pkt.incarnation as u32
+        } else {
+            0
+        };
+        (*ctx.skb.skb).cb[4] = if tcp_state_syn {
+            (pkt.incarnation >> 32) as u32
+        } else {
+            0
+        };
     }
 
-    // Write routing handoff entry for the control plane.  Only the SYN that
-    // starts the connection needs one: userspace consumes handoffs once per
-    // accepted connection, so per-packet writes on established flows would
-    // just churn the map until the janitor sweeps them.
+    // Only the SYN publishes the immutable snapshot used by request/child proof.
     if tcp_state_syn {
-        let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
+        let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
+            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+            return Err(TC_ACT_SHOT);
+        };
+        // WAN inlining shares its bounded stack with the conntrack subprograms.
+        let handoff: &mut RoutingHandoffEntry = unsafe { &mut (*scratch).handoff };
+        unsafe { core::ptr::write_bytes(handoff, 0, 1) };
         handoff.last_seen_ns = unsafe { bpf_ktime_get_ns() };
         handoff.routing_generation = routing_generation;
         handoff.trace_id = trace_id;
+        handoff.incarnation = pkt.incarnation;
         handoff.result.mark = mark;
         handoff.result.must = must as u8;
         handoff.result.outbound = outbound;
@@ -608,6 +645,7 @@ fn fast_path_decision(
     routing_generation: u64,
     trace_id: u32,
     direct_mark_index: u32,
+    incarnation: u64,
 ) -> Verdict {
     let dns = tuples.five.dst_port == 53;
     if outbound == OUTBOUND_DIRECT && mark == 0 && (!dns || must) {
@@ -647,6 +685,7 @@ fn fast_path_decision(
         true,
         outbound,
         decision_token,
+        incarnation,
     );
     if prepare_result != 0 {
         if dns || mark != 0 || prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
@@ -660,6 +699,7 @@ fn fast_path_decision(
         (*ctx.skb.skb).cb[1] = IPPROTO_UDP as u32;
         (*ctx.skb.skb).cb[2] = dns_route_mark;
         (*ctx.skb.skb).cb[3] = trace_id;
+        (*ctx.skb.skb).cb[4] = 0;
     }
 
     // Must UDP53 ownership (including the direct mark index) is entirely
@@ -668,16 +708,35 @@ fn fast_path_decision(
         let now = unsafe { bpf_ktime_get_ns() };
         let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
             Some(old) => unsafe {
-                if (*old).result.decision_token != decision_token {
+                if crate::contrack::auxiliary_expired(
+                    &tuples.five,
+                    (*old).incarnation,
+                    now.wrapping_sub((*old).last_seen_ns),
+                    true,
+                ) {
                     return Err(TC_ACT_SHOT);
                 }
-                now.wrapping_sub((*old).last_seen_ns)
+                if (*old).result.decision_token != decision_token
+                    || (*old).incarnation != incarnation
+                {
+                    return Err(TC_ACT_SHOT);
+                }
+                if now.wrapping_sub((*old).last_seen_ns)
                     >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+                {
+                    (*old).last_seen_ns = now;
+                }
+                false
             },
             None => true,
         };
         if write_handoff {
-            let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
+            let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
+                increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+                return Err(TC_ACT_SHOT);
+            };
+            let handoff: &mut RoutingHandoffEntry = unsafe { &mut (*scratch).handoff };
+            unsafe { core::ptr::write_bytes(handoff, 0, 1) };
             handoff.last_seen_ns = now;
             handoff.routing_generation = if routing_generation != 0 {
                 routing_generation
@@ -685,6 +744,7 @@ fn fast_path_decision(
                 crate::route::captured_generation(trace_id)
             };
             handoff.trace_id = trace_id;
+            handoff.incarnation = incarnation;
             handoff.result.mark = mark;
             handoff.result.must = must as u8;
             handoff.result.outbound = outbound;
@@ -696,7 +756,11 @@ fn fast_path_decision(
                 handoff.result.pname.copy_from_slice(pname);
             }
             if ROUTING_HANDOFF_MAP
-                .insert(tuples.five, handoff, 0u64)
+                .insert(
+                    tuples.five,
+                    handoff,
+                    aya_ebpf_bindings::bindings::BPF_NOEXIST as u64,
+                )
                 .is_err()
             {
                 increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
@@ -735,8 +799,7 @@ fn do_tproxy_wan_egress_udp(
         IpVersionType::V6 as u8
     };
 
-    // Check control plane (single cookie lookup).
-    let pid_pname_opt = pid_is_control_plane(ctx);
+    let pid_pname_opt = socket_identity::lookup(ctx);
     if let Some(pid_pname) = pid_pname_opt {
         let param = PARAM.load();
         if pid_pname.pid == param.control_plane_pid {
@@ -779,6 +842,7 @@ fn do_tproxy_wan_egress_udp(
                 0,
                 conn_state.trace_id,
                 u32::MAX,
+                conn_state.incarnation,
             );
         }
     }
@@ -852,11 +916,17 @@ fn do_tproxy_wan_egress_udp(
             routing_meta_flags,
         );
         if state.is_none() {
+            if crate::contrack::tuple_unavailable(&tuples.five, false)
+                || crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
+            {
+                return Err(TC_ACT_SHOT);
+            }
             if outbound == OUTBOUND_DIRECT && mark == 0 {
                 return Err(TC_ACT_OK);
             }
             return Err(TC_ACT_SHOT);
         }
+        pkt.incarnation = state.unwrap().incarnation;
     }
 
     fast_path_decision(
@@ -874,6 +944,7 @@ fn do_tproxy_wan_egress_udp(
         routing_generation,
         trace_id,
         decision.direct_mark_index,
+        pkt.incarnation,
     )
 }
 
@@ -939,21 +1010,24 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     {
         return Err(TC_ACT_OK);
     }
+    if crate::contrack::tuple_unavailable(
+        &pkt.tuples.five,
+        pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph),
+    ) {
+        return Err(TC_ACT_SHOT);
+    }
+    let _tcp_publisher = if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
+        let publisher =
+            crate::contrack::TcpPublisher::acquire(&pkt.tuples.five).ok_or(TC_ACT_SHOT)?;
+        pkt.incarnation = publisher.incarnation;
+        Some(publisher)
+    } else {
+        None
+    };
 
     match pkt.l4proto {
         IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt),
-        IPPROTO_UDP => {
-            let Some(epoch) = crate::maps::begin_udp_decision() else {
-                return Err(TC_ACT_SHOT);
-            };
-            let verdict = if crate::maps::udp_decision_retiring(&pkt.tuples.five) {
-                Err(TC_ACT_SHOT)
-            } else {
-                do_tproxy_wan_egress_udp(ctx, link_h_len, pkt)
-            };
-            crate::maps::end_udp_decision(epoch);
-            verdict
-        }
+        IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
         _ => Ok(TC_ACT_OK),
     }
 }

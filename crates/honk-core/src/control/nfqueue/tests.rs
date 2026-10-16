@@ -930,3 +930,77 @@ fn fixed_deadlines_match_the_held_packet_contract() {
     assert_eq!(WATCHDOG_INTERVAL, Duration::from_millis(100));
     assert_eq!(HARD_HOLD_TIMEOUT, Duration::from_secs(3));
 }
+
+#[tokio::test]
+async fn staged_admission_keeps_captured_incarnation_through_cancel() {
+    let token = 47;
+    let key = identity(token, 0).key;
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.seed_staged_udp_flow(
+        &key.tuples(),
+        ConnState {
+            state: UdpDecisionState::Pending as u8,
+            decision_token: token,
+            incarnation: 61,
+            meta: RoutingMeta {
+                raw: ROUTING_META_FLAG_PUBLISHED,
+            },
+            ..Default::default()
+        },
+    );
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let endpoints = Arc::new(UdpEndpointPool::new());
+    let (pending, mut fatal) = PendingUdpVerdicts::new(
+        Arc::clone(&backend),
+        endpoints,
+        Arc::new(StatsManager::new()),
+    );
+    pending.open_admission();
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let received_at = Instant::now();
+    let packet = QueuedPacket {
+        tuple: UdpTuple {
+            client: key.client,
+            destination: key.destination,
+        },
+        payload: bytes::Bytes::from_static(b"old"),
+        mark: honk_ebpf_common::pack_nfqueue_mark(token).unwrap(),
+        priority: None,
+        received_at,
+    };
+    let NfqueueIngest::Initialize { lease, identity } = pending
+        .ingest_held_wait(
+            packet,
+            HeldVerdict::test(1, received_at, Arc::clone(&sink)),
+            Some(test_flow_slot()),
+        )
+        .await
+    else {
+        panic!("pending flow must initialize")
+    };
+    assert_eq!(lease.kernel_incarnation(), Some(61));
+    assert_eq!(identity.kernel_incarnation, Some(61));
+    {
+        let mut backend = backend.write().await;
+        let mut state = backend
+            .udp_conn_state_lookup(&key.tuples())
+            .unwrap()
+            .unwrap();
+        state.incarnation = 62;
+        backend.udp_conn_state_store(&key.tuples(), &state).unwrap();
+    }
+    pending.cancel(identity).await.unwrap();
+    assert_eq!(*sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .udp_conn_state_lookup(&key.tuples())
+            .unwrap()
+            .unwrap()
+            .incarnation,
+        62
+    );
+    assert!(fatal.try_recv().is_err());
+    drop(lease);
+}

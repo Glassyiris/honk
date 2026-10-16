@@ -34,10 +34,19 @@ real decision/load goldens remain in `ebpf/real/routing/tests/`.
 
 Token-zero WAN UDP publishes explicit userspace ownership in RoutingMeta bit 58;
 native unmarked WAN direct instead publishes OFFLOAD. WAN cached and fresh writers
-must join the UDP reader epoch and honor the tuple retirement fence. Retire owned
-conn-state, handoff and redirect metadata together only after checking auxiliary
-tokens; preserve native/offloaded, missing and newer-token authority. Never infer
-WAN ownership from `must` alone or change the persistent 12-byte allocator ABI.
+must check the canonical tuple fence before borrowing state. Retire owned
+conn-state, handoff and redirect metadata only after a successful synchronous
+kernel grace barrier and matching auxiliary tokens/incarnations. Preserve
+native/offloaded, missing and newer-token authority. Never infer WAN ownership
+from `must` alone or change the persistent 12-byte allocator ABI.
+
+Socket process identity is native non-cloned `SK_STORAGE`, captured once by
+create/connect/sendmsg and reclaimed only with the actual socket object. A
+missing identity after CREATE and one lookup refuses the operation; no cookie
+hash, release hook, janitor or allow-and-drop fallback remains. Required cgroup
+capture failure aborts startup. Discover cgroup mounts through
+`/proc/thread-self/mounts`; root-cgroup tests require a disposable VM, because
+private mount/network namespaces do not isolate cgroup BPF attachment.
 
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The child also strips inherited `CARGO_PROFILE_*` overrides so host profiling cannot replace the standalone kernel crate's release policy. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it, and a sidecar older than core's `build.rs` triggers a rebuild after embedding-policy changes. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`; manually built or supplied objects remain the caller's responsibility.
 

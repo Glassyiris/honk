@@ -1,6 +1,39 @@
 use super::*;
 
 impl PendingUdpVerdicts {
+    pub(super) fn retire_pending(
+        &self,
+        backend: &mut dyn EbpfBackend,
+        key: TuplesKey,
+        token: u32,
+        incarnation: Option<u64>,
+    ) -> Result<UdpDecisionCommitResult, PendingUdpDecisionError> {
+        let request = crate::ebpf::RetireRequest {
+            key,
+            kind: crate::ebpf::RetireKind::Udp {
+                token,
+                incarnation,
+                pending_only: true,
+            },
+        };
+        let mut outcomes = [None];
+        let result = backend.retire_batch(&[request], &mut outcomes);
+        let conn = match &result {
+            Ok(counts) => counts.conn,
+            Err(error) => error.counts.conn,
+        };
+        crate::ebpf::USERSPACE_CONN_STATE_DELETES
+            .fetch_add(conn, std::sync::atomic::Ordering::Relaxed);
+        result
+            .map_err(|error| self.fatal_error("retire pending flow", error.source.to_string()))?;
+        outcomes[0].ok_or_else(|| {
+            self.fatal_error(
+                "retire pending flow",
+                "backend omitted retirement outcome".into(),
+            )
+        })
+    }
+
     pub(in crate::control) async fn run_watchdog(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
         let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -75,16 +108,13 @@ impl PendingUdpVerdicts {
                         let Ok(mut backend) = self.ebpf.try_write() else {
                             return;
                         };
-                        backend.abort_pending_udp_flow(&key.tuples(), decision_token)
+                        self.retire_pending(backend.as_mut(), key.tuples(), decision_token, None)
                     };
                     match result {
                         Ok(UdpDecisionCommitResult::Applied)
                         | Ok(UdpDecisionCommitResult::Missing) => {}
                         Ok(result) => self.record_commit_mismatch(result),
-                        Err(error) => self.signal_fatal(PendingUdpFatal::new(
-                            "scheduled abort",
-                            error.to_string(),
-                        )),
+                        Err(_) => {}
                     }
                     false
                 }

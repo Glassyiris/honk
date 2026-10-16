@@ -21,5 +21,7 @@ pub mod route;
 pub mod routing;
 pub mod sk;
 pub mod sk_lookup;
+mod socket_identity;
 pub mod stats;
+mod tcp_binding;
 pub mod transport;

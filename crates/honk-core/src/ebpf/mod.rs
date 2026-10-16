@@ -3,6 +3,8 @@
 pub mod maps;
 pub mod mock;
 pub mod probe;
+mod retirement;
+pub use retirement::*;
 #[cfg(feature = "ebpf")]
 pub mod real;
 
@@ -11,9 +13,7 @@ use honk_ebpf_common::*;
 use std::sync::atomic::AtomicU64;
 
 pub const UDP_DECISION_SEQUENCE_MAP: &str = "UDP_DECISION_SEQUENCE";
-pub const UDP_DECISION_EPOCH_MAP: &str = "UDP_DECISION_EPOCH";
-pub const UDP_DECISION_INFLIGHT_MAP: &str = "UDP_DECISION_INFLIGHT";
-pub const UDP_DECISION_RETIRE_FENCE_MAP: &str = "UDP_DECISION_RETIRE_FENCE";
+pub const RETIRE_FENCE_MAP: &str = "RETIRE_FENCE";
 
 /// Cumulative conn-state entries deleted by userspace (TCP relay teardown,
 /// UDP endpoint reaper), for the janitor's occupancy gauge.  eBPF-side
@@ -26,9 +26,9 @@ pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 /// chunk boundary (used to enforce the janitor time budget).
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> bool + 'a;
 pub type RedirectTrackChunkVisitor<'a> = dyn FnMut(&[(RedirectTuple, RedirectEntry)]) -> bool + 'a;
-pub type CookiePidChunkVisitor<'a> = dyn FnMut(&[(u64, PIDName)]) -> bool + 'a;
 pub type RoutingHandoffChunkVisitor<'a> =
     dyn FnMut(&[(TuplesKey, RoutingHandoffEntry)]) -> bool + 'a;
+pub type TcpRequestChunkVisitor<'a> = dyn FnMut(&[(TcpRequestKey, TcpSocketBinding)]) -> bool + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPushPhase {
@@ -574,10 +574,10 @@ pub trait EbpfBackend: Send + Sync {
 
     fn tcp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     fn tcp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
-    fn tcp_conn_state_remove(&mut self, key: &TuplesKey) -> anyhow::Result<()>;
     fn udp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     fn udp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
-    fn udp_conn_state_remove(&mut self, key: &TuplesKey) -> anyhow::Result<()>;
+    /// Capture ownership at endpoint admission, never at teardown.
+    fn udp_flow_incarnation(&self, key: &TuplesKey, token: u32) -> anyhow::Result<Option<u64>>;
 
     /// Publish one token-bound UDP decision transition. The caller holds the
     /// backend write lock; implementations validate the state incarnation and
@@ -589,22 +589,22 @@ pub trait EbpfBackend: Send + Sync {
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult>;
 
-    /// Fail a staged flow closed without touching a later tuple incarnation.
-    fn abort_pending_udp_flow(
+    /// Retire captured owners under one bounded tuple-fence/grace batch.
+    fn retire_batch(
         &mut self,
-        key: &TuplesKey,
-        token: u32,
-    ) -> anyhow::Result<UdpDecisionCommitResult>;
-
-    /// Retire a userspace-owned flow. Nonzero tokens remove only the matching
-    /// staged/proxy incarnation and auxiliaries. Zero removes a legacy published,
-    /// non-offloaded state and, for explicit WAN userspace ownership, its matching
-    /// auxiliaries. Native kernel decisions and superseding incarnations survive.
-    fn remove_udp_flow(
-        &mut self,
-        key: &TuplesKey,
-        token: u32,
-    ) -> anyhow::Result<UdpDecisionCommitResult>;
+        requests: &[RetireRequest<'_>],
+        outcomes: &mut [Option<UdpDecisionCommitResult>],
+    ) -> Result<RetireCounts, RetireError>;
+    fn tcp_socket_ownership(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> anyhow::Result<TcpSocketOwnership>;
+    fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>>;
+    fn tcp_request_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut TcpRequestChunkVisitor<'_>,
+    ) -> anyhow::Result<()>;
 
     /// Validate the pinned allocator map and its locked value before admission.
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()>;
@@ -616,8 +616,7 @@ pub trait EbpfBackend: Send + Sync {
     /// rolled-back legacy monotonic allocator starting at `generation`.
     fn reset_udp_decision_sequence(&mut self, generation: u32) -> anyhow::Result<bool>;
 
-    /// Inspect a staged handoff without consuming it. UDP decision commit owns
-    /// the token-checked removal; legacy consumers may still use `take`.
+    /// Inspect immutable handoff metadata without consuming newer ownership.
     fn routing_handoff_lookup(
         &self,
         key: &TuplesKey,
@@ -629,30 +628,6 @@ pub trait EbpfBackend: Send + Sync {
         key: &RedirectTuple,
         entry: &RedirectEntry,
     ) -> anyhow::Result<()>;
-    fn redirect_track_remove(&mut self, key: &RedirectTuple) -> anyhow::Result<()>;
-
-    /// Atomically look up and remove the handoff entry for `key`.
-    ///
-    /// The real backend prefers a single `BPF_MAP_LOOKUP_AND_DELETE_ELEM`
-    /// syscall (kernel 4.20+) and falls back to lookup+delete on kernels
-    /// without it.  The fallback is not atomic: the eBPF datapath may
-    /// re-insert the key between the two syscalls, in which case the fresh
-    /// entry can be dropped. Ordinary flows may re-route in userspace;
-    /// transparent TCP DNS rejects a missing handoff instead.
-    ///
-    /// Takes `&self` so the per-connection hot path only needs a read lock
-    /// on the backend: individual bpf() map operations are serialized by
-    /// the kernel and no userspace backend state is touched.  The lock's
-    /// only job is to keep the backend (and its map fds) alive against
-    /// `cleanup()`, which takes the write lock.
-    fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>>;
-
-    fn routing_handoff_take_observed(
-        &self,
-        key: &TuplesKey,
-    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
-        Ok(self.routing_handoff_take(key)?.map(|entry| (entry, true)))
-    }
 
     #[cfg(feature = "native-api")]
     fn bind_kernel_trace_dictionary(
@@ -679,9 +654,6 @@ pub trait EbpfBackend: Send + Sync {
         PnameSupport::Full
     }
 
-    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
-    fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;
-
     fn set_outbound_alive(
         &mut self,
         outbound: u8,
@@ -693,10 +665,8 @@ pub trait EbpfBackend: Send + Sync {
 
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>>;
 
-    // CONN_STATE_MAP is a plain hash: the datapath expires entries lazily on
-    // hit, and the janitor sweeps it proactively with state-based timeouts
-    // (mirroring the datapath's own expiry rules).  The kernel never evicts
-    // on its own — silent LRU eviction could re-route or break live flows.
+    // CONN_STATE_MAP is a plain hash. Expired datapath hits emit advisory
+    // hints; all physical reclamation belongs to fenced userspace retirement.
 
     /// Snapshot all (key, entry) pairs from CONN_STATE_MAP for janitor scans.
     /// Implementations may use bounded batch reads internally.
@@ -739,40 +709,9 @@ pub trait EbpfBackend: Send + Sync {
         visit: &mut RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 
-    fn cookie_pid_for_each_chunk(
-        &self,
-        chunk_size: usize,
-        visit: &mut CookiePidChunkVisitor<'_>,
-    ) -> anyhow::Result<()>;
-
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
-
-    /// Re-check candidates before deleting them. A key reused or transitioned
-    /// after the scan is retained unless its current timestamp and TCP state
-    /// match the scanned incarnation and it is no newer than
-    /// `expired_before_ns`.
-    fn conn_state_remove_if_unchanged(
-        &mut self,
-        entries: &[(TuplesKey, ConnState)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64>;
-    fn redirect_track_remove_if_unchanged(
-        &mut self,
-        entries: &[(RedirectTuple, RedirectEntry)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64>;
-    fn cookie_pid_remove_if_unchanged(
-        &mut self,
-        entries: &[(u64, PIDName)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64>;
-    fn routing_handoff_remove_if_unchanged(
-        &mut self,
-        entries: &[(TuplesKey, RoutingHandoffEntry)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64>;
 }

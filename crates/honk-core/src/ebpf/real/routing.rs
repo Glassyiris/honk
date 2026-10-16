@@ -600,10 +600,13 @@ impl RealEbpfBackend {
             version >= (6, 12, 0),
             "routing tests require Linux 6.12 or newer"
         );
+        events::validate_flow_lifetime_object_layout(obj)?;
         let mut loader = EbpfLoader::new();
         loader.override_global("PARAM", &param, true);
-        let bpf = loader.load(obj)?;
+        let mut bpf = loader.load(obj)?;
         validate_routing_handoff_layout(&bpf)?;
+        retirement::validate_flow_lifetime_layout(&bpf)?;
+        let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
         Ok(Self {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),
@@ -618,7 +621,12 @@ impl RealEbpfBackend {
             listeners_published: false,
             log_flush_handle: None,
             event_flush_handle: None,
-            cap_lookup_and_delete: BatchCapability::new(),
+            expiry_hints: None,
+            retirement_grace_inner,
+            retirement_owner: 0,
+            retirement_failed: false,
+            retirement_faults: Default::default(),
+            tcp_bindings: None,
             cap_lookup_batch: BatchCapability::new(),
             routing_generation: None,
             routing_slot: 0,

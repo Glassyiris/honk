@@ -16,12 +16,6 @@ use std::path::Path;
 const ENOENT: c_long = libc::ENOENT as c_long;
 pub const BPF_BATCH_CHUNK: usize = 128;
 
-pub enum LookupAndDelete<V> {
-    Unsupported,
-    Missing,
-    Value(V),
-}
-
 pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
 pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long> {
@@ -227,50 +221,30 @@ pub(super) fn write_udp_decision_sequence_locked(
     )
 }
 
-pub fn bpf_lookup_and_delete<K: Pod, V: Pod>(
+pub(super) fn validate_map_layout(
     bpf: &Ebpf,
-    cap: &BatchCapability,
-    map: &str,
-    key: &K,
-) -> anyhow::Result<LookupAndDelete<V>> {
-    if cap.is_unsupported() {
-        return Ok(LookupAndDelete::Unsupported);
-    }
-    let fd = map_fd(bpf, map)?;
-    let mut value = MaybeUninit::<V>::uninit();
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key as *const K as u64;
-    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_mut_ptr() as u64;
-    let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_AND_DELETE_ELEM as c_long, &mut attr) };
-    if !cap.observe(result) {
-        debug!(
-            "bpf lookup_and_delete({}) unsupported, using lookup+delete",
-            map
-        );
-        return Ok(LookupAndDelete::Unsupported);
-    }
-    match result {
-        Ok(()) => Ok(LookupAndDelete::Value(unsafe { value.assume_init() })),
-        Err(ENOENT) => Ok(LookupAndDelete::Missing),
-        Err(error) => Err(anyhow::anyhow!(
-            "bpf lookup_and_delete({map}) errno={error}"
-        )),
-    }
-}
-
-/// Delete through a shared Aya map handle. This is only used by the legacy
-/// fallback for `routing_handoff_take`, whose public contract deliberately
-/// takes `&self` so hot-path callers can retain a backend read lock.
-pub fn bpf_delete_shared<K: Pod>(bpf: &Ebpf, map: &str, key: &K) -> anyhow::Result<()> {
-    let fd = map_fd(bpf, map)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key as *const K as u64;
-    match unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) } {
-        Ok(()) | Err(ENOENT) => Ok(()),
-        Err(error) => Err(anyhow::anyhow!("bpf delete({map}) errno={error}")),
-    }
+    name: &str,
+    type_: bpf_map_type,
+    key: u32,
+    value: u32,
+    entries: u32,
+    flags: u32,
+) -> anyhow::Result<()> {
+    let info = raw_map_info(map_fd(bpf, name)?)?;
+    anyhow::ensure!(
+        info.type_ == type_ as u32
+            && info.key_size == key
+            && info.value_size == value
+            && info.max_entries == entries
+            && info.map_flags == flags,
+        "map '{name}' has incompatible lifetime layout: type={} key={} value={} entries={} flags={}",
+        info.type_,
+        info.key_size,
+        info.value_size,
+        info.max_entries,
+        info.map_flags
+    );
+    Ok(())
 }
 
 fn lookup_batch_result(result: Result<(), c_long>, count: u32) -> Result<(usize, bool), c_long> {

@@ -15,6 +15,8 @@ struct Fixture {
     listener: tokio::net::TcpListener,
     client: TcpStream,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    removals: Option<tokio::task::JoinHandle<()>>,
+    removal_errors: mpsc::UnboundedReceiver<anyhow::Error>,
 }
 
 impl Fixture {
@@ -97,6 +99,14 @@ impl Fixture {
         let handle = plane.spawn_handle();
         handle.connection_tracker.disable_api();
         store_active_tcp_flow(&handle, destination, source).await?;
+        let (fatal_tx, removal_errors) = mpsc::unbounded_channel();
+        let removals = spawn_udp_removal_worker(
+            Arc::clone(&plane.udp_pool),
+            Arc::clone(&handle.ebpf),
+            Arc::clone(&handle.connection_tracker),
+            fatal_tx,
+            Arc::clone(&handle.tcp_flow_pins),
+        );
         let worker = handle.clone();
         let task = tokio::spawn(async move { worker.serve_connection(accepted, source).await });
         Ok(Self {
@@ -108,7 +118,19 @@ impl Fixture {
             listener,
             client,
             task,
+            removals: Some(removals),
+            removal_errors,
         })
+    }
+
+    async fn finish_removals(&mut self) -> anyhow::Result<()> {
+        self.plane.udp_pool.shutdown().await;
+        self.handle.tcp_flow_pins.retirement_sink.lock().take();
+        if let Some(task) = self.removals.take() {
+            task.await?;
+        }
+        assert!(self.removal_errors.try_recv().is_err());
+        Ok(())
     }
 
     async fn flow(&self, state: &str) -> anyhow::Result<Value> {
@@ -354,6 +376,7 @@ async fn native_tcp_success_keeps_decision_path_after_selector_change() -> anyho
                 .count(),
             1
         );
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -419,6 +442,7 @@ async fn native_tcp_lost_leaf_capture_does_not_invent_physical_routing_provenanc
         fixture.client.shutdown().await?;
         upstream.shutdown().await?;
         (&mut fixture.task).await??;
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -481,6 +505,7 @@ async fn native_tcp_proxy_hostname_resolution_is_not_business_target_resolution(
         fixture.client.shutdown().await?;
         proxy.shutdown().await?;
         (&mut fixture.task).await??;
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -531,6 +556,7 @@ async fn native_tcp_retains_block_and_failed_dial_without_connection() -> anyhow
                 u32::from(selected == "peer")
             );
             assert_eq!(fixture.handle.stats.snapshot()["outer"].active_conns, 0);
+            fixture.finish_removals().await?;
             fixture.server.shutdown().await;
         }
         Ok::<_, anyhow::Error>(())
@@ -607,6 +633,7 @@ async fn native_tcp_cancelled_attempt_keeps_pre_reload_generation_and_name() -> 
                 .count(),
             1
         );
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -647,6 +674,7 @@ async fn native_tcp_http_host_does_not_replace_consumed_ip_routing_input() -> an
         fixture.client.shutdown().await?;
         upstream.shutdown().await?;
         (&mut fixture.task).await??;
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -712,6 +740,7 @@ async fn native_tcp_delete_closes_both_peers_without_recording() -> anyhow::Resu
             .send()
             .await?;
         assert_eq!(again.status(), reqwest::StatusCode::NOT_FOUND);
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -756,6 +785,7 @@ async fn tcp_close_claims_share_guard_retirement() -> anyhow::Result<()> {
             tracker.close_selected(disappeared).await,
             CloseOutcome::Gone
         );
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -829,6 +859,7 @@ async fn native_bulk_oversize_counts_unowned_mapped_sources_before_any_close() -
         assert_eq!(fixture.client.read(&mut byte).await?, 0);
         assert_eq!(upstream.read(&mut byte).await?, 0);
         (&mut fixture.task).await??;
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -846,6 +877,13 @@ async fn aborted_tcp_close_does_not_acknowledge_guard_retirement() -> anyhow::Re
         upstream.read_exact(&mut byte).await?;
         let tracker = &fixture.handle.connection_tracker;
         let backend = fixture.handle.ebpf.write().await;
+        let retiring = fixture.flow("active").await?;
+        assert!(retiring["ended_at"].is_null());
+        assert!(
+            !steps(&retiring, "connection")
+                .iter()
+                .any(|step| step["data"]["milestone"] == "terminal")
+        );
         let selected = tracker
             .snapshot_close(Some("tcp"), None, 1000)
             .unwrap()
@@ -862,18 +900,11 @@ async fn aborted_tcp_close_does_not_acknowledge_guard_retirement() -> anyhow::Re
             ),
         );
         assert!(futures::poll!(&mut duplicate).is_pending());
-        assert_eq!(upstream.read(&mut byte).await?, 0);
-        let retiring = fixture.flow("active").await?;
-        assert!(retiring["ended_at"].is_null());
-        assert!(
-            !steps(&retiring, "connection")
-                .iter()
-                .any(|step| step["data"]["milestone"] == "terminal")
-        );
         fixture.task.abort();
         assert!((&mut fixture.task).await.unwrap_err().is_cancelled());
         assert_eq!(completion.wait().await, CloseOutcome::Failed);
         assert_eq!(duplicate.await, CloseOutcome::Failed);
+        assert_eq!(upstream.read(&mut byte).await?, 0);
         assert_eq!(fixture.client.read(&mut byte).await?, 0);
         drop(backend);
         let cancelled = fixture.flow("failed").await?;
@@ -883,6 +914,7 @@ async fn aborted_tcp_close_does_not_acknowledge_guard_retirement() -> anyhow::Re
             .collect();
         assert_eq!(terminals.len(), 1);
         assert_eq!(terminals[0]["data"]["reason"], "cancelled");
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -995,6 +1027,7 @@ async fn native_tcp_race_links_only_actual_winner_and_cancels_loser() -> anyhow:
                         == attempt["data"]["attempt_id"])
             );
         }
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })
@@ -1025,6 +1058,7 @@ async fn native_tcp_empty_plan_records_selection_without_dial() -> anyhow::Resul
     let dial = steps(&failed, "dial_mode").pop().unwrap();
     assert_eq!(dial["data"]["effective_target"], "none");
     assert_eq!(dial["data"]["reason"], "no_eligible_candidates");
+    fixture.finish_removals().await?;
     fixture.server.shutdown().await;
     Ok(())
 }
@@ -1107,6 +1141,7 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             crate::observe::vocab::ConnectionState::Failed,
             "dial_failed",
         );
+        fixture.finish_removals().await?;
         fixture.server.shutdown().await;
         Ok::<_, anyhow::Error>(())
     })

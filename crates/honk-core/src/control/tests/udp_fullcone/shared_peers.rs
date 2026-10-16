@@ -227,10 +227,10 @@ async fn run_shadowsocks(
                 let body = ss_open(&master, &buffer[..size])?;
                 let (target, payload) = take_addr(&body)?;
                 let serial = clients.len() as u64 + 1;
-                if !clients.contains_key(&client) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = clients.entry(client) {
                     let socket = egress(bind).await?;
                     spawn_egress_reader(&mut tasks, Arc::clone(&socket), client, reply_tx.clone());
-                    clients.insert(client, (serial, socket));
+                    entry.insert((serial, socket));
                 }
                 let (association, socket) = &clients[&client];
                 socket.send_to(payload, target).await?;

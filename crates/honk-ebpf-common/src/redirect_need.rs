@@ -36,7 +36,11 @@ pub struct TuplesKey {
     pub src_port: u16,
     pub dst_port: u16,
     pub l4proto: u8,
+    pub padding: [u8; 3],
 }
+
+const _: () = assert!(core::mem::size_of::<TuplesKey>() == 40);
+const _: () = assert!(core::mem::offset_of!(TuplesKey, padding) == 37);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -53,9 +57,10 @@ pub struct RoutingHandoffEntry {
     pub routing_generation: u64,
     pub trace_id: u32,
     pub trace_padding: u32,
+    pub incarnation: u64,
 }
 
-const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 64);
+const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 72);
 const _ROUTING_HANDOFF_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RoutingHandoffEntry>() == 8);
 const _ROUTING_HANDOFF_LAST_SEEN_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingHandoffEntry, last_seen_ns) == 0);
@@ -70,6 +75,38 @@ const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
 );
 const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_id) == 56);
 const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_padding) == 60);
+const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, incarnation) == 64);
+
+pub const TCP_BINDING_LISTENER: u32 = 1;
+pub const TCP_BINDING_CHILD: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct TcpRequestKey {
+    pub address: u64,
+    pub cookie: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<TcpRequestKey>() == 16);
+const _: () = assert!(core::mem::align_of::<TcpRequestKey>() == 8);
+const _: () = assert!(core::mem::offset_of!(TcpRequestKey, address) == 0);
+const _: () = assert!(core::mem::offset_of!(TcpRequestKey, cookie) == 8);
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct TcpSocketBinding {
+    pub tuples: TuplesKey,
+    pub handoff: RoutingHandoffEntry,
+    pub kind: u32,
+    pub padding: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<TcpSocketBinding>() == 120);
+const _: () = assert!(core::mem::align_of::<TcpSocketBinding>() == 8);
+const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, tuples) == 0);
+const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, handoff) == 40);
+const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, kind) == 112);
+const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, padding) == 116);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -79,13 +116,17 @@ pub struct DomainRouting {
 const _: () = assert!(ROUTING_BITMAP_WORDS == crate::ROUTING_FACT_CAPACITY / 32);
 const _: () = assert!(core::mem::size_of::<DomainRouting>() == 32);
 
-#[derive(Debug, Clone, Copy, Default)]
+/// First-captured process identity retained by the socket's own lifetime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
-pub struct PIDName {
-    pub last_seen_ns: u64,
+pub struct SocketIdentity {
     pub pid: u32,
     pub pname: [u8; TASK_COMM_LEN],
 }
+const _: () = assert!(core::mem::size_of::<SocketIdentity>() == 20);
+const _: () = assert!(core::mem::align_of::<SocketIdentity>() == 4);
+const _: () = assert!(core::mem::offset_of!(SocketIdentity, pid) == 0);
+const _: () = assert!(core::mem::offset_of!(SocketIdentity, pname) == 4);
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for TuplesKey {}
@@ -94,4 +135,8 @@ unsafe impl aya::Pod for RoutingHandoffEntry {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for DomainRouting {}
 #[cfg(not(target_arch = "bpf"))]
-unsafe impl aya::Pod for PIDName {}
+unsafe impl aya::Pod for SocketIdentity {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for TcpRequestKey {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for TcpSocketBinding {}

@@ -291,9 +291,12 @@ impl PendingUdpVerdicts {
                 drop(backend);
                 return Err(self.expire_unarmed_pending(&cell, identity));
             }
-            let result = backend
-                .abort_pending_udp_flow(&identity.tuples(), identity.decision_token)
-                .map_err(|error| self.fatal_error("abort pending flow", error.to_string()))?;
+            let result = self.retire_pending(
+                backend.as_mut(),
+                identity.tuples(),
+                identity.decision_token,
+                identity.kernel_incarnation,
+            )?;
             let mismatch = match result {
                 UdpDecisionCommitResult::Applied
                 | UdpDecisionCommitResult::Missing

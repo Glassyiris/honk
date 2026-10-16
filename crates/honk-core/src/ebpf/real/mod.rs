@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use super::{
-    EbpfBackend, UDP_DECISION_EPOCH_MAP, UDP_DECISION_INFLIGHT_MAP, UDP_DECISION_RETIRE_FENCE_MAP,
-    UDP_DECISION_SEQUENCE_MAP, USERSPACE_CONN_STATE_DELETES, UdpDecisionCommitResult,
-    UdpDecisionSequenceStatus, UdpDecisionTransition, apply_udp_decision_transition,
-    probe::BatchCapability, udp_state_is_legacy_userspace_owned, udp_state_is_userspace_owned,
+    EbpfBackend, FlowExpiryHint, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP, RetireCounts,
+    RetireError, RetireKind, RetireRequest, TcpSocketOwnership, UDP_DECISION_SEQUENCE_MAP,
+    USERSPACE_CONN_STATE_DELETES, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
+    UdpDecisionTransition, apply_udp_decision_transition, probe::BatchCapability,
+    udp_state_is_legacy_userspace_owned, udp_state_is_userspace_owned,
     validate_udp_decision_transition,
 };
 
@@ -63,10 +64,31 @@ pub(super) fn validate_routing_handoff_layout(bpf: &Ebpf) -> anyhow::Result<()> 
     validate_routing_handoff_sizes(info.key_size(), info.value_size())
 }
 
+fn validate_socket_identity_layout(bpf: &Ebpf) -> anyhow::Result<()> {
+    const NAME: &str = "SOCKET_IDENTITY";
+    let map = bpf
+        .map(NAME)
+        .ok_or_else(|| anyhow::anyhow!("map '{NAME}' not found"))?;
+    let aya::maps::Map::SkStorage(map) = map else {
+        anyhow::bail!("map '{NAME}' has incompatible map type");
+    };
+    let info = map
+        .info()
+        .map_err(|error| anyhow::anyhow!("query map '{NAME}': {error}"))?;
+    anyhow::ensure!(
+        info.key_size() == core::mem::size_of::<i32>() as u32
+            && info.value_size() == core::mem::size_of::<SocketIdentity>() as u32
+            && info.max_entries() == 0
+            && info.map_flags() == aya_obj::generated::BPF_F_NO_PREALLOC,
+        "map '{NAME}' has incompatible socket identity layout or flags"
+    );
+    Ok(())
+}
+
 /// Real eBPF backend backed by Aya and kernel BPF maps.
 ///
-/// Aya owns ordinary map operations; raw extensions provide atomic take,
-/// batch reads/writes, and locked persistent-allocator access.
+/// Aya owns ordinary map operations; raw extensions provide batch reads/writes
+/// and locked persistent-allocator access. Every reclamation uses fence/grace.
 pub struct RealEbpfBackend {
     bpf: Option<Ebpf>,
     pin_root: PathBuf,
@@ -79,9 +101,8 @@ pub struct RealEbpfBackend {
     /// lets a reconnect release stale primary links and makes a
     /// retry observe hooks that are still live instead of stacking them.
     interface_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
-    /// cgroup sock_create/sock_release links (cookie→PID mapping, control-plane
-    /// bypass). Held for the backend lifetime — dropping one detaches the
-    /// program in the kernel.
+    /// cgroup sock_create identity-capture link, held for the backend lifetime.
+    /// Dropping the link detaches the program in the kernel.
     cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
     /// cgroup connect4/6 + sendmsg4/6 links; same lifetime rule as above.
     cgroup_sock_addr_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
@@ -94,8 +115,13 @@ pub struct RealEbpfBackend {
     log_flush_handle: Option<tokio::task::JoinHandle<()>>,
     /// Background task that drains EVENT_RINGBUF (DaeEvent) into the log.
     event_flush_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Runtime probe for `BPF_MAP_LOOKUP_AND_DELETE_ELEM` (handoff take).
-    cap_lookup_and_delete: BatchCapability,
+    expiry_hints: Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>>,
+    retirement_grace_inner: AyaArray<AyaMapData, u32>,
+    retirement_owner: u64,
+    retirement_failed: bool,
+    #[cfg(test)]
+    retirement_faults: retirement::RetirementFaults,
+    tcp_bindings: Option<tcp_binding::TcpBindings>,
     /// Runtime probe for `BPF_MAP_LOOKUP_BATCH` (janitor map scans).
     cap_lookup_batch: BatchCapability,
     /// Active compiled program, links, descriptor, and generation-owned maps.
@@ -115,10 +141,9 @@ pub struct RealEbpfBackend {
     udp_staging_quiesce_incomplete: bool,
 }
 
-/// Detect the first cgroup2 mount point from /proc/mounts.
-/// Returns the mount path (e.g. /sys/fs/cgroup) if found.
+/// Find cgroup2 in the calling thread's mount namespace, not its thread-group leader's.
 fn detect_cgroup_path() -> anyhow::Result<String> {
-    let mounts = std::fs::read_to_string("/proc/mounts")?;
+    let mounts = std::fs::read_to_string("/proc/thread-self/mounts")?;
     for line in mounts.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 3 && fields[2] == "cgroup2" {
@@ -152,16 +177,17 @@ mod observation;
 mod process_name;
 #[cfg(feature = "native-api")]
 pub(crate) mod receive_trace;
+mod retirement;
 mod routing;
 mod syscall;
+mod tcp_binding;
 #[cfg(test)]
 mod tests;
 
 pub use events::*;
 pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
 use syscall::{
-    LookupAndDelete, bpf_delete_shared, bpf_lookup_and_delete, bpf_lookup_batch_scan,
-    bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
+    bpf_lookup_batch_scan, bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
     validate_loaded_udp_decision_sequence,
 };
 
@@ -254,6 +280,10 @@ impl RealEbpfBackend {
     }
 
     fn hash_remove_present<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        if name != RETIRE_FENCE_MAP {
+            retirement::inject_indexed_fault(&mut self.retirement_faults.delete, "delete")?;
+        }
         match self.hash_map_mut::<K, V>(name)?.remove(key) {
             Ok(()) => Ok(true),
             Err(error) if Self::map_error_is_missing(&error) => Ok(false),
@@ -339,126 +369,6 @@ impl RealEbpfBackend {
         Ok(())
     }
 
-    fn rotate_udp_decision_epoch(&mut self) -> anyhow::Result<u32> {
-        let previous = self
-            .array_get::<u32>(UDP_DECISION_EPOCH_MAP, 0)?
-            .unwrap_or(0)
-            & 1;
-        self.array_set(UDP_DECISION_EPOCH_MAP, 0, &(previous ^ 1))?;
-        Ok(previous)
-    }
-
-    fn wait_udp_decision_slot(&self, slot: u32) -> anyhow::Result<()> {
-        let bpf = self.bpf()?;
-        let map = bpf
-            .map(UDP_DECISION_INFLIGHT_MAP)
-            .ok_or_else(|| anyhow::anyhow!("map '{UDP_DECISION_INFLIGHT_MAP}' not found"))?;
-        let array = AyaPerCpuArray::<_, u32>::try_from(map)
-            .map_err(|error| anyhow::anyhow!("map '{UDP_DECISION_INFLIGHT_MAP}': {error}"))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            let active = match array.get(&(slot & 1), 0) {
-                Ok(values) => values
-                    .iter()
-                    .fold(0u64, |total, value| total.wrapping_add(*value as u64)),
-                Err(MapError::KeyNotFound) => 0,
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "map '{UDP_DECISION_INFLIGHT_MAP}' get[{slot}]: {error}"
-                    ));
-                }
-            };
-            if active == 0 {
-                return Ok(());
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "UDP decision grace period {slot} did not quiesce"
-            );
-            std::thread::yield_now();
-        }
-    }
-
-    fn with_udp_retirement_fence(
-        &mut self,
-        key: &TuplesKey,
-        token: u32,
-        operation: impl FnOnce(&mut Self) -> anyhow::Result<UdpDecisionCommitResult>,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
-        self.hash_insert_noexist(UDP_DECISION_RETIRE_FENCE_MAP, key, &token)?;
-        let result = (|| {
-            let previous = self.rotate_udp_decision_epoch()?;
-            self.wait_udp_decision_slot(previous)?;
-            operation(self)
-        })();
-        let release = match self.hash_lookup::<_, u32>(UDP_DECISION_RETIRE_FENCE_MAP, key)? {
-            Some(current) if current == token => {
-                self.hash_remove::<_, u32>(UDP_DECISION_RETIRE_FENCE_MAP, key)
-            }
-            Some(current) => Err(anyhow::anyhow!(
-                "UDP retirement fence token changed from {token} to {current}"
-            )),
-            None => Err(anyhow::anyhow!(
-                "UDP retirement fence for token {token} disappeared"
-            )),
-        };
-        release?;
-        result
-    }
-
-    fn remove_token_bound_udp_flow(
-        &mut self,
-        key: &TuplesKey,
-        token: u32,
-        pending_only: bool,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
-        if token == 0 && !pending_only {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
-        }
-        self.with_udp_retirement_fence(key, token, |backend| {
-            let Some(state) = backend.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
-                return Ok(UdpDecisionCommitResult::Missing);
-            };
-            if state.decision_token != token {
-                return Ok(if pending_only {
-                    UdpDecisionCommitResult::TokenMismatch
-                } else {
-                    UdpDecisionCommitResult::Superseded
-                });
-            }
-            let state_allowed = if pending_only {
-                state.state == UdpDecisionState::Preparing as u8
-                    || state.state == UdpDecisionState::Pending as u8
-            } else {
-                udp_state_is_userspace_owned(state.state)
-            };
-            if !state_allowed {
-                return Ok(UdpDecisionCommitResult::StateMismatch);
-            }
-            let handoff =
-                backend.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-            if handoff.is_some_and(|entry| entry.result.decision_token != token) {
-                return Ok(UdpDecisionCommitResult::TokenMismatch);
-            }
-            let track_key = RedirectTuple::from_tuples(key);
-            let track = backend.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-            if track.is_some_and(|entry| entry.decision_token != token) {
-                return Ok(UdpDecisionCommitResult::TokenMismatch);
-            }
-            if handoff.is_some() {
-                backend.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-            }
-            if track.is_some() {
-                backend.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-            }
-            if !backend.hash_remove_present::<_, ConnState>("CONN_STATE_MAP", key)? {
-                return Ok(UdpDecisionCommitResult::Missing);
-            }
-            USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(UdpDecisionCommitResult::Applied)
-        })
-    }
-
     /// The pin root defaults to `/sys/fs/bpf`, which every other BPF consumer on the host also
     /// pins into, so cleanup unlinks the names this instance claimed rather than sweeping the
     /// directory. Neither persistent sequence is claimed, so both survive ordinary cleanup,
@@ -526,6 +436,10 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !ready || !self.retirement_failed,
+            "retirement ownership is unresolved"
+        );
         if ready && !self.listeners_published {
             anyhow::bail!("listener socket generation is not fully published");
         }
@@ -534,7 +448,8 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
         anyhow::ensure!(
-            flags & DATAPATH_FLAG_NFQ_READY == 0 || !self.udp_staging_quiesce_incomplete,
+            flags & DATAPATH_FLAG_NFQ_READY == 0
+                || (!self.udp_staging_quiesce_incomplete && !self.retirement_failed),
             "UDP staging quiescence must complete before NFQUEUE can reopen"
         );
         self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
@@ -542,27 +457,56 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
         self.udp_staging_quiesce_incomplete = true;
-        let previous = self.rotate_udp_decision_epoch()?;
-        self.wait_udp_decision_slot(previous)?;
+        self.grace_barrier()?;
 
         let mut staged = Vec::new();
         self.for_each_map_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
             staged.extend(chunk.iter().filter_map(|(key, state)| {
-                (state.state == UdpDecisionState::Preparing as u8
-                    || state.state == UdpDecisionState::Pending as u8)
-                    .then_some((*key, state.decision_token))
+                (key.l4proto == libc::IPPROTO_UDP as u8
+                    && (state.state == UdpDecisionState::Preparing as u8
+                        || state.state == UdpDecisionState::Pending as u8))
+                    .then_some((*key, state.decision_token, state.incarnation))
             }));
             true
         })?;
-        for (key, token) in staged {
-            let result = self.remove_token_bound_udp_flow(&key, token, true)?;
-            anyhow::ensure!(
-                matches!(
-                    result,
-                    UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing
-                ),
-                "UDP staging quiescence rejected token {token}: {result:?}"
-            );
+        #[cfg(test)]
+        if let Some(complete_publication) = self.retirement_faults.quiesce_after_scan.take() {
+            complete_publication(self)?;
+        }
+        for chunk in staged.chunks(RETIRE_BATCH_CAPACITY) {
+            let mut requests = [RetireRequest {
+                key: TuplesKey::default(),
+                kind: RetireKind::Tcp { incarnation: 0 },
+            }; RETIRE_BATCH_CAPACITY];
+            let mut outcomes = [None; RETIRE_BATCH_CAPACITY];
+            for (request, (key, token, incarnation)) in requests.iter_mut().zip(chunk) {
+                *request = RetireRequest {
+                    key: *key,
+                    kind: RetireKind::Udp {
+                        token: *token,
+                        incarnation: Some(*incarnation),
+                        pending_only: true,
+                    },
+                };
+            }
+            let result = self.retire_flows(&requests[..chunk.len()], &mut outcomes[..chunk.len()]);
+            let conn = match &result {
+                Ok(counts) => counts.conn,
+                Err(error) => error.counts.conn,
+            };
+            USERSPACE_CONN_STATE_DELETES.fetch_add(conn, std::sync::atomic::Ordering::Relaxed);
+            result?;
+            // A token-zero claim can finish native publication between scan and fence.
+            for (result, (_, token, _)) in outcomes.iter().zip(chunk) {
+                anyhow::ensure!(
+                    matches!(
+                        result,
+                        Some(UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing)
+                    ) || (*token == 0
+                        && matches!(result, Some(UdpDecisionCommitResult::StateMismatch))),
+                    "UDP staging quiescence rejected retirement: {result:?}"
+                );
+            }
         }
         self.fence_routing_generation()?;
         self.udp_staging_quiesce_incomplete = false;
@@ -643,9 +587,6 @@ impl EbpfBackend for RealEbpfBackend {
     fn tcp_conn_state_store(&mut self, k: &TuplesKey, s: &ConnState) -> anyhow::Result<()> {
         self.hash_insert("CONN_STATE_MAP", k, s)
     }
-    fn tcp_conn_state_remove(&mut self, k: &TuplesKey) -> anyhow::Result<()> {
-        self.hash_remove::<_, ConnState>("CONN_STATE_MAP", k)
-    }
 
     fn udp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
         self.hash_lookup("CONN_STATE_MAP", k)
@@ -653,8 +594,22 @@ impl EbpfBackend for RealEbpfBackend {
     fn udp_conn_state_store(&mut self, k: &TuplesKey, s: &ConnState) -> anyhow::Result<()> {
         self.hash_insert("CONN_STATE_MAP", k, s)
     }
-    fn udp_conn_state_remove(&mut self, k: &TuplesKey) -> anyhow::Result<()> {
-        self.hash_remove::<_, ConnState>("CONN_STATE_MAP", k)
+
+    fn udp_flow_incarnation(&self, key: &TuplesKey, token: u32) -> anyhow::Result<Option<u64>> {
+        anyhow::ensure!(
+            !self.retirement_failed,
+            "retirement ownership is unresolved"
+        );
+        let state = self
+            .hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
+            .ok_or_else(|| anyhow::anyhow!("UDP admission has no current conn state"))?;
+        anyhow::ensure!(state.decision_token == token, "UDP admission token changed");
+        anyhow::ensure!(
+            state.incarnation != 0
+                && state.incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX,
+            "UDP admission has invalid lifetime identity"
+        );
+        Ok(Some(state.incarnation))
     }
 
     fn commit_udp_decision(
@@ -663,101 +618,38 @@ impl EbpfBackend for RealEbpfBackend {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult> {
-        validate_udp_decision_transition(transition)?;
-        if token == 0 {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
-        }
-        let Some(mut state) = self.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
-            return Ok(UdpDecisionCommitResult::Missing);
-        };
-        if state.decision_token != token {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
-        }
-        if let Err(result) = apply_udp_decision_transition(&mut state, transition) {
-            return Ok(result);
-        }
-        let handoff = self.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-        if handoff.is_some_and(|entry| entry.result.decision_token != token) {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
-        }
-        let track_key = RedirectTuple::from_tuples(key);
-        let track = self.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-        if track.is_some_and(|entry| entry.decision_token != token) {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
-        }
-        let initial_transition = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
-        if initial_transition && (handoff.is_none() || track.is_none()) {
-            return Ok(UdpDecisionCommitResult::Missing);
-        }
-
-        if handoff.is_some() {
-            self.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-        }
-        match transition {
-            UdpDecisionTransition::ActivateProxy(outbound, _) => {
-                let mut track = track.expect("proxy track checked above");
-                track.outbound = outbound;
-                self.hash_insert("REDIRECT_TRACK", &track_key, &track)?;
-            }
-            UdpDecisionTransition::ArmDirect(_)
-            | UdpDecisionTransition::ActivateDirect(_)
-            | UdpDecisionTransition::Block => {
-                if track.is_some() {
-                    self.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-                }
-            }
-        }
-        self.hash_insert("CONN_STATE_MAP", key, &state)?;
-        Ok(UdpDecisionCommitResult::Applied)
+        self.commit_udp_fenced(key, token, transition)
     }
 
-    fn abort_pending_udp_flow(
+    fn retire_batch(
         &mut self,
-        key: &TuplesKey,
-        token: u32,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
-        self.remove_token_bound_udp_flow(key, token, true)
+        requests: &[RetireRequest<'_>],
+        outcomes: &mut [Option<UdpDecisionCommitResult>],
+    ) -> Result<RetireCounts, RetireError> {
+        self.retire_flows(requests, outcomes)
     }
 
-    fn remove_udp_flow(
-        &mut self,
-        key: &TuplesKey,
-        token: u32,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
-        if token != 0 {
-            return self.remove_token_bound_udp_flow(key, token, false);
-        }
-        self.with_udp_retirement_fence(key, 0, |backend| {
-            let Some(state) = backend.hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
-                return Ok(UdpDecisionCommitResult::Missing);
-            };
-            if !udp_state_is_legacy_userspace_owned(&state) {
-                return Ok(UdpDecisionCommitResult::Superseded);
-            }
-            if unsafe { state.meta.raw } & ROUTING_META_FLAG_WAN_USERSPACE != 0 {
-                let handoff =
-                    backend.hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-                let track_key = RedirectTuple::from_tuples(key);
-                let track =
-                    backend.hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-                if handoff.is_some_and(|entry| entry.result.decision_token != 0)
-                    || track.is_some_and(|entry| entry.decision_token != 0)
-                {
-                    return Ok(UdpDecisionCommitResult::TokenMismatch);
-                }
-                if handoff.is_some() {
-                    backend.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-                }
-                if track.is_some() {
-                    backend.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-                }
-            }
-            if !backend.hash_remove_present::<_, ConnState>("CONN_STATE_MAP", key)? {
-                return Ok(UdpDecisionCommitResult::Missing);
-            }
-            USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(UdpDecisionCommitResult::Applied)
-        })
+    fn tcp_socket_ownership(&self, fd: BorrowedFd<'_>) -> anyhow::Result<TcpSocketOwnership> {
+        anyhow::ensure!(
+            !self.retirement_failed,
+            "retirement ownership is unresolved"
+        );
+        Ok(TcpSocketOwnership::Kernel(tcp_binding::lookup(
+            self.bpf()?,
+            fd,
+        )?))
+    }
+
+    fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>> {
+        self.expiry_hints.take()
+    }
+
+    fn tcp_request_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::TcpRequestChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("TCP_REQUEST_BINDINGS", chunk_size, visit)
     }
 
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
@@ -790,13 +682,13 @@ impl EbpfBackend for RealEbpfBackend {
             !live
         })?;
         if !live {
-            self.for_each_map_chunk::<TuplesKey, u32>(
-                UDP_DECISION_RETIRE_FENCE_MAP,
+            self.for_each_map_chunk::<TuplesKey, honk_ebpf_common::conn::RetirementFence>(
+                RETIRE_FENCE_MAP,
                 256,
                 &mut |chunk| {
                     live = chunk
                         .iter()
-                        .any(|(_, token)| conflicts_with_rollback(*token));
+                        .any(|(_, fence)| conflicts_with_rollback(fence.decision_token));
                     !live
                 },
             )?;
@@ -845,37 +737,6 @@ impl EbpfBackend for RealEbpfBackend {
     }
     fn redirect_track_store(&mut self, k: &RedirectTuple, e: &RedirectEntry) -> anyhow::Result<()> {
         self.hash_insert("REDIRECT_TRACK", k, e)
-    }
-    fn redirect_track_remove(&mut self, k: &RedirectTuple) -> anyhow::Result<()> {
-        self.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", k)
-    }
-
-    fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>> {
-        Ok(self
-            .routing_handoff_take_observed(key)?
-            .map(|(entry, _)| entry))
-    }
-
-    fn routing_handoff_take_observed(
-        &self,
-        key: &TuplesKey,
-    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
-        let bpf = self.bpf()?;
-        match bpf_lookup_and_delete::<_, RoutingHandoffEntry>(
-            bpf,
-            &self.cap_lookup_and_delete,
-            "ROUTING_HANDOFF_MAP",
-            key,
-        )? {
-            LookupAndDelete::Value(entry) => return Ok(Some((entry, true))),
-            LookupAndDelete::Missing => return Ok(None),
-            LookupAndDelete::Unsupported => {}
-        }
-        let entry = self.hash_lookup("ROUTING_HANDOFF_MAP", key)?;
-        if entry.is_some() {
-            bpf_delete_shared(bpf, "ROUTING_HANDOFF_MAP", key)?;
-        }
-        Ok(entry.map(|entry| (entry, false)))
     }
 
     #[cfg(feature = "native-api")]
@@ -936,27 +797,12 @@ impl EbpfBackend for RealEbpfBackend {
         self.receive_trace.clone()
     }
 
-    fn cookie_pid_lookup(&self, c: u64) -> anyhow::Result<Option<PIDName>> {
-        self.hash_lookup("COOKIE_PID_MAP", &c)
-    }
-    fn cookie_pid_store(&mut self, c: u64, e: &PIDName) -> anyhow::Result<()> {
-        self.hash_insert("COOKIE_PID_MAP", &c, e)
-    }
-
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut crate::ebpf::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
         self.for_each_map_chunk("REDIRECT_TRACK", chunk_size, visit)
-    }
-
-    fn cookie_pid_for_each_chunk(
-        &self,
-        chunk_size: usize,
-        visit: &mut crate::ebpf::CookiePidChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        self.for_each_map_chunk("COOKIE_PID_MAP", chunk_size, visit)
     }
 
     fn routing_handoff_for_each_chunk(
@@ -1011,91 +857,6 @@ impl EbpfBackend for RealEbpfBackend {
         Ok((totals[0], totals[1]))
     }
 
-    fn conn_state_remove_if_unchanged(
-        &mut self,
-        entries: &[(TuplesKey, ConnState)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64> {
-        let mut removed = 0;
-        for (key, scanned) in entries {
-            if self
-                .hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
-                .is_some_and(|current| {
-                    current.last_seen_ns == scanned.last_seen_ns
-                        && current.state == scanned.state
-                        && current.last_seen_ns <= expired_before_ns
-                })
-            {
-                self.hash_remove::<_, ConnState>("CONN_STATE_MAP", key)?;
-                removed += 1;
-            }
-        }
-        Ok(removed)
-    }
-
-    fn redirect_track_remove_if_unchanged(
-        &mut self,
-        entries: &[(RedirectTuple, RedirectEntry)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64> {
-        let mut removed = 0;
-        for (key, scanned) in entries {
-            if self
-                .hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", key)?
-                .is_some_and(|current| {
-                    current.last_seen_ns == scanned.last_seen_ns
-                        && current.last_seen_ns <= expired_before_ns
-                })
-            {
-                self.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", key)?;
-                removed += 1;
-            }
-        }
-        Ok(removed)
-    }
-
-    fn cookie_pid_remove_if_unchanged(
-        &mut self,
-        entries: &[(u64, PIDName)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64> {
-        let mut removed = 0;
-        for (cookie, scanned) in entries {
-            if self
-                .hash_lookup::<_, PIDName>("COOKIE_PID_MAP", cookie)?
-                .is_some_and(|current| {
-                    current.last_seen_ns == scanned.last_seen_ns
-                        && current.last_seen_ns <= expired_before_ns
-                })
-            {
-                self.hash_remove::<_, PIDName>("COOKIE_PID_MAP", cookie)?;
-                removed += 1;
-            }
-        }
-        Ok(removed)
-    }
-
-    fn routing_handoff_remove_if_unchanged(
-        &mut self,
-        entries: &[(TuplesKey, RoutingHandoffEntry)],
-        expired_before_ns: u64,
-    ) -> anyhow::Result<u64> {
-        let mut removed = 0;
-        for (key, scanned) in entries {
-            if self
-                .hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?
-                .is_some_and(|current| {
-                    current.last_seen_ns == scanned.last_seen_ns
-                        && current.last_seen_ns <= expired_before_ns
-                })
-            {
-                self.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-                removed += 1;
-            }
-        }
-        Ok(removed)
-    }
-
     fn set_outbound_alive(
         &mut self,
         outbound: u8,
@@ -1126,6 +887,7 @@ impl EbpfBackend for RealEbpfBackend {
             "Detaching BPF hooks (lan_ingress, lan_egress, wan_egress, wan_ingress, bond slaves, bridge slaves, cgroup, dae0, sk_lookup)"
         );
         self.interface_links.clear();
+        self.tcp_bindings = None;
         self.cgroup_sock_links.clear();
         self.cgroup_sock_addr_links.clear();
         self.dae0_ingress_link = None;
@@ -1236,6 +998,10 @@ impl EbpfBackend for RealEbpfBackend {
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
         self.listeners_published = false;
+        for fd in [tcp4_fd, tcp6_fd] {
+            // The caller retains both actual listeners through publication.
+            tcp_binding::publish_listener(self.bpf_mut()?, unsafe { BorrowedFd::borrow_raw(fd) })?;
+        }
         // Slot layout is part of the sk_lookup ABI: TCP4/TCP6, then four
         // UDP4 sockets and four UDP6 sockets.
         let mut entries = vec![(0u32, tcp4_fd), (1u32, tcp6_fd)];
@@ -1338,6 +1104,14 @@ impl EbpfBackend for RealEbpfBackend {
 impl Drop for RealEbpfBackend {
     fn drop(&mut self) {
         let _ = self.detach_hooks();
+        // Normal cleanup joins these nonblocking consumers. Drop must still
+        // cancel them instead of detaching a ring/map/channel owner forever.
+        if let Some(handle) = self.event_flush_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.log_flush_handle.take() {
+            handle.abort();
+        }
         self.routing_generation = None;
         let _ = self.remove_nonpersistent_pins();
     }

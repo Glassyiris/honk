@@ -163,8 +163,11 @@ fn netns_tcp_dns_must_relays_original_frames_without_dns_processing() {
             let destination = listener.local_addr()?;
             let (plane, queries) = dns_plane(destination, peer, Some((2, 1)))?;
             let handle = plane.spawn_handle();
+            let retirement = support::TestRetirement::start(&handle);
             store_active_tcp_flow(&handle, destination, peer).await?;
-            let task = tokio::spawn(async move { handle.serve_connection(accepted, peer).await });
+            let task_handle = handle.clone();
+            let task =
+                tokio::spawn(async move { task_handle.serve_connection(accepted, peer).await });
             let query = dns_query_payload();
             let mut wire = (query.len() as u16).to_be_bytes().to_vec();
             wire.extend_from_slice(&query);
@@ -188,6 +191,7 @@ fn netns_tcp_dns_must_relays_original_frames_without_dns_processing() {
             drop(client);
             drop(upstream);
             tokio::time::timeout(Duration::from_secs(3), task).await???;
+            retirement.join(&handle).await?;
         }
         Ok(())
     });
@@ -206,6 +210,7 @@ fn netns_tcp_dns_missing_handoff_and_block_close_before_reading_frames() {
             let destination = listener.local_addr()?;
             let (plane, queries) = dns_plane(destination, peer, route)?;
             let handle = plane.spawn_handle();
+            let retirement = support::TestRetirement::start(&handle);
             store_active_tcp_flow(&handle, destination, peer).await?;
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
@@ -220,6 +225,7 @@ fn netns_tcp_dns_missing_handoff_and_block_close_before_reading_frames() {
             let mut byte = [0; 1];
             assert_eq!(client.read(&mut byte).await?, 0);
             assert_eq!(queries.load(Ordering::Relaxed), 0);
+            retirement.join(&handle).await?;
         }
         Ok(())
     });
@@ -233,6 +239,7 @@ fn netns_tcp_dns_queued_must_handoff_cannot_alias_reordered_group() {
         let destination = listener.local_addr()?;
         let (plane, _) = dns_plane(destination, peer, Some((2, 1)))?;
         let handle = plane.spawn_handle();
+        let retirement = support::TestRetirement::start(&handle);
         store_active_tcp_flow(&handle, destination, peer).await?;
         let mut replacement = plane.config.read().await.as_ref().clone();
         replacement.groups.swap(0, 1);
@@ -254,6 +261,7 @@ fn netns_tcp_dns_queued_must_handoff_cannot_alias_reordered_group() {
         assert!(result.is_err());
         let mut byte = [0; 1];
         assert_eq!(client.read(&mut byte).await?, 0);
+        retirement.join(&handle).await?;
         Ok(())
     });
 }
@@ -285,8 +293,10 @@ fn netns_tcp_dns_must_keeps_pinned_node_and_runtime_across_reload() {
             Arc::new(NodeDial),
         )?;
         let handle = plane.spawn_handle();
+        let retirement = support::TestRetirement::start(&handle);
         store_active_tcp_flow(&handle, destination, peer).await?;
-        let task = tokio::spawn(async move { handle.serve_connection(accepted, peer).await });
+        let task_handle = handle.clone();
+        let task = tokio::spawn(async move { task_handle.serve_connection(accepted, peer).await });
 
         let query = dns_query_payload();
         let mut wire = (query.len() as u16).to_be_bytes().to_vec();
@@ -342,6 +352,7 @@ fn netns_tcp_dns_must_keeps_pinned_node_and_runtime_across_reload() {
         drop(client);
         drop(upstream);
         tokio::time::timeout(Duration::from_secs(3), task).await???;
+        retirement.join(&handle).await?;
         Ok(())
     });
 }

@@ -1,4 +1,378 @@
 use super::*;
+use honk_ebpf_common::conn::RetirementFence;
+
+mod socket_identity;
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn retirement_release_failure_retains_applied_counts_and_releases_other_fences() {
+    let mut backend = retirement_fixture();
+    let requests = [
+        seed_retirement_flow(&mut backend, 41007),
+        seed_retirement_flow(&mut backend, 41008),
+    ];
+    backend.retirement_faults.release = Some(0);
+    let mut outcomes = [None; 2];
+    let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
+    assert_eq!(
+        error.counts,
+        RetireCounts {
+            conn: 2,
+            redirect: 2,
+            handoff: 2,
+            request: 0
+        }
+    );
+    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied); 2]);
+    for (index, request) in requests.iter().enumerate() {
+        assert!(
+            backend
+                .udp_conn_state_lookup(&request.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .routing_handoff_lookup(&request.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&request.key))
+                .unwrap()
+                .is_none()
+        );
+        assert_retirement_fence(&backend, &request.key, index == 0);
+    }
+    assert_eq!(
+        backend.array_get::<u32>("RETIRE_ACTIVE", 0).unwrap(),
+        Some(1)
+    );
+    assert!(backend.retirement_failed);
+}
+
+fn retirement_fixture() -> RealEbpfBackend {
+    RealEbpfBackend::load_routing_test_fixture(crate::DEFAULT_BPF_OBJECT, DaeParam::default())
+        .expect("load production maps without attaching programs")
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn quiescence_preserves_tcp_closing_while_retiring_udp_staging() -> anyhow::Result<()> {
+    let mut backend = retirement_fixture();
+    let tcp = TuplesKey {
+        src_port: 41120,
+        l4proto: libc::IPPROTO_TCP as u8,
+        ..Default::default()
+    };
+    let udp = TuplesKey {
+        l4proto: libc::IPPROTO_UDP as u8,
+        ..tcp
+    };
+    backend.tcp_conn_state_store(
+        &tcp,
+        &ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateClosing as u8,
+            incarnation: 2,
+            ..Default::default()
+        },
+    )?;
+    backend.udp_conn_state_store(
+        &udp,
+        &ConnState {
+            state: UdpDecisionState::Pending as u8,
+            decision_token: 7,
+            incarnation: 1,
+            ..Default::default()
+        },
+    )?;
+    backend.quiesce_udp_staging()?;
+    assert_eq!(backend.tcp_conn_state_lookup(&tcp)?.unwrap().incarnation, 2);
+    assert!(backend.udp_conn_state_lookup(&udp)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn quiescence_preserves_native_udp_publication_completed_after_scan() -> anyhow::Result<()> {
+    fn key() -> TuplesKey {
+        TuplesKey {
+            src_port: 41121,
+            l4proto: libc::IPPROTO_UDP as u8,
+            ..Default::default()
+        }
+    }
+    fn complete_publication(backend: &mut RealEbpfBackend) -> anyhow::Result<()> {
+        let mut state = backend.udp_conn_state_lookup(&key())?.unwrap();
+        state.state = UdpDecisionState::None as u8;
+        state.meta = RoutingMeta {
+            raw: ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
+        };
+        backend.udp_conn_state_store(&key(), &state)
+    }
+    let mut backend = retirement_fixture();
+    backend.udp_conn_state_store(
+        &key(),
+        &ConnState {
+            state: UdpDecisionState::Preparing as u8,
+            incarnation: 3,
+            ..Default::default()
+        },
+    )?;
+    backend.retirement_faults.quiesce_after_scan = Some(complete_publication);
+    backend.quiesce_udp_staging()?;
+    let retained = backend.udp_conn_state_lookup(&key())?.unwrap();
+    assert_eq!(
+        (retained.incarnation, retained.state),
+        (3, UdpDecisionState::None as u8)
+    );
+    assert_ne!(unsafe { retained.meta.raw } & ROUTING_META_FLAG_OFFLOAD, 0);
+    backend.set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn udp_admission_requires_current_token_and_nonzero_56_bit_incarnation() {
+    use honk_ebpf_common::conn::FLOW_INCARNATION_MAX;
+
+    let mut backend = retirement_fixture();
+    for token in [0, 7] {
+        let key = TuplesKey {
+            src_port: 41100 + token as u16,
+            l4proto: libc::IPPROTO_UDP as u8,
+            ..TuplesKey::default()
+        };
+        assert!(backend.udp_flow_incarnation(&key, token).is_err());
+        for incarnation in [1, FLOW_INCARNATION_MAX] {
+            backend
+                .udp_conn_state_store(
+                    &key,
+                    &ConnState {
+                        decision_token: token,
+                        incarnation,
+                        ..ConnState::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                backend.udp_flow_incarnation(&key, token).unwrap(),
+                Some(incarnation)
+            );
+            assert!(backend.udp_flow_incarnation(&key, token + 1).is_err());
+        }
+        for incarnation in [0, FLOW_INCARNATION_MAX + 1, u64::MAX] {
+            backend
+                .udp_conn_state_store(
+                    &key,
+                    &ConnState {
+                        decision_token: token,
+                        incarnation,
+                        ..ConnState::default()
+                    },
+                )
+                .unwrap();
+            assert!(backend.udp_flow_incarnation(&key, token).is_err());
+        }
+    }
+}
+
+fn seed_retirement_flow(backend: &mut RealEbpfBackend, port: u16) -> RetireRequest<'static> {
+    let key = TuplesKey {
+        src_port: port,
+        l4proto: libc::IPPROTO_TCP as u8,
+        ..TuplesKey::default()
+    };
+    let incarnation = u64::from(port);
+    backend
+        .hash_insert(
+            "CONN_STATE_MAP",
+            &key,
+            &ConnState {
+                incarnation,
+                ..ConnState::default()
+            },
+        )
+        .unwrap();
+    backend
+        .hash_insert(
+            "ROUTING_HANDOFF_MAP",
+            &key,
+            &RoutingHandoffEntry {
+                incarnation,
+                ..RoutingHandoffEntry::default()
+            },
+        )
+        .unwrap();
+    backend
+        .hash_insert(
+            "REDIRECT_TRACK",
+            &RedirectTuple::from_tuples(&key),
+            &RedirectEntry {
+                incarnation,
+                ..RedirectEntry::default()
+            },
+        )
+        .unwrap();
+    RetireRequest {
+        key,
+        kind: RetireKind::Tcp { incarnation },
+    }
+}
+
+fn assert_retirement_flow_present(backend: &RealEbpfBackend, key: &TuplesKey) {
+    assert!(backend.udp_conn_state_lookup(key).unwrap().is_some());
+    assert!(backend.routing_handoff_lookup(key).unwrap().is_some());
+    assert!(
+        backend
+            .redirect_track_lookup(&RedirectTuple::from_tuples(key))
+            .unwrap()
+            .is_some()
+    );
+}
+
+fn assert_retirement_fence(backend: &RealEbpfBackend, key: &TuplesKey, present: bool) {
+    assert_eq!(
+        backend
+            .hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, key)
+            .unwrap()
+            .is_some(),
+        present
+    );
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_fences() {
+    for barrier in [false, true] {
+        let mut backend = retirement_fixture();
+        let requests = [
+            seed_retirement_flow(&mut backend, 41001),
+            seed_retirement_flow(&mut backend, 41002),
+        ];
+        backend.retirement_faults = retirement::RetirementFaults {
+            acquire: (!barrier).then_some(1),
+            barrier,
+            ..Default::default()
+        };
+        let mut outcomes = [None; 2];
+        let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
+        assert_eq!(error.counts, RetireCounts::default());
+        assert_eq!(outcomes, [None; 2]);
+        for request in &requests {
+            assert_retirement_flow_present(&backend, &request.key);
+            assert_retirement_fence(&backend, &request.key, false);
+        }
+        assert_eq!(
+            backend.array_get::<u32>("RETIRE_ACTIVE", 0).unwrap(),
+            Some(0)
+        );
+        assert!(!backend.retirement_failed);
+        assert_eq!(
+            backend.retire_batch(&requests, &mut outcomes).unwrap(),
+            RetireCounts {
+                conn: 2,
+                redirect: 2,
+                handoff: 2,
+                request: 0,
+            }
+        );
+        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied); 2]);
+    }
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn retirement_delete_failure_reports_completed_map_deletions_only() {
+    let mut backend = retirement_fixture();
+    let request = seed_retirement_flow(&mut backend, 41003);
+    backend.retirement_faults.delete = Some(1);
+    let mut outcomes = [None];
+    let error = backend.retire_batch(&[request], &mut outcomes).unwrap_err();
+    assert_eq!(
+        error.counts,
+        RetireCounts {
+            handoff: 1,
+            ..RetireCounts::default()
+        }
+    );
+    assert_eq!(outcomes, [None]);
+    assert!(
+        backend
+            .routing_handoff_lookup(&request.key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .udp_conn_state_lookup(&request.key)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .redirect_track_lookup(&RedirectTuple::from_tuples(&request.key))
+            .unwrap()
+            .is_some()
+    );
+    assert_retirement_fence(&backend, &request.key, false);
+    assert_eq!(
+        backend.array_get::<u32>("RETIRE_ACTIVE", 0).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        backend.retire_batch(&[request], &mut outcomes).unwrap(),
+        RetireCounts {
+            conn: 1,
+            redirect: 1,
+            ..RetireCounts::default()
+        }
+    );
+    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+}
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn retirement_preserves_barrier_and_release_errors_and_inhibits_admission() {
+    let mut backend = retirement_fixture();
+    let requests = [
+        seed_retirement_flow(&mut backend, 41004),
+        seed_retirement_flow(&mut backend, 41005),
+        seed_retirement_flow(&mut backend, 41006),
+    ];
+    backend.retirement_faults = retirement::RetirementFaults {
+        barrier: true,
+        release: Some(1),
+        ..Default::default()
+    };
+    let mut outcomes = [None; 3];
+    let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
+    assert_eq!(error.counts, RetireCounts::default());
+    assert_eq!(outcomes, [None; 3]);
+    for (index, request) in requests.iter().enumerate() {
+        assert_retirement_flow_present(&backend, &request.key);
+        assert_retirement_fence(&backend, &request.key, index == 1);
+    }
+    assert_eq!(
+        backend.array_get::<u32>("RETIRE_ACTIVE", 0).unwrap(),
+        Some(1)
+    );
+    assert!(backend.retirement_failed);
+    let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
+    assert_eq!(error.counts, RetireCounts::default());
+    assert_eq!(outcomes, [None; 3]);
+    assert!(
+        format!("{:#}", backend.set_datapath_ready(true).unwrap_err())
+            .contains("ownership is unresolved")
+    );
+    assert!(
+        backend
+            .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+            .is_err()
+    );
+    assert!(backend.retirement_failed);
+}
 
 /// Number of bpf links this process currently holds open. Every link fd
 /// shows a `link_type:` line in its /proc/self/fdinfo entry.
@@ -127,10 +501,7 @@ fn missing_dae0peer_attach_failure_is_propagated() {
 #[ignore = "requires root; run via just test-netns"]
 async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     use std::os::fd::AsRawFd;
-    let cgroup_path = match detect_cgroup_path() {
-        Ok(p) => p,
-        Err(_) => return, // cgroup2 unavailable: nothing to attach, nothing to test
-    };
+    let cgroup_path = detect_cgroup_path().expect("required cgroup2 mount");
     let cgroup_file = std::fs::File::open(&cgroup_path).unwrap();
     let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-link-test-{}", std::process::id()));
     // Other agents (systemd, …) may legitimately hold root-cgroup programs;
@@ -158,23 +529,36 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         }
     );
 
-    let staged_key = TuplesKey::default();
+    let staged_key = TuplesKey {
+        l4proto: libc::IPPROTO_UDP as u8,
+        ..TuplesKey::default()
+    };
     backend
         .udp_conn_state_store(
             &staged_key,
             &ConnState {
                 state: UdpDecisionState::Pending as u8,
                 decision_token: 42,
+                incarnation: 42,
                 ..ConnState::default()
             },
         )
         .expect("seed newer staged token");
-    assert_eq!(
-        backend
-            .remove_udp_flow(&staged_key, 41)
-            .expect("stale retirement result"),
-        UdpDecisionCommitResult::Superseded
-    );
+    let mut outcomes = [None];
+    backend
+        .retire_batch(
+            &[RetireRequest {
+                key: staged_key,
+                kind: RetireKind::Udp {
+                    token: 41,
+                    incarnation: Some(41),
+                    pending_only: false,
+                },
+            }],
+            &mut outcomes,
+        )
+        .expect("stale retirement result");
+    assert_eq!(outcomes[0], Some(UdpDecisionCommitResult::Superseded));
     assert_eq!(
         backend
             .udp_conn_state_lookup(&staged_key)
@@ -186,25 +570,35 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     );
     assert!(
         backend
-            .hash_lookup::<_, u32>(UDP_DECISION_RETIRE_FENCE_MAP, &staged_key)
+            .hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, &staged_key)
             .expect("retirement fence lookup")
             .is_none(),
         "completed stale cleanup must release its exact fence"
     );
     backend
-        .udp_conn_state_remove(&staged_key)
-        .expect("remove staged test state");
+        .retire_batch(
+            &[RetireRequest {
+                key: staged_key,
+                kind: RetireKind::Udp {
+                    token: 42,
+                    incarnation: Some(42),
+                    pending_only: false,
+                },
+            }],
+            &mut outcomes,
+        )
+        .expect("retire staged test state");
 
-    // 6 cgroup links + wan_ingress/wan_egress on lo.
+    // Five cgroup capture links + wan_ingress/wan_egress on lo.
     let held = held_bpf_link_count();
     assert!(
-        held >= 8,
-        "expected >= 8 held bpf links after load, got {held}"
+        held >= 7,
+        "expected >= 7 held bpf links after load, got {held}"
     );
     assert_eq!(
         cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
-        baseline + 6,
-        "all 6 cgroup programs must stay attached after load"
+        baseline + 5,
+        "all 5 cgroup capture programs must stay attached after load"
     );
 
     let lo_ifindex = std::fs::read_to_string("/sys/class/net/lo/ifindex")
@@ -401,7 +795,15 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     let fence_key = TuplesKey::default();
     let fence_token = udp_decision_token(2, 7).unwrap();
     reloaded
-        .hash_insert(UDP_DECISION_RETIRE_FENCE_MAP, &fence_key, &fence_token)
+        .hash_insert(
+            RETIRE_FENCE_MAP,
+            &fence_key,
+            &RetirementFence {
+                owner: u64::MAX,
+                decision_token: fence_token,
+                padding: 0,
+            },
+        )
         .expect("seed live retirement fence");
     syscall::write_udp_decision_sequence_locked(
         reloaded.bpf().unwrap(),
@@ -423,9 +825,10 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
             .expect("reject live retirement generation"),
         "a live retirement fence must prevent generation reuse"
     );
+    // Fault-injection setup: remove the synthetic live fence, not a flow.
     reloaded
-        .hash_remove::<TuplesKey, u32>(UDP_DECISION_RETIRE_FENCE_MAP, &fence_key)
-        .expect("remove live retirement fence");
+        .hash_remove::<TuplesKey, RetirementFence>(RETIRE_FENCE_MAP, &fence_key)
+        .expect("remove synthetic live retirement fence");
     assert!(
         reloaded
             .reset_udp_decision_sequence(2)
@@ -503,44 +906,22 @@ async fn pname_is_ready_before_first_packet() {
     .await
     .expect("load backend for pname test");
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
     let worker = std::thread::Builder::new()
         .name("worker-thread".into())
-        .spawn(move || {
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("create worker socket");
-            let mut cookie = 0u64;
-            let mut cookie_len = std::mem::size_of::<u64>() as libc::socklen_t;
-            let status = unsafe {
-                libc::getsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_COOKIE,
-                    &mut cookie as *mut _ as *mut libc::c_void,
-                    &mut cookie_len,
-                )
-            };
-            assert_eq!(
-                status,
-                0,
-                "read socket cookie: {}",
-                std::io::Error::last_os_error()
-            );
-            ready_tx.send(cookie).expect("publish socket cookie");
-            release_rx.recv().expect("release worker socket");
-            drop(socket);
+        .spawn(|| {
+            let mut sockets = Vec::new();
+            for domain in [socket2::Domain::IPV4, socket2::Domain::IPV6] {
+                for (kind, protocol) in [
+                    (socket2::Type::STREAM, socket2::Protocol::TCP),
+                    (socket2::Type::DGRAM, socket2::Protocol::UDP),
+                ] {
+                    sockets.push(socket2::Socket::new(domain, kind, Some(protocol)).unwrap());
+                }
+            }
+            sockets
         })
         .expect("spawn named worker");
-    let cookie = ready_rx.recv().expect("receive socket cookie");
-
-    let entry = backend
-        .cookie_pid_lookup(cookie)
-        .expect("look up socket cookie")
-        .expect("pname map entry must exist before the first packet");
-    assert!(
-        entry.pname.iter().any(|byte| *byte != 0),
-        "pname must never be empty at first-packet lookup"
-    );
+    let sockets = worker.join().expect("join named worker");
 
     let expected = match mode {
         process_name::PnameCaptureMode::Argv0 => {
@@ -559,10 +940,85 @@ async fn pname_is_ready_before_first_packet() {
             expected
         }
     };
-    assert_eq!(entry.pname, expected);
+    let storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
+        backend.bpf().unwrap().map("SOCKET_IDENTITY").unwrap(),
+    )
+    .expect("socket identity storage");
+    for socket in &sockets {
+        let entry = storage
+            .get(socket, 0)
+            .expect("identity before first packet");
+        assert_eq!(entry.pid, std::process::id());
+        assert_eq!(entry.pname, expected);
+    }
 
-    release_tx.send(()).expect("release worker");
-    worker.join().expect("join named worker");
+    // A duplicate FD owns the same socket even after the creating thread exits
+    // and the first FD closes. Connect/send must retain its first identity.
+    for (index, socket) in sockets.into_iter().enumerate() {
+        if index % 2 == 0 {
+            continue;
+        }
+        let mut retained = SocketIdentity {
+            pid: u32::MAX,
+            pname: [0; TASK_COMM_LEN],
+        };
+        retained.pname[..12].copy_from_slice(b"sticky-owner");
+        aya::maps::SkStorage::<_, SocketIdentity>::try_from(
+            backend
+                .bpf_mut()
+                .unwrap()
+                .map_mut("SOCKET_IDENTITY")
+                .unwrap(),
+        )
+        .unwrap()
+        .insert(&socket, retained, 0)
+        .unwrap();
+        let duplicate = socket.try_clone().expect("duplicate socket FD");
+        drop(socket);
+        let receiver =
+            std::net::UdpSocket::bind(if index == 1 { "127.0.0.1:0" } else { "[::1]:0" })
+                .expect("bind identity-test receiver");
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let destination = socket2::SockAddr::from(receiver.local_addr().unwrap());
+        let duplicate = std::thread::Builder::new()
+            .name("next-owner".into())
+            .spawn(move || {
+                duplicate.connect(&destination).unwrap();
+                duplicate.send(b"sticky").unwrap();
+                duplicate
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let mut bytes = [0; 6];
+        assert_eq!(receiver.recv(&mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"sticky");
+        let storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
+            backend.bpf().unwrap().map("SOCKET_IDENTITY").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(storage.get(&duplicate, 0).unwrap(), retained);
+        drop(duplicate);
+        let replacement = socket2::Socket::new(
+            if index == 1 {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            },
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        let fresh = storage.get(&replacement, 0).unwrap();
+        assert_eq!(fresh.pid, std::process::id());
+        assert_ne!(
+            fresh.pname, retained.pname,
+            "new sockets must not inherit old storage"
+        );
+    }
+
     backend.detach_hooks().expect("detach pname test hooks");
     backend
         .cleanup()
@@ -599,6 +1055,7 @@ fn routing_handoff_layout_validation_rejects_legacy_value_size() {
     let current = core::mem::size_of::<RoutingHandoffEntry>() as u32;
     assert!(validate_routing_handoff_sizes(key, current).is_ok());
     assert!(validate_routing_handoff_sizes(key, 48).is_err());
+    assert!(validate_routing_handoff_sizes(key, 64).is_err());
 }
 
 #[test]

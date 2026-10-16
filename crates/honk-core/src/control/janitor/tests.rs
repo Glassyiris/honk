@@ -259,8 +259,12 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
 
     let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
     let first = janitor
-        .cleanup_redirect_track_at(REDIRECT_TRACK_TIMEOUT_NS + 1, scan_tuning(0.0))
-        .await;
+        .cleanup_redirect_track_at(
+            REDIRECT_TRACK_TIMEOUT_NS + 1,
+            scan_tuning(0.0),
+            &mut OccupancyGauge::default(),
+        )
+        .await?;
     assert_eq!(first.deleted, JANITOR_BASE_CANDIDATES as u64);
     assert_eq!(first.scanned, JANITOR_BASE_CANDIDATES);
     assert!(!first.complete);
@@ -270,8 +274,9 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
         .cleanup_redirect_track_at(
             REDIRECT_TRACK_TIMEOUT_NS + 1,
             scan_tuning(CONN_STATE_PRESSURE_WATERMARK),
+            &mut OccupancyGauge::default(),
         )
-        .await;
+        .await?;
     assert_eq!(second.deleted, 1);
     assert_eq!(second.scanned, 1);
     assert!(second.complete);
@@ -440,5 +445,169 @@ async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
             .is_none()
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()> {
+    for redirect in [false, true] {
+        let key = test_tuple(30_001, IPPROTO_TCP);
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+        {
+            let mut backend = backend.write().await;
+            backend.tcp_conn_state_store(&key, &test_state(TcpState::TcpStateActive, 0))?;
+            backend.redirect_track_store(
+                &RedirectTuple::from_tuples(&key),
+                &RedirectEntry::default(),
+            )?;
+        }
+        let pins = Arc::new(TcpFlowPins::default());
+        let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+        let adopt_backend = Arc::clone(&backend);
+        let adopt_pins = Arc::clone(&pins);
+        janitor.before_delete_hook = Some(Arc::new(move || {
+            // Match admission's continuous backend-read/pin-retain section.
+            let _backend = adopt_backend.blocking_read();
+            adopt_pins.retain_for_test(TcpFlowKey::from_tuples(&key));
+        }));
+        let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
+        let result = if redirect {
+            janitor.cleanup_redirect_track_for_test(now_ns).await
+        } else {
+            janitor.cleanup_conn_state_for_test(now_ns).await
+        };
+        assert_eq!(result, (0, 1));
+        {
+            let backend = backend.read().await;
+            assert!(backend.tcp_conn_state_lookup(&key)?.is_some());
+            assert!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
+                    .is_some()
+            );
+        }
+        janitor.before_delete_hook = None;
+        assert_eq!(
+            pins.release_for_test(TcpFlowKey::from_tuples(&key)),
+            Some(true)
+        );
+        let result = if redirect {
+            janitor.cleanup_redirect_track_for_test(now_ns).await
+        } else {
+            janitor.cleanup_conn_state_for_test(now_ns).await
+        };
+        assert_eq!(result, (1, 1));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_proof_expiry_is_bounded_ignores_relay_pins_and_keeps_timeout_boundary()
+-> anyhow::Result<()> {
+    use honk_ebpf_common::redirect_need::{TcpRequestKey, TcpSocketBinding};
+    let mut model = MockEbpfBackend::new();
+    for index in 0..=JANITOR_BASE_CANDIDATES {
+        let binding = TcpSocketBinding {
+            tuples: test_tuple(index as u16, IPPROTO_TCP),
+            ..Default::default()
+        };
+        model
+            .tcp_request_bindings
+            .insert((index as u64, 1), binding);
+    }
+    let fresh = TcpRequestKey {
+        address: u64::MAX,
+        cookie: 2,
+    };
+    let mut binding = TcpSocketBinding {
+        tuples: test_tuple(u16::MAX, IPPROTO_TCP),
+        ..Default::default()
+    };
+    binding.handoff.last_seen_ns = 1;
+    model
+        .tcp_request_bindings
+        .insert((fresh.address, fresh.cookie), binding);
+    let pinned_key = test_tuple(0, IPPROTO_TCP);
+    model.tcp_conn_state_store(&pinned_key, &test_state(TcpState::TcpStateActive, 0))?;
+    let pins = Arc::new(TcpFlowPins::default());
+    pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_key));
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+    let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
+    let mut gauge = OccupancyGauge::default();
+    let first = janitor
+        .cleanup_tcp_requests_at(now_ns, scan_tuning(0.0), &mut gauge)
+        .await?;
+    assert_eq!(first.deleted, JANITOR_BASE_CANDIDATES as u64);
+    assert!(!first.complete);
+    let second = janitor
+        .cleanup_tcp_requests_at(now_ns, scan_tuning(0.0), &mut gauge)
+        .await?;
+    assert_eq!(second.deleted, 1);
+    assert!(second.complete);
+    let mut remaining = Vec::new();
+    backend
+        .read()
+        .await
+        .tcp_request_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+            remaining.extend(chunk.iter().map(|(key, _)| *key));
+            true
+        })?;
+    assert_eq!(remaining, vec![fresh]);
+    assert!(pins.contains(&pinned_key));
+    assert!(
+        backend
+            .read()
+            .await
+            .tcp_conn_state_lookup(&pinned_key)?
+            .is_some()
+    );
+    assert_eq!(gauge.janitor_deletes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()> {
+    let mut model = MockEbpfBackend::new();
+    for port in 0..3 {
+        model.udp_conn_state_store(
+            &test_tuple(port, 17),
+            &test_state(TcpState::TcpStateActive, 0),
+        )?;
+    }
+    model.retire_fault_after = Some(2);
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+    let mut gauge = OccupancyGauge::default();
+    let error = janitor
+        .cleanup_conn_state_at(
+            UDP_CONN_STATE_TIMEOUT_NS + 1,
+            &mut gauge,
+            ((3, 0), 0),
+            scan_tuning(0.0),
+        )
+        .await
+        .expect_err("injected third retirement failure propagates");
+    let error = error
+        .downcast_ref::<RetireError>()
+        .expect("original partial retirement error retained");
+    assert_eq!(
+        error.counts,
+        RetireCounts {
+            conn: 2,
+            ..Default::default()
+        }
+    );
+    assert_eq!(gauge.janitor_deletes, 2);
+    let mut remaining = 0;
+    backend
+        .read()
+        .await
+        .conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+            remaining += chunk.len();
+            true
+        })?;
+    assert_eq!(remaining, 1);
     Ok(())
 }

@@ -481,6 +481,13 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
     match args.map.as_str() {
         "conn-state" => {
             let fd = open(&args.pin_root, "CONN_STATE_MAP")?;
+            query_map_layout(
+                fd,
+                "CONN_STATE_MAP",
+                1,
+                std::mem::size_of::<TuplesKey>() as u32,
+                std::mem::size_of::<ConnState>() as u32,
+            )?;
             let entries = map_entries(
                 fd,
                 std::mem::size_of::<TuplesKey>(),
@@ -513,6 +520,13 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
         }
         "redirect-track" => {
             let fd = open(&args.pin_root, "REDIRECT_TRACK")?;
+            query_map_layout(
+                fd,
+                "REDIRECT_TRACK",
+                1,
+                std::mem::size_of::<RedirectTuple>() as u32,
+                std::mem::size_of::<RedirectEntry>() as u32,
+            )?;
             let entries = map_entries(
                 fd,
                 std::mem::size_of::<RedirectTuple>(),
@@ -624,11 +638,12 @@ fn print_ordinary_stats(pin_root: &Path) -> anyhow::Result<()> {
     println!("conn-state overflow: udp={udp_ovf} tcp={tcp_ovf}");
     let redirect_failures: u64 = read_value(fd, &2u32.to_ne_bytes())?.unwrap_or(0);
     let handoff_failures: u64 = read_value(fd, &3u32.to_ne_bytes())?.unwrap_or(0);
-    let cookie_failures: u64 = read_value(fd, &4u32.to_ne_bytes())?.unwrap_or(0);
+    let identity_failures: u64 = read_value(fd, &4u32.to_ne_bytes())?.unwrap_or(0);
     println!(
         "auxiliary insert failures: redirect_track={redirect_failures} \
-         routing_handoff={handoff_failures} cookie_pid={cookie_failures}"
+         routing_handoff={handoff_failures}"
     );
+    println!("socket identity capture failures: {identity_failures}");
     Ok(())
 }
 

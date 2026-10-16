@@ -551,6 +551,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
                 removal.client,
                 removal.dst,
                 removal.decision_token,
+                removal.kernel_incarnation,
                 removal.generation
             ));
         }

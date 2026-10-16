@@ -105,6 +105,7 @@ impl QueuedBatch {
             destination,
             first,
             None,
+            None,
             pool.initialization_epoch(),
             acquire_slow_permit(&slow_slots),
             enqueued_at,
@@ -134,6 +135,7 @@ impl QueuedBatch {
             self.client,
             self.destination,
             payload,
+            None,
             None,
             self.pool.initialization_epoch(),
             acquire_slow_permit(&self.slow_slots),
@@ -224,6 +226,7 @@ impl ReadyBatch {
             removal.client,
             removal.dst,
             removal.decision_token,
+            removal.kernel_incarnation,
             removal.generation,
         ));
         let pool = Arc::clone(&self.pool);
@@ -269,6 +272,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
             destination,
             b"rollback",
             None,
+            None,
             pool.initialization_epoch(),
             acquire_slow_permit(&slow_slots),
             enqueued_at,
@@ -285,6 +289,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
             removal.client,
             removal.dst,
             removal.decision_token,
+            removal.kernel_incarnation,
             removal.generation,
         ));
         assert_released(&pool, &slow_slots, iterations);
