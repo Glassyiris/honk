@@ -200,36 +200,15 @@ fn seed_retirement_flow(backend: &mut RealEbpfBackend, port: u16) -> RetireReque
         ..TuplesKey::default()
     };
     let incarnation = u64::from(port);
-    backend
-        .flow_insert(
-            "CONN_STATE_MAP",
-            &key,
-            &ConnState {
-                incarnation,
-                ..ConnState::default()
-            },
-        )
-        .unwrap();
-    backend
-        .flow_insert(
-            "ROUTING_HANDOFF_MAP",
-            &key,
-            &RoutingHandoffEntry {
-                incarnation,
-                ..RoutingHandoffEntry::default()
-            },
-        )
-        .unwrap();
-    backend
-        .flow_insert(
-            "REDIRECT_TRACK",
-            &RedirectTuple::from_tuples(&key),
-            &RedirectEntry {
-                incarnation,
-                ..RedirectEntry::default()
-            },
-        )
-        .unwrap();
+    publish_retirement_flow(
+        backend,
+        &key,
+        &ConnState {
+            incarnation,
+            ..ConnState::default()
+        },
+    )
+    .unwrap();
     RetireRequest {
         key,
         kind: RetireKind::Tcp { incarnation },
