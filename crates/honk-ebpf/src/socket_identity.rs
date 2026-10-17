@@ -10,18 +10,18 @@ use honk_ebpf_common::{conn::BpfStatsKey, redirect_need::SocketIdentity};
 
 use crate::maps::{SOCKET_IDENTITY, increment_bpf_stat};
 
-/// Retain the first complete identity, or refuse the cgroup operation.
+/// Retain the first complete identity; a failure is counted, never enforced.
 ///
 /// # Safety
 /// `socket` must retain its verifier pointer type: the original cgroup sock
 /// context, or the `sk` field loaded directly from a cgroup sock_addr context.
 #[inline(always)]
-pub(crate) unsafe fn capture(socket: *mut c_void, argv0: bool) -> bool {
+pub(crate) unsafe fn capture(socket: *mut c_void, argv0: bool) {
     // Aya's SkStorage wrapper only accepts SockAddrContext. Keep the static map
     // relocation while using the helper's context-specific socket argument.
     let map = (&raw const SOCKET_IDENTITY).cast_mut().cast();
     if !unsafe { bpf_sk_storage_get(map, socket.cast(), ptr::null_mut(), 0) }.is_null() {
-        return true;
+        return;
     }
 
     let mut identity = SocketIdentity {
@@ -37,7 +37,7 @@ pub(crate) unsafe fn capture(socket: *mut c_void, argv0: bool) -> bool {
         };
         if ret != 0 {
             increment_bpf_stat(BpfStatsKey::SocketIdentityCaptureFailure);
-            return false;
+            return;
         }
     }
 
@@ -51,15 +51,14 @@ pub(crate) unsafe fn capture(socket: *mut c_void, argv0: bool) -> bool {
         )
     };
     if !captured.is_null() {
-        return true;
+        return;
     }
     // A concurrent creator can win publication while our CREATE returns null.
     if !unsafe { bpf_sk_storage_get(map, socket.cast(), ptr::null_mut(), 0) }.is_null() {
-        return true;
+        return;
     }
 
     increment_bpf_stat(BpfStatsKey::SocketIdentityCaptureFailure);
-    false
 }
 
 /// Borrow only the identity of the actual skb socket; never allocate in TC.

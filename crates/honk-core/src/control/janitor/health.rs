@@ -86,7 +86,7 @@ impl BpfJanitor {
                     "BPF janitor: auxiliary map insert failures increased"
                 }
                 BpfStatsKey::SocketIdentityCaptureFailure => {
-                    "BPF janitor: socket identity capture failures increased; socket operations were denied"
+                    "BPF janitor: socket identity capture failures increased; affected sockets lost process-name matching"
                 }
                 BpfStatsKey::TcpRequestProofInsertFailure
                 | BpfStatsKey::TcpChildProofStorageFailure

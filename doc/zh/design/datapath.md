@@ -67,9 +67,9 @@ flowchart LR
 | `dae0_ingress` | 主机 `dae0` 的 TC ingress | 反查 `REDIRECT_TRACK`，恢复原始 MAC/接口交付，并统计 RX 流量。没有精确记录的 UDP 回复改用客户端的 `CLIENT_REPLY_TRACK` 帧信息，且不计入 RX。 |
 | `dae0peer_ingress` | `daens` `dae0peer` 的 TC ingress | 在链路 scrub 后恢复 UDP53 provenance 与 SYN incarnation；TC 只分配 UDP。TCP 先保留原生 established/TIME_WAIT 查找，再选择监听器。 |
 | `tproxy_sk_lookup` | `daens` 中的 `sk_lookup` | 用 `LISTEN_SOCKET_MAP` 中的透明监听器覆盖普通套接字查找。 |
-| `tproxy_wan_cg_sock_create` | cgroup `sock_create` | 保留套接字首次捕获的进程身份；捕获失败则拒绝创建。 |
-| `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | 保留已有身份，缺失时在 connect 前捕获；捕获失败则拒绝连接。 |
-| `tproxy_wan_cg_sendmsg4`, `tproxy_wan_cg_sendmsg6` | cgroup `sendmsg4`, `sendmsg6` | 保留已有身份，缺失时在发送前捕获；捕获失败则拒绝发送。 |
+| `tproxy_wan_cg_sock_create` | cgroup `sock_create` | 保留套接字首次捕获的进程身份；捕获失败只计数，创建照常进行。 |
+| `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | 保留已有身份，缺失时在 connect 前捕获；捕获失败只计数，连接照常进行。 |
+| `tproxy_wan_cg_sendmsg4`, `tproxy_wan_cg_sendmsg6` | cgroup `sendmsg4`, `sendmsg6` | 保留已有身份，缺失时在发送前捕获；捕获失败只计数，发送照常进行。 |
 | `honk_tcp_v4_route_req`、`honk_tcp_v6_route_req` | TCP request 路由的必需 fentry | 将实际 SYN skb 的 tuple/incarnation 与不可变 handoff 绑定到实际 request socket。 |
 | `honk_tcp_create_openreq_child` | child 创建的必需 fexit | 验证 request/child cookie 继承关系，把已证明的 handoff 放入实际 child 的 socket storage。 |
 | `honk_tcp_v4_reqsk_destructor`、`honk_tcp_v6_reqsk_destructor` | request 析构的必需 fentry | 删除精确 request 地址/cookie 的证明；有界 janitor 过期清理兜底可能漏执行的 tracing invocation。 |
@@ -87,7 +87,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 - LAN egress 仅抑制本机发起的 ICMPv6 Redirect，使用扩展头遍历后的 ICMPv6 header；转发的 Redirect 与其他 ICMPv6 仍放行。`honk-core/tests/ebpf_datapath_test.rs` 通过 `BPF_PROG_TEST_RUN` 检查 L2、通过隔离 TUN 接口检查 L3，并覆盖精确 tuple RX 计数与 cached-route 策略。
 - `dae0peer_ingress` — 在 `daens` 恢复 UDP53 路由/代际 provenance 与 TCP SYN incarnation；只有 UDP 使用 TC `bpf_sk_assign`。TCP 先经过原生 established/TIME_WAIT 处理，再进入现有 `sk_lookup` listener hook。
 - `tproxy_sk_lookup`（`src/sk_lookup.rs`）— 透明 listener：key 0/1 为 TCP4/TCP6，2..5 为 UDP4，6..9 为 UDP6。v4/v6 UDP listener-key 读取保留在 `#[inline(never)]` 子程序中。opt-level=2 时，LLVM 会把地址族分支转成通过计算 ctx offset 的 load，导致 verifier 报告 "dereference of modified ctx ptr"；新的分支选择 ctx 读取须保留此形态。
-- cgroup sock_create/connect4/6/sendmsg4/6（`src/cgroup.rs`）— 原生 socket storage 保留首次捕获的 `SocketIdentity{pid, pname}`，供进程名规则及控制面旁路使用；`pname` 通过运行时 kernel-BTF offset 读取 `argv[0]` 可执行文件 basename，限制为 15 字节，不可用或读取失败时回退到线程 `comm`。内核在 socket 对象销毁时回收 storage，不再有 release hook 或 cookie janitor。缺失必需的 cgroup/storage 支持会拒绝启动；身份捕获失败会以 `EPERM` 拒绝当前操作，而不会放行身份丢失的流量。
+- cgroup sock_create/connect4/6/sendmsg4/6（`src/cgroup.rs`）— 原生 socket storage 保留首次捕获的 `SocketIdentity{pid, pname}`，供进程名规则及控制面旁路使用；`pname` 通过运行时 kernel-BTF offset 读取 `argv[0]` 可执行文件 basename，限制为 15 字节，不可用或读取失败时回退到线程 `comm`。内核在 socket 对象销毁时回收 storage，不再有 release hook 或 cookie janitor。缺失必需的 cgroup/storage 支持会拒绝启动。这些 hook 挂在根 cgroup 上，因此身份捕获失败（storage 分配或 optmem 计费失败）不会拒绝宿主机操作：只计数，该 socket 的流量没有身份，进程名规则不会匹配它。honk 自身的 socket 仍通过 `dae_socket_mark` 识别。
 
 ## Map 清单
 
@@ -109,7 +109,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
 | `SOCKET_IDENTITY` | 不克隆的 `SK_STORAGE`，保存 socket 首次捕获的 PID/可执行文件 basename。存储跟随实际 socket 生命周期，不受固定 hash 项数或用户态过期清理约束。WAN TC 只查询；cgroup create/connect/sendmsg 同步捕获缺失的身份。 |
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 插入/内核删除计数，结合实际用户态删除计数估算占用。此路径不再由内核删除 tuple，故内核删除计数保持零。 |
-| `BPF_STATS_MAP` | 八个计数器：UDP/TCP conn-state overflow、redirect/handoff 插入失败、socket 身份捕获拒绝、request 证明插入失败、child 证明存储失败，以及普通同 tuple 竞争之外的 SYN 排他失败。TCP 归属计数增长时 janitor 会告警，`honk-tool bpf stats` 会打印它们。 |
+| `BPF_STATS_MAP` | 八个计数器：UDP/TCP conn-state overflow、redirect/handoff 插入失败、socket 身份捕获失败、request 证明插入失败、child 证明存储失败，以及普通同 tuple 竞争之外的 SYN 排他失败。TCP 归属计数增长时 janitor 会告警，`honk-tool bpf stats` 会打印它们。 |
 | `EVENT_RINGBUF` | 262,144 字节 ring，记录为 80 字节，包含功能性的 tuple/incarnation 过期提示。Producer 直接预留并初始化 ring 存储，不再经有界 TC 栈复制事件。 |
 | `UDP_DECISION_SEQUENCE` | NFQUEUE 决策身份的单槽 pinned allocator 状态；协议细节见 [NFQUEUE](./nfqueue.md)。 |
 | `FLOW_INCARNATION_SEQUENCE` | 按代持有、spin-lock 保护、不可回绕的 56 位身份域，以 `u64` 表示；独立于持久化 UDP decision token。 |

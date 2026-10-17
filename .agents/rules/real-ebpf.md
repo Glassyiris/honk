@@ -47,10 +47,10 @@ with syn_isn at offset 116, TcpBindingOffsets 32, DaeParam 44. Proof selection,
 IPv6 and sysctl rules live in `AGENTS.md` (Notes for agents).
 
 Socket process identity is native non-cloned `SK_STORAGE`, captured once by
-create/connect/sendmsg and reclaimed only with the actual socket object. A
-missing identity after CREATE and one lookup refuses the operation; no cookie
-hash, release hook, janitor or allow-and-drop fallback remains. Required cgroup
-capture failure aborts startup. Discover cgroup mounts through
+create/connect/sendmsg and reclaimed only with the actual socket object. The
+hooks sit on the root cgroup, so capture failure is counted and the operation
+proceeds without identity; no cookie hash, release hook or janitor remains.
+Required cgroup attachment failure aborts startup. Discover cgroup mounts through
 `/proc/thread-self/mounts`; root-cgroup tests require a disposable VM, because
 private mount/network namespaces do not isolate cgroup BPF attachment.
 

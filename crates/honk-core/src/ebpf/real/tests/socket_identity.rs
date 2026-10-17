@@ -3,7 +3,7 @@ use honk_ebpf_common::conn::BpfStatsKey;
 
 #[tokio::test]
 #[ignore = "requires disposable VM, root, cgroup v2, Linux 6.12+, and an eBPF build"]
-async fn allocation_failure_refuses_create_connect_and_send() {
+async fn allocation_failure_allows_create_connect_and_send_without_identity() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-identity-failure-{}", std::process::id()));
     let mut backend = RealEbpfBackend::load(
@@ -84,47 +84,40 @@ async fn allocation_failure_refuses_create_connect_and_send() {
                 // bpf_sk_storage_charge rejects every positive allocation at zero.
                 // All setup sockets and FDs already exist before admission closes.
                 std::fs::write(OPTMEM, "0").unwrap();
-                let refused = |error: std::io::Error| {
-                    assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-                };
                 for (domain, listener, receiver, tcp, udp_connect, udp_send) in &cases {
                     for (kind, protocol) in [
                         (socket2::Type::STREAM, socket2::Protocol::TCP),
                         (socket2::Type::DGRAM, socket2::Protocol::UDP),
                     ] {
-                        refused(socket2::Socket::new(*domain, kind, Some(protocol)).unwrap_err());
+                        let created = socket2::Socket::new(*domain, kind, Some(protocol)).unwrap();
+                        assert!(matches!(
+                            storage.get(&created, 0),
+                            Err(MapError::KeyNotFound)
+                        ));
                     }
-                    refused(
-                        tcp.connect(&socket2::SockAddr::from(listener.local_addr().unwrap()))
-                            .unwrap_err(),
-                    );
-                    refused(
-                        udp_connect
-                            .connect(&socket2::SockAddr::from(receiver.local_addr().unwrap()))
-                            .unwrap_err(),
-                    );
-                    refused(
-                        udp_send
-                            .send_to(
-                                b"denied",
-                                &socket2::SockAddr::from(receiver.local_addr().unwrap()),
-                            )
-                            .unwrap_err(),
-                    );
+                    tcp.connect(&socket2::SockAddr::from(listener.local_addr().unwrap()))
+                        .unwrap();
+                    udp_connect
+                        .connect(&socket2::SockAddr::from(receiver.local_addr().unwrap()))
+                        .unwrap();
+                    udp_send
+                        .send_to(
+                            b"unnamed",
+                            &socket2::SockAddr::from(receiver.local_addr().unwrap()),
+                        )
+                        .unwrap();
+                    let mut bytes = [0; 7];
+                    assert_eq!(receiver.recv(&mut bytes).unwrap(), bytes.len());
+                    assert_eq!(&bytes, b"unnamed");
                     for socket in [tcp, udp_connect, udp_send] {
                         assert!(matches!(storage.get(socket, 0), Err(MapError::KeyNotFound)));
                     }
                 }
                 drop(restore);
 
-                // The same operations succeed and retain real identity after the
-                // allocation charge is restored; EPERM was not a routing failure.
-                for (_, listener, receiver, tcp, udp_connect, udp_send) in &cases {
-                    tcp.connect(&socket2::SockAddr::from(listener.local_addr().unwrap()))
-                        .unwrap();
-                    udp_connect
-                        .connect(&socket2::SockAddr::from(receiver.local_addr().unwrap()))
-                        .unwrap();
+                // Once the charge is restored, the next hooked operation captures
+                // the identity that the failed attempts left missing.
+                for (_, _, receiver, _, _, udp_send) in &cases {
                     udp_send
                         .send_to(
                             b"allowed",
@@ -134,9 +127,7 @@ async fn allocation_failure_refuses_create_connect_and_send() {
                     let mut bytes = [0; 7];
                     assert_eq!(receiver.recv(&mut bytes).unwrap(), bytes.len());
                     assert_eq!(&bytes, b"allowed");
-                    for socket in [tcp, udp_connect, udp_send] {
-                        assert_eq!(storage.get(socket, 0).unwrap().pid, std::process::id());
-                    }
+                    assert_eq!(storage.get(udp_send, 0).unwrap().pid, std::process::id());
                 }
             })
             .join()
