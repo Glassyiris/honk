@@ -443,11 +443,17 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             source.port(),
             17,
         );
+        // Published, userspace-owned routing makes token-zero retirement
+        // eligible, so only the captured incarnation preserves the replacement.
+        let published = honk_ebpf_common::RoutingMeta {
+            raw: honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED | 2,
+        };
         let mut mock = MockEbpfBackend::new();
         mock.udp_conn_state_store(
             &key,
             &ConnState {
                 incarnation: if raw_dns { 22 } else { 11 },
+                meta: published,
                 ..Default::default()
             },
         )
@@ -486,6 +492,7 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
                 &key,
                 &ConnState {
                     incarnation: 22,
+                    meta: published,
                     ..Default::default()
                 },
             )
