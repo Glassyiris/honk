@@ -58,6 +58,14 @@ CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 
 必须启用 cgroup v2。真实 datapath 会在根 cgroup 上挂载 socket 身份 hook，缺少时直接拒绝启动。运行内核还必须提供原始 BTF（`/sys/kernel/btf/vmlinux` 或 `HONK_VMLINUX_BTF`），并允许在 `tcp_v4_route_req`、`tcp_v4_reqsk_destructor` 和 `tcp_create_openreq_child` 上挂 fentry/fexit，用于 TCP request 归属证明。若有已绑定的 IPv6 TCP listener，还需要对应的 IPv6 函数，因此要求内置 IPv6（`CONFIG_IPV6=y`）；模块化 IPv6 会被拒绝，不会降级为仅 IPv4。
 
+这些 TCP 归属 hook 额外需要下列内核选项；32 位内核会被拒绝：
+
+```text
+CONFIG_DEBUG_INFO_BTF=y   # 除非由 HONK_VMLINUX_BTF 提供 BTF
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+```
+
 ### bpffs
 
 eBPF map 必须 pin 在 bpffs，不能使用普通目录：
