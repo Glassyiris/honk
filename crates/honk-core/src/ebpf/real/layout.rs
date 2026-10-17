@@ -241,6 +241,18 @@ pub(super) fn validate_loaded_maps(bpf: &Ebpf) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn validate_socket_identity(bpf: &Ebpf) -> anyhow::Result<()> {
+    syscall::validate_map_layout(
+        bpf,
+        "SOCKET_IDENTITY",
+        aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_SK_STORAGE,
+        core::mem::size_of::<i32>() as u32,
+        core::mem::size_of::<SocketIdentity>() as u32,
+        0,
+        aya_obj::generated::BPF_F_NO_PREALLOC,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

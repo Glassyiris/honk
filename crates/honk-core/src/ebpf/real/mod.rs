@@ -40,27 +40,6 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
     }
 }
 
-fn validate_socket_identity_layout(bpf: &Ebpf) -> anyhow::Result<()> {
-    const NAME: &str = "SOCKET_IDENTITY";
-    let map = bpf
-        .map(NAME)
-        .ok_or_else(|| anyhow::anyhow!("map '{NAME}' not found"))?;
-    let aya::maps::Map::SkStorage(map) = map else {
-        anyhow::bail!("map '{NAME}' has incompatible map type");
-    };
-    let info = map
-        .info()
-        .map_err(|error| anyhow::anyhow!("query map '{NAME}': {error}"))?;
-    anyhow::ensure!(
-        info.key_size() == core::mem::size_of::<i32>() as u32
-            && info.value_size() == core::mem::size_of::<SocketIdentity>() as u32
-            && info.max_entries() == 0
-            && info.map_flags() == aya_obj::generated::BPF_F_NO_PREALLOC,
-        "map '{NAME}' has incompatible socket identity layout or flags"
-    );
-    Ok(())
-}
-
 /// Real eBPF backend backed by Aya and kernel BPF maps.
 ///
 /// Aya owns ordinary map operations; raw extensions provide batch reads/writes

@@ -146,7 +146,7 @@ impl RealEbpfBackend {
         }
         let mut bpf = loader.load(obj)?;
         layout::validate_loaded_maps(&bpf)?;
-        validate_socket_identity_layout(&bpf)?;
+        layout::validate_socket_identity(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         for name in [
             "COOKIE_PID_MAP",
