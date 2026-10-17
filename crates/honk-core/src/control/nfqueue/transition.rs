@@ -45,7 +45,7 @@ impl PendingUdpVerdicts {
                     identity.owner.token,
                     UdpDecisionTransition::ArmDirect(direct_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("arm direct", error.to_string()))?;
+                .map_err(|error| self.fatal_error("arm direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -110,7 +110,7 @@ impl PendingUdpVerdicts {
                     identity.owner.token,
                     UdpDecisionTransition::ActivateDirect(direct_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("activate direct", error.to_string()))?;
+                .map_err(|error| self.fatal_error("activate direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 let fatal = PendingUdpFatal::new(
@@ -173,7 +173,7 @@ impl PendingUdpVerdicts {
                     identity.owner.token,
                     UdpDecisionTransition::ActivateProxy(final_outbound, final_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("activate proxy", error.to_string()))?;
+                .map_err(|error| self.fatal_error("activate proxy", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -223,7 +223,7 @@ impl PendingUdpVerdicts {
                     identity.owner.token,
                     UdpDecisionTransition::Block,
                 )
-                .map_err(|error| self.fatal_error("block", error.to_string()))?;
+                .map_err(|error| self.fatal_error("block", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);

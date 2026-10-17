@@ -448,7 +448,10 @@ impl PendingUdpVerdicts {
                     key,
                     decision_token,
                 });
-                self.signal_fatal(PendingUdpFatal::new("state inspection", error.to_string()));
+                self.signal_fatal(PendingUdpFatal::new(
+                    "state inspection",
+                    format!("{error:#}"),
+                ));
                 self.drop_one(held, DropOutcome::Other);
                 return NfqueueIngest::Dropped;
             }

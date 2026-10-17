@@ -25,7 +25,9 @@ impl PendingUdpVerdicts {
                 "retire pending flow",
                 "backend omitted retirement outcome".into(),
             )),
-            Err(error) => Err(self.fatal_error("retire pending flow", error.source.to_string())),
+            Err(error) => {
+                Err(self.fatal_error("retire pending flow", format!("{:#}", error.source)))
+            }
         }
     }
 
