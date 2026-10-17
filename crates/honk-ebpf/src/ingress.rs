@@ -681,20 +681,17 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let flags = crate::maps::datapath_flags();
     let short_lived_udp =
         pkt.l4proto == IPPROTO_UDP && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five);
-    let udp_claimed = if pkt.l4proto == IPPROTO_UDP && !short_lived_udp {
+    if pkt.l4proto == IPPROTO_UDP && !short_lived_udp {
         if let Some(incarnation) =
             crate::contrack::udp::claim_udp_preparing(&pkt.tuples.five, &pkt.ethh.src_addr)
         {
             pkt.incarnation = incarnation;
-            true
         } else if let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five) {
             return cached_udp_decision(ctx, link_h_len, pkt, state);
         } else {
             return Err(TC_ACT_SHOT);
         }
-    } else {
-        false
-    };
+    }
 
     let route_l4proto = if pkt.l4proto == IPPROTO_TCP {
         L4ProtoType::Tcp as u8
@@ -723,7 +720,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         Ok(result) => result,
         Err(_error) => {
             error!(ctx, target: "honk", "lan_ingress route fail: {}", _error);
-            if udp_claimed {
+            if pkt.l4proto == IPPROTO_UDP && !short_lived_udp {
                 crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
             }
             return Err(TC_ACT_SHOT);
@@ -752,7 +749,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         decision.handoff_outbound()
     };
 
-    let mut udp_published = true;
     pkt.trace_id = 0;
     if (short_lived_udp || pkt.l4proto == IPPROTO_TCP)
         && !offload_direct
@@ -806,11 +802,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             let verdict = if flags & DATAPATH_FLAG_NFQ_READY == 0
                 || current_nfq_flags & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
                     != (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-                || !udp_claimed
             {
-                if udp_claimed {
-                    crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
-                }
+                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
                 Err(TC_ACT_SHOT)
             } else {
                 let pending_meta =
@@ -831,28 +824,22 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             pkt.tuples.dscp,
             offload_direct,
         );
-        if udp_claimed {
-            let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
-                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
-                return Err(TC_ACT_SHOT);
-            };
-            let state = unsafe { &mut (*scratch_ptr).state };
-            crate::contrack::udp::populate_udp_conn_state(
-                state,
-                meta,
-                &pkt.ethh.src_addr,
-                UdpDecisionState::None,
-                0,
-                pkt.incarnation,
-            );
-            state.trace_id = pkt.trace_id;
-            udp_published =
-                crate::contrack::udp::publish_claimed_udp_state(&pkt.tuples.five, state);
-            if !udp_published {
-                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
-            }
-        } else {
-            // Every ordinary fresh LAN UDP flow must own a Preparing claim.
+        let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
+            crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+            return Err(TC_ACT_SHOT);
+        };
+        let state = unsafe { &mut (*scratch_ptr).state };
+        crate::contrack::udp::populate_udp_conn_state(
+            state,
+            meta,
+            &pkt.ethh.src_addr,
+            UdpDecisionState::None,
+            0,
+            pkt.incarnation,
+        );
+        state.trace_id = pkt.trace_id;
+        if !crate::contrack::udp::publish_claimed_udp_state(&pkt.tuples.five, state) {
+            crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
             return Err(TC_ACT_SHOT);
         }
     }
@@ -864,10 +851,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
-        return Err(TC_ACT_SHOT);
-    }
-
-    if pkt.l4proto == IPPROTO_UDP && !short_lived_udp && !udp_published {
         return Err(TC_ACT_SHOT);
     }
 
