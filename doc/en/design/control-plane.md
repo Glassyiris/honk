@@ -22,7 +22,7 @@ Module map:
     - `quic.rs`, `packet_sniffer.rs`, `tcp_sniff.rs` — QUIC decryption/reassembly, per-flow sniff sessions, and TCP negative cache, respectively.
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`; [endpoint transactions](#udp-endpoint-pipeline).
     - `probers.rs` — `ProxyHttpProber`, `ProxyUdpProber`; [health probes](./groups.md#health-state-and-probes).
-    - `janitor.rs` — `BpfJanitor` scheduling and pressure policy; `janitor/sweep.rs` owns bounded scans and fenced retirement for [map maintenance](./datapath.md#userspace-maintenance-and-accounting).
+    - `janitor.rs` — `BpfJanitor` scheduling and pressure policy; `janitor/sweep.rs` owns bounded scans and fenced retirement for [map maintenance](./datapath.md#userspace-maintenance-and-accounting); `janitor/health.rs` owns map-pressure and BPF failure-counter warnings.
     - `retirement_worker.rs` — joined TCP/UDP/hint retirement ownership; `drain.rs` owns `DrainTracker` and [accepted-flow drain](#reload-and-runtime-generations).
 
 ## Startup and shutdown
