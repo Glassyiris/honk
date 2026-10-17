@@ -997,11 +997,7 @@ fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
 
 #[test]
 fn stateless_udp_retirement_has_no_kernel_flow_identity() {
-    for (client_port, dst_port, route) in [
-        (12345, 53, Some(RawDnsRoute::Direct(0))),
-        (12345, 53, None),
-        (53, 443, None),
-    ] {
+    for (client_port, dst_port) in [(12345, 53), (53, 443)] {
         let pool = Arc::new(UdpEndpointPool::new());
         let stats = StatsManager::new();
         let client = make_addr("10.0.0.1", client_port);
@@ -1013,7 +1009,7 @@ fn stateless_udp_retirement_has_no_kernel_flow_identity() {
                 client,
                 dst,
                 b"malformed DNS",
-                route,
+                None,
                 Some(41),
                 pool.initialization_epoch(),
                 Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
@@ -1026,7 +1022,7 @@ fn stateless_udp_retirement_has_no_kernel_flow_identity() {
             client,
             dst,
             b"malformed DNS",
-            route,
+            None,
             None,
             pool.initialization_epoch(),
             Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),

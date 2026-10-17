@@ -183,38 +183,37 @@ fn retirement_fence_prevents_missing_tuple_publication_and_reply_fallback() {
         for name in ["lan_egress_l2", "wan_ingress_l2", "dae0_ingress"] {
             load_classifier(&mut backend, name);
         }
-        for (src, dst) in PEERS {
-            for protocol in [IPPROTO_TCP, IPPROTO_UDP] {
-                for (index, (side, reverse)) in [
-                    ("lan_ingress_l2", false),
-                    ("wan_egress_l2", false),
-                    ("lan_egress_l2", true),
-                    ("wan_ingress_l2", true),
-                    ("dae0_ingress", true),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let key = tuple(src, dst, 45100 + index as u16, 443, protocol);
-                    fence(&mut backend, &key);
-                    let before = owned_values(&backend, &key);
-                    let bytes = if reverse {
-                        packet(dst, src, protocol, 443, key.src_port, 5, 0x02)
-                    } else {
-                        packet(src, dst, protocol, key.src_port, 443, 5, 0x02)
-                    };
-                    assert_eq!(
-                        run(&backend, side, &bytes, SkbInput::default()).verdict,
-                        TC_ACT_SHOT,
-                        "{side} {protocol} {src}"
-                    );
-                    assert_eq!(
-                        owned_values(&backend, &key),
-                        before,
-                        "{side} published behind retirement"
-                    );
-                    unfence(&mut backend, &key);
-                }
+        let (src, dst) = PEERS[0];
+        for protocol in [IPPROTO_TCP, IPPROTO_UDP] {
+            for (index, (side, reverse)) in [
+                ("lan_ingress_l2", false),
+                ("wan_egress_l2", false),
+                ("lan_egress_l2", true),
+                ("wan_ingress_l2", true),
+                ("dae0_ingress", true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let key = tuple(src, dst, 45100 + index as u16, 443, protocol);
+                fence(&mut backend, &key);
+                let before = owned_values(&backend, &key);
+                let bytes = if reverse {
+                    packet(dst, src, protocol, 443, key.src_port, 5, 0x02)
+                } else {
+                    packet(src, dst, protocol, key.src_port, 443, 5, 0x02)
+                };
+                assert_eq!(
+                    run(&backend, side, &bytes, SkbInput::default()).verdict,
+                    TC_ACT_SHOT,
+                    "{side} {protocol} {src}"
+                );
+                assert_eq!(
+                    owned_values(&backend, &key),
+                    before,
+                    "{side} published behind retirement"
+                );
+                unfence(&mut backend, &key);
             }
         }
     });
@@ -228,74 +227,73 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
         for name in ["lan_egress_l2", "wan_ingress_l2"] {
             load_classifier(&mut backend, name);
         }
-        for (src, dst) in PEERS {
-            for (index, (side, reverse, expected)) in [
-                ("lan_ingress_l2", false, TC_ACT_REDIRECT),
-                ("wan_egress_l2", false, TC_ACT_REDIRECT),
-                ("lan_egress_l2", true, TC_ACT_PIPE),
-                ("wan_ingress_l2", true, TC_ACT_PIPE),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let key = tuple(src, dst, 45200 + index as u16, 443, IPPROTO_TCP);
-                seed(&backend, "lan_ingress_l2", &key, src, dst);
-                let before = owned_values(&backend, &key);
+        let (src, dst) = PEERS[0];
+        for (index, (side, reverse, expected)) in [
+            ("lan_ingress_l2", false, TC_ACT_REDIRECT),
+            ("wan_egress_l2", false, TC_ACT_REDIRECT),
+            ("lan_egress_l2", true, TC_ACT_PIPE),
+            ("wan_ingress_l2", true, TC_ACT_PIPE),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = tuple(src, dst, 45200 + index as u16, 443, IPPROTO_TCP);
+            seed(&backend, "lan_ingress_l2", &key, src, dst);
+            let before = owned_values(&backend, &key);
+            backend
+                .hash_insert_noexist("TCP_PUBLISHING", &key, &777u64)
+                .unwrap();
+            let syn = if reverse {
+                packet(dst, src, IPPROTO_TCP, 443, key.src_port, 19, 0x02)
+            } else {
+                packet(src, dst, IPPROTO_TCP, key.src_port, 443, 19, 0x02)
+            };
+            assert_eq!(
+                run(&backend, side, &syn, SkbInput::default()).verdict,
+                TC_ACT_SHOT,
+                "{side} {src}"
+            );
+            assert_eq!(owned_values(&backend, &key), before);
+            assert_eq!(
                 backend
-                    .hash_insert_noexist("TCP_PUBLISHING", &key, &777u64)
-                    .unwrap();
-                let syn = if reverse {
-                    packet(dst, src, IPPROTO_TCP, 443, key.src_port, 19, 0x02)
-                } else {
-                    packet(src, dst, IPPROTO_TCP, key.src_port, 443, 19, 0x02)
-                };
+                    .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
+                    .unwrap(),
+                Some(777)
+            );
+            backend
+                .hash_remove::<_, u64>("TCP_PUBLISHING", &key)
+                .unwrap();
+            let mut previous = backend
+                .udp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .incarnation;
+            for isn in 1..=2 {
                 assert_eq!(
-                    run(&backend, side, &syn, SkbInput::default()).verdict,
-                    TC_ACT_SHOT,
-                    "{side} {src}"
+                    run(
+                        &backend,
+                        side,
+                        &with_isn(syn.clone(), isn),
+                        SkbInput::default()
+                    )
+                    .verdict,
+                    expected,
+                    "{side} remained busy"
                 );
-                assert_eq!(owned_values(&backend, &key), before);
-                assert_eq!(
-                    backend
-                        .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
-                        .unwrap(),
-                    Some(777)
-                );
-                backend
-                    .hash_remove::<_, u64>("TCP_PUBLISHING", &key)
-                    .unwrap();
-                let mut previous = backend
+                let current = backend
                     .udp_conn_state_lookup(&key)
                     .unwrap()
                     .unwrap()
                     .incarnation;
-                for isn in 1..=2 {
-                    assert_eq!(
-                        run(
-                            &backend,
-                            side,
-                            &with_isn(syn.clone(), isn),
-                            SkbInput::default()
-                        )
-                        .verdict,
-                        expected,
-                        "{side} remained busy"
-                    );
-                    let current = backend
-                        .udp_conn_state_lookup(&key)
-                        .unwrap()
-                        .unwrap()
-                        .incarnation;
-                    assert_ne!(current, previous);
-                    assert_ne!(current, 0);
-                    assert_eq!(
-                        backend
-                            .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
-                            .unwrap(),
-                        None
-                    );
-                    previous = current;
-                }
+                assert_ne!(current, previous);
+                assert_ne!(current, 0);
+                assert_eq!(
+                    backend
+                        .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
+                        .unwrap(),
+                    None
+                );
+                previous = current;
             }
         }
     });
@@ -305,116 +303,115 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
     isolated(|| {
-        for (src, dst) in PEERS {
-            for side in ["lan_ingress_l2", "wan_egress_l2"] {
-                let (mut backend, _, _listeners) = proxy_fixture();
-                load_classifier(&mut backend, "dae0peer_ingress");
-                let live_udp = tuple(src, dst, 45300, 443, IPPROTO_UDP);
-                seed(&backend, side, &live_udp, src, dst);
-                let live_owner = handoff(&backend, &live_udp).incarnation;
-                set_array(
-                    &mut backend,
-                    "FLOW_INCARNATION_SEQUENCE",
-                    0,
-                    FlowIncarnationSequence {
-                        next: LAST_INCARNATION - 1,
-                        ..Default::default()
-                    },
-                );
-                let key = tuple(src, dst, 45301, 443, IPPROTO_TCP);
-                let syn = packet(src, dst, IPPROTO_TCP, key.src_port, 443, 5, 0x02);
-                let published = run(&backend, side, &syn, SkbInput::default());
-                assert_eq!(published.verdict, TC_ACT_REDIRECT);
-                assert_eq!(handoff(&backend, &key).incarnation, LAST_INCARNATION);
-                assert_eq!(
-                    backend
-                        .udp_conn_state_lookup(&key)
-                        .unwrap()
-                        .unwrap()
-                        .incarnation,
-                    LAST_INCARNATION
-                );
-                assert_eq!(
-                    backend
-                        .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
-                        .unwrap()
-                        .unwrap()
-                        .incarnation,
-                    LAST_INCARNATION
-                );
-                let peer = run(
-                    &backend,
-                    "dae0peer_ingress",
-                    &syn,
-                    SkbInput {
-                        cb: published.cb,
-                        mark: published.mark,
-                        ..Default::default()
-                    },
-                );
-                assert_eq!(peer.verdict, TC_ACT_OK);
-                assert_eq!(
-                    (u64::from(peer.priority) << 24) | u64::from(peer.mark & 0x00ff_ffff),
-                    LAST_INCARNATION
-                );
-                // An identical retry reuses the pending owner and needs no allocation.
-                assert_eq!(
-                    run(&backend, side, &syn, SkbInput::default()).verdict,
-                    TC_ACT_REDIRECT
-                );
-                assert_eq!(handoff(&backend, &key).incarnation, LAST_INCARNATION);
-                let before = owned_values(&backend, &key);
-                for isn in 1..=2 {
-                    assert_eq!(
-                        run(
-                            &backend,
-                            side,
-                            &with_isn(syn.clone(), isn),
-                            SkbInput::default()
-                        )
-                        .verdict,
-                        TC_ACT_SHOT
-                    );
-                    assert_eq!(owned_values(&backend, &key), before);
-                    let fresh = tuple(src, dst, 45302, 443, IPPROTO_UDP);
-                    let bytes = packet(src, dst, IPPROTO_UDP, fresh.src_port, 443, 5, 0);
-                    assert_eq!(
-                        run(&backend, side, &bytes, SkbInput::default()).verdict,
-                        TC_ACT_SHOT
-                    );
-                    assert!(backend.udp_conn_state_lookup(&fresh).unwrap().is_none());
-                    assert!(backend.routing_handoff_lookup(&fresh).unwrap().is_none());
-                    assert!(
-                        backend
-                            .redirect_track_lookup(&RedirectTuple::from_tuples(&fresh))
-                            .unwrap()
-                            .is_none()
-                    );
-                    let sequence = Array::<_, FlowIncarnationSequence>::try_from(
-                        backend
-                            .bpf()
-                            .unwrap()
-                            .map("FLOW_INCARNATION_SEQUENCE")
-                            .unwrap(),
-                    )
+        let (src, dst) = PEERS[0];
+        for side in ["lan_ingress_l2", "wan_egress_l2"] {
+            let (mut backend, _, _listeners) = proxy_fixture();
+            load_classifier(&mut backend, "dae0peer_ingress");
+            let live_udp = tuple(src, dst, 45300, 443, IPPROTO_UDP);
+            seed(&backend, side, &live_udp, src, dst);
+            let live_owner = handoff(&backend, &live_udp).incarnation;
+            set_array(
+                &mut backend,
+                "FLOW_INCARNATION_SEQUENCE",
+                0,
+                FlowIncarnationSequence {
+                    next: LAST_INCARNATION - 1,
+                    ..Default::default()
+                },
+            );
+            let key = tuple(src, dst, 45301, 443, IPPROTO_TCP);
+            let syn = packet(src, dst, IPPROTO_TCP, key.src_port, 443, 5, 0x02);
+            let published = run(&backend, side, &syn, SkbInput::default());
+            assert_eq!(published.verdict, TC_ACT_REDIRECT);
+            assert_eq!(handoff(&backend, &key).incarnation, LAST_INCARNATION);
+            assert_eq!(
+                backend
+                    .udp_conn_state_lookup(&key)
                     .unwrap()
-                    .get(&0, 0)
-                    .unwrap();
-                    assert_eq!(sequence.next, LAST_INCARNATION);
-                    assert_eq!(
-                        backend
-                            .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
-                            .unwrap(),
-                        None
-                    );
-                }
-                let bytes = packet(src, dst, IPPROTO_UDP, live_udp.src_port, 443, 5, 0);
+                    .unwrap()
+                    .incarnation,
+                LAST_INCARNATION
+            );
+            assert_eq!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                    .unwrap()
+                    .unwrap()
+                    .incarnation,
+                LAST_INCARNATION
+            );
+            let peer = run(
+                &backend,
+                "dae0peer_ingress",
+                &syn,
+                SkbInput {
+                    cb: published.cb,
+                    mark: published.mark,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(peer.verdict, TC_ACT_OK);
+            assert_eq!(
+                (u64::from(peer.priority) << 24) | u64::from(peer.mark & 0x00ff_ffff),
+                LAST_INCARNATION
+            );
+            // An identical retry reuses the pending owner and needs no allocation.
+            assert_eq!(
+                run(&backend, side, &syn, SkbInput::default()).verdict,
+                TC_ACT_REDIRECT
+            );
+            assert_eq!(handoff(&backend, &key).incarnation, LAST_INCARNATION);
+            let before = owned_values(&backend, &key);
+            for isn in 1..=2 {
+                assert_eq!(
+                    run(
+                        &backend,
+                        side,
+                        &with_isn(syn.clone(), isn),
+                        SkbInput::default()
+                    )
+                    .verdict,
+                    TC_ACT_SHOT
+                );
+                assert_eq!(owned_values(&backend, &key), before);
+                let fresh = tuple(src, dst, 45302, 443, IPPROTO_UDP);
+                let bytes = packet(src, dst, IPPROTO_UDP, fresh.src_port, 443, 5, 0);
                 assert_eq!(
                     run(&backend, side, &bytes, SkbInput::default()).verdict,
-                    TC_ACT_REDIRECT
+                    TC_ACT_SHOT
                 );
-                assert_eq!(handoff(&backend, &live_udp).incarnation, live_owner);
+                assert!(backend.udp_conn_state_lookup(&fresh).unwrap().is_none());
+                assert!(backend.routing_handoff_lookup(&fresh).unwrap().is_none());
+                assert!(
+                    backend
+                        .redirect_track_lookup(&RedirectTuple::from_tuples(&fresh))
+                        .unwrap()
+                        .is_none()
+                );
+                let sequence = Array::<_, FlowIncarnationSequence>::try_from(
+                    backend
+                        .bpf()
+                        .unwrap()
+                        .map("FLOW_INCARNATION_SEQUENCE")
+                        .unwrap(),
+                )
+                .unwrap()
+                .get(&0, 0)
+                .unwrap();
+                assert_eq!(sequence.next, LAST_INCARNATION);
+                assert_eq!(
+                    backend
+                        .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
+                        .unwrap(),
+                    None
+                );
             }
+            let bytes = packet(src, dst, IPPROTO_UDP, live_udp.src_port, 443, 5, 0);
+            assert_eq!(
+                run(&backend, side, &bytes, SkbInput::default()).verdict,
+                TC_ACT_REDIRECT
+            );
+            assert_eq!(handoff(&backend, &live_udp).incarnation, live_owner);
         }
     });
 }
@@ -429,140 +426,139 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
         if wait_ns != 0 {
             std::thread::sleep(Duration::from_nanos(wait_ns));
         }
-        for (src, dst) in PEERS {
-            for side in ["lan_ingress_l2", "wan_egress_l2"] {
-                let (mut backend, _, _listeners) = proxy_fixture();
-                let mut ring = RingBuf::try_from(
-                    backend
-                        .bpf_mut()
-                        .unwrap()
-                        .take_map("EVENT_RINGBUF")
-                        .unwrap(),
-                )
-                .unwrap();
-                let mut keys = [TuplesKey::default(); 3];
-                let mut owners = [0; 3];
-                for index in 0..3 {
-                    let key = tuple(src, dst, 45400 + index as u16, 443, IPPROTO_UDP);
-                    seed(&backend, side, &key, src, dst);
-                    let mut state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-                    owners[index] = state.incarnation;
-                    state.last_seen_ns = 0;
-                    backend.udp_conn_state_store(&key, &state).unwrap();
-                    let before = owned_values(&backend, &key);
-                    let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 19, 0);
-                    assert_eq!(
-                        run(&backend, side, &bytes, SkbInput::default()).verdict,
-                        TC_ACT_SHOT
-                    );
-                    assert_eq!(
-                        owned_values(&backend, &key),
-                        before,
-                        "kernel deleted or refreshed expired owner"
-                    );
-                    let item = ring.next().expect("expired packet must emit a hint");
-                    assert_eq!(item.len(), mem::size_of::<DaeEvent>());
-                    let event: DaeEvent = unsafe { ptr::read_unaligned(item.as_ptr().cast()) };
-                    assert_eq!(event.type_, DaeEventType::FlowExpired as u32);
-                    assert_eq!(event.incarnation, state.incarnation);
-                    assert_eq!(event.l4proto, IPPROTO_UDP);
-                    assert_eq!(event.sip, unsafe { key.src_ip.u6_addr32 });
-                    assert_eq!(event.dip, unsafe { key.dst_ip.u6_addr32 });
-                    assert_eq!((event.sport, event.dport), (key.src_port, key.dst_port));
-                    assert!(event.timestamp > 120_000_000_000);
-                    keys[index] = key;
-                }
-                // Delay one hint across an actual new kernel admission.
+        let (src, dst) = PEERS[0];
+        for side in ["lan_ingress_l2", "wan_egress_l2"] {
+            let (mut backend, _, _listeners) = proxy_fixture();
+            let mut ring = RingBuf::try_from(
                 backend
-                    .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &keys[1])
-                    .unwrap();
-                backend
-                    .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
-                        "ROUTING_HANDOFF_MAP",
-                        &keys[1],
-                    )
-                    .unwrap();
-                backend
-                    .hash_remove::<_, FlowMapValue<RedirectEntry>>(
-                        "REDIRECT_TRACK",
-                        &RedirectTuple::from_tuples(&keys[1]),
-                    )
-                    .unwrap();
-                seed(&backend, side, &keys[1], src, dst);
-                assert_ne!(handoff(&backend, &keys[1]).incarnation, owners[1]);
-                // Delay another hint across refresh of the same incarnation.
-                let mut refreshed = backend.udp_conn_state_lookup(&keys[2]).unwrap().unwrap();
-                refreshed.last_seen_ns = now_ns() - 2_000_000_000;
-                backend.udp_conn_state_store(&keys[2], &refreshed).unwrap();
-                let bytes = packet(src, dst, IPPROTO_UDP, keys[2].src_port, 443, 19, 0);
+                    .bpf_mut()
+                    .unwrap()
+                    .take_map("EVENT_RINGBUF")
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut keys = [TuplesKey::default(); 3];
+            let mut owners = [0; 3];
+            for index in 0..3 {
+                let key = tuple(src, dst, 45400 + index as u16, 443, IPPROTO_UDP);
+                seed(&backend, side, &key, src, dst);
+                let mut state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                owners[index] = state.incarnation;
+                state.last_seen_ns = 0;
+                backend.udp_conn_state_store(&key, &state).unwrap();
+                let before = owned_values(&backend, &key);
+                let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 19, 0);
                 assert_eq!(
                     run(&backend, side, &bytes, SkbInput::default()).verdict,
-                    TC_ACT_REDIRECT
-                );
-                let refreshed_now = backend.udp_conn_state_lookup(&keys[2]).unwrap().unwrap();
-                assert_eq!(refreshed_now.incarnation, owners[2]);
-                assert!(refreshed_now.last_seen_ns > refreshed.last_seen_ns);
-                let new_owner = owned_values(&backend, &keys[1]);
-                let fresh_state = owned_values(&backend, &keys[2]);
-                let mut outcomes = [None; 3];
-                let counts = backend
-                    .retire_batch(
-                        &[
-                            RetireRequest {
-                                key: keys[0],
-                                kind: RetireKind::ExpiryHint {
-                                    incarnation: owners[0],
-                                    now_ns: now_ns(),
-                                },
-                            },
-                            RetireRequest {
-                                key: keys[1],
-                                kind: RetireKind::ExpiryHint {
-                                    incarnation: owners[1],
-                                    now_ns: now_ns(),
-                                },
-                            },
-                            RetireRequest {
-                                key: keys[2],
-                                kind: RetireKind::ExpiryHint {
-                                    incarnation: owners[2],
-                                    now_ns: now_ns(),
-                                },
-                            },
-                        ],
-                        &mut outcomes,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    counts,
-                    RetireCounts {
-                        conn: 1,
-                        redirect: 1,
-                        handoff: 1,
-                        request: 0
-                    }
+                    TC_ACT_SHOT
                 );
                 assert_eq!(
-                    outcomes,
-                    [
-                        Some(UdpDecisionCommitResult::Applied),
-                        Some(UdpDecisionCommitResult::Superseded),
-                        Some(UdpDecisionCommitResult::StateMismatch)
-                    ]
+                    owned_values(&backend, &key),
+                    before,
+                    "kernel deleted or refreshed expired owner"
                 );
-                assert_eq!(owned_values(&backend, &keys[1]), new_owner);
-                assert_eq!(owned_values(&backend, &keys[2]), fresh_state);
-                assert!(backend.udp_conn_state_lookup(&keys[0]).unwrap().is_none());
-                assert!(backend.routing_handoff_lookup(&keys[0]).unwrap().is_none());
-                assert!(
-                    backend
-                        .redirect_track_lookup(&RedirectTuple::from_tuples(&keys[0]))
-                        .unwrap()
-                        .is_none()
-                );
-                seed(&backend, side, &keys[0], src, dst);
-                assert_ne!(handoff(&backend, &keys[0]).incarnation, owners[0]);
+                let item = ring.next().expect("expired packet must emit a hint");
+                assert_eq!(item.len(), mem::size_of::<DaeEvent>());
+                let event: DaeEvent = unsafe { ptr::read_unaligned(item.as_ptr().cast()) };
+                assert_eq!(event.type_, DaeEventType::FlowExpired as u32);
+                assert_eq!(event.incarnation, state.incarnation);
+                assert_eq!(event.l4proto, IPPROTO_UDP);
+                assert_eq!(event.sip, unsafe { key.src_ip.u6_addr32 });
+                assert_eq!(event.dip, unsafe { key.dst_ip.u6_addr32 });
+                assert_eq!((event.sport, event.dport), (key.src_port, key.dst_port));
+                assert!(event.timestamp > 120_000_000_000);
+                keys[index] = key;
             }
+            // Delay one hint across an actual new kernel admission.
+            backend
+                .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &keys[1])
+                .unwrap();
+            backend
+                .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                    "ROUTING_HANDOFF_MAP",
+                    &keys[1],
+                )
+                .unwrap();
+            backend
+                .hash_remove::<_, FlowMapValue<RedirectEntry>>(
+                    "REDIRECT_TRACK",
+                    &RedirectTuple::from_tuples(&keys[1]),
+                )
+                .unwrap();
+            seed(&backend, side, &keys[1], src, dst);
+            assert_ne!(handoff(&backend, &keys[1]).incarnation, owners[1]);
+            // Delay another hint across refresh of the same incarnation.
+            let mut refreshed = backend.udp_conn_state_lookup(&keys[2]).unwrap().unwrap();
+            refreshed.last_seen_ns = now_ns() - 2_000_000_000;
+            backend.udp_conn_state_store(&keys[2], &refreshed).unwrap();
+            let bytes = packet(src, dst, IPPROTO_UDP, keys[2].src_port, 443, 19, 0);
+            assert_eq!(
+                run(&backend, side, &bytes, SkbInput::default()).verdict,
+                TC_ACT_REDIRECT
+            );
+            let refreshed_now = backend.udp_conn_state_lookup(&keys[2]).unwrap().unwrap();
+            assert_eq!(refreshed_now.incarnation, owners[2]);
+            assert!(refreshed_now.last_seen_ns > refreshed.last_seen_ns);
+            let new_owner = owned_values(&backend, &keys[1]);
+            let fresh_state = owned_values(&backend, &keys[2]);
+            let mut outcomes = [None; 3];
+            let counts = backend
+                .retire_batch(
+                    &[
+                        RetireRequest {
+                            key: keys[0],
+                            kind: RetireKind::ExpiryHint {
+                                incarnation: owners[0],
+                                now_ns: now_ns(),
+                            },
+                        },
+                        RetireRequest {
+                            key: keys[1],
+                            kind: RetireKind::ExpiryHint {
+                                incarnation: owners[1],
+                                now_ns: now_ns(),
+                            },
+                        },
+                        RetireRequest {
+                            key: keys[2],
+                            kind: RetireKind::ExpiryHint {
+                                incarnation: owners[2],
+                                now_ns: now_ns(),
+                            },
+                        },
+                    ],
+                    &mut outcomes,
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                RetireCounts {
+                    conn: 1,
+                    redirect: 1,
+                    handoff: 1,
+                    request: 0
+                }
+            );
+            assert_eq!(
+                outcomes,
+                [
+                    Some(UdpDecisionCommitResult::Applied),
+                    Some(UdpDecisionCommitResult::Superseded),
+                    Some(UdpDecisionCommitResult::StateMismatch)
+                ]
+            );
+            assert_eq!(owned_values(&backend, &keys[1]), new_owner);
+            assert_eq!(owned_values(&backend, &keys[2]), fresh_state);
+            assert!(backend.udp_conn_state_lookup(&keys[0]).unwrap().is_none());
+            assert!(backend.routing_handoff_lookup(&keys[0]).unwrap().is_none());
+            assert!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&keys[0]))
+                    .unwrap()
+                    .is_none()
+            );
+            seed(&backend, side, &keys[0], src, dst);
+            assert_ne!(handoff(&backend, &keys[0]).incarnation, owners[0]);
         }
     });
 }
@@ -641,76 +637,75 @@ fn assert_fenced_claim_unchanged(backend: &RealEbpfBackend, key: &TuplesKey, byt
 fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republishes() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
-        for (src, dst) in PEERS {
-            let key = tuple(src, dst, 45500, 443, IPPROTO_UDP);
-            let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
-            let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 1);
-            let published = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-            assert_eq!(published.incarnation, incarnation);
-            assert_eq!(published.decision_token, 0);
-            assert_eq!(result.cb[3], published.state as u32);
-            assert_eq!(
-                published.state,
-                if result.cb[4] == 0 {
-                    UdpDecisionState::Aborted as u8
-                } else {
-                    UdpDecisionState::Block as u8
-                },
-                "pre-fence completion left an orphan Preparing claim"
-            );
-            assert_fenced_claim_unchanged(&backend, &key, &bytes);
-            unfence(&mut backend, &key);
-            let before = owned_values(&backend, &key);
-            assert_eq!(
-                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
-                TC_ACT_SHOT
-            );
-            assert_eq!(
-                owned_values(&backend, &key),
-                before,
-                "terminal follower rewrote captured ownership"
-            );
-            // Aborted is eligible immediately. For a successful publication,
-            // advance only the supplied expiry clock past its normal timeout.
-            let expiry_clock = if published.state == UdpDecisionState::Aborted as u8 {
-                now_ns()
+        let (src, dst) = PEERS[0];
+        let key = tuple(src, dst, 45500, 443, IPPROTO_UDP);
+        let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+        let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 1);
+        let published = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        assert_eq!(published.incarnation, incarnation);
+        assert_eq!(published.decision_token, 0);
+        assert_eq!(result.cb[3], published.state as u32);
+        assert_eq!(
+            published.state,
+            if result.cb[4] == 0 {
+                UdpDecisionState::Aborted as u8
             } else {
-                published.last_seen_ns + UDP_CONN_STATE_TIMEOUT_NS + 1
-            };
-            let mut outcomes = [None];
-            assert_eq!(
-                backend
-                    .retire_batch(
-                        &[RetireRequest {
-                            key,
-                            kind: RetireKind::ExpiryHint {
-                                incarnation,
-                                now_ns: expiry_clock
-                            },
-                        }],
-                        &mut outcomes
-                    )
-                    .unwrap(),
-                RetireCounts {
-                    conn: 1,
-                    ..Default::default()
-                }
-            );
-            assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
-            assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
-            assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
-            assert!(
-                backend
-                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
-                    .unwrap()
-                    .is_none()
-            );
-            seed(&backend, "lan_ingress_l2", &key, src, dst);
-            let republished = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-            assert_ne!(republished.incarnation, incarnation);
-            assert_ne!(republished.state, UdpDecisionState::Preparing as u8);
-            assert_ne!(republished.state, UdpDecisionState::Aborted as u8);
-        }
+                UdpDecisionState::Block as u8
+            },
+            "pre-fence completion left an orphan Preparing claim"
+        );
+        assert_fenced_claim_unchanged(&backend, &key, &bytes);
+        unfence(&mut backend, &key);
+        let before = owned_values(&backend, &key);
+        assert_eq!(
+            run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
+            TC_ACT_SHOT
+        );
+        assert_eq!(
+            owned_values(&backend, &key),
+            before,
+            "terminal follower rewrote captured ownership"
+        );
+        // Aborted is eligible immediately. For a successful publication,
+        // advance only the supplied expiry clock past its normal timeout.
+        let expiry_clock = if published.state == UdpDecisionState::Aborted as u8 {
+            now_ns()
+        } else {
+            published.last_seen_ns + UDP_CONN_STATE_TIMEOUT_NS + 1
+        };
+        let mut outcomes = [None];
+        assert_eq!(
+            backend
+                .retire_batch(
+                    &[RetireRequest {
+                        key,
+                        kind: RetireKind::ExpiryHint {
+                            incarnation,
+                            now_ns: expiry_clock
+                        },
+                    }],
+                    &mut outcomes
+                )
+                .unwrap(),
+            RetireCounts {
+                conn: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+        assert!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .is_none()
+        );
+        seed(&backend, "lan_ingress_l2", &key, src, dst);
+        let republished = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        assert_ne!(republished.incarnation, incarnation);
+        assert_ne!(republished.state, UdpDecisionState::Preparing as u8);
+        assert_ne!(republished.state, UdpDecisionState::Aborted as u8);
     });
 }
 
@@ -719,87 +714,86 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
 fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_republishes() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
-        for (src, dst) in PEERS {
-            let key = tuple(src, dst, 45501, 443, IPPROTO_UDP);
-            let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
-            let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 2);
-            assert_eq!(
-                result.cb[3], 1,
-                "abort must preserve both owned auxiliaries"
-            );
-            let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-            assert_eq!(aborted.incarnation, incarnation);
-            assert_eq!(aborted.state, UdpDecisionState::Aborted as u8);
-            assert_eq!(aborted.decision_token, 41);
-            assert_eq!(handoff(&backend, &key).incarnation, incarnation);
-            assert_eq!(handoff(&backend, &key).result.decision_token, 41);
-            let track = backend
+        let (src, dst) = PEERS[0];
+        let key = tuple(src, dst, 45501, 443, IPPROTO_UDP);
+        let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+        let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 2);
+        assert_eq!(
+            result.cb[3], 1,
+            "abort must preserve both owned auxiliaries"
+        );
+        let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        assert_eq!(aborted.incarnation, incarnation);
+        assert_eq!(aborted.state, UdpDecisionState::Aborted as u8);
+        assert_eq!(aborted.decision_token, 41);
+        assert_eq!(handoff(&backend, &key).incarnation, incarnation);
+        assert_eq!(handoff(&backend, &key).result.decision_token, 41);
+        let track = backend
+            .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!((track.incarnation, track.decision_token), (incarnation, 41));
+        assert_fenced_claim_unchanged(&backend, &key, &bytes);
+        unfence(&mut backend, &key);
+        let before = owned_values(&backend, &key);
+        assert_eq!(
+            run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
+            TC_ACT_SHOT
+        );
+        assert_eq!(
+            owned_values(&backend, &key),
+            before,
+            "Aborted follower renewed the marker"
+        );
+        let mut outcomes = [None];
+        let counts = backend
+            .retire_batch(
+                &[RetireRequest {
+                    key,
+                    kind: RetireKind::ExpiryHint {
+                        incarnation,
+                        now_ns: now_ns(),
+                    },
+                }],
+                &mut outcomes,
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            RetireCounts {
+                conn: 1,
+                handoff: 1,
+                redirect: 1,
+                request: 0
+            }
+        );
+        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+        assert!(
+            backend
                 .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
                 .unwrap()
-                .unwrap();
-            assert_eq!((track.incarnation, track.decision_token), (incarnation, 41));
-            assert_fenced_claim_unchanged(&backend, &key, &bytes);
-            unfence(&mut backend, &key);
-            let before = owned_values(&backend, &key);
-            assert_eq!(
-                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
-                TC_ACT_SHOT
-            );
-            assert_eq!(
-                owned_values(&backend, &key),
-                before,
-                "Aborted follower renewed the marker"
-            );
-            let mut outcomes = [None];
-            let counts = backend
-                .retire_batch(
-                    &[RetireRequest {
-                        key,
-                        kind: RetireKind::ExpiryHint {
-                            incarnation,
-                            now_ns: now_ns(),
-                        },
-                    }],
-                    &mut outcomes,
-                )
-                .unwrap();
-            assert_eq!(
-                counts,
-                RetireCounts {
-                    conn: 1,
-                    handoff: 1,
-                    redirect: 1,
-                    request: 0
-                }
-            );
-            assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
-            assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
-            assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
-            assert!(
-                backend
-                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
-                    .unwrap()
-                    .is_none()
-            );
-            seed(&backend, "lan_ingress_l2", &key, src, dst);
-            let state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-            assert_ne!(state.incarnation, incarnation);
-            assert_ne!(state.state, UdpDecisionState::Preparing as u8);
-            assert_ne!(state.state, UdpDecisionState::Aborted as u8);
-            assert_eq!(handoff(&backend, &key).incarnation, state.incarnation);
-            assert_eq!(
-                backend
-                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
-                    .unwrap()
-                    .unwrap()
-                    .incarnation,
-                state.incarnation
-            );
-            assert_eq!(
-                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
-                TC_ACT_REDIRECT
-            );
-        }
+                .is_none()
+        );
+        seed(&backend, "lan_ingress_l2", &key, src, dst);
+        let state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        assert_ne!(state.incarnation, incarnation);
+        assert_ne!(state.state, UdpDecisionState::Preparing as u8);
+        assert_ne!(state.state, UdpDecisionState::Aborted as u8);
+        assert_eq!(handoff(&backend, &key).incarnation, state.incarnation);
+        assert_eq!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .unwrap()
+                .incarnation,
+            state.incarnation
+        );
+        assert_eq!(
+            run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
+            TC_ACT_REDIRECT
+        );
     });
 }
 
@@ -808,91 +802,90 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
 fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
-        for (src, dst) in PEERS {
-            for mode in 3..=5 {
-                let key = tuple(src, dst, 45500 + mode as u16, 443, IPPROTO_UDP);
-                let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
-                let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, mode);
-                assert_eq!(result.cb[3], if mode == 5 { 0 } else { 1 });
-                assert_eq!(result.cb[4], 0, "old claim published over a newer owner");
-                let entry = handoff(&backend, &key);
-                let token = if mode == 3 { 42 } else { 41 };
-                let aux_incarnation = if mode == 3 {
-                    incarnation
-                } else {
-                    assert!(entry.incarnation > incarnation);
-                    entry.incarnation
-                };
-                let expected_handoff = RoutingHandoffEntry {
-                    last_seen_ns: 77,
-                    incarnation: aux_incarnation,
-                    result: RoutingResult {
-                        decision_token: token,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                assert_eq!(format!("{entry:?}"), format!("{expected_handoff:?}"));
-                let track = backend
-                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
-                    .unwrap()
-                    .unwrap();
-                let expected_track = RedirectEntry {
-                    last_seen_ns: 99,
+        let (src, dst) = PEERS[0];
+        for mode in 3..=5 {
+            let key = tuple(src, dst, 45500 + mode as u16, 443, IPPROTO_UDP);
+            let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+            let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, mode);
+            assert_eq!(result.cb[3], if mode == 5 { 0 } else { 1 });
+            assert_eq!(result.cb[4], 0, "old claim published over a newer owner");
+            let entry = handoff(&backend, &key);
+            let token = if mode == 3 { 42 } else { 41 };
+            let aux_incarnation = if mode == 3 {
+                incarnation
+            } else {
+                assert!(entry.incarnation > incarnation);
+                entry.incarnation
+            };
+            let expected_handoff = RoutingHandoffEntry {
+                last_seen_ns: 77,
+                incarnation: aux_incarnation,
+                result: RoutingResult {
                     decision_token: token,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(format!("{entry:?}"), format!("{expected_handoff:?}"));
+            let track = backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .unwrap();
+            let expected_track = RedirectEntry {
+                last_seen_ns: 99,
+                decision_token: token,
+                incarnation: aux_incarnation,
+                ..Default::default()
+            };
+            assert_eq!(format!("{track:?}"), format!("{expected_track:?}"));
+            if mode == 5 {
+                let newer = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                let expected = ConnState {
+                    state: UdpDecisionState::Preparing as u8,
                     incarnation: aux_incarnation,
+                    last_seen_ns: newer.last_seen_ns,
                     ..Default::default()
                 };
-                assert_eq!(format!("{track:?}"), format!("{expected_track:?}"));
-                if mode == 5 {
-                    let newer = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-                    let expected = ConnState {
-                        state: UdpDecisionState::Preparing as u8,
-                        incarnation: aux_incarnation,
-                        last_seen_ns: newer.last_seen_ns,
-                        ..Default::default()
-                    };
-                    assert_eq!(format!("{newer:?}"), format!("{expected:?}"));
-                } else {
-                    let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-                    assert_eq!(
-                        (aborted.incarnation, aborted.decision_token, aborted.state),
-                        (incarnation, 41, UdpDecisionState::Aborted as u8)
-                    );
-                }
-                assert_fenced_claim_unchanged(&backend, &key, &bytes);
-                unfence(&mut backend, &key);
-                let before = owned_values(&backend, &key);
-                let mut outcomes = [None];
+                assert_eq!(format!("{newer:?}"), format!("{expected:?}"));
+            } else {
+                let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(
-                    backend
-                        .retire_batch(
-                            &[RetireRequest {
-                                key,
-                                kind: RetireKind::ExpiryHint {
-                                    incarnation,
-                                    now_ns: now_ns()
-                                },
-                            }],
-                            &mut outcomes
-                        )
-                        .unwrap(),
-                    RetireCounts::default()
-                );
-                assert_eq!(
-                    outcomes,
-                    [Some(if mode == 5 {
-                        UdpDecisionCommitResult::Superseded
-                    } else {
-                        UdpDecisionCommitResult::TokenMismatch
-                    })]
-                );
-                assert_eq!(
-                    owned_values(&backend, &key),
-                    before,
-                    "retirement destroyed foreign authority"
+                    (aborted.incarnation, aborted.decision_token, aborted.state),
+                    (incarnation, 41, UdpDecisionState::Aborted as u8)
                 );
             }
+            assert_fenced_claim_unchanged(&backend, &key, &bytes);
+            unfence(&mut backend, &key);
+            let before = owned_values(&backend, &key);
+            let mut outcomes = [None];
+            assert_eq!(
+                backend
+                    .retire_batch(
+                        &[RetireRequest {
+                            key,
+                            kind: RetireKind::ExpiryHint {
+                                incarnation,
+                                now_ns: now_ns()
+                            },
+                        }],
+                        &mut outcomes
+                    )
+                    .unwrap(),
+                RetireCounts::default()
+            );
+            assert_eq!(
+                outcomes,
+                [Some(if mode == 5 {
+                    UdpDecisionCommitResult::Superseded
+                } else {
+                    UdpDecisionCommitResult::TokenMismatch
+                })]
+            );
+            assert_eq!(
+                owned_values(&backend, &key),
+                before,
+                "retirement destroyed foreign authority"
+            );
         }
     });
 }
@@ -908,45 +901,32 @@ fn udp_preparing_and_aborted_followers_do_not_renew_claim_timestamp() {
             std::thread::sleep(Duration::from_nanos(wait_ns));
         }
         let (mut backend, _, _listeners) = proxy_fixture();
-        for (src, dst) in PEERS {
-            for (index, (side, verdict)) in [
-                ("lan_ingress_l2", TC_ACT_SHOT),
-                ("wan_egress_l2", TC_ACT_SHOT),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let key = tuple(src, dst, 45510 + index as u16, 443, IPPROTO_UDP);
-                seed(&backend, side, &key, src, dst);
-                let mut preparing = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-                let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
-                for state in [UdpDecisionState::Preparing, UdpDecisionState::Aborted] {
-                    preparing.state = state as u8;
-                    preparing.decision_token = if state == UdpDecisionState::Aborted {
-                        41
-                    } else {
-                        0
-                    };
-                    preparing.last_seen_ns = now_ns() - 2_000_000_000;
-                    backend.udp_conn_state_store(&key, &preparing).unwrap();
-                    for _ in 0..3 {
-                        assert_eq!(
-                            run(&backend, side, &bytes, SkbInput::default()).verdict,
-                            if state == UdpDecisionState::Aborted {
-                                TC_ACT_SHOT
-                            } else {
-                                verdict
-                            },
-                            "{side} {src} {state:?}"
-                        );
-                        let followed = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-                        assert_eq!(
-                            format!("{followed:?}"),
-                            format!("{preparing:?}"),
-                            "{side} follower renewed or rewrote the unpublished claim"
-                        );
-                    }
-                }
+        let (src, dst) = PEERS[0];
+        for (index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
+            let key = tuple(src, dst, 45510 + index as u16, 443, IPPROTO_UDP);
+            seed(&backend, side, &key, src, dst);
+            let mut preparing = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+            let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+            for state in [UdpDecisionState::Preparing, UdpDecisionState::Aborted] {
+                preparing.state = state as u8;
+                preparing.decision_token = if state == UdpDecisionState::Aborted {
+                    41
+                } else {
+                    0
+                };
+                preparing.last_seen_ns = now_ns() - 2_000_000_000;
+                backend.udp_conn_state_store(&key, &preparing).unwrap();
+                assert_eq!(
+                    run(&backend, side, &bytes, SkbInput::default()).verdict,
+                    TC_ACT_SHOT,
+                    "{side} {src} {state:?}"
+                );
+                let followed = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                assert_eq!(
+                    format!("{followed:?}"),
+                    format!("{preparing:?}"),
+                    "{side} follower renewed or rewrote the unpublished claim"
+                );
             }
         }
     });

@@ -427,7 +427,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
 
 #[tokio::test]
 async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
-    for (raw_dns, decoded_route) in [(false, false), (true, true), (true, false)] {
+    for raw_dns in [false, true] {
         let pool = Arc::new(UdpEndpointPool::new());
         let stats = StatsManager::new();
         let tracker = Arc::new(ConnectionTracker::new());
@@ -470,7 +470,7 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             source,
             destination,
             b"old",
-            decoded_route.then_some(RawDnsRoute::Direct(0)),
+            None,
             (!raw_dns).then_some(11),
             pool.initialization_epoch(),
             Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),

@@ -39,6 +39,39 @@ impl TcpOutbound for KernelTcpDial {
     }
 }
 
+/// Process-lifetime state (DAENS_FD) cannot be reset, so each case runs `child` in a
+/// fresh process: the parent re-executes `test` once per case with `env` set to it.
+pub(in crate::control::tests) fn run_isolated(
+    test: &str,
+    env: &str,
+    cases: impl IntoIterator<Item = impl AsRef<str>>,
+    child: fn(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Some(case) = std::env::var_os(env) {
+        let case = case
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid child case"))?;
+        return std::thread::spawn(move || child(&case))
+            .join()
+            .map_err(|_| anyhow::anyhow!("{test} child panicked"))?;
+    }
+    for case in cases {
+        let case = case.as_ref();
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                test,
+                "--ignored",
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(env, case)
+            .status()?;
+        anyhow::ensure!(status.success(), "{test} {case}: {status}");
+    }
+    Ok(())
+}
+
 /// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
 pub(in crate::control::tests) fn build_lab(
     lan_ip: IpAddr,

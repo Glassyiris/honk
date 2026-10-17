@@ -27,10 +27,6 @@ fn reverse_tuple() -> TuplesKey {
     )
 }
 
-fn set_padding(tuple: &mut TuplesKey, padding: [u8; 3]) {
-    tuple.padding = padding;
-}
-
 fn backend() -> Arc<RwLock<Box<dyn EbpfBackend>>> {
     Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())))
 }
@@ -104,8 +100,8 @@ async fn tcp_pair() -> anyhow::Result<(TcpStream, TcpStream)> {
 fn directional_key_ignores_padding_and_refcounts_owners() {
     let mut first = forward_tuple();
     let mut second = forward_tuple();
-    set_padding(&mut first, [1, 2, 3]);
-    set_padding(&mut second, [4, 5, 6]);
+    first.padding = [1, 2, 3];
+    second.padding = [4, 5, 6];
     let key = TcpFlowKey::from_tuples(&first);
 
     assert_eq!(key, TcpFlowKey::from_tuples(&second));

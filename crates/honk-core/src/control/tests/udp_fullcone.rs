@@ -1,4 +1,4 @@
-use super::support::netns::{add_address, build_lab, lab_config, pinned_map};
+use super::support::netns::{add_address, build_lab, lab_config, pinned_map, run_isolated};
 use super::support::{QuicUdpMode, QuicUdpPeer};
 use super::{NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder};
 use crate::control::{ControlCommand, ControlPlane};
@@ -24,40 +24,23 @@ const CHILD: &str = "HONK_UDP_FULLCONE_CHILD";
 #[test]
 #[ignore = "requires Linux 6.12+, root, bpffs and eBPF TC support in an isolated VM"]
 fn netns_udp_full_cone_source_contract() -> anyhow::Result<()> {
-    if let Some(case) = std::env::var_os(CHILD) {
-        let case = case
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("invalid child case"))?;
-        return std::thread::spawn(move || run_child(&case))
-            .join()
-            .map_err(|_| anyhow::anyhow!("full-cone child thread panicked"))?;
-    }
-    // DAENS_FD is process-lifetime state, not a fixture that can be reset.
-    for family in ["v4", "v6"] {
-        for protocol in [
-            "hy2",
-            "tuic-datagram",
-            "tuic-stream",
-            "ss",
-            "socks5",
-            "trojan",
-            "socks5-source53",
-        ] {
-            let case = format!("{family}/{protocol}");
-            let status = std::process::Command::new(std::env::current_exe()?)
-                .args([
-                    CASE,
-                    "--ignored",
-                    "--exact",
-                    "--test-threads=1",
-                    "--nocapture",
-                ])
-                .env(CHILD, &case)
-                .status()?;
-            ensure!(status.success(), "{case} failed: {status}");
-        }
-    }
-    Ok(())
+    run_isolated(
+        CASE,
+        CHILD,
+        ["v4", "v6"].into_iter().flat_map(|family| {
+            [
+                "hy2",
+                "tuic-datagram",
+                "tuic-stream",
+                "ss",
+                "socks5",
+                "trojan",
+                "socks5-source53",
+            ]
+            .map(|protocol| format!("{family}/{protocol}"))
+        }),
+        run_child,
+    )
 }
 
 fn run_child(case: &str) -> anyhow::Result<()> {

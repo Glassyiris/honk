@@ -1,4 +1,4 @@
-use super::support::netns::{KernelTcpDial, build_lab, lab_config, pinned_map};
+use super::support::netns::{KernelTcpDial, build_lab, lab_config, pinned_map, run_isolated};
 use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
 };
@@ -25,32 +25,7 @@ const REPLIES: [&[u8]; 2] = [b"first-server-active-close", b"second-server-activ
 #[test]
 #[ignore = "requires Linux 6.12+, root, bpffs and eBPF TC support in an isolated VM"]
 fn netns_tcp_reuses_tuple_during_daens_time_wait() -> anyhow::Result<()> {
-    if let Some(family) = std::env::var_os(CHILD) {
-        let family = family
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("invalid family"))?;
-        return std::thread::spawn(move || run_child(&family))
-            .join()
-            .map_err(|_| anyhow::anyhow!("TCP tuple-reuse child thread panicked"))?;
-    }
-    // DAENS_FD is process-lifetime state: each address family needs its own child.
-    for family in ["v4", "v6"] {
-        let status = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                CASE,
-                "--ignored",
-                "--exact",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env(CHILD, family)
-            .status()?;
-        ensure!(
-            status.success(),
-            "TCP tuple reuse {family} failed: {status}"
-        );
-    }
-    Ok(())
+    run_isolated(CASE, CHILD, ["v4", "v6"], run_child)
 }
 
 fn run_child(family: &str) -> anyhow::Result<()> {

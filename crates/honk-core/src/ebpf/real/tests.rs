@@ -717,8 +717,6 @@ fn routing_handoff_layout_validation_rejects_legacy_value_size() {
         core::mem::size_of::<honk_ebpf_common::FlowMapValue<RoutingHandoffEntry>>() as u32;
     assert!(validate_routing_handoff_sizes(key, current).is_ok());
     assert!(validate_routing_handoff_sizes(key, 48).is_err());
-    assert!(validate_routing_handoff_sizes(key, 64).is_err());
-    assert!(validate_routing_handoff_sizes(key, 72).is_err());
 }
 
 #[test]

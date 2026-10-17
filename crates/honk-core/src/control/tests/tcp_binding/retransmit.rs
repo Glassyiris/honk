@@ -51,23 +51,6 @@ impl TcpOutbound for ForwardDial {
     }
 }
 
-fn packet_socket() -> anyhow::Result<OwnedFd> {
-    let protocol = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            protocol,
-        )
-    };
-    ensure!(
-        fd >= 0,
-        "open daens packet capture: {}",
-        std::io::Error::last_os_error()
-    );
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
 /// Raw capture inside daens: a SYN seen here already crossed the host production TC.
 struct SynTap(OwnedFd);
 
@@ -101,26 +84,17 @@ impl SynTap {
                 }
                 return Err(error.into());
             }
-            let frame = &bytes[..length as usize];
-            let (transport, addresses) = match frame.get(12..14) {
-                Some([0x08, 0x00]) if target.is_ipv4() && frame.len() >= 34 && frame[23] == 6 => (
-                    14 + (frame[14] as usize & 15) * 4,
-                    (&frame[26..30], &frame[30..34]),
-                ),
-                Some([0x86, 0xdd]) if target.is_ipv6() && frame.len() >= 54 && frame[20] == 6 => {
-                    (54, (&frame[22..38], &frame[38..54]))
-                }
-                _ => continue,
+            let Some((src, dst, tcp)) = tcp_segment(&bytes[..length as usize], target.is_ipv6())
+            else {
+                continue;
             };
-            if addresses == (&source_ip[..], &target_ip[..])
-                && frame.len() >= transport + 20
-                && u16::from_be_bytes([frame[transport], frame[transport + 1]]) == source.port()
-                && u16::from_be_bytes([frame[transport + 2], frame[transport + 3]]) == target.port()
-                && frame[transport + 13] & 0x12 == 0x02
+            if src == source_ip
+                && dst == target_ip
+                && u16::from_be_bytes([tcp[0], tcp[1]]) == source.port()
+                && u16::from_be_bytes([tcp[2], tcp[3]]) == target.port()
+                && tcp[13] & 0x12 == 0x02
             {
-                syns.push(u32::from_be_bytes(
-                    frame[transport + 4..transport + 8].try_into().unwrap(),
-                ));
+                syns.push(u32::from_be_bytes(tcp[4..8].try_into().unwrap()));
             }
         }
     }

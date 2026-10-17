@@ -89,85 +89,87 @@ fn fixture() -> (RealEbpfBackend, RoutingPushPlan, TproxyListeners) {
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn client_framing_refills_after_outbound_and_exact_reply_refresh() {
     isolated(|| {
-        for (client, target, foreign) in peers() {
-            for source_port in [40000, 53] {
-                for reverse in [false, true] {
-                    let (mut backend, _, _listeners) = fixture();
-                    let key = tuple(client, target, source_port, 443, IPPROTO_UDP);
-                    let outbound = packet(client, target, IPPROTO_UDP, source_port, 443, 5, 0);
-                    assert_eq!(
-                        run(&backend, "lan_ingress_l2", &outbound, SkbInput::default()).verdict,
-                        TC_ACT_REDIRECT
-                    );
-                    assert!(client_entry(&backend, &key).is_some());
-                    evict_client(&mut backend, &key);
-                    let redirect_key = RedirectTuple::from_tuples(&key);
-                    let mut exact = backend
-                        .redirect_track_lookup(&redirect_key)
-                        .unwrap()
-                        .unwrap();
-                    exact.last_seen_ns = now_ns().checked_sub(REFRESH_NS + 1).unwrap();
-                    backend.redirect_track_store(&redirect_key, &exact).unwrap();
-                    let reply = packet(target, client, IPPROTO_UDP, 443, source_port, 0, 0);
-                    let (name, bytes) = if reverse {
-                        ("dae0_ingress", &reply)
-                    } else {
-                        ("lan_ingress_l2", &outbound)
-                    };
-                    assert_eq!(
-                        run(&backend, name, bytes, SkbInput::default()).verdict,
-                        TC_ACT_REDIRECT
-                    );
-                    let restored = client_entry(&backend, &key)
-                        .expect("active exact flow did not restore evicted client framing");
-                    let current = backend
-                        .redirect_track_lookup(&redirect_key)
-                        .unwrap()
-                        .unwrap();
-                    assert!(current.last_seen_ns > exact.last_seen_ns);
-                    assert_eq!(
-                        (restored.ifindex, restored.smac, restored.dmac),
-                        (current.ifindex, current.smac, current.dmac)
-                    );
-                    assert_eq!(
-                        (
-                            restored.decision_token,
-                            restored.incarnation,
-                            restored.from_wan
-                        ),
-                        (0, 0, 0)
-                    );
-                    let received_before = rx_packets(&backend, 2);
-                    let foreign_packet =
-                        packet(foreign, client, IPPROTO_UDP, 3478, source_port, 0, 0);
-                    let delivered = run(
-                        &backend,
-                        "dae0_ingress",
-                        &foreign_packet,
-                        SkbInput::default(),
-                    );
-                    assert_eq!(delivered.verdict, TC_ACT_REDIRECT);
-                    assert_eq!(&delivered.data[..6], &current.smac);
-                    assert_eq!(
-                        rx_packets(&backend, 2),
-                        received_before,
-                        "foreign reply acquired outbound attribution"
-                    );
-                    let foreign_key = tuple(client, foreign, source_port, 3478, IPPROTO_UDP);
-                    assert!(
-                        backend
-                            .redirect_track_lookup(&RedirectTuple::from_tuples(&foreign_key))
-                            .unwrap()
-                            .is_none()
-                    );
-                    assert!(
-                        backend
-                            .udp_conn_state_lookup(&foreign_key)
-                            .unwrap()
-                            .is_none()
-                    );
-                }
-            }
+        let [v4, v6] = peers();
+        for ((client, target, foreign), source_port, reverse) in [
+            (v4, 40000, false),
+            (v4, 40000, true),
+            (v4, 53, false),
+            (v4, 53, true),
+            (v6, 40000, true),
+        ] {
+            let (mut backend, _, _listeners) = fixture();
+            let key = tuple(client, target, source_port, 443, IPPROTO_UDP);
+            let outbound = packet(client, target, IPPROTO_UDP, source_port, 443, 5, 0);
+            assert_eq!(
+                run(&backend, "lan_ingress_l2", &outbound, SkbInput::default()).verdict,
+                TC_ACT_REDIRECT
+            );
+            assert!(client_entry(&backend, &key).is_some());
+            evict_client(&mut backend, &key);
+            let redirect_key = RedirectTuple::from_tuples(&key);
+            let mut exact = backend
+                .redirect_track_lookup(&redirect_key)
+                .unwrap()
+                .unwrap();
+            exact.last_seen_ns = now_ns().checked_sub(REFRESH_NS + 1).unwrap();
+            backend.redirect_track_store(&redirect_key, &exact).unwrap();
+            let reply = packet(target, client, IPPROTO_UDP, 443, source_port, 0, 0);
+            let (name, bytes) = if reverse {
+                ("dae0_ingress", &reply)
+            } else {
+                ("lan_ingress_l2", &outbound)
+            };
+            assert_eq!(
+                run(&backend, name, bytes, SkbInput::default()).verdict,
+                TC_ACT_REDIRECT
+            );
+            let restored = client_entry(&backend, &key)
+                .expect("active exact flow did not restore evicted client framing");
+            let current = backend
+                .redirect_track_lookup(&redirect_key)
+                .unwrap()
+                .unwrap();
+            assert!(current.last_seen_ns > exact.last_seen_ns);
+            assert_eq!(
+                (restored.ifindex, restored.smac, restored.dmac),
+                (current.ifindex, current.smac, current.dmac)
+            );
+            assert_eq!(
+                (
+                    restored.decision_token,
+                    restored.incarnation,
+                    restored.from_wan
+                ),
+                (0, 0, 0)
+            );
+            let received_before = rx_packets(&backend, 2);
+            let foreign_packet = packet(foreign, client, IPPROTO_UDP, 3478, source_port, 0, 0);
+            let delivered = run(
+                &backend,
+                "dae0_ingress",
+                &foreign_packet,
+                SkbInput::default(),
+            );
+            assert_eq!(delivered.verdict, TC_ACT_REDIRECT);
+            assert_eq!(&delivered.data[..6], &current.smac);
+            assert_eq!(
+                rx_packets(&backend, 2),
+                received_before,
+                "foreign reply acquired outbound attribution"
+            );
+            let foreign_key = tuple(client, foreign, source_port, 3478, IPPROTO_UDP);
+            assert!(
+                backend
+                    .redirect_track_lookup(&RedirectTuple::from_tuples(&foreign_key))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .udp_conn_state_lookup(&foreign_key)
+                    .unwrap()
+                    .is_none()
+            );
         }
     });
     client_framing_refresh_excludes_dns_destinations_and_wan_records();
@@ -336,47 +338,43 @@ fn stateless_udp_refreshes_complete_policy_without_changing_owned_lifetimes() {
                         > aged.last_seen_ns
                 );
                 assert_eq!(client_entry(&backend, &key).is_some(), from_wan == 0);
-                for (incarnation, token) in [(41, 0), (42, 7)] {
-                    let mut foreign_handoff = handoff(&backend, &key);
-                    foreign_handoff.incarnation = incarnation;
-                    foreign_handoff.result.decision_token = token;
-                    backend
-                        .flow_insert("ROUTING_HANDOFF_MAP", &key, &foreign_handoff)
-                        .unwrap();
-                    assert_eq!(
-                        run(&backend, side, &fresh, SkbInput::default()).verdict,
-                        TC_ACT_SHOT
-                    );
-                    let retained = handoff(&backend, &key);
-                    assert_eq!(
-                        (retained.incarnation, retained.result.decision_token),
-                        (incarnation, token)
-                    );
-                    backend
-                        .flow_insert("ROUTING_HANDOFF_MAP", &key, &current)
-                        .unwrap();
-                    let mut foreign_redirect = updated;
-                    foreign_redirect.incarnation = incarnation;
-                    foreign_redirect.decision_token = token;
-                    backend
-                        .redirect_track_store(&redirect_key, &foreign_redirect)
-                        .unwrap();
-                    assert_eq!(
-                        run(&backend, side, &fresh, SkbInput::default()).verdict,
-                        TC_ACT_SHOT
-                    );
-                    let retained = backend
-                        .redirect_track_lookup(&redirect_key)
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(
-                        (retained.incarnation, retained.decision_token),
-                        (incarnation, token)
-                    );
-                    backend
-                        .redirect_track_store(&redirect_key, &updated)
-                        .unwrap();
-                }
+                let (incarnation, token) = (41, 0);
+                let mut foreign_handoff = handoff(&backend, &key);
+                foreign_handoff.incarnation = incarnation;
+                foreign_handoff.result.decision_token = token;
+                backend
+                    .flow_insert("ROUTING_HANDOFF_MAP", &key, &foreign_handoff)
+                    .unwrap();
+                assert_eq!(
+                    run(&backend, side, &fresh, SkbInput::default()).verdict,
+                    TC_ACT_SHOT
+                );
+                let retained = handoff(&backend, &key);
+                assert_eq!(
+                    (retained.incarnation, retained.result.decision_token),
+                    (incarnation, token)
+                );
+                backend
+                    .flow_insert("ROUTING_HANDOFF_MAP", &key, &current)
+                    .unwrap();
+                let mut foreign_redirect = updated;
+                foreign_redirect.incarnation = incarnation;
+                foreign_redirect.decision_token = token;
+                backend
+                    .redirect_track_store(&redirect_key, &foreign_redirect)
+                    .unwrap();
+                assert_eq!(
+                    run(&backend, side, &fresh, SkbInput::default()).verdict,
+                    TC_ACT_SHOT
+                );
+                let retained = backend
+                    .redirect_track_lookup(&redirect_key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    (retained.incarnation, retained.decision_token),
+                    (incarnation, token)
+                );
             }
         }
     });

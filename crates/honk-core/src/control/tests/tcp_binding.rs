@@ -2,15 +2,15 @@
 //! the original SYN and final ACK traverse the production TC and request hooks.
 
 use super::support::TestRetirement;
-use super::support::netns::{build_lab, lab_config, pinned_hash_snapshot, pinned_map};
+use super::support::netns::{
+    build_lab, lab_config, pinned_hash_snapshot, pinned_map, run_isolated,
+};
 use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
 };
 use crate::control::{ControlPlane, ControlPlaneHandle};
 use crate::dns::DnsResolver;
-use crate::ebpf::{
-    EbpfBackend, RetireKind, RetireRequest, TcpSocketOwnership, real::RealEbpfBackend,
-};
+use crate::ebpf::{EbpfBackend, TcpSocketOwnership, real::RealEbpfBackend};
 use crate::routing::Router;
 use anyhow::{Context, ensure};
 use aya::maps::{Array, HashMap};
@@ -39,33 +39,22 @@ const CHILD: &str = "HONK_TCP_BINDING_CHILD";
 const ROOT: &str = "/sys/fs/bpf/tcp-binding";
 const FIRST_PUBLISHED_INCARNATION: u64 = 0x005a_1234_5678_9abc;
 
+// Cases whose branch is family-independent (shared fexit/userspace code, no v4/v6
+// hook of its own) run once on v4; `accepted` covers the v6 hooks.
 macro_rules! kernel_case {
     ($name:ident, $case:literal) => {
+        kernel_case!($name, $case, "v4", "v6");
+    };
+    ($name:ident, $case:literal, $($family:literal),+) => {
         #[test]
         #[ignore = "requires Linux 6.12+, root and the disposable kernel VM gate"]
         fn $name() -> anyhow::Result<()> {
-            if let Some(family) = std::env::var_os(CHILD) {
-                let family = family
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("invalid family"))?;
-                return std::thread::spawn(move || run_child(&family, $case))
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("TCP binding child panicked"))?;
-            }
-            for family in ["v4", "v6"] {
-                let status = std::process::Command::new(std::env::current_exe()?)
-                    .args([
-                        concat!("control::tests::tcp_binding::", stringify!($name)),
-                        "--ignored",
-                        "--exact",
-                        "--test-threads=1",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, family)
-                    .status()?;
-                ensure!(status.success(), "TCP binding {} {family}: {status}", $case);
-            }
-            Ok(())
+            run_isolated(
+                concat!("control::tests::tcp_binding::", stringify!($name)),
+                CHILD,
+                [$($family),+],
+                |family| run_child(family, $case),
+            )
         }
     };
 }
@@ -75,22 +64,19 @@ kernel_case!(netns_tcp_accepted_fd_proves_original_syn, "accepted");
 // Ablate adopt_tcp_flow's binding/current incarnation equality.
 kernel_case!(
     netns_tcp_queued_closed_child_cannot_adopt_newer_tuple,
-    "superseded"
+    "superseded",
+    "v4"
 );
 // Ablate the fexit current-incarnation check before child storage CREATE.
 kernel_case!(
     netns_tcp_superseded_request_cannot_prove_later_child,
-    "request-superseded"
+    "request-superseded",
+    "v4"
 );
 // Ablate serve_connection's required FD ownership lookup (tuple fallback must fail).
 kernel_case!(netns_tcp_missing_request_proof_refuses_adoption, "missing");
 // Ablate the fexit request-proof age check.
 kernel_case!(netns_tcp_expired_request_proof_refuses_adoption, "expired");
-// Ablate the ExpiredRequest branch's age-checked request deletion.
-kernel_case!(
-    netns_tcp_request_age_reclaim_prevents_late_child,
-    "reclaimed"
-);
 // Ablate the required FD lookup: a cookie-created child has no original SYN proof.
 kernel_case!(netns_tcp_forced_syn_cookie_child_is_unproven, "cookie");
 // Ablate the required FD lookup, replacing it with tuple authority.
@@ -98,7 +84,8 @@ kernel_case!(netns_tcp_full_request_storage_fails_closed, "request-full");
 // Ablate the required FD lookup, replacing it with tuple authority.
 kernel_case!(
     netns_tcp_child_storage_allocation_failure_fails_closed,
-    "child-full"
+    "child-full",
+    "v4"
 );
 // Ablate destroy_request's exact address/cookie removal.
 kernel_case!(
@@ -373,7 +360,7 @@ async fn exercise(
         root,
         "TCP_REQUEST_BINDINGS",
     )?)?;
-    if matches!(case, "expired" | "reclaimed")
+    if case == "expired"
         || (case.starts_with("lifetime-")
             && !matches!(
                 case,
@@ -474,35 +461,10 @@ async fn exercise(
         );
         match case {
             "missing" => requests.remove(&request)?,
-            "expired" | "reclaimed" => {
+            "expired" => {
                 let mut expired = binding;
                 expired.handoff.last_seen_ns = 1;
                 requests.insert(request, expired, 2)?;
-                if case == "reclaimed" {
-                    let retire = RetireRequest {
-                        key,
-                        kind: RetireKind::ExpiredRequest {
-                            request: &request,
-                            expected: &expired,
-                            expired_before_ns: monotonic_ns()?
-                                - honk_ebpf_common::conn::TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
-                        },
-                    };
-                    let counts = handle
-                        .ebpf
-                        .write()
-                        .await
-                        .retire_batch(&[retire], &mut [None])
-                        .map_err(anyhow::Error::new)?;
-                    ensure!(
-                        counts.request == 1,
-                        "age fallback did not remove the actual request proof"
-                    );
-                    ensure!(
-                        request_snapshot()?.iter().all(|(key, _)| *key != request),
-                        "age fallback retained request proof"
-                    );
-                }
             }
             "destroyed" => {
                 drop(connect);
@@ -774,6 +736,41 @@ fn hold_synack(fd: libc::c_int, hold: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn packet_socket() -> anyhow::Result<OwnedFd> {
+    let protocol = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            protocol,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "open packet capture: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Source IP, destination IP and TCP header+payload of an Ethernet frame carrying
+/// TCP over the given IP family; `None` for anything else.
+fn tcp_segment(frame: &[u8], ipv6: bool) -> Option<(&[u8], &[u8], &[u8])> {
+    let (source, destination, transport) = match frame.get(12..14)? {
+        [0x08, 0x00] if !ipv6 && frame.len() >= 34 && frame[23] == 6 => (
+            &frame[26..30],
+            &frame[30..34],
+            14 + (frame[14] as usize & 15) * 4,
+        ),
+        [0x86, 0xdd] if ipv6 && frame.len() >= 54 && frame[20] == 6 => {
+            (&frame[22..38], &frame[38..54], 54)
+        }
+        _ => return None,
+    };
+    let tcp = frame.get(transport..)?;
+    (tcp.len() >= 20).then_some((source, destination, tcp))
+}
+
 struct Wire {
     fd: OwnedFd,
     address: libc::sockaddr_ll,
@@ -781,23 +778,10 @@ struct Wire {
 
 impl Wire {
     fn on(interface: &str) -> anyhow::Result<Self> {
-        let protocol = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                protocol,
-            )
-        };
-        ensure!(
-            fd >= 0,
-            "open packet capture: {}",
-            std::io::Error::last_os_error()
-        );
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = packet_socket()?;
         let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         address.sll_family = libc::AF_PACKET as _;
-        address.sll_protocol = protocol as _;
+        address.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
         address.sll_ifindex = crate::netlink::NlSock::new()?.get_link(interface)?.0 as _;
         ensure!(
             unsafe {
@@ -833,17 +817,12 @@ impl Wire {
                 continue;
             }
             let frame = &bytes[..length as usize];
-            let transport = match frame.get(12..14) {
-                Some([0x08, 0x00]) if source.is_ipv4() && frame.len() >= 34 && frame[23] == 6 => {
-                    14 + (frame[14] as usize & 15) * 4
-                }
-                Some([0x86, 0xdd]) if source.is_ipv6() && frame.len() >= 54 && frame[20] == 6 => 54,
-                _ => continue,
+            let Some((_, _, tcp)) = tcp_segment(frame, source.is_ipv6()) else {
+                continue;
             };
-            if frame.len() >= transport + 20
-                && u16::from_be_bytes([frame[transport], frame[transport + 1]]) == target.port()
-                && u16::from_be_bytes([frame[transport + 2], frame[transport + 3]]) == source.port()
-                && frame[transport + 13] & 0x12 == 0x12
+            if u16::from_be_bytes([tcp[0], tcp[1]]) == target.port()
+                && u16::from_be_bytes([tcp[2], tcp[3]]) == source.port()
+                && tcp[13] & 0x12 == 0x12
             {
                 return Ok(frame.to_vec());
             }

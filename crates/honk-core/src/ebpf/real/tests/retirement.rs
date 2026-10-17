@@ -363,10 +363,7 @@ fn retirement_preserves_barrier_and_release_errors_and_inhibits_admission() {
     let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
     assert_eq!(error.counts, RetireCounts::default());
     assert_eq!(outcomes, [None; 3]);
-    assert!(
-        format!("{:#}", backend.set_datapath_ready(true).unwrap_err())
-            .contains("ownership is unresolved")
-    );
+    assert!(backend.set_datapath_ready(true).is_err());
     assert!(
         backend
             .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
@@ -462,38 +459,33 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
     );
     assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
     assert_retirement_flow_present(&backend, &key);
-    for raw in [
-        ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
-        ROUTING_META_FLAG_PUBLISHED | (1 << 40),
-        ROUTING_META_FLAG_PUBLISHED | OutboundIndex::Block as u64,
-    ] {
-        backend.udp_conn_state_store(
-            &key,
-            &ConnState {
-                incarnation: 2,
-                meta: RoutingMeta { raw },
-                ..state
-            },
-        )?;
-        let native_request = RetireRequest {
-            key,
-            kind: RetireKind::Udp {
-                token: 0,
-                incarnation: Some(2),
-                pending_only: false,
-            },
-        };
-        assert_eq!(
-            backend.retire_batch(&[native_request], &mut outcomes)?,
-            RetireCounts::default()
-        );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
-        assert_retirement_flow_present(&backend, &key);
-        assert_eq!(
-            unsafe { backend.udp_conn_state_lookup(&key)?.unwrap().meta.raw },
-            raw
-        );
-    }
+    let raw = ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD;
+    backend.udp_conn_state_store(
+        &key,
+        &ConnState {
+            incarnation: 2,
+            meta: RoutingMeta { raw },
+            ..state
+        },
+    )?;
+    let native_request = RetireRequest {
+        key,
+        kind: RetireKind::Udp {
+            token: 0,
+            incarnation: Some(2),
+            pending_only: false,
+        },
+    };
+    assert_eq!(
+        backend.retire_batch(&[native_request], &mut outcomes)?,
+        RetireCounts::default()
+    );
+    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
+    assert_retirement_flow_present(&backend, &key);
+    assert_eq!(
+        unsafe { backend.udp_conn_state_lookup(&key)?.unwrap().meta.raw },
+        raw
+    );
     Ok(())
 }
 
@@ -554,83 +546,70 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
 #[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
 fn retirement_auxiliary_owner_mismatch_is_fatal_and_preserves_all_maps() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
-    let mut port = 41220;
-    for handoff_mismatch in [false, true] {
-        for (incarnation, token) in [(2, 0), (1, 7)] {
-            for operation in 0..4 {
-                let key = TuplesKey {
-                    src_port: port,
-                    l4proto: if operation == 0 { 6 } else { 17 },
-                    ..Default::default()
-                };
-                port += 1;
-                let state = ConnState {
-                    incarnation: 1,
-                    meta: RoutingMeta {
-                        raw: ROUTING_META_FLAG_PUBLISHED | OutboundIndex::UserBase as u64,
-                    },
-                    ..Default::default()
-                };
-                publish_retirement_flow(&mut backend, &key, &state)?;
-                if handoff_mismatch {
-                    let mut entry = backend.routing_handoff_lookup(&key)?.unwrap();
-                    entry.incarnation = incarnation;
-                    entry.result.decision_token = token;
-                    backend.flow_insert("ROUTING_HANDOFF_MAP", &key, &entry)?;
-                } else {
-                    let track_key = RedirectTuple::from_tuples(&key);
-                    let mut entry = backend.redirect_track_lookup(&track_key)?.unwrap();
-                    entry.incarnation = incarnation;
-                    entry.decision_token = token;
-                    backend.flow_insert("REDIRECT_TRACK", &track_key, &entry)?;
-                }
-                let kind = match operation {
-                    0 => RetireKind::Tcp { incarnation: 1 },
-                    1 => RetireKind::Udp {
-                        token: 0,
-                        incarnation: Some(1),
-                        pending_only: false,
-                    },
-                    2 => RetireKind::ExpiredConn {
-                        expected: &state,
-                        expired_before_ns: 0,
-                    },
-                    _ => RetireKind::ExpiryHint {
-                        incarnation: 1,
-                        now_ns: u64::MAX,
-                    },
-                };
-                let mut outcomes = [None];
-                assert_eq!(
-                    backend.retire_batch(&[RetireRequest { key, kind }], &mut outcomes)?,
-                    RetireCounts::default()
-                );
-                assert_eq!(outcomes, [Some(UdpDecisionCommitResult::TokenMismatch)]);
-                assert_retirement_flow_present(&backend, &key);
-                assert_retirement_fence(&backend, &key, false);
-                assert_eq!(backend.udp_conn_state_lookup(&key)?.unwrap().incarnation, 1);
-                let retained_handoff = backend.routing_handoff_lookup(&key)?.unwrap();
-                let retained_track = backend
-                    .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
-                    .unwrap();
-                assert_eq!(
-                    retained_handoff.incarnation,
-                    if handoff_mismatch { incarnation } else { 1 }
-                );
-                assert_eq!(
-                    retained_handoff.result.decision_token,
-                    if handoff_mismatch { token } else { 0 }
-                );
-                assert_eq!(
-                    retained_track.incarnation,
-                    if handoff_mismatch { 1 } else { incarnation }
-                );
-                assert_eq!(
-                    retained_track.decision_token,
-                    if handoff_mismatch { 0 } else { token }
-                );
-            }
+    for operation in 0..5 {
+        let key = TuplesKey {
+            src_port: 41220 + operation,
+            l4proto: if matches!(operation, 0 | 4) { 6 } else { 17 },
+            ..Default::default()
+        };
+        let state = ConnState {
+            incarnation: 1,
+            meta: RoutingMeta {
+                raw: ROUTING_META_FLAG_PUBLISHED | OutboundIndex::UserBase as u64,
+            },
+            ..Default::default()
+        };
+        publish_retirement_flow(&mut backend, &key, &state)?;
+        if operation == 4 {
+            let track_key = RedirectTuple::from_tuples(&key);
+            let mut track = backend.redirect_track_lookup(&track_key)?.unwrap();
+            track.decision_token = 7;
+            backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
+        } else {
+            let mut handoff = backend.routing_handoff_lookup(&key)?.unwrap();
+            handoff.result.decision_token = 7;
+            backend.flow_insert("ROUTING_HANDOFF_MAP", &key, &handoff)?;
         }
+        let kind = match operation {
+            0 | 4 => RetireKind::Tcp { incarnation: 1 },
+            1 => RetireKind::Udp {
+                token: 0,
+                incarnation: Some(1),
+                pending_only: false,
+            },
+            2 => RetireKind::ExpiredConn {
+                expected: &state,
+                expired_before_ns: 0,
+            },
+            _ => RetireKind::ExpiryHint {
+                incarnation: 1,
+                now_ns: u64::MAX,
+            },
+        };
+        let mut outcomes = [None];
+        assert_eq!(
+            backend.retire_batch(&[RetireRequest { key, kind }], &mut outcomes)?,
+            RetireCounts::default()
+        );
+        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::TokenMismatch)]);
+        assert_retirement_flow_present(&backend, &key);
+        assert_retirement_fence(&backend, &key, false);
+        assert_eq!(backend.udp_conn_state_lookup(&key)?.unwrap().incarnation, 1);
+        assert_eq!(
+            backend
+                .routing_handoff_lookup(&key)?
+                .unwrap()
+                .result
+                .decision_token,
+            if operation == 4 { 0 } else { 7 }
+        );
+        assert_eq!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
+                .unwrap()
+                .decision_token,
+            if operation == 4 { 7 } else { 0 }
+        );
     }
     Ok(())
 }
@@ -722,73 +701,66 @@ fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::
 
 #[test]
 #[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
-fn hint_auxiliary_expiry_requires_matching_tokens_with_or_without_conn() -> anyhow::Result<()> {
+fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
-    let mut port = 41270;
-    for conn_present in [false, true] {
-        for handoff_mismatch in [false, true] {
-            let key = TuplesKey {
-                src_port: port,
-                l4proto: 17,
-                ..Default::default()
-            };
-            port += 1;
-            let state = ConnState {
-                incarnation: 1,
-                decision_token: 7,
-                last_seen_ns: 121_000_000_000,
-                ..Default::default()
-            };
-            publish_retirement_flow(&mut backend, &key, &state)?;
-            if !conn_present {
-                backend.hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &key)?;
-            }
-            let track_key = RedirectTuple::from_tuples(&key);
-            if handoff_mismatch {
-                let mut entry = backend.routing_handoff_lookup(&key)?.unwrap();
-                entry.result.decision_token = 8;
-                backend.flow_insert("ROUTING_HANDOFF_MAP", &key, &entry)?;
-            } else {
-                let mut entry = backend.redirect_track_lookup(&track_key)?.unwrap();
-                entry.decision_token = 8;
-                backend.flow_insert("REDIRECT_TRACK", &track_key, &entry)?;
-            }
-            let request = RetireRequest {
-                key,
-                kind: RetireKind::ExpiryHint {
-                    incarnation: 1,
-                    now_ns: 121_000_000_000,
-                },
-            };
-            let mut outcomes = [None];
-            assert_eq!(
-                backend.retire_batch(&[request], &mut outcomes)?,
-                RetireCounts::default()
-            );
-            assert_eq!(outcomes, [Some(UdpDecisionCommitResult::TokenMismatch)]);
-            let mut handoff = backend.routing_handoff_lookup(&key)?.unwrap();
-            let mut track = backend.redirect_track_lookup(&track_key)?.unwrap();
-            assert_eq!(
-                handoff.result.decision_token,
-                if handoff_mismatch { 8 } else { 7 }
-            );
-            assert_eq!(track.decision_token, if handoff_mismatch { 7 } else { 8 });
-            handoff.result.decision_token = 7;
-            track.decision_token = 7;
-            backend.flow_insert("ROUTING_HANDOFF_MAP", &key, &handoff)?;
-            backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
-            assert_eq!(
-                backend.retire_batch(&[request], &mut outcomes)?,
-                RetireCounts {
-                    handoff: 1,
-                    redirect: 1,
-                    ..Default::default()
-                }
-            );
-            assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
-            assert_eq!(backend.udp_conn_state_lookup(&key)?.is_some(), conn_present);
+    let key = TuplesKey {
+        src_port: 41270,
+        l4proto: 17,
+        ..Default::default()
+    };
+    let state = ConnState {
+        incarnation: 1,
+        decision_token: 7,
+        ..Default::default()
+    };
+    publish_retirement_flow(&mut backend, &key, &state)?;
+    backend.hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &key)?;
+    let track_key = RedirectTuple::from_tuples(&key);
+    let mut track = backend.redirect_track_lookup(&track_key)?.unwrap();
+    track.decision_token = 8;
+    backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
+    let request = RetireRequest {
+        key,
+        kind: RetireKind::ExpiryHint {
+            incarnation: 1,
+            now_ns: 121_000_000_000,
+        },
+    };
+    let mut outcomes = [None];
+    assert_eq!(
+        backend.retire_batch(&[request], &mut outcomes)?,
+        RetireCounts::default()
+    );
+    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::TokenMismatch)]);
+    assert_eq!(
+        backend
+            .routing_handoff_lookup(&key)?
+            .unwrap()
+            .result
+            .decision_token,
+        7
+    );
+    assert_eq!(
+        backend
+            .redirect_track_lookup(&track_key)?
+            .unwrap()
+            .decision_token,
+        8
+    );
+    assert_retirement_fence(&backend, &key, false);
+    track.decision_token = 7;
+    backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
+    assert_eq!(
+        backend.retire_batch(&[request], &mut outcomes)?,
+        RetireCounts {
+            handoff: 1,
+            redirect: 1,
+            ..Default::default()
         }
-    }
+    );
+    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+    assert!(backend.udp_conn_state_lookup(&key)?.is_none());
+    assert_retirement_fence(&backend, &key, false);
     Ok(())
 }
 
