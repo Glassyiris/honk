@@ -123,7 +123,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 内核/用户空间共用的 map key 和 value 是 `#[repr(C)]` ABI。共享流结构中的 IPv4 地址都以网络字节序的 IPv4-mapped IPv6 值保存。
 
-`ConnState`、`RedirectEntry`、`RoutingHandoffEntry` payload 分别为 64、40、72 字节，含独立的 `incarnation: u64`。对应 tuple map 使用 `FlowMapValue<T>`：原生 lock 位于 offset 0，payload 位于 offset 8，实际 value 大小为 72、48、80 字节。Payload 内的 decision token 偏移不变。`TuplesKey` 仍为 40 字节，尾部 padding 显式清零；`TcpRequestKey` 为 16 字节，不可变 `TcpSocketBinding` payload 为 120 字节。持久化 `UDP_DECISION_SEQUENCE` 严格保留 12 字节。Core 在 attach 前验证实际 map 的 BTF/value 布局，工具在解码前验证存储布局；须使用匹配版本，不提供兼容 shim。
+`ConnState`、`RedirectEntry`、`RoutingHandoffEntry` payload 分别为 72、40、72 字节，含独立的 `incarnation: u64`。对应 tuple map 使用 `FlowMapValue<T>`：原生 lock 位于 offset 0，payload 位于 offset 8，实际 value 大小为 80、48、80 字节。Payload 内的 decision token 偏移不变。`ConnState` 还记录原始 SYN ISN、已提交拦截/request 历史标志与精确 request 证明计数。`TuplesKey` 仍为 40 字节，尾部 padding 显式清零；`TcpRequestKey` 为 16 字节，不可变 `TcpSocketBinding` payload 为 120 字节，offset 116 为 `syn_isn`。持久化 `UDP_DECISION_SEQUENCE` 严格保留 12 字节。Core 在 attach 前验证实际 map 的 BTF/value 布局，工具在解码前验证存储布局；须使用匹配版本，不提供兼容 shim。
 
 既有 tuple element 只原地更新、不替换：Linux 普通 hash 替换可在 RCU 读者仍持有旧指针时复用其存储。内核在原生锁内取得一致快照或窄投影，修改时在同一锁内比较捕获的身份；持锁时除 unlock 外不调用 helper。物理删除仍必须经过 tuple fence、成功的内核 grace 与事后所有权复验。外部工具使用 bucket 保护的 batch 与加锁 value copy，不回退到不安全的单项读取。
 
@@ -144,7 +144,11 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 `crates/honk-ebpf/src/route.rs` — 静态 root/slot facade 与固定 ABI dispatch；生成的 policy code 由用户态加载。
 `crates/honk-ebpf/src/tcp_binding.rs` 与 `honk-core/src/ebpf/real/tcp_binding.rs` 持有必需的 SYN/request/child 绑定与运行内核 BTF 校验。Peer ingress 恢复后，SYN 使用 mark 低 24 位与 priority 的 32 位携带 56 位身份；创建 request 时 TCP 已复用 `skb->cb`。身份耗尽后拒绝发布，不回绕。
 
-自有 `daens` 关闭并校验 SYN cookies、request migration 与 Fast Open。缺失 BTF target/offset/attachment 会拒绝启动。证明缺失、过期、分配失败或被重传 SYN 替代时，关闭 accepted socket，不授权删除 tuple。Request 证明在 120 秒后过期；已取得证明的 child storage 跟随实际 socket 生命周期。Backlog 溢出依赖客户端重试，不猜测 cookie 归属。
+被拦截 SYN 的重传在 FD 持有的 `daens` 中查询真实 request 或 child，在精确证明校验期间持有 lookup 引用并随后释放。仍存活的原始 request 保留 incarnation 与原始路由快照，即使期间策略已改变。在尚未出现任何 request 时，同 ISN 的 SYN 只能复用完整、未过期的原始发布；不可回退的 request 历史与精确计数阻止销毁后的复用。已提交拦截缺失 handoff/redirect 证据时拒绝重传，不重建归属，也不转为原生放行。原生直连流不取得拦截证明。
+
+运行内核偏移、hook 原型与 loader 使用同一份选定的 `HONK_VMLINUX_BTF`。Request 可能继承 SockMap 包装后的协议，因此不能用转换 helper 的协议指针相等性判断 request 归属。有界前缀读取复用既有 328 字节 route-witness scratch，成功或出错后均清空整个 scratch；字段布局超出容量时拒绝启动。IPv4/child hook 在加载时必需；IPv6 hook 在发布实际绑定的 IPv6 TCP listener 前必需，只有 `EAFNOSUPPORT` 允许 listener 缺席。当前 Aya API 下，已绑定的模块化 IPv6 会被拒绝而非静默降级：需使用内建 IPv6 或确实不可用的 IPv6 栈。IPv4-only 启动后再启用 IPv6，需要重启。
+
+自有 `daens` 关闭并校验 SYN cookies、request migration 与 Fast Open。只有缺失的 `tcp_syncookies` key 可作为内核未提供该功能处理；检查、写入或校验错误仍然致命。缺失必需的 BTF target/offset/attachment 会拒绝启动。证明缺失、过期、分配失败或被新 owner 替代时，关闭 accepted socket，不授权删除 tuple。Request 证明在 120 秒后过期；已取得证明的 child storage 跟随实际 socket 生命周期。Backlog 溢出依赖客户端重试，不猜测 cookie 归属。
 
 `crates/honk-ebpf-common/src/event.rs` — 固定布局的 ring event，包括 conntrack overflow 与 UDP decision-token exhaustion。
 `crates/honk-ebpf-common/src/dae_ip.rs` — `In6Addr` union 与 v4-mapped helper。

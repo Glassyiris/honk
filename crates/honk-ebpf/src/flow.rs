@@ -79,6 +79,36 @@ pub fn conn_lifecycle(key: &TuplesKey) -> Option<ConnLifecycle> {
     }
 }
 
+pub struct TcpSynState {
+    pub incarnation: u64,
+    pub tcp_syn_isn: u32,
+    pub tcp_request_count: u32,
+    pub tcp_syn_flags: u16,
+    pub state: u8,
+    pub published: bool,
+}
+
+#[inline(always)]
+pub fn tcp_syn_state(key: &TuplesKey) -> Option<TcpSynState> {
+    let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let value = &raw const (*ptr).value;
+        let result = TcpSynState {
+            incarnation: (&raw const (*value).incarnation).read_volatile(),
+            tcp_syn_isn: (&raw const (*value).tcp_syn_isn).read_volatile(),
+            tcp_request_count: (&raw const (*value).tcp_request_count).read_volatile(),
+            tcp_syn_flags: (&raw const (*value).tcp_syn_flags).read_volatile(),
+            state: (&raw const (*value).state).read_volatile(),
+            published: (&raw const (*value).meta.raw).read_volatile()
+                & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED
+                != 0,
+        };
+        bpf_spin_unlock(&mut (*ptr).lock);
+        Some(result)
+    }
+}
+
 #[inline(always)]
 pub fn redirect_identity(key: &RedirectTuple) -> Option<AuxiliaryIdentity> {
     let ptr = REDIRECT_TRACK.get_ptr_mut(key)?;

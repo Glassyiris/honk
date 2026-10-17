@@ -13,7 +13,7 @@ use network_types::tcp::TcpHdr;
 use crate::{
     action::{TC_ACT_OK, TC_ACT_SHOT},
     auxiliary::{publish_handoff, publish_redirect},
-    contrack::{TcpPublisher, is_new_tcp_connection, mark_tcp_seen},
+    contrack::{TcpPublisher, TcpSynRole, is_new_tcp_connection, mark_tcp_seen},
     flow::{conn_incarnation, conn_snapshot, copy_payload, handoff_snapshot, redirect_snapshot},
     maps::{
         CONN_STATE_MAP, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP,
@@ -79,8 +79,11 @@ fn publish_syn(
     {
         return None;
     }
-    let publisher = TcpPublisher::acquire(key)?;
-    let mut incarnation = publisher.incarnation;
+    let mut publisher = TcpPublisher::new(key, TcpSynRole::InterceptedForward);
+    if !publisher.acquire_fresh() {
+        return None;
+    }
+    let incarnation = publisher.incarnation;
     // No routing evaluator ran: preserve A's real selected route/framing inputs,
     // but explicitly mark its witness unavailable instead of attributing B to A.
     scratch.handoff.result.dscp = dscp;
@@ -97,7 +100,7 @@ fn publish_syn(
         Some(&scratch.handoff.result.pname),
         scratch.handoff.result.pid,
         scratch.handoff.trace_id,
-        &mut incarnation,
+        &publisher,
     )?;
     unsafe { (&raw mut (*ctx).cb[4]).write_volatile(1) };
     let now = unsafe { bpf_ktime_get_ns() };
@@ -112,6 +115,9 @@ fn publish_syn(
     scratch.redirect.decision_token = 0;
     scratch.redirect.from_wan = direction as u8;
     publish_redirect(key, scratch, true).ok()?;
+    if !crate::contrack::commit_tcp_intercept(key, u32::from_be_bytes(tcp.seq), incarnation) {
+        return None;
+    }
     unsafe { (&raw mut (*ctx).cb[4]).write_volatile(7) };
     drop(publisher);
     Some(incarnation)

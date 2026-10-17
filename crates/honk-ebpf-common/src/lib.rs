@@ -236,7 +236,12 @@ pub struct DaeParam {
     pub padding2: u16,
     pub dae_socket_mark: u32,
     pub local_ip: u32,
+    /// Host-relative ID of the FD-owned daens; negative means unconfigured.
+    pub tcp_daens_netns_id: i32,
 }
+
+const _: () = assert!(core::mem::offset_of!(DaeParam, tcp_daens_netns_id) == 40);
+const _: () = assert!(core::mem::size_of::<DaeParam>() == 44);
 
 impl DaeParam {
     pub const DEFAULT: Self = Self {
@@ -253,6 +258,7 @@ impl DaeParam {
         padding2: 0,
         dae_socket_mark: 0,
         local_ip: 0,
+        tcp_daens_netns_id: -1,
     };
 }
 

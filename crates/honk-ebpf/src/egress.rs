@@ -42,7 +42,7 @@ use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict,
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
 use crate::auxiliary::{
-    IDENTITY_MISMATCH as TOKEN_IDENTITY_MISMATCH, prep_redirect_to_control_plane,
+    IDENTITY_MISMATCH as TOKEN_IDENTITY_MISMATCH, RedirectPrep, prep_redirect_to_control_plane,
 };
 
 #[inline(always)]
@@ -161,14 +161,16 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             if crate::contrack::tuple_unavailable(&reversed_key, is_new_tcp_connection(&pkt.tcph)) {
                 return Err(TC_ACT_SHOT);
             }
-            let _tcp_publisher = if is_new_tcp_connection(&pkt.tcph) {
-                let publisher =
-                    crate::contrack::TcpPublisher::acquire(&reversed_key).ok_or(TC_ACT_SHOT)?;
-                pkt.incarnation = publisher.incarnation;
-                Some(publisher)
-            } else {
-                None
-            };
+            let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+                &reversed_key,
+                crate::contrack::TcpSynRole::ObservedReverse,
+            );
+            if is_new_tcp_connection(&pkt.tcph) {
+                if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+                    return Err(TC_ACT_SHOT);
+                }
+                pkt.incarnation = tcp_publisher.incarnation;
+            }
             mark_tcp_seen(
                 &reversed_key,
                 &pkt.tcph,
@@ -181,7 +183,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 None, // pname
                 0,    // pid
                 0,
-                &mut pkt.incarnation,
+                &tcp_publisher,
             );
             if crate::contrack::tuple_unavailable(&reversed_key, false) {
                 return Err(TC_ACT_SHOT);
@@ -241,12 +243,14 @@ fn do_tproxy_wan_egress_tcp(
     ctx: &TcContext,
     link_h_len: u32,
     pkt: &mut crate::transport::ParsedPacket,
+    syn: &crate::contrack::TcpPublisher,
 ) -> Verdict {
     let tuples = &pkt.tuples;
     let ethh = &pkt.ethh;
     let tcph = &pkt.tcph;
     let dns = tuples.five.dst_port == 53;
-    let tcp_state_syn = is_new_tcp_connection(tcph);
+    let wire_pure_syn = is_new_tcp_connection(tcph);
+    let fresh_publication = syn.is_fresh();
     let outbound: u8;
     let must: bool;
     let mark: u32;
@@ -258,7 +262,7 @@ fn do_tproxy_wan_egress_tcp(
 
     let mut mac = [0u8; 6];
 
-    if tcp_state_syn {
+    if fresh_publication {
         let proto = ctx.skb.protocol() as u16;
         let ip_version = if proto == ETH_P_IP.to_be() {
             IpVersionType::V4 as u8
@@ -313,7 +317,7 @@ fn do_tproxy_wan_egress_tcp(
 
         let dscp = tuples.dscp;
         let (outbound_ptr, mark_ptr, must_ptr): (Option<&u8>, Option<&u32>, Option<&u8>) =
-            if outbound == OUTBOUND_DIRECT && mark == 0 && !must {
+            if outbound == OUTBOUND_DIRECT && mark == 0 && !must && !dns {
                 (None, None, None)
             } else {
                 (Some(&outbound), Some(&mark), Some(&must_val))
@@ -343,7 +347,7 @@ fn do_tproxy_wan_egress_tcp(
             pname_bytes,
             handoff_pid,
             trace_id,
-            &mut pkt.incarnation,
+            syn,
         );
 
         if tcp_conn.is_none() {
@@ -370,7 +374,7 @@ fn do_tproxy_wan_egress_tcp(
             None, // pname
             0,    // pid
             0,
-            &mut pkt.incarnation,
+            syn,
         );
 
         if let Some(conn) = tcp_conn {
@@ -389,7 +393,7 @@ fn do_tproxy_wan_egress_tcp(
                 return Err(TC_ACT_OK);
             }
         } else {
-            if crate::contrack::tuple_unavailable(&tuples.five, false) {
+            if wire_pure_syn || crate::contrack::tuple_unavailable(&tuples.five, false) {
                 return Err(TC_ACT_SHOT);
             }
             // No state at all — pass through.
@@ -416,17 +420,19 @@ fn do_tproxy_wan_egress_tcp(
         tuples,
         ethh,
         1,
-        !tcp_state_syn,
+        if fresh_publication {
+            RedirectPrep::Publish
+        } else if wire_pure_syn {
+            RedirectPrep::Existing
+        } else {
+            RedirectPrep::Refresh
+        },
         outbound,
         0,
         pkt.incarnation,
     );
     if prepare_result != 0 {
-        if dns || mark != 0 || prepare_result == TOKEN_IDENTITY_MISMATCH {
-            return Err(TC_ACT_SHOT);
-        }
-        // Preserve the existing non-DNS direct-pass fallback for map write failures.
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_SHOT);
     }
 
     // Set cb marks for dae0peer_ingress.
@@ -434,20 +440,20 @@ fn do_tproxy_wan_egress_tcp(
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = 0;
         (*ctx.skb.skb).cb[2] = 0;
-        (*ctx.skb.skb).cb[3] = if tcp_state_syn {
+        (*ctx.skb.skb).cb[3] = if wire_pure_syn {
             pkt.incarnation as u32
         } else {
             0
         };
-        (*ctx.skb.skb).cb[4] = if tcp_state_syn {
+        (*ctx.skb.skb).cb[4] = if wire_pure_syn {
             (pkt.incarnation >> 32) as u32
         } else {
             0
         };
     }
 
-    // Only the SYN publishes the immutable snapshot used by request/child proof.
-    if tcp_state_syn {
+    // Only fresh publication captures the immutable request/child snapshot.
+    if fresh_publication {
         let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
             increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
             return Err(TC_ACT_SHOT);
@@ -469,12 +475,14 @@ fn do_tproxy_wan_egress_tcp(
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
         }
-        if let Err(error) =
-            crate::auxiliary::publish_handoff(&tuples.five, unsafe { &mut *scratch }, true)
-        {
-            if dns || mark != 0 || error == TOKEN_IDENTITY_MISMATCH {
-                return Err(TC_ACT_SHOT);
-            }
+        crate::auxiliary::publish_handoff(&tuples.five, unsafe { &mut *scratch }, true)
+            .map_err(|_| TC_ACT_SHOT)?;
+        if !crate::contrack::commit_tcp_intercept(
+            &tuples.five,
+            u32::from_be_bytes(tcph.seq),
+            pkt.incarnation,
+        ) {
+            return Err(TC_ACT_SHOT);
         }
     }
 
@@ -536,16 +544,13 @@ fn fast_path_decision(
         tuples,
         ethh,
         1,
-        true,
+        RedirectPrep::Refresh,
         outbound,
         decision_token,
         incarnation,
     );
     if prepare_result != 0 {
-        if dns || mark != 0 || prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
-            return Err(TC_ACT_SHOT);
-        }
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_SHOT);
     }
 
     unsafe {
@@ -848,17 +853,19 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     ) {
         return Err(TC_ACT_SHOT);
     }
-    let _tcp_publisher = if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
-        let publisher =
-            crate::contrack::TcpPublisher::acquire(&pkt.tuples.five).ok_or(TC_ACT_SHOT)?;
-        pkt.incarnation = publisher.incarnation;
-        Some(publisher)
-    } else {
-        None
-    };
+    let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+        &pkt.tuples.five,
+        crate::contrack::TcpSynRole::InterceptedForward,
+    );
+    if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
+        if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+            return Err(TC_ACT_SHOT);
+        }
+        pkt.incarnation = tcp_publisher.incarnation;
+    }
 
     match pkt.l4proto {
-        IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt),
+        IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
         IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
         _ => Ok(TC_ACT_OK),
     }

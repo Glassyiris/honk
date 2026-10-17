@@ -228,6 +228,7 @@ fn syn_publisher(key: &TuplesKey, incarnation: u64) -> bool {
         && TCP_PUBLISHING
             .get_ptr(key)
             .is_some_and(|owner| unsafe { *owner } == incarnation)
+        && crate::flow::conn_incarnation(key) == Some(incarnation)
 }
 
 /// Fresh SYN and stateless per-packet authority publish payloads without replacing elements.
@@ -375,6 +376,13 @@ pub fn publish_handoff(
         })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RedirectPrep {
+    Publish,
+    Refresh,
+    Existing,
+}
+
 /// Prepare a packet for redirection to the control plane.
 ///
 /// Stores the original source/dest MAC in `REDIRECT_TRACK` so the dae0 ingress
@@ -393,12 +401,20 @@ pub fn prep_redirect_to_control_plane(
     tuples: &Tuples,
     ethh: &EthHdr,
     from_wan: u8,
-    refresh_if_stale: bool,
+    mode: RedirectPrep,
     outbound: u8,
     decision_token: u32,
     incarnation: u64,
 ) -> i32 {
     let param = PARAM.load();
+    if tuples.five.l4proto == crate::transport::IPPROTO_TCP && param.tcp_daens_netns_id < 0 {
+        return IDENTITY_MISMATCH;
+    }
+    if mode == RedirectPrep::Existing
+        && crate::flow::handoff_incarnation(&tuples.five) != Some(incarnation)
+    {
+        return IDENTITY_MISMATCH;
+    }
 
     // bpf_redirect_peer is NOT supported in egress direction;
     // only use for ingress (from_wan == 0).
@@ -444,7 +460,7 @@ pub fn prep_redirect_to_control_plane(
 
     let redirect_tuple = RedirectTuple::from_tuples(&tuples.five);
     let now = unsafe { bpf_ktime_get_ns() };
-    if refresh_if_stale {
+    if mode != RedirectPrep::Publish {
         match crate::auxiliary::refresh_redirect(
             &tuples.five,
             &redirect_tuple,
@@ -453,7 +469,11 @@ pub fn prep_redirect_to_control_plane(
             now,
         ) {
             Ok(true) => return 0,
-            Ok(false) => {}
+            Ok(false) => {
+                if mode == RedirectPrep::Existing {
+                    return IDENTITY_MISMATCH;
+                }
+            }
             Err(error) => return error,
         }
     }
@@ -485,7 +505,7 @@ pub fn prep_redirect_to_control_plane(
     }
     // else: L3-only — MACs stay zero.
 
-    match crate::auxiliary::publish_redirect(&tuples.five, scratch, !refresh_if_stale) {
+    match crate::auxiliary::publish_redirect(&tuples.five, scratch, mode == RedirectPrep::Publish) {
         Ok(()) => 0,
         Err(error) => error,
     }

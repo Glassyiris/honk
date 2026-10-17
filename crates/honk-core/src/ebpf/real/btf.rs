@@ -1,8 +1,30 @@
 //! Raw BTF reader for the few kernel and object layouts aya does not expose.
 
+use anyhow::Context;
 use std::ops::Range;
 
 pub(super) const BTF_HEADER_LEN: usize = 24;
+
+const VMLINUX_BTF_PATHS: [&str; 2] = ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
+const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
+
+pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
+    let data = if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
+        std::fs::read(&path).with_context(|| {
+            format!(
+                "reading kernel BTF from {VMLINUX_BTF_ENV}={}",
+                std::path::Path::new(&path).display()
+            )
+        })?
+    } else {
+        VMLINUX_BTF_PATHS
+            .iter()
+            .find_map(|path| std::fs::read(path).ok())
+            .context("kernel BTF unavailable in default paths; set HONK_VMLINUX_BTF")?
+    };
+    let btf = aya::Btf::parse(&data, Default::default()).context("parsing selected kernel BTF")?;
+    Ok((data, btf))
+}
 
 #[derive(Clone, Copy)]
 enum Endian {

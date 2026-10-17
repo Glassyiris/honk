@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context as _;
 
 impl RealEbpfBackend {
     pub async fn load(
@@ -19,9 +20,15 @@ impl RealEbpfBackend {
             version.2
         );
         events::validate_flow_lifetime_object_layout(obj)?;
-        let prepared_binding = tcp_binding::prepare()?;
-        let process_name_offsets = process_name::detect();
-        let pname_mode = process_name::select_capture_mode(obj, process_name_offsets);
+        let (kernel_data, kernel_btf) = btf::load_kernel()?;
+        let tcp_binding_offsets = tcp_binding::offsets(&kernel_data)?;
+        let ipv6_proof = tcp_binding::ipv6_proof(&kernel_data);
+        let process_name_offsets = process_name::detect(&kernel_data);
+        let pname_mode = process_name::select_capture_mode(obj, &kernel_btf, process_name_offsets);
+        let tcp_daens_netns_id = crate::netlink::NlSock::new()?
+            .ensure_netns_id(std::os::fd::AsFd::as_fd(crate::daens_fd()?))?;
+        let ipv6_sockets_available =
+            u8::from(crate::ipv6_socket_available().context("probe IPv6 socket family")?);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
         let dae0_ifindex = crate::netlink::ifindex_of("dae0").unwrap_or(0);
@@ -96,6 +103,7 @@ impl RealEbpfBackend {
                 as u8,
             dae_socket_mark: honk_outbound::util::bypass_mark(),
             control_plane_pid: std::process::id(),
+            tcp_daens_netns_id,
             local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
             ..Default::default()
         };
@@ -117,10 +125,12 @@ impl RealEbpfBackend {
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut loader = EbpfLoader::new();
         loader
+            .btf(Some(&kernel_btf))
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
-            .override_global("TCP_BINDING_OFFSETS", &prepared_binding.offsets, true)
+            .override_global("TCP_BINDING_OFFSETS", &tcp_binding_offsets, true)
+            .override_global("IPV6_SOCKETS_AVAILABLE", &ipv6_sockets_available, true)
             .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
         if matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
             && let Some(offsets) = process_name_offsets.as_ref()
@@ -130,7 +140,7 @@ impl RealEbpfBackend {
                 .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
         }
         #[cfg(feature = "native-api")]
-        let receive_trace_offsets = receive_trace::detect();
+        let receive_trace_offsets = receive_trace::detect(&kernel_data);
         #[cfg(feature = "native-api")]
         if let Some(offsets) = &receive_trace_offsets {
             offsets.configure(&mut loader);
@@ -190,7 +200,7 @@ impl RealEbpfBackend {
                 .map_err(|error| {
                     anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}")
                 })?;
-        let tcp_bindings = prepared_binding.attach(&mut bpf)?;
+        let tcp_bindings = tcp_binding::attach(&mut bpf, kernel_btf, ipv6_proof)?;
         match pname_mode {
             process_name::PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")

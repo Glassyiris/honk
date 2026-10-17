@@ -131,6 +131,7 @@ pub(crate) fn handoff_matches(
 
 pub(crate) fn request_matches(a: &TcpSocketBinding, b: &TcpSocketBinding, cutoff: u64) -> bool {
     a.kind == b.kind
+        && a.syn_isn == b.syn_isn
         && tuple_matches(&a.tuples, &b.tuples)
         && handoff_matches(&a.handoff, &b.handoff, cutoff)
 }

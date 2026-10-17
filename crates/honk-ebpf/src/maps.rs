@@ -110,7 +110,8 @@ pub fn request_retiring(key: &TcpRequestKey) -> bool {
 #[btf_map]
 pub static TCP_SOCKET_BINDING: SkStorage<TcpSocketBinding> = SkStorage::new();
 
-/// Exclusive non-sleepable SYN publishers; no userspace mutation or expiry.
+/// SYN invocation exclusion: zero during classification/cached reuse, a fresh
+/// incarnation only for authorized replacement. No userspace mutation or expiry.
 #[btf_map]
 pub static TCP_PUBLISHING: HashMap<TuplesKey, u64, 65536, 1> = HashMap::new();
 

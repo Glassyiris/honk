@@ -4,6 +4,7 @@ use aya::maps::RingBuf;
 use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_STATE_TIMEOUT_NS};
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
+mod publication;
 mod stable_values;
 
 const TC_ACT_PIPE: u32 = 3;
@@ -268,9 +269,15 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
                     .unwrap()
                     .unwrap()
                     .incarnation;
-                for _ in 0..2 {
+                for isn in 1..=2 {
                     assert_eq!(
-                        run(&backend, side, &syn, SkbInput::default()).verdict,
+                        run(
+                            &backend,
+                            side,
+                            &with_isn(syn.clone(), isn),
+                            SkbInput::default()
+                        )
+                        .verdict,
                         expected,
                         "{side} remained busy"
                     );
@@ -350,10 +357,22 @@ fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
                     (u64::from(peer.priority) << 24) | u64::from(peer.mark & 0x00ff_ffff),
                     LAST_INCARNATION
                 );
+                // An identical retry reuses the pending owner and needs no allocation.
+                assert_eq!(
+                    run(&backend, side, &syn, SkbInput::default()).verdict,
+                    TC_ACT_REDIRECT
+                );
+                assert_eq!(handoff(&backend, &key).incarnation, LAST_INCARNATION);
                 let before = owned_values(&backend, &key);
-                for _ in 0..2 {
+                for isn in 1..=2 {
                     assert_eq!(
-                        run(&backend, side, &syn, SkbInput::default()).verdict,
+                        run(
+                            &backend,
+                            side,
+                            &with_isn(syn.clone(), isn),
+                            SkbInput::default()
+                        )
+                        .verdict,
                         TC_ACT_SHOT
                     );
                     assert_eq!(owned_values(&backend, &key), before);

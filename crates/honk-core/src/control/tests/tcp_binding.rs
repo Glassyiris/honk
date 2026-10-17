@@ -33,6 +33,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
 
 mod lifetime;
+mod retransmit;
 
 const CHILD: &str = "HONK_TCP_BINDING_CHILD";
 const ROOT: &str = "/sys/fs/bpf/tcp-binding";
@@ -149,6 +150,38 @@ kernel_case!(
     netns_tcp_native_pin_retirement_error_is_unconfirmed_once,
     "lifetime-pin-retire-error"
 );
+
+// Ablate the shared fresh-versus-cached SYN classification: a client retry must
+// neither mint a new incarnation nor replace the original request's route.
+kernel_case!(
+    netns_tcp_retransmitted_syn_keeps_original_request_and_route,
+    "retransmit"
+);
+// Same, with a different real routing policy published before the retry.
+kernel_case!(
+    netns_tcp_retransmitted_syn_keeps_original_route_after_policy_change,
+    "retransmit-policy"
+);
+// WAN is a genuine second process in the router namespace: this test process is the
+// control plane, whose PID the datapath deliberately exempts.
+kernel_case!(
+    netns_tcp_wan_retransmitted_syn_keeps_original_request_and_route,
+    "retransmit-wan"
+);
+kernel_case!(
+    netns_tcp_wan_retransmitted_syn_keeps_original_route_after_policy_change,
+    "retransmit-wan-policy"
+);
+kernel_case!(
+    netns_tcp_native_direct_syn_retry_reaches_server,
+    "retransmit-native"
+);
+kernel_case!(
+    netns_tcp_wan_native_direct_syn_retry_reaches_server,
+    "retransmit-wan-native"
+);
+kernel_case!(netns_tcp_namespace_disables_request_shortcuts, "namespace");
+
 #[derive(Debug)]
 struct CountDial(Arc<AtomicUsize>);
 
@@ -176,7 +209,30 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
     let (client_ns, server_ns) = build_lab(lan, wan)?;
     configure_test_edge(&client_ns, "honk-c0", client, lan, &[]);
     configure_test_edge(&server_ns, "honk-s0", destination, wan, &[]);
+    let target = SocketAddr::new(destination, 41002);
+    let server = case
+        .starts_with("retransmit")
+        .then(|| retransmit::listen(&server_ns, target))
+        .transpose()?;
     let _dae0 = crate::create_dae0_link()?;
+    if case == "namespace" {
+        crate::setup_daens_namespace(honk_ebpf_common::TPROXY_MARK, 12345)?;
+        return crate::with_daens_netns("verify request shortcut settings", || {
+            for name in ["tcp_syncookies", "tcp_migrate_req", "tcp_fastopen"] {
+                match std::fs::read_to_string(format!("/proc/sys/net/ipv4/{name}")) {
+                    Ok(value) => ensure!(value.trim() == "0", "{name} remains enabled"),
+                    Err(error)
+                        if name == "tcp_syncookies"
+                            && error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        });
+    }
+    let object = std::env::var_os("HONK_TEST_BPF_OBJECT")
+        .map(std::fs::read)
+        .transpose()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -184,7 +240,7 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
             let config = lab_config(&udp_test_node());
             let root = Path::new(ROOT);
             let mut backend = RealEbpfBackend::load(
-                crate::DEFAULT_BPF_OBJECT,
+                object.as_deref().unwrap_or(crate::DEFAULT_BPF_OBJECT),
                 root,
                 config.global.tproxy_port,
                 Some("honk-lan0"),
@@ -200,19 +256,48 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
                 SocketAddr::new("0.0.0.0".parse()?, config.global.tproxy_port),
                 config.global.tproxy_mark,
             )?;
-            let tcp6 = crate::control::sockets::bind_tproxy_tcp(
+            // Only an actual missing IPv6 family may omit the proof; a v6 scenario needs its listener.
+            let tcp6 = match crate::control::sockets::bind_tproxy_tcp(
                 SocketAddr::new("::".parse()?, config.global.tproxy_port),
                 config.global.tproxy_mark,
+            ) {
+                Ok(listener) => Some(listener),
+                Err(error)
+                    if client.is_ipv4()
+                        && error
+                            .chain()
+                            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                            .any(|cause| cause.raw_os_error() == Some(libc::EAFNOSUPPORT)) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            backend.publish_listener_sockets(
+                tcp4.as_raw_fd(),
+                tcp6.as_ref().map(AsRawFd::as_raw_fd),
+                &[],
+                &[],
             )?;
-            backend.publish_listener_sockets(tcp4.as_raw_fd(), tcp6.as_raw_fd(), &[], &[])?;
-            let listener = TcpListener::from_std(if client.is_ipv4() { tcp4 } else { tcp6 })?;
+            let listener = TcpListener::from_std(if client.is_ipv4() {
+                tcp4
+            } else {
+                tcp6.context("IPv6 scenario has no IPv6 transparent listener")?
+            })?;
             let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
             let dials = Arc::new(AtomicUsize::new(0));
             let mut registry = ProxyRegistry::new();
-            registry.register(ProtocolEntry::new(
-                honk_config::types::NodeProtocol::Socks5,
-                Arc::new(CountDial(Arc::clone(&dials))),
-            ));
+            registry.register(if server.is_some() {
+                ProtocolEntry::new(
+                    honk_config::types::NodeProtocol::Socks5,
+                    Arc::new(retransmit::ForwardDial(Arc::clone(&dials))),
+                )
+            } else {
+                ProtocolEntry::new(
+                    honk_config::types::NodeProtocol::Socks5,
+                    Arc::new(CountDial(Arc::clone(&dials))),
+                )
+            });
             let mut plane = ControlPlane::new(
                 config,
                 Box::new(backend),
@@ -248,16 +333,18 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
                 )?;
             }
             handle.ebpf.write().await.set_datapath_ready(true)?;
-            let exercise = exercise(
-                &handle,
-                &listener,
-                &client_ns,
-                client,
-                SocketAddr::new(destination, 41002),
-                case,
-                &dials,
-            )
-            .await;
+            let exercise = match server {
+                Some(server) => {
+                    retransmit::exercise(
+                        &handle, &listener, &client_ns, &server_ns, client, wan, target, server,
+                        &dials, case,
+                    )
+                    .await
+                }
+                None => {
+                    exercise(&handle, &listener, &client_ns, client, target, case, &dials).await
+                }
+            };
             handle.ebpf.write().await.set_datapath_ready(false)?;
             let joined = match retirement {
                 Some(retirement) => retirement.join(&handle).await,
@@ -321,7 +408,7 @@ async fn exercise(
     } else {
         0
     };
-    let wire = Wire::new()?;
+    let wire = Wire::on("honk-lan0")?;
     let socket = in_test_netns(client_ns, || -> anyhow::Result<_> {
         let socket = if client.is_ipv4() {
             TcpSocket::new_v4()?
@@ -693,7 +780,7 @@ struct Wire {
 }
 
 impl Wire {
-    fn new() -> anyhow::Result<Self> {
+    fn on(interface: &str) -> anyhow::Result<Self> {
         let protocol = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
         let fd = unsafe {
             libc::socket(
@@ -711,7 +798,7 @@ impl Wire {
         let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         address.sll_family = libc::AF_PACKET as _;
         address.sll_protocol = protocol as _;
-        address.sll_ifindex = crate::netlink::ifindex_of("honk-lan0")? as _;
+        address.sll_ifindex = crate::netlink::NlSock::new()?.get_link(interface)?.0 as _;
         ensure!(
             unsafe {
                 libc::bind(

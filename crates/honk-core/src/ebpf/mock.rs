@@ -248,10 +248,10 @@ impl MockEbpfBackend {
         &mut self,
         request: &RetireRequest<'_>,
         counts: &mut RetireCounts,
-    ) -> UdpDecisionCommitResult {
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
         let raw = Self::tuples_key_bytes(&request.key);
         let track_raw = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(&request.key));
-        match request.kind {
+        Ok(match request.kind {
             RetireKind::Tcp { .. } | RetireKind::Udp { .. } | RetireKind::ExpiredConn { .. } => {
                 self.retire_owned_flow(&request.key, request.kind, counts)
             }
@@ -292,8 +292,18 @@ impl MockEbpfBackend {
                         if tuple_matches(&request.key, &current.tuples)
                             && request_matches(current, expected, expired_before_ns) =>
                     {
-                        counts.request +=
-                            u64::from(self.tcp_request_bindings.remove(&proof_key).is_some());
+                        let incarnation = current.handoff.incarnation;
+                        if self.tcp_request_bindings.remove(&proof_key).is_some() {
+                            counts.request += 1;
+                            if let Some(state) = self.tcp_conn_states.get_mut(&raw)
+                                && state.incarnation == incarnation
+                            {
+                                state.tcp_request_count =
+                                    state.tcp_request_count.checked_sub(1).ok_or_else(|| {
+                                        anyhow::anyhow!("TCP request accounting underflow")
+                                    })?;
+                            }
+                        }
                         UdpDecisionCommitResult::Applied
                     }
                     Some(_) => UdpDecisionCommitResult::Superseded,
@@ -316,7 +326,7 @@ impl MockEbpfBackend {
                     current,
                 ) {
                     Ok(expired) => expired,
-                    Err(result) => return result,
+                    Err(result) => return Ok(result),
                 };
                 if !expired {
                     let handoff = self.routing_handoffs.get_mut().get(&raw);
@@ -329,7 +339,7 @@ impl MockEbpfBackend {
                         track,
                     ) {
                         Ok(removal) => removal,
-                        Err(result) => return result,
+                        Err(result) => return Ok(result),
                     };
                     let mut removed = false;
                     if removal.handoff {
@@ -342,11 +352,11 @@ impl MockEbpfBackend {
                         counts.redirect += u64::from(deleted);
                         removed |= deleted;
                     }
-                    return removal.outcome(removed);
+                    return Ok(removal.outcome(removed));
                 }
                 self.retire_owned_flow(&request.key, request.kind, counts)
             }
-        }
+        })
     }
 
     pub fn fail_next_routing_phase(&mut self, phase: RoutingPushPhase) {
@@ -586,12 +596,14 @@ impl EbpfBackend for MockEbpfBackend {
     fn publish_listener_sockets(
         &mut self,
         tcp4_fd: std::os::fd::RawFd,
-        tcp6_fd: std::os::fd::RawFd,
+        tcp6_fd: Option<std::os::fd::RawFd>,
         udp4_fds: &[std::os::fd::RawFd],
         udp6_fds: &[std::os::fd::RawFd],
     ) -> anyhow::Result<()> {
         self.listener_socket_slots.insert(0, tcp4_fd);
-        self.listener_socket_slots.insert(1, tcp6_fd);
+        if let Some(fd) = tcp6_fd {
+            self.listener_socket_slots.insert(1, fd);
+        }
         for (base, fds) in [(2, udp4_fds), (6, udp6_fds)] {
             for (offset, fd) in fds.iter().enumerate() {
                 self.listener_socket_slots.insert(base + offset as u32, *fd);
@@ -1035,7 +1047,10 @@ impl EbpfBackend for MockEbpfBackend {
             }
             #[cfg(not(test))]
             let _ = index;
-            *outcome = Some(self.retire_model_request(request, &mut counts));
+            *outcome = Some(
+                self.retire_model_request(request, &mut counts)
+                    .map_err(|source| RetireError { counts, source })?,
+            );
         }
         Ok(counts)
     }
@@ -1946,6 +1961,16 @@ mod batch_retirement_tests {
         backend
             .tcp_request_bindings
             .insert((proof.address, proof.cookie), fresh);
+        backend
+            .tcp_conn_state_store(
+                &key,
+                &ConnState {
+                    incarnation: 2,
+                    tcp_request_count: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let mut scanned = 0;
         backend
             .tcp_request_for_each_chunk(1, &mut |chunk| {
@@ -1967,6 +1992,14 @@ mod batch_retirement_tests {
         );
         assert_eq!(counts.request, 0);
         assert_eq!(outcome, UdpDecisionCommitResult::Superseded);
+        assert_eq!(
+            backend
+                .tcp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .tcp_request_count,
+            1
+        );
         let (counts, outcome) = retire_fixture(
             &mut backend,
             key,
@@ -1978,6 +2011,14 @@ mod batch_retirement_tests {
         );
         assert_eq!(counts.request, 1);
         assert_eq!(outcome, UdpDecisionCommitResult::Applied);
+        assert_eq!(
+            backend
+                .tcp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .tcp_request_count,
+            0
+        );
         assert!(backend.tcp_request_bindings.is_empty());
         assert!(backend.take_expiry_hints().is_none());
     }
@@ -2099,7 +2140,7 @@ mod tests {
         assert!(!backend.datapath_ready);
         assert!(backend.set_datapath_ready(true).is_err());
         backend
-            .publish_listener_sockets(10, 11, &[12, 13, 14, 15], &[16, 17, 18, 19])
+            .publish_listener_sockets(10, Some(11), &[12, 13, 14, 15], &[16, 17, 18, 19])
             .unwrap();
         backend.set_datapath_ready(true).unwrap();
         assert!(backend.datapath_ready);
@@ -2111,7 +2152,7 @@ mod tests {
     fn listener_clear_rejects_live_admission_and_fences_partial_failure() {
         let mut backend = MockEbpfBackend::new();
         backend
-            .publish_listener_sockets(10, 11, &[12, 13, 14, 15], &[16, 17, 18, 19])
+            .publish_listener_sockets(10, Some(11), &[12, 13, 14, 15], &[16, 17, 18, 19])
             .unwrap();
         backend.set_datapath_ready(true).unwrap();
         assert!(backend.clear_listener_sockets().is_err());
@@ -2129,9 +2170,10 @@ mod tests {
         assert!(backend.listener_socket_slots.is_empty());
         assert!(backend.set_datapath_ready(true).is_err());
         backend
-            .publish_listener_sockets(20, 21, &[22, 23, 24, 25], &[])
+            .publish_listener_sockets(20, None, &[22, 23, 24, 25], &[])
             .unwrap();
-        assert_eq!(backend.listener_socket_slots.len(), 6);
+        assert_eq!(backend.listener_socket_slots.len(), 5);
+        assert!(!backend.listener_socket_slots.contains_key(&1));
         assert!(!backend.listener_socket_slots.contains_key(&6));
         backend.set_datapath_ready(true).unwrap();
     }

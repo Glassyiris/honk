@@ -1,4 +1,4 @@
-use super::support::netns::{build_lab, lab_config, pinned_map};
+use super::support::netns::{KernelTcpDial, build_lab, lab_config, pinned_map};
 use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
 };
@@ -8,14 +8,12 @@ use crate::ebpf::{EbpfBackend, real::RealEbpfBackend};
 use crate::routing::Router;
 use anyhow::{Context, ensure};
 use aya::maps::Array;
-use honk_config::node::Node;
-use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
+use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket};
 
@@ -53,33 +51,6 @@ fn netns_tcp_reuses_tuple_during_daens_time_wait() -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-// Only the outbound dial is a fixture: ingress, listener, routing and relay are real.
-#[derive(Debug)]
-struct KernelTcpDial;
-
-#[async_trait::async_trait]
-impl TcpOutbound for KernelTcpDial {
-    async fn dial(
-        &self,
-        _node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        let stream = honk_outbound::util::connect_marked_addr(
-            target,
-            Some(honk_outbound::util::bypass_mark()),
-            connect_timeout,
-        )
-        .await?;
-        Ok(ProxyStream {
-            stream: Box::new(stream),
-            target_addr: target,
-            target_domain: target_domain.map(str::to_owned),
-        })
-    }
 }
 
 fn run_child(family: &str) -> anyhow::Result<()> {

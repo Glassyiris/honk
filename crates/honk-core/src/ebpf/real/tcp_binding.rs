@@ -15,14 +15,39 @@ use honk_ebpf_common::{
 
 use super::btf::Btf as OffsetBtf;
 
-pub(super) struct PreparedBinding {
-    pub offsets: TcpBindingOffsets,
-    btf: Btf,
+pub(super) struct TcpBindings {
+    _entries: [FEntryLink; 2],
+    _child: FExitLink,
+    ipv6: Ipv6Bindings,
 }
 
-pub(super) struct TcpBindings {
-    _entries: Vec<FEntryLink>,
-    _child: FExitLink,
+enum Ipv6Bindings {
+    Pending(Btf),
+    Attached { _links: [FEntryLink; 2] },
+    Unavailable(anyhow::Error),
+}
+
+impl TcpBindings {
+    pub(super) fn attach_ipv6(&mut self, bpf: &mut Ebpf) -> Result<()> {
+        let btf = match &self.ipv6 {
+            Ipv6Bindings::Attached { .. } => return Ok(()),
+            Ipv6Bindings::Pending(btf) => btf,
+            Ipv6Bindings::Unavailable(error) => anyhow::bail!(
+                "IPv6 TCP listener requires tcp_v6_route_req and tcp_v6_reqsk_destructor proof: {error:#}; use a kernel with built-in IPv6 (CONFIG_IPV6=y), or boot without an IPv6 stack (ipv6.disable=1); modular IPv6 proof is unsupported"
+            ),
+        };
+        let links = [
+            attach_entry(bpf, btf, "honk_tcp_v6_route_req", "tcp_v6_route_req")?,
+            attach_entry(
+                bpf,
+                btf,
+                "honk_tcp_v6_reqsk_destructor",
+                "tcp_v6_reqsk_destructor",
+            )?,
+        ];
+        self.ipv6 = Ipv6Bindings::Attached { _links: links };
+        Ok(())
+    }
 }
 
 fn validate_signature(
@@ -65,26 +90,22 @@ fn validate_signature(
     Ok(())
 }
 
-fn offsets(data: &[u8]) -> Result<TcpBindingOffsets> {
+pub(super) fn offsets(data: &[u8]) -> Result<TcpBindingOffsets> {
     let btf = OffsetBtf::parse(data).ok_or_else(|| anyhow!("invalid running-kernel BTF"))?;
-    for name in ["tcp_v4_route_req", "tcp_v6_route_req"] {
-        // Both 6.12 and current kernels pass tw_isn, not a pointer or a boolean.
-        validate_signature(
-            &btf,
-            name,
-            &["sock", "sk_buff", "flowi", "request_sock", "u32"],
-            Some("dst_entry"),
-        )?;
-    }
+    // Both 6.12 and current kernels pass tw_isn, not a pointer or a boolean.
+    validate_signature(
+        &btf,
+        "tcp_v4_route_req",
+        &["sock", "sk_buff", "flowi", "request_sock", "u32"],
+        Some("dst_entry"),
+    )?;
     validate_signature(
         &btf,
         "tcp_create_openreq_child",
         &["sock", "request_sock", "sk_buff"],
         Some("sock"),
     )?;
-    for name in ["tcp_v4_reqsk_destructor", "tcp_v6_reqsk_destructor"] {
-        validate_signature(&btf, name, &["request_sock"], None)?;
-    }
+    validate_signature(&btf, "tcp_v4_reqsk_destructor", &["request_sock"], None)?;
     let member = |structure, field, width| {
         btf.sized_member_offset(structure, field, width)
             .ok_or_else(|| {
@@ -98,10 +119,19 @@ fn offsets(data: &[u8]) -> Result<TcpBindingOffsets> {
         .member_offset("request_sock", "__req_common")
         .ok_or_else(|| anyhow!("request_sock.__req_common missing"))?;
     ensure!(
-        common == 0 && request_common == 0,
+        common == 0
+            && request_common == 0
+            && btf.member_offset("tcp_request_sock", "req") == Some(0)
+            && btf.member_offset("inet_request_sock", "req") == Some(0),
         "unsupported socket common-prefix layout"
     );
     let socket_cookie = member("sock_common", "skc_cookie", 8)?;
+    let request_rcv_isn = member("tcp_request_sock", "rcv_isn", 4)?;
+    let capacity = core::mem::size_of::<honk_ebpf_common::KernelRouteWitness>() as u32;
+    ensure!(
+        socket_cookie <= capacity - 8 && request_rcv_isn <= capacity - 4,
+        "running-kernel TCP request fields exceed the {capacity}-byte prefix scratch"
+    );
     Ok(TcpBindingOffsets {
         skb_head: member("sk_buff", "head", 8)?,
         skb_network_header: member("sk_buff", "network_header", 2)?,
@@ -110,56 +140,64 @@ fn offsets(data: &[u8]) -> Result<TcpBindingOffsets> {
         skb_mark: member("sk_buff", "mark", 4)?,
         skb_priority: member("sk_buff", "priority", 4)?,
         socket_cookie,
+        request_rcv_isn,
     })
 }
 
-pub(super) fn prepare() -> Result<PreparedBinding> {
-    let data = std::fs::read("/sys/kernel/btf/vmlinux")
-        .context("reading required running-kernel TCP proof BTF")?;
-    Ok(PreparedBinding {
-        offsets: offsets(&data)?,
-        btf: Btf::parse(&data, Default::default())
-            .context("parsing required TCP proof attachment BTF")?,
-    })
+pub(super) fn ipv6_proof(data: &[u8]) -> Result<()> {
+    let btf = OffsetBtf::parse(data).ok_or_else(|| anyhow!("invalid running-kernel BTF"))?;
+    validate_signature(
+        &btf,
+        "tcp_v6_route_req",
+        &["sock", "sk_buff", "flowi", "request_sock", "u32"],
+        Some("dst_entry"),
+    )?;
+    validate_signature(&btf, "tcp_v6_reqsk_destructor", &["request_sock"], None)
 }
 
-impl PreparedBinding {
-    pub(super) fn attach(self, bpf: &mut Ebpf) -> Result<TcpBindings> {
-        let mut entries = Vec::with_capacity(4);
-        for (name, target) in [
-            ("honk_tcp_v4_route_req", "tcp_v4_route_req"),
-            ("honk_tcp_v6_route_req", "tcp_v6_route_req"),
-            ("honk_tcp_v4_reqsk_destructor", "tcp_v4_reqsk_destructor"),
-            ("honk_tcp_v6_reqsk_destructor", "tcp_v6_reqsk_destructor"),
-        ] {
-            let program: &mut FEntry = bpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow!("required TCP proof program {name} missing"))?
-                .try_into()?;
-            program
-                .load(target, &self.btf)
-                .with_context(|| format!("loading required TCP proof {name}"))?;
-            let link = program
-                .attach()
-                .with_context(|| format!("attaching required TCP proof {name}"))?;
-            entries.push(program.take_link(link)?);
-        }
-        let program: &mut FExit = bpf
-            .program_mut("honk_tcp_create_openreq_child")
-            .ok_or_else(|| anyhow!("required TCP child proof program missing"))?
-            .try_into()?;
-        program
-            .load("tcp_create_openreq_child", &self.btf)
-            .context("loading required TCP child proof")?;
-        let link = program
-            .attach()
-            .context("attaching required TCP child proof")?;
-        let child = program.take_link(link)?;
-        Ok(TcpBindings {
-            _entries: entries,
-            _child: child,
-        })
-    }
+fn attach_entry(bpf: &mut Ebpf, btf: &Btf, name: &str, target: &str) -> Result<FEntryLink> {
+    let program: &mut FEntry = bpf
+        .program_mut(name)
+        .ok_or_else(|| anyhow!("required TCP proof program {name} missing"))?
+        .try_into()?;
+    program
+        .load(target, btf)
+        .with_context(|| format!("loading required TCP proof {name}"))?;
+    let link = program
+        .attach()
+        .with_context(|| format!("attaching required TCP proof {name}"))?;
+    Ok(program.take_link(link)?)
+}
+
+pub(super) fn attach(bpf: &mut Ebpf, btf: Btf, ipv6: Result<()>) -> Result<TcpBindings> {
+    let entries = [
+        attach_entry(bpf, &btf, "honk_tcp_v4_route_req", "tcp_v4_route_req")?,
+        attach_entry(
+            bpf,
+            &btf,
+            "honk_tcp_v4_reqsk_destructor",
+            "tcp_v4_reqsk_destructor",
+        )?,
+    ];
+    let program: &mut FExit = bpf
+        .program_mut("honk_tcp_create_openreq_child")
+        .ok_or_else(|| anyhow!("required TCP child proof program missing"))?
+        .try_into()?;
+    program
+        .load("tcp_create_openreq_child", &btf)
+        .context("loading required TCP child proof")?;
+    let link = program
+        .attach()
+        .context("attaching required TCP child proof")?;
+    let child = program.take_link(link)?;
+    Ok(TcpBindings {
+        _entries: entries,
+        _child: child,
+        ipv6: match ipv6 {
+            Ok(()) => Ipv6Bindings::Pending(btf),
+            Err(error) => Ipv6Bindings::Unavailable(error),
+        },
+    })
 }
 
 pub(super) fn publish_listener(bpf: &mut Ebpf, fd: BorrowedFd<'_>) -> Result<()> {

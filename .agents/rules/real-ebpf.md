@@ -40,6 +40,12 @@ kernel grace barrier and matching auxiliary tokens/incarnations. Preserve
 native/offloaded, missing and newer-token authority. Never infer WAN ownership
 from `must` alone or change the persistent 12-byte allocator ABI.
 
+TCP cached-SYN classification queries the FD-owned daens by its explicit
+host-relative namespace ID, never the packet namespace or an assumed ID zero.
+ABI sizes: ConnState 72 bytes (80 with its lock wrapper), TcpSocketBinding 120
+with syn_isn at offset 116, TcpBindingOffsets 32, DaeParam 44. Proof selection,
+IPv6 and sysctl rules live in `AGENTS.md` (Notes for agents).
+
 Socket process identity is native non-cloned `SK_STORAGE`, captured once by
 create/connect/sendmsg and reclaimed only with the actual socket object. A
 missing identity after CREATE and one lookup refuses the operation; no cookie

@@ -98,7 +98,7 @@ pub struct TcpSocketBinding {
     pub tuples: TuplesKey,
     pub handoff: RoutingHandoffEntry,
     pub kind: u32,
-    pub padding: u32,
+    pub syn_isn: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<TcpSocketBinding>() == 120);
@@ -106,7 +106,7 @@ const _: () = assert!(core::mem::align_of::<TcpSocketBinding>() == 8);
 const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, tuples) == 0);
 const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, handoff) == 40);
 const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, kind) == 112);
-const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, padding) == 116);
+const _: () = assert!(core::mem::offset_of!(TcpSocketBinding, syn_isn) == 116);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]

@@ -205,6 +205,20 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
         ..Default::default()
     };
     backend.hash_insert_noexist("TCP_REQUEST_BINDINGS", &request, &proof)?;
+    let sibling = TcpRequestKey {
+        address: request.address + 1,
+        cookie: request.cookie + 1,
+    };
+    backend.hash_insert_noexist("TCP_REQUEST_BINDINGS", &sibling, &proof)?;
+    backend.tcp_conn_state_store(
+        &key,
+        &ConnState {
+            incarnation: 1,
+            tcp_syn_flags: 3,
+            tcp_request_count: 2,
+            ..Default::default()
+        },
+    )?;
     let retire = RetireRequest {
         key,
         kind: RetireKind::ExpiredRequest {
@@ -232,6 +246,13 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
             .is_none()
     );
     assert!(!backend.retirement_failed);
+    assert_eq!(
+        backend
+            .tcp_conn_state_lookup(&key)?
+            .unwrap()
+            .tcp_request_count,
+        2
+    );
 
     backend.retirement_faults.release = Some(1); // Release tuple, fail exact request release.
     let error = backend
@@ -255,6 +276,14 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
         backend
             .hash_lookup::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", &request)?
             .is_none()
+    );
+    let state = backend.tcp_conn_state_lookup(&key)?.unwrap();
+    assert_eq!(state.tcp_request_count, 1);
+    assert_eq!(state.tcp_syn_flags, 3);
+    assert!(
+        backend
+            .hash_lookup::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", &sibling)?
+            .is_some()
     );
     assert_retirement_fence(&backend, &key, false);
     assert!(

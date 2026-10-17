@@ -55,7 +55,13 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                 let old = handoff(&backend, &key);
                 assert_ne!(old.incarnation, 0);
                 assert_eq!(
-                    run(&backend, side, &syn, SkbInput::default()).verdict,
+                    run(
+                        &backend,
+                        side,
+                        &with_isn(syn.clone(), 1),
+                        SkbInput::default()
+                    )
+                    .verdict,
                     TC_ACT_REDIRECT
                 );
                 let current = handoff(&backend, &key);
@@ -325,7 +331,12 @@ fn tcp_replacement_keeps_ambiguity_after_prior_sidecar_loss() {
             .unwrap()
             .remove(&first.trace_id)
             .unwrap();
-        run(&backend, "lan_ingress_l2", &syn, SkbInput::default());
+        run(
+            &backend,
+            "lan_ingress_l2",
+            &with_isn(syn, 1),
+            SkbInput::default(),
+        );
         let second = handoff(&backend, &key);
         assert_ne!(first.trace_id, second.trace_id);
         assert_ne!(

@@ -42,9 +42,10 @@ unsafe impl<T: aya::Pod> aya::Pod for FlowMapValue<T> {}
 /// (for cleanup).  All fields are repr(C) so the binary layout is identical
 /// regardless of compiler or target triple.
 ///
-/// Layout (repr(C), total 64 bytes):
+/// Layout (repr(C), total 72 bytes):
 ///   offset 0:  is_wan_ingress_direction: u8
 ///   offset 1:  state: u8 (`TcpState` for TCP, `UdpDecisionState` for UDP)
+///   offset 2:  tcp_syn_flags: u16 (committed redirect/request history)
 ///   offset 4:  decision_token: u32 (nonzero only for staged UDP flows)
 ///   offset 8:  last_seen_ns: u64 (monotonic timestamp from bpf_ktime_get_ns)
 ///   offset 16: meta: RoutingMeta (cached routing decision)
@@ -54,11 +55,14 @@ unsafe impl<T: aya::Pod> aya::Pod for FlowMapValue<T> {}
 ///   offset 48: pid: u32
 ///   offset 52: trace_id: u32 (immutable route witness, independent of decision_token)
 ///   offset 56: incarnation: u64 (generation-owned identity, independent of UDP tokens)
+///   offset 64: tcp_syn_isn: u32 (host-order original sequence, including zero)
+///   offset 68: tcp_request_count: u32 (exact reserved/published request proofs)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnState {
     pub is_wan_ingress_direction: u8,
     pub state: u8,
+    pub tcp_syn_flags: u16,
     pub decision_token: u32,
     pub last_seen_ns: u64,
     pub meta: RoutingMeta,
@@ -68,13 +72,16 @@ pub struct ConnState {
     pub pid: u32,
     pub trace_id: u32,
     pub incarnation: u64,
+    pub tcp_syn_isn: u32,
+    pub tcp_request_count: u32,
 }
 
-const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 64);
+const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 72);
 const _CONN_STATE_ALIGN: () = assert!(core::mem::align_of::<ConnState>() == 8);
 const _CONN_STATE_DIRECTION_OFFSET: () =
     assert!(core::mem::offset_of!(ConnState, is_wan_ingress_direction) == 0);
 const _CONN_STATE_STATE_OFFSET: () = assert!(core::mem::offset_of!(ConnState, state) == 1);
+const _: () = assert!(core::mem::offset_of!(ConnState, tcp_syn_flags) == 2);
 const _CONN_STATE_TOKEN_OFFSET: () = assert!(core::mem::offset_of!(ConnState, decision_token) == 4);
 const _CONN_STATE_LAST_SEEN_OFFSET: () =
     assert!(core::mem::offset_of!(ConnState, last_seen_ns) == 8);
@@ -85,10 +92,17 @@ const _CONN_STATE_PNAME_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pn
 const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid) == 48);
 const _: () = assert!(core::mem::offset_of!(ConnState, trace_id) == 52);
 const _: () = assert!(core::mem::offset_of!(ConnState, incarnation) == 56);
+const _: () = assert!(core::mem::offset_of!(ConnState, tcp_syn_isn) == 64);
+const _: () = assert!(core::mem::offset_of!(ConnState, tcp_request_count) == 68);
+
+/// The original forward SYN committed both handoff and redirect before delivery.
+/// Native/direct and failed/incomplete publications never set this eligibility bit.
+pub const TCP_SYN_ORIGINAL_INTERCEPT: u16 = 1 << 0;
+pub const TCP_SYN_REQUEST_SEEN: u16 = 1 << 1;
 
 const _: () = assert!(core::mem::offset_of!(FlowMapValue<ConnState>, lock) == 0);
 const _: () = assert!(core::mem::offset_of!(FlowMapValue<ConnState>, value) == 8);
-const _: () = assert!(core::mem::size_of::<FlowMapValue<ConnState>>() == 72);
+const _: () = assert!(core::mem::size_of::<FlowMapValue<ConnState>>() == 80);
 const _: () = assert!(core::mem::size_of::<FlowMapValue<crate::RedirectEntry>>() == 48);
 const _: () =
     assert!(core::mem::size_of::<FlowMapValue<crate::redirect_need::RoutingHandoffEntry>>() == 80);
@@ -255,6 +269,9 @@ pub struct ParseTransportCtx {
 pub const CT_ARGS_HAS_ROUTING: u8 = 1 << 0;
 pub const CT_ARGS_HAS_MAC: u8 = 1 << 1;
 pub const CT_ARGS_HAS_PNAME: u8 = 1 << 2;
+pub const CT_ARGS_TCP_FRESH_SYN: u8 = 1 << 3;
+pub const CT_ARGS_TCP_INTERCEPTED: u8 = 1 << 4;
+pub const CT_ARGS_TCP_PENDING_SYN: u8 = 1 << 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -270,11 +287,15 @@ pub struct ConntrackArgs {
     pub pname: [u8; TASK_COMM_LEN],
     pub trace_id: u32,
     pub incarnation: u64,
+    pub tcp_syn_isn: u32,
+    pub tcp_padding: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 48);
+const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 56);
 const _: () = assert!(core::mem::offset_of!(ConntrackArgs, trace_id) == 36);
 const _: () = assert!(core::mem::offset_of!(ConntrackArgs, incarnation) == 40);
+const _: () = assert!(core::mem::offset_of!(ConntrackArgs, tcp_syn_isn) == 48);
+const _: () = assert!(core::mem::offset_of!(ConntrackArgs, tcp_padding) == 52);
 
 impl ConntrackArgs {
     #[inline(always)]

@@ -84,7 +84,7 @@ fn tcp_proof_btf_matches(btf: &btf::Btf<'_>, value: usize) -> bool {
         && btf.sized_member_offset("TcpSocketBinding", "tuples", 40) == Some(0)
         && btf.sized_member_offset("TcpSocketBinding", "handoff", 72) == Some(40)
         && btf.sized_member_offset("TcpSocketBinding", "kind", 4) == Some(112)
-        && btf.sized_member_offset("TcpSocketBinding", "padding", 4) == Some(116)
+        && btf.sized_member_offset("TcpSocketBinding", "syn_isn", 4) == Some(116)
 }
 
 fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
@@ -108,6 +108,7 @@ fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
                     offset_of!(ConnState, is_wan_ingress_direction),
                 ),
                 ("state", 1, offset_of!(ConnState, state)),
+                ("tcp_syn_flags", 2, offset_of!(ConnState, tcp_syn_flags)),
                 ("decision_token", 4, offset_of!(ConnState, decision_token)),
                 ("last_seen_ns", 8, offset_of!(ConnState, last_seen_ns)),
                 ("meta", 8, offset_of!(ConnState, meta)),
@@ -117,6 +118,12 @@ fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
                 ("pid", 4, offset_of!(ConnState, pid)),
                 ("trace_id", 4, offset_of!(ConnState, trace_id)),
                 ("incarnation", 8, offset_of!(ConnState, incarnation)),
+                ("tcp_syn_isn", 4, offset_of!(ConnState, tcp_syn_isn)),
+                (
+                    "tcp_request_count",
+                    4,
+                    offset_of!(ConnState, tcp_request_count),
+                ),
             ][..],
         ),
         (
@@ -366,10 +373,11 @@ mod tests {
             ("TuplesKey", 40, &[("padding", 3, 37)][..]),
             (
                 "ConnState",
-                64,
+                72,
                 &[
                     ("is_wan_ingress_direction", 1, 0),
                     ("state", 1, 1),
+                    ("tcp_syn_flags", 19, 2),
                     ("decision_token", 9, 4),
                     ("last_seen_ns", 2, 8),
                     ("meta", 2, 16),
@@ -379,6 +387,8 @@ mod tests {
                     ("pid", 9, 48),
                     ("trace_id", 9, 52),
                     ("incarnation", 2, 56),
+                    ("tcp_syn_isn", 9, 64),
+                    ("tcp_request_count", 9, 68),
                 ][..],
             ),
             (
@@ -431,7 +441,7 @@ mod tests {
         ]);
         let mut wrappers = [0; 3];
         for (index, (name, payload, size)) in [
-            ("ConnValue", 5, 72),
+            ("ConnValue", 5, 80),
             ("RedirectValue", 7, 48),
             ("HandoffValue", 6, 80),
         ]
@@ -468,7 +478,7 @@ mod tests {
             add_name("kind"),
             9,
             896,
-            add_name("padding"),
+            add_name("syn_isn"),
             9,
             928,
         ]);
@@ -491,6 +501,7 @@ mod tests {
             types.extend_from_slice(&[add_name(name), type_id, offset * 8]);
         }
         types.extend_from_slice(&[0, 3 << 24, 0, 1, 1, 2]);
+        types.extend_from_slice(&[add_name("u16"), 1 << 24, 2, 16]);
         let type_len = (types.len() * 4) as u32;
         let mut data = vec![0x9f, 0xeb, 1, 0];
         for word in [
@@ -512,7 +523,7 @@ mod tests {
             for ((record, payload), size) in wrappers
                 .iter()
                 .zip(["ConnState", "RedirectEntry", "RoutingHandoffEntry"])
-                .zip([72, 48, 80])
+                .zip([80, 48, 80])
             {
                 anyhow::ensure!(
                     flow_value_btf_matches(&btf, *record, payload, size),
@@ -523,6 +534,11 @@ mod tests {
             Ok(())
         };
         assert!(validate(&data).is_ok());
+        let syn_name = proof + 48;
+        let name: [u8; 4] = data[syn_name..syn_name + 4].try_into().unwrap();
+        data[syn_name..syn_name + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(validate(&data).is_err());
+        data[syn_name..syn_name + 4].copy_from_slice(&name);
 
         let padding_name = records[0] + 12;
         let name: [u8; 4] = data[padding_name..padding_name + 4].try_into().unwrap();

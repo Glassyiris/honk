@@ -198,6 +198,51 @@ fn detect_cgroup_path() -> anyhow::Result<String> {
 }
 
 impl RealEbpfBackend {
+    fn publish_listener_socket_maps(
+        &mut self,
+        tcp4_fd: RawFd,
+        tcp6_fd: Option<RawFd>,
+        udp4_fds: &[RawFd],
+        udp6_fds: &[RawFd],
+    ) -> anyhow::Result<()> {
+        self.listeners_published = false;
+        for fd in std::iter::once(tcp4_fd).chain(tcp6_fd) {
+            // The caller retains the actual listeners through publication.
+            tcp_binding::publish_listener(self.bpf_mut()?, unsafe { BorrowedFd::borrow_raw(fd) })?;
+        }
+        let entries = std::iter::once((0u32, tcp4_fd)).chain(tcp6_fd.map(|fd| (1u32, fd)));
+        let entries = entries.chain(
+            udp4_fds
+                .iter()
+                .enumerate()
+                .map(|(index, fd)| (2 + index as u32, *fd)),
+        );
+        let entries = entries.chain(
+            udp6_fds
+                .iter()
+                .enumerate()
+                .map(|(index, fd)| (6 + index as u32, *fd)),
+        );
+        {
+            let map = self
+                .bpf_mut()?
+                .map_mut("LISTEN_SOCKET_MAP")
+                .ok_or_else(|| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' not found"))?;
+            let mut sockets = AyaSockMap::try_from(map)
+                .map_err(|error| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP': {error}"))?;
+            for (key, fd) in entries {
+                // The control plane owns every listener for this entire call.
+                let socket = unsafe { BorrowedFd::borrow_raw(fd) };
+                sockets.set(key, &socket, 0).map_err(|error| {
+                    anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' set[{key}]: {error}")
+                })?;
+                debug!(fd, key, "Published listener socket to LISTEN_SOCKET_MAP");
+            }
+        }
+        self.listeners_published = true;
+        Ok(())
+    }
+
     #[inline(always)]
     fn bpf(&self) -> anyhow::Result<&Ebpf> {
         self.bpf
@@ -920,7 +965,10 @@ impl EbpfBackend for RealEbpfBackend {
             if !self.receive_trace_available {
                 warn!("kernel UDP trace unavailable: checked BTF offsets missing");
             } else {
-                match receive_trace::ReceiveTrace::attach(self.bpf_mut().ok()?) {
+                let result = btf::load_kernel().and_then(|(_, kernel_btf)| {
+                    receive_trace::ReceiveTrace::attach(self.bpf_mut()?, &kernel_btf)
+                });
+                match result {
                     Ok(trace) => self.receive_trace = Some(trace),
                     Err(error) => warn!(%error, "kernel UDP trace attach unavailable"),
                 }
@@ -1128,48 +1176,23 @@ impl EbpfBackend for RealEbpfBackend {
     fn publish_listener_sockets(
         &mut self,
         tcp4_fd: RawFd,
-        tcp6_fd: RawFd,
+        tcp6_fd: Option<RawFd>,
         udp4_fds: &[RawFd],
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
         self.listeners_published = false;
-        for fd in [tcp4_fd, tcp6_fd] {
-            // The caller retains both actual listeners through publication.
-            tcp_binding::publish_listener(self.bpf_mut()?, unsafe { BorrowedFd::borrow_raw(fd) })?;
+        let bindings = self
+            .tcp_bindings
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("required TCP ownership hooks are not attached"))?;
+        if tcp6_fd.is_some() {
+            bindings.attach_ipv6(
+                self.bpf
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("eBPF object unavailable"))?,
+            )?;
         }
-        // Slot layout is part of the sk_lookup ABI: TCP4/TCP6, then four
-        // UDP4 sockets and four UDP6 sockets.
-        let mut entries = vec![(0u32, tcp4_fd), (1u32, tcp6_fd)];
-        entries.extend(
-            udp4_fds
-                .iter()
-                .enumerate()
-                .map(|(index, fd)| (2 + index as u32, *fd)),
-        );
-        entries.extend(
-            udp6_fds
-                .iter()
-                .enumerate()
-                .map(|(index, fd)| (6 + index as u32, *fd)),
-        );
-        {
-            let map = self
-                .bpf_mut()?
-                .map_mut("LISTEN_SOCKET_MAP")
-                .ok_or_else(|| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' not found"))?;
-            let mut sockets = AyaSockMap::try_from(map)
-                .map_err(|error| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP': {error}"))?;
-            for (key, fd) in entries {
-                // The control plane owns every listener for this entire call.
-                let socket = unsafe { BorrowedFd::borrow_raw(fd) };
-                sockets.set(key, &socket, 0).map_err(|error| {
-                    anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' set[{key}]: {error}")
-                })?;
-                debug!(fd, key, "Published listener socket to LISTEN_SOCKET_MAP");
-            }
-        }
-        self.listeners_published = true;
-        Ok(())
+        self.publish_listener_socket_maps(tcp4_fd, tcp6_fd, udp4_fds, udp6_fds)
     }
 
     fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {

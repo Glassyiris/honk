@@ -593,7 +593,10 @@ impl RealEbpfBackend {
     /// Load the production object without attaching any network or cgroup hook.
     /// The resulting backend can publish a real generated policy and exercise
     /// the optional `routing_test` classifier with `BPF_PROG_TEST_RUN`.
-    pub(crate) fn load_routing_test_fixture(obj: &[u8], param: DaeParam) -> anyhow::Result<Self> {
+    pub(crate) fn load_routing_test_fixture(
+        obj: &[u8],
+        mut param: DaeParam,
+    ) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
         anyhow::ensure!(
@@ -601,6 +604,8 @@ impl RealEbpfBackend {
             "routing tests require Linux 6.12 or newer"
         );
         events::validate_flow_lifetime_object_layout(obj)?;
+        param.tcp_daens_netns_id = crate::netlink::NlSock::new()?
+            .ensure_netns_id(std::os::fd::AsFd::as_fd(crate::daens_fd()?))?;
         let mut loader = EbpfLoader::new();
         loader.override_global("PARAM", &param, true);
         let mut bpf = loader.load(obj)?;

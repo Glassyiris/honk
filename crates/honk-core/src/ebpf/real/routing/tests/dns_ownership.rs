@@ -126,7 +126,12 @@ impl TproxyListeners {
     fn publish(&self, backend: &mut RealEbpfBackend) -> anyhow::Result<()> {
         let udp4 = [self.udp4.as_raw_fd(); 4];
         let udp6 = [self.udp6.as_raw_fd(); 4];
-        backend.publish_listener_sockets(self.tcp4.as_raw_fd(), self.tcp6.as_raw_fd(), &udp4, &udp6)
+        backend.publish_listener_socket_maps(
+            self.tcp4.as_raw_fd(),
+            Some(self.tcp6.as_raw_fd()),
+            &udp4,
+            &udp6,
+        )
     }
 }
 
@@ -386,6 +391,18 @@ fn packet(
     }
     bytes.append(&mut transport);
     bytes
+}
+
+/// Same-tuple replays with the same ISN are retransmissions; replacement needs a new ISN.
+fn with_isn(mut packet: Vec<u8>, isn: u32) -> Vec<u8> {
+    let tcp = 14
+        + if packet[12..14] == [0x08, 0x00] {
+            20
+        } else {
+            40
+        };
+    packet[tcp + 4..tcp + 8].copy_from_slice(&isn.to_be_bytes());
+    packet
 }
 
 fn tuple(

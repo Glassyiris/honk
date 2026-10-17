@@ -676,13 +676,16 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
 #[tokio::test]
 async fn request_proof_expiry_is_bounded_ignores_relay_pins_and_keeps_timeout_boundary()
 -> anyhow::Result<()> {
-    use honk_ebpf_common::redirect_need::{TcpRequestKey, TcpSocketBinding};
+    use honk_ebpf_common::conn::{TCP_SYN_ORIGINAL_INTERCEPT, TCP_SYN_REQUEST_SEEN};
+    use honk_ebpf_common::redirect_need::{TCP_BINDING_CHILD, TcpRequestKey, TcpSocketBinding};
     let mut model = MockEbpfBackend::new();
     for index in 0..=JANITOR_BASE_CANDIDATES {
-        let binding = TcpSocketBinding {
+        let mut binding = TcpSocketBinding {
             tuples: test_tuple(index as u16, IPPROTO_TCP),
+            kind: TCP_BINDING_CHILD,
             ..Default::default()
         };
+        binding.handoff.incarnation = index as u64 + 1;
         model
             .tcp_request_bindings
             .insert((index as u64, 1), binding);
@@ -693,14 +696,24 @@ async fn request_proof_expiry_is_bounded_ignores_relay_pins_and_keeps_timeout_bo
     };
     let mut binding = TcpSocketBinding {
         tuples: test_tuple(u16::MAX, IPPROTO_TCP),
+        kind: TCP_BINDING_CHILD,
         ..Default::default()
     };
     binding.handoff.last_seen_ns = 1;
+    binding.handoff.incarnation = JANITOR_BASE_CANDIDATES as u64 + 2;
     model
         .tcp_request_bindings
         .insert((fresh.address, fresh.cookie), binding);
     let pinned_key = test_tuple(0, IPPROTO_TCP);
-    model.tcp_conn_state_store(&pinned_key, &test_state(TcpState::TcpStateActive, 0))?;
+    model.tcp_conn_state_store(
+        &pinned_key,
+        &ConnState {
+            incarnation: 1,
+            tcp_syn_flags: TCP_SYN_ORIGINAL_INTERCEPT | TCP_SYN_REQUEST_SEEN,
+            tcp_request_count: 1,
+            ..test_state(TcpState::TcpStateActive, 0)
+        },
+    )?;
     let pins = Arc::new(TcpFlowPins::default());
     pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_key));
     let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
@@ -727,13 +740,13 @@ async fn request_proof_expiry_is_bounded_ignores_relay_pins_and_keeps_timeout_bo
         })?;
     assert_eq!(remaining, vec![fresh]);
     assert!(pins.contains(&pinned_key));
-    assert!(
-        backend
-            .read()
-            .await
-            .tcp_conn_state_lookup(&pinned_key)?
-            .is_some()
-    );
+    let retained = backend
+        .read()
+        .await
+        .tcp_conn_state_lookup(&pinned_key)?
+        .expect("relay pin retains the conn owner, not an expired request");
+    assert_eq!(retained.incarnation, 1);
+    assert_eq!(retained.tcp_request_count, 0);
     assert_eq!(gauge.janitor_deletes, 0);
     Ok(())
 }

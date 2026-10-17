@@ -85,6 +85,9 @@ fn redirect_lan_packet_to_control_plane(
     trace_id: u32,
     incarnation: u64,
 ) -> Verdict {
+    if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
+        return Err(TC_ACT_SHOT);
+    }
     let routing_meta = RoutingMeta {
         raw: routing_meta_raw,
     };
@@ -177,6 +180,12 @@ fn redirect_lan_packet_to_control_plane(
 
     // Keep reverse-path framing stable and refresh cached ownership lazily.
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
+    let cached_syn = pkt.l4proto == IPPROTO_TCP
+        && crate::contrack::is_new_tcp_connection(&pkt.tcph)
+        && handoff_mode == HANDOFF_WRITE_SKIP;
+    if cached_syn && crate::flow::handoff_incarnation(&pkt.tuples.five) != Some(incarnation) {
+        return Err(TC_ACT_SHOT);
+    }
     let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
         true
     } else {
@@ -189,6 +198,9 @@ fn redirect_lan_packet_to_control_plane(
         )
         .map_err(|_| TC_ACT_SHOT)?
     };
+    if cached_syn && write_track {
+        return Err(TC_ACT_SHOT);
+    }
     if write_track {
         // Built in per-CPU scratch, not on the stack: the LAN classifier is at
         // the verifier's combined stack limit.
@@ -213,6 +225,16 @@ fn redirect_lan_packet_to_control_plane(
             handoff_mode == HANDOFF_WRITE_ALWAYS,
         )
         .map_err(|_| TC_ACT_SHOT)?;
+    }
+    if pkt.l4proto == IPPROTO_TCP
+        && handoff_mode == HANDOFF_WRITE_ALWAYS
+        && !crate::contrack::commit_tcp_intercept(
+            &pkt.tuples.five,
+            u32::from_be_bytes(pkt.tcph.seq),
+            incarnation,
+        )
+    {
+        return Err(TC_ACT_SHOT);
     }
 
     if dns_fragment {
@@ -523,17 +545,18 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     ) {
         return Err(TC_ACT_SHOT);
     }
-    let _tcp_publisher =
-        if pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph) {
-            let publisher =
-                crate::contrack::TcpPublisher::acquire(&pkt.tuples.five).ok_or(TC_ACT_SHOT)?;
-            pkt.incarnation = publisher.incarnation;
-            Some(publisher)
-        } else {
-            None
-        };
+    let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+        &pkt.tuples.five,
+        crate::contrack::TcpSynRole::InterceptedForward,
+    );
+    if pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph) {
+        if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+            return Err(TC_ACT_SHOT);
+        }
+        pkt.incarnation = tcp_publisher.incarnation;
+    }
 
-    if pkt.l4proto == IPPROTO_TCP && !crate::contrack::is_new_tcp_connection(&pkt.tcph) {
+    if pkt.l4proto == IPPROTO_TCP && !tcp_publisher.is_fresh() {
         let tcp_state = crate::contrack::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
@@ -546,12 +569,14 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             None,
             0,
             0,
-            &mut pkt.incarnation,
+            &tcp_publisher,
         );
         let tcp_state = match tcp_state {
             Some(state) => state,
             None => {
-                if crate::contrack::tuple_unavailable(&pkt.tuples.five, false) {
+                if crate::contrack::is_new_tcp_connection(&pkt.tcph)
+                    || crate::contrack::tuple_unavailable(&pkt.tuples.five, false)
+                {
                     return Err(TC_ACT_SHOT);
                 }
                 return pass_through_classified(ctx);
@@ -618,7 +643,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             None,
             0,
             0,
-            &mut pkt.incarnation,
+            &tcp_publisher,
         );
         if tcp_state.is_none() && crate::maps::tuple_retiring(&pkt.tuples.five) {
             return Err(TC_ACT_SHOT);
@@ -631,7 +656,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
     }
 
-    // A pure TCP SYN always leaves a handoff for accept-time consumption.
+    // Only a fresh TCP publication captures the immutable accept-time handoff.
     // UDP tuple handoffs are refreshed only when userspace may need them;
     // raw must UDP53 is authoritative from its per-packet carrier.
     let handoff_mode = if pkt.l4proto == IPPROTO_TCP {
@@ -964,14 +989,16 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         ) {
             return Err(TC_ACT_SHOT);
         }
-        let _tcp_publisher = if crate::contrack::is_new_tcp_connection(&pkt.tcph) {
-            let publisher =
-                crate::contrack::TcpPublisher::acquire(&reversed_key).ok_or(TC_ACT_SHOT)?;
-            pkt.incarnation = publisher.incarnation;
-            Some(publisher)
-        } else {
-            None
-        };
+        let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+            &reversed_key,
+            crate::contrack::TcpSynRole::ObservedReverse,
+        );
+        if crate::contrack::is_new_tcp_connection(&pkt.tcph) {
+            if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+                return Err(TC_ACT_SHOT);
+            }
+            pkt.incarnation = tcp_publisher.incarnation;
+        }
         let _ = crate::contrack::mark_tcp_seen(
             &reversed_key,
             &pkt.tcph,
@@ -984,7 +1011,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             None,
             0,
             0,
-            &mut pkt.incarnation,
+            &tcp_publisher,
         );
         if crate::contrack::tuple_unavailable(&reversed_key, false) {
             return Err(TC_ACT_SHOT);

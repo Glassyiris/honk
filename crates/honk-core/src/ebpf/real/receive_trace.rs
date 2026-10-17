@@ -12,7 +12,6 @@ use honk_ebpf_common::receive_trace::{
 };
 
 use super::btf::Btf as OffsetBtf;
-use super::process_name::{VMLINUX_BTF_ENV, VMLINUX_BTF_PATHS};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReceiveTraceOffsets {
@@ -32,26 +31,17 @@ impl ReceiveTraceOffsets {
     }
 }
 
-pub(super) fn detect() -> Option<ReceiveTraceOffsets> {
-    fn offsets(data: &[u8]) -> Option<ReceiveTraceOffsets> {
-        let btf = OffsetBtf::parse(data)?;
-        let common = btf.member_offset("sock", "__sk_common")?;
-        let cookie =
-            common.checked_add(btf.sized_member_offset("sock_common", "skc_cookie", 8)?)?;
-        Some(ReceiveTraceOffsets {
-            cookie,
-            priority: btf.sized_member_offset("sk_buff", "priority", 4)?,
-            mark: btf.sized_member_offset("sk_buff", "mark", 4)?,
-            // The hooks see host TGIDs; like `control_plane_pid`, this assumes the host PID namespace.
-            owner: std::process::id(),
-        })
-    }
-    if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
-        return offsets(&std::fs::read(path).ok()?);
-    }
-    VMLINUX_BTF_PATHS
-        .iter()
-        .find_map(|path| offsets(&std::fs::read(path).ok()?))
+pub(super) fn detect(data: &[u8]) -> Option<ReceiveTraceOffsets> {
+    let btf = OffsetBtf::parse(data)?;
+    let common = btf.member_offset("sock", "__sk_common")?;
+    let cookie = common.checked_add(btf.sized_member_offset("sock_common", "skc_cookie", 8)?)?;
+    Some(ReceiveTraceOffsets {
+        cookie,
+        priority: btf.sized_member_offset("sk_buff", "priority", 4)?,
+        mark: btf.sized_member_offset("sk_buff", "mark", 4)?,
+        // The hooks see host TGIDs; like `control_plane_pid`, this assumes the host PID namespace.
+        owner: std::process::id(),
+    })
 }
 
 pub struct ReceiveTrace {
@@ -69,17 +59,18 @@ fn handle(map: &MapData) -> io::Result<HashMap<MapData, u64, ReceiveTraceBatch>>
 impl ReceiveTrace {
     #[cfg(test)]
     pub(crate) fn load_for_test() -> anyhow::Result<(Ebpf, Arc<Self>)> {
-        let offsets =
-            detect().ok_or_else(|| anyhow::anyhow!("receive trace BTF offsets unavailable"))?;
+        let (data, kernel_btf) = super::btf::load_kernel()?;
+        let offsets = detect(&data)
+            .ok_or_else(|| anyhow::anyhow!("receive trace BTF offsets unavailable"))?;
         let mut loader = EbpfLoader::new();
+        loader.btf(Some(&kernel_btf));
         offsets.configure(&mut loader);
         let mut bpf = loader.load(crate::DEFAULT_BPF_OBJECT)?;
-        let trace = Self::attach(&mut bpf)?;
+        let trace = Self::attach(&mut bpf, &kernel_btf)?;
         Ok((bpf, trace))
     }
 
-    pub(super) fn attach(bpf: &mut Ebpf) -> anyhow::Result<Arc<Self>> {
-        let btf = Btf::from_sys_fs()?;
+    pub(super) fn attach(bpf: &mut Ebpf, btf: &Btf) -> anyhow::Result<Arc<Self>> {
         let mut entries = Vec::with_capacity(2);
         let mut exits = Vec::with_capacity(3);
         for (name, target) in [
@@ -90,7 +81,7 @@ impl ReceiveTrace {
                 .program_mut(name)
                 .ok_or_else(|| anyhow::anyhow!("missing receive program {name}"))?
                 .try_into()?;
-            program.load(target, &btf)?;
+            program.load(target, btf)?;
             let link = program.attach()?;
             entries.push(program.take_link(link)?);
         }
@@ -103,7 +94,7 @@ impl ReceiveTrace {
                 .program_mut(name)
                 .ok_or_else(|| anyhow::anyhow!("missing receive program {name}"))?
                 .try_into()?;
-            program.load(target, &btf)?;
+            program.load(target, btf)?;
             let link = program.attach()?;
             exits.push(program.take_link(link)?);
         }

@@ -1817,6 +1817,19 @@ fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
 }
 
 #[cfg(feature = "ebpf")]
+pub(crate) fn ipv6_socket_available() -> std::io::Result<bool> {
+    match socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    ) {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EAFNOSUPPORT) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "ebpf")]
 fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<()> {
     let _ = tproxy_port;
     use netlink::{FAM_V4, FAM_V6, NlSock};
@@ -1850,6 +1863,7 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
         let (peer, peer_mac) = n.get_link("dae0peer").context("dae0peer in daens")?;
         n.set_link_up(lo, true).context("lo up")?;
         n.set_link_up(peer, true).context("dae0peer up")?;
+        let ipv6 = ipv6_socket_available().context("probe IPv6 family in daens")?;
 
         // fwmark → table 100 with a local default route (v4 + v6 mirror):
         // marked packets are delivered to daens-local sockets.
@@ -1869,22 +1883,24 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
             None,
             Some(lo),
         )?;
-        n.add_rule_fwmark(
-            FAM_V6,
-            tproxy_mark,
-            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
-            100,
-        )?;
-        n.add_route(
-            FAM_V6,
-            100,
-            netlink::ROUTE_LOCAL,
-            netlink::SCOPE_HOST,
-            netlink::PROTO_STATIC,
-            None,
-            None,
-            Some(lo),
-        )?;
+        if ipv6 {
+            n.add_rule_fwmark(
+                FAM_V6,
+                tproxy_mark,
+                !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
+                100,
+            )?;
+            n.add_route(
+                FAM_V6,
+                100,
+                netlink::ROUTE_LOCAL,
+                netlink::SCOPE_HOST,
+                netlink::PROTO_STATIC,
+                None,
+                None,
+                Some(lo),
+            )?;
+        }
 
         // Link-local /32 on dae0peer. The link-scope route tells the kernel
         // that 169.254.0.1 (dae0) is directly reachable at L2; without it,
@@ -1959,6 +1975,13 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
             ),
             ("net.ipv4.tcp_fastopen", "/proc/sys/net/ipv4/tcp_fastopen"),
         ] {
+            if key == "net.ipv4.tcp_syncookies"
+                && !std::path::Path::new(path)
+                    .try_exists()
+                    .with_context(|| format!("inspect {key} in daens"))?
+            {
+                continue;
+            }
             set_sysctl(key, "0").with_context(|| format!("disable {key} in daens"))?;
             let actual =
                 std::fs::read_to_string(path).with_context(|| format!("verify {key} in daens"))?;

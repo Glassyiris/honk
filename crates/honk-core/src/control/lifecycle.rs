@@ -143,9 +143,7 @@ impl ControlPlane {
                 Some(l)
             }
             Err(e) => {
-                // Same rule as the UDPv6 listeners: only a host without an
-                // IPv6 stack may continue with the slot empty (the published
-                // v4 fd fallback cannot accept v6 flows).
+                // Only a host without an IPv6 stack may leave this slot empty.
                 let no_ipv6 = e
                     .downcast_ref::<io::Error>()
                     .and_then(|error| error.raw_os_error())
@@ -315,7 +313,7 @@ impl ControlPlane {
     async fn prepare_epoch(&mut self, listeners: BoundListeners) -> anyhow::Result<RuntimeEpoch> {
         use std::os::fd::AsRawFd;
         let tcp4 = listeners.tcp4.as_raw_fd();
-        let tcp6 = listeners.tcp6.as_ref().map_or(tcp4, AsRawFd::as_raw_fd);
+        let tcp6 = listeners.tcp6.as_ref().map(AsRawFd::as_raw_fd);
         let udp4: Vec<_> = listeners
             .udp4
             .iter()

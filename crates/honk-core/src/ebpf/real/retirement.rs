@@ -40,7 +40,7 @@ pub(super) fn validate_flow_lifetime_layout(bpf: &Ebpf) -> anyhow::Result<()> {
             "CONN_STATE_MAP",
             BPF_MAP_TYPE_HASH,
             40,
-            72,
+            80,
             MAX_CONN_STATE_NUM,
             1,
         ),
@@ -406,11 +406,21 @@ impl RealEbpfBackend {
                 if !request_matches(&current, expected, expired_before_ns) {
                     return Ok(Superseded);
                 }
-                counts.request +=
-                    u64::from(self.hash_remove_present::<_, TcpSocketBinding>(
-                        "TCP_REQUEST_BINDINGS",
-                        request,
-                    )?);
+                if self
+                    .hash_remove_present::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", request)?
+                {
+                    counts.request += 1;
+                    if let Some(mut state) =
+                        self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
+                        && state.incarnation == current.handoff.incarnation
+                    {
+                        state.tcp_request_count = state
+                            .tcp_request_count
+                            .checked_sub(1)
+                            .ok_or_else(|| anyhow::anyhow!("TCP request accounting underflow"))?;
+                        self.flow_insert("CONN_STATE_MAP", key, &state)?;
+                    }
+                }
                 return Ok(Applied);
             }
             RetireKind::ExpiredRedirect {

@@ -1,5 +1,6 @@
 use super::*;
 
+mod btf_source;
 mod retirement;
 mod socket_identity;
 
@@ -546,7 +547,12 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
 #[tokio::test]
 #[ignore = "requires root, cgroup v2, and an eBPF build"]
 async fn pname_is_ready_before_first_packet() {
-    let mode = process_name::select_capture_mode(crate::DEFAULT_BPF_OBJECT, process_name::detect());
+    let (data, kernel_btf) = btf::load_kernel().unwrap();
+    let mode = process_name::select_capture_mode(
+        crate::DEFAULT_BPF_OBJECT,
+        &kernel_btf,
+        process_name::detect(&data),
+    );
     let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-pname-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&pin_root);
     std::fs::create_dir_all(&pin_root).expect("create test pin root");
@@ -751,9 +757,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let udp6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
         backend
-            .publish_listener_sockets(
+            .publish_listener_socket_maps(
                 tcp4.as_raw_fd(),
-                tcp6.as_raw_fd(),
+                Some(tcp6.as_raw_fd()),
                 &[udp4.as_raw_fd(); 4],
                 &[udp6.as_raw_fd(); 4],
             )
@@ -836,9 +842,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
             }
         }
         backend
-            .publish_listener_sockets(
+            .publish_listener_socket_maps(
                 tcp4.as_raw_fd(),
-                tcp6.as_raw_fd(),
+                Some(tcp6.as_raw_fd()),
                 &[udp4.as_raw_fd(); 4],
                 &[],
             )

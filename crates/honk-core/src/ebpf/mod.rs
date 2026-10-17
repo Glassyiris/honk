@@ -488,18 +488,14 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
-    /// Publish the raw file descriptors of the tproxy listener sockets into the
-    /// eBPF listen_socket_map so TC programs can bpf_sk_assign() inbound proxy
-    /// traffic directly to the userspace listeners.
-    ///
-    /// Key mapping: 0 = IPv4 TCP, 1 = IPv6 TCP, 2.. = IPv4 UDP group,
-    /// 2 + UDP_LISTENER_COUNT.. = IPv6 UDP group. The eBPF programs hash the
-    /// flow tuple into the UDP group, so `udp4_fds`/`udp6_fds` must be in
-    /// hash-slot order.
+    /// Publish transparent listeners after their required address-family proofs
+    /// are attached. Missing TCP6 leaves slot 1 empty, never an IPv4 substitute.
+    /// Keys: 0 TCP4, 1 TCP6, 2.. IPv4 UDP, 2 + UDP_LISTENER_COUNT.. IPv6 UDP.
+    /// UDP descriptors must be in flow-hash slot order.
     fn publish_listener_sockets(
         &mut self,
         _tcp4_fd: std::os::unix::io::RawFd,
-        _tcp6_fd: std::os::unix::io::RawFd,
+        _tcp6_fd: Option<std::os::unix::io::RawFd>,
         _udp4_fds: &[std::os::unix::io::RawFd],
         _udp6_fds: &[std::os::unix::io::RawFd],
     ) -> anyhow::Result<()> {

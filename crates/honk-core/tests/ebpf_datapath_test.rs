@@ -92,6 +92,8 @@ impl Fixture {
             wan_ifindex: 1,
             dae0peer_mac: [0x02, 0, 0, 0, 0, 2],
             dae_socket_mark: DAE_BYPASS_MARK,
+            // Cached non-SYN rows never perform a native socket lookup.
+            tcp_daens_netns_id: 0,
             ..Default::default()
         };
         let wan_ifindex = 1u32;
@@ -246,12 +248,9 @@ fn routing_meta(outbound: u8, mark: u32, must: bool, offload: bool) -> RoutingMe
 }
 
 fn monotonic_now_ns() -> u64 {
-    let mut now: libc::timespec = unsafe { mem::zeroed() };
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
-        0
-    );
-    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+    let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .expect("read monotonic clock");
+    now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64
 }
 
 fn cached_state(outbound: u8, state: u8, token: u32, must: bool, offload: bool) -> ConnState {

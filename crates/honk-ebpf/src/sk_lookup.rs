@@ -52,6 +52,9 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
     let lookup = unsafe { &*ctx.lookup };
     let protocol = lookup.protocol as u8;
     let family = lookup.family;
+    if family == AF_INET6 && crate::sk::IPV6_SOCKETS_AVAILABLE.load() == 0 {
+        return SK_DROP;
+    }
 
     let key = if family == AF_INET && protocol as u32 == IPPROTO_TCP as u32 {
         KEY_TCP4
@@ -60,8 +63,10 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
     } else if protocol as u32 == IPPROTO_UDP as u32 {
         if family == AF_INET {
             udp_listener_key_v4(ctx.lookup)
-        } else {
+        } else if family == AF_INET6 {
             udp_listener_key_v6(ctx.lookup)
+        } else {
+            return SK_DROP;
         }
     } else {
         return SK_PASS;

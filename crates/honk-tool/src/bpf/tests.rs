@@ -122,7 +122,7 @@ fn flow_wrapper_layouts_reject_old_payload_only_maps() {
             std::mem::size_of::<TuplesKey>(),
             std::mem::size_of::<ConnState>(),
             std::mem::size_of::<FlowMapValue<ConnState>>(),
-            72,
+            80,
             std::mem::offset_of!(FlowMapValue<ConnState>, value),
         ),
         (
@@ -162,16 +162,22 @@ fn flow_payload_decodes_fixed_wire_offsets_without_lock_header() {
     let bytes = &mut bytes[1..81];
     bytes[..8].fill(0xa5);
     bytes[9] = 6;
+    bytes[10..12].copy_from_slice(&3u16.to_ne_bytes());
     bytes[12..16].copy_from_slice(&42u32.to_ne_bytes());
     bytes[16..24].copy_from_slice(&456u64.to_ne_bytes());
     bytes[60..64].copy_from_slice(&123u32.to_ne_bytes());
     bytes[64..72].copy_from_slice(&789u64.to_ne_bytes());
-    let conn: ConnState = flow_payload(&bytes[..72]);
+    bytes[72..76].copy_from_slice(&u32::MAX.to_ne_bytes());
+    bytes[76..80].copy_from_slice(&2u32.to_ne_bytes());
+    let conn: ConnState = flow_payload(bytes);
     assert_eq!(conn.state, 6);
     assert_eq!(conn.decision_token, 42);
     assert_eq!(conn.last_seen_ns, 456);
     assert_eq!(conn.trace_id, 123);
     assert_eq!(conn.incarnation, 789);
+    assert_eq!(conn.tcp_syn_flags, 3);
+    assert_eq!(conn.tcp_syn_isn, u32::MAX);
+    assert_eq!(conn.tcp_request_count, 2);
 
     bytes[8..].fill(0);
     bytes[8..16].copy_from_slice(&321u64.to_ne_bytes());

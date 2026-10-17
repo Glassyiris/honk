@@ -20,6 +20,9 @@ use nix::sys::socket::{
 };
 use nix::sys::time::TimeVal;
 
+#[cfg(feature = "ebpf")]
+mod netns_id;
+
 // ---- kernel ABI (stable) --------------------------------------------------
 
 const AF_INET: i32 = libc::AF_INET;
@@ -605,7 +608,7 @@ pub(crate) const SCOPE_LINK: u8 = RT_SCOPE_LINK;
 pub(crate) const SCOPE_UNIVERSE: u8 = RT_SCOPE_UNIVERSE;
 pub(crate) const SCOPE_HOST: u8 = RT_SCOPE_HOST;
 
-/// Read an interface's ifindex from /sys (namespace-relative).
+/// Read an interface's ifindex in the mounted sysfs view, not a scoped setns view.
 pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?;
     s.trim()

@@ -4923,12 +4923,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let tcp_listener = TcpListener::bind("0.0.0.0:0").await?;
             let udp_listener = UdpSocket::bind("0.0.0.0:0").await?;
             let udp_fds = vec![udp_listener.as_raw_fd(); 4];
-            backend.publish_listener_sockets(
-                tcp_listener.as_raw_fd(),
-                tcp_listener.as_raw_fd(),
-                &udp_fds,
-                &udp_fds,
-            )?;
+            backend.publish_listener_sockets(tcp_listener.as_raw_fd(), None, &udp_fds, &udp_fds)?;
 
             let proxy_socket =
                 Arc::new(honk_outbound::util::udp_marked_bind("0.0.0.0:0".parse()?).await?);

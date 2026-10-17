@@ -1,13 +1,43 @@
 use super::super::{fresh_test_netns, wait_for_test_address};
 use super::udp_test_config;
 use aya::maps::{Map, MapData};
-use honk_config::node::Group;
+use honk_config::node::{Group, Node};
+use honk_outbound::proxy::{ProxyStream, TcpOutbound};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use std::mem::size_of;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
+use std::time::Duration;
+
+/// The only fixture in a transparent TCP lab: a real bypass-marked dial from the
+/// router namespace. Ingress, listener, routing and relay stay production.
+#[derive(Debug)]
+pub(in crate::control::tests) struct KernelTcpDial;
+
+#[async_trait::async_trait]
+impl TcpOutbound for KernelTcpDial {
+    async fn dial(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let stream = honk_outbound::util::connect_marked_addr(
+            target,
+            Some(honk_outbound::util::bypass_mark()),
+            connect_timeout,
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_owned),
+        })
+    }
+}
 
 /// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
 pub(in crate::control::tests) fn build_lab(

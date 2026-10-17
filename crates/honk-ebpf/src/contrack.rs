@@ -20,9 +20,10 @@ use aya_ebpf_bindings::{
 use honk_ebpf_common::{
     NFQUEUE_TOKEN_MASK, RoutingMeta, UDP_DECISION_SEQUENCE_MASK,
     conn::{
-        BpfStatsKey, ConnState, ConntrackArgs, FLOW_INCARNATION_MAX, FlowMapValue,
-        OCCUPANCY_INSERTS, TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
-        UdpDecisionState, tcp_conn_state_expired,
+        BpfStatsKey, CT_ARGS_TCP_FRESH_SYN, CT_ARGS_TCP_INTERCEPTED, CT_ARGS_TCP_PENDING_SYN,
+        ConnState, ConntrackArgs, FLOW_INCARNATION_MAX, FlowMapValue, OCCUPANCY_INSERTS,
+        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT, TCP_SYN_REQUEST_SEEN,
+        TcpState, UDP_CONN_STATE_TIMEOUT_NS, UdpDecisionState, tcp_conn_state_expired,
     },
     redirect_need::TuplesKey,
 };
@@ -68,40 +69,178 @@ pub fn allocate_flow_incarnation() -> Option<u64> {
     }
 }
 
-/// A SYN owns every tuple publication until its invocation stops using maps.
-/// The key stays in packet scratch (or the reverse caller's stack) until Drop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TcpSynRole {
+    InterceptedForward,
+    ObservedReverse,
+}
+
+/// The NOEXIST claim spans classification and the final tuple-map access.
 pub struct TcpPublisher {
     key: core::ptr::NonNull<TuplesKey>,
     pub incarnation: u64,
+    expected_incarnation: u64,
+    flags: u8,
+    claimed: u8,
 }
-
-const _: () = assert!(core::mem::size_of::<Option<TcpPublisher>>() == 16);
 
 impl TcpPublisher {
     #[inline(always)]
-    pub fn acquire(key: &TuplesKey) -> Option<Self> {
-        if tuple_retiring(key) {
-            return None;
-        }
-        let incarnation = allocate_flow_incarnation()?;
-        crate::maps::TCP_PUBLISHING
-            .insert(key, incarnation, BPF_NOEXIST as u64)
-            .ok()?;
-        Some(Self {
+    pub fn new(key: &TuplesKey, role: TcpSynRole) -> Self {
+        Self {
             key: core::ptr::NonNull::from(key),
-            incarnation,
-        })
+            incarnation: 0,
+            expected_incarnation: 0,
+            flags: if role == TcpSynRole::InterceptedForward {
+                CT_ARGS_TCP_INTERCEPTED
+            } else {
+                0
+            },
+            claimed: 0,
+        }
     }
+
+    #[inline(always)]
+    fn claim(&mut self) -> bool {
+        let key = unsafe { self.key.as_ref() };
+        if self.claimed != 0 || tuple_retiring(key) {
+            return false;
+        }
+        // Zero is exclusion only, never fresh-publication authority. Cached
+        // SYNs neither allocate an incarnation nor gain replacement permission.
+        if crate::maps::TCP_PUBLISHING
+            .insert(key, 0, BPF_NOEXIST as u64)
+            .is_err()
+        {
+            return false;
+        }
+        self.claimed = 1;
+        self.expected_incarnation = crate::flow::conn_incarnation(key).unwrap_or(0);
+        true
+    }
+
+    #[inline(always)]
+    fn select_fresh(&mut self) -> bool {
+        let Some(incarnation) = allocate_flow_incarnation() else {
+            return false;
+        };
+        let key = unsafe { self.key.as_ref() };
+        let Some(claim) = crate::maps::TCP_PUBLISHING.get_ptr_mut(key) else {
+            return false;
+        };
+        unsafe { claim.write_volatile(incarnation) };
+        self.incarnation = incarnation;
+        self.flags |= CT_ARGS_TCP_FRESH_SYN;
+        true
+    }
+
+    #[inline(always)]
+    pub fn is_fresh(&self) -> bool {
+        self.flags & CT_ARGS_TCP_FRESH_SYN != 0
+    }
+
+    #[inline(always)]
+    pub fn acquire(&mut self, ctx: &aya_ebpf::programs::TcContext, tcph: &TcpHdr) -> bool {
+        let intercepted = self.flags & CT_ARGS_TCP_INTERCEPTED != 0;
+        if !is_new_tcp_connection(tcph)
+            || (intercepted && crate::maps::PARAM.load().tcp_daens_netns_id < 0)
+            || !self.claim()
+        {
+            return false;
+        }
+        if !intercepted {
+            return self.select_fresh();
+        }
+        let key = unsafe { self.key.as_ref() };
+        let Some(state) = crate::flow::tcp_syn_state(key) else {
+            return self.select_fresh();
+        };
+        if state.incarnation != self.expected_incarnation {
+            return false;
+        }
+        if !state.published || state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT == 0 {
+            return self.select_fresh();
+        }
+        let isn = u32::from_be_bytes(tcph.seq);
+        use crate::tcp_binding::{SYN_OWNER_ABSENT, SYN_OWNER_FRESH, SYN_OWNER_REFUSE};
+        let owner = crate::tcp_binding::native_syn_owner(ctx, key, isn);
+        if owner == SYN_OWNER_REFUSE {
+            return false;
+        } else if owner == SYN_OWNER_FRESH {
+            return self.select_fresh();
+        } else if owner == SYN_OWNER_ABSENT {
+            if state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT == 0 || state.tcp_syn_isn != isn {
+                return self.select_fresh();
+            } else if state.tcp_syn_flags & TCP_SYN_REQUEST_SEEN != 0 {
+                if state.tcp_request_count != 0 {
+                    return false;
+                }
+                return self.select_fresh();
+            } else {
+                if state.tcp_request_count != 0
+                    || state.state != TcpState::TcpStateActive as u8
+                    || !pending_syn_publication(key, state.incarnation)
+                {
+                    return false;
+                }
+                self.incarnation = state.incarnation;
+                self.flags |= CT_ARGS_TCP_PENDING_SYN;
+            }
+        } else {
+            if state.incarnation != owner
+                || state.tcp_syn_isn != isn
+                || state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT == 0
+            {
+                return false;
+            }
+            self.incarnation = owner;
+        }
+        true
+    }
+
+    /// Deterministic competing-SYN driver: bypass retransmission classification explicitly.
+    #[cfg(feature = "routing-test")]
+    #[inline(always)]
+    pub fn acquire_fresh(&mut self) -> bool {
+        self.claim() && self.select_fresh()
+    }
+}
+
+#[inline(always)]
+fn pending_syn_publication(key: &TuplesKey, incarnation: u64) -> bool {
+    if tuple_retiring(key) {
+        return false;
+    }
+    let Some(handoff) = crate::flow::handoff_identity(key) else {
+        return false;
+    };
+    let Some(redirect) =
+        crate::flow::redirect_identity(&honk_ebpf_common::RedirectTuple::from_tuples(key))
+    else {
+        return false;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    incarnation != 0
+        && handoff.incarnation == incarnation
+        && redirect.incarnation == incarnation
+        && handoff.decision_token == 0
+        && redirect.decision_token == 0
+        && now >= handoff.last_seen_ns
+        && now >= redirect.last_seen_ns
+        && !auxiliary_expired(key, incarnation, now - handoff.last_seen_ns, true)
+        && !auxiliary_expired(key, incarnation, now - redirect.last_seen_ns, false)
 }
 
 impl Drop for TcpPublisher {
     #[inline(always)]
     fn drop(&mut self) {
-        // Only this producer can release its NOEXIST claim. No competing SYN
-        // can replace tuple metadata until the final borrowed access completes.
+        if self.claimed == 0 {
+            return;
+        }
         let key = unsafe { self.key.as_ref() };
+        let claim = if self.is_fresh() { self.incarnation } else { 0 };
         if let Some(owner) = crate::maps::TCP_PUBLISHING.get_ptr(key)
-            && unsafe { *owner } == self.incarnation
+            && unsafe { *owner } == claim
         {
             let _ = crate::maps::TCP_PUBLISHING.remove(key);
         }
@@ -443,12 +582,22 @@ fn update_tcp_locked(state: &mut ConnState, args: &ConntrackArgs, now: u64, fin_
     }
 }
 
+#[inline(always)]
+fn cached_syn_owned(state: &ConnState, args: &ConntrackArgs) -> bool {
+    state.incarnation == args.incarnation
+        && state.tcp_syn_isn == args.tcp_syn_isn
+        && state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT != 0
+        && (args.flags & CT_ARGS_TCP_PENDING_SYN == 0
+            || (state.tcp_syn_flags & TCP_SYN_REQUEST_SEEN == 0 && state.tcp_request_count == 0))
+}
+
 /// Returns invocation-local scratch, never a borrowed map payload.
 fn __mark_tcp_seen(
     key: *const TuplesKey,
     is_wan_ingress_direction: u8,
     tcp_flags: u8,
     args: *mut ConntrackArgs,
+    expected_incarnation: u64,
 ) -> *mut ConnState {
     let key = unsafe { &*key };
     let args = unsafe { &mut *args };
@@ -461,12 +610,16 @@ fn __mark_tcp_seen(
     };
     let ptr_opt = CONN_STATE_MAP.get_ptr_mut(key);
     let fin_rst = tcp_flags & 2 != 0;
-    if tcp_flags & 1 == 0 {
+    if args.flags & CT_ARGS_TCP_FRESH_SYN == 0 {
         let Some(ptr) = ptr_opt else {
             return core::ptr::null_mut();
         };
         unsafe { bpf_spin_lock(&mut (*ptr).lock) };
         let state = unsafe { &mut (*ptr).value };
+        if tcp_flags & 1 != 0 && !cached_syn_owned(state, args) {
+            unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+            return core::ptr::null_mut();
+        }
         let expired = tcp_conn_state_expired(state, now.saturating_sub(state.last_seen_ns));
         if !expired {
             update_tcp_locked(state, args, now, fin_rst);
@@ -483,7 +636,8 @@ fn __mark_tcp_seen(
             }
             unsafe { bpf_spin_lock(&mut (*ptr).lock) };
             let state = unsafe { &mut (*ptr).value };
-            let owned = state.incarnation == incarnation;
+            let owned = state.incarnation == incarnation
+                && (tcp_flags & 1 == 0 || cached_syn_owned(state, args));
             if owned {
                 update_tcp_locked(state, args, now, fin_rst);
                 unsafe { crate::flow::copy_payload(output, state) };
@@ -508,6 +662,9 @@ fn __mark_tcp_seen(
     let new_state = unsafe { &mut *output };
     *new_state = unsafe { core::mem::zeroed() };
     new_state.incarnation = incarnation;
+    if args.flags & CT_ARGS_TCP_INTERCEPTED != 0 {
+        new_state.tcp_syn_isn = args.tcp_syn_isn;
+    }
     new_state.is_wan_ingress_direction = (is_wan_ingress_direction != 0) as u8;
     new_state.state = TcpState::TcpStateActive as u8;
     new_state.last_seen_ns = now;
@@ -523,11 +680,17 @@ fn __mark_tcp_seen(
         update_tcp_locked(new_state, args, now, false);
     }
     if let Some(ptr) = ptr_opt {
-        unsafe {
-            bpf_spin_lock(&mut (*ptr).lock);
-            crate::flow::copy_payload(&raw mut (*ptr).value, new_state);
-            bpf_spin_unlock(&mut (*ptr).lock);
+        unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+        let owned = unsafe { (*ptr).value.incarnation == expected_incarnation };
+        if owned {
+            unsafe { crate::flow::copy_payload(&raw mut (*ptr).value, new_state) };
         }
+        unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+        if !owned {
+            return core::ptr::null_mut();
+        }
+    } else if expected_incarnation != 0 {
+        return core::ptr::null_mut();
     } else if CONN_STATE_MAP
         .insert(key, FlowMapValue::new(*new_state), BPF_NOEXIST as u64)
         .is_ok()
@@ -557,7 +720,12 @@ fn __mark_tcp_seen(
 /// Commit only this captured SYN's routing fields; preserve concurrent lifecycle refreshes.
 #[inline(always)]
 pub fn publish_tcp_routing(key: &TuplesKey, snapshot: &ConnState) -> bool {
-    if tuple_retiring(key) || snapshot.incarnation == 0 {
+    if tuple_retiring(key)
+        || snapshot.incarnation == 0
+        || crate::maps::TCP_PUBLISHING
+            .get_ptr(key)
+            .is_none_or(|owner| unsafe { *owner } != snapshot.incarnation)
+    {
         return false;
     }
     let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
@@ -585,6 +753,52 @@ pub fn publish_tcp_routing(key: &TuplesKey, snapshot: &ConnState) -> bool {
     owned
 }
 
+/// A fresh SYN becomes pending-reuse eligible only after both redirect
+/// publications are complete. Native and incomplete decisions retain flag zero.
+#[inline(always)]
+pub fn commit_tcp_intercept(key: &TuplesKey, syn_isn: u32, incarnation: u64) -> bool {
+    if key.l4proto != crate::transport::IPPROTO_TCP
+        || incarnation == 0
+        || tuple_retiring(key)
+        || crate::maps::TCP_PUBLISHING
+            .get_ptr(key)
+            .is_none_or(|owner| unsafe { *owner } != incarnation)
+    {
+        return false;
+    }
+    let Some(handoff) = crate::flow::handoff_identity(key) else {
+        return false;
+    };
+    let Some(redirect) =
+        crate::flow::redirect_identity(&honk_ebpf_common::RedirectTuple::from_tuples(key))
+    else {
+        return false;
+    };
+    if handoff.incarnation != incarnation
+        || redirect.incarnation != incarnation
+        || handoff.decision_token != 0
+        || redirect.decision_token != 0
+    {
+        return false;
+    }
+    let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
+        return false;
+    };
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let current = unsafe { &mut (*ptr).value };
+    let owned = current.incarnation == incarnation
+        && current.tcp_syn_isn == syn_isn
+        && current.is_wan_ingress_direction == 0
+        && current.tcp_syn_flags == 0
+        && current.tcp_request_count == 0
+        && (unsafe { current.meta.raw } & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED != 0);
+    if owned {
+        current.tcp_syn_flags = TCP_SYN_ORIGINAL_INTERCEPT;
+    }
+    unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+    owned
+}
+
 /// Thin inline wrapper: populates the per-CPU `CONNTRACK_ARGS_MAP` scratch
 /// and delegates to [`__mark_tcp_seen`].
 #[inline(always)]
@@ -600,7 +814,7 @@ pub fn mark_tcp_seen(
     pname: Option<&[u8; 16]>,
     pid: u32,
     trace_id: u32,
-    incarnation: &mut u64,
+    syn: &TcpPublisher,
 ) -> Option<&'static mut ConnState> {
     let zero: u32 = 0;
     let args = unsafe { CONNTRACK_ARGS_MAP.get_ptr_mut(zero).map(|ptr| &mut *ptr)? };
@@ -613,11 +827,20 @@ pub fn mark_tcp_seen(
 
     args.set(dscp, pid, routing, mac, pname);
     args.trace_id = trace_id;
-    args.incarnation = if is_new_tcp_connection(tcph) {
-        *incarnation
-    } else {
-        0
-    };
+    let wire_syn = is_new_tcp_connection(tcph);
+    if wire_syn != (syn.claimed != 0) {
+        return None;
+    }
+    let mut expected_incarnation = 0;
+    if syn.claimed != 0 {
+        if !syn.is_fresh() && args.has_routing() {
+            return None;
+        }
+        args.incarnation = syn.incarnation;
+        args.tcp_syn_isn = u32::from_be_bytes(tcph.seq);
+        expected_incarnation = syn.expected_incarnation;
+        args.flags |= syn.flags;
+    }
 
     // Encode tcp_flags: bit 0 = pure SYN, bit 1 = FIN || RST
     let mut tcp_flags: u8 = 0;
@@ -630,8 +853,13 @@ pub fn mark_tcp_seen(
 
     let key_ptr: *const TuplesKey = key;
     let args_ptr: *mut ConntrackArgs = args;
-    let result = __mark_tcp_seen(key_ptr, is_wan_ingress_direction, tcp_flags, args_ptr);
-    *incarnation = args.incarnation;
+    let result = __mark_tcp_seen(
+        key_ptr,
+        is_wan_ingress_direction,
+        tcp_flags,
+        args_ptr,
+        expected_incarnation,
+    );
     if result.is_null() {
         None
     } else {
@@ -695,13 +923,19 @@ fn __mark_udp_seen(
         return state as *mut ConnState;
     }
 
+    // Build the immutable publication in the existing invocation snapshot, not on
+    // the WAN classifier's near-limit stack. No map element is touched before claim.
+    let Some(output) = conntrack_output() else {
+        return core::ptr::null_mut();
+    };
     let mac = if args.has_mac() { args.mac } else { [0; 6] };
     let Some(incarnation) = claim_udp_preparing(key, &mac) else {
         return core::ptr::null_mut();
     };
     let has_rt = args.has_routing();
 
-    let mut new_state: ConnState = unsafe { core::mem::zeroed() };
+    unsafe { core::ptr::write_bytes(output, 0, 1) };
+    let new_state = unsafe { &mut *output };
     new_state.is_wan_ingress_direction = (is_wan_ingress_direction != 0) as u8;
     new_state.state = UdpDecisionState::None as u8;
     new_state.incarnation = incarnation;
@@ -720,7 +954,7 @@ fn __mark_udp_seen(
         }
     }
 
-    if !publish_claimed_udp_state(key, &new_state) {
+    if !publish_claimed_udp_state(key, new_state) {
         abort_udp_preparing(key, incarnation, 0);
         let stats_key: u32 = BpfStatsKey::UdpConnOverflow as u32;
         if let Some(overflow_count) = BPF_STATS_MAP.get_ptr_mut(stats_key) {
@@ -742,11 +976,6 @@ fn __mark_udp_seen(
         warn!((), target: "honk", "udp conn state map overflow, key: {:i}:{} -> {:i}:{}", unsafe { key.src_ip.u6_addr8 }, key.src_port, unsafe { key.dst_ip.u6_addr8 }, key.dst_port);
         return core::ptr::null_mut();
     }
-    let Some(output) = conntrack_output() else {
-        return core::ptr::null_mut();
-    };
-    // Publication copied these exact immutable contents under the element lock.
-    unsafe { crate::flow::copy_payload(output, &new_state) };
     output
 }
 
