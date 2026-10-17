@@ -1,6 +1,6 @@
 use super::*;
 use crate::ebpf::{
-    RetireCounts, RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult,
+    RetireCounts, RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult, retire_fixture,
 };
 use aya::maps::RingBuf;
 use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_STATE_TIMEOUT_NS};
@@ -675,29 +675,22 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
         } else {
             published.last_seen_ns + UDP_CONN_STATE_TIMEOUT_NS + 1
         };
-        let mut outcomes = [RetireOutcome::NotRun];
+        let (counts, result) = retire_fixture(
+            &mut backend,
+            key,
+            RetireKind::ExpiryHint {
+                incarnation,
+                now_ns: expiry_clock,
+            },
+        );
         assert_eq!(
-            backend
-                .retire_batch(
-                    &[RetireRequest {
-                        key,
-                        kind: RetireKind::ExpiryHint {
-                            incarnation,
-                            now_ns: expiry_clock
-                        },
-                    }],
-                    &mut outcomes
-                )
-                .unwrap(),
+            counts,
             RetireCounts {
                 conn: 1,
                 ..Default::default()
             }
         );
-        assert_eq!(
-            outcomes,
-            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-        );
+        assert_eq!(result, UdpDecisionCommitResult::Applied);
         assert!(backend.conn_state_lookup(&key).unwrap().is_none());
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
@@ -750,19 +743,14 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
             before,
             "Aborted follower renewed the marker"
         );
-        let mut outcomes = [RetireOutcome::NotRun];
-        let counts = backend
-            .retire_batch(
-                &[RetireRequest {
-                    key,
-                    kind: RetireKind::ExpiryHint {
-                        incarnation,
-                        now_ns: now_ns(),
-                    },
-                }],
-                &mut outcomes,
-            )
-            .unwrap();
+        let (counts, result) = retire_fixture(
+            &mut backend,
+            key,
+            RetireKind::ExpiryHint {
+                incarnation,
+                now_ns: now_ns(),
+            },
+        );
         assert_eq!(
             counts,
             RetireCounts {
@@ -772,10 +760,7 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
                 request: 0
             }
         );
-        assert_eq!(
-            outcomes,
-            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-        );
+        assert_eq!(result, UdpDecisionCommitResult::Applied);
         assert!(backend.conn_state_lookup(&key).unwrap().is_none());
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
@@ -865,29 +850,22 @@ fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
             assert_fenced_claim_unchanged(&backend, &key, &bytes);
             unfence(&mut backend, &key);
             let before = owned_values(&backend, &key);
-            let mut outcomes = [RetireOutcome::NotRun];
-            assert_eq!(
-                backend
-                    .retire_batch(
-                        &[RetireRequest {
-                            key,
-                            kind: RetireKind::ExpiryHint {
-                                incarnation,
-                                now_ns: now_ns()
-                            },
-                        }],
-                        &mut outcomes
-                    )
-                    .unwrap(),
-                RetireCounts::default()
+            let (counts, result) = retire_fixture(
+                &mut backend,
+                key,
+                RetireKind::ExpiryHint {
+                    incarnation,
+                    now_ns: now_ns(),
+                },
             );
+            assert_eq!(counts, RetireCounts::default());
             assert_eq!(
-                outcomes,
-                [RetireOutcome::Done(if mode == 5 {
+                result,
+                if mode == 5 {
                     UdpDecisionCommitResult::Superseded
                 } else {
                     UdpDecisionCommitResult::TokenMismatch
-                })]
+                }
             );
             assert_eq!(
                 owned_values(&backend, &key),

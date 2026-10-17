@@ -8,6 +8,8 @@
 use super::RetireKind;
 #[cfg(test)]
 use super::TcpSocketOwnership;
+#[cfg(test)]
+use super::retirement::retire_fixture;
 use super::retirement::{
     Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit,
     release_request_count, retire_staged_udp,
@@ -1230,22 +1232,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.bpf_stats.clear();
         Ok(())
     }
-}
-
-#[cfg(test)]
-fn retire_fixture(
-    backend: &mut MockEbpfBackend,
-    key: TuplesKey,
-    kind: RetireKind<'_>,
-) -> (RetireCounts, UdpDecisionCommitResult) {
-    let mut outcomes = [RetireOutcome::NotRun];
-    let counts = backend
-        .retire_batch(&[RetireRequest { key, kind }], &mut outcomes)
-        .unwrap();
-    let RetireOutcome::Done(result) = outcomes[0] else {
-        panic!("model retirement skipped a request");
-    };
-    (counts, result)
 }
 
 #[cfg(test)]

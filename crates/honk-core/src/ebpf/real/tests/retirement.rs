@@ -1,5 +1,6 @@
 use super::super::retirement as backend_retirement;
 use super::*;
+use crate::ebpf::retire_fixture;
 use honk_ebpf_common::conn::{FlowMapValue, RetirementFence};
 
 mod storage;
@@ -333,18 +334,16 @@ fn retirement_delete_failure_reports_completed_map_deletions_only() {
         backend.array_get::<u32>("RETIRE_ACTIVE", 0).unwrap(),
         Some(0)
     );
+    let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
     assert_eq!(
-        backend.retire_batch(&[request], &mut outcomes).unwrap(),
+        counts,
         RetireCounts {
             conn: 1,
             redirect: 1,
             ..RetireCounts::default()
         }
     );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-    );
+    assert_eq!(result, UdpDecisionCommitResult::Applied);
 }
 
 #[test]
@@ -447,9 +446,9 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             pending_only: false,
         },
     };
-    let mut outcomes = [RetireOutcome::NotRun];
+    let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
     assert_eq!(
-        backend.retire_batch(&[request], &mut outcomes)?,
+        counts,
         RetireCounts {
             conn: 1,
             handoff: 1,
@@ -457,10 +456,7 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             request: 0
         }
     );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-    );
+    assert_eq!(result, UdpDecisionCommitResult::Applied);
     assert_retirement_fence(&backend, &key, false);
     publish_retirement_flow(
         &mut backend,
@@ -470,14 +466,9 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             ..state
         },
     )?;
-    assert_eq!(
-        backend.retire_batch(&[request], &mut outcomes)?,
-        RetireCounts::default()
-    );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
-    );
+    let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
+    assert_eq!(counts, RetireCounts::default());
+    assert_eq!(result, UdpDecisionCommitResult::Superseded);
     assert_retirement_flow_present(&backend, &key);
     let raw = ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD;
     backend.udp_conn_state_store(
@@ -496,14 +487,9 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             pending_only: false,
         },
     };
-    assert_eq!(
-        backend.retire_batch(&[native_request], &mut outcomes)?,
-        RetireCounts::default()
-    );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
-    );
+    let (counts, result) = retire_fixture(&mut backend, native_request.key, native_request.kind);
+    assert_eq!(counts, RetireCounts::default());
+    assert_eq!(result, UdpDecisionCommitResult::Superseded);
     assert_retirement_flow_present(&backend, &key);
     assert_eq!(
         unsafe { backend.conn_state_lookup(&key)?.unwrap().meta.raw },
@@ -529,7 +515,6 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
             ..Default::default()
         };
         publish_retirement_flow(&mut backend, &key, &state)?;
-        let mut outcomes = [RetireOutcome::NotRun];
         let request = RetireRequest {
             key,
             kind: RetireKind::ExpiredConn {
@@ -537,8 +522,9 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
                 expired_before_ns: 10,
             },
         };
+        let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
         assert_eq!(
-            backend.retire_batch(&[request], &mut outcomes)?,
+            counts,
             RetireCounts {
                 conn: 1,
                 handoff: 1,
@@ -546,10 +532,7 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
                 request: 0
             }
         );
-        assert_eq!(
-            outcomes,
-            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-        );
+        assert_eq!(result, UdpDecisionCommitResult::Applied);
         publish_retirement_flow(
             &mut backend,
             &key,
@@ -558,14 +541,9 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
                 ..state
             },
         )?;
-        assert_eq!(
-            backend.retire_batch(&[request], &mut outcomes)?,
-            RetireCounts::default()
-        );
-        assert_eq!(
-            outcomes,
-            [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
-        );
+        let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
+        assert_eq!(counts, RetireCounts::default());
+        assert_eq!(result, UdpDecisionCommitResult::Superseded);
         assert_retirement_flow_present(&backend, &key);
     }
     Ok(())
@@ -615,15 +593,9 @@ fn retirement_auxiliary_owner_mismatch_is_fatal_and_preserves_all_maps() -> anyh
                 now_ns: u64::MAX,
             },
         };
-        let mut outcomes = [RetireOutcome::NotRun];
-        assert_eq!(
-            backend.retire_batch(&[RetireRequest { key, kind }], &mut outcomes)?,
-            RetireCounts::default()
-        );
-        assert_eq!(
-            outcomes,
-            [RetireOutcome::Done(UdpDecisionCommitResult::TokenMismatch)]
-        );
+        let (counts, result) = retire_fixture(&mut backend, key, kind);
+        assert_eq!(counts, RetireCounts::default());
+        assert_eq!(result, UdpDecisionCommitResult::TokenMismatch);
         assert_retirement_flow_present(&backend, &key);
         assert_retirement_fence(&backend, &key, false);
         assert_eq!(backend.conn_state_lookup(&key)?.unwrap().incarnation, 1);
@@ -719,18 +691,16 @@ fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::
     );
     assert!(backend.conn_state_lookup(&request.key)?.is_some());
     assert_retirement_fence(&backend, &request.key, false);
+    let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
     assert_eq!(
-        backend.retire_batch(&[request], &mut outcomes)?,
+        counts,
         RetireCounts {
             conn: 1,
             redirect: 1,
             ..Default::default()
         }
     );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-    );
+    assert_eq!(result, UdpDecisionCommitResult::Applied);
     Ok(())
 }
 
@@ -761,15 +731,9 @@ fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Resu
             now_ns: 121_000_000_000,
         },
     };
-    let mut outcomes = [RetireOutcome::NotRun];
-    assert_eq!(
-        backend.retire_batch(&[request], &mut outcomes)?,
-        RetireCounts::default()
-    );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::TokenMismatch)]
-    );
+    let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
+    assert_eq!(counts, RetireCounts::default());
+    assert_eq!(result, UdpDecisionCommitResult::TokenMismatch);
     assert_eq!(
         backend
             .routing_handoff_lookup(&key)?
@@ -788,18 +752,16 @@ fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Resu
     assert_retirement_fence(&backend, &key, false);
     track.decision_token = 7;
     backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
+    let (counts, result) = retire_fixture(&mut backend, request.key, request.kind);
     assert_eq!(
-        backend.retire_batch(&[request], &mut outcomes)?,
+        counts,
         RetireCounts {
             handoff: 1,
             redirect: 1,
             ..Default::default()
         }
     );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-    );
+    assert_eq!(result, UdpDecisionCommitResult::Applied);
     assert!(backend.conn_state_lookup(&key)?.is_none());
     assert_retirement_fence(&backend, &key, false);
     Ok(())
@@ -822,17 +784,14 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
         ..Default::default()
     };
     publish_retirement_flow(&mut backend, &key, &aborted)?;
-    let mut outcomes = [RetireOutcome::NotRun];
-    let counts = backend.retire_batch(
-        &[RetireRequest {
-            key,
-            kind: RetireKind::ExpiredConn {
-                expected: &aborted,
-                expired_before_ns: 0,
-            },
-        }],
-        &mut outcomes,
-    )?;
+    let (counts, result) = retire_fixture(
+        &mut backend,
+        key,
+        RetireKind::ExpiredConn {
+            expected: &aborted,
+            expired_before_ns: 0,
+        },
+    );
     assert_eq!(
         counts,
         RetireCounts {
@@ -842,10 +801,7 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
             request: 0
         }
     );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-    );
+    assert_eq!(result, UdpDecisionCommitResult::Applied);
 
     let mut staged = Vec::new();
     for (index, state) in [

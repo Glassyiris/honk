@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::{RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult};
+use crate::ebpf::{RetireKind, UdpDecisionCommitResult, retire_fixture};
 use crate::netlink::{FAM_V4, FAM_V6, PROTO_STATIC, ROUTE_UNICAST, SCOPE_UNIVERSE};
 use honk_outbound::proxy::ProxyRegistry;
 use std::io::{Read, Write};
@@ -13,24 +13,16 @@ fn retire_udp_incarnation(
     key: &TuplesKey,
     incarnation: u64,
 ) -> UdpDecisionCommitResult {
-    let mut outcomes = [RetireOutcome::NotRun];
-    backend
-        .retire_batch(
-            &[RetireRequest {
-                key: *key,
-                kind: RetireKind::Udp {
-                    token: 0,
-                    incarnation: Some(incarnation),
-                    pending_only: false,
-                },
-            }],
-            &mut outcomes,
-        )
-        .unwrap();
-    let RetireOutcome::Done(result) = outcomes[0] else {
-        panic!("singleton retirement skipped");
-    };
-    result
+    retire_fixture(
+        backend,
+        *key,
+        RetireKind::Udp {
+            token: 0,
+            incarnation: Some(incarnation),
+            pending_only: false,
+        },
+    )
+    .1
 }
 
 fn attach_wan(backend: &mut RealEbpfBackend, interface: &str) {

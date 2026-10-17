@@ -631,4 +631,20 @@ pub(crate) fn account_retirement(result: &Result<RetireCounts, RetireError>) {
 }
 
 #[cfg(test)]
+pub(crate) fn retire_fixture(
+    backend: &mut dyn EbpfBackend,
+    key: TuplesKey,
+    kind: RetireKind<'_>,
+) -> (RetireCounts, UdpDecisionCommitResult) {
+    let mut outcomes = [RetireOutcome::NotRun];
+    let counts = backend
+        .retire_batch(&[RetireRequest { key, kind }], &mut outcomes)
+        .unwrap();
+    let RetireOutcome::Done(result) = outcomes[0] else {
+        panic!("singleton retirement skipped a request");
+    };
+    (counts, result)
+}
+
+#[cfg(test)]
 mod tests;

@@ -174,24 +174,16 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
             },
         )
         .expect("seed newer staged token");
-    let mut outcomes = [RetireOutcome::NotRun];
-    backend
-        .retire_batch(
-            &[RetireRequest {
-                key: staged_key,
-                kind: RetireKind::Udp {
-                    token: 41,
-                    incarnation: Some(41),
-                    pending_only: false,
-                },
-            }],
-            &mut outcomes,
-        )
-        .expect("stale retirement result");
-    assert_eq!(
-        outcomes[0],
-        RetireOutcome::Done(UdpDecisionCommitResult::Superseded)
+    let (_, result) = crate::ebpf::retire_fixture(
+        &mut backend,
+        staged_key,
+        RetireKind::Udp {
+            token: 41,
+            incarnation: Some(41),
+            pending_only: false,
+        },
     );
+    assert_eq!(result, UdpDecisionCommitResult::Superseded);
     assert_eq!(
         backend
             .conn_state_lookup(&staged_key)
@@ -208,19 +200,15 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
             .is_none(),
         "completed stale cleanup must release its exact fence"
     );
-    backend
-        .retire_batch(
-            &[RetireRequest {
-                key: staged_key,
-                kind: RetireKind::Udp {
-                    token: 42,
-                    incarnation: Some(42),
-                    pending_only: false,
-                },
-            }],
-            &mut outcomes,
-        )
-        .expect("retire staged test state");
+    crate::ebpf::retire_fixture(
+        &mut backend,
+        staged_key,
+        RetireKind::Udp {
+            token: 42,
+            incarnation: Some(42),
+            pending_only: false,
+        },
+    );
 
     // Five cgroup capture links + wan_ingress/wan_egress on lo.
     let held = held_bpf_link_count();

@@ -1,7 +1,5 @@
 use super::*;
-use crate::ebpf::{
-    RetireCounts, RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult,
-};
+use crate::ebpf::{RetireCounts, RetireKind, UdpDecisionCommitResult, retire_fixture};
 use honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED;
 
 fn witness(backend: &RealEbpfBackend, id: u32) -> KernelRouteWitness {
@@ -69,23 +67,15 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                 let current = handoff(&backend, &key);
                 assert_ne!(current.incarnation, 0);
                 assert_ne!(current.incarnation, old.incarnation);
-                let mut outcomes = [RetireOutcome::NotRun];
-                let counts = backend
-                    .retire_batch(
-                        &[RetireRequest {
-                            key,
-                            kind: RetireKind::Tcp {
-                                incarnation: old.incarnation,
-                            },
-                        }],
-                        &mut outcomes,
-                    )
-                    .unwrap();
-                assert_eq!(counts, RetireCounts::default());
-                assert_eq!(
-                    outcomes,
-                    [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
+                let (counts, result) = retire_fixture(
+                    &mut backend,
+                    key,
+                    RetireKind::Tcp {
+                        incarnation: old.incarnation,
+                    },
                 );
+                assert_eq!(counts, RetireCounts::default());
+                assert_eq!(result, UdpDecisionCommitResult::Superseded);
                 assert_eq!(
                     backend
                         .conn_state_lookup(&key)
@@ -104,18 +94,15 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                         .incarnation,
                     current.incarnation
                 );
+                let (counts, result) = retire_fixture(
+                    &mut backend,
+                    key,
+                    RetireKind::Tcp {
+                        incarnation: current.incarnation,
+                    },
+                );
                 assert_eq!(
-                    backend
-                        .retire_batch(
-                            &[RetireRequest {
-                                key,
-                                kind: RetireKind::Tcp {
-                                    incarnation: current.incarnation
-                                },
-                            }],
-                            &mut outcomes
-                        )
-                        .unwrap(),
+                    counts,
                     RetireCounts {
                         conn: 1,
                         handoff: 1,
@@ -123,10 +110,7 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                         request: 0,
                     }
                 );
-                assert_eq!(
-                    outcomes,
-                    [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
-                );
+                assert_eq!(result, UdpDecisionCommitResult::Applied);
             }
         }
     });
