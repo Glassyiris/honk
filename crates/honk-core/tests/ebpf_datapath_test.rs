@@ -92,6 +92,8 @@ impl Fixture {
             wan_ifindex: 1,
             dae0peer_mac: [0x02, 0, 0, 0, 0, 2],
             dae_socket_mark: DAE_BYPASS_MARK,
+            // Cached non-SYN rows never perform a native socket lookup.
+            tcp_daens_netns_id: 0,
             ..Default::default()
         };
         let wan_ifindex = 1u32;
@@ -186,21 +188,21 @@ fn set_array<V: Pod>(bpf: &mut Ebpf, name: &str, index: u32, value: V) -> Result
 
 fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError> {
     let map = bpf.map_mut(name).expect("hash map present");
-    let mut hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
-    hash.insert(key, value, 0)
+    let mut hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
+    hash.insert(key, FlowMapValue::new(value), 4)
 }
 
 fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize {
     let map = bpf.map(name).expect("hash map present");
-    let hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
+    let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     hash.keys().map(Result::unwrap).count()
 }
 
 fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V> {
     let map = bpf.map(name).expect("hash map present");
-    let hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
-    match hash.get(&key, 0) {
-        Ok(value) => Some(value),
+    let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
+    match hash.get(&key, 4) {
+        Ok(value) => Some(value.value),
         Err(MapError::KeyNotFound) => None,
         Err(error) => panic!("read {name}: {error}"),
     }
@@ -245,14 +247,15 @@ fn routing_meta(outbound: u8, mark: u32, must: bool, offload: bool) -> RoutingMe
     RoutingMeta { raw }
 }
 
+fn monotonic_now_ns() -> u64 {
+    let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .expect("read monotonic clock");
+    now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64
+}
+
 fn cached_state(outbound: u8, state: u8, token: u32, must: bool, offload: bool) -> ConnState {
     let mut value: ConnState = unsafe { mem::zeroed() };
-    let mut now: libc::timespec = unsafe { mem::zeroed() };
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
-        0
-    );
-    value.last_seen_ns = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+    value.last_seen_ns = monotonic_now_ns();
     value.state = state;
     value.decision_token = token;
     value.meta = routing_meta(outbound, 0, must, offload);
@@ -516,6 +519,8 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
             smac: [0x02, 0, 0, 0, 0, 2],
             outbound: TEST_OUTBOUND,
             ifindex: 1,
+            last_seen_ns: monotonic_now_ns(),
+            incarnation: 1,
             ..Default::default()
         },
     )

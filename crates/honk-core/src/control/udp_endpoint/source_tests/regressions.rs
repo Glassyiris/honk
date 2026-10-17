@@ -784,7 +784,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
             assert!(pool.complete_removal(
                 removed.client,
                 removed.dst,
-                removed.decision_token,
+                removed.owner,
                 removed.generation,
             ));
         }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::connection_tracker::{CloseOutcome, ConnectionTracker};
+use crate::control::retirement_worker::{RetirementPort, spawn_retirement_worker};
 use crate::control::udp_endpoint::tests::closure::tracked_entry;
 use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
 
@@ -28,11 +29,15 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let (fatal, mut failures) = mpsc::unbounded_channel();
-        let worker = crate::control::udp_removal::spawn_udp_removal_worker(
+        let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
+        let port = Arc::new(RetirementPort::default());
+        let worker = spawn_retirement_worker(
             Arc::clone(&pool),
             backend,
             Arc::clone(&tracker),
             fatal,
+            Arc::clone(&pins),
+            Arc::clone(&port),
         );
         let attach = async |target| {
             pool.prepare_source(
@@ -165,6 +170,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         drop(endpoint_b);
         assert!(pool.shutdown().await.joined);
         assert!(failures.try_recv().is_err());
+        port.sink.lock().take();
         worker.await.unwrap();
         drop(owner);
         generation.shutdown().await;

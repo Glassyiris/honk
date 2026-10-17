@@ -57,7 +57,7 @@ impl RealEbpfBackend {
             _ => result.record_error(DatapathObservationError::Admission),
         }
         match self
-            .hash_map::<TuplesKey, ConnState>("CONN_STATE_MAP")
+            .hash_map::<TuplesKey, FlowMapValue<ConnState>>("CONN_STATE_MAP")
             .and_then(|map| Ok(map.map().info()?.max_entries()))
         {
             Ok(capacity) => result.conn_state_capacity = Some(capacity),

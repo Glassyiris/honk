@@ -149,6 +149,7 @@ impl IoHarness {
             target,
             FIRST_PAYLOAD,
             None,
+            crate::ebpf::UdpFlowOwner::new(0, None).expect("benchmark UDP owner"),
             self.pool.initialization_epoch(),
             slow,
             queue_now(),

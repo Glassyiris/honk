@@ -100,7 +100,7 @@ impl PendingUdpVerdicts {
             .await
     }
 
-    pub(super) async fn ingest_held_wait(
+    pub(in crate::control) async fn ingest_held_wait(
         &self,
         packet: QueuedPacket,
         held: HeldVerdict,
@@ -252,7 +252,7 @@ impl PendingUdpVerdicts {
         held: HeldVerdict,
         slow_permit: Option<OwnedSemaphorePermit>,
     ) -> NfqueueIngest {
-        if cell.identity.decision_token != decision_token {
+        if cell.identity.owner.token != decision_token {
             self.stats.record_udp_nfqueue_token_mismatch();
             self.schedule_cleanup(CleanupRequest::Token {
                 key: cell.identity.key,
@@ -308,7 +308,7 @@ impl PendingUdpVerdicts {
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
-                    decision_token,
+                    cell.identity.owner,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
                     held.received_at,
@@ -358,7 +358,7 @@ impl PendingUdpVerdicts {
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
-                    decision_token,
+                    cell.identity.owner,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
                     held.received_at,
@@ -425,9 +425,18 @@ impl PendingUdpVerdicts {
             self.drop_one(held, DropOutcome::Other);
             return NfqueueIngest::Dropped;
         };
-        let retained = match backend.udp_conn_state_lookup(&key.tuples()) {
-            Ok(Some(state)) if state.decision_token == decision_token => retained_state(&state),
-            Ok(Some(_)) | Ok(None) => {
+        let tuples = key.tuples();
+        let inspected = backend.conn_state_lookup(&tuples).and_then(|state| {
+            let Some(state) = state.filter(|state| state.decision_token == decision_token) else {
+                return Ok(None);
+            };
+            backend
+                .udp_flow_owner(decision_token, Some(state))
+                .map(|owner| Some((retained_state(&state), owner)))
+        });
+        let (retained, owner) = match inspected {
+            Ok(Some(retained)) => retained,
+            Ok(None) => {
                 drop(vacant);
                 self.stats.record_udp_nfqueue_token_mismatch();
                 self.drop_one(held, DropOutcome::Other);
@@ -439,7 +448,10 @@ impl PendingUdpVerdicts {
                     key,
                     decision_token,
                 });
-                self.signal_fatal(PendingUdpFatal::new("state inspection", error.to_string()));
+                self.signal_fatal(PendingUdpFatal::new(
+                    "state inspection",
+                    format!("{error:#}"),
+                ));
                 self.drop_one(held, DropOutcome::Other);
                 return NfqueueIngest::Dropped;
             }
@@ -448,7 +460,7 @@ impl PendingUdpVerdicts {
         match retained {
             RetainedState::Pending => {
                 let Some(slow_permit) = slow_permit else {
-                    self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                    self.insert_dead_vacant(vacant, key, owner, flow_slot);
                     self.schedule_cleanup(CleanupRequest::Token {
                         key,
                         decision_token,
@@ -460,7 +472,7 @@ impl PendingUdpVerdicts {
                     key.client,
                     key.destination,
                     payload,
-                    decision_token,
+                    owner,
                     None,
                     slow_permit,
                     held.received_at,
@@ -479,7 +491,7 @@ impl PendingUdpVerdicts {
                         NfqueueIngest::Initialize { lease, identity }
                     }
                     EndpointReservation::IdentityMismatch => {
-                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                        self.insert_dead_vacant(vacant, key, owner, flow_slot);
                         self.stats.record_udp_nfqueue_token_mismatch();
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
@@ -489,7 +501,7 @@ impl PendingUdpVerdicts {
                         NfqueueIngest::Dropped
                     }
                     EndpointReservation::Enqueued => {
-                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                        self.insert_dead_vacant(vacant, key, owner, flow_slot);
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
                             decision_token,
@@ -500,7 +512,7 @@ impl PendingUdpVerdicts {
                     EndpointReservation::CapacityRejected
                     | EndpointReservation::QueueFull
                     | EndpointReservation::QueueClosed => {
-                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                        self.insert_dead_vacant(vacant, key, owner, flow_slot);
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
                             decision_token,
@@ -513,7 +525,7 @@ impl PendingUdpVerdicts {
             RetainedState::ActiveDirect(final_mark) => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity::new(key, decision_token, 0);
+                let identity = PendingUdpIdentity::new(key, owner, 0);
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::ActiveDirect {
@@ -532,12 +544,12 @@ impl PendingUdpVerdicts {
                     key.client,
                     key.destination,
                     payload,
-                    decision_token,
+                    owner,
                     held.received_at,
                     &self.stats,
                 ) {
                     Ok(generation) => {
-                        let identity = PendingUdpIdentity::new(key, decision_token, generation);
+                        let identity = PendingUdpIdentity::new(key, owner, generation);
                         vacant.insert(Arc::new(FlowCell::terminal(
                             identity,
                             CellState::Proxy {
@@ -565,7 +577,7 @@ impl PendingUdpVerdicts {
             RetainedState::Block => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity::new(key, decision_token, 0);
+                let identity = PendingUdpIdentity::new(key, owner, 0);
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::Block {

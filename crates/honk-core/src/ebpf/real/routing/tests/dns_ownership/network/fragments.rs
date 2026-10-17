@@ -170,7 +170,7 @@ fn fragmented_dns_v4_v6_reassembles_before_queue_in_both_orders() {
                 .unwrap();
             let initial_sequence = fixture.backend.udp_decision_sequence_status().unwrap();
             let initial_states =
-                hash_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP");
+                flow_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP");
             let payload = padded_query();
             let mut id = 1;
             for destination in ["10.81.0.1:53", "[fd81::1]:53"] {
@@ -230,7 +230,7 @@ fn fragmented_dns_v4_v6_reassembles_before_queue_in_both_orders() {
                 initial_sequence
             );
             assert_eq!(
-                hash_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP"),
+                flow_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP"),
                 initial_states
             );
             fixture.backend.set_datapath_ready(false).unwrap();

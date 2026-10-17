@@ -181,6 +181,15 @@ impl NetworkFixture {
                 .try_into()
                 .unwrap();
             program.attach("hrpeer0", TcAttachType::Ingress).unwrap();
+            let lookup: &mut aya::programs::SkLookup = backend
+                .bpf_mut()
+                .unwrap()
+                .program_mut("tproxy_sk_lookup")
+                .unwrap()
+                .try_into()
+                .unwrap();
+            lookup.load().unwrap();
+            lookup.attach(&daens_ns).unwrap();
         });
         backend.set_datapath_ready(true).unwrap();
         Self {

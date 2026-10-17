@@ -34,6 +34,12 @@ mkdir -p "$log_dir"
   2>&1 | tee "$log_dir/ebpf-datapath.log"
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-nfqueue.log"
+for ownership_test in \
+  control::tests::tcp_binding::netns_tcp_accepted_fd_proves_original_syn \
+  control::tests::tcp_tuple_reuse::netns_tcp_reuses_tuple_during_daens_time_wait \
+  control::tests::udp_fullcone::netns_udp_full_cone_source_contract; do
+  test "$("$HONK_CORE_TEST_BIN" "$ownership_test" --exact --ignored --list --format terse)" = "$ownership_test: test"
+done
 "$HONK_CORE_TEST_BIN" netns --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-netns.log"
 watcher_test=ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription

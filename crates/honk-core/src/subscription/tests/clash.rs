@@ -32,6 +32,77 @@ proxies:
 }
 
 #[test]
+fn tuic_alpn_defaults_follow_the_subscription_dialect() {
+    for (alpn, clash_expected, other_expected) in [
+        (None, Some("h3"), None),
+        (Some("null"), Some("h3"), None),
+        (Some("[]"), Some(""), Some("")),
+        (Some(r#""""#), Some(""), Some("")),
+        (Some(r#""  ""#), Some("  "), Some("  ")),
+        (Some(r#"["tuic"]"#), Some("tuic"), Some("tuic")),
+        (Some(r#"["h3","tuic"]"#), Some("h3,tuic"), Some("h3,tuic")),
+    ] {
+        let field = alpn.map_or_else(String::new, |value| format!(r#", "alpn": {value}"#));
+        let clash = format!(
+            r#"{{"proxies":[{{"name":"tuic","type":"tuic","server":"127.0.0.1","port":443,
+                "uuid":"11111111-1111-4111-8111-111111111111","password":"secret"{field}}}]}}"#
+        );
+        let sing_box = format!(
+            r#"{{"outbounds":[{{"tag":"tuic","type":"tuic","server":"127.0.0.1","server_port":443,
+                "uuid":"11111111-1111-4111-8111-111111111111","password":"secret",
+                "tls":{{"enabled":true{field}}}}}]}}"#
+        );
+        for (content, expected) in [(clash, clash_expected), (sing_box, other_expected)] {
+            let nodes = parse_subscription_content(&Subscription::default(), &content).unwrap();
+            assert_eq!(
+                nodes[0].tuic().unwrap().alpn.as_deref(),
+                expected,
+                "{content}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tuic_source_default_preserves_runtime_reuse_until_alpn_changes() {
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+    use std::sync::Arc;
+
+    let parse = |alpn| {
+        parse_clash_subscription(
+            &format!(
+                "proxies:\n  - name: tuic\n    type: tuic\n    server: 127.0.0.1\n    port: 443\n    uuid: 11111111-1111-4111-8111-111111111111\n    password: secret\n{alpn}"
+            ),
+            None,
+        )
+        .unwrap()
+        .remove(0)
+    };
+    let explicit = parse("    alpn: [h3]\n");
+    let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&explicit)).unwrap();
+    let original = first.get(&explicit.id).unwrap();
+    for (alpn, should_reuse) in [
+        ("", true),
+        ("    alpn: null\n", true),
+        ("    alpn: [tuic]\n", false),
+    ] {
+        let imported = parse(alpn);
+        assert_eq!(imported.id, explicit.id);
+        let (next, reused) = OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&imported),
+            64,
+            Some(&first),
+        )
+        .unwrap();
+        assert_eq!(reused.contains(&imported.id), should_reuse);
+        assert_eq!(
+            Arc::ptr_eq(&original, &next.get(&imported.id).unwrap()),
+            should_reuse
+        );
+    }
+}
+
+#[test]
 fn imported_tls_required_protocols_and_quic_options_are_preserved() {
     let implicit = r#"proxies:
   - name: implicit-trojan

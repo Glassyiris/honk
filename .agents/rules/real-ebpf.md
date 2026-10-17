@@ -34,10 +34,47 @@ real decision/load goldens remain in `ebpf/real/routing/tests/`.
 
 Token-zero WAN UDP publishes explicit userspace ownership in RoutingMeta bit 58;
 native unmarked WAN direct instead publishes OFFLOAD. WAN cached and fresh writers
-must join the UDP reader epoch and honor the tuple retirement fence. Retire owned
-conn-state, handoff and redirect metadata together only after checking auxiliary
-tokens; preserve native/offloaded, missing and newer-token authority. Never infer
-WAN ownership from `must` alone or change the persistent 12-byte allocator ABI.
+must check the canonical tuple fence before borrowing state. Retire owned
+conn-state, handoff and redirect metadata only after a successful synchronous
+kernel grace barrier and matching auxiliary tokens/incarnations. Preserve
+native/offloaded, missing and newer-token authority. Never infer WAN ownership
+from `must` alone or change the persistent 12-byte allocator ABI.
+
+TCP cached-SYN classification queries the FD-owned daens by its explicit
+host-relative namespace ID, never the packet namespace or an assumed ID zero.
+ABI sizes: ConnState 72 bytes (80 with its lock wrapper), TcpSocketBinding 120
+with syn_isn at offset 116, TcpBindingOffsets 32, DaeParam 44. Proof selection,
+IPv6 and sysctl rules live in `AGENTS.md` (Notes for agents).
+
+Socket process identity is native non-cloned `SK_STORAGE`, captured once by
+create/connect/sendmsg and reclaimed only with the actual socket object. The
+hooks sit on the root cgroup, so capture failure is counted and the operation
+proceeds without identity; no cookie hash, release hook or janitor remains.
+Required cgroup attachment failure aborts startup. Discover cgroup mounts through
+`/proc/thread-self/mounts`; root-cgroup tests require a disposable VM, because
+private mount/network namespaces do not isolate cgroup BPF attachment.
+
+`just test-routing` and `just test-netns` both use the existing disposable VM
+gate (`.github/ci/run-vm-gate.sh floor`); `test-netns` retains `test-routing` as
+its dependency and boots only one guest. The complete routing suite also has
+root-cgroup cases, so neither recipe executes ignored tests on the host.
+The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
+TCP accepted-FD/request and tuple-reuse ownership, UDP fullcone source ownership,
+native lifecycle, route-only watcher and SO_MARK socket checks. Exact nonempty
+selections in the guest gate must remain intact.
+
+Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
+x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,
+checksum-pinned virtme-ng and bpf-linker, geo assets, both BTF-bearing objects,
+and the runner's workspace/temp/summary environment. Host dependency setup
+requires root; the guest runs as root. KVM access is optional with explicit TCG
+fallback. The recipes do not install host packages or change shared-host KVM
+permissions. Non-x86_64/non-Linux hosts and restricted containers without these
+prerequisites cannot run this runner; report the gate as not run and use CI.
+Native builds and unprivileged tests remain supported, but Linux 6.12+ and root
+are not sufficient isolation for direct protected-suite execution. Never invoke
+the guest script directly on a host or export its VM identity markers to bypass
+the fixture guard.
 
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The child also strips inherited `CARGO_PROFILE_*` overrides so host profiling cannot replace the standalone kernel crate's release policy. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it, and a sidecar older than core's `build.rs` triggers a rebuild after embedding-policy changes. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`; manually built or supplied objects remain the caller's responsibility.
 

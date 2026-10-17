@@ -305,12 +305,16 @@ node {
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `tuic_uuid` / `tuic_password` |
 | TUIC | `congestion_control` | `cubic`, `new_reno`, or `bbr`; `cubic` when omitted; unknown values warn and fall back to cubic |
-| TUIC | `alpn` | Comma-separated ALPN override; default is `tuic` |
+| TUIC | `alpn` | Comma-separated ALPN override; share links default to `tuic`; original Clash/Mihomo imports use the source default described below |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | Receive-window overrides |
 | Juicity | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `juicity_uuid` / `juicity_password` |
 | Juicity | protocol defaults | ALPN `h3`, BBR, and 8 MiB / 8 MiB initial receive windows that the shared adaptive flow control can grow |
 | Juicity | UDP | One QUIC bi stream per client source carries every destination; replies return the real remote peer, subject to the server's own UDP socket and egress policy |
 | Both | `mtu`, `sni`, insecure aliases, pin, ECH | Shared QUIC/TLS parameters |
+
+Original Clash/Mihomo `proxies` entries materialize `h3` when TUIC `alpn` is missing or null. Explicit nonempty lists retain their order; explicit empty lists or blank strings retain honk's existing `tuic` fallback, not a no-ALPN handshake. This source default does not apply to native share links, flat nodes, sing-box `outbounds`, or textual record formats.
+
+**Upgrade:** imported TUIC nodes that relied on the previous `tuic` fallback must specify `alpn: [tuic]` to retain it. The protocol-specific ALPN does not change the node UUID, but an effective configuration change replaces its runtime for new work; existing flows retain the normal generation-retirement behavior.
 
 ### AnyTLS
 

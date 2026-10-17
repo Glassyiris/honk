@@ -1,3 +1,5 @@
+//! Direct ring reservations keep event payloads off the bounded TC call-chain stack.
+
 use crate::maps::EVENT_RINGBUF;
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use honk_ebpf_common::event::DaeEvent;
@@ -15,7 +17,13 @@ pub fn send_dae_event(
     sport: u16,
     dport: u16,
 ) -> i32 {
-    let mut e: DaeEvent = unsafe { core::mem::zeroed() };
+    let Some(mut reservation) = EVENT_RINGBUF.reserve(0) else {
+        return -1;
+    };
+    let e: &mut DaeEvent = unsafe {
+        reservation.as_mut_ptr().write_bytes(0, 1);
+        reservation.assume_init_mut()
+    };
 
     e.timestamp = unsafe { bpf_ktime_get_ns() };
     e.type_ = type_;
@@ -35,5 +43,27 @@ pub fn send_dae_event(
         e.dip.copy_from_slice(d);
     }
 
-    EVENT_RINGBUF.output(e, 0).map(|_| 0).unwrap_or(-1)
+    reservation.submit(0);
+    0
+}
+
+/// Advisory only: physical reclamation always belongs to fenced userspace retirement.
+#[inline(always)]
+pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incarnation: u64) {
+    let Some(mut reservation) = EVENT_RINGBUF.reserve(0) else {
+        return;
+    };
+    let event: &mut DaeEvent = unsafe {
+        reservation.as_mut_ptr().write_bytes(0, 1);
+        reservation.assume_init_mut()
+    };
+    event.timestamp = unsafe { bpf_ktime_get_ns() };
+    event.type_ = honk_ebpf_common::event::DaeEventType::FlowExpired as u32;
+    event.incarnation = incarnation;
+    event.l4proto = key.l4proto;
+    event.sip = unsafe { key.src_ip.u6_addr32 };
+    event.dip = unsafe { key.dst_ip.u6_addr32 };
+    event.sport = key.src_port;
+    event.dport = key.dst_port;
+    reservation.submit(0);
 }

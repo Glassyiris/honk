@@ -35,7 +35,7 @@ use honk_ebpf_common::{
     conn::{BpfStatsKey, ConnState, UdpDecisionState},
     dae_ip::In6Addr,
     pack_nfqueue_mark,
-    redirect_need::{RoutingHandoffEntry, TuplesKey},
+    redirect_need::TuplesKey,
 };
 use network_types::{
     eth::EthHdr,
@@ -44,9 +44,10 @@ use network_types::{
 };
 
 use crate::{
+    auxiliary::{AuxPrep, redirect_needs_publish},
     maps::{
-        CLIENT_REPLY_TRACK, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTING_HANDOFF_MAP,
-        UDP_DECISION_SCRATCH_MAP, UdpDecisionScratch, increment_bpf_stat,
+        CLIENT_REPLY_TRACK, PARAM, PKT_SCRATCH_KEY, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP,
+        increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT},
     sk,
@@ -58,35 +59,21 @@ use crate::{
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
-/// Handoff write modes for [`redirect_lan_packet_to_control_plane`].
-///
-/// `HANDOFF_WRITE_ALWAYS`: new TCP flow (pure-SYN path).  Userspace
-///   consumes the entry once when the connection is accepted, so every new
-///   flow must leave one behind.  `REDIRECT_TRACK` is written
-///   unconditionally as well.
-/// `HANDOFF_WRITE_SKIP`: established TCP on the cached-routing path.
-///   Userspace never looks up handoffs for these packets, so writing one
-///   would just sit in the map until the janitor sweeps it.
-///   `REDIRECT_TRACK` is refreshed only when stale.
-/// `HANDOFF_WRITE_REFRESH`: UDP that may need tuple fallback, on the first
-///   packet and cached path alike. Write when absent or stale so userspace
-///   can recover metadata on an endpoint-pool miss. Raw must UDP53 uses its
-///   per-packet carrier instead and is excluded by the redirect helper.
-const HANDOFF_WRITE_ALWAYS: u8 = 0;
-const HANDOFF_WRITE_SKIP: u8 = 1;
-const HANDOFF_WRITE_REFRESH: u8 = 2;
-
 #[inline(always)]
 fn redirect_lan_packet_to_control_plane(
     ctx: &TcContext,
     _link_h_len: u32,
     pkt: &ParsedPacket,
     routing_meta_raw: u64,
-    handoff_mode: u8,
+    policy: AuxPrep,
     decision_token: u32,
     routing_generation: u64,
     trace_id: u32,
+    incarnation: u64,
 ) -> Verdict {
+    if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
+        return Err(TC_ACT_SHOT);
+    }
     let routing_meta = RoutingMeta {
         raw: routing_meta_raw,
     };
@@ -120,11 +107,16 @@ fn redirect_lan_packet_to_control_plane(
             (*ctx.skb.skb).cb[0] = TPROXY_MARK;
             (*ctx.skb.skb).cb[1] = pkt.listener_l4proto as u32;
             (*ctx.skb.skb).cb[2] = dns_route_mark;
-            (*ctx.skb.skb).cb[3] = if pkt.l4proto == IPPROTO_UDP {
+            let syn =
+                pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph);
+            (*ctx.skb.skb).cb[3] = if syn {
+                incarnation as u32
+            } else if pkt.l4proto == IPPROTO_UDP {
                 trace_id
             } else {
                 0
             };
+            (*ctx.skb.skb).cb[4] = if syn { (incarnation >> 32) as u32 } else { 0 };
         }
     }
 
@@ -132,22 +124,14 @@ fn redirect_lan_packet_to_control_plane(
     // that userspace may look up publish a tuple handoff.
     let raw_must_dns = dns_route_mark != 0 && unsafe { routing_meta.data.must != 0 };
     let write_handoff = !raw_must_dns
-        && match handoff_mode {
-            HANDOFF_WRITE_ALWAYS => true,
-            HANDOFF_WRITE_REFRESH => match ROUTING_HANDOFF_MAP.get_ptr_mut(pkt.tuples.five) {
-                Some(old) => unsafe {
-                    if (*old).result.decision_token != decision_token {
-                        return Err(TC_ACT_SHOT);
-                    }
-                    now.wrapping_sub((*old).last_seen_ns)
-                        >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-                },
-                None => true,
-            },
-            _ => false,
-        };
+        && policy
+            .handoff_needs_publish(&pkt.tuples.five, decision_token, incarnation, now)
+            .map_err(|_| TC_ACT_SHOT)?;
     if write_handoff {
-        let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
+        let scratch = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0).ok_or(TC_ACT_SHOT)?;
+        let scratch = unsafe { &mut *scratch };
+        let handoff = &mut scratch.handoff;
+        unsafe { ptr::write_bytes(handoff, 0, 1) };
         handoff.last_seen_ns = now;
         handoff.routing_generation = if routing_generation != 0 {
             routing_generation
@@ -155,6 +139,7 @@ fn redirect_lan_packet_to_control_plane(
             crate::route::captured_generation(trace_id)
         };
         handoff.trace_id = trace_id;
+        handoff.incarnation = incarnation;
         unsafe {
             handoff.result.mark = routing_meta.data.mark;
             handoff.result.must = routing_meta.data.must;
@@ -163,36 +148,21 @@ fn redirect_lan_packet_to_control_plane(
         }
         handoff.result.decision_token = decision_token;
         handoff.result.mac.copy_from_slice(&pkt.ethh.src_addr);
-        if ROUTING_HANDOFF_MAP
-            .insert(pkt.tuples.five, handoff, 0)
-            .is_err()
-        {
-            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-            // The control plane would otherwise receive an unrouteable flow;
-            // do not redirect it without the required handoff.
-            return Err(TC_ACT_SHOT);
-        }
+        crate::auxiliary::publish_handoff(&pkt.tuples.five, scratch, policy == AuxPrep::Publish)
+            .map_err(|_| TC_ACT_SHOT)?;
     }
 
-    // Store the original LAN framing so dae0_ingress can rewrite replies
-    // back to the original client without involving host IP forwarding.
-    // New flows write unconditionally; cached-flow packets only refresh the
-    // entry once it is older than AUXILIARY_MAP_REFRESH_INTERVAL_NS.
+    // Keep reverse-path framing stable and refresh cached ownership lazily.
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
-    let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
-        true
-    } else {
-        match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
-            Some(old) => unsafe {
-                if (*old).decision_token != decision_token {
-                    return Err(TC_ACT_SHOT);
-                }
-                now.wrapping_sub((*old).last_seen_ns)
-                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-            },
-            None => true,
-        }
-    };
+    let write_track = redirect_needs_publish(
+        &pkt.tuples.five,
+        &redirect_tuple,
+        policy,
+        decision_token,
+        incarnation,
+        now,
+    )
+    .map_err(|_| TC_ACT_SHOT)?;
     if write_track {
         // Built in per-CPU scratch, not on the stack: the LAN classifier is at
         // the verifier's combined stack limit.
@@ -210,21 +180,18 @@ fn redirect_lan_packet_to_control_plane(
         // Record the final outbound so dae0_ingress can attribute replies.
         scratch.redirect.outbound = unsafe { routing_meta.data.outbound };
         scratch.redirect.decision_token = decision_token;
-        if REDIRECT_TRACK
-            .insert(&scratch.redirect_key, &scratch.redirect, 0)
-            .is_err()
-        {
-            increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
-            // Do not redirect when reply restoration cannot be guaranteed.
-            return Err(TC_ACT_SHOT);
-        }
-        // DNS replies always leave from the queried address and match exactly;
-        // recording each query's random port would only churn the LRU.
-        if pkt.l4proto == IPPROTO_UDP
-            && !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five)
-        {
-            publish_client_reply(scratch);
-        }
+        scratch.redirect.incarnation = incarnation;
+        crate::auxiliary::publish_redirect(&pkt.tuples.five, scratch, policy == AuxPrep::Publish)
+            .map_err(|_| TC_ACT_SHOT)?;
+    }
+    if policy == AuxPrep::Publish
+        && !crate::contrack::tcp::commit_tcp_intercept(
+            &pkt.tuples.five,
+            u32::from_be_bytes(pkt.tcph.seq),
+            incarnation,
+        )
+    {
+        return Err(TC_ACT_SHOT);
     }
 
     if dns_fragment {
@@ -248,50 +215,19 @@ fn redirect_lan_packet_to_control_plane(
     }
 }
 
-#[inline(always)]
-fn remove_udp_stage_aux(key: &TuplesKey, decision_token: u32) {
-    if let Some(handoff) = ROUTING_HANDOFF_MAP.get_ptr(key)
-        && unsafe { (*handoff).result.decision_token } == decision_token
-    {
-        let _ = ROUTING_HANDOFF_MAP.remove(key);
-    }
-    let redirect_tuple = RedirectTuple::from_tuples(key);
-    if let Some(track) = REDIRECT_TRACK.get_ptr(redirect_tuple)
-        && unsafe { (*track).decision_token } == decision_token
-    {
-        let _ = REDIRECT_TRACK.remove(redirect_tuple);
-    }
-}
-
-/// Record the client's LAN framing so a reply from a peer it never contacted
-/// can still reach it; see `CLIENT_REPLY_TRACK`. Rewrites the scratch copy of
-/// the exact record in place, because the callers have no stack left to build
-/// another. Best effort: a failed insert must not fail the flow, it only leaves
-/// the previous reply behaviour.
-#[inline(always)]
-fn publish_client_reply(scratch: &mut UdpDecisionScratch) {
-    scratch.redirect_key.dst_ip.u6_addr64 = [0, 0];
-    scratch.redirect_key.dst_port = 0;
-    scratch.redirect.decision_token = 0;
-    let _ = CLIENT_REPLY_TRACK.insert(&scratch.redirect_key, &scratch.redirect, 0);
-}
-
 /// The client record for a UDP reply with no exact flow record. Replies from
 /// honk's own link addresses come from the TPROXY listener and are never
 /// forwarded to a client.
 #[inline(always)]
-fn client_reply_entry(
-    pkt: &ParsedPacket,
-    mut key: RedirectTuple,
-) -> Option<&'static mut RedirectEntry> {
+fn client_reply_entry(pkt: &ParsedPacket, mut key: RedirectTuple) -> Option<RedirectEntry> {
     if pkt.l4proto != IPPROTO_UDP || pkt.tuples.five.src_ip.is_dae0_link() {
         return None;
     }
     key.dst_ip = In6Addr::zero();
     key.dst_port = 0;
     CLIENT_REPLY_TRACK
-        .get_ptr_mut(key)
-        .map(|entry| unsafe { &mut *entry })
+        .get_ptr(key)
+        .map(|entry| unsafe { *entry })
 }
 
 /// Publish all token-bound auxiliary state before exposing Pending to followers.
@@ -309,16 +245,16 @@ fn stage_udp_decision(
     let mark = unsafe { routing_meta.data.mark };
     let must = unsafe { routing_meta.data.must };
     let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
-        crate::contrack::remove_udp_preparing(&pkt.tuples.five);
+        crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
         return Err(TC_ACT_SHOT);
     };
     unsafe {
         ptr::write_bytes(scratch_ptr, 0, 1);
     }
     let scratch = unsafe { &mut *scratch_ptr };
-    let Some(decision_token) = crate::contrack::allocate_udp_decision_token(&pkt.tuples.five)
+    let Some(decision_token) = crate::contrack::udp::allocate_udp_decision_token(&pkt.tuples.five)
     else {
-        crate::contrack::remove_udp_preparing(&pkt.tuples.five);
+        crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
         return Err(TC_ACT_SHOT);
     };
     pkt.trace_id = crate::route::capture(
@@ -336,19 +272,20 @@ fn stage_udp_decision(
     scratch.redirect.last_seen_ns = now;
     scratch.redirect.outbound = OUTBOUND_CONTROL_PLANE_ROUTING;
     scratch.redirect.decision_token = decision_token;
-    if REDIRECT_TRACK
-        .insert(scratch.redirect_key, scratch.redirect, 0)
-        .is_err()
-    {
-        increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
-        crate::contrack::remove_udp_preparing(&pkt.tuples.five);
+    scratch.redirect.incarnation = pkt.incarnation;
+    if crate::auxiliary::publish_redirect(&pkt.tuples.five, scratch, false).is_err() {
+        crate::contrack::udp::abort_udp_preparing(
+            &pkt.tuples.five,
+            pkt.incarnation,
+            decision_token,
+        );
         return Err(TC_ACT_SHOT);
     }
-    publish_client_reply(scratch);
 
     scratch.handoff.last_seen_ns = now;
     scratch.handoff.routing_generation = routing_generation;
     scratch.handoff.trace_id = pkt.trace_id;
+    scratch.handoff.incarnation = pkt.incarnation;
     scratch.handoff.result.mark = mark;
     scratch.handoff.result.must = must;
     scratch.handoff.result.outbound = outbound;
@@ -359,27 +296,30 @@ fn stage_udp_decision(
         .result
         .mac
         .copy_from_slice(&pkt.ethh.src_addr);
-    if ROUTING_HANDOFF_MAP
-        .insert(pkt.tuples.five, scratch.handoff, 0)
-        .is_err()
-    {
-        increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-        remove_udp_stage_aux(&pkt.tuples.five, decision_token);
-        crate::contrack::remove_udp_preparing(&pkt.tuples.five);
+    if crate::auxiliary::publish_handoff(&pkt.tuples.five, scratch, false).is_err() {
+        crate::contrack::udp::abort_udp_preparing(
+            &pkt.tuples.five,
+            pkt.incarnation,
+            decision_token,
+        );
         return Err(TC_ACT_SHOT);
     }
 
-    crate::contrack::populate_udp_conn_state(
+    crate::contrack::udp::populate_udp_conn_state(
         &mut scratch.state,
         routing_meta,
         &pkt.ethh.src_addr,
         UdpDecisionState::Pending,
         decision_token,
+        pkt.incarnation,
     );
     scratch.state.trace_id = pkt.trace_id;
-    if !crate::contrack::publish_claimed_udp_state(&pkt.tuples.five, &scratch.state) {
-        remove_udp_stage_aux(&pkt.tuples.five, decision_token);
-        crate::contrack::remove_udp_preparing(&pkt.tuples.five);
+    if !crate::contrack::udp::publish_claimed_udp_state(&pkt.tuples.five, &scratch.state) {
+        crate::contrack::udp::abort_udp_preparing(
+            &pkt.tuples.five,
+            pkt.incarnation,
+            decision_token,
+        );
         return Err(TC_ACT_SHOT);
     }
 
@@ -392,42 +332,15 @@ fn cached_udp_decision(
     ctx: &TcContext,
     link_h_len: u32,
     pkt: &ParsedPacket,
-    state: &mut ConnState,
-) -> Verdict {
-    let decision_token = state.decision_token;
-    if decision_token == 0 {
-        return cached_udp_decision_inner(ctx, link_h_len, pkt, state);
-    }
-    let Some(epoch) = crate::maps::begin_udp_decision() else {
-        return Err(TC_ACT_SHOT);
-    };
-    let verdict = if crate::maps::udp_decision_retiring(&pkt.tuples.five) {
-        Err(TC_ACT_SHOT)
-    } else if let Some(current) = crate::contrack::lookup_udp_seen(&pkt.tuples.five) {
-        if current.decision_token == decision_token {
-            cached_udp_decision_inner(ctx, link_h_len, pkt, current)
-        } else {
-            Err(TC_ACT_SHOT)
-        }
-    } else {
-        Err(TC_ACT_SHOT)
-    };
-    crate::maps::end_udp_decision(epoch);
-    verdict
-}
-
-#[inline(always)]
-fn cached_udp_decision_inner(
-    ctx: &TcContext,
-    link_h_len: u32,
-    pkt: &ParsedPacket,
-    state: &mut ConnState,
+    state: &ConnState,
 ) -> Verdict {
     if state.is_wan_ingress_direction != 0 {
         return pass_through_classified(ctx);
     }
 
-    if state.state == UdpDecisionState::Preparing as u8 {
+    if state.state == UdpDecisionState::Preparing as u8
+        || state.state == UdpDecisionState::Aborted as u8
+    {
         return Err(TC_ACT_SHOT);
     }
     if state.state == UdpDecisionState::Pending as u8
@@ -468,10 +381,11 @@ fn cached_udp_decision_inner(
             link_h_len,
             pkt,
             meta_raw,
-            HANDOFF_WRITE_SKIP,
+            AuxPrep::RedirectOnly,
             state.decision_token,
             0,
             state.trace_id,
+            state.incarnation,
         );
     }
     if state.decision_token != 0 && (outbound != OUTBOUND_DIRECT || !offload || must != 0) {
@@ -493,10 +407,11 @@ fn cached_udp_decision_inner(
         link_h_len,
         pkt,
         meta_raw,
-        HANDOFF_WRITE_REFRESH,
+        AuxPrep::Refresh,
         state.decision_token,
         0,
         state.trace_id,
+        state.incarnation,
     )
 }
 
@@ -593,9 +508,23 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return pass_through_classified(ctx);
         }
     }
+    // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
+    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
+        return Err(TC_ACT_SHOT);
+    }
+    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
+        &pkt.tuples.five,
+        crate::contrack::tcp::TcpSynRole::InterceptedForward,
+    );
+    if pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph) {
+        if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+            return Err(TC_ACT_SHOT);
+        }
+        pkt.incarnation = tcp_publisher.incarnation;
+    }
 
-    if pkt.l4proto == IPPROTO_TCP && !crate::contrack::is_new_tcp_connection(&pkt.tcph) {
-        let tcp_state = crate::contrack::mark_tcp_seen(
+    if pkt.l4proto == IPPROTO_TCP && !tcp_publisher.is_fresh() {
+        let tcp_state = crate::contrack::tcp::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
             0u8,
@@ -607,10 +536,18 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             None,
             0,
             0,
+            &tcp_publisher,
         );
         let tcp_state = match tcp_state {
             Some(state) => state,
-            None => return pass_through_classified(ctx),
+            None => {
+                if crate::contrack::is_new_tcp_connection(&pkt.tcph)
+                    || crate::contrack::tuple_unavailable(&pkt.tuples.five)
+                {
+                    return Err(TC_ACT_SHOT);
+                }
+                return pass_through_classified(ctx);
+            }
         };
         if (unsafe { tcp_state.meta.raw } >> 56) & 1 == 0 {
             return pass_through_classified(ctx);
@@ -646,10 +583,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             link_h_len,
             pkt,
             unsafe { tcp_state.meta.raw },
-            HANDOFF_WRITE_SKIP,
+            AuxPrep::tcp(&tcp_publisher),
             0,
             0,
             tcp_state.trace_id,
+            tcp_state.incarnation,
         );
     }
 
@@ -660,7 +598,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let mut tcp_state: Option<&mut ConnState> = None;
 
     if pkt.l4proto == IPPROTO_TCP {
-        tcp_state = crate::contrack::mark_tcp_seen(
+        tcp_state = crate::contrack::tcp::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
             0u8,
@@ -672,22 +610,26 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             None,
             0,
             0,
+            &tcp_publisher,
         );
+        if tcp_state.is_none() && crate::maps::tuple_retiring(&pkt.tuples.five) {
+            return Err(TC_ACT_SHOT);
+        }
     } else {
         if !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five)
-            && let Some(state) = crate::contrack::lookup_udp_seen(&pkt.tuples.five)
+            && let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five)
         {
             return cached_udp_decision(ctx, link_h_len, pkt, state);
         }
     }
 
-    // A pure TCP SYN always leaves a handoff for accept-time consumption.
+    // Only a fresh TCP publication captures the immutable accept-time handoff.
     // UDP tuple handoffs are refreshed only when userspace may need them;
     // raw must UDP53 is authoritative from its per-packet carrier.
-    let handoff_mode = if pkt.l4proto == IPPROTO_TCP {
-        HANDOFF_WRITE_ALWAYS
+    let aux_policy = if pkt.l4proto == IPPROTO_TCP {
+        AuxPrep::Publish
     } else {
-        HANDOFF_WRITE_REFRESH
+        AuxPrep::Refresh
     };
 
     let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
@@ -739,19 +681,17 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let flags = crate::maps::datapath_flags();
     let short_lived_udp =
         pkt.l4proto == IPPROTO_UDP && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five);
-    let udp_claimed =
-        if pkt.l4proto == IPPROTO_UDP && !short_lived_udp && flags & DATAPATH_FLAG_NFQ_ENABLED != 0
+    if pkt.l4proto == IPPROTO_UDP && !short_lived_udp {
+        if let Some(incarnation) =
+            crate::contrack::udp::claim_udp_preparing(&pkt.tuples.five, &pkt.ethh.src_addr)
         {
-            if crate::contrack::claim_udp_preparing(&pkt.tuples.five, &pkt.ethh.src_addr) {
-                true
-            } else if let Some(state) = crate::contrack::lookup_udp_seen(&pkt.tuples.five) {
-                return cached_udp_decision(ctx, link_h_len, pkt, state);
-            } else {
-                return Err(TC_ACT_SHOT);
-            }
+            pkt.incarnation = incarnation;
+        } else if let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five) {
+            return cached_udp_decision(ctx, link_h_len, pkt, state);
         } else {
-            false
-        };
+            return Err(TC_ACT_SHOT);
+        }
+    }
 
     let route_l4proto = if pkt.l4proto == IPPROTO_TCP {
         L4ProtoType::Tcp as u8
@@ -780,8 +720,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         Ok(result) => result,
         Err(_error) => {
             error!(ctx, target: "honk", "lan_ingress route fail: {}", _error);
-            if udp_claimed {
-                crate::contrack::remove_udp_preparing(&pkt.tuples.five);
+            if pkt.l4proto == IPPROTO_UDP && !short_lived_udp {
+                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
             }
             return Err(TC_ACT_SHOT);
         }
@@ -809,7 +749,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         decision.handoff_outbound()
     };
 
-    let mut udp_published = true;
     pkt.trace_id = 0;
     if (short_lived_udp || pkt.l4proto == IPPROTO_TCP)
         && !offload_direct
@@ -837,7 +776,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 pkt.tuples.dscp,
                 offload_direct,
             );
-            crate::contrack::publish_routing_meta(&mut state.meta, meta);
+            state.meta = meta;
+            if !crate::contrack::tcp::publish_tcp_routing(&pkt.tuples.five, state) {
+                return Err(TC_ACT_SHOT);
+            }
         }
     } else if pkt.l4proto == IPPROTO_UDP {
         let unresolved_direct = outbound == OUTBOUND_DIRECT && !offload_direct;
@@ -856,28 +798,18 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                     && udp_has_quic_long_header(ctx, link_h_len, pkt)));
 
         if stage_required && flags & DATAPATH_FLAG_NFQ_ENABLED != 0 {
-            let Some(epoch) = crate::maps::begin_udp_decision() else {
-                if udp_claimed {
-                    crate::contrack::remove_udp_preparing(&pkt.tuples.five);
-                }
-                return Err(TC_ACT_SHOT);
-            };
             let current_nfq_flags = crate::maps::datapath_flags();
             let verdict = if flags & DATAPATH_FLAG_NFQ_READY == 0
                 || current_nfq_flags & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
                     != (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-                || !udp_claimed
             {
-                if udp_claimed {
-                    crate::contrack::remove_udp_preparing(&pkt.tuples.five);
-                }
+                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
                 Err(TC_ACT_SHOT)
             } else {
                 let pending_meta =
                     crate::contrack::build_routing_meta(meta_outbound, mark, must, pkt.tuples.dscp);
                 stage_udp_decision(ctx, pkt, unsafe { pending_meta.raw }, routing_generation)
             };
-            crate::maps::end_udp_decision(epoch);
             return verdict;
         }
 
@@ -892,45 +824,23 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             pkt.tuples.dscp,
             offload_direct,
         );
-        if udp_claimed {
-            let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
-                crate::contrack::remove_udp_preparing(&pkt.tuples.five);
-                return Err(TC_ACT_SHOT);
-            };
-            let state = unsafe { &mut (*scratch_ptr).state };
-            crate::contrack::populate_udp_conn_state(
-                state,
-                meta,
-                &pkt.ethh.src_addr,
-                UdpDecisionState::None,
-                0,
-            );
-            state.trace_id = pkt.trace_id;
-            udp_published = crate::contrack::publish_claimed_udp_state(&pkt.tuples.five, state);
-            if !udp_published {
-                crate::contrack::remove_udp_preparing(&pkt.tuples.five);
-            }
-        } else {
-            let state = crate::contrack::mark_udp_seen(
-                &pkt.tuples.five,
-                0u8,
-                Some(&meta_outbound),
-                Some(&mark),
-                Some(&must),
-                Some(&pkt.ethh.src_addr),
-                pkt.tuples.dscp,
-                None,
-                0,
-                pkt.trace_id,
-                0,
-            );
-            if let Some(state) = state {
-                state.state = UdpDecisionState::None as u8;
-                state.decision_token = 0;
-                crate::contrack::publish_routing_meta(&mut state.meta, meta);
-            } else {
-                udp_published = false;
-            }
+        let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
+            crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+            return Err(TC_ACT_SHOT);
+        };
+        let state = unsafe { &mut (*scratch_ptr).state };
+        crate::contrack::udp::populate_udp_conn_state(
+            state,
+            meta,
+            &pkt.ethh.src_addr,
+            UdpDecisionState::None,
+            0,
+            pkt.incarnation,
+        );
+        state.trace_id = pkt.trace_id;
+        if !crate::contrack::udp::publish_claimed_udp_state(&pkt.tuples.five, state) {
+            crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+            return Err(TC_ACT_SHOT);
         }
     }
 
@@ -941,10 +851,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
-        return Err(TC_ACT_SHOT);
-    }
-
-    if pkt.l4proto == IPPROTO_UDP && !short_lived_udp && !udp_published {
         return Err(TC_ACT_SHOT);
     }
 
@@ -975,28 +881,20 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
     let redirect_must = if outbound == OUTBOUND_BLOCK { 0 } else { must };
-    let dns_fragment_epoch =
-        if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port == 53 && pkt.is_fragmented != 0 {
-            // Non-host Ethernet traffic may be bridged without inet prerouting, even before
-            // an interface watcher has installed the destination port's egress fence.
-            if link_h_len != 0 && unsafe { (*ctx.skb.skb).pkt_type } != 0 {
-                return Err(TC_ACT_SHOT);
-            }
-            let Some(epoch) = crate::maps::begin_udp_decision() else {
-                return Err(TC_ACT_SHOT);
-            };
-            // Read readiness inside the epoch so its fence covers publication.
-            let current_nfq_flags = crate::maps::datapath_flags();
-            if current_nfq_flags & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-                != (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-            {
-                crate::maps::end_udp_decision(epoch);
-                return Err(TC_ACT_SHOT);
-            }
-            Some(epoch)
-        } else {
-            None
-        };
+    if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port == 53 && pkt.is_fragmented != 0 {
+        // Non-host Ethernet traffic may be bridged without inet prerouting, even before
+        // an interface watcher has installed the destination port's egress fence.
+        if link_h_len != 0 && unsafe { (*ctx.skb.skb).pkt_type } != 0 {
+            return Err(TC_ACT_SHOT);
+        }
+        // Re-read readiness before publication; the kernel grace barrier drains this invocation.
+        let current_nfq_flags = crate::maps::datapath_flags();
+        if current_nfq_flags & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+            != (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+        {
+            return Err(TC_ACT_SHOT);
+        }
+    }
     let verdict = redirect_lan_packet_to_control_plane(
         ctx,
         link_h_len,
@@ -1005,14 +903,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             crate::contrack::build_routing_meta(meta_outbound, mark, redirect_must, pkt.tuples.dscp)
                 .raw
         },
-        handoff_mode,
+        aux_policy,
         0,
         routing_generation,
         pkt.trace_id,
+        pkt.incarnation,
     );
-    if let Some(epoch) = dns_fragment_epoch {
-        crate::maps::end_udp_decision(epoch);
-    }
     verdict
 }
 
@@ -1038,7 +934,17 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto == IPPROTO_TCP {
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        let _ = crate::contrack::mark_tcp_seen(
+        let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
+            &reversed_key,
+            crate::contrack::tcp::TcpSynRole::ObservedReverse,
+        );
+        if crate::contrack::is_new_tcp_connection(&pkt.tcph) {
+            if !tcp_publisher.acquire(ctx, &pkt.tcph) {
+                return Err(TC_ACT_SHOT);
+            }
+            pkt.incarnation = tcp_publisher.incarnation;
+        }
+        let _ = crate::contrack::tcp::mark_tcp_seen(
             &reversed_key,
             &pkt.tcph,
             1u8,
@@ -1050,7 +956,11 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             None,
             0,
             0,
+            &tcp_publisher,
         );
+        if crate::contrack::tuple_unavailable(&reversed_key) {
+            return Err(TC_ACT_SHOT);
+        }
     } else if pkt.l4proto == IPPROTO_UDP {
         let src_port = u16::from_be_bytes(pkt.udph.src);
         let dst_port = u16::from_be_bytes(pkt.udph.dst);
@@ -1060,7 +970,10 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        let _ = crate::contrack::mark_udp_seen(
+        if crate::contrack::tuple_unavailable(&reversed_key) {
+            return Err(TC_ACT_SHOT);
+        }
+        let _ = crate::contrack::udp::mark_udp_seen(
             &reversed_key,
             1u8,
             None,
@@ -1073,6 +986,9 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             0,
             0,
         );
+        if crate::contrack::tuple_unavailable(&reversed_key) {
+            return Err(TC_ACT_SHOT);
+        }
     }
 
     Ok(TC_ACT_PIPE)
@@ -1087,13 +1003,9 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
 
-    // listener_l4proto is stored in cb[1] only when the control-plane handoff
-    // needs an explicit listener assignment (UDP or TCP SYN, including first
-    // fragments that still expose those headers).  Established TCP can return
-    // to the stack without bpf_sk_assign; the kernel will find the child
-    // socket via normal socket lookup.
+    // TCP must resolve established/TIME_WAIT owners before sk_lookup selects a listener.
     let listener_l4proto = (unsafe { (*ctx.skb.skb).cb[1] }) as u8;
-    if listener_l4proto != 0 && listener_l4proto != IPPROTO_TCP && listener_l4proto != IPPROTO_UDP {
+    if listener_l4proto != 0 && listener_l4proto != IPPROTO_UDP {
         return Err(TC_ACT_SHOT);
     }
     let route_mark = unsafe { (*ctx.skb.skb).cb[2] };
@@ -1106,48 +1018,38 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
         }
         route_mark
     };
-    ctx.set_mark(mark);
     if listener_l4proto == IPPROTO_UDP {
-        // A delayed datagram must retain its own route, not the latest tuple owner.
+        ctx.set_mark(mark);
         unsafe { (*ctx.skb.skb).priority = (*ctx.skb.skb).cb[3] };
+    } else {
+        // Restore only after the namespace crossing has scrubbed link metadata.
+        let low = unsafe { (*ctx.skb.skb).cb[3] };
+        let high = unsafe { (*ctx.skb.skb).cb[4] };
+        if high & 0xff000000 != 0 {
+            return Err(TC_ACT_SHOT);
+        }
+        ctx.set_mark(TPROXY_MARK | (low & 0x00ffffff));
+        unsafe { (*ctx.skb.skb).priority = (low >> 24) | (high << 8) };
     }
     // Redirected frames may still carry the original destination MAC.
     let _ = ctx.change_type(0);
-    if listener_l4proto != 0 {
-        let _ = assign_listener(ctx, listener_l4proto);
+    if listener_l4proto == IPPROTO_UDP {
+        let _ = assign_udp_listener(ctx);
     }
 
     Ok(TC_ACT_OK)
 }
 
-/// SockMap keys for `LISTEN_SOCKET_MAP`, shared with `sk_lookup.rs` and the
-/// userspace publish path: 0 = TCP4, 1 = TCP6, 2.. = UDP4 group,
-/// 2 + UDP_LISTENER_COUNT.. = UDP6 group.
-use crate::sk_lookup::{KEY_TCP4, KEY_TCP6, KEY_UDP4_BASE, KEY_UDP6_BASE, listener_hash};
+use crate::sk_lookup::{KEY_UDP4_BASE, KEY_UDP6_BASE, listener_hash};
 
-/// Assign the TPROXY listener socket to the current skb so the kernel delivers
-/// the packet to the transparent proxy listener instead of performing a normal
-/// route lookup.
-///
-/// Ported from Go dae's `assign_listener` in `control/kern/tproxy.c`.  Uses
-/// `bpf_sk_assign` via a SOCKMAP lookup — the same proven pattern employed by
-/// the `tproxy_sk_lookup` program in `sk_lookup.rs`, shared via
-/// [`sk::sk_assign_by_index`].  UDP flows are hashed across the parallel
-/// listener group so each userspace receive loop drains a subset of flows.
 #[inline(always)]
-fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> {
-    // SockMap keys differentiate IPv4 vs IPv6 to match the per-family
-    // listeners published by userspace.
+fn assign_udp_listener(ctx: &TcContext) -> Result<(), c_long> {
     let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
-    let key = if listener_l4proto == IPPROTO_TCP {
-        if is_v6 { KEY_TCP6 } else { KEY_TCP4 }
+    let h = udp_listener_hash(ctx, is_v6);
+    let key = if is_v6 {
+        KEY_UDP6_BASE + h
     } else {
-        let h = udp_listener_hash(ctx, is_v6);
-        if is_v6 {
-            KEY_UDP6_BASE + h
-        } else {
-            KEY_UDP4_BASE + h
-        }
+        KEY_UDP4_BASE + h
     };
 
     let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
@@ -1213,17 +1115,18 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     if parse_packet(ctx, ETH_HLEN, pkt) != 0 {
         return Err(TC_ACT_OK);
     }
+    let mut canonical: TuplesKey = unsafe { mem::zeroed() };
+    crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut canonical);
+    if crate::contrack::tuple_unavailable(&canonical) {
+        return Err(TC_ACT_SHOT);
+    }
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five).reverse();
 
-    let entry = match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let entry = match crate::auxiliary::reverse_redirect(&canonical, &redirect_tuple, now)
+        .map_err(|_| TC_ACT_SHOT)?
+    {
         Some(entry) => {
-            let entry = unsafe { &mut *entry };
-            let now = unsafe { bpf_ktime_get_ns() };
-            if now.wrapping_sub(entry.last_seen_ns)
-                >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-            {
-                entry.last_seen_ns = now;
-            }
             crate::stats::count_rx(ctx, entry.outbound);
             entry
         }

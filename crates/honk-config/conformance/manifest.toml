@@ -1788,7 +1788,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-04"
-source = { file = "doc/en/reference/nodes.md", lines = "351-356" }
+source = { file = "doc/en/reference/nodes.md", lines = "355-360" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2105,7 +2105,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-04"
-source = { file = "doc/zh/reference/nodes.md", lines = "347-352" }
+source = { file = "doc/zh/reference/nodes.md", lines = "351-356" }
 wrap = ""
 layer = "structure"
 honk = "accept"

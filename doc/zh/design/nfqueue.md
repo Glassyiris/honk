@@ -107,7 +107,7 @@ Watchdog 独立检查被持有的 cell，并强制执行硬持有上限。Token�
 Reload 和 shutdown 共用同一 producer fence：
 
 1. 发布 `DATAPATH_FLAG_NFQ_READY=false`。现在需要暂存的新流会 fail closed。
-2. 翻转 `UDP_DECISION_EPOCH`，等待旧 per-CPU `UDP_DECISION_INFLIGHT` 槽归零，再移除残留的 `Preparing` 和 `Pending` conn state。之后延迟到达的 queue delivery 会因 token lookup 失败而终止。
+2. 完成同步 `RETIRE_GRACE_ROOT` barrier，再以有界、检查 incarnation 的 tuple-fence batch 移除残留 `Preparing`、`Pending`、`Aborted` 状态。延迟 queue delivery 随后因 token lookup 失败而终止；descriptor generation 发布仍对排队 DNS fragment 实施 fence。
 3. 关闭 correlator admission；在改变 runtime 所有权前 drain 或 cancel verdict guard、initializer lease、scheduled token cleanup、endpoint tombstone 和 retirement work。
 4. 成功 reload 会发布 replacement runtime generation，最后再重开 correlator admission 和 readiness。Shutdown 会 detach producer、关闭 queue 所有权，并最后删除 `inet honk_nfqueue`。
 
@@ -115,16 +115,18 @@ Listener、queue、watchdog、cleanup、verdict 或 retirement 生命周期中�
 
 ### 精确 tuple 退役
 
-Retirement 以 `BPF_NOEXIST` 插入 `UDP_DECISION_RETIRE_FENCE[tuple] = token`，因此并发的新 owner 无法替换该 fence。随后翻转 epoch，等待 pre-fence reader 退出，并重新验证 conn state、token、handoff 和 redirect track。只删除匹配的辅助项与 conn state；之后释放精确 fence。不匹配时保留更新的 tuple incarnation 并 fail closed。
+Retirement 先发布 `RETIRE_ACTIVE`，再用 `BPF_NOEXIST` 插入各 `RETIRE_FENCE[tuple]`，value 中独立保存唯一退役操作 owner 与 decision token。成功重装私有 `RETIRE_GRACE_ROOT` 的同一个 inner map 会同步排空 fence 前的 non-sleepable 读者。排他期间重新验证捕获的 incarnation、token、state、handoff 与 redirect 所有权后才删除。Batch 对 tuple fence 去重，但保留每个请求的结果。释放时逐一验证 owner；保留实际部分删除计数及操作/释放两类错误。无法解决的所有权禁止继续准入。暂存 commit 也使用同一 fence/grace 协议。
 
-WAN 用户态 UDP 即使 token 为零也使用同一 fence：显式 `RoutingMeta` 所有权 bit 允许退役带 mark 的 direct/must endpoint，而不删除原生直连状态。任何删除前都必须确认两类辅助项的 token 仍为零；conn state 缺失或已被替代时保留全部辅助项。旧 LAN token-zero 退役仍只清理 conn state。
+WAN 与 LAN 用户态 UDP 即使 token 为零也使用同一 fence：endpoint 保留准入时捕获的 incarnation，WAN ownership bit 区分带 mark 的 direct/must 与原生直连。事务内先回收匹配的辅助项，再回收 conn-state，过期 conn 清理也相同，使新 incarnation 能复用 tuple。遇到外来 token/incarnation 元数据时保留原项并拒绝操作；conn 所有权缺失或被替代，不授权删除其他 owner。
+
+内核 producer 在成功发布前失败时，记录捕获 incarnation 和实际已分配 token 的终态 `Aborted`（尚未分配则为零），不删除 tuple 项，也不把已完成的 Pending/native/proxy/block 改成 Aborted。Preparing 与 Aborted follower 都不能续期时间戳；Aborted 不得激活或转发，立即满足精确 fenced hint/janitor 清理条件。全部物理 tuple 回收仍共用后端协议。
 
 ## Sequence 耗尽与 generation 轮转
 
 耗尽使用生命周期 fence，而不会重置仍存活的 allocator：
 
 1. Fence readiness，quiesce 内核 stager，cancel 并 drain 用户空间 cell，再对固定队列执行 hard rebind，确保旧的被持有 skb 和 guard 无法跨越轮转存活。
-2. 检查所有四个存活的 token-bearing map：`CONN_STATE_MAP`、`UDP_DECISION_RETIRE_FENCE`、`ROUTING_HANDOFF_MAP` 和 `REDIRECT_TRACK`。
+2. 检查全部四个存活 token-bearing map：`CONN_STATE_MAP`、`RETIRE_FENCE`（读取 `decision_token`，不是操作 owner）、`ROUTING_HANDOFF_MAP` 和 `REDIRECT_TRACK`。
 3. 仅当候选 generation **以及数值上比它更高直至 `3` 的所有 generation** 都不存在于四张 map 中时才重置。从候选值开始的回滚 legacy allocator 恰好可以沿该 suffix 前进，因此只检查候选值会允许 token 重用。
 4. 只有锁定 allocator 重置成功后，才重新开放 admission 和 readiness。
 

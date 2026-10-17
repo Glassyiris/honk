@@ -125,7 +125,7 @@ impl PendingUdpVerdicts {
     pub(super) fn identity_for_lease(lease: &UdpInitLease) -> PendingUdpIdentity {
         PendingUdpIdentity::new(
             FlowKey::new(lease.client_addr(), lease.original_dst()),
-            lease.decision_token(),
+            lease.owner(),
             lease.generation(),
         )
     }

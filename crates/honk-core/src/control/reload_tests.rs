@@ -2229,6 +2229,7 @@ async fn reordered_groups_interrupt_only_their_captured_tcp_owner_without_native
         let mut client = TcpStream::connect(destination).await?;
         let (accepted, source) = listener.accept().await?;
         let handle = cp.spawn_handle();
+        let retirement = crate::control::tests::support::TestRetirement::start(&handle);
         crate::control::tests::store_active_tcp_flow(&handle, destination, source).await?;
         let worker = handle.clone();
         let task = tokio::spawn(async move { worker.serve_connection(accepted, source).await });
@@ -2273,6 +2274,7 @@ async fn reordered_groups_interrupt_only_their_captured_tcp_owner_without_native
         assert_eq!(upstream.read(&mut bytes).await?, 0);
         task.await??;
         assert!(handle.connection_tracker.snapshot().is_empty());
+        retirement.join(&handle).await?;
         Ok::<_, anyhow::Error>(())
     })
     .await?

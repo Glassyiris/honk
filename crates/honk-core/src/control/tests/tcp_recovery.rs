@@ -65,6 +65,7 @@ async fn cold_urltest_refunds_unscheduled_score_work_before_relay_closes() -> an
             },
             1,
         );
+        let retirement = support::TestRetirement::start(&handle);
         let manager = handle.group_manager.read().clone();
         // Trials only serve challengers trailing the selection's completions, so each child's
         // selection needs one before its sibling can hold cold work.
@@ -126,6 +127,7 @@ async fn cold_urltest_refunds_unscheduled_score_work_before_relay_closes() -> an
         drop(upstream);
         drop(client);
         serving.await??;
+        retirement.join(&handle).await?;
         let generation = handle.runtime_registry.read().clone();
         generation.shutdown().await;
         Ok::<_, anyhow::Error>(())
@@ -301,6 +303,7 @@ async fn loopback_recovery(
     )
     .unwrap()
     .spawn_handle();
+    let retirement = support::TestRetirement::start(&handle);
 
     // Warm URLTest measurements: a (1ms) wins over b (50ms).
     handle.alive_set.record_probe_latency(
@@ -397,6 +400,7 @@ async fn loopback_recovery(
             .is_failure_demoted(node_b.id, ProbeDomain::Tcp, IpVersion::V4),
         "the replacement node must stay clean"
     );
+    retirement.join(&handle).await?;
     Ok(())
 }
 
@@ -573,6 +577,7 @@ async fn start_held_flow(
 async fn tcp_score_alternate_shares_primary_absolute_deadline() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let (handle, nodes, release, mut attempts) = held_score_handle(None, false, false);
+    let retirement = support::TestRetirement::start(&handle);
     let (mut client, mut serve) = start_held_flow(&handle, &nodes).await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), attempts.recv())
@@ -592,6 +597,7 @@ async fn tcp_score_alternate_shares_primary_absolute_deadline() -> anyhow::Resul
     tokio::time::timeout(Duration::from_millis(1), &mut serve).await???;
     assert_eq!(client.read(&mut [0; 1]).await?, 0);
     assert!(attempts.try_recv().is_err(), "never admit a third leaf");
+    retirement.join(&handle).await?;
     Ok(())
 }
 
@@ -605,6 +611,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
         None,
     ] {
         let (handle, nodes, release, mut attempts) = held_score_handle(refusal, false, false);
+        let retirement = support::TestRetirement::start(&handle);
         let (_client, serve) = start_held_flow(&handle, &nodes).await?;
         assert_eq!(attempts.recv().await, Some(nodes[0].id));
         if refusal.is_none() {
@@ -626,6 +633,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
                 .alive_set
                 .is_alive_for(nodes[0].id, ProbeDomain::Tcp, IpVersion::V4)
         );
+        retirement.join(&handle).await?;
     }
     Ok(())
 }
@@ -634,6 +642,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
 async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let (handle, nodes, release, mut attempts) = held_score_handle(None, true, false);
+    let retirement = support::TestRetirement::start(&handle);
     let (mut client, serve) = start_held_flow(&handle, &nodes).await?;
     assert_eq!(attempts.recv().await, Some(nodes[0].id));
     release.notify_one();
@@ -643,6 +652,7 @@ async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> an
         attempts.try_recv().is_err(),
         "duplicate A and unchosen B are not alternates"
     );
+    retirement.join(&handle).await?;
     Ok(())
 }
 
@@ -650,6 +660,7 @@ async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> an
 async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyhow::Result<()> {
     use crate::group::SelectionNetwork;
     let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
+    let retirement = support::TestRetirement::start(&handle);
     for (index, node) in nodes.iter().enumerate() {
         handle.alive_set.record_probe_latency(
             node.id,
@@ -675,6 +686,7 @@ async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyho
     assert_eq!(after.business_starts, before.business_starts);
     serve.abort();
     let _ = serve.await;
+    retirement.join(&handle).await?;
     Ok(())
 }
 
@@ -682,6 +694,7 @@ async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyho
 async fn tcp_urltest_retry_after_score_reload_requires_committed_pool() -> anyhow::Result<()> {
     use crate::group::SelectionNetwork;
     let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
+    let retirement = support::TestRetirement::start(&handle);
     for (index, node) in nodes.iter().enumerate() {
         handle.alive_set.record_probe_latency(
             node.id,
@@ -723,5 +736,6 @@ async fn tcp_urltest_retry_after_score_reload_requires_committed_pool() -> anyho
         replacement.score_budget_counters("proxy", SelectionNetwork::Tcp),
         before
     );
+    retirement.join(&handle).await?;
     Ok(())
 }

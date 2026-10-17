@@ -267,10 +267,11 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 
 当前 CI 的真实内核基线是固定的 Ubuntu Linux
 `6.12.0-061200-generic` VM。CI 在 hosted runner 上构建测试 executable，
-再在该 VM 中运行完全相同的产物，不会在 guest 内重新编译。VM 执行 root-only
-路由与集成 gate；`just test-routing` 还会沿真实 root/slot 路径检查生成 policy，
-包括优先级、完整 decision 元数据、容量失败和发布失败保留旧状态。
-`just test-netns` 包含该路由 gate。
+再在该 VM 中运行完全相同的产物，不会在 guest 内重新编译。`just test-routing`
+与依赖它的 `just test-netns` 共用完整、已准备前置条件的一次性 VM gate，
+沿真实 root/slot 路径检查优先级、完整 decision 元数据、容量失败和发布失败保留，
+随后执行所有权/netns 套件。工具链、两个对象及 VM 环境前置条件见
+`honk-real-ebpf-tests` skill；受保护的夹具不在共享宿主机运行。
 
 性能测量及历史原型/实验室记录有意不保留在本设计页。reload 基准定义见
 [`crates/honk-core/benches/reload.rs`](../../../crates/honk-core/benches/reload.rs)；

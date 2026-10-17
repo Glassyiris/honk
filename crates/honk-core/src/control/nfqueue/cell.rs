@@ -28,15 +28,19 @@ impl FlowKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::control) struct PendingUdpIdentity {
     pub(super) key: FlowKey,
-    pub(super) decision_token: u32,
+    pub(super) owner: crate::ebpf::UdpFlowOwner,
     pub(super) endpoint_generation: u64,
 }
 
 impl PendingUdpIdentity {
-    pub(super) fn new(key: FlowKey, decision_token: u32, endpoint_generation: u64) -> Self {
+    pub(super) fn new(
+        key: FlowKey,
+        owner: crate::ebpf::UdpFlowOwner,
+        endpoint_generation: u64,
+    ) -> Self {
         Self {
             key,
-            decision_token,
+            owner,
             endpoint_generation,
         }
     }
@@ -215,7 +219,7 @@ pub(super) fn terminal_cell_is_stale(cell: &FlowCell, decision_token: u32, now: 
     cell.state
         .lock()
         .terminal_expiry()
-        .is_some_and(|expiry| expiry <= now || cell.identity.decision_token != decision_token)
+        .is_some_and(|expiry| expiry <= now || cell.identity.owner.token != decision_token)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

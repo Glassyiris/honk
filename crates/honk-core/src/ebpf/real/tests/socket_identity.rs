@@ -1,0 +1,195 @@
+use super::*;
+use honk_ebpf_common::conn::BpfStatsKey;
+
+#[tokio::test]
+#[ignore = "requires disposable VM, root, cgroup v2, Linux 6.12+, and an eBPF build"]
+async fn allocation_failure_allows_create_connect_and_send_without_identity() {
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-identity-failure-{}", std::process::id()));
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        Some("lo"),
+        "lo",
+        true,
+    )
+    .await
+    .expect("load required identity capture");
+    let stat = BpfStatsKey::SocketIdentityCaptureFailure as u32;
+    let before = backend.get_bpf_stats(stat).unwrap().unwrap_or(0);
+
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // optmem_max is per-netns on the 6.12 floor. No host sysctl or
+                // allocator fault injector is changed by this test.
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+                let mut netlink = crate::netlink::NlSock::new().unwrap();
+                let (loopback, _) = netlink.get_link("lo").unwrap();
+                netlink.set_link_up(loopback, true).unwrap();
+                let mut storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
+                    backend
+                        .bpf_mut()
+                        .unwrap()
+                        .map_mut("SOCKET_IDENTITY")
+                        .unwrap(),
+                )
+                .unwrap();
+                let mut cases = Vec::new();
+                for (domain, address) in [
+                    (socket2::Domain::IPV4, "127.0.0.1:0"),
+                    (socket2::Domain::IPV6, "[::1]:0"),
+                ] {
+                    let listener = std::net::TcpListener::bind(address).unwrap();
+                    let receiver = std::net::UdpSocket::bind(address).unwrap();
+                    receiver
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    let tcp = socket2::Socket::new(
+                        domain,
+                        socket2::Type::STREAM,
+                        Some(socket2::Protocol::TCP),
+                    )
+                    .unwrap();
+                    let udp_connect = socket2::Socket::new(
+                        domain,
+                        socket2::Type::DGRAM,
+                        Some(socket2::Protocol::UDP),
+                    )
+                    .unwrap();
+                    let udp_send = socket2::Socket::new(
+                        domain,
+                        socket2::Type::DGRAM,
+                        Some(socket2::Protocol::UDP),
+                    )
+                    .unwrap();
+                    for socket in [&tcp, &udp_connect, &udp_send] {
+                        assert_eq!(storage.get(socket, 0).unwrap().pid, std::process::id());
+                        // Prepare actual missing capture, without replacing storage
+                        // or simulating the kernel allocation failure.
+                        storage.remove(socket).unwrap();
+                    }
+                    cases.push((domain, listener, receiver, tcp, udp_connect, udp_send));
+                }
+
+                const OPTMEM: &str = "/proc/sys/net/core/optmem_max";
+                struct RestoreOptmem(String);
+                impl Drop for RestoreOptmem {
+                    fn drop(&mut self) {
+                        std::fs::write(OPTMEM, &self.0).expect("restore owned netns optmem_max");
+                    }
+                }
+                let restore = RestoreOptmem(std::fs::read_to_string(OPTMEM).unwrap());
+                // bpf_sk_storage_charge rejects every positive allocation at zero.
+                // All setup sockets and FDs already exist before admission closes.
+                std::fs::write(OPTMEM, "0").unwrap();
+                for (domain, listener, receiver, tcp, udp_connect, udp_send) in &cases {
+                    for (kind, protocol) in [
+                        (socket2::Type::STREAM, socket2::Protocol::TCP),
+                        (socket2::Type::DGRAM, socket2::Protocol::UDP),
+                    ] {
+                        let created = socket2::Socket::new(*domain, kind, Some(protocol)).unwrap();
+                        assert!(matches!(
+                            storage.get(&created, 0),
+                            Err(MapError::KeyNotFound)
+                        ));
+                    }
+                    tcp.connect(&socket2::SockAddr::from(listener.local_addr().unwrap()))
+                        .unwrap();
+                    udp_connect
+                        .connect(&socket2::SockAddr::from(receiver.local_addr().unwrap()))
+                        .unwrap();
+                    udp_send
+                        .send_to(
+                            b"unnamed",
+                            &socket2::SockAddr::from(receiver.local_addr().unwrap()),
+                        )
+                        .unwrap();
+                    let mut bytes = [0; 7];
+                    assert_eq!(receiver.recv(&mut bytes).unwrap(), bytes.len());
+                    assert_eq!(&bytes, b"unnamed");
+                    for socket in [tcp, udp_connect, udp_send] {
+                        assert!(matches!(storage.get(socket, 0), Err(MapError::KeyNotFound)));
+                    }
+                }
+                drop(restore);
+
+                // Once the charge is restored, the next hooked operation captures
+                // the identity that the failed attempts left missing.
+                for (_, _, receiver, _, _, udp_send) in &cases {
+                    udp_send
+                        .send_to(
+                            b"allowed",
+                            &socket2::SockAddr::from(receiver.local_addr().unwrap()),
+                        )
+                        .unwrap();
+                    let mut bytes = [0; 7];
+                    assert_eq!(receiver.recv(&mut bytes).unwrap(), bytes.len());
+                    assert_eq!(&bytes, b"allowed");
+                    assert_eq!(storage.get(udp_send, 0).unwrap().pid, std::process::id());
+                }
+            })
+            .join()
+            .expect("identity failure test in owned netns");
+    });
+    assert!(backend.get_bpf_stats(stat).unwrap().unwrap_or(0) >= before + 10);
+    backend.detach_hooks().unwrap();
+    backend.cleanup().await.unwrap();
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).unwrap();
+    }
+    std::fs::remove_dir(pin_root).unwrap();
+}
+
+#[test]
+#[ignore = "requires disposable VM, root, cgroup v2, Linux 6.12+, and an eBPF build"]
+fn unavailable_cgroup_capture_refuses_startup() {
+    std::thread::spawn(|| {
+        detect_cgroup_path().expect("real cgroup2 mount before isolation");
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).unwrap();
+        nix::mount::mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .unwrap();
+        // Remove only this private mount namespace's views, not cgroup hooks
+        // or memberships. This formerly allowed startup with capture disabled.
+        while let Ok(path) = detect_cgroup_path() {
+            nix::mount::umount2(path.as_str(), nix::mount::MntFlags::MNT_DETACH).unwrap();
+        }
+        let pin_root = Path::new("/sys/fs/bpf")
+            .join(format!("honk-identity-unavailable-{}", std::process::id()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let links_before = held_bpf_link_count();
+        let result = runtime.block_on(RealEbpfBackend::load(
+            crate::DEFAULT_BPF_OBJECT,
+            &pin_root,
+            12345,
+            Some("lo"),
+            "lo",
+            true,
+        ));
+        assert!(
+            result.is_err(),
+            "startup allowed missing required cgroup capture"
+        );
+        assert_eq!(
+            held_bpf_link_count(),
+            links_before,
+            "failed startup retained attachments"
+        );
+        std::fs::remove_dir_all(pin_root).unwrap();
+    })
+    .join()
+    .expect("startup refusal in private mount namespace");
+}

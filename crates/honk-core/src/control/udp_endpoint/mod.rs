@@ -9,6 +9,7 @@
 
 #[cfg(test)]
 use self::driver::TRANSPORT_SEND_TIMEOUT;
+use crate::ebpf::UdpFlowOwner;
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;

@@ -56,7 +56,15 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-`pname(...)` routing requires cgroup v2. Without cgroup v2, the remaining features can still start, but process-name routing is disabled.
+cgroup v2 is required. The real datapath attaches socket-identity hooks to the root cgroup and refuses to start without them. The running kernel must also expose raw BTF (`/sys/kernel/btf/vmlinux` or `HONK_VMLINUX_BTF`) and allow fentry/fexit on `tcp_v4_route_req`, `tcp_v4_reqsk_destructor` and `tcp_create_openreq_child` for TCP request ownership. A bound IPv6 TCP listener additionally needs the IPv6 variants, which requires built-in IPv6 (`CONFIG_IPV6=y`); modular IPv6 is refused rather than downgraded to IPv4-only.
+
+Those TCP ownership hooks add these kernel requirements; 32-bit kernels are refused:
+
+```text
+CONFIG_DEBUG_INFO_BTF=y   # unless HONK_VMLINUX_BTF supplies the BTF
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+```
 
 ### bpffs
 

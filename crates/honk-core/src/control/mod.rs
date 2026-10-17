@@ -37,13 +37,13 @@ use udp_ingress::{
     UdpLoopState, UdpSlowPathWork, begin_udp_slow_path, dispatch_udp_slow_path,
     reserve_udp_slow_path, try_admit_udp_slow_path, udp_fast_path,
 };
+mod retirement_worker;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
 mod udp_dial;
 pub mod udp_endpoint;
 mod udp_ingress;
-mod udp_removal;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::udp_endpoint::{EndpointReservation, UdpEndpointPool, UdpInitLease};
@@ -160,6 +160,7 @@ pub struct ControlPlane {
     connection_pool: Arc<ConnectionPool>,
     connection_tracker: Arc<ConnectionTracker>,
     tcp_flow_pins: Arc<TcpFlowPins>,
+    retirement: Arc<retirement_worker::RetirementPort>,
     /// Persistent cache (selector choices, delay samples); opened by `run()`
     /// via `init_cache_db` unless `experimental.cache_file.enabled` is false.
     cache_db: Option<Arc<crate::state::cache::CacheDb>>,
@@ -227,7 +228,7 @@ pub struct ControlPlane {
     iface_watcher: Option<crate::ebpf::real::IfaceWatcher>,
 }
 
-pub(crate) use udp_removal::spawn_udp_removal_worker;
+pub(in crate::control) use retirement_worker::spawn_retirement_worker;
 
 impl ControlPlane {
     #[cfg(feature = "native-api")]

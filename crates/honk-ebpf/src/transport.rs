@@ -47,19 +47,6 @@ pub fn ipv6_optlen(hdr_ext_len: u8) -> u32 {
     (hdr_ext_len as u32 + 1) * 8
 }
 
-#[inline(always)]
-pub fn is_pure_syn(tcph: &TcpHdr) -> bool {
-    tcph.syn() != 0 && tcph.ack() == 0
-}
-
-/// Return `IPPROTO_TCP` when the TCP segment is a pure SYN (no ACK),
-/// or `0` otherwise.  Used by `egress.rs` to populate `cb[1]` for listener
-/// assignment at dae0peer ingress.
-#[inline(always)]
-pub fn tcp_listener_l4proto(tcph: &TcpHdr) -> u8 {
-    if is_pure_syn(tcph) { IPPROTO_TCP } else { 0 }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FragHdr {
@@ -82,6 +69,7 @@ pub struct ParsedPacket {
     pub routing_input: honk_ebpf_common::RoutingInput,
     pub route_witness: honk_ebpf_common::KernelRouteWitness,
     pub trace_id: u32,
+    pub incarnation: u64,
 }
 
 /// Malformed packet: invalid header, bad length, too many extension headers.
@@ -324,7 +312,6 @@ impl ParseTransportExt for ParseTransportCtx {
                     if ret != 0 {
                         return Err(ERR_MALFORMED);
                     }
-                    self.listener_l4proto = tcp_listener_l4proto(&self.tcph);
                 }
                 IPPROTO_UDP => {
                     ret = unsafe {
@@ -438,7 +425,6 @@ impl ParseTransportExt for ParseTransportCtx {
                     if ret != 0 {
                         return Err(ERR_MALFORMED);
                     }
-                    self.listener_l4proto = tcp_listener_l4proto(&self.tcph);
                 }
                 IPPROTO_UDP => {
                     ret = unsafe {
@@ -537,9 +523,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     if unsafe { data.add(l4_offset + mem::size_of::<TcpHdr>()) } > data_end {
                         return Err(ERR_FALLBACK);
                     }
-                    let tcph = unsafe { &*tcph_ptr };
                     self.tcph = unsafe { ptr::read(tcph_ptr) };
-                    self.listener_l4proto = tcp_listener_l4proto(tcph);
                     return Ok(());
                 }
                 IPPROTO_UDP => {
@@ -613,9 +597,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     if unsafe { data.add(offset as usize + mem::size_of::<TcpHdr>()) } > data_end {
                         return Err(ERR_FALLBACK);
                     }
-                    let tcph = unsafe { &*tcph_ptr };
                     self.tcph = unsafe { ptr::read(tcph_ptr) };
-                    self.listener_l4proto = tcp_listener_l4proto(tcph);
                     return Ok(());
                 }
                 IPPROTO_UDP => {
@@ -713,6 +695,7 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
     out.l4proto = tctx.l4proto;
     out.listener_l4proto = tctx.listener_l4proto;
     out.is_fragmented = tctx.is_fragmented;
+    out.incarnation = 0;
     tctx.fill_tuples(&mut out.tuples);
     0
 }

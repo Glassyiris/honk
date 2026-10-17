@@ -1,3 +1,4 @@
+use super::handoff::RetireAck;
 use super::overall_dial_timeout;
 use super::routing::{build_connection_info, connection_chains};
 use crate::control::*;
@@ -288,7 +289,7 @@ impl ControlPlaneHandle {
         });
         #[cfg(feature = "native-api")]
         let mut terminal = None;
-        let close = self
+        let mut close = self
             .connection_tracker
             .is_enabled()
             .then(|| CloseCompletion(CloseSignal::new()));
@@ -328,6 +329,14 @@ impl ControlPlaneHandle {
                         {
                             terminal = Some(TcpTerminal::DnsInterceptCompleted);
                         }
+                        anyhow::ensure!(
+                            flow.retire(RetireAck {
+                                close: close.take(),
+                                outbound: None
+                            })
+                            .await,
+                            "TCP DNS retirement failed"
+                        );
                         return Ok(());
                     }
                 } else {
@@ -953,7 +962,6 @@ impl ControlPlaneHandle {
                             debug!("Failed to write sniffed bytes to proxy: {}", error);
                             self.stats.record_error(&outbound_name, outbound_kind);
                         }
-                        drop(outbound_guard);
                         if let Some(reporter) = &score_reporter {
                             reporter.finish(if intentionally_closed {
                                 crate::group::ScoreOutcome::Cancelled
@@ -962,7 +970,14 @@ impl ControlPlaneHandle {
                             });
                         }
                         drop(proxy_stream);
-                        anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                        anyhow::ensure!(
+                            flow.retire(RetireAck {
+                                close: close.take(),
+                                outbound: Some(outbound_guard)
+                            })
+                            .await,
+                            "TCP retirement failed"
+                        );
                         return Ok(());
                     }
                 };
@@ -1034,7 +1049,14 @@ impl ControlPlaneHandle {
                     {
                         terminal = Some(TcpTerminal::IntentionalRetirement);
                     }
-                    anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                    anyhow::ensure!(
+                        flow.retire(RetireAck {
+                            close: close.take(),
+                            outbound: Some(outbound_guard)
+                        })
+                        .await,
+                        "TCP retirement failed"
+                    );
                     return Ok(());
                 };
                 #[cfg(feature = "native-api")]
@@ -1075,8 +1097,14 @@ impl ControlPlaneHandle {
                         }
                     }
                 }
-                anyhow::ensure!(flow.retire().await, "TCP retirement failed");
-                drop(outbound_guard);
+                anyhow::ensure!(
+                    flow.retire(RetireAck {
+                        close: close.take(),
+                        outbound: Some(outbound_guard)
+                    })
+                    .await,
+                    "TCP retirement failed"
+                );
 
                 if relay_succeeded && outbound_name != "direct" && outbound_name != "block" {
                     self.replenish_tcp_pool(
@@ -1171,6 +1199,15 @@ mod score_tests {
                         test_dns_forwarder(),
                     )?;
                     let handle = plane.spawn_handle();
+                    let (fatal_tx, mut removal_errors) = mpsc::unbounded_channel();
+                    let removals = spawn_retirement_worker(
+                        Arc::clone(&plane.udp_pool),
+                        Arc::clone(&handle.ebpf),
+                        Arc::clone(&handle.connection_tracker),
+                        fatal_tx,
+                        Arc::clone(&handle.tcp_flow_pins),
+                        Arc::clone(&handle.retirement),
+                    );
                     let manager = handle.group_manager.read().clone();
                     let seed = manager
                         .feedback_for_node(
@@ -1254,6 +1291,10 @@ mod score_tests {
                     }
                     let runtime = handle.runtime_registry.read().clone();
                     runtime.shutdown().await;
+                    plane.udp_pool.shutdown().await;
+                    handle.retirement.sink.lock().take();
+                    removals.await?;
+                    assert_eq!(removal_errors.try_recv().is_ok(), retirement_fails);
                 }
             }
             Ok::<_, anyhow::Error>(())

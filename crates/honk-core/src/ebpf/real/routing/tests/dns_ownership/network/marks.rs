@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::UdpDecisionCommitResult;
+use crate::ebpf::{RetireKind, UdpDecisionCommitResult, retire_fixture};
 use crate::netlink::{FAM_V4, FAM_V6, PROTO_STATIC, ROUTE_UNICAST, SCOPE_UNIVERSE};
 use honk_outbound::proxy::ProxyRegistry;
 use std::io::{Read, Write};
@@ -7,6 +7,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const RULE_MARK: u32 = 0x200;
 const POLICY_TABLE: u32 = 123;
+
+fn retire_udp_incarnation(
+    backend: &mut RealEbpfBackend,
+    key: &TuplesKey,
+    incarnation: u64,
+) -> UdpDecisionCommitResult {
+    retire_fixture(
+        backend,
+        *key,
+        RetireKind::Udp {
+            token: 0,
+            incarnation: Some(incarnation),
+            pending_only: false,
+        },
+    )
+    .1
+}
 
 fn attach_wan(backend: &mut RealEbpfBackend, interface: &str) {
     load_classifier(backend, "wan_egress_l2");
@@ -122,20 +139,16 @@ fn direct_marks_route_native_lan_v4_v6_tcp_udp_and_cached_packets() {
                     if port != 53 {
                         let source = client.local_addr().unwrap();
                         let key = tuple(source.ip(), target, source.port(), port, IPPROTO_UDP);
-                        let state = fixture
-                            .backend
-                            .udp_conn_state_lookup(&key)
-                            .unwrap()
-                            .unwrap();
+                        let state = fixture.backend.conn_state_lookup(&key).unwrap().unwrap();
                         assert_eq!(
-                            fixture.backend.remove_udp_flow(&key, 0).unwrap(),
+                            retire_udp_incarnation(&mut fixture.backend, &key, state.incarnation),
                             UdpDecisionCommitResult::Superseded
                         );
                         assert_eq!(
                             unsafe {
                                 fixture
                                     .backend
-                                    .udp_conn_state_lookup(&key)
+                                    .conn_state_lookup(&key)
                                     .unwrap()
                                     .unwrap()
                                     .meta
@@ -170,7 +183,7 @@ fn direct_marks_route_native_lan_v4_v6_tcp_udp_and_cached_packets() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
-fn direct_socket_marks_route_v4_v6_tcp_udp_without_cookie_identity_or_recapture() {
+fn direct_socket_marks_route_v4_v6_tcp_udp_without_socket_identity_or_recapture() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
         let targets = policy_targets(&fixture);
@@ -191,10 +204,6 @@ fn direct_socket_marks_route_v4_v6_tcp_udp_without_cookie_identity_or_recapture(
             )
             .unwrap();
         attach_wan(&mut fixture.backend, "hrwan0");
-        assert_eq!(
-            hash_count::<u64, PIDName>(&fixture.backend, "COOKIE_PID_MAP"),
-            0
-        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -273,11 +282,7 @@ fn direct_socket_marks_route_v4_v6_tcp_udp_without_cookie_identity_or_recapture(
             }
         });
         assert_eq!(
-            hash_count::<u64, PIDName>(&fixture.backend, "COOKIE_PID_MAP"),
-            0
-        );
-        assert_eq!(
-            hash_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
+            flow_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
             0
         );
         fixture.assert_no_redirects();
@@ -496,26 +501,22 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     IPPROTO_UDP,
                 );
                 let native = in_netns(&fixture.resolver_ns, || udp_socket(destination));
-                let mut cookie = 0u64;
-                let mut size = mem::size_of_val(&cookie) as libc::socklen_t;
-                assert_eq!(
-                    unsafe {
-                        libc::getsockopt(
-                            client.as_raw_fd(),
-                            libc::SOL_SOCKET,
-                            libc::SO_COOKIE,
-                            (&mut cookie as *mut u64).cast(),
-                            &mut size,
-                        )
-                    },
-                    0
-                );
-                let mut identity = PIDName {
+                let mut identity = SocketIdentity {
                     pid: std::process::id(),
                     ..Default::default()
                 };
                 identity.pname[..10].copy_from_slice(b"mark-owner");
-                fixture.backend.cookie_pid_store(cookie, &identity).unwrap();
+                aya::maps::SkStorage::<_, SocketIdentity>::try_from(
+                    fixture
+                        .backend
+                        .bpf_mut()
+                        .unwrap()
+                        .map_mut("SOCKET_IDENTITY")
+                        .unwrap(),
+                )
+                .unwrap()
+                .insert(&client, identity, 0)
+                .unwrap();
                 let policy = |mark| {
                     let must = if must { "must, " } else { "" };
                     let config = honk_config::parser::parse_dae_config(&format!(
@@ -530,7 +531,19 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     .unwrap();
                 client.send_to(b"initial", destination).unwrap();
                 assert_eq!(recv_marked(receiver).0, b"initial");
-                let initial = fixture.backend.routing_handoff_take(&key).unwrap().unwrap();
+                let initial = fixture
+                    .backend
+                    .routing_handoff_lookup(&key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fixture
+                        .backend
+                        .udp_flow_owner(0, fixture.backend.conn_state_lookup(&key).unwrap())
+                        .unwrap()
+                        .incarnation(),
+                    Some(initial.incarnation)
+                );
                 assert_eq!(initial.result.mark, RULE_MARK);
                 assert_eq!(initial.result.must, u8::from(must));
                 assert_eq!(initial.result.pname, identity.pname);
@@ -538,10 +551,13 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
 
                 fixture
                     .backend
-                    .with_udp_retirement_fence(&key, 0, |backend| {
+                    .with_retirement_fences(&[(key, 0)], |backend| {
                         client.send_to(b"fenced-cached", destination).unwrap();
                         assert_udp_empty(receiver);
-                        assert!(backend.routing_handoff_take(&key)?.is_none());
+                        assert_eq!(
+                            backend.routing_handoff_lookup(&key)?.unwrap().incarnation,
+                            initial.incarnation
+                        );
                         Ok(UdpDecisionCommitResult::Applied)
                     })
                     .unwrap();
@@ -550,26 +566,19 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     .backend
                     .publish_routing_plan(&policy(new_mark), &[])
                     .unwrap();
-                // Repopulate the consumed handoff AFTER publication: it is still
-                // cached X and fresh enough for the one-second no-rewrite path.
+                // Non-destructive admission keeps cached X across policy publication.
                 client.send_to(b"cached-old", destination).unwrap();
                 assert_eq!(recv_marked(receiver).0, b"cached-old");
                 assert_eq!(handoff(&fixture.backend, &key).result.mark, RULE_MARK);
                 assert_eq!(
-                    fixture.backend.remove_udp_flow(&key, 0).unwrap(),
+                    retire_udp_incarnation(&mut fixture.backend, &key, initial.incarnation),
                     UdpDecisionCommitResult::Applied
                 );
+                assert!(fixture.backend.conn_state_lookup(&key).unwrap().is_none());
                 assert!(
                     fixture
                         .backend
-                        .udp_conn_state_lookup(&key)
-                        .unwrap()
-                        .is_none()
-                );
-                assert!(
-                    fixture
-                        .backend
-                        .routing_handoff_take(&key)
+                        .routing_handoff_lookup(&key)
                         .unwrap()
                         .is_none()
                 );
@@ -582,11 +591,11 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                 );
                 fixture
                     .backend
-                    .with_udp_retirement_fence(&key, 0, |backend| {
+                    .with_retirement_fences(&[(key, 0)], |backend| {
                         client.send_to(b"fenced-new", destination).unwrap();
                         assert_udp_empty(receiver);
-                        assert!(backend.udp_conn_state_lookup(&key)?.is_none());
-                        assert!(backend.routing_handoff_take(&key)?.is_none());
+                        assert!(backend.conn_state_lookup(&key)?.is_none());
+                        assert!(backend.routing_handoff_lookup(&key)?.is_none());
                         assert!(
                             backend
                                 .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
@@ -598,7 +607,20 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
 
                 client.send_to(b"new-policy", destination).unwrap();
                 assert_eq!(recv_marked(receiver).0, b"new-policy");
-                let selected = fixture.backend.routing_handoff_take(&key).unwrap().unwrap();
+                let selected = fixture
+                    .backend
+                    .routing_handoff_lookup(&key)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(selected.incarnation, initial.incarnation);
+                assert_eq!(
+                    retire_udp_incarnation(&mut fixture.backend, &key, initial.incarnation),
+                    UdpDecisionCommitResult::Superseded
+                );
+                assert_eq!(
+                    handoff(&fixture.backend, &key).incarnation,
+                    selected.incarnation
+                );
                 assert_eq!(selected.result.mark, new_mark);
                 assert_eq!(selected.result.must, u8::from(must));
                 assert_eq!(selected.result.outbound, OutboundIndex::Direct as u8);
@@ -630,11 +652,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     let (size, _) = native.recv_from(&mut bytes).unwrap();
                     assert_eq!(&bytes[..size], b"new-mark-dial");
                 });
-                let state = fixture
-                    .backend
-                    .udp_conn_state_lookup(&key)
-                    .unwrap()
-                    .unwrap();
+                let state = fixture.backend.conn_state_lookup(&key).unwrap().unwrap();
                 let track_key = RedirectTuple::from_tuples(&key);
                 let track = fixture
                     .backend
@@ -664,13 +682,17 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                             )
                             .unwrap();
                     } else {
-                        fixture.backend.udp_conn_state_remove(&key).unwrap();
+                        // Inject absent authoritative state while retaining auxiliaries.
+                        fixture
+                            .backend
+                            .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &key)
+                            .unwrap();
                     }
                     let mut entry = selected;
                     entry.result.decision_token = handoff_token;
                     fixture
                         .backend
-                        .hash_insert("ROUTING_HANDOFF_MAP", &key, &entry)
+                        .flow_insert("ROUTING_HANDOFF_MAP", &key, &entry)
                         .unwrap();
                     fixture
                         .backend
@@ -682,11 +704,14 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                             },
                         )
                         .unwrap();
-                    assert_eq!(fixture.backend.remove_udp_flow(&key, 0).unwrap(), expected);
+                    assert_eq!(
+                        retire_udp_incarnation(&mut fixture.backend, &key, selected.incarnation),
+                        expected
+                    );
                     assert_eq!(
                         fixture
                             .backend
-                            .udp_conn_state_lookup(&key)
+                            .conn_state_lookup(&key)
                             .unwrap()
                             .map(|s| s.decision_token),
                         state_token
@@ -708,14 +733,14 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                 fixture.backend.udp_conn_state_store(&key, &state).unwrap();
                 fixture
                     .backend
-                    .hash_insert("ROUTING_HANDOFF_MAP", &key, &selected)
+                    .flow_insert("ROUTING_HANDOFF_MAP", &key, &selected)
                     .unwrap();
                 fixture
                     .backend
                     .redirect_track_store(&track_key, &track)
                     .unwrap();
                 assert_eq!(
-                    fixture.backend.remove_udp_flow(&key, 0).unwrap(),
+                    retire_udp_incarnation(&mut fixture.backend, &key, selected.incarnation),
                     UdpDecisionCommitResult::Applied
                 );
 
@@ -726,20 +751,16 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     .publish_routing_plan(&policy(0), &[])
                     .unwrap();
                 exchange_udp(&client, &native, destination);
-                let native_state = fixture
-                    .backend
-                    .udp_conn_state_lookup(&key)
-                    .unwrap()
-                    .unwrap();
+                let native_state = fixture.backend.conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(
-                    fixture.backend.remove_udp_flow(&key, 0).unwrap(),
+                    retire_udp_incarnation(&mut fixture.backend, &key, selected.incarnation),
                     UdpDecisionCommitResult::Superseded
                 );
                 assert_eq!(
                     unsafe {
                         fixture
                             .backend
-                            .udp_conn_state_lookup(&key)
+                            .conn_state_lookup(&key)
                             .unwrap()
                             .unwrap()
                             .meta
@@ -822,11 +843,11 @@ fn wan_direct_dns_same_tuple_keeps_each_datagrams_mark_before_userspace_reads() 
             }
         }
         assert_eq!(
-            hash_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
+            flow_count::<TuplesKey, RoutingHandoffEntry>(&fixture.backend, "ROUTING_HANDOFF_MAP"),
             0
         );
         assert_eq!(
-            hash_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP"),
+            flow_count::<TuplesKey, ConnState>(&fixture.backend, "CONN_STATE_MAP"),
             0
         );
         fixture.assert_no_redirects();

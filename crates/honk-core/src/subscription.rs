@@ -922,7 +922,7 @@ fn emit_clash_proxies(
             None => {
                 IndexedOutcome::malformed(ordinal, "proxies", "Clash proxy entry must be an object")
             }
-            Some(mapping) => match clash::parse_clash_proxy(mapping, subscription_id) {
+            Some(mapping) => match clash::parse_clash_proxy(mapping, subscription_id, Some("h3")) {
                 Ok(node) => IndexedOutcome::node(ordinal, "proxies", node),
                 Err(reason) if reason.contains("unsupported") => {
                     IndexedOutcome::unsupported(ordinal, "proxies", reason)

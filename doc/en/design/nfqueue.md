@@ -111,7 +111,7 @@ A watchdog checks held cells independently and enforces the hard hold bound. Sta
 Reload and shutdown share the same producer fence:
 
 1. Publish `DATAPATH_FLAG_NFQ_READY=false`. New flows that require staging now fail closed.
-2. Flip `UDP_DECISION_EPOCH`, wait for the old per-CPU `UDP_DECISION_INFLIGHT` slot to reach zero, then remove residual `Preparing` and `Pending` conn states. A delayed queue delivery subsequently fails token lookup.
+2. Complete the synchronous `RETIRE_GRACE_ROOT` barrier, then remove residual `Preparing`, `Pending` and `Aborted` state in bounded, incarnation-checked tuple-fence batches. A delayed queue delivery subsequently fails token lookup; descriptor-generation publication still fences queued DNS fragments.
 3. Close correlator admission and drain or cancel verdict guards, initializer leases, scheduled token cleanups, endpoint tombstones, and retirement work before changing runtime ownership.
 4. A successful reload publishes the replacement runtime generation and reopens correlator admission and readiness last. Shutdown detaches producers, closes queue ownership, and deletes `inet honk_nfqueue` last.
 
@@ -119,16 +119,18 @@ Failure or ambiguity in listener, queue, watchdog, cleanup, verdict, or retireme
 
 ### Exact tuple retirement
 
-Retirement inserts `UDP_DECISION_RETIRE_FENCE[tuple] = token` with `BPF_NOEXIST`, so a concurrent newer owner cannot replace the fence. It then flips the epoch, waits out pre-fence readers, and revalidates conn state, token, handoff, and redirect track. Only matching auxiliaries and conn state are deleted; the exact fence is released afterward. A mismatch retains the newer tuple incarnation and fails closed.
+Retirement publishes `RETIRE_ACTIVE` and inserts each `RETIRE_FENCE[tuple]` with `BPF_NOEXIST`. The value keeps a unique retirement-operation owner separate from its decision token. A successful same-inner update of the private `RETIRE_GRACE_ROOT` synchronously drains pre-fence non-sleepable readers. Under exclusion, the backend revalidates captured incarnation, token, state, handoff and redirect authority before deleting owned entries. A batch deduplicates tuple fences but retains each request's outcome. Every acquired fence is owner-checked on release; partial deletion counts and both operation/release failures are retained. Unresolved ownership inhibits further admission. Staged commits use this same fence/grace protocol.
 
-WAN userspace UDP shares this fence even with token zero: its explicit `RoutingMeta` ownership bit permits retiring a marked direct/must endpoint without deleting native direct state. Both auxiliary tokens must still be zero before any deletion; missing or superseded conn state preserves all auxiliaries. Legacy LAN token-zero retirement remains conn-state-only.
+WAN and LAN userspace UDP share this fence even with token zero: the endpoint retains its admission incarnation, and the WAN ownership bit distinguishes marked direct/must from native direct state. Matching auxiliaries are reclaimed before conn-state in the same transaction, including expired-conn cleanup, so a new incarnation can reuse the tuple. Foreign token/incarnation metadata is preserved and the operation refuses; missing or superseded conn ownership is not permission to delete another owner.
+
+Before successful publication, a failed kernel producer records terminal `Aborted` with its captured incarnation and actual allocated token (zero if none was allocated). It does not delete tuple entries or convert a completed Pending/native/proxy/block decision. Preparing and Aborted followers cannot renew timestamps; Aborted cannot activate or forward and is immediately eligible for exact fenced hint/janitor cleanup. All physical tuple reclamation stays in the shared backend protocol.
 
 ## Sequence exhaustion and rotation
 
 Exhaustion uses the lifecycle fence rather than resetting a live allocator:
 
 1. Fence readiness, quiesce kernel stagers, cancel and drain userspace cells, and hard-rebind the fixed queue so old held skbs and guards cannot survive rotation.
-2. Inspect all four live token-bearing maps: `CONN_STATE_MAP`, `UDP_DECISION_RETIRE_FENCE`, `ROUTING_HANDOFF_MAP`, and `REDIRECT_TRACK`.
+2. Inspect all four live token-bearing maps: `CONN_STATE_MAP`, `RETIRE_FENCE` (its `decision_token`, never its operation owner), `ROUTING_HANDOFF_MAP`, and `REDIRECT_TRACK`.
 3. Reset only when the candidate generation **and every numerically higher generation through `3`** are absent from all four maps. A rolled-back legacy allocator starting at the candidate can advance through exactly that suffix, so checking only the candidate would permit token reuse.
 4. Reopen admission and readiness only after the locked allocator reset succeeds.
 

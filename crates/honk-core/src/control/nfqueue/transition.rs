@@ -42,10 +42,10 @@ impl PendingUdpVerdicts {
             let result = backend
                 .commit_udp_decision(
                     &identity.tuples(),
-                    identity.decision_token,
+                    identity.owner.token,
                     UdpDecisionTransition::ArmDirect(direct_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("arm direct", error.to_string()))?;
+                .map_err(|error| self.fatal_error("arm direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -107,10 +107,10 @@ impl PendingUdpVerdicts {
             let result = backend
                 .commit_udp_decision(
                     &identity.tuples(),
-                    identity.decision_token,
+                    identity.owner.token,
                     UdpDecisionTransition::ActivateDirect(direct_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("activate direct", error.to_string()))?;
+                .map_err(|error| self.fatal_error("activate direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 let fatal = PendingUdpFatal::new(
@@ -170,10 +170,10 @@ impl PendingUdpVerdicts {
             let result = backend
                 .commit_udp_decision(
                     &identity.tuples(),
-                    identity.decision_token,
+                    identity.owner.token,
                     UdpDecisionTransition::ActivateProxy(final_outbound, final_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("activate proxy", error.to_string()))?;
+                .map_err(|error| self.fatal_error("activate proxy", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -220,10 +220,10 @@ impl PendingUdpVerdicts {
             let result = backend
                 .commit_udp_decision(
                     &identity.tuples(),
-                    identity.decision_token,
+                    identity.owner.token,
                     UdpDecisionTransition::Block,
                 )
-                .map_err(|error| self.fatal_error("block", error.to_string()))?;
+                .map_err(|error| self.fatal_error("block", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -291,21 +291,10 @@ impl PendingUdpVerdicts {
                 drop(backend);
                 return Err(self.expire_unarmed_pending(&cell, identity));
             }
-            let result = backend
-                .abort_pending_udp_flow(&identity.tuples(), identity.decision_token)
-                .map_err(|error| self.fatal_error("abort pending flow", error.to_string()))?;
-            let mismatch = match result {
-                UdpDecisionCommitResult::Applied
-                | UdpDecisionCommitResult::Missing
-                | UdpDecisionCommitResult::Superseded => None,
-                UdpDecisionCommitResult::TokenMismatch => {
-                    self.stats.record_udp_nfqueue_token_mismatch();
-                    Some(UdpDecisionCommitResult::TokenMismatch)
-                }
-                UdpDecisionCommitResult::StateMismatch => {
-                    Some(UdpDecisionCommitResult::StateMismatch)
-                }
-            };
+            let mismatch = self.retire_pending(backend.as_mut(), CleanupRequest::Flow(identity))?;
+            if let Some(refusal) = mismatch {
+                self.record_commit_mismatch(refusal);
+            }
             let verdicts = std::mem::take(verdicts);
             *state = CellState::Dead {
                 expires_at: Instant::now() + TERMINAL_GRACE,
@@ -317,7 +306,7 @@ impl PendingUdpVerdicts {
         self.endpoints.retire_staged_identity(
             identity.client(),
             identity.destination(),
-            identity.decision_token,
+            identity.owner.token,
             identity.endpoint_generation,
         );
         match mismatch {
@@ -363,7 +352,7 @@ impl PendingUdpVerdicts {
         self.endpoints.retire_staged_identity(
             identity.client(),
             identity.destination(),
-            identity.decision_token,
+            identity.owner.token,
             identity.endpoint_generation,
         );
         self.signal_fatal(PendingUdpFatal::new(

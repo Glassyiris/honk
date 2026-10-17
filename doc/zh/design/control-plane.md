@@ -22,12 +22,12 @@
     - `quic.rs`、`packet_sniffer.rs`、`tcp_sniff.rs` — 分别负责 QUIC 解密/重组、逐流嗅探会话与 TCP 负缓存。
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`；[endpoint 事务](#udp-endpoint-流水线)。
     - `probers.rs` — `ProxyHttpProber`、`ProxyUdpProber`；[健康探测](./groups.md#健康状态与探测)。
-    - `janitor.rs` — `BpfJanitor`；[map 维护](./datapath.md#用户空间维护与计数)。
-    - `drain.rs` — `DrainTracker`；[已接受流的排空](#reload-与运行时-generation)。
+    - `janitor.rs` — `BpfJanitor` 的调度与压力策略；`janitor/sweep.rs` 持有 [map 维护](./datapath.md#用户空间维护与计数)的有界扫描与 fenced retirement；`janitor/health.rs` 持有 map 压力与 BPF 失败计数告警。
+    - `retirement_worker.rs` — joined TCP/UDP/hint 退役所有权；`drain.rs` 持有 `DrainTracker` 与[已接受流的排空](#reload-与运行时-generation)。
 
 ## 启动与关闭
 
-- `src/lib.rs` — `run()`、`Cli`/`ClashCommand`、资源限制、后端选择与固定队列启动前置检查（[配置指南](../configuration.md)）。真实实例持有 `/run/honk-core.lock` 并发布 `reload` PID。通过 rtnetlink 创建由 FD 持有的 `daens` 与 L2 netkit `dae0`；仅遇到 `EOPNOTSUPP` 时回退 veth。加载或复用持久化 allocator pin，然后在数据路径准入前启动 NFQUEUE。
+- `src/lib.rs` — `run()`、`Cli`/`ClashCommand`、资源限制、后端选择与固定队列启动前置检查（[配置指南](../configuration.md)）。真实实例持有 `/run/honk-core.lock` 并发布 `reload` PID。`src/daens.rs` 负责由 FD 持有的 `daens`/`dae0` 初始化与有作用域的命名空间切换；`src/sysctl.rs` 负责 sysctl 写入及加固验证。加载或复用持久化 allocator pin，然后在数据路径准入前启动 NFQUEUE。
 
 配置诊断在初始化 tracing 前收集。加载或配置校验提前失败时，先向标准错误输出已有的非终止诊断，每条仅输出一次，再由二进制程序返回一次脱敏后的终止错误。加载成功时，诊断延迟到配置指定的 tracing 订阅器就绪后输出。后续运行时致命错误仍保留原有的日志文件记录。
 
@@ -37,7 +37,7 @@
 2. 加载并校验配置、选择 `global.data_dir`，在任何网络 I/O 前初始化进程旁路 mark，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
 3. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
-5. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
+5. 在真实模式下，`src/daens.rs` 通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过 `daens::with_daens_netns` 进入 `daens`。
 6. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
 7. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
 8. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
@@ -61,7 +61,7 @@ UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | 透明 socket 的 `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | 下文所述的受约束 provenance 规则 |
 
-形成规范 tuple 后，普通非 DNS 流通过 `routing_handoff_take` 消费 `ROUTING_HANDOFF_MAP`。没有 handoff，或出站为 `ControlPlaneRouting` 时，回退到 `Router::route_action`。最终的 `must` 和 `block` 结果不能被 Clash mode 覆盖。该回退不是透明 DNS 的所有权边界。
+真实 TCP 先验证 accepted-FD 所有权，再使用该 socket 不可变的 SYN handoff；证明缺失或被替代时关闭 socket，不选择当前 tuple 元数据。普通 UDP 按捕获的 incarnation 与 decision token 非破坏性读取 handoff。已确认所有权的 `ControlPlaneRouting` 结果，或允许缺少 handoff 的 token-zero UDP，仍可使用 `Router::route_action`。最终 `must` 和 `block` 结果不受 Clash mode 覆盖；透明 DNS 保留独立所有权边界。
 
 端口 53 的控制器与原始转发归属遵循[有序流量规则契约](../reference/routing.md#出站目标与-must)，包括畸形非 `must` UDP 的通用回退。
 
@@ -79,7 +79,7 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 
 `connection/` 是每流 route/sniff/mode/selection 的规范边界。Socket UDP 入口与 NFQUEUE 持有的 payload 都在同一个 `UdpEndpointPool` 中预留相同的 `UdpInitLease`；NFQUEUE 没有第二套 Router 或拨号器，也没有克隆报文、重放或主动重传路径。暂存流在 token 校验的终态转换前计算唯一最终出站与 mark。
 
-`build_tuples_key` 必须用 `mem::zeroed()` 初始化 `TuplesKey`。这个 `#[repr(C)]` key 在 40 字节布局中只有 37 字节字段，内核会散列包括三个 padding 字节在内的全部 40 字节。因此逐字段初始化可能产生用户态无法可靠查询或删除的 key。
+`TuplesKey` 的 40 字节 `#[repr(C)]` 布局包含显式的三字节 `padding` 字段。内核会散列全部 40 字节，因此每个构造入口都必须把该字段置零；`build_tuples_key` 零初始化规范 key，retirement 会拒绝非零 padding。
 
 权威 URLTest 建立失败保留按延迟前三候选的一轮重赛。Score 所属失败可顺序尝试一个不同的合格叶节点，在排名前排除失败身份，即使普通评分仍把它排在第一。Score 两次尝试共享绝对 deadline，并保留固定 generation、Selector 选择和首选真正经过的 final 边。类型化拒绝、本地拨号容量耗尽、取消和关闭均为终态，包括排空竞速时发现的已完成拒绝；应用写入和已建立 relay 从不重放。
 
@@ -196,7 +196,7 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 | 端口 53 入口 slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
 
-不存在单独的 256 条 TCP slow-path 上限。TCP accept 使用由描述符导出的流预算。Endpoint-removal channel 限制为 1024 条消息，每批排空 128 条。非阻塞投递遇到满队列时，去重的 `removal_dirty` 集保留补偿；worker 每批完成后刷新该集合，再确认精确 endpoint tombstone。
+不存在单独的 256 条 TCP slow-path 上限。TCP accept 使用由描述符导出的流预算。现有 removal worker 合并有界 TCP、UDP 和 expiry-hint 输入，每批最多 128 项，共用一次内核 grace。UDP removal 保留 1024 条消息的 channel 与去重 `removal_dirty` 补偿；只有自有 I/O 和后端退役完成后才确认精确 tombstone。
 
 透明 TCP 先等待任一 IP 族监听器变为可读，再预留共享流 permit，最后用非阻塞系统调用完成 accept。因此空闲监听器不占用流容量，达到上限后到达的连接仍留在内核 listen backlog。`/stats` 的 `tcp` 对象提供 `activeFlows`、`limit` 和 `capacity.rejected`；后者统计等待 permit 的 accept-loop，而不是 accept 后被丢弃的连接。动态上限低于 256 时启动会告警；网关部署应提高服务的 `RLIMIT_NOFILE` 限制。
 
@@ -216,7 +216,15 @@ copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的
 
 客户端不发 FIN 或 RST 就消失的情况单独限制：TPROXY TCP listener 启用 TCP keepalive（空闲 3600 秒、间隔 15 秒、4 次探测），accepted socket 继承该设置。静默的客户端约一小时后结束其 relay；仍在线的空闲客户端会应答探测，因此长时间空闲的连接保持打开。该错误是客户端侧的 `TimedOut`，按取消结算 Score。
 
-Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时才会被接管。`TcpFlowPins` 为每个 accepted owner 引用计数该方向 tuple。BPF janitor 跳过已 pin 的 conn-state 和匹配的 redirect 元数据。最后一个 owner 退役时读取当前条目，并且只在 state 与 timestamp 仍匹配已观察 incarnation 时条件删除；旧 relay 不能删除复用的 tuple。
+Accepted TCP FD 在 tuple 路由、pin 或取得清理权限前，必须携带原始 SYN/request 的有效证明；不可变 handoff 与 incarnation 必须匹配当前 conn/handoff/redirect 所有权。证明缺失、过期或被替代时关闭 socket，不删除当前 tuple。准入在同一 backend 读 guard 内完成校验，保留 tuple-local `TcpFlowPins` 引用与精确 `TCP_LIVE_PINS` incarnation。内核 Closing/redirect 老化检查只查询该 incarnation 的原生 pin，使存活的空闲或半关闭 owner 能恢复传输，而不靠 timer 伪造时间戳。新的 SYN 不继承旧 pin。
+
+Janitor 收集阶段在消耗 candidate budget 前排除 pinned TCP，并在 backend 写所有权下再次检查当前 pin。Request 证明过期独立处理：child 的 socket storage 保留自己的证明。退役只使用 guard 捕获的 incarnation，不选择 tuple 的后继占用者。
+
+I/O 完成后，joined retirement worker 持有已准入 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。其 `FlowPin` 在同一 backend 写 guard 内释放 local 与精确 native pin，然后才检查外部 owner；释放失败不能确认清理成功。准入前取消同步 Drop native pin，物理 tuple 回收交给原子 janitor，不声称已确认。控制面的 `RetirementPort` 将 native Drop 错误发往当前 worker epoch 的 critical channel，并通过 joined worker handle 收回 hint receiver。Worker 和 janitor 在关闭告警后仍 join 已准入工作，不执行 abort。
+
+普通 UDP 只在冷 endpoint 准入、异步准备前捕获已校验的 `UdpFlowOwner`（token 与可选的非零 kernel incarnation）；Ready enqueue 不增加 backend 查询。身份贯穿 initializer、endpoint 与 tombstone。Token-zero UDP 任一方向端口为 53 都保持无 conn-state；源端口 53 的 transport 流量不会因此变成控制器 DNS。畸形目的端口 53 回退也保持无状态。模型执行不声称具有原生 socket 证明。
+
+NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并调用 backend 自有的 UDP 准入校验。无法解决的 retirement 所有权或超出 allocator 范围的身份不能重建 ActiveDirect 放行；已准入的 fast follower 仍保留既有无查询路径。
 
 真实 relay 完成后，TCP owner 先按实际结果恰一次结算 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。
 
@@ -228,7 +236,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 `apply_runtime_config` 首先构建替代 Router、GroupManager、出站 registry、DNS 运行时与路由计划，不修改 live state。提交顺序为：
 
-1. Fence NFQUEUE readiness，并等待内核 reader-epoch 宽限期。
+1. Fence NFQUEUE readiness，并完成同步内核 grace barrier。
 2. 拒绝新的透明代理准入。
 3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 变空，并排空精确 endpoint retirement。
 4. 编译 generation 的 `RoutingPushPlan`；在下述发布 guard 内，只有 compiled plan、learned facts 变化或数据路径健康需要恢复时才调用 `EbpfBackend::publish_routing_plan(&plan, learned_domains)`。后端选择 inactive slot，暂存由该 generation 持有的 IP/source/MAC/domain 事实 map（使用完整的 256 位谓词值），把生成函数附着到每个相关 target，最后切换 `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活使用已经持有的 backend 重置 mode，用户态再于同一串行边界内发布替代出站 registry、DNS runtime pointer、Router、配置、组与 projection snapshot；root 已提交后 mode reset 失败会提交新代为 degraded，并保持准入 fence。
@@ -250,7 +258,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./groups.md#预热与所有权)。
 
-- `src/mode.rs` — `DatapathFlagsHandle` 在同一异步互斥锁下串行更新 `ModeState` 与 `DATAPATH_FLAGS_MAP`。Initialize/mode/GLOBAL/static 更新与 NFQUEUE fence/reopen/disable 协同，避免并发 API 更新在 reload 中重新发布 ready。Fence 完成前须发布 READY=false、等待内核 reader-epoch grace period，并移除全部未交付的 Preparing/Pending 状态。
+- `src/mode.rs` — `DatapathFlagsHandle` 在同一异步互斥锁下串行更新 `ModeState` 与 `DATAPATH_FLAGS_MAP`。Initialize/mode/GLOBAL/static 更新与 NFQUEUE fence/reopen/disable 协同，避免 API 更新在 reload 中重新发布 ready。Fence 完成要求 READY=false、成功的同步内核 grace，以及 fenced 清理全部未交付 Preparing/Pending/Aborted 状态。
 
 ### 需要重启的变更
 

@@ -22,12 +22,12 @@ Module map:
     - `quic.rs`, `packet_sniffer.rs`, `tcp_sniff.rs` — QUIC decryption/reassembly, per-flow sniff sessions, and TCP negative cache, respectively.
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`; [endpoint transactions](#udp-endpoint-pipeline).
     - `probers.rs` — `ProxyHttpProber`, `ProxyUdpProber`; [health probes](./groups.md#health-state-and-probes).
-    - `janitor.rs` — `BpfJanitor`; [map maintenance](./datapath.md#userspace-maintenance-and-accounting).
-    - `drain.rs` — `DrainTracker`; [accepted-flow drain](#reload-and-runtime-generations).
+    - `janitor.rs` — `BpfJanitor` scheduling and pressure policy; `janitor/sweep.rs` owns bounded scans and fenced retirement for [map maintenance](./datapath.md#userspace-maintenance-and-accounting); `janitor/health.rs` owns map-pressure and BPF failure-counter warnings.
+    - `retirement_worker.rs` — joined TCP/UDP/hint retirement ownership; `drain.rs` owns `DrainTracker` and [accepted-flow drain](#reload-and-runtime-generations).
 
 ## Startup and shutdown
 
-- `src/lib.rs` — `run()`, `Cli`/`ClashCommand`, resource limits, backend selection, fixed-queue startup preflight ([Configuration](../configuration.md)). Real instances hold `/run/honk-core.lock` and publish the `reload` PID. Via rtnetlink, create FD-owned `daens` and L2 netkit `dae0`; fall back to veth only on `EOPNOTSUPP`. Load/reuse the persistent allocator pin, then start NFQUEUE before datapath admission.
+- `src/lib.rs` — `run()`, `Cli`/`ClashCommand`, resource limits, backend selection, fixed-queue startup preflight ([Configuration](../configuration.md)). Real instances hold `/run/honk-core.lock` and publish the `reload` PID. `src/daens.rs` owns FD-owned `daens`/`dae0` setup and scoped namespace switches; `src/sysctl.rs` owns sysctl writes and hardening verification. Load/reuse the persistent allocator pin, then start NFQUEUE before datapath admission.
 
 Configuration diagnostics are collected before tracing setup. An early load or operator-validation failure writes prior nonterminal diagnostics to stderr once, then lets the binary return the redacted terminal cause once. Successful loading defers diagnostics to the configured tracing subscriber. Later runtime fatal errors retain their existing log-file mirror.
 
@@ -37,7 +37,7 @@ Startup keeps kernel admission closed until userspace can receive every redirect
 2. Load and validate the configuration, select `global.data_dir`, initialize the process bypass mark before any network I/O, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
 3. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
 4. After the real-instance lock handoff, probe the fixed NFQUEUE queue prerequisites. Mock/no-`ebpf` mode or a failed preflight logs a warning and disables NFQUEUE for this process; the preflight does not reject the reserved nftables table because installation reclaims stale owned state.
-5. In real mode, create the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through scoped `setns` calls.
+5. In real mode, `src/daens.rs` creates the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through `daens::with_daens_netns`.
 6. Load the BPF object and attach the real datapath. The default object is embedded with `include_bytes!`; `--bpf-object` supplies a runtime override. With the `ebpf` feature, `build.rs` locates the object, rejects stale or BTF-less output, rebuilds it with nightly after removing inherited `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, verifies `.BTF`, and copies it into `OUT_DIR` for embedding.
 7. Reuse or create the pinned `UDP_DECISION_SEQUENCE` allocator and validate its map ABI, BTF, locked value, token range, and exhaustion state. NFQUEUE startup rechecks the locked allocator status and leaves staging fenced if no rollback-safe generation is available.
 8. Build the userspace router, outbound runtime registry, DNS runtime, group manager, cache DB, optional Clash API, and control-plane supervisors.
@@ -62,7 +62,7 @@ Original destinations are recovered as follows:
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | Transparent socket `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | Guarded provenance rules described below |
 
-For ordinary flows, userspace forms the canonical tuple and consumes `ROUTING_HANDOFF_MAP` with `routing_handoff_take`. A missing handoff, or an outbound of `ControlPlaneRouting`, falls back to `Router::route_action`. Final `must` and `block` results cannot be overridden by Clash mode. This fallback is not the transparent DNS ownership boundary.
+Real TCP first validates accepted-FD ownership and uses that socket's immutable SYN handoff; missing or superseded proof closes the socket instead of selecting current tuple metadata. Ordinary UDP reads handoff metadata non-destructively against its captured incarnation and decision token. An owned `ControlPlaneRouting` result, or an eligible token-zero UDP flow without a handoff, can still use `Router::route_action`. Final `must` and `block` results cannot be overridden by Clash mode. Transparent DNS keeps its separate ownership boundary.
 
 Port-53 controller versus raw-transport ownership follows the [ordered traffic-rule contract](../reference/routing.md#outbound-targets-and-must), including the malformed non-`must` UDP fallback.
 
@@ -80,7 +80,7 @@ The sniffers feed the canonical initializer and may resolve a staged decision, b
 
 `connection/` is the canonical per-flow route/sniff/mode/selection boundary. Socket UDP ingress and NFQUEUE-owned payloads both reserve the same `UdpInitLease` in the same `UdpEndpointPool`; NFQUEUE has no second router, dialer, cloned packet, replay, or deliberate retransmission path. A staged flow computes one final outbound and mark before its token-checked terminal transition.
 
-`build_tuples_key` must initialize `TuplesKey` with `mem::zeroed()`. The `#[repr(C)]` key has 37 field bytes in a 40-byte layout, and the kernel hashes all 40 bytes, including its three padding bytes. Field-wise initialization can therefore create keys that userspace cannot look up or delete reliably.
+`TuplesKey` has an explicit three-byte `padding` field in its 40-byte `#[repr(C)]` layout. Every constructor must keep that field zero because the kernel hashes all 40 bytes; `build_tuples_key` zero-initializes the canonical key, and retirement rejects nonzero padding.
 
 An authoritative URLTest setup failure retains one retry round over its latency-ordered top three. A Score-owned failure can try one different permitted leaf sequentially, excluding the failed identity before ranking even if its ordinary score remains highest. Score attempts share one absolute deadline; request-local recovery preserves the pinned generation, Selector choices and actual primary final-edge provenance. Typed refusal, local admission-capacity exhaustion, cancellation and shutdown remain terminal, including completed refusals found while draining a race. Application writes and established relays are never replayed.
 
@@ -209,7 +209,7 @@ Admission ceilings are distinct:
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
 
-There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The endpoint-removal channel is bounded to 1024 messages and drains in batches of 128. If nonblocking delivery finds it full, a deduplicating `removal_dirty` set retains compensation; the worker flushes that set after each batch before acknowledging exact endpoint tombstones.
+There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The existing removal worker multiplexes bounded TCP, UDP and expiry-hint inputs into batches of at most 128 with one kernel grace period per batch. UDP removal retains its 1024-message channel and deduplicating `removal_dirty` compensation; exact tombstones are acknowledged only after owned I/O and backend retirement finish.
 
 Transparent TCP waits for either IP-family listener to become readable before reserving a shared flow permit, then completes the accept with a nonblocking syscall. An idle listener therefore consumes no flow capacity, while connections that arrive at the limit remain in the kernel listen backlog. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
 
@@ -230,7 +230,15 @@ After the first EOF, both relay paths bound only idle drain time: `DRAIN_DEADLIN
 
 A client that disappears without FIN or RST is bounded separately: the TPROXY TCP listeners enable TCP keepalive (3600 s idle, 15 s interval, 4 probes) and accepted sockets inherit it. A silent client ends its relay after about an hour; a live idle client answers the probes, so long idle connections stay open. Its error is a client-side `TimedOut`, which settles Score as cancellation.
 
-An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP` entry still exists. `TcpFlowPins` reference-counts that directional tuple for every accepted owner. The BPF janitor skips pinned conn-state and matching redirect metadata. When the final owner retires, it reads the current entry and conditionally removes it only if the state and timestamp still match the observed incarnation; an older relay cannot delete a reused tuple.
+An accepted TCP FD must carry a proven original SYN/request binding before tuple routing, pinning or cleanup authority. Its immutable handoff and incarnation must agree with current conn/handoff/redirect ownership. Missing, expired or superseded proof closes the socket without deleting current tuple state. Admission retains both its tuple-local `TcpFlowPins` reference and an exact `TCP_LIVE_PINS` incarnation under the same backend read guard as validation. Kernel Closing/redirect age checks consult only that incarnation's native pin; a live idle or half-closed owner can resume without timer-synthesized timestamps. A newer SYN does not inherit the old pin.
+
+Janitor collection excludes pinned TCP before spending its candidate budget and rechecks current pins under backend write ownership. Request-proof expiry is independent: the child's socket storage retains its own proof. Retirement uses the guard's captured incarnation, never the tuple's later occupant.
+
+After I/O completes, the joined retirement worker owns admitted TCP retirement, its socket, tracker/close completion and outbound statistics guard even if the waiter is cancelled. Its `FlowPin` releases both local and exact native pins under the same backend write guard before checking external owners; a release failure cannot acknowledge cleanup. Cancellation before admission drops the native pin synchronously and leaves physical tuple reclamation to the atomic janitor, without claiming confirmation. The control plane's `RetirementPort` routes native Drop errors to the current worker epoch's critical channel and receives the hint receiver back through the joined worker handle. Worker and janitor shutdown join admitted work beyond warnings rather than aborting it.
+
+Ordinary UDP captures its validated `UdpFlowOwner` (token and optional nonzero kernel incarnation) only on cold endpoint admission, before asynchronous preparation; Ready enqueue adds no backend query. The captured identity survives initializer, endpoint and tombstone lifetimes. Token-zero UDP with either source or destination port 53 remains stateless; source-port-53 transport traffic is not reclassified as controller DNS. Malformed destination-53 fallback also remains stateless. Model execution never claims native socket proof.
+
+Cold NFQUEUE cell reconstruction retains its conn-state snapshot and invokes backend-owned UDP admission validation under the same read guard. Unresolved retirement ownership or an invalid allocator-domain identity cannot reconstruct an ActiveDirect acceptance; already admitted fast followers keep their existing no-lookup path.
 
 After a real relay completes, the TCP owner settles its actual Score outcome and relay-error statistics once before propagating any retirement failure. Successful relay evidence is not changed to cancellation by failed retirement. TCP pool replenishment still requires both relay success and confirmed retirement; intentional cancellation retains its separate neutral path.
 
@@ -242,7 +250,7 @@ SIGHUP uses an attempt-local diagnostic list. Load and operator-validation warni
 
 `apply_runtime_config` first builds the replacement router, group manager, outbound registry, DNS runtime, and routing plan without mutating live state. Commit ordering is:
 
-1. Fence NFQUEUE readiness and wait for the kernel reader-epoch grace period.
+1. Fence NFQUEUE readiness and complete the synchronous kernel grace barrier.
 2. Reject new transparent admission.
 3. Cancel correlator cells and token-bound originals, advance the UDP initializer epoch, drain `Initializing` leases, wait for the correlator to become empty, and drain exact endpoint retirements.
 4. Under the publication guards below, call `EbpfBackend::publish_routing_plan(&plan, learned_domains)` when the compiled plan or learned facts changed, or datapath health requires recovery. The backend stages the inactive slot's generation-owned facts and generated functions and switches `ROUTING_POLICY_ROOT` last. A native explicit activation then resets mode using the already-owned backend, before publishing the replacement registry, DNS pointer, router, config, groups and projection. A post-root mode-reset failure commits the new generation as degraded and leaves admission fenced.
@@ -264,7 +272,7 @@ Selector and UDP warm ownership stay generation-bound; see [warm-up ownership](.
 
 `DrainTracker` is the process-wide accepted-flow gate. Reload and shutdown set reject-new before a drain and wait up to five seconds; shutdown then continues teardown with the remaining count.
 
-- `src/mode.rs` — `DatapathFlagsHandle` serializes `ModeState` and `DATAPATH_FLAGS_MAP` updates under one async mutex. Initialize/mode/GLOBAL/static updates compose with NFQUEUE fence/reopen/disable so a concurrent API update cannot republish ready during reload. Fence completion follows READY=false publication, a kernel reader-epoch grace period, and removal of every undelivered Preparing/Pending state.
+- `src/mode.rs` — `DatapathFlagsHandle` serializes `ModeState` and `DATAPATH_FLAGS_MAP` under one async mutex. Initialize/mode/GLOBAL/static updates compose with NFQUEUE fence/reopen/disable so an API update cannot republish ready during reload. Fence completion follows READY=false, successful synchronous kernel grace, and fenced removal of undelivered Preparing/Pending/Aborted state.
 
 ### Restart-required changes
 

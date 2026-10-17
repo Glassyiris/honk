@@ -83,13 +83,22 @@ impl ControlPlane {
                 }
             }
         }
+        self.retirement.sink.lock().take();
         let udp = self.udp_pool.shutdown().await;
         if !udp.joined || !udp.graceful {
             error.get_or_insert_with(|| anyhow::anyhow!("UDP quiescence required forced cleanup"));
         }
         if let Some(epoch) = epoch {
-            retain_error(&mut error, joined(&mut epoch.removals).await);
-            retain_error(&mut error, joined(&mut epoch.janitor).await);
+            match join_retirement_owner(&mut epoch.removals, "flow retirement worker").await {
+                Ok(hints) => *self.retirement.hints.lock() = hints,
+                Err(join_error) => {
+                    error.get_or_insert(join_error);
+                }
+            }
+            retain_error(
+                &mut error,
+                join_retirement_owner(&mut epoch.janitor, "BPF janitor").await,
+            );
             if let Some(updates) = epoch.health_updates.as_mut() {
                 retain_error(&mut error, updates.stop().await);
             }

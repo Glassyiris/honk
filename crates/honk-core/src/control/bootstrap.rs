@@ -257,6 +257,7 @@ impl ControlPlane {
             )),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             tcp_flow_pins: Arc::new(TcpFlowPins::default()),
+            retirement: Arc::new(retirement_worker::RetirementPort::default()),
             cache_db: None,
             mode_db: None,
             state_db: None,

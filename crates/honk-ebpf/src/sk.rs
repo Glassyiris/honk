@@ -5,7 +5,7 @@
 
 use core::ffi::{c_long, c_void};
 
-use aya_ebpf::programs::TcContext;
+use aya_ebpf::{Global, programs::TcContext};
 use aya_ebpf_bindings::{
     bindings::{bpf_sock, bpf_sock_tuple},
     helpers::{bpf_map_lookup_elem, bpf_sk_assign, bpf_sk_lookup_udp, bpf_sk_release},
@@ -15,6 +15,9 @@ use crate::{errno::ENOENT, routing::bpf_sock_is_dae_socket};
 
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
+
+#[unsafe(no_mangle)]
+pub static IPV6_SOCKETS_AVAILABLE: Global<u8> = Global::new(1);
 
 /// TC-side `SockMap::redirect_sk_lookup`: look the socket up by sockmap
 /// index and assign it to the current skb.
@@ -75,7 +78,7 @@ pub(crate) fn probe_udp_socket(
     let family = unsafe { (*sk).family };
     let is_wildcard = if family == AF_INET {
         socket_is_v4_wildcard(sk)
-    } else if family == AF_INET6 {
+    } else if family == AF_INET6 && IPV6_SOCKETS_AVAILABLE.load() != 0 {
         socket_is_v6_wildcard(sk)
     } else {
         true
@@ -95,6 +98,8 @@ fn socket_is_v4_wildcard(sk: *const bpf_sock) -> bool {
     unsafe { (*sk).src_ip4 == 0 }
 }
 
+// Linux 6.12's CONFIG_IPV6=n converter cannot size src_ip6 reads. The loader
+// excludes this path only when AF_INET6 socket creation proves the family absent.
 #[inline(never)]
 fn socket_is_v6_wildcard(sk: *const bpf_sock) -> bool {
     let address = unsafe { (*sk).src_ip6 };

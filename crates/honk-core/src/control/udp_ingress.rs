@@ -2,6 +2,7 @@
 
 use super::udp_endpoint::{DatagramPayload, RawDnsRoute};
 use super::*;
+use crate::ebpf::UdpFlowOwner;
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) type PacketRoute =
@@ -110,6 +111,7 @@ pub(super) fn begin_udp_slow_path(
         original_dst,
         data,
         None,
+        UdpFlowOwner::new(0, None).expect("model UDP owner"),
         pool.initialization_epoch(),
         udp_endpoint::queue_now(),
     )
@@ -129,6 +131,7 @@ pub(super) fn begin_udp_slow_path_at(
     original_dst: SocketAddr,
     data: &[u8],
     raw_dns_route: Option<RawDnsRoute<&str>>,
+    owner: UdpFlowOwner,
     expected_epoch: u64,
     enqueued_at: u32,
 ) -> UdpSlowPathWork {
@@ -150,6 +153,7 @@ pub(super) fn begin_udp_slow_path_at(
         original_dst,
         data,
         raw_dns_route,
+        owner,
         expected_epoch,
         permit,
         enqueued_at,
@@ -285,6 +289,7 @@ impl UdpLoopState {
                 None,
                 enqueued_at,
             )
+            .await
         };
         #[cfg(feature = "native-api")]
         let work = {
@@ -390,15 +395,18 @@ impl UdpLoopState {
             return work;
         }
         let work = match data {
-            DatagramPayload::Borrowed(data) => self.admit_datagram_at(
-                data,
-                src_addr,
-                original_dst,
-                None,
-                raw_dns_route,
-                Some(expected_epoch),
-                enqueued_at,
-            ),
+            DatagramPayload::Borrowed(data) => {
+                self.admit_datagram_at(
+                    data,
+                    src_addr,
+                    original_dst,
+                    None,
+                    raw_dns_route,
+                    Some(expected_epoch),
+                    enqueued_at,
+                )
+                .await
+            }
             #[cfg(feature = "ebpf")]
             DatagramPayload::Owned(data) => {
                 let Some(permit) =
@@ -426,7 +434,7 @@ impl UdpLoopState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn admit_datagram_at(
+    async fn admit_datagram_at(
         &self,
         data: &[u8],
         src_addr: SocketAddr,
@@ -454,6 +462,35 @@ impl UdpLoopState {
         ) {
             return UdpSlowPathWork::Done;
         }
+        let expected_epoch = expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch());
+        let backend =
+            if honk_ebpf_common::conn::is_stateless_udp_ports(src_addr.port(), original_dst.port())
+            {
+                None
+            } else {
+                Some(self.handle.ebpf.read().await)
+            };
+        let owner = if let Some(backend) = backend.as_ref() {
+            let key = crate::control::connection::build_tuples_key(
+                original_dst.ip(),
+                original_dst.port(),
+                src_addr.ip(),
+                src_addr.port(),
+                17,
+            );
+            match backend
+                .conn_state_lookup(&key)
+                .and_then(|state| backend.udp_flow_owner(0, state))
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    debug!(%src_addr, %original_dst, %error, "Dropping UDP without kernel flow ownership");
+                    return UdpSlowPathWork::Done;
+                }
+            }
+        } else {
+            UdpFlowOwner::new(0, None).expect("stateless UDP owner")
+        };
         begin_udp_slow_path_at(
             &self.udp_pool,
             &self.stats,
@@ -463,7 +500,8 @@ impl UdpLoopState {
             original_dst,
             data,
             raw_dns_route,
-            expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch()),
+            owner,
+            expected_epoch,
             enqueued_at,
         )
     }
@@ -498,6 +536,7 @@ impl UdpLoopState {
                         original_dst,
                         DatagramPayload::Owned(data),
                         raw_dns_route.as_ref().map(RawDnsRoute::as_ref),
+                        UdpFlowOwner::new(0, None).expect("stateless UDP owner"),
                         expected_epoch,
                         permit,
                         enqueued_at,

@@ -43,7 +43,7 @@ pub(super) fn bind_tproxy_tcp(
 ) -> anyhow::Result<std::net::TcpListener> {
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
-        return crate::with_daens_netns("bind TPROXY TCP listener", || {
+        return crate::daens::with_daens_netns("bind TPROXY TCP listener", || {
             build_tproxy_tcp(addr, true)
         });
     }
@@ -56,7 +56,7 @@ pub(super) fn bind_tproxy_tcp(
 /// between "bind inside daens" and "bind here".
 #[cfg(target_os = "linux")]
 pub(super) fn daens_netns_exists() -> bool {
-    crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
+    crate::daens::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -145,7 +145,7 @@ pub(super) fn bind_tproxy_udp_listeners(
 ) -> anyhow::Result<Vec<UdpSocket>> {
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
-        return crate::with_daens_netns("bind TPROXY UDP listener group", || {
+        return crate::daens::with_daens_netns("bind TPROXY UDP listener group", || {
             (0..count)
                 .map(|_| build_tproxy_udp(addr, true, true))
                 .collect()
@@ -314,7 +314,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
 /// single UDP reply.
 ///
 /// Go "anyfrom" semantics: in real eBPF mode the socket is created inside
-/// the daens netns via a scoped `crate::with_daens_netns` switch, so its
+/// the daens netns via a scoped `crate::daens::with_daens_netns` switch, so its
 /// reply packets egress dae0peer and take the host dae0_ingress rewrite path
 /// back to the LAN client.  A socket is pinned to the netns it was created
 /// in, so after creation it may be used from any (host-netns) worker thread.
@@ -323,7 +323,7 @@ pub(super) async fn send_udp_reply_from_orig_dst(
 #[cfg(target_os = "linux")]
 pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
     if daens_netns_exists() {
-        return crate::with_daens_netns("create UDP reply socket", || {
+        return crate::daens::with_daens_netns("create UDP reply socket", || {
             build_udp_reply_socket(original_dst).map_err(anyhow::Error::from)
         })
         .map_err(into_io_error);
@@ -374,7 +374,7 @@ fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
 // of once per reply.
 //
 // Netns note: the process always stays in the host netns.  Each cached
-// socket is created inside daens via a scoped `crate::with_daens_netns`
+// socket is created inside daens via a scoped `crate::daens::with_daens_netns`
 // switch (Go anyfrom semantics: the reply socket must live in daens so its
 // packets egress dae0peer → host dae0_ingress rewrite → LAN; mock mode has
 // no daens and creates it in the host netns).  A socket is pinned to the
@@ -411,13 +411,13 @@ fn dns_reply_socket_cache(is_v6: bool) -> &'static Mutex<Option<Arc<UdpSocket>>>
 /// pktinfo source address only has to supply the source IP.
 ///
 /// Like the one-shot path, the socket is created inside daens via a scoped
-/// `crate::with_daens_netns` switch when daens exists (Go anyfrom semantics)
+/// `crate::daens::with_daens_netns` switch when daens exists (Go anyfrom semantics)
 /// and is pinned to daens afterwards; sends may run on any worker thread.
 /// Mock mode has no daens and creates the socket in the current netns.
 #[cfg(target_os = "linux")]
 fn new_dns_reply_socket(is_v6: bool) -> io::Result<UdpSocket> {
     if daens_netns_exists() {
-        return crate::with_daens_netns("create cached DNS reply socket", || {
+        return crate::daens::with_daens_netns("create cached DNS reply socket", || {
             build_dns_reply_socket(is_v6).map_err(anyhow::Error::from)
         })
         .map_err(into_io_error);

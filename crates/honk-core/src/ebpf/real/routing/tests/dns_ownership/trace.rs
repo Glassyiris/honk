@@ -1,4 +1,5 @@
 use super::*;
+use crate::ebpf::{RetireCounts, RetireKind, UdpDecisionCommitResult, retire_fixture};
 use honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED;
 
 fn witness(backend: &RealEbpfBackend, id: u32) -> KernelRouteWitness {
@@ -31,6 +32,92 @@ fn capturing(must: bool) -> (RealEbpfBackend, RoutingPushPlan, TproxyListeners) 
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
+    isolated(|| {
+        let (mut backend, _, _listeners) = capturing(true);
+        for (src, dst) in [
+            (
+                "192.0.2.27".parse().unwrap(),
+                "198.51.100.37".parse().unwrap(),
+            ),
+            (
+                "2001:db8:1::27".parse().unwrap(),
+                "2001:db8:2::37".parse().unwrap(),
+            ),
+        ] {
+            for side in ["lan_ingress_l2", "wan_egress_l2"] {
+                let key = tuple(src, dst, 43127, 443, IPPROTO_TCP);
+                let syn = packet(src, dst, IPPROTO_TCP, key.src_port, key.dst_port, 5, 0x02);
+                assert_eq!(
+                    run(&backend, side, &syn, SkbInput::default()).verdict,
+                    TC_ACT_REDIRECT
+                );
+                let old = handoff(&backend, &key);
+                assert_ne!(old.incarnation, 0);
+                assert_eq!(
+                    run(
+                        &backend,
+                        side,
+                        &with_isn(syn.clone(), 1),
+                        SkbInput::default()
+                    )
+                    .verdict,
+                    TC_ACT_REDIRECT
+                );
+                let current = handoff(&backend, &key);
+                assert_ne!(current.incarnation, 0);
+                assert_ne!(current.incarnation, old.incarnation);
+                let (counts, result) = retire_fixture(
+                    &mut backend,
+                    key,
+                    RetireKind::Tcp {
+                        incarnation: old.incarnation,
+                    },
+                );
+                assert_eq!(counts, RetireCounts::default());
+                assert_eq!(result, UdpDecisionCommitResult::Superseded);
+                assert_eq!(
+                    backend
+                        .conn_state_lookup(&key)
+                        .unwrap()
+                        .unwrap()
+                        .incarnation,
+                    current.incarnation
+                );
+                assert_eq!(handoff(&backend, &key).incarnation, current.incarnation);
+                assert_eq!(handoff(&backend, &key).trace_id, current.trace_id);
+                assert_eq!(
+                    backend
+                        .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                        .unwrap()
+                        .unwrap()
+                        .incarnation,
+                    current.incarnation
+                );
+                let (counts, result) = retire_fixture(
+                    &mut backend,
+                    key,
+                    RetireKind::Tcp {
+                        incarnation: current.incarnation,
+                    },
+                );
+                assert_eq!(
+                    counts,
+                    RetireCounts {
+                        conn: 1,
+                        handoff: 1,
+                        redirect: 1,
+                        request: 0,
+                    }
+                );
+                assert_eq!(result, UdpDecisionCommitResult::Applied);
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -51,7 +138,6 @@ fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
                 assert_eq!(off.verdict, TC_ACT_REDIRECT);
                 let unrecorded = handoff(&backend, &key);
                 assert_eq!(unrecorded.trace_id, 0);
-                assert_eq!(off.cb[3], 0);
                 assert_eq!(
                     hash_count::<u32, KernelRouteWitness>(&backend, "ROUTE_TRACE_MAP"),
                     count
@@ -92,7 +178,13 @@ fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
                 backend.set_datapath_flags(0).unwrap();
                 assert_eq!(witness(&backend, recorded.trace_id).output, retained.output);
                 if protocol == IPPROTO_UDP {
-                    backend.routing_handoff_take(&key).unwrap().unwrap();
+                    // Inject missing tuple metadata to exercise cached recovery.
+                    backend
+                        .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                            "ROUTING_HANDOFF_MAP",
+                            &key,
+                        )
+                        .unwrap();
                     let cached = run(&backend, side, &bytes, SkbInput::default());
                     assert_eq!(cached.cb[3], recorded.trace_id);
                     assert_eq!(handoff(&backend, &key).trace_id, recorded.trace_id);
@@ -115,7 +207,11 @@ fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_cha
             let first = packet(src, dst, IPPROTO_UDP, port, 443, 5, 0);
             let first_run = run(&backend, side, &first, SkbInput::default());
             assert_eq!(first_run.verdict, TC_ACT_REDIRECT);
-            let original = backend.routing_handoff_take(&key).unwrap().unwrap();
+            let original = backend.routing_handoff_lookup(&key).unwrap().unwrap();
+            // Inject missing tuple metadata; ordinary admission never consumes it.
+            backend
+                .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", &key)
+                .unwrap();
             assert_ne!(original.trace_id, 0);
             assert_ne!(original.trace_id, ROUTE_TRACE_LOST);
             assert_eq!(original.result.decision_token, 0);
@@ -192,11 +288,7 @@ fn staged_udp_witness_uses_exact_token_and_generation() {
                 );
             }
             assert_eq!(
-                backend
-                    .udp_conn_state_lookup(&key)
-                    .unwrap()
-                    .unwrap()
-                    .trace_id,
+                backend.conn_state_lookup(&key).unwrap().unwrap().trace_id,
                 entry.trace_id
             );
             run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
@@ -227,7 +319,12 @@ fn tcp_replacement_keeps_ambiguity_after_prior_sidecar_loss() {
             .unwrap()
             .remove(&first.trace_id)
             .unwrap();
-        run(&backend, "lan_ingress_l2", &syn, SkbInput::default());
+        run(
+            &backend,
+            "lan_ingress_l2",
+            &with_isn(syn, 1),
+            SkbInput::default(),
+        );
         let second = handoff(&backend, &key);
         assert_ne!(first.trace_id, second.trace_id);
         assert_ne!(
@@ -270,7 +367,7 @@ fn exhausted_capture_ids_do_not_change_redirect_or_decision_tokens() {
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence() {
     isolated(|| {
-        let (backend, _, _listeners) = capturing(true);
+        let (mut backend, _, _listeners) = capturing(true);
         let src = "192.0.2.23".parse().unwrap();
         let dst = "198.51.100.33".parse().unwrap();
         let mut references = Vec::new();
@@ -290,7 +387,10 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
             .iter()
             .find(|(_, entry)| map.get(&entry.trace_id, 0).is_err())
             .expect("bounded sidecar must evict a witness");
-        backend.routing_handoff_take(key).unwrap().unwrap();
+        // Inject missing tuple metadata after its witness has been evicted.
+        backend
+            .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", key)
+            .unwrap();
         let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 7, 0);
         assert_eq!(
             run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
@@ -298,6 +398,8 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
         );
         let restored = handoff(&backend, key);
         assert_eq!(restored.trace_id, original.trace_id);
+        let map = backend.bpf().unwrap().map("ROUTE_TRACE_MAP").unwrap();
+        let map = HashMap::<_, u32, KernelRouteWitness>::try_from(map).unwrap();
         assert!(map.get(&restored.trace_id, 0).is_err());
         assert_eq!(restored.result.outbound, original.result.outbound);
     });
@@ -326,12 +428,27 @@ fn delayed_token_zero_udp_keeps_its_packet_reference_after_conn_recreation() {
                 let packet_a = packet(src, dst, IPPROTO_UDP, port, 443, 5, 0);
                 let a = run(&backend, side, &packet_a, SkbInput::default());
                 assert_eq!(a.verdict, TC_ACT_REDIRECT);
-                let old = backend.routing_handoff_take(&key).unwrap().unwrap();
+                let old = backend.routing_handoff_lookup(&key).unwrap().unwrap();
                 assert_eq!(old.result.decision_token, 0);
                 assert_ne!(old.trace_id, 0);
                 assert_ne!(old.trace_id, ROUTE_TRACE_LOST);
                 assert_eq!(a.cb[3], old.trace_id);
-                backend.udp_conn_state_remove(&key).unwrap();
+                // Inject lost tuple metadata while retaining the delayed packet/witness.
+                backend
+                    .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
+                        "ROUTING_HANDOFF_MAP",
+                        &key,
+                    )
+                    .unwrap();
+                backend
+                    .hash_remove::<_, FlowMapValue<ConnState>>("CONN_STATE_MAP", &key)
+                    .unwrap();
+                backend
+                    .hash_remove::<_, FlowMapValue<RedirectEntry>>(
+                        "REDIRECT_TRACK",
+                        &RedirectTuple::from_tuples(&key),
+                    )
+                    .unwrap();
 
                 let packet_b = packet(src, dst, IPPROTO_UDP, port, 443, 19, 0);
                 let b = run(&backend, side, &packet_b, SkbInput::default());
@@ -341,11 +458,7 @@ fn delayed_token_zero_udp_keeps_its_packet_reference_after_conn_recreation() {
                 assert_ne!(current.trace_id, old.trace_id);
                 assert_ne!(current.trace_id, ROUTE_TRACE_LOST);
                 assert_eq!(
-                    backend
-                        .udp_conn_state_lookup(&key)
-                        .unwrap()
-                        .unwrap()
-                        .trace_id,
+                    backend.conn_state_lookup(&key).unwrap().unwrap().trace_id,
                     current.trace_id
                 );
                 assert_eq!(witness(&backend, old.trace_id).output.input.dscp, 5);
@@ -426,7 +539,7 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
                 if redirected && port == 53 && protocol == IPPROTO_UDP {
                     // Must UDP DNS ownership is per packet: the route rides cb[2]
                     // and no tuple handoff is written.
-                    assert!(backend.routing_handoff_take(&key).unwrap().is_none());
+                    assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
                     assert_eq!(
                         result.cb[2],
                         UdpDnsRoute::direct(0, backend.routing_policy_generation())
@@ -453,7 +566,7 @@ fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
                     assert_ne!(captured.output.flags & ROUTE_TRACE_COMPLETE, 0);
                 } else {
                     assert_eq!(result.mark, mark);
-                    assert!(backend.routing_handoff_take(&key).unwrap().is_none());
+                    assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
                 }
             }
         }

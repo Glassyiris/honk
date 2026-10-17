@@ -23,9 +23,7 @@ const AF_INET6: u32 = 10;
 const SK_DROP: u32 = 0;
 const SK_PASS: u32 = 1;
 
-/// Listener socket map keys shared with `assign_listener` (ingress.rs) and
-/// the userspace publish path: 0 = TCP4, 1 = TCP6, 2.. = UDP4 group,
-/// 2 + UDP_LISTENER_COUNT.. = UDP6 group.
+/// Listener map keys shared with TC UDP assignment and userspace publication.
 pub(crate) const KEY_TCP4: u32 = 0;
 pub(crate) const KEY_TCP6: u32 = 1;
 pub(crate) const KEY_UDP4_BASE: u32 = 2;
@@ -54,6 +52,9 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
     let lookup = unsafe { &*ctx.lookup };
     let protocol = lookup.protocol as u8;
     let family = lookup.family;
+    if family == AF_INET6 && crate::sk::IPV6_SOCKETS_AVAILABLE.load() == 0 {
+        return SK_DROP;
+    }
 
     let key = if family == AF_INET && protocol as u32 == IPPROTO_TCP as u32 {
         KEY_TCP4
@@ -62,8 +63,10 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
     } else if protocol as u32 == IPPROTO_UDP as u32 {
         if family == AF_INET {
             udp_listener_key_v4(ctx.lookup)
-        } else {
+        } else if family == AF_INET6 {
             udp_listener_key_v6(ctx.lookup)
+        } else {
+            return SK_DROP;
         }
     } else {
         return SK_PASS;
