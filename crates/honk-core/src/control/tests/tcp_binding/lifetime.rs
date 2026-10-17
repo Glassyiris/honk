@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::control::connection::handoff::TcpFlowGuard;
-use crate::control::retirement_worker::RetirementWorker;
 use honk_ebpf_common::{
     RedirectEntry,
     conn::{TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState},
@@ -291,25 +290,10 @@ pub(super) fn pin_retire_error(family: &str) -> anyhow::Result<()> {
 async fn native_pin_error(lab: &Lab, retire: bool) -> anyhow::Result<()> {
     let (s, accepted) = settle(lab, false, false).await?;
     let (handle, key, incarnation) = (&lab.handle, s.key, s.incarnation);
-    fn start(
-        handle: &ControlPlaneHandle,
-    ) -> (
-        RetirementWorker,
-        tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
-    ) {
-        let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
-        let task = crate::control::spawn_retirement_worker(
-            Arc::clone(&handle.udp_pool),
-            Arc::clone(&handle.ebpf),
-            Arc::clone(&handle.connection_tracker),
-            fatal_tx,
-            Arc::clone(&handle.tcp_flow_pins),
-            Arc::clone(&handle.retirement),
-        );
-        (task, fatal)
-    }
-
-    let (old_task, mut old_fatal) = start(handle);
+    let TestRetirement {
+        task: old_task,
+        fatal: mut old_fatal,
+    } = TestRetirement::start(handle);
     let flow = adopt(handle, accepted, key).await?;
     let mut pins = live_pins()?;
     ensure!(
@@ -324,7 +308,10 @@ async fn native_pin_error(lab: &Lab, retire: bool) -> anyhow::Result<()> {
     handle.retirement.sink.lock().take();
     let hints = tokio::time::timeout(NETNS_TEST_TIMEOUT, old_task).await??;
     *handle.retirement.hints.lock() = hints;
-    let (current_task, mut current_fatal) = start(handle);
+    let TestRetirement {
+        task: current_task,
+        fatal: mut current_fatal,
+    } = TestRetirement::start(handle);
     drop(handoff_rx);
     {
         let _backend = handle.ebpf.write().await;

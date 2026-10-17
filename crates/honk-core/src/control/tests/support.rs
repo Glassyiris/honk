@@ -22,8 +22,8 @@ pub(super) mod netns;
 pub(super) mod wire;
 
 pub(in crate::control) struct TestRetirement {
-    task: RetirementWorker,
-    fatal: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
+    pub(in crate::control) task: RetirementWorker,
+    pub(in crate::control) fatal: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
 }
 
 impl TestRetirement {
