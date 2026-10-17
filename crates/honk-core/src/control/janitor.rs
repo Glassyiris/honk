@@ -23,6 +23,7 @@
 
 use super::connection::TcpFlowPins;
 use crate::ebpf::{EbpfBackend, RETIRE_BATCH_CAPACITY};
+use health::{AuxMap, HealthLatches};
 use honk_ebpf_common::conn::{BpfStatsKey, MAX_CONN_STATE_NUM};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,14 +32,8 @@ use tracing::{debug, error, info, warn};
 
 /// Janitor tick interval: 2 seconds.
 const JANITOR_TICK_INTERVAL_SECS: u64 = 2;
-/// Normal-mode redirect-track scan interval: 60 seconds.
-const REDIRECT_STEADY_INTERVAL_SECS: u64 = 60;
-/// Aggressive-mode redirect-track scan interval: 8 seconds.
-const REDIRECT_PRESSURE_INTERVAL_SECS: u64 = 8;
-/// Normal-mode routing-handoff scan interval: 60 seconds.
-const ROUTING_HANDOFF_STEADY_SECS: u64 = 60;
-/// Aggressive-mode routing-handoff scan interval: 8 seconds.
-const ROUTING_HANDOFF_PRESSURE_SECS: u64 = 8;
+const AUX_STEADY_INTERVAL_SECS: u64 = 60;
+const AUX_PRESSURE_INTERVAL_SECS: u64 = 8;
 /// Map health check interval: 5 seconds.
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 
@@ -63,25 +58,16 @@ const JANITOR_PRESSURE_SCAN_BUDGET: Duration = Duration::from_millis(200);
 const AUX_MAP_CAPACITY: usize = 65_536;
 const AUX_MAP_PRESSURE_WATERMARK: f64 = 0.80;
 
-/// Redirect track entry timeout: 120 seconds.
-const REDIRECT_TRACK_TIMEOUT_NS: u64 = 120_000_000_000;
-/// Routing handoff entry timeout: 30 seconds.
-const ROUTING_HANDOFF_TIMEOUT_NS: u64 = 30_000_000_000;
-
 /// Number of consecutive ticks without conn-state overflow after which
 /// pressure mode is switched off.
 const PRESSURE_EXIT_ROUNDS: u32 = 3;
 
-/// TCP protocol number in `TuplesKey::l4proto`.
-const IPPROTO_TCP: u8 = 6;
-
 /// Live CONN_STATE_MAP occupancy estimate, derived from the datapath's
-/// insert/delete counters plus the janitor's own delete accounting, and
-/// recalibrated against the exact entry count on every sweep.
+/// insert/delete counters plus the userspace delete counter (which every
+/// backend retirement feeds), recalibrated against the exact entry count on
+/// every sweep.
 #[derive(Debug, Default)]
 struct OccupancyGauge {
-    /// Cumulative entries deleted by janitor sweeps.
-    janitor_deletes: u64,
     /// `exact_count - raw_estimate` recorded at the last sweep, absorbing
     /// races (e.g. a datapath delete of an entry the janitor also removed).
     drift: i64,
@@ -89,24 +75,17 @@ struct OccupancyGauge {
 
 impl OccupancyGauge {
     /// Raw counter-derived occupancy before drift correction.
-    fn raw_estimate(&self, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> i64 {
-        inserts as i64
-            - ebpf_deletes as i64
-            - self.janitor_deletes as i64
-            - userspace_deletes as i64
+    fn raw_estimate(inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> i64 {
+        inserts as i64 - ebpf_deletes as i64 - userspace_deletes as i64
     }
 
     fn estimate(&self, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> u64 {
-        (self.raw_estimate(inserts, ebpf_deletes, userspace_deletes) + self.drift).max(0) as u64
+        (Self::raw_estimate(inserts, ebpf_deletes, userspace_deletes) + self.drift).max(0) as u64
     }
 
     /// Recalibrate with the exact entry count observed during a sweep.
     fn calibrate(&mut self, exact: u64, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) {
-        self.drift = exact as i64 - self.raw_estimate(inserts, ebpf_deletes, userspace_deletes);
-    }
-
-    fn note_janitor_deletes(&mut self, n: u64) {
-        self.janitor_deletes += n;
+        self.drift = exact as i64 - Self::raw_estimate(inserts, ebpf_deletes, userspace_deletes);
     }
 }
 
@@ -203,14 +182,10 @@ impl BpfJanitor {
             let mut aux_scan_results = [AuxScanResult {
                 complete: true,
                 ..AuxScanResult::default()
-            }; 3];
+            }; AuxMap::COUNT];
+            let mut health = HealthLatches::default();
 
-            let mut last_aux_failures = [0u64; 6];
-            let mut aux_pressure_warned = [false; 3];
-            let mut pressure_warned = [false; 4];
-
-            let mut last_redirect_cleanup = tokio::time::Instant::now();
-            let mut last_routing_handoff = tokio::time::Instant::now();
+            let mut last_aux_cleanup = tokio::time::Instant::now();
             let mut last_health_check = tokio::time::Instant::now();
             let mut last_conn_state_cleanup = tokio::time::Instant::now();
 
@@ -237,11 +212,24 @@ impl BpfJanitor {
                 }
 
                 let now = tokio::time::Instant::now();
+                let now_ns = match monotonic_now_ns() {
+                    Ok(now_ns) => Some(now_ns),
+                    Err(error) => {
+                        warn!(%error, "BPF janitor: failed to get monotonic time");
+                        None
+                    }
+                };
 
                 let (overflow_delta, utilization, occ_counters) = {
                     let ebpf = self.ebpf.read().await;
-                    let udp = ebpf.get_bpf_stats(0).unwrap_or(None).unwrap_or(0);
-                    let tcp = ebpf.get_bpf_stats(1).unwrap_or(None).unwrap_or(0);
+                    let udp = ebpf
+                        .get_bpf_stats(BpfStatsKey::UdpConnOverflow as u32)
+                        .unwrap_or(None)
+                        .unwrap_or(0);
+                    let tcp = ebpf
+                        .get_bpf_stats(BpfStatsKey::TcpConnOverflow as u32)
+                        .unwrap_or(None)
+                        .unwrap_or(0);
                     let delta =
                         udp > pressure.last_udp_overflow || tcp > pressure.last_tcp_overflow;
                     pressure.last_udp_overflow = udp;
@@ -261,15 +249,10 @@ impl BpfJanitor {
                 let aux_pressure = aux_scan_results
                     .iter()
                     .any(|result| aux_scan_is_pressured(result.scanned, result.complete));
-                let redirect_interval = if pressure.active || aux_pressure {
-                    Duration::from_secs(REDIRECT_PRESSURE_INTERVAL_SECS)
+                let aux_interval = if pressure.active || aux_pressure {
+                    Duration::from_secs(AUX_PRESSURE_INTERVAL_SECS)
                 } else {
-                    Duration::from_secs(REDIRECT_STEADY_INTERVAL_SECS)
-                };
-                let routing_interval = if pressure.active || aux_pressure {
-                    Duration::from_secs(ROUTING_HANDOFF_PRESSURE_SECS)
-                } else {
-                    Duration::from_secs(ROUTING_HANDOFF_STEADY_SECS)
+                    Duration::from_secs(AUX_STEADY_INTERVAL_SECS)
                 };
 
                 let conn_state_interval = if pressure.active {
@@ -282,15 +265,19 @@ impl BpfJanitor {
 
                 if last_conn_state_cleanup + conn_state_interval <= now {
                     let tuning = scan_tuning(utilization);
-                    let (deleted, total) = match self
-                        .cleanup_conn_state(&mut gauge, occ_counters, tuning)
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => {
-                            error!(%error, "BPF janitor: conn-state retirement failed");
-                            return;
+                    let (deleted, total) = if let Some(now_ns) = now_ns {
+                        match self
+                            .cleanup_conn_state_at(now_ns, &mut gauge, occ_counters, tuning)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                error!(%error, "BPF janitor: conn-state retirement failed");
+                                return;
+                            }
                         }
+                    } else {
+                        (0, 0)
                     };
                     last_conn_state_cleanup = now;
                     if utilization >= CONN_STATE_ELEVATED_WATERMARK || deleted > 0 {
@@ -308,48 +295,37 @@ impl BpfJanitor {
                     0.0
                 };
 
-                if last_redirect_cleanup + redirect_interval <= now {
-                    let utilization = (aux_scan_results[0].scanned as f64
-                        / AUX_MAP_CAPACITY as f64)
-                        .max(auxiliary_pressure_floor);
-                    let tuning = scan_tuning(utilization);
-                    aux_scan_results[0] =
-                        match self.cleanup_redirect_track(tuning, &mut gauge).await {
+                if last_aux_cleanup + aux_interval <= now {
+                    for map in AuxMap::ALL {
+                        let index = map as usize;
+                        let utilization = (aux_scan_results[index].scanned as f64
+                            / AUX_MAP_CAPACITY as f64)
+                            .max(auxiliary_pressure_floor);
+                        let tuning = scan_tuning(utilization);
+                        let cleanup = if let Some(now_ns) = now_ns {
+                            match map {
+                                AuxMap::RedirectTrack => {
+                                    self.cleanup_redirect_track_at(now_ns, tuning).await
+                                }
+                                AuxMap::RoutingHandoff => {
+                                    self.cleanup_routing_handoff_at(now_ns, tuning).await
+                                }
+                                AuxMap::TcpRequestBindings => {
+                                    self.cleanup_tcp_requests_at(now_ns, tuning).await
+                                }
+                            }
+                        } else {
+                            Ok(AuxScanResult::default())
+                        };
+                        aux_scan_results[index] = match cleanup {
                             Ok(result) => result,
                             Err(error) => {
-                                error!(%error, "BPF janitor: redirect retirement failed");
+                                error!(%error, map = map.label(), "BPF janitor: auxiliary retirement failed");
                                 return;
                             }
                         };
-                    last_redirect_cleanup = now;
-                }
-                if last_routing_handoff + routing_interval <= now {
-                    let utilization = (aux_scan_results[1].scanned as f64
-                        / AUX_MAP_CAPACITY as f64)
-                        .max(auxiliary_pressure_floor);
-                    let tuning = scan_tuning(utilization);
-                    aux_scan_results[1] =
-                        match self.cleanup_routing_handoff(tuning, &mut gauge).await {
-                            Ok(result) => result,
-                            Err(error) => {
-                                error!(%error, "BPF janitor: handoff retirement failed");
-                                return;
-                            }
-                        };
-                    let utilization = (aux_scan_results[2].scanned as f64
-                        / AUX_MAP_CAPACITY as f64)
-                        .max(auxiliary_pressure_floor);
-                    aux_scan_results[2] = match self
-                        .cleanup_tcp_requests(scan_tuning(utilization), &mut gauge)
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => {
-                            error!(%error, "BPF janitor: TCP request retirement failed");
-                            return;
-                        }
-                    };
-                    last_routing_handoff = now;
+                    }
+                    last_aux_cleanup = now;
                 }
 
                 if last_health_check + Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS) <= now {
@@ -357,9 +333,7 @@ impl BpfJanitor {
                         utilization,
                         pressure.active,
                         aux_scan_results,
-                        &mut last_aux_failures,
-                        &mut aux_pressure_warned,
-                        &mut pressure_warned,
+                        &mut health,
                     )
                     .await;
                     last_health_check = now;
@@ -393,145 +367,10 @@ impl BpfJanitor {
                     candidates: JANITOR_MAX_CANDIDATES,
                     budget: Duration::from_secs(1),
                 },
-                &mut OccupancyGauge::default(),
             )
             .await
             .expect("redirect retirement succeeds");
         (result.deleted, result.scanned)
-    }
-
-    /// Check BPF map health — overflow counter warnings plus conn-state
-    /// occupancy watermark warnings.
-    async fn check_map_health(
-        &self,
-        utilization: f64,
-        pressure_active: bool,
-        aux_scans: [AuxScanResult; 3],
-        last_aux_failures: &mut [u64; 6],
-        aux_pressure_warned: &mut [bool; 3],
-        pressure_warned: &mut [bool; 4],
-    ) {
-        let ebpf = self.ebpf.read().await;
-        let stat = |key: BpfStatsKey| ebpf.get_bpf_stats(key as u32).unwrap_or(None).unwrap_or(0);
-        let udp_overflow = stat(BpfStatsKey::UdpConnOverflow);
-        let tcp_overflow = stat(BpfStatsKey::TcpConnOverflow);
-        let redirect_failures = stat(BpfStatsKey::RedirectTrackInsertFailure);
-        let handoff_failures = stat(BpfStatsKey::RoutingHandoffInsertFailure);
-        let identity_failures = stat(BpfStatsKey::SocketIdentityCaptureFailure);
-        let request_proof_failures = stat(BpfStatsKey::TcpRequestProofInsertFailure);
-        let child_proof_failures = stat(BpfStatsKey::TcpChildProofStorageFailure);
-        let publisher_claim_failures = stat(BpfStatsKey::TcpPublisherClaimFailure);
-        drop(ebpf);
-
-        // The overflow counters are cumulative and this runs every few
-        // seconds: warn once per pressure episode, repeats stay at DEBUG.
-        if !pressure_active {
-            *pressure_warned = [false; 4];
-        }
-        let mut first_in_episode =
-            |index: usize| pressure_active && !std::mem::replace(&mut pressure_warned[index], true);
-
-        if udp_overflow > 0 || tcp_overflow > 0 {
-            crate::logging::warn_on_entry!(
-                first_in_episode(0),
-                "BPF janitor: map overflow detected — UDP={}, TCP={}. \
-                 Some packets may be falling back to slower paths. \
-                 Consider increasing map capacity.",
-                udp_overflow,
-                tcp_overflow
-            );
-        }
-        let aux_failures = [
-            redirect_failures,
-            handoff_failures,
-            identity_failures,
-            request_proof_failures,
-            child_proof_failures,
-            publisher_claim_failures,
-        ];
-        if aux_failures[..2]
-            .iter()
-            .zip(last_aux_failures[..2].iter())
-            .any(|(current, previous)| current > previous)
-        {
-            warn!(
-                redirect_failures,
-                handoff_failures, "BPF janitor: auxiliary map insert failures increased"
-            );
-        }
-        if identity_failures > last_aux_failures[2] {
-            warn!(
-                identity_failures,
-                "BPF janitor: socket identity capture failures increased; socket operations were denied"
-            );
-        }
-        if aux_failures[3..]
-            .iter()
-            .zip(last_aux_failures[3..].iter())
-            .any(|(current, previous)| current > previous)
-        {
-            warn!(
-                request_proof_failures,
-                child_proof_failures,
-                publisher_claim_failures,
-                "BPF janitor: TCP ownership publication failures increased; affected connections were refused"
-            );
-        }
-        *last_aux_failures = aux_failures;
-
-        for (index, (map, scan)) in [
-            ("redirect-track", aux_scans[0]),
-            ("routing-handoff", aux_scans[1]),
-            ("tcp-request-bindings", aux_scans[2]),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let entries = scan.scanned;
-            let utilization = entries as f64 / AUX_MAP_CAPACITY as f64;
-            if utilization >= AUX_MAP_PRESSURE_WATERMARK {
-                if !aux_pressure_warned[index] {
-                    warn!(
-                        map,
-                        entries,
-                        capacity = AUX_MAP_CAPACITY,
-                        utilization_pct = utilization * 100.0,
-                        "BPF janitor: auxiliary map scan high-water indicates pressure"
-                    );
-                    aux_pressure_warned[index] = true;
-                }
-            } else if scan.complete {
-                // A bounded scan is only a lower bound; a complete one proves
-                // the map left pressure.
-                aux_pressure_warned[index] = false;
-            }
-        }
-
-        if udp_overflow > 100 {
-            crate::logging::warn_on_entry!(
-                first_in_episode(1),
-                "BPF janitor: UDP conn state map under heavy pressure (overflow={}). \
-                 Consider increasing udp_conn_state_map capacity or reducing UDP connection timeout.",
-                udp_overflow
-            );
-        }
-        if tcp_overflow > 100 {
-            crate::logging::warn_on_entry!(
-                first_in_episode(2),
-                "BPF janitor: TCP conn state map under heavy pressure (overflow={}). \
-                 Consider increasing tcp_conn_state_map capacity or reducing TCP connection timeout.",
-                tcp_overflow
-            );
-        }
-
-        if utilization >= CONN_STATE_PRESSURE_WATERMARK {
-            crate::logging::warn_on_entry!(
-                first_in_episode(3),
-                "BPF janitor: conn-state map occupancy ~{:.1}% — sweeping every tick; \
-                 consider increasing MAX_CONN_STATE_NUM if this persists",
-                utilization * 100.0
-            );
-        }
     }
 }
 
@@ -582,6 +421,7 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utiliz
     }
 }
 
+mod health;
 mod sweep;
 
 #[cfg(test)]

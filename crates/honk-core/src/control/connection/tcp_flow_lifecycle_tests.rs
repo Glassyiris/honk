@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::connection_tracker::ConnectionEntry;
-use crate::ebpf::mock::MockEbpfBackend;
+use crate::control::retirement_worker::{RetirementPort, RetirementWorker};
+use crate::ebpf::{TcpPin, mock::MockEbpfBackend};
 use honk_ebpf_common::RedirectTuple;
 use honk_ebpf_common::conn::{ConnState, TcpState};
 use std::net::{IpAddr, Ipv4Addr};
@@ -37,29 +38,32 @@ fn removal_worker(
     tracker: &Arc<ConnectionTracker>,
 ) -> (
     Arc<UdpEndpointPool>,
-    tokio::task::JoinHandle<()>,
+    Arc<RetirementPort>,
+    RetirementWorker,
     mpsc::UnboundedReceiver<anyhow::Error>,
 ) {
     let pool = Arc::new(UdpEndpointPool::new());
+    let port = Arc::new(RetirementPort::default());
     let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
-    let task = spawn_udp_removal_worker(
+    let task = spawn_retirement_worker(
         Arc::clone(&pool),
         Arc::clone(backend),
         Arc::clone(tracker),
         fatal_tx,
         Arc::clone(pins),
+        Arc::clone(&port),
     );
-    (pool, task, fatal_rx)
+    (pool, port, task, fatal_rx)
 }
 
 async fn stop_removals(
     pool: Arc<UdpEndpointPool>,
-    pins: &TcpFlowPins,
-    worker: tokio::task::JoinHandle<()>,
+    port: &RetirementPort,
+    worker: RetirementWorker,
     mut fatal: mpsc::UnboundedReceiver<anyhow::Error>,
 ) -> anyhow::Result<()> {
     pool.shutdown().await;
-    pins.retirement_sink.lock().take();
+    port.sink.lock().take();
     worker.await?;
     assert!(fatal.try_recv().is_err());
     Ok(())
@@ -138,6 +142,8 @@ async fn tcp_flow_guard_abort_releases_pin_tracker_and_socket() -> anyhow::Resul
         1,
         Arc::clone(&pins),
         Arc::clone(&tracker),
+        Arc::new(RetirementPort::default()),
+        TcpPin::Model,
     );
     flow.track(tracked_entry("abort"));
     assert_eq!(pins.snapshot().len(), 1);
@@ -175,7 +181,7 @@ async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
     )?;
     let pins = Arc::new(TcpFlowPins::default());
     let tracker = Arc::new(ConnectionTracker::new());
-    let (pool, worker, fatal) = removal_worker(&backend, &pins, &tracker);
+    let (pool, port, worker, fatal) = removal_worker(&backend, &pins, &tracker);
     let (first_stream, _first_peer) = tcp_pair().await?;
     let (second_stream, _second_peer) = tcp_pair().await?;
     let first = TcpFlowGuard::new(
@@ -184,29 +190,27 @@ async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
         1,
         Arc::clone(&pins),
         Arc::clone(&tracker),
+        Arc::clone(&port),
+        TcpPin::Model,
     );
-    let second = TcpFlowGuard::new(second_stream, tuple, 1, Arc::clone(&pins), tracker);
+    let second = TcpFlowGuard::new(
+        second_stream,
+        tuple,
+        1,
+        Arc::clone(&pins),
+        tracker,
+        Arc::clone(&port),
+        TcpPin::Model,
+    );
 
-    assert!(first.retire().await);
-    assert!(
-        backend
-            .read()
-            .await
-            .tcp_conn_state_lookup(&tuple)?
-            .is_some()
-    );
+    assert!(first.retire(Default::default()).await);
+    assert!(backend.read().await.conn_state_lookup(&tuple)?.is_some());
     assert!(pins.snapshot().contains(&TcpFlowKey::from_tuples(&tuple)));
 
-    assert!(second.retire().await);
-    assert!(
-        backend
-            .read()
-            .await
-            .tcp_conn_state_lookup(&tuple)?
-            .is_none()
-    );
+    assert!(second.retire(Default::default()).await);
+    assert!(backend.read().await.conn_state_lookup(&tuple)?.is_none());
     assert!(pins.snapshot().is_empty());
-    stop_removals(pool, &pins, worker, fatal).await?;
+    stop_removals(pool, &port, worker, fatal).await?;
     Ok(())
 }
 
@@ -229,7 +233,7 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
 
     let pins = Arc::new(TcpFlowPins::default());
     let tracker = Arc::new(ConnectionTracker::new());
-    let (pool, worker, fatal) = removal_worker(&backend, &pins, &tracker);
+    let (pool, port, worker, fatal) = removal_worker(&backend, &pins, &tracker);
     let (stream, mut peer) = tcp_pair().await?;
     let mut flow = TcpFlowGuard::new(
         stream,
@@ -237,11 +241,13 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
         old.incarnation,
         Arc::clone(&pins),
         Arc::clone(&tracker),
+        Arc::clone(&port),
+        TcpPin::Model,
     );
     flow.track(tracked_entry("replacement"));
 
     let mut backend_guard = backend.write().await;
-    let retire = tokio::spawn(flow.retire());
+    let retire = tokio::spawn(flow.retire(Default::default()));
     tokio::task::yield_now().await;
     assert_eq!(
         tracker.snapshot().len(),
@@ -262,13 +268,13 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     let backend = backend.read().await;
     assert_eq!(
         backend
-            .tcp_conn_state_lookup(&tuple)?
+            .conn_state_lookup(&tuple)?
             .expect("replacement state")
             .incarnation,
         2,
         "an old guard must never retire a newer SYN even when it reads that state at teardown"
     );
-    assert!(backend.tcp_conn_state_lookup(&reverse)?.is_some());
+    assert!(backend.conn_state_lookup(&reverse)?.is_some());
     drop(backend);
     assert!(pins.snapshot().is_empty());
     assert!(tracker.snapshot().is_empty());
@@ -277,6 +283,6 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
         tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte)).await??,
         0
     );
-    stop_removals(pool, &pins, worker, fatal).await?;
+    stop_removals(pool, &port, worker, fatal).await?;
     Ok(())
 }

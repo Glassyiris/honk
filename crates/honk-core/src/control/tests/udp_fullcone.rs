@@ -2,6 +2,7 @@ use super::support::netns::{add_address, build_lab, lab_config, pinned_map, run_
 use super::support::{QuicUdpMode, QuicUdpPeer};
 use super::{NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder};
 use crate::control::{ControlCommand, ControlPlane};
+use crate::daens;
 use crate::dns::DnsResolver;
 use crate::ebpf::{EbpfBackend, real::RealEbpfBackend};
 use crate::routing::Router;
@@ -86,7 +87,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
     })?;
     let target_b = targets.pop().context("target B socket")?;
     let target_a = targets.pop().context("target A socket")?;
-    let _dae0 = crate::create_dae0_link()?;
+    let _dae0 = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -105,7 +106,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 )
                 .await?;
                 backend.attach_dae0_programs()?;
-                crate::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
+                daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
                 backend.attach_sk_lookup()?;
                 backend.attach_dae0peer_ingress()?;
                 let ready = Array::<_, u32>::try_from(pinned_map(pin_root, "DATAPATH_STATE_MAP")?)?;
@@ -223,11 +224,11 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                             "C unexpectedly acquired exact redirect framing"
                         );
                         ensure!(
-                            ebpf.read().await.udp_conn_state_lookup(&forward)?.is_none(),
+                            ebpf.read().await.conn_state_lookup(&forward)?.is_none(),
                             "foreign reply learned client-to-C UDP state"
                         );
                         ensure!(
-                            ebpf.read().await.udp_conn_state_lookup(&reverse)?.is_none(),
+                            ebpf.read().await.conn_state_lookup(&reverse)?.is_none(),
                             "foreign reply learned C-to-client UDP state"
                         );
                     }
@@ -260,7 +261,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                 tuples_key(destination, client_addr),
                             ] {
                                 ensure!(
-                                    ebpf.read().await.udp_conn_state_lookup(&tuple)?.is_none(),
+                                    ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
                                     "stateless source53 traffic created ordinary conn-state"
                                 );
                             }
@@ -284,7 +285,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                 tuples_key(destination, client_addr),
                             ] {
                                 ensure!(
-                                    ebpf.read().await.udp_conn_state_lookup(&tuple)?.is_none(),
+                                    ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
                                     "stateless retirement acquired ordinary conn-state"
                                 );
                             }

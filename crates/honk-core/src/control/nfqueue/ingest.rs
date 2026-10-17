@@ -252,7 +252,7 @@ impl PendingUdpVerdicts {
         held: HeldVerdict,
         slow_permit: Option<OwnedSemaphorePermit>,
     ) -> NfqueueIngest {
-        if cell.identity.decision_token != decision_token {
+        if cell.identity.owner.token != decision_token {
             self.stats.record_udp_nfqueue_token_mismatch();
             self.schedule_cleanup(CleanupRequest::Token {
                 key: cell.identity.key,
@@ -308,8 +308,7 @@ impl PendingUdpVerdicts {
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
-                    decision_token,
-                    cell.identity.kernel_incarnation,
+                    cell.identity.owner,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
                     held.received_at,
@@ -359,8 +358,7 @@ impl PendingUdpVerdicts {
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
-                    decision_token,
-                    cell.identity.kernel_incarnation,
+                    cell.identity.owner,
                     Some(cell.identity.endpoint_generation),
                     slow_permit,
                     held.received_at,
@@ -428,15 +426,15 @@ impl PendingUdpVerdicts {
             return NfqueueIngest::Dropped;
         };
         let tuples = key.tuples();
-        let inspected = backend.udp_conn_state_lookup(&tuples).and_then(|state| {
+        let inspected = backend.conn_state_lookup(&tuples).and_then(|state| {
             let Some(state) = state.filter(|state| state.decision_token == decision_token) else {
                 return Ok(None);
             };
             backend
-                .udp_flow_incarnation(&tuples, decision_token)
-                .map(|incarnation| Some((retained_state(&state), incarnation)))
+                .udp_flow_owner(decision_token, Some(state))
+                .map(|owner| Some((retained_state(&state), owner)))
         });
-        let (retained, kernel_incarnation) = match inspected {
+        let (retained, owner) = match inspected {
             Ok(Some(retained)) => retained,
             Ok(None) => {
                 drop(vacant);
@@ -459,7 +457,7 @@ impl PendingUdpVerdicts {
         match retained {
             RetainedState::Pending => {
                 let Some(slow_permit) = slow_permit else {
-                    self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                    self.insert_dead_vacant(vacant, key, owner, flow_slot);
                     self.schedule_cleanup(CleanupRequest::Token {
                         key,
                         decision_token,
@@ -471,8 +469,7 @@ impl PendingUdpVerdicts {
                     key.client,
                     key.destination,
                     payload,
-                    decision_token,
-                    kernel_incarnation,
+                    owner,
                     None,
                     slow_permit,
                     held.received_at,
@@ -491,7 +488,7 @@ impl PendingUdpVerdicts {
                         NfqueueIngest::Initialize { lease, identity }
                     }
                     EndpointReservation::IdentityMismatch => {
-                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                        self.insert_dead_vacant(vacant, key, owner, flow_slot);
                         self.stats.record_udp_nfqueue_token_mismatch();
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
@@ -501,7 +498,7 @@ impl PendingUdpVerdicts {
                         NfqueueIngest::Dropped
                     }
                     EndpointReservation::Enqueued => {
-                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                        self.insert_dead_vacant(vacant, key, owner, flow_slot);
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
                             decision_token,
@@ -512,7 +509,7 @@ impl PendingUdpVerdicts {
                     EndpointReservation::CapacityRejected
                     | EndpointReservation::QueueFull
                     | EndpointReservation::QueueClosed => {
-                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
+                        self.insert_dead_vacant(vacant, key, owner, flow_slot);
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
                             decision_token,
@@ -525,10 +522,7 @@ impl PendingUdpVerdicts {
             RetainedState::ActiveDirect(final_mark) => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity {
-                    kernel_incarnation,
-                    ..PendingUdpIdentity::new(key, decision_token, 0)
-                };
+                let identity = PendingUdpIdentity::new(key, owner, 0);
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::ActiveDirect {
@@ -547,16 +541,12 @@ impl PendingUdpVerdicts {
                     key.client,
                     key.destination,
                     payload,
-                    decision_token,
-                    kernel_incarnation,
+                    owner,
                     held.received_at,
                     &self.stats,
                 ) {
                     Ok(generation) => {
-                        let identity = PendingUdpIdentity {
-                            kernel_incarnation,
-                            ..PendingUdpIdentity::new(key, decision_token, generation)
-                        };
+                        let identity = PendingUdpIdentity::new(key, owner, generation);
                         vacant.insert(Arc::new(FlowCell::terminal(
                             identity,
                             CellState::Proxy {
@@ -584,10 +574,7 @@ impl PendingUdpVerdicts {
             RetainedState::Block => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity {
-                    kernel_incarnation,
-                    ..PendingUdpIdentity::new(key, decision_token, 0)
-                };
+                let identity = PendingUdpIdentity::new(key, owner, 0);
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::Block {

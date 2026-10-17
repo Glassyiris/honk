@@ -23,11 +23,11 @@
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`；[endpoint 事务](#udp-endpoint-流水线)。
     - `probers.rs` — `ProxyHttpProber`、`ProxyUdpProber`；[健康探测](./groups.md#健康状态与探测)。
     - `janitor.rs` — `BpfJanitor` 的调度与压力策略；`janitor/sweep.rs` 持有 [map 维护](./datapath.md#用户空间维护与计数)的有界扫描与 fenced retirement。
-    - `drain.rs` — `DrainTracker`；[已接受流的排空](#reload-与运行时-generation)。
+    - `retirement_worker.rs` — joined TCP/UDP/hint 退役所有权；`drain.rs` 持有 `DrainTracker` 与[已接受流的排空](#reload-与运行时-generation)。
 
 ## 启动与关闭
 
-- `src/lib.rs` — `run()`、`Cli`/`ClashCommand`、资源限制、后端选择与固定队列启动前置检查（[配置指南](../configuration.md)）。真实实例持有 `/run/honk-core.lock` 并发布 `reload` PID。通过 rtnetlink 创建由 FD 持有的 `daens` 与 L2 netkit `dae0`；仅遇到 `EOPNOTSUPP` 时回退 veth。加载或复用持久化 allocator pin，然后在数据路径准入前启动 NFQUEUE。
+- `src/lib.rs` — `run()`、`Cli`/`ClashCommand`、资源限制、后端选择与固定队列启动前置检查（[配置指南](../configuration.md)）。真实实例持有 `/run/honk-core.lock` 并发布 `reload` PID。`src/daens.rs` 负责由 FD 持有的 `daens`/`dae0` 初始化与有作用域的命名空间切换；`src/sysctl.rs` 负责 sysctl 写入及加固验证。加载或复用持久化 allocator pin，然后在数据路径准入前启动 NFQUEUE。
 
 配置诊断在初始化 tracing 前收集。加载或配置校验提前失败时，先向标准错误输出已有的非终止诊断，每条仅输出一次，再由二进制程序返回一次脱敏后的终止错误。加载成功时，诊断延迟到配置指定的 tracing 订阅器就绪后输出。后续运行时致命错误仍保留原有的日志文件记录。
 
@@ -37,7 +37,7 @@
 2. 加载并校验配置、选择 `global.data_dir`，在任何网络 I/O 前初始化进程旁路 mark，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
 3. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
-5. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
+5. 在真实模式下，`src/daens.rs` 通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过 `daens::with_daens_netns` 进入 `daens`。
 6. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
 7. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
 8. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
@@ -220,9 +220,9 @@ Accepted TCP FD 在 tuple 路由、pin 或取得清理权限前，必须携带�
 
 Janitor 收集阶段在消耗 candidate budget 前排除 pinned TCP，并在 backend 写所有权下再次检查当前 pin。Request 证明过期独立处理：child 的 socket storage 保留自己的证明。退役只使用 guard 捕获的 incarnation，不选择 tuple 的后继占用者。
 
-I/O 完成后，joined removal worker 持有已准入 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。它在 fenced 退役前分别尝试释放 local 与精确 native pin；释放失败不能确认清理成功。准入前取消同步 Drop native pin，物理 tuple 回收交给原子 janitor，不声称已确认；native Drop 错误发往当前 worker epoch 的 critical channel。Worker 和 janitor 在关闭告警后仍 join 已准入工作，不执行 abort。
+I/O 完成后，joined retirement worker 持有已准入 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。其 `FlowPin` 在同一 backend 写 guard 内释放 local 与精确 native pin，然后才检查外部 owner；释放失败不能确认清理成功。准入前取消同步 Drop native pin，物理 tuple 回收交给原子 janitor，不声称已确认。控制面的 `RetirementPort` 将 native Drop 错误发往当前 worker epoch 的 critical channel，并通过 joined worker handle 收回 hint receiver。Worker 和 janitor 在关闭告警后仍 join 已准入工作，不执行 abort。
 
-普通 UDP 只在冷 endpoint 准入、异步准备前捕获 kernel incarnation；Ready enqueue 不增加 backend 查询。身份贯穿 initializer、endpoint 与 tombstone。Token-zero UDP 任一方向端口为 53 都保持无 conn-state；源端口 53 的 transport 流量不会因此变成控制器 DNS。畸形目的端口 53 回退也保持无状态。模型执行不声称具有原生 socket 证明。
+普通 UDP 只在冷 endpoint 准入、异步准备前捕获已校验的 `UdpFlowOwner`（token 与可选的非零 kernel incarnation）；Ready enqueue 不增加 backend 查询。身份贯穿 initializer、endpoint 与 tombstone。Token-zero UDP 任一方向端口为 53 都保持无 conn-state；源端口 53 的 transport 流量不会因此变成控制器 DNS。畸形目的端口 53 回退也保持无状态。模型执行不声称具有原生 socket 证明。
 
 NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并调用 backend 自有的 UDP 准入校验。无法解决的 retirement 所有权或超出 allocator 范围的身份不能重建 ActiveDirect 放行；已准入的 fast follower 仍保留既有无查询路径。
 

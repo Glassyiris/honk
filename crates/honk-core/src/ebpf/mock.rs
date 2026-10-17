@@ -4,19 +4,23 @@
 //! data structures instead of real kernel eBPF. All operations use
 //! HashMap storage.
 
+#[cfg(test)]
+use super::RetireKind;
+#[cfg(test)]
+use super::TcpSocketOwnership;
 use super::retirement::{
-    auxiliaries_match, expiry_hint_auxiliary_removal, expiry_hint_conn_expired, handoff_matches,
-    redirect_matches, request_matches, tuple_matches, validate_conn_retirement,
+    Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit,
+    release_request_count, retire_staged_udp,
 };
 #[cfg(test)]
 use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
 use super::{
     EbpfBackend, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
-    UdpDecisionTransition, apply_udp_decision_transition, validate_udp_decision_transition,
+    UdpDecisionTransition, validate_udp_decision_transition,
 };
 use super::{
-    FlowExpiryHint, RETIRE_BATCH_CAPACITY, RetireCounts, RetireError, RetireKind, RetireRequest,
-    TcpSocketOwnership,
+    FlowExpiryHint, RETIRE_BATCH_CAPACITY, RetireCounts, RetireError, RetireOutcome, RetireRequest,
+    udp_state_is_staged,
 };
 use async_trait::async_trait;
 use honk_ebpf_common::*;
@@ -209,41 +213,24 @@ impl MockEbpfBackend {
         .unwrap();
     }
 
-    fn retire_owned_flow(
-        &mut self,
-        key: &TuplesKey,
-        kind: RetireKind<'_>,
-        counts: &mut RetireCounts,
-    ) -> UdpDecisionCommitResult {
-        let raw = Self::tuples_key_bytes(key);
-        let map = if key.l4proto == 6 {
+    fn conn_states(&self, proto: u8) -> &HashMap<[u8; 40], ConnState> {
+        if proto == libc::IPPROTO_TCP as u8 {
             &self.tcp_conn_states
         } else {
             &self.udp_conn_states
-        };
-        let Some(state) = map.get(&raw).copied() else {
-            return UdpDecisionCommitResult::Missing;
-        };
-        // Explicit model fixtures may use zero identities; native backends reject them.
-        if let Err(result) = validate_conn_retirement(&state, key.l4proto, kind) {
-            return result;
         }
-        let track_raw = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(key));
-        let handoff = self.routing_handoffs.get_mut().get(&raw);
-        let track = self.redirect_tracks.get(&track_raw);
-        if !auxiliaries_match(state.incarnation, state.decision_token, handoff, track) {
-            return UdpDecisionCommitResult::TokenMismatch;
-        }
-        counts.handoff += u64::from(self.routing_handoffs.get_mut().remove(&raw).is_some());
-        counts.redirect += u64::from(self.redirect_tracks.remove(&track_raw).is_some());
-        let map = if key.l4proto == 6 {
+    }
+
+    fn conn_states_mut(&mut self, proto: u8) -> &mut HashMap<[u8; 40], ConnState> {
+        if proto == libc::IPPROTO_TCP as u8 {
             &mut self.tcp_conn_states
         } else {
             &mut self.udp_conn_states
-        };
-        counts.conn += u64::from(map.remove(&raw).is_some());
-        UdpDecisionCommitResult::Applied
+        }
     }
+
+    // Explicit model fixtures may use zero identities that native backends reject, and
+    // exclusive access stands in for the kernel fence and grace barrier.
     fn retire_model_request(
         &mut self,
         request: &RetireRequest<'_>,
@@ -251,112 +238,87 @@ impl MockEbpfBackend {
     ) -> anyhow::Result<UdpDecisionCommitResult> {
         let raw = Self::tuples_key_bytes(&request.key);
         let track_raw = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(&request.key));
-        Ok(match request.kind {
-            RetireKind::Tcp { .. } | RetireKind::Udp { .. } | RetireKind::ExpiredConn { .. } => {
-                self.retire_owned_flow(&request.key, request.kind, counts)
+        let reads = request.kind.owner_reads();
+        let conn = reads
+            .conn
+            .then(|| self.conn_states(request.key.l4proto).get(&raw).copied())
+            .flatten();
+        let handoff = reads
+            .handoff
+            .then(|| self.routing_handoffs.lock().get(&raw).copied())
+            .flatten();
+        let redirect = reads
+            .redirect
+            .then(|| self.redirect_tracks.get(&track_raw).copied())
+            .flatten();
+        let binding = reads.request.and_then(|proof| {
+            self.tcp_request_bindings
+                .get(&(proof.address, proof.cookie))
+                .copied()
+        });
+        let owners = Owners {
+            conn: conn.as_ref(),
+            handoff: handoff.as_ref(),
+            redirect: redirect.as_ref(),
+            request: binding.as_ref(),
+        };
+        let plan = match plan_retirement(request, &owners) {
+            Ok(plan) => plan,
+            Err(result) => return Ok(result),
+        };
+        let before = *counts;
+        if plan.handoff {
+            counts.handoff += u64::from(self.routing_handoffs.get_mut().remove(&raw).is_some());
+        }
+        if plan.redirect {
+            counts.redirect += u64::from(self.redirect_tracks.remove(&track_raw).is_some());
+        }
+        if let (Some(incarnation), Some(proof)) = (plan.request, reads.request)
+            && self
+                .tcp_request_bindings
+                .remove(&(proof.address, proof.cookie))
+                .is_some()
+        {
+            counts.request += 1;
+            if let Some(state) = self.tcp_conn_states.get_mut(&raw) {
+                release_request_count(state, incarnation)?;
             }
-            RetireKind::ExpiredRedirect {
-                expected,
-                expired_before_ns,
-            } => match self.redirect_tracks.get(&track_raw) {
-                None => UdpDecisionCommitResult::Missing,
-                Some(current) if redirect_matches(current, expected, expired_before_ns) => {
-                    counts.redirect += u64::from(self.redirect_tracks.remove(&track_raw).is_some());
-                    UdpDecisionCommitResult::Applied
-                }
-                Some(_) => UdpDecisionCommitResult::Superseded,
-            },
-            RetireKind::ExpiredHandoff {
-                expected,
-                expired_before_ns,
-            } => {
-                let handoffs = self.routing_handoffs.get_mut();
-                match handoffs.get(&raw) {
-                    None => UdpDecisionCommitResult::Missing,
-                    Some(current) if handoff_matches(current, expected, expired_before_ns) => {
-                        counts.handoff += u64::from(handoffs.remove(&raw).is_some());
-                        UdpDecisionCommitResult::Applied
-                    }
-                    Some(_) => UdpDecisionCommitResult::Superseded,
-                }
+        }
+        if plan.conn {
+            counts.conn += u64::from(
+                self.conn_states_mut(request.key.l4proto)
+                    .remove(&raw)
+                    .is_some(),
+            );
+        }
+        Ok(plan.outcome((*counts).since(before)))
+    }
+
+    fn retire_model_batch(
+        &mut self,
+        requests: &[RetireRequest<'_>],
+        outcomes: &mut [RetireOutcome],
+        counts: &mut RetireCounts,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            requests.len() == outcomes.len() && requests.len() <= RETIRE_BATCH_CAPACITY,
+            "invalid retirement batch length"
+        );
+        anyhow::ensure!(
+            self.retire_fences.is_empty(),
+            "unresolved model retirement fences"
+        );
+        for (index, (request, outcome)) in requests.iter().zip(outcomes).enumerate() {
+            #[cfg(test)]
+            if self.retire_fault_after == Some(index) {
+                self.retire_fault_after = None;
+                anyhow::bail!("injected retirement failure");
             }
-            RetireKind::ExpiredRequest {
-                request: proof,
-                expected,
-                expired_before_ns,
-            } => {
-                let proof_key = (proof.address, proof.cookie);
-                match self.tcp_request_bindings.get(&proof_key) {
-                    None => UdpDecisionCommitResult::Missing,
-                    Some(current)
-                        if tuple_matches(&request.key, &current.tuples)
-                            && request_matches(current, expected, expired_before_ns) =>
-                    {
-                        let incarnation = current.handoff.incarnation;
-                        if self.tcp_request_bindings.remove(&proof_key).is_some() {
-                            counts.request += 1;
-                            if let Some(state) = self.tcp_conn_states.get_mut(&raw)
-                                && state.incarnation == incarnation
-                            {
-                                state.tcp_request_count =
-                                    state.tcp_request_count.checked_sub(1).ok_or_else(|| {
-                                        anyhow::anyhow!("TCP request accounting underflow")
-                                    })?;
-                            }
-                        }
-                        UdpDecisionCommitResult::Applied
-                    }
-                    Some(_) => UdpDecisionCommitResult::Superseded,
-                }
-            }
-            RetireKind::ExpiryHint {
-                incarnation,
-                now_ns,
-            } => {
-                let current = if request.key.l4proto == 6 {
-                    &self.tcp_conn_states
-                } else {
-                    &self.udp_conn_states
-                }
-                .get(&raw);
-                let expired = match expiry_hint_conn_expired(
-                    request.key.l4proto,
-                    incarnation,
-                    now_ns,
-                    current,
-                ) {
-                    Ok(expired) => expired,
-                    Err(result) => return Ok(result),
-                };
-                if !expired {
-                    let handoff = self.routing_handoffs.get_mut().get(&raw);
-                    let track = self.redirect_tracks.get(&track_raw);
-                    let removal = match expiry_hint_auxiliary_removal(
-                        incarnation,
-                        now_ns,
-                        current,
-                        handoff,
-                        track,
-                    ) {
-                        Ok(removal) => removal,
-                        Err(result) => return Ok(result),
-                    };
-                    let mut removed = false;
-                    if removal.handoff {
-                        let deleted = self.routing_handoffs.get_mut().remove(&raw).is_some();
-                        counts.handoff += u64::from(deleted);
-                        removed |= deleted;
-                    }
-                    if removal.redirect {
-                        let deleted = self.redirect_tracks.remove(&track_raw).is_some();
-                        counts.redirect += u64::from(deleted);
-                        removed |= deleted;
-                    }
-                    return Ok(removal.outcome(removed));
-                }
-                self.retire_owned_flow(&request.key, request.kind, counts)
-            }
-        })
+            #[cfg(not(test))]
+            let _ = index;
+            *outcome = self.retire_model_request(request, counts)?.into();
+        }
+        Ok(())
     }
 
     pub fn fail_next_routing_phase(&mut self, phase: RoutingPushPhase) {
@@ -696,15 +658,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.datapath_flags_writes_after_arm = 0;
     }
 
-    #[cfg(feature = "ebpf")]
-    fn retain_tcp_flow(
-        &self,
-        _incarnation: u64,
-        _errors: super::TcpPinErrorSink,
-    ) -> anyhow::Result<super::TcpKernelPin> {
-        anyhow::bail!("native TCP lifetime pins are unsupported by the model backend")
-    }
-
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_quiesce) {
@@ -713,34 +666,18 @@ impl EbpfBackend for MockEbpfBackend {
         let staged = self
             .udp_conn_states
             .iter()
-            .filter_map(|(key, state)| {
-                (state.state == UdpDecisionState::Preparing as u8
-                    || state.state == UdpDecisionState::Pending as u8
-                    || state.state == UdpDecisionState::Aborted as u8)
-                    .then_some(RetireRequest {
-                        key: Self::bytes_to_tuples_key(key),
-                        kind: RetireKind::Udp {
-                            token: state.decision_token,
-                            incarnation: Some(state.incarnation),
-                            pending_only: true,
-                        },
-                    })
+            .filter(|(_, state)| udp_state_is_staged(state.state))
+            .map(|(key, state)| {
+                (
+                    Self::bytes_to_tuples_key(key),
+                    state.decision_token,
+                    state.incarnation,
+                )
             })
             .collect::<Vec<_>>();
-        let mut outcomes = [None; RETIRE_BATCH_CAPACITY];
-        for requests in staged.chunks(RETIRE_BATCH_CAPACITY) {
-            let results = &mut outcomes[..requests.len()];
-            self.retire_batch(requests, results)?;
-            for result in results {
-                anyhow::ensure!(
-                    matches!(
-                        result,
-                        Some(UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing)
-                    ),
-                    "mock UDP staging quiescence rejected {result:?}"
-                );
-            }
-        }
+        retire_staged_udp(&staged, |requests, outcomes| {
+            self.retire_batch(requests, outcomes)
+        })?;
         if self.routing_generation.is_some() {
             let generation = self
                 .next_generation
@@ -892,42 +829,37 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn tcp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
+    fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
         Ok(self
-            .tcp_conn_states
+            .conn_states(key.l4proto)
             .get(&Self::tuples_key_bytes(key))
             .copied())
     }
 
+    #[cfg(test)]
     fn tcp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()> {
         self.tcp_conn_states
             .insert(Self::tuples_key_bytes(key), *state);
         Ok(())
     }
 
-    fn udp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
-        Ok(self
-            .udp_conn_states
-            .get(&Self::tuples_key_bytes(key))
-            .copied())
-    }
-
-    fn udp_flow_incarnation(&self, key: &TuplesKey, token: u32) -> anyhow::Result<Option<u64>> {
-        let Some(state) = self.udp_conn_states.get(&Self::tuples_key_bytes(key)) else {
+    fn udp_flow_owner(
+        &self,
+        token: u32,
+        state: Option<ConnState>,
+    ) -> anyhow::Result<super::UdpFlowOwner> {
+        let Some(state) = state else {
             anyhow::ensure!(token == 0, "model staged UDP admission has no conn-state");
-            return Ok(None);
+            return super::UdpFlowOwner::new(token, None);
         };
         anyhow::ensure!(
             state.decision_token == token,
             "model UDP decision token mismatch"
         );
-        anyhow::ensure!(
-            state.incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX,
-            "model UDP flow incarnation exceeds allocator domain"
-        );
-        Ok((state.incarnation != 0).then_some(state.incarnation))
+        super::UdpFlowOwner::new(token, (state.incarnation != 0).then_some(state.incarnation))
     }
 
+    #[cfg(test)]
     fn udp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()> {
         self.udp_conn_states
             .insert(Self::tuples_key_bytes(key), *state);
@@ -945,45 +877,53 @@ impl EbpfBackend for MockEbpfBackend {
             return Ok(UdpDecisionCommitResult::TokenMismatch);
         }
         let key_bytes = Self::tuples_key_bytes(key);
-        let Some(mut state) = self.udp_conn_states.get(&key_bytes).copied() else {
+        let Some(state) = self.udp_conn_states.get(&key_bytes).copied() else {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         if state.decision_token != token {
             return Ok(UdpDecisionCommitResult::TokenMismatch);
         }
-        if let Err(result) = apply_udp_decision_transition(&mut state, transition) {
-            return Ok(result);
-        }
         let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
         // Explicit model fixtures may commit a zero-identity staged flow.
         let track_key = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(key));
         let track = self.redirect_tracks.get(&track_key).copied();
-        if !auxiliaries_match(state.incarnation, token, handoff.as_ref(), track.as_ref()) {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
-        }
-        let initial_transition = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
-        if initial_transition && (handoff.is_none() || track.is_none()) {
-            return Ok(UdpDecisionCommitResult::Missing);
-        }
-
-        if handoff.is_some() {
+        let plan = match plan_udp_commit(state, token, transition, handoff.as_ref(), track.as_ref())
+        {
+            Ok(plan) => plan,
+            Err(result) => return Ok(result),
+        };
+        if plan.remove_handoff {
             self.routing_handoffs.lock().remove(&key_bytes);
         }
-        match transition {
-            UdpDecisionTransition::ActivateProxy(outbound, _) => {
-                let mut track = track.expect("proxy track checked above");
-                track.outbound = outbound;
+        match plan.redirect {
+            Some(RedirectEffect::Rewrite(track)) => {
                 self.redirect_tracks.insert(track_key, track);
             }
-            UdpDecisionTransition::ArmDirect(_)
-            | UdpDecisionTransition::ActivateDirect(_)
-            | UdpDecisionTransition::Block => {
+            Some(RedirectEffect::Remove) => {
                 self.redirect_tracks.remove(&track_key);
             }
+            None => {}
         }
-        self.udp_conn_states.insert(key_bytes, state);
+        self.udp_conn_states.insert(key_bytes, plan.state);
         Ok(UdpDecisionCommitResult::Applied)
     }
+    fn adopt_tcp(
+        &self,
+        _fd: std::os::fd::BorrowedFd<'_>,
+        tuples: &TuplesKey,
+        _errors: super::TcpPinErrorSink,
+    ) -> anyhow::Result<super::TcpAdoption> {
+        let current = self
+            .conn_state_lookup(tuples)?
+            .ok_or_else(|| anyhow::anyhow!("accepted TCP flow has no conn-state: {tuples:?}"))?;
+        Ok(super::TcpAdoption {
+            incarnation: current.incarnation,
+            handoff: self.routing_handoff_lookup(tuples)?,
+            pin: super::TcpPin::Model,
+        })
+    }
+
+    #[cfg(test)]
     fn tcp_socket_ownership(
         &self,
         _fd: std::os::fd::BorrowedFd<'_>,
@@ -1019,40 +959,16 @@ impl EbpfBackend for MockEbpfBackend {
     fn retire_batch(
         &mut self,
         requests: &[RetireRequest<'_>],
-        outcomes: &mut [Option<UdpDecisionCommitResult>],
+        outcomes: &mut [RetireOutcome],
     ) -> Result<RetireCounts, RetireError> {
-        outcomes.fill(None);
+        outcomes.fill(RetireOutcome::NotRun);
         let mut counts = RetireCounts::default();
-        if requests.len() != outcomes.len() || requests.len() > RETIRE_BATCH_CAPACITY {
-            return Err(RetireError {
-                counts,
-                source: anyhow::anyhow!("invalid retirement batch length"),
-            });
-        }
-        if !self.retire_fences.is_empty() {
-            return Err(RetireError {
-                counts,
-                source: anyhow::anyhow!("unresolved model retirement fences"),
-            });
-        }
-        // Model mutation is exclusive; no kernel grace barrier or FD proof is simulated.
-        for (index, (request, outcome)) in requests.iter().zip(outcomes).enumerate() {
-            #[cfg(test)]
-            if self.retire_fault_after == Some(index) {
-                self.retire_fault_after = None;
-                return Err(RetireError {
-                    counts,
-                    source: anyhow::anyhow!("injected retirement failure"),
-                });
-            }
-            #[cfg(not(test))]
-            let _ = index;
-            *outcome = Some(
-                self.retire_model_request(request, &mut counts)
-                    .map_err(|source| RetireError { counts, source })?,
-            );
-        }
-        Ok(counts)
+        let result = self
+            .retire_model_batch(requests, outcomes, &mut counts)
+            .map(|()| counts)
+            .map_err(|source| RetireError { counts, source });
+        account_retirement(&result);
+        result
     }
 
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
@@ -1128,6 +1044,7 @@ impl EbpfBackend for MockEbpfBackend {
             .copied())
     }
 
+    #[cfg(test)]
     fn redirect_track_store(
         &mut self,
         key: &RedirectTuple,
@@ -1241,13 +1158,27 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
-        for (kb, entry) in self
+    fn conn_state_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::ConnStateChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (key, entry) in self
             .tcp_conn_states
             .iter()
             .chain(self.udp_conn_states.iter())
         {
-            out.push((Self::bytes_to_tuples_key(kb), *entry));
+            chunk.push((Self::bytes_to_tuples_key(key), *entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
         }
         Ok(())
     }
@@ -1307,11 +1238,14 @@ fn retire_fixture(
     key: TuplesKey,
     kind: RetireKind<'_>,
 ) -> (RetireCounts, UdpDecisionCommitResult) {
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     let counts = backend
         .retire_batch(&[RetireRequest { key, kind }], &mut outcomes)
         .unwrap();
-    (counts, outcomes[0].expect("completed model retirement"))
+    let RetireOutcome::Done(result) = outcomes[0] else {
+        panic!("model retirement skipped a request");
+    };
+    (counts, result)
 }
 
 #[cfg(test)]
@@ -1381,11 +1315,7 @@ mod batch_retirement_tests {
                 outcome
             };
             assert_eq!(outcome, UdpDecisionCommitResult::TokenMismatch);
-            let retained = if operation == 0 {
-                backend.tcp_conn_state_lookup(&key).unwrap().unwrap()
-            } else {
-                backend.udp_conn_state_lookup(&key).unwrap().unwrap()
-            };
+            let retained = backend.conn_state_lookup(&key).unwrap().unwrap();
             assert_eq!(
                 (
                     retained.incarnation,
@@ -1518,33 +1448,133 @@ mod batch_retirement_tests {
     }
 
     #[test]
-    fn udp_admission_rejects_token_mismatch_and_out_of_domain_identity() {
+    fn udp_flow_owner_validates_incarnations_and_preserves_model_identity() {
+        use super::super::UdpFlowOwner;
+        use honk_ebpf_common::conn::FLOW_INCARNATION_MAX;
+
+        assert_eq!(UdpFlowOwner::new(0, None).unwrap().incarnation(), None);
+        for incarnation in [0, FLOW_INCARNATION_MAX + 1, u64::MAX] {
+            assert!(UdpFlowOwner::new(7, Some(incarnation)).is_err());
+        }
+        let backend = MockEbpfBackend::new();
+        assert_eq!(backend.udp_flow_owner(0, None).unwrap().incarnation(), None);
+        assert!(backend.udp_flow_owner(7, None).is_err());
+        for incarnation in [0, 1, FLOW_INCARNATION_MAX] {
+            let state = Some(ConnState {
+                decision_token: 7,
+                incarnation,
+                ..Default::default()
+            });
+            let owner = backend.udp_flow_owner(7, state).unwrap();
+            assert_eq!(owner.token, 7);
+            assert_eq!(
+                owner.incarnation(),
+                (incarnation != 0).then_some(incarnation)
+            );
+            assert!(backend.udp_flow_owner(8, state).is_err());
+        }
+        assert!(
+            backend
+                .udp_flow_owner(
+                    0,
+                    Some(ConnState {
+                        incarnation: FLOW_INCARNATION_MAX + 1,
+                        ..Default::default()
+                    }),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn udp_admission_checks_captured_owner_with_model_and_stateless_exemptions() {
+        use super::super::UdpFlowOwner;
+
         let mut backend = MockEbpfBackend::new();
         let key = TuplesKey {
+            src_port: 41000,
+            dst_port: 443,
             l4proto: 17,
             ..Default::default()
         };
-        backend
-            .udp_conn_state_store(
+        let model = UdpFlowOwner::new(0, None).unwrap();
+        assert!(backend.verify_udp_admission(&key, model).unwrap().is_none());
+        assert!(
+            backend
+                .verify_udp_admission(&key, UdpFlowOwner::new(7, None).unwrap())
+                .is_err()
+        );
+        for incarnation in [0, 41] {
+            backend.seed_staged_udp_flow(
                 &key,
-                &ConnState {
+                ConnState {
                     decision_token: 7,
-                    incarnation: 1,
+                    incarnation,
+                    state: UdpDecisionState::Pending as u8,
                     ..Default::default()
                 },
-            )
-            .unwrap();
-        assert!(backend.udp_flow_incarnation(&key, 8).is_err());
+            );
+            let owner = backend
+                .udp_flow_owner(7, backend.conn_state_lookup(&key).unwrap())
+                .unwrap();
+            assert!(backend.verify_udp_admission(&key, owner).unwrap().is_some());
+            assert!(
+                backend
+                    .verify_udp_admission(&key, UdpFlowOwner::new(7, Some(42)).unwrap())
+                    .is_err()
+            );
+            let handoff = backend
+                .routing_handoffs
+                .get_mut()
+                .get_mut(&MockEbpfBackend::tuples_key_bytes(&key))
+                .unwrap();
+            handoff.result.decision_token = 8;
+            assert!(backend.verify_udp_admission(&key, owner).is_err());
+        }
         backend
             .udp_conn_state_store(
                 &key,
                 &ConnState {
-                    incarnation: honk_ebpf_common::conn::FLOW_INCARNATION_MAX + 1,
+                    incarnation: 41,
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert!(backend.udp_flow_incarnation(&key, 0).is_err());
+        assert!(backend.verify_udp_admission(&key, model).is_err());
+        let stateless = TuplesKey {
+            dst_port: 53,
+            ..key
+        };
+        assert!(
+            backend
+                .verify_udp_admission(&stateless, model)
+                .unwrap()
+                .is_none()
+        );
+        backend.routing_handoffs.get_mut().insert(
+            MockEbpfBackend::tuples_key_bytes(&stateless),
+            RoutingHandoffEntry {
+                result: RoutingResult {
+                    decision_token: 7,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(backend.verify_udp_admission(&stateless, model).is_err());
+        backend
+            .routing_handoffs
+            .get_mut()
+            .get_mut(&MockEbpfBackend::tuples_key_bytes(&stateless))
+            .unwrap()
+            .result
+            .decision_token = 0;
+        assert!(
+            backend
+                .verify_udp_admission(&stateless, model)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1622,7 +1652,7 @@ mod batch_retirement_tests {
         );
         assert_eq!(
             backend
-                .udp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()
                 .incarnation,
@@ -1638,7 +1668,7 @@ mod batch_retirement_tests {
         );
         assert_eq!(counts.conn, 1);
         assert_eq!(outcome, UdpDecisionCommitResult::Applied);
-        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(backend.conn_state_lookup(&key).unwrap().is_none());
     }
 
     #[test]
@@ -1670,7 +1700,7 @@ mod batch_retirement_tests {
         assert_eq!(outcome, UdpDecisionCommitResult::Superseded);
         assert_eq!(
             backend
-                .tcp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()
                 .incarnation,
@@ -1713,7 +1743,7 @@ mod batch_retirement_tests {
         assert_eq!(counts, RetireCounts::default());
         assert_eq!(
             backend
-                .tcp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()
                 .incarnation,
@@ -1765,7 +1795,7 @@ mod batch_retirement_tests {
                 expired_before_ns: 0,
             },
         };
-        let mut outcomes = [Some(UdpDecisionCommitResult::Applied); 3];
+        let mut outcomes = [RetireOutcome::NotRun; 3];
         backend.retire_fault_after = Some(2);
         let error = backend
             .retire_batch(&[request; 3], &mut outcomes)
@@ -1780,16 +1810,16 @@ mod batch_retirement_tests {
         assert_eq!(
             outcomes,
             [
-                Some(UdpDecisionCommitResult::Applied),
-                Some(UdpDecisionCommitResult::Missing),
-                None
+                RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+                RetireOutcome::Done(UdpDecisionCommitResult::Missing),
+                RetireOutcome::NotRun
             ]
         );
-        assert!(backend.tcp_conn_state_lookup(&key).unwrap().is_none());
-        let mut outcomes = [Some(UdpDecisionCommitResult::Applied)];
+        assert!(backend.conn_state_lookup(&key).unwrap().is_none());
+        let mut outcomes = [RetireOutcome::Done(UdpDecisionCommitResult::Applied)];
         let error = backend.retire_batch(&[], &mut outcomes).unwrap_err();
         assert_eq!(error.counts, RetireCounts::default());
-        assert_eq!(outcomes, [None]);
+        assert_eq!(outcomes, [RetireOutcome::NotRun]);
     }
 
     #[test]
@@ -1856,7 +1886,7 @@ mod batch_retirement_tests {
         assert_eq!(outcome, UdpDecisionCommitResult::Superseded);
         assert_eq!(
             backend
-                .tcp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()
                 .tcp_request_count,
@@ -1875,7 +1905,7 @@ mod batch_retirement_tests {
         assert_eq!(outcome, UdpDecisionCommitResult::Applied);
         assert_eq!(
             backend
-                .tcp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()
                 .tcp_request_count,
@@ -1967,7 +1997,7 @@ mod tests {
                 .unwrap(),
             UdpDecisionCommitResult::Applied
         );
-        let armed = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let armed = backend.conn_state_lookup(&key).unwrap().unwrap();
         let armed_raw = unsafe { armed.meta.raw };
         assert_eq!(armed.state, UdpDecisionState::DirectArmed as u8);
         assert_eq!(armed.decision_token, 7);
@@ -1996,7 +2026,7 @@ mod tests {
                 .unwrap(),
             UdpDecisionCommitResult::Applied
         );
-        let active = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let active = backend.conn_state_lookup(&key).unwrap().unwrap();
         let active_raw = unsafe { active.meta.raw };
         assert_eq!(active.state, UdpDecisionState::None as u8);
         assert_eq!((active_raw >> 8) & 0xffff_ffff, 0x1234);
@@ -2024,7 +2054,7 @@ mod tests {
                 .unwrap(),
             UdpDecisionCommitResult::Applied
         );
-        let state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let state = backend.conn_state_lookup(&key).unwrap().unwrap();
         let raw = unsafe { state.meta.raw };
         assert_eq!(state.state, UdpDecisionState::Proxy as u8);
         assert_eq!(raw & 0xff, (OutboundIndex::UserBase as u8 + 2) as u64);
@@ -2050,7 +2080,7 @@ mod tests {
             .1,
             UdpDecisionCommitResult::Applied
         );
-        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(backend.conn_state_lookup(&key).unwrap().is_none());
         assert!(
             backend
                 .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
@@ -2076,7 +2106,7 @@ mod tests {
                 .unwrap(),
             UdpDecisionCommitResult::TokenMismatch
         );
-        let mut newer = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let mut newer = backend.conn_state_lookup(&key).unwrap().unwrap();
         newer.state = UdpDecisionState::Proxy as u8;
         backend.udp_conn_state_store(&key, &newer).unwrap();
         assert_eq!(
@@ -2125,7 +2155,7 @@ mod tests {
             .1,
             UdpDecisionCommitResult::Applied
         );
-        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(backend.conn_state_lookup(&key).unwrap().is_none());
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
             backend
@@ -2159,7 +2189,7 @@ mod tests {
             .1,
             UdpDecisionCommitResult::Superseded
         );
-        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_some());
+        assert!(backend.conn_state_lookup(&key).unwrap().is_some());
     }
 
     #[test]

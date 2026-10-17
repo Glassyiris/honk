@@ -1,3 +1,4 @@
+use crate::control::retirement_worker::RetirementWorker;
 use crate::control::udp_endpoint::UdpEndpointPool;
 use crate::control::{ControlPlane, ControlPlaneHandle};
 use crate::dns::{self, DnsResolver};
@@ -19,19 +20,20 @@ use tokio::net::{TcpStream, UdpSocket};
 pub(super) mod netns;
 
 pub(in crate::control) struct TestRetirement {
-    task: tokio::task::JoinHandle<()>,
+    task: RetirementWorker,
     fatal: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
 }
 
 impl TestRetirement {
     pub(in crate::control) fn start(handle: &ControlPlaneHandle) -> Self {
         let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
-        let task = crate::control::spawn_udp_removal_worker(
+        let task = crate::control::spawn_retirement_worker(
             Arc::clone(&handle.udp_pool),
             Arc::clone(&handle.ebpf),
             Arc::clone(&handle.connection_tracker),
             fatal_tx,
             Arc::clone(&handle.tcp_flow_pins),
+            Arc::clone(&handle.retirement),
         );
         Self { task, fatal }
     }
@@ -41,7 +43,7 @@ impl TestRetirement {
         handle: &ControlPlaneHandle,
     ) -> anyhow::Result<()> {
         let shutdown = handle.udp_pool.shutdown().await;
-        handle.tcp_flow_pins.retirement_sink.lock().take();
+        handle.retirement.sink.lock().take();
         self.task.await?;
         anyhow::ensure!(shutdown.joined, "test UDP retirement did not join");
         if let Ok(error) = self.fatal.try_recv() {

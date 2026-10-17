@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::{RetireKind, RetireRequest, UdpDecisionCommitResult};
+use crate::ebpf::{RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult};
 use crate::netlink::{FAM_V4, FAM_V6, PROTO_STATIC, ROUTE_UNICAST, SCOPE_UNIVERSE};
 use honk_outbound::proxy::ProxyRegistry;
 use std::io::{Read, Write};
@@ -13,7 +13,7 @@ fn retire_udp_incarnation(
     key: &TuplesKey,
     incarnation: u64,
 ) -> UdpDecisionCommitResult {
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     backend
         .retire_batch(
             &[RetireRequest {
@@ -27,7 +27,10 @@ fn retire_udp_incarnation(
             &mut outcomes,
         )
         .unwrap();
-    outcomes[0].expect("singleton retirement outcome")
+    let RetireOutcome::Done(result) = outcomes[0] else {
+        panic!("singleton retirement skipped");
+    };
+    result
 }
 
 fn attach_wan(backend: &mut RealEbpfBackend, interface: &str) {
@@ -144,11 +147,7 @@ fn direct_marks_route_native_lan_v4_v6_tcp_udp_and_cached_packets() {
                     if port != 53 {
                         let source = client.local_addr().unwrap();
                         let key = tuple(source.ip(), target, source.port(), port, IPPROTO_UDP);
-                        let state = fixture
-                            .backend
-                            .udp_conn_state_lookup(&key)
-                            .unwrap()
-                            .unwrap();
+                        let state = fixture.backend.conn_state_lookup(&key).unwrap().unwrap();
                         assert_eq!(
                             retire_udp_incarnation(&mut fixture.backend, &key, state.incarnation),
                             UdpDecisionCommitResult::Superseded
@@ -157,7 +156,7 @@ fn direct_marks_route_native_lan_v4_v6_tcp_udp_and_cached_packets() {
                             unsafe {
                                 fixture
                                     .backend
-                                    .udp_conn_state_lookup(&key)
+                                    .conn_state_lookup(&key)
                                     .unwrap()
                                     .unwrap()
                                     .meta
@@ -546,7 +545,11 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     .unwrap()
                     .unwrap();
                 assert_eq!(
-                    fixture.backend.udp_flow_incarnation(&key, 0).unwrap(),
+                    fixture
+                        .backend
+                        .udp_flow_owner(0, fixture.backend.conn_state_lookup(&key).unwrap())
+                        .unwrap()
+                        .incarnation(),
                     Some(initial.incarnation)
                 );
                 assert_eq!(initial.result.mark, RULE_MARK);
@@ -579,13 +582,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     retire_udp_incarnation(&mut fixture.backend, &key, initial.incarnation),
                     UdpDecisionCommitResult::Applied
                 );
-                assert!(
-                    fixture
-                        .backend
-                        .udp_conn_state_lookup(&key)
-                        .unwrap()
-                        .is_none()
-                );
+                assert!(fixture.backend.conn_state_lookup(&key).unwrap().is_none());
                 assert!(
                     fixture
                         .backend
@@ -605,7 +602,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     .with_retirement_fences(&[(key, 0)], |backend| {
                         client.send_to(b"fenced-new", destination).unwrap();
                         assert_udp_empty(receiver);
-                        assert!(backend.udp_conn_state_lookup(&key)?.is_none());
+                        assert!(backend.conn_state_lookup(&key)?.is_none());
                         assert!(backend.routing_handoff_lookup(&key)?.is_none());
                         assert!(
                             backend
@@ -663,11 +660,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     let (size, _) = native.recv_from(&mut bytes).unwrap();
                     assert_eq!(&bytes[..size], b"new-mark-dial");
                 });
-                let state = fixture
-                    .backend
-                    .udp_conn_state_lookup(&key)
-                    .unwrap()
-                    .unwrap();
+                let state = fixture.backend.conn_state_lookup(&key).unwrap().unwrap();
                 let track_key = RedirectTuple::from_tuples(&key);
                 let track = fixture
                     .backend
@@ -726,7 +719,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     assert_eq!(
                         fixture
                             .backend
-                            .udp_conn_state_lookup(&key)
+                            .conn_state_lookup(&key)
                             .unwrap()
                             .map(|s| s.decision_token),
                         state_token
@@ -766,11 +759,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     .publish_routing_plan(&policy(0), &[])
                     .unwrap();
                 exchange_udp(&client, &native, destination);
-                let native_state = fixture
-                    .backend
-                    .udp_conn_state_lookup(&key)
-                    .unwrap()
-                    .unwrap();
+                let native_state = fixture.backend.conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(
                     retire_udp_incarnation(&mut fixture.backend, &key, selected.incarnation),
                     UdpDecisionCommitResult::Superseded
@@ -779,7 +768,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                     unsafe {
                         fixture
                             .backend
-                            .udp_conn_state_lookup(&key)
+                            .conn_state_lookup(&key)
                             .unwrap()
                             .unwrap()
                             .meta

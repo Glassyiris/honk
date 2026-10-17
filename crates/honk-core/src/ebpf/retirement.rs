@@ -1,12 +1,21 @@
 //! Owned flow retirement shared by real and explicit model backends.
 
+use super::{
+    EbpfBackend, UdpDecisionCommitResult, UdpDecisionTransition, apply_udp_decision_transition,
+    udp_state_is_legacy_userspace_owned, udp_state_is_staged, udp_state_is_userspace_owned,
+};
+use honk_ebpf_common::conn::{REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS};
 use honk_ebpf_common::redirect_need::{TcpRequestKey, TcpSocketBinding};
 use honk_ebpf_common::{ConnState, RedirectEntry, RoutingHandoffEntry, TuplesKey};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const RETIRE_BATCH_CAPACITY: usize = 128;
 
-pub(crate) const HANDOFF_TIMEOUT_NS: u64 = 30_000_000_000;
-pub(crate) const REDIRECT_TIMEOUT_NS: u64 = 120_000_000_000;
+/// Cumulative conn-state entries physically deleted by userspace retirement,
+/// for the janitor's occupancy gauge. eBPF-side inserts/deletes are counted by
+/// the `CONN_STATE_OCCUPANCY` map; every backend `retire_batch` adds its own
+/// deletes here (including those before a failure) so no caller counts twice.
+pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct FlowExpiryHint {
@@ -14,6 +23,7 @@ pub struct FlowExpiryHint {
     pub incarnation: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub enum TcpSocketOwnership {
     Kernel(TcpSocketBinding),
@@ -24,6 +34,20 @@ pub enum TcpSocketOwnership {
 pub struct RetireRequest<'a> {
     pub key: TuplesKey,
     pub kind: RetireKind<'a>,
+}
+
+impl<'a> RetireRequest<'a> {
+    /// An unpublished UDP staging owner (Preparing, Pending or Aborted) under `token`.
+    pub fn pending_udp(key: TuplesKey, token: u32, incarnation: Option<u64>) -> Self {
+        Self {
+            key,
+            kind: RetireKind::Udp {
+                token,
+                incarnation,
+                pending_only: true,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,12 +83,99 @@ pub enum RetireKind<'a> {
     },
 }
 
+/// Owner entries a request's mutation decision reads, so executors fetch only those.
+pub(crate) struct OwnerReads<'a> {
+    pub conn: bool,
+    pub handoff: bool,
+    pub redirect: bool,
+    pub request: Option<&'a TcpRequestKey>,
+}
+
+impl<'a> RetireKind<'a> {
+    pub(crate) fn owner_reads(&self) -> OwnerReads<'a> {
+        match *self {
+            Self::ExpiredRedirect { .. } => OwnerReads {
+                conn: false,
+                handoff: false,
+                redirect: true,
+                request: None,
+            },
+            Self::ExpiredHandoff { .. } => OwnerReads {
+                conn: false,
+                handoff: true,
+                redirect: false,
+                request: None,
+            },
+            Self::ExpiredRequest { request, .. } => OwnerReads {
+                conn: false,
+                handoff: false,
+                redirect: false,
+                request: Some(request),
+            },
+            Self::Tcp { .. }
+            | Self::Udp { .. }
+            | Self::ExpiredConn { .. }
+            | Self::ExpiryHint { .. } => OwnerReads {
+                conn: true,
+                handoff: true,
+                redirect: true,
+                request: None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RetireCounts {
     pub conn: u64,
     pub redirect: u64,
     pub handoff: u64,
     pub request: u64,
+}
+
+impl RetireCounts {
+    /// Deletes performed after `before` was captured from the same running total.
+    pub(crate) fn since(self, before: Self) -> Self {
+        Self {
+            conn: self.conn - before.conn,
+            redirect: self.redirect - before.redirect,
+            handoff: self.handoff - before.handoff,
+            request: self.request - before.request,
+        }
+    }
+}
+
+impl std::ops::AddAssign for RetireCounts {
+    fn add_assign(&mut self, other: Self) {
+        self.conn += other.conn;
+        self.redirect += other.redirect;
+        self.handoff += other.handoff;
+        self.request += other.request;
+    }
+}
+
+/// Per-request result of `retire_batch`. `NotRun` is the pre-filled value and
+/// survives only where the batch failed first, so it is never settled.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RetireOutcome {
+    #[default]
+    NotRun,
+    Done(UdpDecisionCommitResult),
+}
+
+impl RetireOutcome {
+    /// The requested owner is gone: removed, already absent, or replaced by a
+    /// newer incarnation that retirement must not touch.
+    pub fn settled(self) -> bool {
+        use UdpDecisionCommitResult::*;
+        matches!(self, Self::Done(Applied | Missing | Superseded))
+    }
+}
+
+impl From<UdpDecisionCommitResult> for RetireOutcome {
+    fn from(result: UdpDecisionCommitResult) -> Self {
+        Self::Done(result)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +193,7 @@ pub(crate) fn tuple_matches(a: &TuplesKey, b: &TuplesKey) -> bool {
         && a.l4proto == b.l4proto
 }
 
-pub(crate) fn conn_matches(a: &ConnState, b: &ConnState, cutoff: u64) -> bool {
+fn conn_matches(a: &ConnState, b: &ConnState, cutoff: u64) -> bool {
     a.last_seen_ns <= cutoff
         && a.last_seen_ns == b.last_seen_ns
         && a.incarnation == b.incarnation
@@ -96,7 +207,7 @@ pub(crate) fn conn_matches(a: &ConnState, b: &ConnState, cutoff: u64) -> bool {
         && a.trace_id == b.trace_id
 }
 
-pub(crate) fn redirect_matches(a: &RedirectEntry, b: &RedirectEntry, cutoff: u64) -> bool {
+fn redirect_matches(a: &RedirectEntry, b: &RedirectEntry, cutoff: u64) -> bool {
     a.last_seen_ns <= cutoff
         && a.last_seen_ns == b.last_seen_ns
         && a.incarnation == b.incarnation
@@ -108,11 +219,7 @@ pub(crate) fn redirect_matches(a: &RedirectEntry, b: &RedirectEntry, cutoff: u64
         && a.ifindex == b.ifindex
 }
 
-pub(crate) fn handoff_matches(
-    a: &RoutingHandoffEntry,
-    b: &RoutingHandoffEntry,
-    cutoff: u64,
-) -> bool {
+fn handoff_matches(a: &RoutingHandoffEntry, b: &RoutingHandoffEntry, cutoff: u64) -> bool {
     let (x, y) = (&a.result, &b.result);
     a.last_seen_ns <= cutoff
         && a.last_seen_ns == b.last_seen_ns
@@ -129,39 +236,42 @@ pub(crate) fn handoff_matches(
         && x.decision_token == y.decision_token
 }
 
-pub(crate) fn request_matches(a: &TcpSocketBinding, b: &TcpSocketBinding, cutoff: u64) -> bool {
+fn request_matches(a: &TcpSocketBinding, b: &TcpSocketBinding, cutoff: u64) -> bool {
     a.kind == b.kind
         && a.syn_isn == b.syn_isn
         && tuple_matches(&a.tuples, &b.tuples)
         && handoff_matches(&a.handoff, &b.handoff, cutoff)
 }
 
-pub(crate) fn conn_expired(proto: u8, state: &ConnState, now_ns: u64) -> bool {
+pub(crate) fn conn_state_timeout_ns(proto: u8, state: &ConnState) -> u64 {
     use honk_ebpf_common::conn::{
         TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState,
         UDP_CONN_STATE_TIMEOUT_NS,
     };
-    if proto == libc::IPPROTO_UDP as u8
-        && state.state == honk_ebpf_common::UdpDecisionState::Aborted as u8
-    {
-        return true;
-    }
-    let timeout = if proto == libc::IPPROTO_UDP as u8 {
-        UDP_CONN_STATE_TIMEOUT_NS
+    if proto == libc::IPPROTO_UDP as u8 {
+        if state.state == honk_ebpf_common::UdpDecisionState::Aborted as u8 {
+            0
+        } else {
+            UDP_CONN_STATE_TIMEOUT_NS
+        }
     } else if state.state == TcpState::TcpStateClosing as u8 {
         TCP_CONN_STATE_CLOSING_TIMEOUT_NS
     } else {
         TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-    };
-    now_ns.saturating_sub(state.last_seen_ns) > timeout
+    }
 }
 
-pub(crate) fn validate_conn_retirement(
+pub(crate) fn conn_expired(proto: u8, state: &ConnState, now_ns: u64) -> bool {
+    let timeout = conn_state_timeout_ns(proto, state);
+    timeout == 0 || now_ns.saturating_sub(state.last_seen_ns) > timeout
+}
+
+fn validate_conn_retirement(
     state: &ConnState,
     proto: u8,
     kind: RetireKind<'_>,
-) -> Result<(), super::UdpDecisionCommitResult> {
-    use super::UdpDecisionCommitResult::*;
+) -> Result<(), UdpDecisionCommitResult> {
+    use UdpDecisionCommitResult::*;
     match kind {
         RetireKind::Tcp { incarnation } => {
             if state.incarnation != incarnation {
@@ -183,17 +293,14 @@ pub(crate) fn validate_conn_retirement(
                 });
             }
             if pending_only {
-                if state.state != honk_ebpf_common::UdpDecisionState::Preparing as u8
-                    && state.state != honk_ebpf_common::UdpDecisionState::Pending as u8
-                    && state.state != honk_ebpf_common::UdpDecisionState::Aborted as u8
-                {
+                if !udp_state_is_staged(state.state) {
                     return Err(StateMismatch);
                 }
             } else if token != 0 {
-                if !super::udp_state_is_userspace_owned(state.state) {
+                if !udp_state_is_userspace_owned(state.state) {
                     return Err(StateMismatch);
                 }
-            } else if !super::udp_state_is_legacy_userspace_owned(state)
+            } else if !udp_state_is_legacy_userspace_owned(state)
                 && !(state.state == honk_ebpf_common::UdpDecisionState::Aborted as u8
                     && incarnation == Some(state.incarnation))
             {
@@ -231,7 +338,7 @@ pub(crate) fn validate_conn_retirement(
     Ok(())
 }
 
-pub(crate) fn auxiliaries_match(
+fn auxiliaries_match(
     incarnation: u64,
     token: u32,
     handoff: Option<&RoutingHandoffEntry>,
@@ -243,12 +350,12 @@ pub(crate) fn auxiliaries_match(
         .is_none_or(|entry| entry.incarnation == incarnation && entry.decision_token == token)
 }
 
-pub(crate) fn expiry_hint_conn_expired(
+fn expiry_hint_conn_expired(
     proto: u8,
     incarnation: u64,
     now_ns: u64,
     current: Option<&ConnState>,
-) -> Result<bool, super::UdpDecisionCommitResult> {
+) -> Result<bool, UdpDecisionCommitResult> {
     let Some(state) = current else {
         return Ok(false);
     };
@@ -261,35 +368,25 @@ pub(crate) fn expiry_hint_conn_expired(
         },
     ) {
         Ok(()) => Ok(true),
-        Err(super::UdpDecisionCommitResult::StateMismatch) => Ok(false),
+        Err(UdpDecisionCommitResult::StateMismatch) => Ok(false),
         Err(result) => Err(result),
     }
 }
 
-pub(crate) struct ExpiryHintAuxiliaryRemoval {
-    pub(crate) handoff: bool,
-    pub(crate) redirect: bool,
-    unchanged: super::UdpDecisionCommitResult,
+struct ExpiryHintAuxiliaryRemoval {
+    handoff: bool,
+    redirect: bool,
+    unchanged: UdpDecisionCommitResult,
 }
 
-impl ExpiryHintAuxiliaryRemoval {
-    pub(crate) fn outcome(self, removed: bool) -> super::UdpDecisionCommitResult {
-        if removed {
-            super::UdpDecisionCommitResult::Applied
-        } else {
-            self.unchanged
-        }
-    }
-}
-
-pub(crate) fn expiry_hint_auxiliary_removal(
+fn expiry_hint_auxiliary_removal(
     incarnation: u64,
     now_ns: u64,
     current: Option<&ConnState>,
     handoff: Option<&RoutingHandoffEntry>,
     track: Option<&RedirectEntry>,
-) -> Result<ExpiryHintAuxiliaryRemoval, super::UdpDecisionCommitResult> {
-    use super::UdpDecisionCommitResult::*;
+) -> Result<ExpiryHintAuxiliaryRemoval, UdpDecisionCommitResult> {
+    use UdpDecisionCommitResult::*;
     let unchanged = if current.is_none() && handoff.is_none() && track.is_none() {
         Missing
     } else {
@@ -305,477 +402,276 @@ pub(crate) fn expiry_hint_auxiliary_removal(
         return Err(TokenMismatch);
     }
     Ok(ExpiryHintAuxiliaryRemoval {
-        handoff: handoff
-            .is_some_and(|entry| now_ns.saturating_sub(entry.last_seen_ns) > HANDOFF_TIMEOUT_NS),
-        redirect: track
-            .is_some_and(|entry| now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TIMEOUT_NS),
+        handoff: handoff.is_some_and(|entry| {
+            now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
+        }),
+        redirect: track.is_some_and(|entry| {
+            now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
+        }),
         unchanged,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ebpf::UdpDecisionCommitResult::{StateMismatch, Superseded, TokenMismatch};
-    use honk_ebpf_common::conn::{
-        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState,
-        UDP_CONN_STATE_TIMEOUT_NS,
-    };
-    use honk_ebpf_common::{
-        OutboundIndex, ROUTING_META_FLAG_OFFLOAD, ROUTING_META_FLAG_PUBLISHED,
-        ROUTING_META_FLAG_WAN_USERSPACE, RoutingMeta, UdpDecisionState,
-    };
+/// Post-grace owner snapshots for one request; only the entries named by
+/// `RetireKind::owner_reads` are populated.
+pub(crate) struct Owners<'a> {
+    pub conn: Option<&'a ConnState>,
+    pub handoff: Option<&'a RoutingHandoffEntry>,
+    pub redirect: Option<&'a RedirectEntry>,
+    pub request: Option<&'a TcpSocketBinding>,
+}
 
-    #[test]
-    fn snapshots_reject_changed_owner_payload_and_future_timestamps() {
-        macro_rules! changed {
-            ($compare:ident, $base:expr; $($field:ident $(.$nested:ident)* = $value:expr),+ $(,)?) => {
-                let base = $base;
-                assert!($compare(&base, &base, 10));
-                assert!(!$compare(&base, &base, 9));
-                $(
-                    let mut current = base;
-                    current.$field$(.$nested)* = $value;
-                    assert!(!$compare(&current, &base, 10), stringify!($field$(.$nested)*));
-                )+
-            };
-        }
-        changed!(conn_matches, ConnState { last_seen_ns: 10, ..Default::default() };
-            last_seen_ns = 9,
-            incarnation = 1,
-            state = 1,
-            decision_token = 1,
-            is_wan_ingress_direction = 1,
-            meta.raw = 1,
-            mac = [1; 6],
-            pname = [1; honk_ebpf_common::TASK_COMM_LEN],
-            pid = 1,
-            trace_id = 1,
-        );
-        changed!(redirect_matches, RedirectEntry { last_seen_ns: 10, ..Default::default() };
-            last_seen_ns = 9,
-            incarnation = 1,
-            decision_token = 1,
-            dmac = [1; 6],
-            smac = [1; 6],
-            from_wan = 1,
-            outbound = 1,
-            ifindex = 1,
-        );
-        changed!(handoff_matches, RoutingHandoffEntry { last_seen_ns: 10, ..Default::default() };
-            last_seen_ns = 9,
-            incarnation = 1,
-            routing_generation = 1,
-            trace_id = 1,
-            result.mark = 1,
-            result.must = 1,
-            result.mac = [1; 6],
-            result.outbound = 1,
-            result.pname = [1; honk_ebpf_common::TASK_COMM_LEN],
-            result.pid = 1,
-            result.dscp = 1,
-            result.decision_token = 1,
-        );
-        let request = TcpSocketBinding {
-            handoff: RoutingHandoffEntry {
-                last_seen_ns: 10,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        changed!(request_matches, request;
-            kind = 1,
-            syn_isn = 1,
-            tuples.src_port = 1,
-            tuples.dst_port = 1,
-            tuples.l4proto = 1,
-            handoff.incarnation = 1,
-        );
-        for source in [false, true] {
-            let mut current = request;
-            if source {
-                current.tuples.src_ip[0] = 1;
-            } else {
-                current.tuples.dst_ip[0] = 1;
-            }
-            assert!(!request_matches(&current, &request, 10));
+/// Mutation set for an authorized retirement. Executors apply it in field
+/// order (auxiliaries, request proof, conn) so a failure part-way never leaves
+/// a conn whose auxiliaries survive it, and count each delete as it happens.
+pub(crate) struct RetirePlan {
+    pub handoff: bool,
+    pub redirect: bool,
+    /// Conn incarnation whose request count the deleted request proof releases.
+    pub request: Option<u64>,
+    pub conn: bool,
+    /// Outcome when the deciding removal finds its entry already gone.
+    unchanged: UdpDecisionCommitResult,
+}
+
+impl RetirePlan {
+    fn auxiliary(unchanged: UdpDecisionCommitResult) -> Self {
+        Self {
+            handoff: false,
+            redirect: false,
+            request: None,
+            conn: false,
+            unchanged,
         }
     }
 
-    #[test]
-    fn conn_retirement_checks_owner_state_and_snapshot() {
-        let state = ConnState {
-            incarnation: 1,
-            decision_token: 7,
-            state: UdpDecisionState::Pending as u8,
-            last_seen_ns: 10,
-            ..Default::default()
+    /// `removed` is what the executor just deleted for this request.
+    pub(crate) fn outcome(&self, removed: RetireCounts) -> UdpDecisionCommitResult {
+        let decided = if self.conn {
+            removed.conn
+        } else {
+            removed.handoff + removed.redirect + removed.request
         };
-        for (incarnation, expected) in [(1, Ok(())), (2, Err(Superseded))] {
-            assert_eq!(
-                validate_conn_retirement(&state, 6, RetireKind::Tcp { incarnation }),
-                expected,
-            );
-        }
-        for pending_only in [false, true] {
-            for token in [7, 8] {
-                for incarnation in [None, Some(1), Some(2)] {
-                    for decision in [
-                        UdpDecisionState::None,
-                        UdpDecisionState::Preparing,
-                        UdpDecisionState::Pending,
-                        UdpDecisionState::Aborted,
-                        UdpDecisionState::DirectArmed,
-                        UdpDecisionState::Proxy,
-                    ] {
-                        let current = ConnState {
-                            state: decision as u8,
-                            ..state
-                        };
-                        let expected = if token != 7 || incarnation == Some(2) {
-                            Err(if pending_only {
-                                TokenMismatch
-                            } else {
-                                Superseded
-                            })
-                        } else if matches!(
-                            decision,
-                            UdpDecisionState::Preparing
-                                | UdpDecisionState::Pending
-                                | UdpDecisionState::Aborted
-                        ) || (!pending_only && decision == UdpDecisionState::Proxy)
-                        {
-                            Ok(())
-                        } else {
-                            Err(StateMismatch)
-                        };
-                        assert_eq!(
-                            validate_conn_retirement(
-                                &current,
-                                17,
-                                RetireKind::Udp {
-                                    token,
-                                    incarnation,
-                                    pending_only,
-                                },
-                            ),
-                            expected,
-                        );
-                    }
-                }
-            }
-        }
-        for expired_before_ns in [9, 10] {
-            assert_eq!(
-                validate_conn_retirement(
-                    &state,
-                    17,
-                    RetireKind::ExpiredConn {
-                        expected: &state,
-                        expired_before_ns,
-                    },
-                ),
-                if expired_before_ns == 10 {
-                    Ok(())
-                } else {
-                    Err(Superseded)
-                },
-            );
-        }
-        let aborted = ConnState {
-            state: UdpDecisionState::Aborted as u8,
-            ..state
-        };
-        assert_eq!(
-            validate_conn_retirement(
-                &aborted,
-                17,
-                RetireKind::ExpiredConn {
-                    expected: &aborted,
-                    expired_before_ns: 0,
-                },
-            ),
-            Ok(()),
-        );
-        assert_eq!(
-            validate_conn_retirement(
-                &aborted,
-                6,
-                RetireKind::ExpiredConn {
-                    expected: &aborted,
-                    expired_before_ns: 0,
-                },
-            ),
-            Err(Superseded),
-        );
-        let changed = ConnState {
-            incarnation: 2,
-            ..state
-        };
-        assert_eq!(
-            validate_conn_retirement(
-                &changed,
-                17,
-                RetireKind::ExpiredConn {
-                    expected: &state,
-                    expired_before_ns: 10,
-                },
-            ),
-            Err(Superseded),
-        );
-    }
-
-    #[test]
-    fn token_zero_requires_legacy_ownership_or_exact_aborted_owner() {
-        for (raw, owned) in [
-            (0, false),
-            (ROUTING_META_FLAG_PUBLISHED, true),
-            (
-                ROUTING_META_FLAG_PUBLISHED | OutboundIndex::UserBase as u64,
-                true,
-            ),
-            (
-                ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
-                false,
-            ),
-            (ROUTING_META_FLAG_PUBLISHED | (1 << 40), false),
-            (
-                ROUTING_META_FLAG_PUBLISHED | OutboundIndex::Block as u64,
-                false,
-            ),
-            (
-                ROUTING_META_FLAG_PUBLISHED | (1 << 40) | ROUTING_META_FLAG_WAN_USERSPACE,
-                true,
-            ),
-        ] {
-            let state = ConnState {
-                incarnation: 1,
-                meta: RoutingMeta { raw },
-                ..Default::default()
-            };
-            for incarnation in [None, Some(1), Some(2)] {
-                assert_eq!(
-                    validate_conn_retirement(
-                        &state,
-                        17,
-                        RetireKind::Udp {
-                            token: 0,
-                            incarnation,
-                            pending_only: false,
-                        },
-                    ),
-                    if owned && incarnation != Some(2) {
-                        Ok(())
-                    } else {
-                        Err(Superseded)
-                    },
-                );
-            }
-        }
-        for (decision, terminal_owner, pending_owner) in [
-            (UdpDecisionState::None, false, false),
-            (UdpDecisionState::Preparing, false, true),
-            (UdpDecisionState::Pending, false, true),
-            (UdpDecisionState::Aborted, true, true),
-            (UdpDecisionState::DirectArmed, false, false),
-            (UdpDecisionState::Proxy, false, false),
-        ] {
-            let state = ConnState {
-                incarnation: 1,
-                state: decision as u8,
-                ..Default::default()
-            };
-            for incarnation in [None, Some(1), Some(2)] {
-                for pending_only in [false, true] {
-                    let expected = if pending_only {
-                        if incarnation == Some(2) {
-                            Err(TokenMismatch)
-                        } else if pending_owner {
-                            Ok(())
-                        } else {
-                            Err(StateMismatch)
-                        }
-                    } else if terminal_owner && incarnation == Some(1) {
-                        Ok(())
-                    } else {
-                        Err(Superseded)
-                    };
-                    assert_eq!(
-                        validate_conn_retirement(
-                            &state,
-                            17,
-                            RetireKind::Udp {
-                                token: 0,
-                                incarnation,
-                                pending_only,
-                            },
-                        ),
-                        expected
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn expiry_hint_checks_incarnation_and_strict_protocol_deadlines() {
-        for (proto, decision, timeout) in [
-            (
-                6,
-                TcpState::TcpStateActive as u8,
-                TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
-            ),
-            (
-                6,
-                TcpState::TcpStateClosing as u8,
-                TCP_CONN_STATE_CLOSING_TIMEOUT_NS,
-            ),
-            (
-                17,
-                UdpDecisionState::Pending as u8,
-                UDP_CONN_STATE_TIMEOUT_NS,
-            ),
-        ] {
-            let state = ConnState {
-                incarnation: 1,
-                state: decision,
-                last_seen_ns: 10,
-                ..Default::default()
-            };
-            assert_eq!(
-                expiry_hint_conn_expired(proto, 1, u64::MAX, None),
-                Ok(false),
-            );
-            for (now_ns, expired) in [(0, false), (10 + timeout, false), (11 + timeout, true)] {
-                assert_eq!(conn_expired(proto, &state, now_ns), expired);
-                assert_eq!(
-                    expiry_hint_conn_expired(proto, 1, now_ns, Some(&state)),
-                    Ok(expired),
-                );
-                assert_eq!(
-                    expiry_hint_conn_expired(proto, 2, now_ns, Some(&state)),
-                    Err(Superseded),
-                );
-                assert_eq!(
-                    validate_conn_retirement(
-                        &state,
-                        proto,
-                        RetireKind::ExpiryHint {
-                            incarnation: 1,
-                            now_ns,
-                        },
-                    ),
-                    if expired { Ok(()) } else { Err(StateMismatch) },
-                );
-            }
-        }
-        let aborted = ConnState {
-            state: UdpDecisionState::Aborted as u8,
-            last_seen_ns: u64::MAX,
-            ..Default::default()
-        };
-        assert!(conn_expired(17, &aborted, 0));
-        assert!(!conn_expired(6, &aborted, 0));
-    }
-
-    #[test]
-    fn auxiliary_ownership_and_hint_expiry_truth_table() {
-        let state = ConnState {
-            incarnation: 1,
-            decision_token: 7,
-            ..Default::default()
-        };
-        let handoff = RoutingHandoffEntry {
-            incarnation: 1,
-            result: honk_ebpf_common::RoutingResult {
-                decision_token: 7,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let track = RedirectEntry {
-            incarnation: 1,
-            decision_token: 7,
-            ..Default::default()
-        };
-        let owners = [None, Some((1, 7)), Some((1, 8)), Some((2, 7))];
-        let matching = [
-            [true, true, false, false],
-            [true, true, false, false],
-            [false; 4],
-            [false; 4],
-        ];
-        let hint_mismatches = [
-            [false; 4],
-            [false, false, true, false],
-            [false, true, false, false],
-            [false; 4],
-        ];
-        let conn_mismatches = [
-            [false, false, true, false],
-            [false, false, true, false],
-            [true; 4],
-            [false, false, true, false],
-        ];
-        for current in [None, Some(&state)] {
-            for (h, handoff_owner) in owners.into_iter().enumerate() {
-                for (t, track_owner) in owners.into_iter().enumerate() {
-                    let handoff = handoff_owner.map(|(incarnation, token)| RoutingHandoffEntry {
-                        incarnation,
-                        result: honk_ebpf_common::RoutingResult {
-                            decision_token: token,
-                            ..handoff.result
-                        },
-                        ..handoff
-                    });
-                    let track = track_owner.map(|(incarnation, decision_token)| RedirectEntry {
-                        incarnation,
-                        decision_token,
-                        ..track
-                    });
-                    assert_eq!(
-                        auxiliaries_match(1, 7, handoff.as_ref(), track.as_ref()),
-                        matching[h][t],
-                    );
-                    for (now_ns, handoff_expired, track_expired) in [
-                        (0, false, false),
-                        (HANDOFF_TIMEOUT_NS, false, false),
-                        (HANDOFF_TIMEOUT_NS + 1, true, false),
-                        (REDIRECT_TIMEOUT_NS, true, false),
-                        (REDIRECT_TIMEOUT_NS + 1, true, true),
-                    ] {
-                        let result = expiry_hint_auxiliary_removal(
-                            1,
-                            now_ns,
-                            current,
-                            handoff.as_ref(),
-                            track.as_ref(),
-                        );
-                        if if current.is_some() {
-                            conn_mismatches[h][t]
-                        } else {
-                            hint_mismatches[h][t]
-                        } {
-                            assert!(matches!(result, Err(TokenMismatch)));
-                            continue;
-                        }
-                        let removal = result.unwrap();
-                        assert_eq!(removal.handoff, matches!(h, 1 | 2) && handoff_expired,);
-                        assert_eq!(removal.redirect, matches!(t, 1 | 2) && track_expired,);
-                        let removed = removal.handoff || removal.redirect;
-                        assert_eq!(
-                            removal.outcome(removed),
-                            if removed {
-                                crate::ebpf::UdpDecisionCommitResult::Applied
-                            } else if current.is_none() && handoff.is_none() && track.is_none() {
-                                crate::ebpf::UdpDecisionCommitResult::Missing
-                            } else {
-                                StateMismatch
-                            },
-                        );
-                    }
-                }
-            }
+        if decided != 0 {
+            UdpDecisionCommitResult::Applied
+        } else {
+            self.unchanged
         }
     }
 }
+
+/// Authorize one retirement from post-grace owner snapshots, or refuse with
+/// the outcome that leaves every map untouched. Real executes the plan after
+/// fence and grace; the model executes it on its own maps.
+pub(crate) fn plan_retirement(
+    request: &RetireRequest<'_>,
+    owners: &Owners<'_>,
+) -> Result<RetirePlan, UdpDecisionCommitResult> {
+    use UdpDecisionCommitResult::*;
+    let proto = request.key.l4proto;
+    let conn_plan = |kind| -> Result<RetirePlan, UdpDecisionCommitResult> {
+        let state = owners.conn.ok_or(Missing)?;
+        validate_conn_retirement(state, proto, kind)?;
+        if !auxiliaries_match(
+            state.incarnation,
+            state.decision_token,
+            owners.handoff,
+            owners.redirect,
+        ) {
+            return Err(TokenMismatch);
+        }
+        Ok(RetirePlan {
+            handoff: owners.handoff.is_some(),
+            redirect: owners.redirect.is_some(),
+            conn: true,
+            ..RetirePlan::auxiliary(Missing)
+        })
+    };
+    match request.kind {
+        RetireKind::ExpiredRedirect {
+            expected,
+            expired_before_ns,
+        } => match owners.redirect {
+            None => Err(Missing),
+            Some(current) if redirect_matches(current, expected, expired_before_ns) => {
+                Ok(RetirePlan {
+                    redirect: true,
+                    ..RetirePlan::auxiliary(Applied)
+                })
+            }
+            Some(_) => Err(Superseded),
+        },
+        RetireKind::ExpiredHandoff {
+            expected,
+            expired_before_ns,
+        } => match owners.handoff {
+            None => Err(Missing),
+            Some(current) if handoff_matches(current, expected, expired_before_ns) => {
+                Ok(RetirePlan {
+                    handoff: true,
+                    ..RetirePlan::auxiliary(Applied)
+                })
+            }
+            Some(_) => Err(Superseded),
+        },
+        RetireKind::ExpiredRequest {
+            expected,
+            expired_before_ns,
+            ..
+        } => match owners.request {
+            None => Err(Missing),
+            Some(current)
+                if tuple_matches(&request.key, &current.tuples)
+                    && request_matches(current, expected, expired_before_ns) =>
+            {
+                Ok(RetirePlan {
+                    request: Some(current.handoff.incarnation),
+                    ..RetirePlan::auxiliary(Applied)
+                })
+            }
+            Some(_) => Err(Superseded),
+        },
+        RetireKind::ExpiryHint {
+            incarnation,
+            now_ns,
+        } => {
+            if expiry_hint_conn_expired(proto, incarnation, now_ns, owners.conn)? {
+                return conn_plan(request.kind);
+            }
+            let removal = expiry_hint_auxiliary_removal(
+                incarnation,
+                now_ns,
+                owners.conn,
+                owners.handoff,
+                owners.redirect,
+            )?;
+            Ok(RetirePlan {
+                handoff: removal.handoff,
+                redirect: removal.redirect,
+                ..RetirePlan::auxiliary(removal.unchanged)
+            })
+        }
+        RetireKind::Tcp { .. } | RetireKind::Udp { .. } | RetireKind::ExpiredConn { .. } => {
+            conn_plan(request.kind)
+        }
+    }
+}
+
+/// Release one in-flight TCP request from its conn owner's count when the
+/// deleted proof belonged to that same incarnation; true when `state` changed.
+pub(crate) fn release_request_count(
+    state: &mut ConnState,
+    incarnation: u64,
+) -> anyhow::Result<bool> {
+    if state.incarnation != incarnation {
+        return Ok(false);
+    }
+    state.tcp_request_count = state
+        .tcp_request_count
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("TCP request accounting underflow"))?;
+    Ok(true)
+}
+
+pub(crate) enum RedirectEffect {
+    Remove,
+    Rewrite(RedirectEntry),
+}
+
+/// Mutation set for one token-bound UDP decision commit.
+pub(crate) struct UdpCommitPlan {
+    pub state: ConnState,
+    pub remove_handoff: bool,
+    pub redirect: Option<RedirectEffect>,
+}
+
+/// Authorize a UDP decision transition from post-grace snapshots whose conn
+/// token and incarnation the caller already matched, or refuse.
+pub(crate) fn plan_udp_commit(
+    mut state: ConnState,
+    token: u32,
+    transition: UdpDecisionTransition,
+    handoff: Option<&RoutingHandoffEntry>,
+    track: Option<&RedirectEntry>,
+) -> Result<UdpCommitPlan, UdpDecisionCommitResult> {
+    apply_udp_decision_transition(&mut state, transition)?;
+    if !auxiliaries_match(state.incarnation, token, handoff, track) {
+        return Err(UdpDecisionCommitResult::TokenMismatch);
+    }
+    let initial = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
+    if initial && (handoff.is_none() || track.is_none()) {
+        return Err(UdpDecisionCommitResult::Missing);
+    }
+    Ok(UdpCommitPlan {
+        state,
+        remove_handoff: handoff.is_some(),
+        redirect: track.map(|track| match transition {
+            UdpDecisionTransition::ActivateProxy(outbound, _) => {
+                RedirectEffect::Rewrite(RedirectEntry { outbound, ..*track })
+            }
+            _ => RedirectEffect::Remove,
+        }),
+    })
+}
+
+/// Retire scanned staged UDP flows, `(key, token, incarnation)`, in
+/// capacity-bounded batches through the backend's own fenced executor.
+pub(crate) fn retire_staged_udp(
+    staged: &[(TuplesKey, u32, u64)],
+    mut retire: impl FnMut(
+        &[RetireRequest<'_>],
+        &mut [RetireOutcome],
+    ) -> Result<RetireCounts, RetireError>,
+) -> anyhow::Result<()> {
+    for chunk in staged.chunks(RETIRE_BATCH_CAPACITY) {
+        let mut requests =
+            [RetireRequest::pending_udp(TuplesKey::default(), 0, None); RETIRE_BATCH_CAPACITY];
+        let mut outcomes = [RetireOutcome::NotRun; RETIRE_BATCH_CAPACITY];
+        for (request, (key, token, incarnation)) in requests.iter_mut().zip(chunk) {
+            *request = RetireRequest::pending_udp(*key, *token, Some(*incarnation));
+        }
+        let outcomes = &mut outcomes[..chunk.len()];
+        retire(&requests[..chunk.len()], outcomes)?;
+        for (outcome, (_, token, _)) in outcomes.iter().zip(chunk) {
+            // A token-zero claim can finish native publication between scan and fence.
+            anyhow::ensure!(
+                outcome.settled()
+                    || (*token == 0
+                        && *outcome == RetireOutcome::Done(UdpDecisionCommitResult::StateMismatch)),
+                "UDP staging quiescence rejected retirement: {outcome:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Retire one unpublished UDP token with exact-owner semantics.
+pub fn retire_pending(
+    backend: &mut dyn EbpfBackend,
+    key: TuplesKey,
+    token: u32,
+    incarnation: Option<u64>,
+) -> Result<RetireOutcome, RetireError> {
+    let mut outcome = [RetireOutcome::NotRun];
+    backend.retire_batch(
+        &[RetireRequest::pending_udp(key, token, incarnation)],
+        &mut outcome,
+    )?;
+    Ok(outcome[0])
+}
+
+fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
+    match result {
+        Ok(counts) => counts.conn,
+        Err(error) => error.counts.conn,
+    }
+}
+
+/// Count a finished batch once, at the backend's execution boundary. Deletes
+/// made before a failure are real, so errors contribute their partial counts.
+pub(crate) fn account_retirement(result: &Result<RetireCounts, RetireError>) {
+    USERSPACE_CONN_STATE_DELETES.fetch_add(conn_deletes(result), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests;

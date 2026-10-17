@@ -9,6 +9,7 @@ use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
 };
 use crate::control::{ControlPlane, ControlPlaneHandle};
+use crate::daens;
 use crate::dns::DnsResolver;
 use crate::ebpf::{EbpfBackend, TcpSocketOwnership, real::RealEbpfBackend};
 use crate::routing::Router;
@@ -201,10 +202,10 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
         .starts_with("retransmit")
         .then(|| retransmit::listen(&server_ns, target))
         .transpose()?;
-    let _dae0 = crate::create_dae0_link()?;
+    let _dae0 = daens::create_dae0_link()?;
     if case == "namespace" {
-        crate::setup_daens_namespace(honk_ebpf_common::TPROXY_MARK, 12345)?;
-        return crate::with_daens_netns("verify request shortcut settings", || {
+        daens::setup_daens_namespace(honk_ebpf_common::TPROXY_MARK, 12345)?;
+        return daens::with_daens_netns("verify request shortcut settings", || {
             for name in ["tcp_syncookies", "tcp_migrate_req", "tcp_fastopen"] {
                 match std::fs::read_to_string(format!("/proc/sys/net/ipv4/{name}")) {
                     Ok(value) => ensure!(value.trim() == "0", "{name} remains enabled"),
@@ -236,7 +237,7 @@ fn run_child(family: &str, case: &str) -> anyhow::Result<()> {
             )
             .await?;
             backend.attach_dae0_programs()?;
-            crate::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
+            daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
             backend.attach_sk_lookup()?;
             backend.attach_dae0peer_ingress()?;
             let tcp4 = crate::control::sockets::bind_tproxy_tcp(
@@ -384,7 +385,7 @@ async fn exercise(
         }
     }
     let cookies_before = if case == "cookie" {
-        crate::with_daens_netns("force owned-netns SYN cookies", || {
+        daens::with_daens_netns("force owned-netns SYN cookies", || {
             std::fs::write("/proc/sys/net/ipv4/tcp_syncookies", "2")?;
             ensure!(
                 std::fs::read_to_string("/proc/sys/net/ipv4/tcp_syncookies")?.trim() == "2",
@@ -439,7 +440,7 @@ async fn exercise(
         .ebpf
         .read()
         .await
-        .tcp_conn_state_lookup(&key)?
+        .conn_state_lookup(&key)?
         .context("real SYN did not publish conn-state")?;
     ensure!(original.incarnation != 0, "real SYN has no incarnation");
     if case == "accepted" {
@@ -493,7 +494,7 @@ async fn exercise(
         original.incarnation
     };
     let optmem = if case == "child-full" {
-        Some(crate::with_daens_netns(
+        Some(daens::with_daens_netns(
             "deny child storage allocation",
             || -> anyhow::Result<_> {
                 let old = std::fs::read_to_string("/proc/sys/net/core/optmem_max")?;
@@ -523,7 +524,7 @@ async fn exercise(
     let connected = tokio::time::timeout(NETNS_TEST_TIMEOUT, connect).await;
     let accepted = tokio::time::timeout(NETNS_TEST_TIMEOUT, listener.accept()).await;
     if let Some(old) = optmem {
-        crate::with_daens_netns("restore child storage allocation", || {
+        daens::with_daens_netns("restore child storage allocation", || {
             std::fs::write("/proc/sys/net/core/optmem_max", old).map_err(anyhow::Error::from)
         })?;
     }
@@ -560,7 +561,7 @@ async fn exercise(
     }
     if case == "cookie" {
         ensure!(
-            crate::with_daens_netns("observe forced cookie child", cookie_count)? > cookies_before,
+            daens::with_daens_netns("observe forced cookie child", cookie_count)? > cookies_before,
             "fixture did not send a SYN cookie"
         );
     }
@@ -652,7 +653,7 @@ async fn refused_without_cleanup(
     let backend = handle.ebpf.read().await;
     ensure!(
         backend
-            .tcp_conn_state_lookup(key)?
+            .conn_state_lookup(key)?
             .map(|value| value.incarnation)
             == Some(incarnation),
         "rejected adoption deleted/rebound conn-state"

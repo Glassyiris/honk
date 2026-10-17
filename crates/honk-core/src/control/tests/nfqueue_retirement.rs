@@ -1,7 +1,7 @@
 use super::support::netns::{build_lab, pinned_map};
 use crate::control::nfqueue::{HeldVerdict, NfqueueIngest, PendingUdpVerdicts, TestVerdict};
 use crate::control::udp_endpoint::UdpEndpointPool;
-use crate::ebpf::{EbpfBackend, RetireKind, RetireRequest, real::RealEbpfBackend};
+use crate::ebpf::{EbpfBackend, RetireKind, RetireOutcome, RetireRequest, real::RealEbpfBackend};
 use crate::stats::StatsManager;
 use aya::maps::HashMap;
 use honk_ebpf_common::{
@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Result<()> {
     std::thread::spawn(|| -> anyhow::Result<()> {
         let (_client, _server) = build_lab("192.0.2.1".parse()?, "198.51.100.1".parse()?)?;
-        let _dae0 = crate::create_dae0_link()?;
+        let _dae0 = crate::daens::create_dae0_link()?;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
@@ -52,7 +52,9 @@ fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Resul
                     },
                 )?;
                 assert_eq!(
-                    backend.udp_flow_incarnation(&key, token)?,
+                    backend
+                        .udp_flow_owner(token, backend.conn_state_lookup(&key)?)?
+                        .incarnation(),
                     Some(incarnation)
                 );
                 let mut fences = HashMap::<_, TuplesKey, RetirementFence>::try_from(pinned_map(
@@ -76,10 +78,18 @@ fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Resul
                         pending_only: false,
                     },
                 };
-                assert!(backend.retire_batch(&[request], &mut [None]).is_err());
-                assert!(backend.udp_flow_incarnation(&key, token).is_err());
+                assert!(
+                    backend
+                        .retire_batch(&[request], &mut [RetireOutcome::NotRun])
+                        .is_err()
+                );
+                assert!(
+                    backend
+                        .udp_flow_owner(token, backend.conn_state_lookup(&key)?)
+                        .is_err()
+                );
                 assert_eq!(
-                    backend.udp_conn_state_lookup(&key)?.unwrap().incarnation,
+                    backend.conn_state_lookup(&key)?.unwrap().incarnation,
                     incarnation
                 );
                 assert_eq!(fences.get(&key, 0)?.owner, 900);

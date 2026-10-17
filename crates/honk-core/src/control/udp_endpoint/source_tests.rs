@@ -693,8 +693,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     assert!(pool.complete_removal(
         client_two_addr,
         target_c,
-        removed_two.decision_token,
-        removed_two.kernel_incarnation,
+        removed_two.owner,
         removed_two.generation,
     ));
     drop(endpoint_two);
@@ -756,13 +755,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         .unwrap();
     assert_no_reply(&client).await;
     let removed_a = removed_rx.recv().await.unwrap();
-    assert!(pool.complete_removal(
-        client_addr,
-        target_a,
-        removed_a.decision_token,
-        removed_a.kernel_incarnation,
-        removed_a.generation
-    ));
+    assert!(pool.complete_removal(client_addr, target_a, removed_a.owner, removed_a.generation));
     drop(endpoint_a);
     assert!(matches!(
         pool.classify_source_reply(&owner, target_a),
@@ -830,8 +823,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     assert!(pool.complete_removal(
         client_addr,
         target_a,
-        removed_flow.decision_token,
-        removed_flow.kernel_incarnation,
+        removed_flow.owner,
         removed_flow.generation
     ));
 
@@ -893,8 +885,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         assert!(pool.complete_removal(
             removed.client,
             removed.dst,
-            removed.decision_token,
-            removed.kernel_incarnation,
+            removed.owner,
             removed.generation,
         ));
     }
@@ -949,13 +940,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         identity_c.1
     ));
     let removed_c = removed_rx.recv().await.unwrap();
-    assert!(pool.complete_removal(
-        client_addr,
-        target_c,
-        removed_c.decision_token,
-        removed_c.kernel_incarnation,
-        removed_c.generation
-    ));
+    assert!(pool.complete_removal(client_addr, target_c, removed_c.owner, removed_c.generation));
     drop(endpoint_c);
     drop(replacement);
     assert!(pool.shutdown().await.joined);
@@ -972,7 +957,7 @@ fn endpoint_identity(
     pool.endpoints
         .get(&EndpointKey::new(client, target))
         .and_then(|entry| match entry.value() {
-            EndpointEntry::Ready(ready) => Some((ready.decision_token, ready.generation)),
+            EndpointEntry::Ready(ready) => Some((ready.owner.token, ready.generation)),
             EndpointEntry::Initializing(_) | EndpointEntry::Retiring { .. } => None,
         })
 }

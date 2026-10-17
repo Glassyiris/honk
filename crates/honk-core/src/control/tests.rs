@@ -1,5 +1,6 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
+use crate::control::retirement_worker::RetirementPort;
 use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 #[cfg(feature = "native-api")]
@@ -1185,10 +1186,10 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
     // addresses assigned by the netns setup; this pins the crate-root
     // DAENS_* strings to the DAE0_* constants in honk-ebpf-common.
     for s in [
-        crate::DAENS_HOST_IPV6,
-        crate::DAENS_PEER_IPV6,
-        crate::DAENS_HOST_IP,
-        crate::DAENS_PEER_IP,
+        crate::daens::DAENS_HOST_IPV6,
+        crate::daens::DAENS_PEER_IPV6,
+        crate::daens::DAENS_HOST_IP,
+        crate::daens::DAENS_PEER_IP,
     ] {
         let ip: std::net::IpAddr = s.parse().unwrap();
         assert!(
@@ -1963,7 +1964,7 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
     );
     {
         let backend = handle.ebpf.read().await;
-        assert!(backend.tcp_conn_state_lookup(&tuples)?.is_some());
+        assert!(backend.conn_state_lookup(&tuples)?.is_some());
         assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
     }
 
@@ -1994,7 +1995,7 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
 
     {
         let backend = handle.ebpf.read().await;
-        assert!(backend.tcp_conn_state_lookup(&tuples)?.is_none());
+        assert!(backend.conn_state_lookup(&tuples)?.is_none());
     }
     assert!(handle.tcp_flow_pins.snapshot().is_empty());
     assert!(handle.connection_tracker.snapshot().is_empty());
@@ -3321,7 +3322,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
         dst,
         &query,
         None,
-        None,
+        crate::ebpf::UdpFlowOwner::new(0, None).unwrap(),
         pool.initialization_epoch(),
         received_at,
     ) {
@@ -4425,10 +4426,7 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
     for index in [2, 3] {
         {
             let mut backend = control.ebpf.write().await;
-            let expected = backend
-                .udp_conn_state_lookup(&keys[index])
-                .unwrap()
-                .unwrap();
+            let expected = backend.conn_state_lookup(&keys[index]).unwrap().unwrap();
             backend
                 .retire_batch(
                     &[crate::ebpf::RetireRequest {
@@ -4438,7 +4436,7 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
                             expired_before_ns: 0,
                         },
                     }],
-                    &mut [None],
+                    &mut [crate::ebpf::RetireOutcome::NotRun],
                 )
                 .unwrap();
         }
@@ -4524,7 +4522,7 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
 }
 
 #[tokio::test]
-async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
+async fn retirement_worker_retires_legacy_token_zero_conn_state() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
     use honk_ebpf_common::{ROUTING_META_FLAG_PUBLISHED, RoutingMeta};
 
@@ -4548,12 +4546,14 @@ async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
-    let removal_task = spawn_udp_removal_worker(
+    let port = Arc::new(RetirementPort::default());
+    let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
         Arc::clone(&backend),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
+        Arc::clone(&port),
     );
     let permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
@@ -4576,19 +4576,19 @@ async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
         backend
             .read()
             .await
-            .udp_conn_state_lookup(&key)
+            .conn_state_lookup(&key)
             .unwrap()
             .is_none()
     );
     assert!(fatal_rx.try_recv().is_err());
 
     assert!(pool.shutdown().await.joined);
-    pins.retirement_sink.lock().take();
+    port.sink.lock().take();
     removal_task.await.unwrap();
 }
 
 #[tokio::test]
-async fn udp_removal_worker_acknowledges_superseding_token() {
+async fn retirement_worker_acknowledges_superseding_token() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
 
     let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
@@ -4608,12 +4608,14 @@ async fn udp_removal_worker_acknowledges_superseding_token() {
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
-    let removal_task = spawn_udp_removal_worker(
+    let port = Arc::new(RetirementPort::default());
+    let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
         Arc::clone(&backend),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
+        Arc::clone(&port),
     );
     let lease = match pool.reserve_owned_or_enqueue(
         client,
@@ -4637,7 +4639,7 @@ async fn udp_removal_worker_acknowledges_superseding_token() {
         backend
             .read()
             .await
-            .udp_conn_state_lookup(&key)
+            .conn_state_lookup(&key)
             .unwrap()
             .unwrap()
             .decision_token,
@@ -4646,12 +4648,12 @@ async fn udp_removal_worker_acknowledges_superseding_token() {
     assert!(fatal_rx.try_recv().is_err());
 
     assert!(pool.shutdown().await.joined);
-    pins.retirement_sink.lock().take();
+    port.sink.lock().take();
     removal_task.await.unwrap();
 }
 
 #[tokio::test]
-async fn udp_removal_worker_escalates_auxiliary_token_mismatch() {
+async fn retirement_worker_escalates_auxiliary_token_mismatch() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
     use honk_ebpf_common::{RedirectEntry, RedirectTuple};
 
@@ -4679,12 +4681,14 @@ async fn udp_removal_worker_escalates_auxiliary_token_mismatch() {
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
-    let removal_task = spawn_udp_removal_worker(
+    let port = Arc::new(RetirementPort::default());
+    let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
         Arc::clone(&backend),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
+        Arc::clone(&port),
     );
     let lease = match pool.reserve_owned_or_enqueue(
         client,
@@ -4712,14 +4716,14 @@ async fn udp_removal_worker_escalates_auxiliary_token_mismatch() {
         backend
             .read()
             .await
-            .udp_conn_state_lookup(&key)
+            .conn_state_lookup(&key)
             .unwrap()
             .unwrap()
             .decision_token,
         41
     );
     assert!(!pool.shutdown().await.joined);
-    pins.retirement_sink.lock().take();
+    port.sink.lock().take();
     removal_task.await.unwrap();
 }
 
@@ -5038,12 +5042,13 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             nfqueue.pending.open_admission();
             control.ebpf.write().await.set_datapath_ready(true)?;
             let (removal_fatal_tx, mut removal_fatal_rx) = mpsc::unbounded_channel();
-            let removal_task = spawn_udp_removal_worker(
+            let removal_task = spawn_retirement_worker(
                 Arc::clone(&control.udp_pool),
                 Arc::clone(&control.ebpf),
                 Arc::clone(&control.connection_tracker),
                 removal_fatal_tx,
                 Arc::clone(&control.tcp_flow_pins),
+                Arc::clone(&control.retirement),
             );
 
             let client = UdpSocket::from_std(client)?;
@@ -5211,7 +5216,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let pending_shutdown = nfqueue.finish_pending_drain().await;
             control.pending_udp_verdicts = None;
             let shutdown = control.shutdown_runtime(None, None).await;
-            control.tcp_flow_pins.retirement_sink.lock().take();
+            control.retirement.sink.lock().take();
             let removed = removal_task.await;
             let _ = std::fs::remove_file(pin_root.join(crate::ebpf::UDP_DECISION_SEQUENCE_MAP));
             let _ = std::fs::remove_file(pin_root.join("ROUTING_GENERATION_SEQUENCE"));

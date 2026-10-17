@@ -56,7 +56,7 @@ struct SynTap(OwnedFd);
 
 impl SynTap {
     fn new() -> anyhow::Result<Self> {
-        crate::with_daens_netns("tap daens SYNs", || Ok(Self(packet_socket()?)))
+        crate::daens::with_daens_netns("tap daens SYNs", || Ok(Self(packet_socket()?)))
     }
 
     /// Sequence numbers of client pure SYNs for this connection since the last call.
@@ -103,7 +103,7 @@ impl SynTap {
 /// SYNACK capture/replay for a host-originated flow: the daens side of the real reply
 /// path, so the replay re-enters the host through dae0's production ingress.
 fn daens_wire() -> anyhow::Result<Wire> {
-    crate::with_daens_netns("capture dae0peer", || Wire::on("dae0peer"))
+    crate::daens::with_daens_netns("capture dae0peer", || Wire::on("dae0peer"))
 }
 
 fn conn_key(source: SocketAddr, target: SocketAddr) -> TuplesKey {
@@ -186,7 +186,7 @@ impl Lineage {
         let backend = handle.ebpf.read().await;
         Ok(Self {
             conn: backend
-                .tcp_conn_state_lookup(key)?
+                .conn_state_lookup(key)?
                 .context("conn-state missing")?,
             handoff: backend
                 .routing_handoff_lookup(key)?
@@ -631,7 +631,7 @@ pub(super) async fn exercise(
         };
         tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
             loop {
-                let state = handle.ebpf.read().await.tcp_conn_state_lookup(&key)?
+                let state = handle.ebpf.read().await.conn_state_lookup(&key)?
                     .context("completed request lost its conn owner")?;
                 ensure!(state.incarnation == incarnation, "request completion changed its owner");
                 if state.tcp_request_count == 0 {
@@ -714,7 +714,7 @@ pub(super) async fn exercise(
                 );
                 tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                     loop {
-                        if let Some(state) = handle.ebpf.read().await.tcp_conn_state_lookup(&fresh_key)? {
+                        if let Some(state) = handle.ebpf.read().await.conn_state_lookup(&fresh_key)? {
                             let raw = unsafe { state.meta.raw };
                             if raw & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED != 0 {
                                 ensure!(raw as u8 == OutboundIndex::Block as u8,

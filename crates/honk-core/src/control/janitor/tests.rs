@@ -3,9 +3,12 @@ use super::*;
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::ebpf::{RetireCounts, RetireError};
 use honk_ebpf_common::conn::{
-    ConnState, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+    ConnState, REDIRECT_TRACK_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState,
+    UDP_CONN_STATE_TIMEOUT_NS,
 };
 use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
+
+const IPPROTO_TCP: u8 = 6;
 
 #[test]
 fn aux_pressure_uses_current_scan_result() {
@@ -208,16 +211,14 @@ fn test_pressure_state_inactive_stays_inactive_without_overflow() {
 #[test]
 fn test_occupancy_gauge_estimate_and_calibrate() {
     let mut gauge = OccupancyGauge::default();
-    // 100 inserts, 30 datapath deletes, 20 janitor deletes, 10 userspace
-    // deletes → 40 live.
-    gauge.note_janitor_deletes(20);
-    assert_eq!(gauge.estimate(100, 30, 10), 40);
+    // 100 inserts, 30 datapath deletes, 30 userspace deletes → 40 live.
+    assert_eq!(gauge.estimate(100, 30, 30), 40);
 
     // A sweep observes 35 entries (5 lost to races) → drift corrects.
-    gauge.calibrate(35, 100, 30, 10);
-    assert_eq!(gauge.estimate(100, 30, 10), 35);
+    gauge.calibrate(35, 100, 30, 30);
+    assert_eq!(gauge.estimate(100, 30, 30), 35);
     // Post-calibration deltas apply on top of the exact count.
-    assert_eq!(gauge.estimate(110, 35, 12), 38);
+    assert_eq!(gauge.estimate(110, 35, 32), 38);
 }
 
 #[test]
@@ -264,11 +265,7 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
 
     let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
     let first = janitor
-        .cleanup_redirect_track_at(
-            REDIRECT_TRACK_TIMEOUT_NS + 1,
-            scan_tuning(0.0),
-            &mut OccupancyGauge::default(),
-        )
+        .cleanup_redirect_track_at(REDIRECT_TRACK_TIMEOUT_NS + 1, scan_tuning(0.0))
         .await?;
     assert_eq!(first.deleted, JANITOR_BASE_CANDIDATES as u64);
     assert_eq!(first.scanned, JANITOR_BASE_CANDIDATES);
@@ -279,7 +276,6 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
         .cleanup_redirect_track_at(
             REDIRECT_TRACK_TIMEOUT_NS + 1,
             scan_tuning(CONN_STATE_PRESSURE_WATERMARK),
-            &mut OccupancyGauge::default(),
         )
         .await?;
     assert_eq!(second.deleted, 1);
@@ -292,55 +288,52 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn map_health_warnings_rearm_after_pressure_ends() {
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
-        Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+    let mut model = MockEbpfBackend::new();
+    for key in BpfStatsKey::ALL {
+        model.bpf_stats.insert(key as u32, 101 + key as u64);
+    }
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
     let high = (AUX_MAP_CAPACITY as f64 * AUX_MAP_PRESSURE_WATERMARK) as usize + 1;
-    let redirect = |scanned, complete| {
-        [
-            AuxScanResult {
+    for map in AuxMap::ALL {
+        let scans = |scanned, complete| {
+            let mut scans = [AuxScanResult::default(); AuxMap::COUNT];
+            scans[map as usize] = AuxScanResult {
                 deleted: 0,
                 scanned,
                 complete,
-            },
-            AuxScanResult::default(),
-            AuxScanResult::default(),
-        ]
-    };
-    let mut failures = [0; 6];
-    let mut aux_warned = [false; 3];
-    let mut pressure_warned = [false; 4];
-    for (utilization, pressure, scans, aux_expected, occupancy_expected) in [
-        (
-            CONN_STATE_PRESSURE_WATERMARK,
-            true,
-            redirect(high, true),
-            true,
-            true,
-        ),
-        // A bounded scan below the watermark is only a lower bound.
-        (0.0, false, redirect(0, false), true, false),
-        (0.0, false, redirect(0, true), false, false),
-        (
-            CONN_STATE_PRESSURE_WATERMARK,
-            true,
-            redirect(high, true),
-            true,
-            true,
-        ),
-    ] {
-        janitor
-            .check_map_health(
-                utilization,
-                pressure,
-                scans,
-                &mut failures,
-                &mut aux_warned,
-                &mut pressure_warned,
-            )
-            .await;
-        assert_eq!(aux_warned[0], aux_expected);
-        assert_eq!(pressure_warned[3], occupancy_expected);
+            };
+            scans
+        };
+        let mut health = HealthLatches::default();
+        for (utilization, pressure, scans, aux_expected, occupancy_expected) in [
+            (
+                CONN_STATE_PRESSURE_WATERMARK,
+                true,
+                scans(high, true),
+                true,
+                true,
+            ),
+            // A bounded scan below the watermark is only a lower bound.
+            (0.0, false, scans(0, false), true, false),
+            (0.0, false, scans(0, true), false, false),
+            (
+                CONN_STATE_PRESSURE_WATERMARK,
+                true,
+                scans(high, true),
+                true,
+                true,
+            ),
+        ] {
+            janitor
+                .check_map_health(utilization, pressure, scans, &mut health)
+                .await;
+            assert_eq!(health.aux_pressure_warned[map as usize], aux_expected);
+            assert_eq!(health.occupancy_warned, occupancy_expected);
+            for key in BpfStatsKey::ALL {
+                assert_eq!(health.last_failures[key as usize], 101 + key as u64);
+            }
+        }
     }
 }
 
@@ -373,11 +366,11 @@ async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
     assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (3, 5));
     {
         let backend = backend.read().await;
-        assert!(backend.tcp_conn_state_lookup(&pinned_active)?.is_some());
-        assert!(backend.tcp_conn_state_lookup(&pinned_closing)?.is_some());
-        assert!(backend.tcp_conn_state_lookup(&unpinned_active)?.is_none());
-        assert!(backend.tcp_conn_state_lookup(&unpinned_closing)?.is_none());
-        assert!(backend.udp_conn_state_lookup(&udp)?.is_none());
+        assert!(backend.conn_state_lookup(&pinned_active)?.is_some());
+        assert!(backend.conn_state_lookup(&pinned_closing)?.is_some());
+        assert!(backend.conn_state_lookup(&unpinned_active)?.is_none());
+        assert!(backend.conn_state_lookup(&unpinned_closing)?.is_none());
+        assert!(backend.conn_state_lookup(&udp)?.is_none());
     }
 
     assert_eq!(
@@ -390,8 +383,8 @@ async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
     );
     assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (2, 2));
     let backend = backend.read().await;
-    assert!(backend.tcp_conn_state_lookup(&pinned_active)?.is_none());
-    assert!(backend.tcp_conn_state_lookup(&pinned_closing)?.is_none());
+    assert!(backend.conn_state_lookup(&pinned_active)?.is_none());
+    assert!(backend.conn_state_lookup(&pinned_closing)?.is_none());
 
     anyhow::Ok(())
 }
@@ -546,17 +539,13 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
                     .cleanup_conn_state_at(now_ns, &mut gauge, ((0, 0), 0), tuning)
                     .await?;
                 assert_eq!((deleted, scanned), (1, order.len()));
-                assert_eq!(gauge.estimate(0, 0, 0), order.len() as u64 - 1);
+                assert_eq!(gauge.estimate(0, 0, 0), order.len() as u64);
             }
             "redirect" | "handoff" => {
                 let result = if map == "redirect" {
-                    janitor
-                        .cleanup_redirect_track_at(now_ns, tuning, &mut gauge)
-                        .await?
+                    janitor.cleanup_redirect_track_at(now_ns, tuning).await?
                 } else {
-                    janitor
-                        .cleanup_routing_handoff_at(now_ns, tuning, &mut gauge)
-                        .await?
+                    janitor.cleanup_routing_handoff_at(now_ns, tuning).await?
                 };
                 assert_eq!(result.deleted, 1);
                 assert_eq!(result.scanned, order.len());
@@ -567,7 +556,7 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         let backend = backend.read().await;
         for key in &order {
             let retained = match map {
-                "conn" => backend.tcp_conn_state_lookup(key)?.is_some(),
+                "conn" => backend.conn_state_lookup(key)?.is_some(),
                 "redirect" => backend
                     .redirect_track_lookup(&RedirectTuple::from_tuples(key))?
                     .is_some(),
@@ -616,11 +605,7 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
             "redirect" => janitor.cleanup_redirect_track_for_test(now_ns).await,
             "handoff" => {
                 let result = janitor
-                    .cleanup_routing_handoff_at(
-                        now_ns,
-                        scan_tuning(0.0),
-                        &mut OccupancyGauge::default(),
-                    )
+                    .cleanup_routing_handoff_at(now_ns, scan_tuning(0.0))
                     .await?;
                 (result.deleted, result.scanned)
             }
@@ -629,7 +614,7 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
         assert_eq!(result, (0, 1));
         {
             let backend = backend.read().await;
-            assert!(backend.tcp_conn_state_lookup(&key)?.is_some());
+            assert!(backend.conn_state_lookup(&key)?.is_some());
             assert!(
                 backend
                     .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
@@ -647,11 +632,7 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
             "redirect" => janitor.cleanup_redirect_track_for_test(now_ns).await,
             "handoff" => {
                 let result = janitor
-                    .cleanup_routing_handoff_at(
-                        now_ns,
-                        scan_tuning(0.0),
-                        &mut OccupancyGauge::default(),
-                    )
+                    .cleanup_routing_handoff_at(now_ns, scan_tuning(0.0))
                     .await?;
                 (result.deleted, result.scanned)
             }
@@ -660,7 +641,7 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
         assert_eq!(result, (1, 1));
         let backend = backend.read().await;
         match map {
-            "conn" => assert!(backend.tcp_conn_state_lookup(&key)?.is_none()),
+            "conn" => assert!(backend.conn_state_lookup(&key)?.is_none()),
             "redirect" => assert!(
                 backend
                     .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
@@ -719,14 +700,13 @@ async fn request_proof_expiry_is_bounded_ignores_relay_pins_and_keeps_timeout_bo
     let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
     let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
-    let mut gauge = OccupancyGauge::default();
     let first = janitor
-        .cleanup_tcp_requests_at(now_ns, scan_tuning(0.0), &mut gauge)
+        .cleanup_tcp_requests_at(now_ns, scan_tuning(0.0))
         .await?;
     assert_eq!(first.deleted, JANITOR_BASE_CANDIDATES as u64);
     assert!(!first.complete);
     let second = janitor
-        .cleanup_tcp_requests_at(now_ns, scan_tuning(0.0), &mut gauge)
+        .cleanup_tcp_requests_at(now_ns, scan_tuning(0.0))
         .await?;
     assert_eq!(second.deleted, 1);
     assert!(second.complete);
@@ -743,11 +723,10 @@ async fn request_proof_expiry_is_bounded_ignores_relay_pins_and_keeps_timeout_bo
     let retained = backend
         .read()
         .await
-        .tcp_conn_state_lookup(&pinned_key)?
+        .conn_state_lookup(&pinned_key)?
         .expect("relay pin retains the conn owner, not an expired request");
     assert_eq!(retained.incarnation, 1);
     assert_eq!(retained.tcp_request_count, 0);
-    assert_eq!(gauge.janitor_deletes, 0);
     Ok(())
 }
 
@@ -768,11 +747,12 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         .cleanup_conn_state_at(
             UDP_CONN_STATE_TIMEOUT_NS + 1,
             &mut gauge,
-            ((3, 0), 0),
+            ((10, 0), 0),
             scan_tuning(0.0),
         )
         .await
         .expect_err("injected third retirement failure propagates");
+    assert_eq!(gauge.estimate(10, 0, 0), 3);
     let error = error
         .downcast_ref::<RetireError>()
         .expect("original partial retirement error retained");
@@ -783,7 +763,6 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
             ..Default::default()
         }
     );
-    assert_eq!(gauge.janitor_deletes, 2);
     let mut remaining = 0;
     backend
         .read()

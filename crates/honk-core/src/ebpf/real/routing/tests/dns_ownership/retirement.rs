@@ -1,5 +1,7 @@
 use super::*;
-use crate::ebpf::{RetireCounts, RetireKind, RetireRequest, UdpDecisionCommitResult};
+use crate::ebpf::{
+    RetireCounts, RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult,
+};
 use aya::maps::RingBuf;
 use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_STATE_TIMEOUT_NS};
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
@@ -47,7 +49,7 @@ fn owned_values(backend: &RealEbpfBackend, key: &TuplesKey) -> String {
     format!(
         "{:?}",
         (
-            backend.udp_conn_state_lookup(key).unwrap(),
+            backend.conn_state_lookup(key).unwrap(),
             backend.routing_handoff_lookup(key).unwrap(),
             backend
                 .redirect_track_lookup(&RedirectTuple::from_tuples(key))
@@ -127,7 +129,7 @@ fn retirement_fence_refuses_forward_reverse_and_reply_writers_without_mutation()
                     };
                     seed(&backend, publisher, &key, src, dst);
                     let old = now_ns().saturating_sub(2_000_000_000);
-                    let mut state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                    let mut state = backend.conn_state_lookup(&key).unwrap().unwrap();
                     state.last_seen_ns = old;
                     backend.udp_conn_state_store(&key, &state).unwrap();
                     age_auxiliaries(&mut backend, &key, old);
@@ -264,7 +266,7 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
                 .hash_remove::<_, u64>("TCP_PUBLISHING", &key)
                 .unwrap();
             let mut previous = backend
-                .udp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()
                 .incarnation;
@@ -281,7 +283,7 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
                     "{side} remained busy"
                 );
                 let current = backend
-                    .udp_conn_state_lookup(&key)
+                    .conn_state_lookup(&key)
                     .unwrap()
                     .unwrap()
                     .incarnation;
@@ -326,7 +328,7 @@ fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
             assert_eq!(handoff(&backend, &key).incarnation, LAST_INCARNATION);
             assert_eq!(
                 backend
-                    .udp_conn_state_lookup(&key)
+                    .conn_state_lookup(&key)
                     .unwrap()
                     .unwrap()
                     .incarnation,
@@ -380,7 +382,7 @@ fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
                     run(&backend, side, &bytes, SkbInput::default()).verdict,
                     TC_ACT_SHOT
                 );
-                assert!(backend.udp_conn_state_lookup(&fresh).unwrap().is_none());
+                assert!(backend.conn_state_lookup(&fresh).unwrap().is_none());
                 assert!(backend.routing_handoff_lookup(&fresh).unwrap().is_none());
                 assert!(
                     backend
@@ -442,7 +444,7 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
             for index in 0..3 {
                 let key = tuple(src, dst, 45400 + index as u16, 443, IPPROTO_UDP);
                 seed(&backend, side, &key, src, dst);
-                let mut state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                let mut state = backend.conn_state_lookup(&key).unwrap().unwrap();
                 owners[index] = state.incarnation;
                 state.last_seen_ns = 0;
                 backend.udp_conn_state_store(&key, &state).unwrap();
@@ -488,7 +490,7 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
             seed(&backend, side, &keys[1], src, dst);
             assert_ne!(handoff(&backend, &keys[1]).incarnation, owners[1]);
             // Delay another hint across refresh of the same incarnation.
-            let mut refreshed = backend.udp_conn_state_lookup(&keys[2]).unwrap().unwrap();
+            let mut refreshed = backend.conn_state_lookup(&keys[2]).unwrap().unwrap();
             refreshed.last_seen_ns = now_ns() - 2_000_000_000;
             backend.udp_conn_state_store(&keys[2], &refreshed).unwrap();
             let bytes = packet(src, dst, IPPROTO_UDP, keys[2].src_port, 443, 19, 0);
@@ -496,12 +498,12 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
                 run(&backend, side, &bytes, SkbInput::default()).verdict,
                 TC_ACT_REDIRECT
             );
-            let refreshed_now = backend.udp_conn_state_lookup(&keys[2]).unwrap().unwrap();
+            let refreshed_now = backend.conn_state_lookup(&keys[2]).unwrap().unwrap();
             assert_eq!(refreshed_now.incarnation, owners[2]);
             assert!(refreshed_now.last_seen_ns > refreshed.last_seen_ns);
             let new_owner = owned_values(&backend, &keys[1]);
             let fresh_state = owned_values(&backend, &keys[2]);
-            let mut outcomes = [None; 3];
+            let mut outcomes = [RetireOutcome::NotRun; 3];
             let counts = backend
                 .retire_batch(
                     &[
@@ -542,14 +544,14 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
             assert_eq!(
                 outcomes,
                 [
-                    Some(UdpDecisionCommitResult::Applied),
-                    Some(UdpDecisionCommitResult::Superseded),
-                    Some(UdpDecisionCommitResult::StateMismatch)
+                    RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+                    RetireOutcome::Done(UdpDecisionCommitResult::Superseded),
+                    RetireOutcome::Done(UdpDecisionCommitResult::StateMismatch)
                 ]
             );
             assert_eq!(owned_values(&backend, &keys[1]), new_owner);
             assert_eq!(owned_values(&backend, &keys[2]), fresh_state);
-            assert!(backend.udp_conn_state_lookup(&keys[0]).unwrap().is_none());
+            assert!(backend.conn_state_lookup(&keys[0]).unwrap().is_none());
             assert!(backend.routing_handoff_lookup(&keys[0]).unwrap().is_none());
             assert!(
                 backend
@@ -641,7 +643,7 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
         let key = tuple(src, dst, 45500, 443, IPPROTO_UDP);
         let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
         let (incarnation, result) = controlled_claim(&mut backend, &key, &bytes, 1);
-        let published = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let published = backend.conn_state_lookup(&key).unwrap().unwrap();
         assert_eq!(published.incarnation, incarnation);
         assert_eq!(published.decision_token, 0);
         assert_eq!(result.cb[3], published.state as u32);
@@ -673,7 +675,7 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
         } else {
             published.last_seen_ns + UDP_CONN_STATE_TIMEOUT_NS + 1
         };
-        let mut outcomes = [None];
+        let mut outcomes = [RetireOutcome::NotRun];
         assert_eq!(
             backend
                 .retire_batch(
@@ -692,8 +694,11 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
                 ..Default::default()
             }
         );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
-        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+        );
+        assert!(backend.conn_state_lookup(&key).unwrap().is_none());
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
             backend
@@ -702,7 +707,7 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
                 .is_none()
         );
         seed(&backend, "lan_ingress_l2", &key, src, dst);
-        let republished = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let republished = backend.conn_state_lookup(&key).unwrap().unwrap();
         assert_ne!(republished.incarnation, incarnation);
         assert_ne!(republished.state, UdpDecisionState::Preparing as u8);
         assert_ne!(republished.state, UdpDecisionState::Aborted as u8);
@@ -722,7 +727,7 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
             result.cb[3], 1,
             "abort must preserve both owned auxiliaries"
         );
-        let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let aborted = backend.conn_state_lookup(&key).unwrap().unwrap();
         assert_eq!(aborted.incarnation, incarnation);
         assert_eq!(aborted.state, UdpDecisionState::Aborted as u8);
         assert_eq!(aborted.decision_token, 41);
@@ -745,7 +750,7 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
             before,
             "Aborted follower renewed the marker"
         );
-        let mut outcomes = [None];
+        let mut outcomes = [RetireOutcome::NotRun];
         let counts = backend
             .retire_batch(
                 &[RetireRequest {
@@ -767,8 +772,11 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
                 request: 0
             }
         );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
-        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+        );
+        assert!(backend.conn_state_lookup(&key).unwrap().is_none());
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
             backend
@@ -777,7 +785,7 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
                 .is_none()
         );
         seed(&backend, "lan_ingress_l2", &key, src, dst);
-        let state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let state = backend.conn_state_lookup(&key).unwrap().unwrap();
         assert_ne!(state.incarnation, incarnation);
         assert_ne!(state.state, UdpDecisionState::Preparing as u8);
         assert_ne!(state.state, UdpDecisionState::Aborted as u8);
@@ -839,7 +847,7 @@ fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
             };
             assert_eq!(format!("{track:?}"), format!("{expected_track:?}"));
             if mode == 5 {
-                let newer = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                let newer = backend.conn_state_lookup(&key).unwrap().unwrap();
                 let expected = ConnState {
                     state: UdpDecisionState::Preparing as u8,
                     incarnation: aux_incarnation,
@@ -848,7 +856,7 @@ fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
                 };
                 assert_eq!(format!("{newer:?}"), format!("{expected:?}"));
             } else {
-                let aborted = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                let aborted = backend.conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(
                     (aborted.incarnation, aborted.decision_token, aborted.state),
                     (incarnation, 41, UdpDecisionState::Aborted as u8)
@@ -857,7 +865,7 @@ fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
             assert_fenced_claim_unchanged(&backend, &key, &bytes);
             unfence(&mut backend, &key);
             let before = owned_values(&backend, &key);
-            let mut outcomes = [None];
+            let mut outcomes = [RetireOutcome::NotRun];
             assert_eq!(
                 backend
                     .retire_batch(
@@ -875,7 +883,7 @@ fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
             );
             assert_eq!(
                 outcomes,
-                [Some(if mode == 5 {
+                [RetireOutcome::Done(if mode == 5 {
                     UdpDecisionCommitResult::Superseded
                 } else {
                     UdpDecisionCommitResult::TokenMismatch
@@ -905,7 +913,7 @@ fn udp_preparing_and_aborted_followers_do_not_renew_claim_timestamp() {
         for (index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
             let key = tuple(src, dst, 45510 + index as u16, 443, IPPROTO_UDP);
             seed(&backend, side, &key, src, dst);
-            let mut preparing = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+            let mut preparing = backend.conn_state_lookup(&key).unwrap().unwrap();
             let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
             for state in [UdpDecisionState::Preparing, UdpDecisionState::Aborted] {
                 preparing.state = state as u8;
@@ -921,7 +929,7 @@ fn udp_preparing_and_aborted_followers_do_not_renew_claim_timestamp() {
                     TC_ACT_SHOT,
                     "{side} {src} {state:?}"
                 );
-                let followed = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+                let followed = backend.conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(
                     format!("{followed:?}"),
                     format!("{preparing:?}"),

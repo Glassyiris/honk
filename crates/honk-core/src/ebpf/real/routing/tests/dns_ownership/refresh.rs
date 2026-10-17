@@ -164,12 +164,7 @@ fn client_framing_refills_after_outbound_and_exact_reply_refresh() {
                     .unwrap()
                     .is_none()
             );
-            assert!(
-                backend
-                    .udp_conn_state_lookup(&foreign_key)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(backend.conn_state_lookup(&foreign_key).unwrap().is_none());
         }
     });
     client_framing_refresh_excludes_dns_destinations_and_wan_records();
@@ -298,7 +293,7 @@ fn stateless_udp_refreshes_complete_policy_without_changing_owned_lifetimes() {
                 );
                 assert_ne!(current.routing_generation, old_handoff.routing_generation);
                 assert_eq!((current.incarnation, current.result.decision_token), (0, 0));
-                assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+                assert!(backend.conn_state_lookup(&key).unwrap().is_none());
                 let updated = backend
                     .redirect_track_lookup(&redirect_key)
                     .unwrap()

@@ -123,14 +123,11 @@ impl PendingUdpVerdicts {
     }
 
     pub(super) fn identity_for_lease(lease: &UdpInitLease) -> PendingUdpIdentity {
-        PendingUdpIdentity {
-            kernel_incarnation: lease.kernel_incarnation(),
-            ..PendingUdpIdentity::new(
-                FlowKey::new(lease.client_addr(), lease.original_dst()),
-                lease.decision_token(),
-                lease.generation(),
-            )
-        }
+        PendingUdpIdentity::new(
+            FlowKey::new(lease.client_addr(), lease.original_dst()),
+            lease.owner(),
+            lease.generation(),
+        )
     }
 
     pub(super) fn open_admission(&self) {

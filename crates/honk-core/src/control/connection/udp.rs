@@ -259,8 +259,7 @@ impl ControlPlaneHandle {
             );
             self.lookup_udp_handoff(
                 &tuples,
-                lease.decision_token(),
-                lease.kernel_incarnation(),
+                lease.owner(),
                 #[cfg(feature = "native-api")]
                 observation,
             )

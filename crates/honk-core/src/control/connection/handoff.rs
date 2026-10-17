@@ -104,11 +104,7 @@ impl HandoffResult {
                                 key.dst_port,
                             ))
                     {
-                        let state = if key.l4proto == 6 {
-                            backend.tcp_conn_state_lookup(key)
-                        } else {
-                            backend.udp_conn_state_lookup(key)
-                        };
+                        let state = backend.conn_state_lookup(key);
                         if !state.ok().flatten().is_some_and(|state| {
                             state.incarnation == entry.incarnation
                                 && state.trace_id == entry.trace_id
@@ -215,13 +211,6 @@ impl TcpFlowKey {
 #[derive(Default)]
 pub(in crate::control) struct TcpFlowPins {
     inner: parking_lot::Mutex<HashMap<TcpFlowKey, usize>>,
-    pub(in crate::control) retirement_sink:
-        parking_lot::Mutex<Option<mpsc::Sender<crate::control::udp_removal::TcpRetirement>>>,
-    pub(in crate::control) expiry_hints: parking_lot::Mutex<
-        Option<Arc<tokio::sync::Mutex<mpsc::Receiver<crate::ebpf::FlowExpiryHint>>>>,
-    >,
-    #[cfg(feature = "ebpf")]
-    pub(in crate::control) kernel_pin_errors: crate::ebpf::TcpPinErrorSink,
 }
 
 impl TcpFlowPins {
@@ -229,6 +218,11 @@ impl TcpFlowPins {
         self.inner
             .lock()
             .contains_key(&TcpFlowKey::from_tuples(tuples))
+    }
+
+    pub(in crate::control) fn blocks(&self, request: &crate::ebpf::RetireRequest<'_>) -> bool {
+        !matches!(request.kind, crate::ebpf::RetireKind::ExpiredRequest { .. })
+            && self.contains(&request.key)
     }
 
     fn retain(&self, key: TcpFlowKey) {
@@ -263,18 +257,88 @@ impl TcpFlowPins {
     }
 }
 
+struct LocalPin {
+    pins: Arc<TcpFlowPins>,
+    key: Option<TcpFlowKey>,
+}
+
+impl LocalPin {
+    fn release_once(&mut self) -> anyhow::Result<()> {
+        if let Some(key) = self.key.take() {
+            anyhow::ensure!(
+                self.pins.release(key).is_some(),
+                "TCP flow lost its local pin"
+            );
+        }
+        Ok(())
+    }
+
+    fn release(mut self) -> anyhow::Result<()> {
+        self.release_once()
+    }
+}
+
+impl Drop for LocalPin {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_once() {
+            error!(%error, "TCP flow pin release found no owner");
+        }
+    }
+}
+
+struct FlowPin {
+    local: Option<LocalPin>,
+    kernel: Option<crate::ebpf::TcpPin>,
+}
+
+impl FlowPin {
+    fn new(pins: Arc<TcpFlowPins>, key: TcpFlowKey, kernel: crate::ebpf::TcpPin) -> Self {
+        pins.retain(key);
+        Self {
+            local: Some(LocalPin {
+                pins,
+                key: Some(key),
+            }),
+            kernel: Some(kernel),
+        }
+    }
+
+    fn release(&mut self) -> anyhow::Result<()> {
+        let local = self
+            .local
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("TCP retirement lost its local pin"))
+            .and_then(LocalPin::release);
+        let native = self
+            .kernel
+            .take()
+            .map(crate::ebpf::TcpPin::release)
+            .unwrap_or(Ok(()));
+        match (local, native) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(local), Err(native)) => {
+                Err(local.context(format!("native TCP pin release also failed: {native:#}")))
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(in crate::control) struct RetireAck {
+    pub(in crate::control) close: Option<crate::connection_tracker::CloseCompletion>,
+    pub(in crate::control) outbound: Option<crate::stats::ActiveConnectionGuard>,
+}
+
 pub(in crate::control) struct TcpFlowGuard {
     stream: TcpStream,
     pub(in crate::control) tuples: TuplesKey,
     pub(in crate::control) incarnation: u64,
-    pin_key: Option<TcpFlowKey>,
-    #[cfg(feature = "ebpf")]
-    kernel_pin: Option<crate::ebpf::TcpKernelPin>,
-    pins: Arc<TcpFlowPins>,
+    pin: FlowPin,
+    retirement: Arc<crate::control::retirement_worker::RetirementPort>,
     tracker: Arc<ConnectionTracker>,
     tracker_id: Option<String>,
-    outbound_guard: Option<crate::stats::ActiveConnectionGuard>,
-    close_completion: Option<crate::connection_tracker::CloseCompletion>,
+    ack: RetireAck,
 }
 
 impl TcpFlowGuard {
@@ -284,21 +348,19 @@ impl TcpFlowGuard {
         incarnation: u64,
         pins: Arc<TcpFlowPins>,
         tracker: Arc<ConnectionTracker>,
+        retirement: Arc<crate::control::retirement_worker::RetirementPort>,
+        kernel: crate::ebpf::TcpPin,
     ) -> Self {
         let pin_key = TcpFlowKey::from_tuples(&tuples);
-        pins.retain(pin_key);
         Self {
             stream,
             tuples,
             incarnation,
-            pin_key: Some(pin_key),
-            #[cfg(feature = "ebpf")]
-            kernel_pin: None,
-            pins,
+            pin: FlowPin::new(pins, pin_key, kernel),
+            retirement,
             tracker,
             tracker_id: None,
-            outbound_guard: None,
-            close_completion: None,
+            ack: RetireAck::default(),
         }
     }
 
@@ -339,54 +401,22 @@ impl TcpFlowGuard {
     }
 
     pub(in crate::control) fn release_pin(&mut self) -> anyhow::Result<()> {
-        let local = self
-            .pin_key
-            .take()
-            .and_then(|key| self.pins.release(key))
-            .map(|_| ())
-            .ok_or_else(|| anyhow::anyhow!("TCP retirement lost its local pin"));
-        #[cfg(feature = "ebpf")]
-        let native = self
-            .kernel_pin
-            .take()
-            .map(crate::ebpf::TcpKernelPin::release)
-            .unwrap_or(Ok(()));
-        #[cfg(not(feature = "ebpf"))]
-        let native: anyhow::Result<()> = Ok(());
-        match (local, native) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(local), Err(native)) => {
-                Err(local.context(format!("native TCP pin release also failed: {native:#}")))
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
-    }
-
-    pub(in crate::control) fn retain_close_completion(
-        &mut self,
-        close: Option<crate::connection_tracker::CloseCompletion>,
-    ) {
-        self.close_completion = close;
+        self.pin.release()
     }
 
     pub(in crate::control) fn finish_retirement(mut self, success: bool) {
-        let close = self.close_completion.take();
+        let close = self.ack.close.take();
+        let outbound = self.ack.outbound.take();
         drop(self);
+        drop(outbound);
         if let Some(close) = close {
             close.0.finish(success);
         }
     }
 
-    pub(super) async fn retire_with_outbound(
-        mut self,
-        outbound_guard: crate::stats::ActiveConnectionGuard,
-    ) -> bool {
-        self.outbound_guard = Some(outbound_guard);
-        self.retire().await
-    }
-
-    pub(in crate::control) async fn retire(self) -> bool {
-        let sender = self.pins.retirement_sink.lock().clone();
+    pub(in crate::control) async fn retire(mut self, ack: RetireAck) -> bool {
+        self.ack = ack;
+        let sender = self.retirement.sink.lock().clone();
         let Some(sender) = sender else {
             error!(?self.tuples, "TCP retirement worker is unavailable");
             return false;
@@ -398,7 +428,7 @@ impl TcpFlowGuard {
             return false;
         };
         let (completion, result) = tokio::sync::oneshot::channel();
-        permit.send(crate::control::udp_removal::TcpRetirement {
+        permit.send(crate::control::retirement_worker::TcpRetirement {
             flow: self,
             completion,
         });
@@ -409,11 +439,6 @@ impl TcpFlowGuard {
 impl Drop for TcpFlowGuard {
     fn drop(&mut self) {
         self.untrack();
-        if let Some(key) = self.pin_key.take()
-            && self.pins.release(key).is_none()
-        {
-            error!(?key, "TCP flow pin release found no owner");
-        }
     }
 }
 
@@ -447,49 +472,15 @@ impl ControlPlaneHandle {
     pub(super) async fn lookup_udp_handoff(
         &self,
         tuples: &TuplesKey,
-        decision_token: u32,
-        kernel_incarnation: Option<u64>,
+        owner: crate::ebpf::UdpFlowOwner,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<Option<HandoffResult>> {
         let backend = self.ebpf.read().await;
-        let entry = backend.routing_handoff_lookup(tuples)?;
-        if !honk_ebpf_common::conn::is_stateless_udp_ports(tuples.src_port, tuples.dst_port)
-            || decision_token != 0
-        {
-            let current_incarnation = backend.udp_flow_incarnation(tuples, decision_token)?;
-            if let Some(incarnation) = kernel_incarnation {
-                anyhow::ensure!(
-                    incarnation != 0 && current_incarnation == Some(incarnation),
-                    "UDP admission conn-state incarnation mismatch"
-                );
-            } else {
-                anyhow::ensure!(
-                    decision_token != 0 || current_incarnation.is_none(),
-                    "ordinary UDP admission has no captured incarnation"
-                );
-            }
-            if let Some(entry) = entry {
-                anyhow::ensure!(
-                    entry.result.decision_token == decision_token
-                        && entry.incarnation == current_incarnation.unwrap_or(0),
-                    "UDP admission handoff ownership mismatch"
-                );
-            } else {
-                anyhow::ensure!(
-                    decision_token == 0,
-                    "staged UDP flow has no routing handoff"
-                );
-            }
-        } else if let Some(entry) = entry {
-            anyhow::ensure!(
-                entry.result.decision_token == 0,
-                "raw DNS handoff token mismatch"
-            );
-        }
+        let entry = backend.verify_udp_admission(tuples, owner)?;
         Ok(entry
             .filter(|entry| {
                 tuples.dst_port != 53
-                    || decision_token != 0
+                    || owner.token != 0
                     || (entry.result.outbound == OutboundIndex::ControlPlaneRouting as u8
                         && entry.result.must == 0)
             })
@@ -508,68 +499,26 @@ impl ControlPlaneHandle {
         &self,
         stream: TcpStream,
         tuples: TuplesKey,
-        ownership: crate::ebpf::TcpSocketOwnership,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
+        use std::os::fd::AsFd;
         let backend = self.ebpf.read().await;
-        let current = backend
-            .tcp_conn_state_lookup(&tuples)?
-            .ok_or_else(|| anyhow::anyhow!("accepted TCP flow has no conn-state: {tuples:?}"))?;
-        let entry = match ownership {
-            crate::ebpf::TcpSocketOwnership::Kernel(binding) => {
-                anyhow::ensure!(
-                    binding.kind == honk_ebpf_common::redirect_need::TCP_BINDING_CHILD
-                        && TcpFlowKey::from_tuples(&binding.tuples)
-                            == TcpFlowKey::from_tuples(&tuples)
-                        && binding.handoff.incarnation != 0
-                        && binding.handoff.incarnation == current.incarnation,
-                    "accepted TCP child is unproven or superseded"
-                );
-                let handoff = backend
-                    .routing_handoff_lookup(&tuples)?
-                    .ok_or_else(|| anyhow::anyhow!("accepted TCP child has no current handoff"))?;
-                let redirect = backend
-                    .redirect_track_lookup(&RedirectTuple::from_tuples(&tuples))?
-                    .ok_or_else(|| anyhow::anyhow!("accepted TCP child has no current redirect"))?;
-                anyhow::ensure!(
-                    handoff.incarnation == current.incarnation
-                        && redirect.incarnation == current.incarnation,
-                    "accepted TCP child auxiliary ownership is superseded"
-                );
-                Some(binding.handoff)
-            }
-            crate::ebpf::TcpSocketOwnership::Model => backend.routing_handoff_lookup(&tuples)?,
-        };
-        #[cfg(feature = "ebpf")]
-        let kernel_pin = if matches!(ownership, crate::ebpf::TcpSocketOwnership::Kernel(_)) {
-            Some(backend.retain_tcp_flow(
-                current.incarnation,
-                Arc::clone(&self.tcp_flow_pins.kernel_pin_errors),
-            )?)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "ebpf"))]
-        anyhow::ensure!(
-            matches!(ownership, crate::ebpf::TcpSocketOwnership::Model),
-            "native TCP pin ownership requires the real eBPF backend"
-        );
-        // Verification and pin retention share the continuous backend read lock:
-        // retirement cannot observe an unpinned accepted owner in between.
+        let adoption = backend.adopt_tcp(
+            stream.as_fd(),
+            &tuples,
+            Arc::clone(&self.retirement.pin_errors),
+        )?;
+        // The local pin joins the native pin before releasing backendR.
         let flow = TcpFlowGuard::new(
             stream,
             tuples,
-            current.incarnation,
+            adoption.incarnation,
             Arc::clone(&self.tcp_flow_pins),
             Arc::clone(&self.connection_tracker),
+            Arc::clone(&self.retirement),
+            adoption.pin,
         );
-        #[cfg(feature = "ebpf")]
-        let flow = {
-            let mut flow = flow;
-            flow.kernel_pin = kernel_pin;
-            flow
-        };
-        let handoff = entry.map(|entry| {
+        let handoff = adoption.handoff.map(|entry| {
             HandoffResult::captured(
                 backend.as_ref(),
                 &tuples,

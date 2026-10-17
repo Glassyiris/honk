@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::control::connection::handoff::TcpFlowGuard;
+use crate::control::retirement_worker::RetirementWorker;
 use honk_ebpf_common::{
     RedirectEntry,
     conn::{TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState},
@@ -139,8 +140,8 @@ pub(super) async fn exercise(
             let before = metadata(&key)?;
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             let slot = sender.clone().reserve_owned().await?;
-            let original_sink = handle.tcp_flow_pins.retirement_sink.lock().replace(sender);
-            let mut retirement = Box::pin(flow.retire());
+            let original_sink = handle.retirement.sink.lock().replace(sender);
+            let mut retirement = Box::pin(flow.retire(Default::default()));
             tokio::select! {
                 biased;
                 result = &mut retirement => anyhow::bail!("retirement crossed full admission: {result}"),
@@ -151,7 +152,7 @@ pub(super) async fn exercise(
                 "pending admission released native pin"
             );
             drop(retirement);
-            *handle.tcp_flow_pins.retirement_sink.lock() = original_sink;
+            *handle.retirement.sink.lock() = original_sink;
             drop(slot);
             drop(receiver);
             // No await separates cancellation from these exact native/local checks.
@@ -211,7 +212,6 @@ async fn adopt(
         .adopt_tcp_flow(
             stream,
             key,
-            ownership,
             #[cfg(feature = "native-api")]
             &observation,
         )
@@ -239,16 +239,17 @@ async fn native_pin_error(
     fn start(
         handle: &ControlPlaneHandle,
     ) -> (
-        tokio::task::JoinHandle<()>,
+        RetirementWorker,
         tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
     ) {
         let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
-        let task = crate::control::spawn_udp_removal_worker(
+        let task = crate::control::spawn_retirement_worker(
             Arc::clone(&handle.udp_pool),
             Arc::clone(&handle.ebpf),
             Arc::clone(&handle.connection_tracker),
             fatal_tx,
             Arc::clone(&handle.tcp_flow_pins),
+            Arc::clone(&handle.retirement),
         );
         (task, fatal)
     }
@@ -263,15 +264,20 @@ async fn native_pin_error(
     // A stale guard-captured sender must not be able to deliver the later error.
     old_fatal.close();
     drop(old_fatal);
+    let (handoff_tx, handoff_rx) = tokio::sync::mpsc::channel(1);
+    handle.udp_pool.set_remove_sink(handoff_tx);
+    handle.retirement.sink.lock().take();
+    let hints = tokio::time::timeout(NETNS_TEST_TIMEOUT, old_task).await??;
+    *handle.retirement.hints.lock() = hints;
     let (current_task, mut current_fatal) = start(handle);
-    tokio::time::timeout(NETNS_TEST_TIMEOUT, old_task).await??;
+    drop(handoff_rx);
     {
         let _backend = handle.ebpf.write().await;
         pins.remove(&incarnation)?;
     }
     if case == "lifetime-pin-retire-error" {
         ensure!(
-            !flow.retire().await,
+            !flow.retire(Default::default()).await,
             "native release failure was confirmed retired"
         );
     } else {
@@ -299,7 +305,7 @@ async fn native_pin_error(
     // Join the actual worker so a late duplicate Drop report cannot hide behind
     // scheduling. Consumed explicit release must not retry/report again on Drop.
     let shutdown = handle.udp_pool.shutdown().await;
-    handle.tcp_flow_pins.retirement_sink.lock().take();
+    handle.retirement.sink.lock().take();
     tokio::time::timeout(NETNS_TEST_TIMEOUT, current_task).await??;
     ensure!(
         shutdown.joined,
@@ -556,7 +562,7 @@ async fn close_and_retire(
         client.read_to_end(&mut rest).await?;
         ensure!(rest.is_empty(), "unexpected trailing server bytes");
         ensure!(
-            flow.retire().await,
+            flow.retire(Default::default()).await,
             "normal worker retirement was not confirmed"
         );
         Ok::<_, anyhow::Error>(())
@@ -573,7 +579,7 @@ async fn close_and_retire(
     );
     let backend = handle.ebpf.read().await;
     ensure!(
-        backend.tcp_conn_state_lookup(key)?.is_none(),
+        backend.conn_state_lookup(key)?.is_none(),
         "normal retirement retained conn"
     );
     ensure!(
@@ -683,7 +689,10 @@ async fn superseding_syn(
         received == UP,
         "new native owner failed to resume refused real TCP bytes"
     );
-    ensure!(old.retire().await, "superseded old owner retirement failed");
+    ensure!(
+        old.retire(Default::default()).await,
+        "superseded old owner retirement failed"
+    );
     ensure!(
         pins.get(&old_incarnation, 0).is_err() && pins.get(&newer, 0)? == 1,
         "old retirement removed/leaked an incarnation pin"

@@ -1,5 +1,7 @@
 use super::*;
-use crate::ebpf::{RetireCounts, RetireKind, RetireRequest, UdpDecisionCommitResult};
+use crate::ebpf::{
+    RetireCounts, RetireKind, RetireOutcome, RetireRequest, UdpDecisionCommitResult,
+};
 use honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED;
 
 fn witness(backend: &RealEbpfBackend, id: u32) -> KernelRouteWitness {
@@ -67,7 +69,7 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                 let current = handoff(&backend, &key);
                 assert_ne!(current.incarnation, 0);
                 assert_ne!(current.incarnation, old.incarnation);
-                let mut outcomes = [None];
+                let mut outcomes = [RetireOutcome::NotRun];
                 let counts = backend
                     .retire_batch(
                         &[RetireRequest {
@@ -80,10 +82,13 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                     )
                     .unwrap();
                 assert_eq!(counts, RetireCounts::default());
-                assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
+                assert_eq!(
+                    outcomes,
+                    [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
+                );
                 assert_eq!(
                     backend
-                        .udp_conn_state_lookup(&key)
+                        .conn_state_lookup(&key)
                         .unwrap()
                         .unwrap()
                         .incarnation,
@@ -118,7 +123,10 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                         request: 0,
                     }
                 );
-                assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+                assert_eq!(
+                    outcomes,
+                    [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+                );
             }
         }
     });
@@ -296,11 +304,7 @@ fn staged_udp_witness_uses_exact_token_and_generation() {
                 );
             }
             assert_eq!(
-                backend
-                    .udp_conn_state_lookup(&key)
-                    .unwrap()
-                    .unwrap()
-                    .trace_id,
+                backend.conn_state_lookup(&key).unwrap().unwrap().trace_id,
                 entry.trace_id
             );
             run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
@@ -470,11 +474,7 @@ fn delayed_token_zero_udp_keeps_its_packet_reference_after_conn_recreation() {
                 assert_ne!(current.trace_id, old.trace_id);
                 assert_ne!(current.trace_id, ROUTE_TRACE_LOST);
                 assert_eq!(
-                    backend
-                        .udp_conn_state_lookup(&key)
-                        .unwrap()
-                        .unwrap()
-                        .trace_id,
+                    backend.conn_state_lookup(&key).unwrap().unwrap().trace_id,
                     current.trace_id
                 );
                 assert_eq!(witness(&backend, old.trace_id).output.input.dscp, 5);

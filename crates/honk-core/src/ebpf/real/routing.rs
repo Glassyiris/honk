@@ -603,16 +603,14 @@ impl RealEbpfBackend {
             version >= (6, 12, 0),
             "routing tests require Linux 6.12 or newer"
         );
-        events::validate_flow_lifetime_object_layout(obj)?;
-        param.tcp_daens_netns_id = crate::netlink::NlSock::new()?
-            .ensure_netns_id(std::os::fd::AsFd::as_fd(crate::daens_fd()?))?;
+        layout::validate_object(obj)?;
+        param.tcp_daens_netns_id = crate::daens::daens_netns_id()?;
         let mut loader = EbpfLoader::new();
         loader.override_global("PARAM", &param, true);
         let mut bpf = loader.load(obj)?;
-        validate_routing_handoff_layout(&bpf)?;
-        retirement::validate_flow_lifetime_layout(&bpf)?;
+        layout::validate_loaded_maps(&bpf)?;
         let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
-        let tcp_live_pins = take_tcp_live_pins(&mut bpf)?;
+        let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
         Ok(Self {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),

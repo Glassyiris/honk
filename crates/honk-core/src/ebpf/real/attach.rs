@@ -19,16 +19,15 @@ impl RealEbpfBackend {
             version.1,
             version.2
         );
-        events::validate_flow_lifetime_object_layout(obj)?;
+        layout::validate_object(obj)?;
         let (kernel_data, kernel_btf) = btf::load_kernel()?;
         let tcp_binding_offsets = tcp_binding::offsets(&kernel_data)?;
         let ipv6_proof = tcp_binding::ipv6_proof(&kernel_data);
         let process_name_offsets = process_name::detect(&kernel_data);
         let pname_mode = process_name::select_capture_mode(obj, &kernel_btf, process_name_offsets);
-        let tcp_daens_netns_id = crate::netlink::NlSock::new()?
-            .ensure_netns_id(std::os::fd::AsFd::as_fd(crate::daens_fd()?))?;
+        let tcp_daens_netns_id = crate::daens::daens_netns_id()?;
         let ipv6_sockets_available =
-            u8::from(crate::ipv6_socket_available().context("probe IPv6 socket family")?);
+            u8::from(crate::netlink::ipv6_socket_available().context("probe IPv6 socket family")?);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
         let dae0_ifindex = crate::netlink::ifindex_of("dae0").unwrap_or(0);
@@ -146,10 +145,9 @@ impl RealEbpfBackend {
             offsets.configure(&mut loader);
         }
         let mut bpf = loader.load(obj)?;
-        validate_routing_handoff_layout(&bpf)?;
+        layout::validate_loaded_maps(&bpf)?;
         validate_socket_identity_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
-        retirement::validate_flow_lifetime_layout(&bpf)?;
         for name in [
             "COOKIE_PID_MAP",
             "UDP_DECISION_EPOCH",
@@ -547,7 +545,7 @@ impl RealEbpfBackend {
         };
         let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
         let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
-        let tcp_live_pins = take_tcp_live_pins(&mut bpf)?;
+        let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
 
         Ok(Self {
             bpf: Some(bpf),

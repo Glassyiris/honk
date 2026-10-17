@@ -63,9 +63,9 @@ fn missing_dae0peer_attach_failure_is_propagated() {
         )
         .expect("isolate test runtime directory");
 
-        crate::daens_fd().expect("create test daens namespace");
+        crate::daens::daens_fd().expect("create test daens namespace");
         let dae0peer_ifindex = || {
-            crate::with_daens_netns("inspect test daens", || {
+            crate::daens::with_daens_netns("inspect test daens", || {
                 let mut netlink = crate::netlink::NlSock::new()?;
                 netlink.get_link("lo")?;
                 match netlink.get_link("dae0peer") {
@@ -174,7 +174,7 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
             },
         )
         .expect("seed newer staged token");
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     backend
         .retire_batch(
             &[RetireRequest {
@@ -188,10 +188,13 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
             &mut outcomes,
         )
         .expect("stale retirement result");
-    assert_eq!(outcomes[0], Some(UdpDecisionCommitResult::Superseded));
+    assert_eq!(
+        outcomes[0],
+        RetireOutcome::Done(UdpDecisionCommitResult::Superseded)
+    );
     assert_eq!(
         backend
-            .udp_conn_state_lookup(&staged_key)
+            .conn_state_lookup(&staged_key)
             .expect("newer staged lookup")
             .expect("newer staged state retained")
             .decision_token,
@@ -708,15 +711,6 @@ fn test_event_ip() {
         event_ip(&v6),
         std::net::IpAddr::V6("::1".parse::<std::net::Ipv6Addr>().unwrap())
     );
-}
-
-#[test]
-fn routing_handoff_layout_validation_rejects_legacy_value_size() {
-    let key = core::mem::size_of::<TuplesKey>() as u32;
-    let current =
-        core::mem::size_of::<honk_ebpf_common::FlowMapValue<RoutingHandoffEntry>>() as u32;
-    assert!(validate_routing_handoff_sizes(key, current).is_ok());
-    assert!(validate_routing_handoff_sizes(key, 48).is_err());
 }
 
 #[test]

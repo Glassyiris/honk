@@ -279,8 +279,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
             assert!(f.pool.complete_removal(
                 removed.client,
                 removed.dst,
-                removed.decision_token,
-                removed.kernel_incarnation,
+                removed.owner,
                 removed.generation
             ));
             if removed.dst == f.target(0) {
@@ -309,8 +308,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                 assert!(pool.complete_removal(
                     removed.client,
                     removed.dst,
-                    removed.decision_token,
-                    removed.kernel_incarnation,
+                    removed.owner,
                     removed.generation,
                 ));
             }

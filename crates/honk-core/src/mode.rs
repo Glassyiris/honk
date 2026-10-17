@@ -786,7 +786,7 @@ mod tests {
             backend
                 .read()
                 .await
-                .udp_conn_state_lookup(&key)
+                .conn_state_lookup(&key)
                 .unwrap()
                 .is_none()
         );

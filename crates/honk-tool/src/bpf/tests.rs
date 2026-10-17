@@ -206,6 +206,36 @@ fn flow_payload_decodes_fixed_wire_offsets_without_lock_header() {
     assert_eq!(handoff.incarnation, 791);
 }
 
+#[test]
+fn ordinary_stats_print_all_canonical_keys_and_zero_missing_counters() {
+    let mut reads = 0;
+    let mut output = Vec::new();
+    print_ordinary_stats_with(
+        |key| {
+            let index = u32::from_ne_bytes(key.try_into().unwrap());
+            assert_eq!(index, reads);
+            reads += 1;
+            Ok((index != 4).then_some(u64::from(index) + 10))
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(reads, BpfStatsKey::COUNT);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        concat!(
+            "udp_conn_overflow: 10\n",
+            "tcp_conn_overflow: 11\n",
+            "redirect_track_insert_failure: 12\n",
+            "routing_handoff_insert_failure: 13\n",
+            "socket_identity_capture_failure: 0\n",
+            "tcp_request_proof_insert_failure: 15\n",
+            "tcp_child_proof_storage_failure: 16\n",
+            "tcp_publisher_claim_failure: 17\n",
+        )
+    );
+}
+
 struct SysfsFixture(tempfile::TempDir);
 
 impl SysfsFixture {

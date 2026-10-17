@@ -10,23 +10,67 @@ pub mod real;
 #[cfg(feature = "ebpf")]
 pub use real::TcpKernelPin;
 
-#[cfg(feature = "ebpf")]
 pub type TcpPinErrorSink =
     std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<anyhow::Error>>>>;
 
+pub struct TcpAdoption {
+    pub incarnation: u64,
+    pub handoff: Option<RoutingHandoffEntry>,
+    pub pin: TcpPin,
+}
+
+pub enum TcpPin {
+    Model,
+    #[cfg(feature = "ebpf")]
+    Kernel(TcpKernelPin),
+}
+
+impl TcpPin {
+    pub(crate) fn release(self) -> anyhow::Result<()> {
+        match self {
+            Self::Model => Ok(()),
+            #[cfg(feature = "ebpf")]
+            Self::Kernel(pin) => pin.release(),
+        }
+    }
+}
+
 use async_trait::async_trait;
 use honk_ebpf_common::*;
-use std::sync::atomic::AtomicU64;
+
+/// Captured once at admission; `None` is reserved for stateless or model flows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct UdpFlowOwner {
+    pub token: u32,
+    pub incarnation: Option<std::num::NonZeroU64>,
+}
+
+impl UdpFlowOwner {
+    pub fn new(token: u32, incarnation: Option<u64>) -> anyhow::Result<Self> {
+        let incarnation = incarnation
+            .map(|incarnation| {
+                anyhow::ensure!(
+                    incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX,
+                    "UDP flow incarnation exceeds allocator domain"
+                );
+                std::num::NonZeroU64::new(incarnation)
+                    .ok_or_else(|| anyhow::anyhow!("UDP flow incarnation must be nonzero"))
+            })
+            .transpose()?;
+        Ok(Self { token, incarnation })
+    }
+
+    pub fn incarnation(self) -> Option<u64> {
+        self.incarnation.map(std::num::NonZeroU64::get)
+    }
+
+    pub fn is_stateless(self, src_port: u16, dst_port: u16) -> bool {
+        self.token == 0 && honk_ebpf_common::conn::is_stateless_udp_ports(src_port, dst_port)
+    }
+}
 
 pub const UDP_DECISION_SEQUENCE_MAP: &str = "UDP_DECISION_SEQUENCE";
 pub const RETIRE_FENCE_MAP: &str = "RETIRE_FENCE";
-
-/// Cumulative conn-state entries deleted by userspace (TCP relay teardown,
-/// UDP endpoint reaper), for the janitor's occupancy gauge.  eBPF-side
-/// inserts/deletes are counted by the `CONN_STATE_OCCUPANCY` map; deletions
-/// initiated from userspace must be accounted separately or the gauge
-/// overestimates live occupancy between sweep calibrations.
-pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
 /// Callback for a bounded janitor scan. Return `false` to stop the scan at a
 /// chunk boundary (used to enforce the janitor time budget).
@@ -155,6 +199,14 @@ pub(crate) fn udp_state_is_userspace_owned(state: u8) -> bool {
         || state == UdpDecisionState::Pending as u8
         || state == UdpDecisionState::Aborted as u8
         || state == UdpDecisionState::Proxy as u8
+}
+
+/// Unpublished UDP staging that `quiesce_udp_staging` and pending-only
+/// retirement reclaim; Proxy and finished states belong to their endpoint.
+pub(crate) fn udp_state_is_staged(state: u8) -> bool {
+    state == UdpDecisionState::Preparing as u8
+        || state == UdpDecisionState::Pending as u8
+        || state == UdpDecisionState::Aborted as u8
 }
 
 pub(crate) fn udp_state_is_legacy_userspace_owned(state: &ConnState) -> bool {
@@ -575,12 +627,57 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
-    fn tcp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
-    fn tcp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
-    fn udp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
-    fn udp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
-    /// Capture ownership at endpoint admission, never at teardown.
-    fn udp_flow_incarnation(&self, key: &TuplesKey, token: u32) -> anyhow::Result<Option<u64>>;
+    /// Locked snapshot of one tuple's conn state, for either protocol.
+    fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
+    /// Raw fixture writes bypass fencing; production mutation goes through
+    /// `commit_udp_decision` and `retire_batch`.
+    #[cfg(test)]
+    fn tcp_conn_state_store(&mut self, _key: &TuplesKey, _state: &ConnState) -> anyhow::Result<()> {
+        anyhow::bail!("raw TCP conn-state fixture writes are unsupported")
+    }
+    #[cfg(test)]
+    fn udp_conn_state_store(&mut self, _key: &TuplesKey, _state: &ConnState) -> anyhow::Result<()> {
+        anyhow::bail!("raw UDP conn-state fixture writes are unsupported")
+    }
+    /// Derive ownership from the coherent snapshot already read at admission.
+    fn udp_flow_owner(&self, token: u32, state: Option<ConnState>) -> anyhow::Result<UdpFlowOwner>;
+
+    fn verify_udp_admission(
+        &self,
+        tuples: &TuplesKey,
+        owner: UdpFlowOwner,
+    ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+        let entry = self.routing_handoff_lookup(tuples)?;
+        if !owner.is_stateless(tuples.src_port, tuples.dst_port) {
+            let current = self.udp_flow_owner(owner.token, self.conn_state_lookup(tuples)?)?;
+            if owner.incarnation.is_some() {
+                anyhow::ensure!(
+                    owner.incarnation == current.incarnation,
+                    "UDP admission conn-state incarnation mismatch"
+                );
+            } else {
+                anyhow::ensure!(
+                    owner.token != 0 || current.incarnation.is_none(),
+                    "ordinary UDP admission has no captured incarnation"
+                );
+            }
+            if let Some(entry) = entry {
+                anyhow::ensure!(
+                    entry.result.decision_token == owner.token
+                        && entry.incarnation == current.incarnation().unwrap_or(0),
+                    "UDP admission handoff ownership mismatch"
+                );
+            } else {
+                anyhow::ensure!(owner.token == 0, "staged UDP flow has no routing handoff");
+            }
+        } else if let Some(entry) = entry {
+            anyhow::ensure!(
+                entry.result.decision_token == 0,
+                "raw DNS handoff token mismatch"
+            );
+        }
+        Ok(entry)
+    }
 
     /// Publish one token-bound UDP decision transition. The caller holds the
     /// backend write lock; implementations validate the state incarnation and
@@ -596,19 +693,20 @@ pub trait EbpfBackend: Send + Sync {
     fn retire_batch(
         &mut self,
         requests: &[RetireRequest<'_>],
-        outcomes: &mut [Option<UdpDecisionCommitResult>],
+        outcomes: &mut [RetireOutcome],
     ) -> Result<RetireCounts, RetireError>;
+    /// Verify native child lineage and retain its incarnation under backendR.
+    fn adopt_tcp(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        tuples: &TuplesKey,
+        errors: TcpPinErrorSink,
+    ) -> anyhow::Result<TcpAdoption>;
+    #[cfg(test)]
     fn tcp_socket_ownership(
         &self,
         fd: std::os::fd::BorrowedFd<'_>,
     ) -> anyhow::Result<TcpSocketOwnership>;
-    /// Retain the exact verified TCP incarnation until its real owner releases it.
-    #[cfg(feature = "ebpf")]
-    fn retain_tcp_flow(
-        &self,
-        incarnation: u64,
-        errors: TcpPinErrorSink,
-    ) -> anyhow::Result<TcpKernelPin>;
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>>;
     fn tcp_request_for_each_chunk(
         &self,
@@ -633,11 +731,14 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<Option<RoutingHandoffEntry>>;
 
     fn redirect_track_lookup(&self, key: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>>;
+    #[cfg(test)]
     fn redirect_track_store(
         &mut self,
-        key: &RedirectTuple,
-        entry: &RedirectEntry,
-    ) -> anyhow::Result<()>;
+        _key: &RedirectTuple,
+        _entry: &RedirectEntry,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("raw redirect-track fixture writes are unsupported")
+    }
 
     #[cfg(feature = "native-api")]
     fn bind_kernel_trace_dictionary(
@@ -678,33 +779,18 @@ pub trait EbpfBackend: Send + Sync {
     // CONN_STATE_MAP is a plain hash. Expired datapath hits emit advisory
     // hints; all physical reclamation belongs to fenced userspace retirement.
 
-    /// Snapshot all (key, entry) pairs from CONN_STATE_MAP for janitor scans.
-    /// Implementations may use bounded batch reads internally.
-    fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()>;
-
     /// Visit CONN_STATE_MAP entries in bounded chunks without accumulating
     /// the whole map (524K entries would otherwise spike memory on every
-    /// sweep). Backends with `BPF_MAP_LOOKUP_BATCH` stream chunks straight
-    /// from the kernel; others fall back to a snapshot chunked into visits
-    /// (fine for small/mock maps).
+    /// sweep). The visitor returns `false` to stop at a chunk boundary.
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
         visit: &mut ConnStateChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut entries = Vec::new();
-        self.conn_state_snapshot(&mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     /// Read the datapath's CONN_STATE_MAP occupancy counters:
     /// `(cumulative_inserts, cumulative_ebpf_deletes)`.  Userspace combines
-    /// these with its own janitor-delete accounting to estimate live
+    /// these with `USERSPACE_CONN_STATE_DELETES` to estimate live
     /// occupancy between sweeps (see `CONN_STATE_OCCUPANCY` in the eBPF
     /// maps).  Backends without the gauge return `(0, 0)`.
     fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {

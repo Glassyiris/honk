@@ -31,7 +31,7 @@ pub(super) async fn exercise(
     {
         let backend = handle.ebpf.read().await;
         ensure!(
-            backend.tcp_conn_state_lookup(&key)?.is_some(),
+            backend.conn_state_lookup(&key)?.is_some(),
             "native SYN did not publish conn state"
         );
         ensure!(

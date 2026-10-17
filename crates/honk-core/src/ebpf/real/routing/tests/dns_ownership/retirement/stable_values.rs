@@ -11,7 +11,7 @@ fn native_retained_tuple_elements_observe_same_key_fresh_syn_publication() {
                 let key = tuple(src, dst, 45600 + direction as u16, 443, IPPROTO_TCP);
                 seed(&backend, side, &key, src, dst);
                 let previous = backend
-                    .tcp_conn_state_lookup(&key)
+                    .conn_state_lookup(&key)
                     .unwrap()
                     .unwrap()
                     .incarnation;
@@ -59,7 +59,7 @@ fn native_retained_tuple_elements_observe_same_key_fresh_syn_publication() {
                     result.cb[3], 0b111,
                     "retained conn/handoff/redirect element copied stale publication A after native lock for {side} {src}"
                 );
-                let conn = backend.tcp_conn_state_lookup(&key).unwrap().unwrap();
+                let conn = backend.conn_state_lookup(&key).unwrap().unwrap();
                 let handoff = backend.routing_handoff_lookup(&key).unwrap().unwrap();
                 let redirect = backend
                     .redirect_track_lookup(&RedirectTuple::from_tuples(&key))

@@ -908,7 +908,7 @@ impl UdpEndpointPool {
                 {
                     Some((
                         *entry.key(),
-                        ready.decision_token,
+                        ready.owner.token,
                         ready.generation,
                         Arc::clone(&ready.endpoint),
                     ))

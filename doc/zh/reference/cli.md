@@ -211,6 +211,8 @@ honk-tool bpf stats [--pin-root PATH]
 
 实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、TCP 归属发布失败计数（request 证明、child 证明存储，以及 SYN 发布排他的资源错误）、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
 
+`BPF_STATS_MAP` 的普通计数器使用共享的规范标签逐行输出，例如 `udp_conn_overflow: 0`；计数值与单位不变。
+
 `routing-handoff` 在读取前检查[handoff ABI](../design/datapath.md#map-清单)；请将工具与引擎/对象一起升级。
 
 `stats` 要求 `/sys/devices/system/cpu/possible` 可读且为内核的真实导出文件。每 CPU 缓冲区按该掩码中的 CPU 数量分配，不采用 present 或 online CPU 数量。`CONN_STATE_OCCUPANCY` 和 `OUTBOUND_STATS` 必须为每 CPU 数组，键均为 4 字节，值分别为 8 字节和 32 字节。CPU 列表不可读、格式无效或 map 元数据不兼容时，命令在每 CPU 查找前报错，不回退到猜测的 CPU 数量。

@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::retirement_worker::RetirementWorker;
 use crate::control::tests::{
     store_active_tcp_flow,
     support::{canonical_socks5, test_dns_forwarder},
@@ -15,7 +16,7 @@ struct Fixture {
     listener: tokio::net::TcpListener,
     client: TcpStream,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
-    removals: Option<tokio::task::JoinHandle<()>>,
+    removals: Option<RetirementWorker>,
     removal_errors: mpsc::UnboundedReceiver<anyhow::Error>,
 }
 
@@ -100,12 +101,13 @@ impl Fixture {
         handle.connection_tracker.disable_api();
         store_active_tcp_flow(&handle, destination, source).await?;
         let (fatal_tx, removal_errors) = mpsc::unbounded_channel();
-        let removals = spawn_udp_removal_worker(
+        let removals = spawn_retirement_worker(
             Arc::clone(&plane.udp_pool),
             Arc::clone(&handle.ebpf),
             Arc::clone(&handle.connection_tracker),
             fatal_tx,
             Arc::clone(&handle.tcp_flow_pins),
+            Arc::clone(&handle.retirement),
         );
         let worker = handle.clone();
         let task = tokio::spawn(async move { worker.serve_connection(accepted, source).await });
@@ -125,7 +127,7 @@ impl Fixture {
 
     async fn finish_removals(&mut self) -> anyhow::Result<()> {
         self.plane.udp_pool.shutdown().await;
-        self.handle.tcp_flow_pins.retirement_sink.lock().take();
+        self.handle.retirement.sink.lock().take();
         if let Some(task) = self.removals.take() {
             task.await?;
         }

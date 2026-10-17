@@ -211,6 +211,8 @@ honk-tool bpf stats [--pin-root PATH]
 
 The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, TCP ownership publication failures (request proof, child proof storage, and SYN-claim resource errors), the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.
 
+Each ordinary `BPF_STATS_MAP` counter is printed on its own line using its shared canonical label, for example `udp_conn_overflow: 0`; counter values and units are unchanged.
+
 `routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries; upgrade the tool with the engine/object.
 
 `stats` requires a readable, genuine `/sys/devices/system/cpu/possible` export. It sizes per-CPU buffers from that mask's population, never the present/online CPU count. `CONN_STATE_OCCUPANCY` and `OUTBOUND_STATS` must be per-CPU arrays with 4-byte keys and 8-byte and 32-byte values, respectively. An unreadable or invalid CPU list, or incompatible map metadata, fails before per-CPU lookup; there is no guessed CPU-count fallback.

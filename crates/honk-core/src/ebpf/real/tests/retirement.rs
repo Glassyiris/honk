@@ -13,7 +13,7 @@ fn retirement_release_failure_retains_applied_counts_and_releases_other_fences()
         seed_retirement_flow(&mut backend, 41008),
     ];
     backend.retirement_faults.release = Some(0);
-    let mut outcomes = [None; 2];
+    let mut outcomes = [RetireOutcome::NotRun; 2];
     let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
     assert_eq!(
         error.counts,
@@ -24,14 +24,12 @@ fn retirement_release_failure_retains_applied_counts_and_releases_other_fences()
             request: 0
         }
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied); 2]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Applied); 2]
+    );
     for (index, request) in requests.iter().enumerate() {
-        assert!(
-            backend
-                .udp_conn_state_lookup(&request.key)
-                .unwrap()
-                .is_none()
-        );
+        assert!(backend.conn_state_lookup(&request.key).unwrap().is_none());
         assert!(
             backend
                 .routing_handoff_lookup(&request.key)
@@ -89,8 +87,8 @@ fn quiescence_preserves_tcp_closing_while_retiring_udp_staging() -> anyhow::Resu
         },
     )?;
     backend.quiesce_udp_staging()?;
-    assert_eq!(backend.tcp_conn_state_lookup(&tcp)?.unwrap().incarnation, 2);
-    assert!(backend.udp_conn_state_lookup(&udp)?.is_none());
+    assert_eq!(backend.conn_state_lookup(&tcp)?.unwrap().incarnation, 2);
+    assert!(backend.conn_state_lookup(&udp)?.is_none());
     Ok(())
 }
 
@@ -105,7 +103,7 @@ fn quiescence_preserves_native_udp_publication_completed_after_scan() -> anyhow:
         }
     }
     fn complete_publication(backend: &mut RealEbpfBackend) -> anyhow::Result<()> {
-        let mut state = backend.udp_conn_state_lookup(&key())?.unwrap();
+        let mut state = backend.conn_state_lookup(&key())?.unwrap();
         state.state = UdpDecisionState::None as u8;
         state.meta = RoutingMeta {
             raw: ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
@@ -123,7 +121,7 @@ fn quiescence_preserves_native_udp_publication_completed_after_scan() -> anyhow:
     )?;
     backend.retirement_faults.quiesce_after_scan = Some(complete_publication);
     backend.quiesce_udp_staging()?;
-    let retained = backend.udp_conn_state_lookup(&key())?.unwrap();
+    let retained = backend.conn_state_lookup(&key())?.unwrap();
     assert_eq!(
         (retained.incarnation, retained.state),
         (3, UdpDecisionState::None as u8)
@@ -145,7 +143,11 @@ fn udp_admission_requires_current_token_and_nonzero_56_bit_incarnation() {
             l4proto: libc::IPPROTO_UDP as u8,
             ..TuplesKey::default()
         };
-        assert!(backend.udp_flow_incarnation(&key, token).is_err());
+        assert!(
+            backend
+                .udp_flow_owner(token, backend.conn_state_lookup(&key).unwrap())
+                .is_err()
+        );
         for incarnation in [1, FLOW_INCARNATION_MAX] {
             backend
                 .udp_conn_state_store(
@@ -158,10 +160,17 @@ fn udp_admission_requires_current_token_and_nonzero_56_bit_incarnation() {
                 )
                 .unwrap();
             assert_eq!(
-                backend.udp_flow_incarnation(&key, token).unwrap(),
+                backend
+                    .udp_flow_owner(token, backend.conn_state_lookup(&key).unwrap())
+                    .unwrap()
+                    .incarnation(),
                 Some(incarnation)
             );
-            assert!(backend.udp_flow_incarnation(&key, token + 1).is_err());
+            assert!(
+                backend
+                    .udp_flow_owner(token + 1, backend.conn_state_lookup(&key).unwrap())
+                    .is_err()
+            );
         }
         for incarnation in [0, FLOW_INCARNATION_MAX + 1, u64::MAX] {
             backend
@@ -174,7 +183,11 @@ fn udp_admission_requires_current_token_and_nonzero_56_bit_incarnation() {
                     },
                 )
                 .unwrap();
-            assert!(backend.udp_flow_incarnation(&key, token).is_err());
+            assert!(
+                backend
+                    .udp_flow_owner(token, backend.conn_state_lookup(&key).unwrap())
+                    .is_err()
+            );
         }
     }
 }
@@ -223,7 +236,7 @@ fn seed_retirement_flow(backend: &mut RealEbpfBackend, port: u16) -> RetireReque
 }
 
 fn assert_retirement_flow_present(backend: &RealEbpfBackend, key: &TuplesKey) {
-    assert!(backend.udp_conn_state_lookup(key).unwrap().is_some());
+    assert!(backend.conn_state_lookup(key).unwrap().is_some());
     assert!(backend.routing_handoff_lookup(key).unwrap().is_some());
     assert!(
         backend
@@ -257,10 +270,10 @@ fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_f
             barrier,
             ..Default::default()
         };
-        let mut outcomes = [None; 2];
+        let mut outcomes = [RetireOutcome::NotRun; 2];
         let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
         assert_eq!(error.counts, RetireCounts::default());
-        assert_eq!(outcomes, [None; 2]);
+        assert_eq!(outcomes, [RetireOutcome::NotRun; 2]);
         for request in &requests {
             assert_retirement_flow_present(&backend, &request.key);
             assert_retirement_fence(&backend, &request.key, false);
@@ -279,7 +292,10 @@ fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_f
                 request: 0,
             }
         );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied); 2]);
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Applied); 2]
+        );
     }
 }
 
@@ -289,7 +305,7 @@ fn retirement_delete_failure_reports_completed_map_deletions_only() {
     let mut backend = retirement_fixture();
     let request = seed_retirement_flow(&mut backend, 41003);
     backend.retirement_faults.delete = Some(1);
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     let error = backend.retire_batch(&[request], &mut outcomes).unwrap_err();
     assert_eq!(
         error.counts,
@@ -298,19 +314,14 @@ fn retirement_delete_failure_reports_completed_map_deletions_only() {
             ..RetireCounts::default()
         }
     );
-    assert_eq!(outcomes, [None]);
+    assert_eq!(outcomes, [RetireOutcome::NotRun]);
     assert!(
         backend
             .routing_handoff_lookup(&request.key)
             .unwrap()
             .is_none()
     );
-    assert!(
-        backend
-            .udp_conn_state_lookup(&request.key)
-            .unwrap()
-            .is_some()
-    );
+    assert!(backend.conn_state_lookup(&request.key).unwrap().is_some());
     assert!(
         backend
             .redirect_track_lookup(&RedirectTuple::from_tuples(&request.key))
@@ -330,7 +341,10 @@ fn retirement_delete_failure_reports_completed_map_deletions_only() {
             ..RetireCounts::default()
         }
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+    );
 }
 
 #[test]
@@ -347,10 +361,10 @@ fn retirement_preserves_barrier_and_release_errors_and_inhibits_admission() {
         release: Some(1),
         ..Default::default()
     };
-    let mut outcomes = [None; 3];
+    let mut outcomes = [RetireOutcome::NotRun; 3];
     let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
     assert_eq!(error.counts, RetireCounts::default());
-    assert_eq!(outcomes, [None; 3]);
+    assert_eq!(outcomes, [RetireOutcome::NotRun; 3]);
     for (index, request) in requests.iter().enumerate() {
         assert_retirement_flow_present(&backend, &request.key);
         assert_retirement_fence(&backend, &request.key, index == 1);
@@ -362,7 +376,7 @@ fn retirement_preserves_barrier_and_release_errors_and_inhibits_admission() {
     assert!(backend.retirement_failed);
     let error = backend.retire_batch(&requests, &mut outcomes).unwrap_err();
     assert_eq!(error.counts, RetireCounts::default());
-    assert_eq!(outcomes, [None; 3]);
+    assert_eq!(outcomes, [RetireOutcome::NotRun; 3]);
     assert!(backend.set_datapath_ready(true).is_err());
     assert!(
         backend
@@ -433,7 +447,7 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             pending_only: false,
         },
     };
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     assert_eq!(
         backend.retire_batch(&[request], &mut outcomes)?,
         RetireCounts {
@@ -443,7 +457,10 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             request: 0
         }
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+    );
     assert_retirement_fence(&backend, &key, false);
     publish_retirement_flow(
         &mut backend,
@@ -457,7 +474,10 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
         backend.retire_batch(&[request], &mut outcomes)?,
         RetireCounts::default()
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
+    );
     assert_retirement_flow_present(&backend, &key);
     let raw = ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD;
     backend.udp_conn_state_store(
@@ -480,10 +500,13 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
         backend.retire_batch(&[native_request], &mut outcomes)?,
         RetireCounts::default()
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
+    );
     assert_retirement_flow_present(&backend, &key);
     assert_eq!(
-        unsafe { backend.udp_conn_state_lookup(&key)?.unwrap().meta.raw },
+        unsafe { backend.conn_state_lookup(&key)?.unwrap().meta.raw },
         raw
     );
     Ok(())
@@ -506,7 +529,7 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
             ..Default::default()
         };
         publish_retirement_flow(&mut backend, &key, &state)?;
-        let mut outcomes = [None];
+        let mut outcomes = [RetireOutcome::NotRun];
         let request = RetireRequest {
             key,
             kind: RetireKind::ExpiredConn {
@@ -523,7 +546,10 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
                 request: 0
             }
         );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+        );
         publish_retirement_flow(
             &mut backend,
             &key,
@@ -536,7 +562,10 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
             backend.retire_batch(&[request], &mut outcomes)?,
             RetireCounts::default()
         );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Superseded)]);
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Superseded)]
+        );
         assert_retirement_flow_present(&backend, &key);
     }
     Ok(())
@@ -586,15 +615,18 @@ fn retirement_auxiliary_owner_mismatch_is_fatal_and_preserves_all_maps() -> anyh
                 now_ns: u64::MAX,
             },
         };
-        let mut outcomes = [None];
+        let mut outcomes = [RetireOutcome::NotRun];
         assert_eq!(
             backend.retire_batch(&[RetireRequest { key, kind }], &mut outcomes)?,
             RetireCounts::default()
         );
-        assert_eq!(outcomes, [Some(UdpDecisionCommitResult::TokenMismatch)]);
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::TokenMismatch)]
+        );
         assert_retirement_flow_present(&backend, &key);
         assert_retirement_fence(&backend, &key, false);
-        assert_eq!(backend.udp_conn_state_lookup(&key)?.unwrap().incarnation, 1);
+        assert_eq!(backend.conn_state_lookup(&key)?.unwrap().incarnation, 1);
         assert_eq!(
             backend
                 .routing_handoff_lookup(&key)?
@@ -646,7 +678,7 @@ fn udp_commit_auxiliary_incarnation_mismatch_is_fatal() -> anyhow::Result<()> {
             UdpDecisionCommitResult::TokenMismatch
         );
         assert_eq!(
-            backend.udp_conn_state_lookup(&key)?.unwrap().state,
+            backend.conn_state_lookup(&key)?.unwrap().state,
             UdpDecisionState::Pending as u8
         );
         assert_retirement_flow_present(&backend, &key);
@@ -660,7 +692,7 @@ fn udp_commit_auxiliary_incarnation_mismatch_is_fatal() -> anyhow::Result<()> {
 fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     let seeded = seed_retirement_flow(&mut backend, 41260);
-    let expected = backend.udp_conn_state_lookup(&seeded.key)?.unwrap();
+    let expected = backend.conn_state_lookup(&seeded.key)?.unwrap();
     let request = RetireRequest {
         key: seeded.key,
         kind: RetireKind::ExpiredConn {
@@ -669,7 +701,7 @@ fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::
         },
     };
     backend.retirement_faults.delete = Some(1);
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     let error = backend.retire_batch(&[request], &mut outcomes).unwrap_err();
     assert_eq!(
         error.counts,
@@ -678,14 +710,14 @@ fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::
             ..Default::default()
         }
     );
-    assert_eq!(outcomes, [None]);
+    assert_eq!(outcomes, [RetireOutcome::NotRun]);
     assert!(backend.routing_handoff_lookup(&request.key)?.is_none());
     assert!(
         backend
             .redirect_track_lookup(&RedirectTuple::from_tuples(&request.key))?
             .is_some()
     );
-    assert!(backend.udp_conn_state_lookup(&request.key)?.is_some());
+    assert!(backend.conn_state_lookup(&request.key)?.is_some());
     assert_retirement_fence(&backend, &request.key, false);
     assert_eq!(
         backend.retire_batch(&[request], &mut outcomes)?,
@@ -695,7 +727,10 @@ fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::
             ..Default::default()
         }
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+    );
     Ok(())
 }
 
@@ -726,12 +761,15 @@ fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Resu
             now_ns: 121_000_000_000,
         },
     };
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     assert_eq!(
         backend.retire_batch(&[request], &mut outcomes)?,
         RetireCounts::default()
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::TokenMismatch)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::TokenMismatch)]
+    );
     assert_eq!(
         backend
             .routing_handoff_lookup(&key)?
@@ -758,8 +796,11 @@ fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Resu
             ..Default::default()
         }
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
-    assert!(backend.udp_conn_state_lookup(&key)?.is_none());
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+    );
+    assert!(backend.conn_state_lookup(&key)?.is_none());
     assert_retirement_fence(&backend, &key, false);
     Ok(())
 }
@@ -781,7 +822,7 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
         ..Default::default()
     };
     publish_retirement_flow(&mut backend, &key, &aborted)?;
-    let mut outcomes = [None];
+    let mut outcomes = [RetireOutcome::NotRun];
     let counts = backend.retire_batch(
         &[RetireRequest {
             key,
@@ -801,7 +842,10 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
             request: 0
         }
     );
-    assert_eq!(outcomes, [Some(UdpDecisionCommitResult::Applied)]);
+    assert_eq!(
+        outcomes,
+        [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+    );
 
     let mut staged = Vec::new();
     for (index, state) in [
@@ -847,7 +891,7 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
     )?;
     backend.quiesce_udp_staging()?;
     for key in staged {
-        assert!(backend.udp_conn_state_lookup(&key)?.is_none());
+        assert!(backend.conn_state_lookup(&key)?.is_none());
         assert!(backend.routing_handoff_lookup(&key)?.is_none());
         assert!(
             backend
@@ -857,7 +901,7 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
     }
     assert_retirement_flow_present(&backend, &proxy);
     assert_eq!(
-        backend.udp_conn_state_lookup(&proxy)?.unwrap().state,
+        backend.conn_state_lookup(&proxy)?.unwrap().state,
         UdpDecisionState::Proxy as u8
     );
     Ok(())

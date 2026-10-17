@@ -2,6 +2,7 @@
 
 use super::udp_endpoint::{DatagramPayload, RawDnsRoute};
 use super::*;
+use crate::ebpf::UdpFlowOwner;
 
 #[cfg(feature = "native-api")]
 pub(in crate::control) type PacketRoute =
@@ -110,7 +111,7 @@ pub(super) fn begin_udp_slow_path(
         original_dst,
         data,
         None,
-        None,
+        UdpFlowOwner::new(0, None).expect("model UDP owner"),
         pool.initialization_epoch(),
         udp_endpoint::queue_now(),
     )
@@ -130,7 +131,7 @@ pub(super) fn begin_udp_slow_path_at(
     original_dst: SocketAddr,
     data: &[u8],
     raw_dns_route: Option<RawDnsRoute<&str>>,
-    kernel_incarnation: Option<u64>,
+    owner: UdpFlowOwner,
     expected_epoch: u64,
     enqueued_at: u32,
 ) -> UdpSlowPathWork {
@@ -152,7 +153,7 @@ pub(super) fn begin_udp_slow_path_at(
         original_dst,
         data,
         raw_dns_route,
-        kernel_incarnation,
+        owner,
         expected_epoch,
         permit,
         enqueued_at,
@@ -469,7 +470,7 @@ impl UdpLoopState {
             } else {
                 Some(self.handle.ebpf.read().await)
             };
-        let kernel_incarnation = if let Some(backend) = backend.as_ref() {
+        let owner = if let Some(backend) = backend.as_ref() {
             let key = crate::control::connection::build_tuples_key(
                 original_dst.ip(),
                 original_dst.port(),
@@ -477,15 +478,18 @@ impl UdpLoopState {
                 src_addr.port(),
                 17,
             );
-            match backend.udp_flow_incarnation(&key, 0) {
-                Ok(incarnation) => incarnation,
+            match backend
+                .conn_state_lookup(&key)
+                .and_then(|state| backend.udp_flow_owner(0, state))
+            {
+                Ok(owner) => owner,
                 Err(error) => {
                     debug!(%src_addr, %original_dst, %error, "Dropping UDP without kernel flow ownership");
                     return UdpSlowPathWork::Done;
                 }
             }
         } else {
-            None
+            UdpFlowOwner::new(0, None).expect("stateless UDP owner")
         };
         begin_udp_slow_path_at(
             &self.udp_pool,
@@ -496,7 +500,7 @@ impl UdpLoopState {
             original_dst,
             data,
             raw_dns_route,
-            kernel_incarnation,
+            owner,
             expected_epoch,
             enqueued_at,
         )
@@ -532,7 +536,7 @@ impl UdpLoopState {
                         original_dst,
                         DatagramPayload::Owned(data),
                         raw_dns_route.as_ref().map(RawDnsRoute::as_ref),
-                        None,
+                        UdpFlowOwner::new(0, None).expect("stateless UDP owner"),
                         expected_epoch,
                         permit,
                         enqueued_at,

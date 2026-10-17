@@ -88,11 +88,17 @@ pub(crate) enum RemovalReason {
 pub(crate) struct EndpointRemoval {
     pub(crate) client: SocketAddr,
     pub(crate) dst: SocketAddr,
-    pub(crate) decision_token: u32,
-    pub(crate) kernel_incarnation: Option<u64>,
+    pub(in crate::control) owner: UdpFlowOwner,
     pub(crate) generation: u64,
     pub(crate) conn_id: Option<String>,
     pub(crate) reason: RemovalReason,
+}
+
+impl EndpointRemoval {
+    fn matches(&self, entry: &EndpointEntry) -> bool {
+        matches!(entry, EndpointEntry::Retiring { generation, owner, .. }
+            if *generation == self.generation && *owner == self.owner)
+    }
 }
 
 impl UdpEndpointPool {
@@ -113,7 +119,7 @@ impl UdpEndpointPool {
             .get(&EndpointKey::new(client, dst))
             .ok_or(())?;
         if !matches!(entry.value(), EndpointEntry::Ready(ready)
-            if ready.generation == generation && ready.decision_token == token
+            if ready.generation == generation && ready.owner.token == token
                 && Arc::ptr_eq(&ready.endpoint, endpoint) && ready.alive.load(Ordering::Acquire))
         {
             return Err(());
@@ -150,8 +156,8 @@ impl UdpEndpointPool {
         let key = EndpointKey::new(client, dst);
         self.retire_if_same(key, token, generation)
             || self.endpoints.get(&key).is_some_and(|entry| {
-                matches!(entry.value(), EndpointEntry::Retiring { generation: found, token: observed, .. }
-                    if *found == generation && *observed == token)
+                matches!(entry.value(), EndpointEntry::Retiring { generation: found, owner, .. }
+                    if *found == generation && owner.token == token)
             })
     }
 
@@ -160,18 +166,7 @@ impl UdpEndpointPool {
             .endpoints
             .get(&EndpointKey::new(removal.client, removal.dst))
             .and_then(|entry| match entry.value() {
-                EndpointEntry::Retiring {
-                    generation,
-                    token,
-                    kernel_incarnation,
-                    io,
-                    ..
-                } if *generation == removal.generation
-                    && *token == removal.decision_token
-                    && *kernel_incarnation == removal.kernel_incarnation =>
-                {
-                    io.clone()
-                }
+                EndpointEntry::Retiring { io, .. } if removal.matches(entry.value()) => io.clone(),
                 _ => None,
             });
         match io {
@@ -185,18 +180,7 @@ impl UdpEndpointPool {
             .endpoints
             .get(&EndpointKey::new(removal.client, removal.dst))
             .and_then(|entry| match entry.value() {
-                EndpointEntry::Retiring {
-                    generation,
-                    token,
-                    kernel_incarnation,
-                    io,
-                    ..
-                } if *generation == removal.generation
-                    && *token == removal.decision_token
-                    && *kernel_incarnation == removal.kernel_incarnation =>
-                {
-                    io.clone()
-                }
+                EndpointEntry::Retiring { io, .. } if removal.matches(entry.value()) => io.clone(),
                 _ => None,
             });
         #[cfg(feature = "native-api")]
@@ -205,15 +189,10 @@ impl UdpEndpointPool {
                 .endpoints
                 .get(&EndpointKey::new(removal.client, removal.dst))
             && let EndpointEntry::Retiring {
-                generation,
-                token,
-                kernel_incarnation,
                 native_terminal: Some(terminal),
                 ..
             } = entry.value()
-            && *generation == removal.generation
-            && *token == removal.decision_token
-            && *kernel_incarnation == removal.kernel_incarnation
+            && removal.matches(entry.value())
         {
             terminal.cleaned(false);
         }
@@ -221,8 +200,7 @@ impl UdpEndpointPool {
             && self.complete_removal(
                 removal.client,
                 removal.dst,
-                removal.decision_token,
-                removal.kernel_incarnation,
+                removal.owner,
                 removal.generation,
             );
         if let Some(io) = io {
@@ -265,8 +243,7 @@ impl UdpEndpointPool {
             self.complete_removal(
                 removal.client,
                 removal.dst,
-                removal.decision_token,
-                removal.kernel_incarnation,
+                removal.owner,
                 removal.generation,
             );
             return;
@@ -286,7 +263,7 @@ impl UdpEndpointPool {
         let key = EndpointKey::new(client, dst);
         let identity = self.endpoints.get(&key).and_then(|entry| {
             (!matches!(entry.value(), EndpointEntry::Retiring { .. }))
-                .then(|| (entry.value().decision_token(), entry.value().generation()))
+                .then(|| (entry.value().owner().token, entry.value().generation()))
         });
         if let Some((token, generation)) = identity {
             self.retire_if_same(key, token, generation);
@@ -328,11 +305,10 @@ impl UdpEndpointPool {
                     EndpointEntry::Ready(ready) => ready.endpoint.native.terminal().cloned(),
                     EndpointEntry::Retiring { .. } => None,
                 };
-                let kernel_incarnation = occupied.get().kernel_incarnation();
+                let owner = occupied.get().owner();
                 occupied.insert(EndpointEntry::Retiring {
                     generation,
-                    token,
-                    kernel_incarnation,
+                    owner,
                     io,
                     #[cfg(feature = "native-api")]
                     native_terminal,
@@ -340,9 +316,8 @@ impl UdpEndpointPool {
             }
             _ => return false,
         };
-        let kernel_incarnation = entry.kernel_incarnation();
-        let stateless = token == 0
-            && honk_ebpf_common::conn::is_stateless_udp_ports(key.client_port, key.dst_port);
+        let owner = entry.owner();
+        let stateless = owner.is_stateless(key.client_port, key.dst_port);
         let conn_id = entry.retire();
         drop(entry);
         self.notify_removed(EndpointRemoval {
@@ -354,8 +329,7 @@ impl UdpEndpointPool {
             } else {
                 RemovalReason::UserspaceEndpointRetired
             },
-            decision_token: token,
-            kernel_incarnation,
+            owner,
             generation,
         });
         true
@@ -366,8 +340,7 @@ impl UdpEndpointPool {
         &self,
         client: SocketAddr,
         dst: SocketAddr,
-        decision_token: u32,
-        kernel_incarnation: Option<u64>,
+        owner: UdpFlowOwner,
         generation: u64,
     ) -> bool {
         let key = EndpointKey::new(client, dst);
@@ -375,9 +348,8 @@ impl UdpEndpointPool {
             dashmap::mapref::entry::Entry::Occupied(occupied)
                 if matches!(
                     occupied.get(),
-                    EndpointEntry::Retiring { generation: found, token, kernel_incarnation: incarnation, .. }
-                        if *found == generation && *token == decision_token
-                            && *incarnation == kernel_incarnation
+                    EndpointEntry::Retiring { generation: found, owner: current, .. }
+                        if *found == generation && *current == owner
                 ) =>
             {
                 #[cfg(feature = "native-api")]
@@ -414,14 +386,14 @@ impl UdpEndpointPool {
             .iter()
             .filter_map(|entry| match entry.value() {
                 EndpointEntry::Ready(ready) if ready.endpoint.node_id == node_id => {
-                    Some((*entry.key(), ready.decision_token, ready.generation))
+                    Some((*entry.key(), ready.owner.token, ready.generation))
                 }
                 EndpointEntry::Initializing(initializing)
                     if initializing.selected_node_is(node_id) =>
                 {
                     Some((
                         *entry.key(),
-                        initializing.decision_token,
+                        initializing.owner.token,
                         initializing.generation,
                     ))
                 }
@@ -451,7 +423,7 @@ impl UdpEndpointPool {
                 EndpointEntry::Ready(ready)
                     if ready.endpoint.ref_count() <= 0 && ready.endpoint.is_expired() =>
                 {
-                    Some((*entry.key(), ready.decision_token, ready.generation))
+                    Some((*entry.key(), ready.owner.token, ready.generation))
                 }
                 _ => None,
             })
@@ -528,11 +500,11 @@ impl UdpEndpointPool {
             .filter_map(|entry| match entry.value() {
                 EndpointEntry::Initializing(initializing) => Some((
                     *entry.key(),
-                    initializing.decision_token,
+                    initializing.owner.token,
                     initializing.generation,
                 )),
                 EndpointEntry::Ready(ready) => {
-                    Some((*entry.key(), ready.decision_token, ready.generation))
+                    Some((*entry.key(), ready.owner.token, ready.generation))
                 }
                 EndpointEntry::Retiring { .. } => None,
             })

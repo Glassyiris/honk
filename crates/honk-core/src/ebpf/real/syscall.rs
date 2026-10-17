@@ -317,7 +317,22 @@ pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
     if cap.is_unsupported() {
         return Ok(false);
     }
-    let fd = map_fd(bpf, map)?;
+    scan_lookup_batch(map_fd(bpf, map)?, map, elem_flags, Some(cap), visit)
+}
+
+/// Drive one `BPF_MAP_LOOKUP_BATCH` traversal of `fd`, holding each hash bucket
+/// stable while it copies, with memory bounded to one chunk. The caller owns the
+/// fallback policy: given `cap`, an unsupported command returns `Ok(false)` so a
+/// caller with a proven-safe fallback can take it; without `cap` every failure
+/// is an error, so request maps and external pinned reads never get a singleton
+/// fallback. `Ok(true)` means the scan finished or `visit` stopped it.
+pub(crate) fn scan_lookup_batch<K: Pod, V: Pod>(
+    fd: RawFd,
+    map: &str,
+    elem_flags: u64,
+    cap: Option<&BatchCapability>,
+    visit: &mut BatchVisitor<'_, K, V>,
+) -> anyhow::Result<bool> {
     let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
     let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
     // Hash maps return a four-byte opaque bucket cursor, not a key.
@@ -345,7 +360,9 @@ pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
                 "bpf lookup_batch({map}) failed after a partial scan: errno={error}"
             );
         }
-        if !cap.observe(result) {
+        if let Some(cap) = cap
+            && !cap.observe(result)
+        {
             debug!(
                 "bpf lookup_batch({}) unsupported; caller must select a safe fallback",
                 map

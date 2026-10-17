@@ -222,12 +222,12 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
         },
     };
     backend.retirement_faults.acquire = Some(1); // Request fence after the tuple fence.
-    let mut outcomes = [None; 2];
+    let mut outcomes = [RetireOutcome::NotRun; 2];
     let error = backend
         .retire_batch(&[retire, retire], &mut outcomes)
         .unwrap_err();
     assert_eq!(error.counts, RetireCounts::default());
-    assert_eq!(outcomes, [None; 2]);
+    assert_eq!(outcomes, [RetireOutcome::NotRun; 2]);
     assert!(
         backend
             .hash_lookup::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", &request)?
@@ -241,10 +241,7 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
     );
     assert!(!backend.retirement_failed);
     assert_eq!(
-        backend
-            .tcp_conn_state_lookup(&key)?
-            .unwrap()
-            .tcp_request_count,
+        backend.conn_state_lookup(&key)?.unwrap().tcp_request_count,
         2
     );
 
@@ -262,8 +259,8 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
     assert_eq!(
         outcomes,
         [
-            Some(UdpDecisionCommitResult::Applied),
-            Some(UdpDecisionCommitResult::Missing)
+            RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+            RetireOutcome::Done(UdpDecisionCommitResult::Missing)
         ]
     );
     assert!(
@@ -271,7 +268,7 @@ fn request_retirement_fences_both_domains_deduplicates_and_preserves_failures() 
             .hash_lookup::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", &request)?
             .is_none()
     );
-    let state = backend.tcp_conn_state_lookup(&key)?.unwrap();
+    let state = backend.conn_state_lookup(&key)?.unwrap();
     assert_eq!(state.tcp_request_count, 1);
     assert_eq!(state.tcp_syn_flags, 3);
     assert!(

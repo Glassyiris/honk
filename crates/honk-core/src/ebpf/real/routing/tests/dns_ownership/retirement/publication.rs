@@ -105,7 +105,7 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                         TC_ACT_SHOT,
                         "{side} delivered an incomplete SYN publication with full {name}"
                     );
-                    let failed = backend.tcp_conn_state_lookup(&key).unwrap().unwrap();
+                    let failed = backend.conn_state_lookup(&key).unwrap().unwrap();
                     assert_eq!(failed.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT, 0);
                     assert_eq!(failed.tcp_request_count, 0);
                     take_filler(&mut backend, handoff_map, 0);
@@ -114,8 +114,7 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                         TC_ACT_REDIRECT,
                         "{side} could not retry the unpublished SYN after {name} pressure cleared"
                     );
-                    let committed: ConnState =
-                        backend.tcp_conn_state_lookup(&key).unwrap().unwrap();
+                    let committed: ConnState = backend.conn_state_lookup(&key).unwrap().unwrap();
                     assert_ne!(committed.incarnation, failed.incarnation);
                     assert_ne!(committed.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT, 0);
                     assert_eq!(committed.tcp_request_count, 0);
@@ -132,7 +131,7 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                         run(&backend, side, &bytes, SkbInput::default()).verdict,
                         TC_ACT_REDIRECT
                     );
-                    let pending = backend.tcp_conn_state_lookup(&key).unwrap().unwrap();
+                    let pending = backend.conn_state_lookup(&key).unwrap().unwrap();
                     assert_eq!(pending.incarnation, committed.incarnation);
                     assert_eq!(pending.tcp_request_count, 0);
                     backend
@@ -147,7 +146,7 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                     );
                     assert_eq!(
                         backend
-                            .tcp_conn_state_lookup(&key)
+                            .conn_state_lookup(&key)
                             .unwrap()
                             .unwrap()
                             .incarnation,
@@ -155,7 +154,7 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                     );
                     assert_eq!(
                         backend
-                            .tcp_conn_state_lookup(&key)
+                            .conn_state_lookup(&key)
                             .unwrap()
                             .unwrap()
                             .tcp_request_count,

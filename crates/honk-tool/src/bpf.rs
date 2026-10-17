@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Args;
-use honk_ebpf_common::conn::ConnState;
+use honk_ebpf_common::conn::{BpfStatsKey, ConnState};
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::redirect_need::{DomainRouting, RoutingHandoffEntry, TuplesKey};
 use honk_ebpf_common::{
@@ -579,28 +579,31 @@ fn matches_ip(key: &TuplesKey, ip: &Option<IpAddr>) -> bool {
     }
 }
 
+fn flow_entries<K: Copy, V: Copy>(args: &ShowArgs, name: &str) -> anyhow::Result<Vec<(K, V)>> {
+    let fd = open(&args.pin_root, name)?;
+    let (key_len, value_len) = (
+        std::mem::size_of::<K>(),
+        std::mem::size_of::<FlowMapValue<V>>(),
+    );
+    query_map_layout(fd, name, 1, key_len as u32, value_len as u32)?;
+    Ok(map_entries_batch(fd, key_len, value_len, BPF_F_LOCK)?
+        .into_iter()
+        .map(|(kb, vb)| {
+            (
+                unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const K) },
+                flow_payload(&vb),
+            )
+        })
+        .collect())
+}
+
 fn show(args: ShowArgs) -> anyhow::Result<()> {
     match args.map.as_str() {
         "conn-state" => {
-            let fd = open(&args.pin_root, "CONN_STATE_MAP")?;
-            query_map_layout(
-                fd,
-                "CONN_STATE_MAP",
-                1,
-                std::mem::size_of::<TuplesKey>() as u32,
-                std::mem::size_of::<FlowMapValue<ConnState>>() as u32,
-            )?;
-            let entries = map_entries_batch(
-                fd,
-                std::mem::size_of::<TuplesKey>(),
-                std::mem::size_of::<FlowMapValue<ConnState>>(),
-                BPF_F_LOCK,
-            )?;
+            let entries = flow_entries::<TuplesKey, ConnState>(&args, "CONN_STATE_MAP")?;
             let mut shown = 0usize;
-            for (kb, vb) in &entries {
-                let k: TuplesKey = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: ConnState = flow_payload(vb);
-                if !matches_ip(&k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
+            for (k, v) in &entries {
+                if !matches_ip(k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
                     continue;
                 }
                 shown += 1;
@@ -622,24 +625,9 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             println!("-- {shown}/{} entries", entries.len());
         }
         "redirect-track" => {
-            let fd = open(&args.pin_root, "REDIRECT_TRACK")?;
-            query_map_layout(
-                fd,
-                "REDIRECT_TRACK",
-                1,
-                std::mem::size_of::<RedirectTuple>() as u32,
-                std::mem::size_of::<FlowMapValue<RedirectEntry>>() as u32,
-            )?;
-            let entries = map_entries_batch(
-                fd,
-                std::mem::size_of::<RedirectTuple>(),
-                std::mem::size_of::<FlowMapValue<RedirectEntry>>(),
-                BPF_F_LOCK,
-            )?;
+            let entries = flow_entries::<RedirectTuple, RedirectEntry>(&args, "REDIRECT_TRACK")?;
             let mut shown = 0usize;
-            for (kb, vb) in &entries {
-                let k: RedirectTuple = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: RedirectEntry = flow_payload(vb);
+            for (k, v) in &entries {
                 if let Some(want) = &args.ip
                     && ip_of(&k.src_ip) != *want
                     && ip_of(&k.dst_ip) != *want
@@ -688,25 +676,11 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             println!("-- {shown}/{} entries", entries.len());
         }
         "routing-handoff" => {
-            let fd = open(&args.pin_root, "ROUTING_HANDOFF_MAP")?;
-            query_map_layout(
-                fd,
-                "ROUTING_HANDOFF_MAP",
-                1,
-                std::mem::size_of::<TuplesKey>() as u32,
-                std::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>() as u32,
-            )?;
-            let entries = map_entries_batch(
-                fd,
-                std::mem::size_of::<TuplesKey>(),
-                std::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>(),
-                BPF_F_LOCK,
-            )?;
+            let entries =
+                flow_entries::<TuplesKey, RoutingHandoffEntry>(&args, "ROUTING_HANDOFF_MAP")?;
             let mut shown = 0usize;
-            for (kb, vb) in &entries {
-                let k: TuplesKey = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: RoutingHandoffEntry = flow_payload(vb);
-                if !matches_ip(&k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
+            for (k, v) in &entries {
+                if !matches_ip(k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
                     continue;
                 }
                 shown += 1;
@@ -735,26 +709,19 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
 }
 
 fn print_ordinary_stats(pin_root: &Path) -> anyhow::Result<()> {
-    let stats_fd = unsafe { OwnedFd::from_raw_fd(open(pin_root, "BPF_STATS_MAP")?) };
-    let fd = stats_fd.as_raw_fd();
-    let udp_ovf: u64 = read_value(fd, &0u32.to_ne_bytes())?.unwrap_or(0);
-    let tcp_ovf: u64 = read_value(fd, &1u32.to_ne_bytes())?.unwrap_or(0);
-    println!("conn-state overflow: udp={udp_ovf} tcp={tcp_ovf}");
-    let redirect_failures: u64 = read_value(fd, &2u32.to_ne_bytes())?.unwrap_or(0);
-    let handoff_failures: u64 = read_value(fd, &3u32.to_ne_bytes())?.unwrap_or(0);
-    let identity_failures: u64 = read_value(fd, &4u32.to_ne_bytes())?.unwrap_or(0);
-    println!(
-        "auxiliary insert failures: redirect_track={redirect_failures} \
-         routing_handoff={handoff_failures}"
-    );
-    println!("socket identity capture failures: {identity_failures}");
-    let request_proof: u64 = read_value(fd, &5u32.to_ne_bytes())?.unwrap_or(0);
-    let child_proof: u64 = read_value(fd, &6u32.to_ne_bytes())?.unwrap_or(0);
-    let publisher_claim: u64 = read_value(fd, &7u32.to_ne_bytes())?.unwrap_or(0);
-    println!(
-        "tcp ownership failures: request_proof={request_proof} \
-         child_proof={child_proof} publisher_claim={publisher_claim}"
-    );
+    let fd = unsafe { OwnedFd::from_raw_fd(open(pin_root, "BPF_STATS_MAP")?) };
+    print_ordinary_stats_with(|key| read_value(fd.as_raw_fd(), key), io::stdout().lock())?;
+    Ok(())
+}
+
+fn print_ordinary_stats_with(
+    mut read: impl FnMut(&[u8]) -> io::Result<Option<u64>>,
+    mut output: impl io::Write,
+) -> io::Result<()> {
+    for key in BpfStatsKey::ALL {
+        let value = read(&(key as u32).to_ne_bytes())?.unwrap_or(0);
+        writeln!(output, "{}: {value}", key.label())?;
+    }
     Ok(())
 }
 

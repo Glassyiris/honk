@@ -11,12 +11,13 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use super::TcpSocketOwnership;
 use super::{
     EbpfBackend, FlowExpiryHint, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP, RetireCounts,
-    RetireError, RetireKind, RetireRequest, TcpSocketOwnership, UDP_DECISION_SEQUENCE_MAP,
-    USERSPACE_CONN_STATE_DELETES, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
-    UdpDecisionTransition, apply_udp_decision_transition, probe::BatchCapability,
-    validate_udp_decision_transition,
+    RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
+    UdpDecisionCommitResult, UdpDecisionSequenceStatus, UdpDecisionTransition,
+    probe::BatchCapability, validate_udp_decision_transition,
 };
 
 /// Parse the running kernel version from /proc/version.
@@ -37,30 +38,6 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
     } else {
         None
     }
-}
-pub(super) fn validate_routing_handoff_sizes(key_size: u32, value_size: u32) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        key_size == core::mem::size_of::<TuplesKey>() as u32
-            && value_size == core::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>() as u32,
-        "map 'ROUTING_HANDOFF_MAP' has incompatible layout: expected key={} value={}, actual key={key_size} value={value_size}",
-        core::mem::size_of::<TuplesKey>(),
-        core::mem::size_of::<FlowMapValue<RoutingHandoffEntry>>()
-    );
-    Ok(())
-}
-
-pub(super) fn validate_routing_handoff_layout(bpf: &Ebpf) -> anyhow::Result<()> {
-    const NAME: &str = "ROUTING_HANDOFF_MAP";
-    let map = bpf
-        .map(NAME)
-        .ok_or_else(|| anyhow::anyhow!("map '{NAME}' not found"))?;
-    let aya::maps::Map::HashMap(map) = map else {
-        anyhow::bail!("map '{NAME}' has incompatible map type");
-    };
-    let info = map
-        .info()
-        .map_err(|error| anyhow::anyhow!("query map '{NAME}': {error}"))?;
-    validate_routing_handoff_sizes(info.key_size(), info.value_size())
 }
 
 fn validate_socket_identity_layout(bpf: &Ebpf) -> anyhow::Result<()> {
@@ -142,49 +119,6 @@ pub struct RealEbpfBackend {
     udp_staging_quiesce_incomplete: bool,
 }
 
-/// An exact native lifetime pin; clones only the backend's shared map handle.
-pub struct TcpKernelPin {
-    map: std::sync::Arc<AyaMapData>,
-    incarnation: Option<u64>,
-    errors: super::TcpPinErrorSink,
-}
-
-impl TcpKernelPin {
-    fn release_once(&mut self) -> anyhow::Result<()> {
-        if let Some(incarnation) = self.incarnation.take() {
-            syscall::remove_tcp_live_pin(&self.map, incarnation)?;
-        }
-        Ok(())
-    }
-
-    pub fn release(mut self) -> anyhow::Result<()> {
-        self.release_once()
-    }
-}
-
-impl Drop for TcpKernelPin {
-    fn drop(&mut self) {
-        if let Err(error) = self.release_once() {
-            let sink = self.errors.lock();
-            match sink.as_ref() {
-                Some(sender) => {
-                    if let Err(error) = sender.send(error) {
-                        tracing::error!(error = %error.0, "TCP pin release error channel closed");
-                    }
-                }
-                None => tracing::error!(%error, "TCP pin release error channel unavailable"),
-            }
-        }
-    }
-}
-
-fn take_tcp_live_pins(bpf: &mut Ebpf) -> anyhow::Result<std::sync::Arc<AyaMapData>> {
-    match bpf.take_map("TCP_LIVE_PINS") {
-        Some(aya::maps::Map::HashMap(map)) => Ok(std::sync::Arc::new(map)),
-        _ => anyhow::bail!("TCP_LIVE_PINS unavailable or has an incompatible map type"),
-    }
-}
-
 /// Find cgroup2 in the calling thread's mount namespace, not its thread-group leader's.
 fn detect_cgroup_path() -> anyhow::Result<String> {
     let mounts = std::fs::read_to_string("/proc/thread-self/mounts")?;
@@ -262,13 +196,14 @@ mod attach;
 mod btf;
 mod events;
 mod iface_watch;
+mod layout;
 mod observation;
 mod process_name;
 #[cfg(feature = "native-api")]
 pub(crate) mod receive_trace;
 mod retirement;
 mod routing;
-mod syscall;
+pub(crate) mod syscall;
 mod tcp_binding;
 #[cfg(test)]
 mod tests;
@@ -279,6 +214,7 @@ use syscall::{
     bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
     validate_loaded_udp_decision_sequence,
 };
+pub use tcp_binding::TcpKernelPin;
 
 fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
     (outbound as u32)
@@ -602,62 +538,7 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
-        self.udp_staging_quiesce_incomplete = true;
-        self.grace_barrier()?;
-
-        let mut staged = Vec::new();
-        self.flow_for_each_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
-            staged.extend(chunk.iter().filter_map(|(key, state)| {
-                (key.l4proto == libc::IPPROTO_UDP as u8
-                    && (state.state == UdpDecisionState::Preparing as u8
-                        || state.state == UdpDecisionState::Pending as u8
-                        || state.state == UdpDecisionState::Aborted as u8))
-                    .then_some((*key, state.decision_token, state.incarnation))
-            }));
-            true
-        })?;
-        #[cfg(test)]
-        if let Some(complete_publication) = self.retirement_faults.quiesce_after_scan.take() {
-            complete_publication(self)?;
-        }
-        for chunk in staged.chunks(RETIRE_BATCH_CAPACITY) {
-            let mut requests = [RetireRequest {
-                key: TuplesKey::default(),
-                kind: RetireKind::Tcp { incarnation: 0 },
-            }; RETIRE_BATCH_CAPACITY];
-            let mut outcomes = [None; RETIRE_BATCH_CAPACITY];
-            for (request, (key, token, incarnation)) in requests.iter_mut().zip(chunk) {
-                *request = RetireRequest {
-                    key: *key,
-                    kind: RetireKind::Udp {
-                        token: *token,
-                        incarnation: Some(*incarnation),
-                        pending_only: true,
-                    },
-                };
-            }
-            let result = self.retire_flows(&requests[..chunk.len()], &mut outcomes[..chunk.len()]);
-            let conn = match &result {
-                Ok(counts) => counts.conn,
-                Err(error) => error.counts.conn,
-            };
-            USERSPACE_CONN_STATE_DELETES.fetch_add(conn, std::sync::atomic::Ordering::Relaxed);
-            result?;
-            // A token-zero claim can finish native publication between scan and fence.
-            for (result, (_, token, _)) in outcomes.iter().zip(chunk) {
-                anyhow::ensure!(
-                    matches!(
-                        result,
-                        Some(UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing)
-                    ) || (*token == 0
-                        && matches!(result, Some(UdpDecisionCommitResult::StateMismatch))),
-                    "UDP staging quiescence rejected retirement: {result:?}"
-                );
-            }
-        }
-        self.fence_routing_generation()?;
-        self.udp_staging_quiesce_incomplete = false;
-        Ok(())
+        self.quiesce_staged_udp()
     }
 
     fn publish_routing_plan(
@@ -728,35 +609,31 @@ impl EbpfBackend for RealEbpfBackend {
         }
     }
 
-    fn tcp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
-        self.flow_lookup("CONN_STATE_MAP", k)
+    fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
+        self.flow_lookup("CONN_STATE_MAP", key)
     }
+    #[cfg(test)]
     fn tcp_conn_state_store(&mut self, k: &TuplesKey, s: &ConnState) -> anyhow::Result<()> {
         self.flow_insert("CONN_STATE_MAP", k, s)
     }
-
-    fn udp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
-        self.flow_lookup("CONN_STATE_MAP", k)
-    }
+    #[cfg(test)]
     fn udp_conn_state_store(&mut self, k: &TuplesKey, s: &ConnState) -> anyhow::Result<()> {
         self.flow_insert("CONN_STATE_MAP", k, s)
     }
 
-    fn udp_flow_incarnation(&self, key: &TuplesKey, token: u32) -> anyhow::Result<Option<u64>> {
+    fn udp_flow_owner(
+        &self,
+        token: u32,
+        state: Option<ConnState>,
+    ) -> anyhow::Result<super::UdpFlowOwner> {
         anyhow::ensure!(
             !self.retirement_failed,
             "retirement ownership is unresolved"
         );
-        let state = self
-            .flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
-            .ok_or_else(|| anyhow::anyhow!("UDP admission has no current conn state"))?;
+        let state =
+            state.ok_or_else(|| anyhow::anyhow!("UDP admission has no current conn state"))?;
         anyhow::ensure!(state.decision_token == token, "UDP admission token changed");
-        anyhow::ensure!(
-            state.incarnation != 0
-                && state.incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX,
-            "UDP admission has invalid lifetime identity"
-        );
-        Ok(Some(state.incarnation))
+        super::UdpFlowOwner::new(token, Some(state.incarnation))
     }
 
     fn commit_udp_decision(
@@ -771,11 +648,21 @@ impl EbpfBackend for RealEbpfBackend {
     fn retire_batch(
         &mut self,
         requests: &[RetireRequest<'_>],
-        outcomes: &mut [Option<UdpDecisionCommitResult>],
+        outcomes: &mut [RetireOutcome],
     ) -> Result<RetireCounts, RetireError> {
         self.retire_flows(requests, outcomes)
     }
 
+    fn adopt_tcp(
+        &self,
+        fd: BorrowedFd<'_>,
+        tuples: &TuplesKey,
+        errors: super::TcpPinErrorSink,
+    ) -> anyhow::Result<super::TcpAdoption> {
+        tcp_binding::adopt(self, fd, tuples, errors)
+    }
+
+    #[cfg(test)]
     fn tcp_socket_ownership(&self, fd: BorrowedFd<'_>) -> anyhow::Result<TcpSocketOwnership> {
         anyhow::ensure!(
             !self.retirement_failed,
@@ -785,27 +672,6 @@ impl EbpfBackend for RealEbpfBackend {
             self.bpf()?,
             fd,
         )?))
-    }
-
-    fn retain_tcp_flow(
-        &self,
-        incarnation: u64,
-        errors: super::TcpPinErrorSink,
-    ) -> anyhow::Result<TcpKernelPin> {
-        anyhow::ensure!(
-            !self.retirement_failed && self.bpf.is_some(),
-            "BPF backend closed or retirement ownership unresolved"
-        );
-        anyhow::ensure!(
-            incarnation != 0 && incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX,
-            "invalid TCP lifetime identity"
-        );
-        syscall::insert_tcp_live_pin(&self.tcp_live_pins, incarnation)?;
-        Ok(TcpKernelPin {
-            map: std::sync::Arc::clone(&self.tcp_live_pins),
-            incarnation: Some(incarnation),
-            errors,
-        })
     }
 
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>> {
@@ -912,6 +778,7 @@ impl EbpfBackend for RealEbpfBackend {
     fn redirect_track_lookup(&self, k: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>> {
         self.flow_lookup("REDIRECT_TRACK", k)
     }
+    #[cfg(test)]
     fn redirect_track_store(&mut self, k: &RedirectTuple, e: &RedirectEntry) -> anyhow::Result<()> {
         self.flow_insert("REDIRECT_TRACK", k, e)
     }
@@ -991,13 +858,6 @@ impl EbpfBackend for RealEbpfBackend {
         visit: &mut crate::ebpf::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
         self.flow_for_each_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
-    }
-
-    fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("CONN_STATE_MAP", syscall::BPF_BATCH_CHUNK, &mut |chunk| {
-            out.extend_from_slice(chunk);
-            true
-        })
     }
 
     fn conn_state_for_each_chunk(
@@ -1121,7 +981,7 @@ impl EbpfBackend for RealEbpfBackend {
         // qdisc_add_clsact/attach_tc resolve interface names in the netns
         // they are created in, so both must run inside daens.  The link
         // handle persists after switching back to the host netns.
-        crate::with_daens_netns("attach dae0peer_ingress", move || {
+        crate::daens::with_daens_netns("attach dae0peer_ingress", move || {
             if let Err(error) = aya::programs::tc::qdisc_add_clsact("dae0peer")
                 && !error.to_string().contains("File exists")
             {
@@ -1152,8 +1012,8 @@ impl EbpfBackend for RealEbpfBackend {
         // live in daens too (bound there via a scoped switch at control-plane
         // startup), so proxy-bound packets are assigned to them in their own
         // namespace.  The link handle persists after switching back.
-        crate::with_daens_netns("attach tproxy_sk_lookup", move || {
-            let netns = crate::daens_fd()?;
+        crate::daens::with_daens_netns("attach tproxy_sk_lookup", move || {
+            let netns = crate::daens::daens_fd()?;
             let p: &mut aya::programs::SkLookup = self
                 .bpf_mut()?
                 .program_mut("tproxy_sk_lookup")

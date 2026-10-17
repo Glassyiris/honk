@@ -33,7 +33,7 @@ pub(super) struct RuntimeEpoch {
     maintenance: OwnedTasks,
     dns: Option<dns_listener::DnsListener>,
     janitor: Option<tokio::task::JoinHandle<()>>,
-    removals: Option<tokio::task::JoinHandle<()>>,
+    removals: Option<retirement_worker::RetirementWorker>,
     removal_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     critical_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     health_updates: Option<HealthUpdates>,
@@ -408,12 +408,13 @@ impl ControlPlane {
             }
             #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
             record_udp_trace(&self.degradations, trace_error.is_some());
-            epoch.removals = Some(spawn_udp_removal_worker(
+            epoch.removals = Some(spawn_retirement_worker(
                 self.udp_pool.clone(),
                 self.ebpf.clone(),
                 self.connection_tracker.clone(),
                 removal_tx,
                 self.tcp_flow_pins.clone(),
+                Arc::clone(&self.retirement),
             ));
             epoch.janitor = Some(
                 BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone()).spawn_supervised(
@@ -590,12 +591,12 @@ pub(super) async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> an
     result
 }
 
-async fn join_retirement_owner(
-    task: &mut Option<tokio::task::JoinHandle<()>>,
+async fn join_retirement_owner<T: Default>(
+    task: &mut Option<tokio::task::JoinHandle<T>>,
     owner: &'static str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<T> {
     let Some(handle) = task.as_mut() else {
-        return Ok(());
+        return Ok(T::default());
     };
     let result = match tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await {
         Ok(result) => result,

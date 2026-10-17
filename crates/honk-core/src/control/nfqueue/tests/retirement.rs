@@ -50,7 +50,7 @@ async fn cancel_drops_original_and_removes_exact_pending_state() {
             .backend
             .read()
             .await
-            .udp_conn_state_lookup(&fixture.identity.tuples())
+            .conn_state_lookup(&fixture.identity.tuples())
             .unwrap()
             .is_none()
     );
@@ -108,14 +108,11 @@ async fn staged_admission_keeps_captured_incarnation_through_cancel() {
     else {
         panic!("pending flow must initialize")
     };
-    assert_eq!(lease.kernel_incarnation(), Some(61));
-    assert_eq!(identity.kernel_incarnation, Some(61));
+    assert_eq!(lease.owner().incarnation(), Some(61));
+    assert_eq!(identity.owner.incarnation(), Some(61));
     {
         let mut backend = backend.write().await;
-        let mut state = backend
-            .udp_conn_state_lookup(&key.tuples())
-            .unwrap()
-            .unwrap();
+        let mut state = backend.conn_state_lookup(&key.tuples()).unwrap().unwrap();
         state.incarnation = 62;
         backend.udp_conn_state_store(&key.tuples(), &state).unwrap();
     }
@@ -128,7 +125,7 @@ async fn staged_admission_keeps_captured_incarnation_through_cancel() {
         backend
             .read()
             .await
-            .udp_conn_state_lookup(&key.tuples())
+            .conn_state_lookup(&key.tuples())
             .unwrap()
             .unwrap()
             .incarnation,

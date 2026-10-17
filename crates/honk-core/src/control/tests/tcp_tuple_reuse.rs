@@ -3,6 +3,7 @@ use super::{
     NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
 };
 use crate::control::{ControlCommand, ControlPlane};
+use crate::daens;
 use crate::dns::DnsResolver;
 use crate::ebpf::{EbpfBackend, real::RealEbpfBackend};
 use crate::routing::Router;
@@ -49,7 +50,7 @@ fn run_child(family: &str) -> anyhow::Result<()> {
         Ok(listener)
     })?;
     let target = listener.local_addr()?;
-    let _dae0 = crate::create_dae0_link()?;
+    let _dae0 = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -66,7 +67,7 @@ fn run_child(family: &str) -> anyhow::Result<()> {
             )
             .await?;
             backend.attach_dae0_programs()?;
-            crate::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
+            daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
             backend.attach_sk_lookup()?;
             backend.attach_dae0peer_ingress()?;
             let ready = Array::<_, u32>::try_from(pinned_map(pin_root, "DATAPATH_STATE_MAP")?)?;
@@ -129,7 +130,7 @@ fn run_child(family: &str) -> anyhow::Result<()> {
                     .context("first transparent TCP exchange")?;
                 tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                     loop {
-                        let time_wait = crate::with_daens_netns("observe exact TIME_WAIT", || {
+                        let time_wait = daens::with_daens_netns("observe exact TIME_WAIT", || {
                             tuple_state(target, source)
                         })?;
                         let client_closed =
