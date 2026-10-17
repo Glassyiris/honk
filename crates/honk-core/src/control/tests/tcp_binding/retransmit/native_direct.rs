@@ -1,30 +1,31 @@
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn exercise(
-    handle: &ControlPlaneHandle,
-    client_ns: &OwnedFd,
-    server_ns: &OwnedFd,
-    client_ip: IpAddr,
-    wan_ip: IpAddr,
-    target: SocketAddr,
-    server: std::net::TcpListener,
-    dials: &AtomicUsize,
-    wan: bool,
-) -> anyhow::Result<()> {
+pub(in crate::control::tests::tcp_binding) fn lan(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Forward, async |lab| {
+        exercise(lab, false).await
+    })
+}
+
+pub(in crate::control::tests::tcp_binding) fn wan(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Forward, async |lab| exercise(lab, true).await)
+}
+
+async fn exercise(lab: &Lab, wan: bool) -> anyhow::Result<()> {
+    let (handle, target, dials) = (&lab.handle, lab.target, &lab.dials);
+    let server = lab.server()?;
     handle
         .ebpf
         .write()
         .await
         .publish_routing_plan(&port_plan(target.port(), "direct", true)?, &[])?;
-    let (tap, wire) = in_test_netns(server_ns, || -> anyhow::Result<_> {
+    let (tap, wire) = in_test_netns(&lab.server_ns, || -> anyhow::Result<_> {
         Ok((SynTap(packet_socket()?), Wire::on("honk-s0")?))
     })?;
-    let server = TcpListener::from_std(server)?;
+    let (client_ip, wan_ip, client_ns) = (lab.client, lab.wan, &lab.client_ns);
     let (mut client, source) = if wan {
         Client::wan(wan_ip, target).await?
     } else {
-        Client::lan(client_ns, client_ip, target)?
+        Client::lan(client_ns, client_ip, target, false)?
     };
     let (synack, mut syns) = original_synack(&mut client, &wire, &tap, source, target).await?;
     let key = conn_key(source, target);

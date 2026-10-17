@@ -8,24 +8,33 @@ use honk_ebpf_common::{
     conn::{TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const UP: &[u8] = b"client bytes after native metadata age";
 const DOWN: &[u8] = b"accepted child bytes after native metadata age";
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn exercise(
-    handle: &ControlPlaneHandle,
-    listener: &TcpListener,
-    client_ns: &OwnedFd,
-    mut accepted: TcpStream,
-    mut client: TcpStream,
+/// A real accepted child that already exchanged bytes in both directions but is not
+/// adopted, so it holds no native pin.
+struct Settled {
+    client: TcpStream,
     source: SocketAddr,
-    target: SocketAddr,
     key: TuplesKey,
     incarnation: u64,
-    case: &str,
-) -> anyhow::Result<()> {
+    pins: HashMap<aya::maps::MapData, u64, u8>,
+}
+
+/// `aged` waits until the real boot clock can represent an expired tuple; `reuse` lets
+/// the client rebind its source for a later SYN on the same tuple.
+async fn settle(lab: &Lab, aged: bool, reuse: bool) -> anyhow::Result<(Settled, TcpStream)> {
+    if aged {
+        await_established_age().await?;
+    }
+    let mut hs = Handshake::open(lab, reuse).await?;
+    hs.proof()?;
+    let Child {
+        stream: mut accepted,
+        mut client,
+        peer: source,
+    } = hs.release().await?;
     accepted.set_nodelay(true)?;
     client.set_nodelay(true)?;
     // Establish that these exact sockets exchange real application bytes before
@@ -33,163 +42,201 @@ pub(super) async fn exercise(
     transfer(&mut client, &mut accepted, UP).await?;
     transfer(&mut accepted, &mut client, DOWN).await?;
     quiesce(&accepted, &client).await?;
+    let (key, incarnation) = (hs.key, hs.original.incarnation);
     let pins = live_pins()?;
     ensure!(
         pins.get(&incarnation, 0).is_err(),
         "unadopted child was pinned"
     );
-
-    if matches!(
-        case,
-        "lifetime-pin-drop-error" | "lifetime-pin-retire-error"
-    ) {
-        return native_pin_error(handle, accepted, key, incarnation, case).await;
-    }
-
-    if matches!(
-        case,
-        "lifetime-unowned-redirect" | "lifetime-unowned-closing"
-    ) {
-        let closing = case == "lifetime-unowned-closing";
-        if closing {
-            half_close(&mut client, &mut accepted).await?;
-        }
-        backdate(handle, &key, closing).await?;
-        // Keep the real retirement worker from reclaiming an expiry hint while
-        // checking the kernel's non-deletion contract; packets still execute TC.
-        let backend = handle.ebpf.read().await;
-        let before = metadata(&key)?;
-        if closing {
-            refused(&mut accepted, &mut client, DOWN).await?;
-        } else {
-            refused(&mut client, &mut accepted, UP).await?;
-        }
-        assert_refused_metadata(&key, &before, closing)?;
-        ensure!(pins.get(&incarnation, 0).is_err(), "refusal invented a pin");
-        drop(backend);
-        return Ok(());
-    }
-
-    let duplicate = if case == "lifetime-cancel" {
-        Some(duplicate_stream(&accepted)?)
-    } else {
-        None
+    let settled = Settled {
+        client,
+        source,
+        key,
+        incarnation,
+        pins,
     };
-    let mut flow = adopt(handle, accepted, key).await?;
-    ensure!(
-        pins.get(&incarnation, 0)? == 1,
-        "adoption did not pin exact incarnation"
-    );
-    ensure!(
-        handle.tcp_flow_pins.contains(&key),
-        "adoption lost local tuple pin"
-    );
+    Ok((settled, accepted))
+}
 
-    match case {
-        "lifetime-idle" => {
-            backdate(handle, &key, false).await?;
-            transfer(&mut client, flow.stream_mut(), UP).await?;
-            quiesce(flow.stream_mut(), &client).await?;
-            backdate(handle, &key, false).await?;
-            transfer(flow.stream_mut(), &mut client, DOWN).await?;
-        }
-        "lifetime-client-fin" => {
-            half_close(&mut client, flow.stream_mut()).await?;
-            backdate(handle, &key, true).await?;
-            transfer(flow.stream_mut(), &mut client, DOWN).await?;
-        }
-        "lifetime-server-fin" => {
-            half_close(flow.stream_mut(), &mut client).await?;
-            backdate(handle, &key, true).await?;
-            transfer(&mut client, flow.stream_mut(), UP).await?;
-        }
-        "lifetime-other-incarnation" => {
-            half_close(&mut client, flow.stream_mut()).await?;
-            let newer = supersede(handle, &key).await?;
-            ensure!(newer != incarnation && pins.get(&newer, 0).is_err());
-            backdate(handle, &key, true).await?;
-            let backend = handle.ebpf.read().await;
-            let before = metadata(&key)?;
-            refused(flow.stream_mut(), &mut client, DOWN).await?;
-            assert_refused_metadata(&key, &before, true)?;
-            ensure!(
-                pins.get(&incarnation, 0)? == 1,
-                "foreign refusal removed old pin"
-            );
-            drop(backend);
-            // Drop is exact-key cleanup even though tuple authority has moved.
-            drop(flow);
-            ensure!(pins.get(&incarnation, 0).is_err(), "old native pin leaked");
-            ensure!(!handle.tcp_flow_pins.contains(&key), "old local pin leaked");
-            return Ok(());
-        }
-        "lifetime-cancel" => {
-            let duplicate = duplicate.context("missing duplicate accepted FD")?;
-            let result = adopt(handle, duplicate, key).await;
-            ensure!(
-                result.is_err(),
-                "same real child admitted a second native owner"
-            );
-            ensure!(
-                pins.get(&incarnation, 0)? == 1,
-                "duplicate refusal damaged original pin"
-            );
-            ensure!(handle.tcp_flow_pins.contains(&key));
-            transfer(&mut client, flow.stream_mut(), UP).await?;
-            quiesce(flow.stream_mut(), &client).await?;
-            let before = metadata(&key)?;
-            let (sender, receiver) = tokio::sync::mpsc::channel(1);
-            let slot = sender.clone().reserve_owned().await?;
-            let original_sink = handle.retirement.sink.lock().replace(sender);
-            let mut retirement = Box::pin(flow.retire(Default::default()));
-            tokio::select! {
-                biased;
-                result = &mut retirement => anyhow::bail!("retirement crossed full admission: {result}"),
-                _ = tokio::task::yield_now() => {}
-            }
-            ensure!(
-                pins.get(&incarnation, 0)? == 1,
-                "pending admission released native pin"
-            );
-            drop(retirement);
-            *handle.retirement.sink.lock() = original_sink;
-            drop(slot);
-            drop(receiver);
-            // No await separates cancellation from these exact native/local checks.
-            ensure!(
-                pins.get(&incarnation, 0).is_err(),
-                "cancelled admission leaked native pin"
-            );
-            ensure!(
-                !handle.tcp_flow_pins.contains(&key),
-                "cancelled admission leaked local refcount"
-            );
-            assert_authority(&key, before.0.incarnation)?;
-            return Ok(());
-        }
-        "lifetime-new-syn" => {
-            return superseding_syn(
-                handle,
-                listener,
-                client_ns,
-                flow,
-                client,
-                source,
-                target,
-                key,
-                incarnation,
-            )
-            .await;
-        }
-        _ => anyhow::bail!("unknown lifetime case {case}"),
+impl Settled {
+    async fn adopt(&self, lab: &Lab, accepted: TcpStream) -> anyhow::Result<TcpFlowGuard> {
+        let flow = adopt(&lab.handle, accepted, self.key).await?;
+        ensure!(
+            self.pins.get(&self.incarnation, 0)? == 1,
+            "adoption did not pin exact incarnation"
+        );
+        ensure!(
+            lab.handle.tcp_flow_pins.contains(&self.key),
+            "adoption lost local tuple pin"
+        );
+        Ok(flow)
     }
-    quiesce(flow.stream_mut(), &client).await?;
+
+    async fn finish(self, lab: &Lab, mut flow: TcpFlowGuard) -> anyhow::Result<()> {
+        quiesce(flow.stream_mut(), &self.client).await?;
+        ensure!(
+            self.pins.get(&self.incarnation, 0)? == 1,
+            "live transfer lost native owner"
+        );
+        assert_authority(&self.key, self.incarnation)?;
+        close_and_retire(&lab.handle, flow, self.client, &self.key, self.incarnation).await
+    }
+}
+
+pub(super) fn idle(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (mut s, accepted) = settle(lab, true, false).await?;
+        let mut flow = s.adopt(lab, accepted).await?;
+        backdate(&lab.handle, &s.key, false).await?;
+        transfer(&mut s.client, flow.stream_mut(), UP).await?;
+        quiesce(flow.stream_mut(), &s.client).await?;
+        backdate(&lab.handle, &s.key, false).await?;
+        transfer(flow.stream_mut(), &mut s.client, DOWN).await?;
+        s.finish(lab, flow).await
+    })
+}
+
+pub(super) fn client_fin(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (mut s, accepted) = settle(lab, true, false).await?;
+        let mut flow = s.adopt(lab, accepted).await?;
+        half_close(&mut s.client, flow.stream_mut()).await?;
+        backdate(&lab.handle, &s.key, true).await?;
+        transfer(flow.stream_mut(), &mut s.client, DOWN).await?;
+        s.finish(lab, flow).await
+    })
+}
+
+pub(super) fn server_fin(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (mut s, accepted) = settle(lab, true, false).await?;
+        let mut flow = s.adopt(lab, accepted).await?;
+        half_close(flow.stream_mut(), &mut s.client).await?;
+        backdate(&lab.handle, &s.key, true).await?;
+        transfer(&mut s.client, flow.stream_mut(), UP).await?;
+        s.finish(lab, flow).await
+    })
+}
+
+pub(super) fn unowned_redirect(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab| unowned(lab, false).await)
+}
+
+pub(super) fn unowned_closing(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab| unowned(lab, true).await)
+}
+
+/// An aged tuple whose child was never adopted has no native pin: refusal must not
+/// delete or refresh anything.
+async fn unowned(lab: &Lab, closing: bool) -> anyhow::Result<()> {
+    let (mut s, mut accepted) = settle(lab, true, false).await?;
+    if closing {
+        half_close(&mut s.client, &mut accepted).await?;
+    }
+    backdate(&lab.handle, &s.key, closing).await?;
+    // Keep the real retirement worker from reclaiming an expiry hint while
+    // checking the kernel's non-deletion contract; packets still execute TC.
+    let backend = lab.handle.ebpf.read().await;
+    let before = metadata(&s.key)?;
+    if closing {
+        refused(&mut accepted, &mut s.client, DOWN).await?;
+    } else {
+        refused(&mut s.client, &mut accepted, UP).await?;
+    }
+    assert_refused_metadata(&s.key, &before, closing)?;
     ensure!(
-        pins.get(&incarnation, 0)? == 1,
-        "live transfer lost native owner"
+        s.pins.get(&s.incarnation, 0).is_err(),
+        "refusal invented a pin"
     );
-    assert_authority(&key, incarnation)?;
-    close_and_retire(handle, flow, client, &key, incarnation).await
+    drop(backend);
+    Ok(())
+}
+
+pub(super) fn other_incarnation(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (mut s, accepted) = settle(lab, true, false).await?;
+        let mut flow = s.adopt(lab, accepted).await?;
+        half_close(&mut s.client, flow.stream_mut()).await?;
+        let newer = supersede(&lab.handle, &s.key).await?;
+        ensure!(newer != s.incarnation && s.pins.get(&newer, 0).is_err());
+        backdate(&lab.handle, &s.key, true).await?;
+        let backend = lab.handle.ebpf.read().await;
+        let before = metadata(&s.key)?;
+        refused(flow.stream_mut(), &mut s.client, DOWN).await?;
+        assert_refused_metadata(&s.key, &before, true)?;
+        ensure!(
+            s.pins.get(&s.incarnation, 0)? == 1,
+            "foreign refusal removed old pin"
+        );
+        drop(backend);
+        // Drop is exact-key cleanup even though tuple authority has moved.
+        drop(flow);
+        ensure!(
+            s.pins.get(&s.incarnation, 0).is_err(),
+            "old native pin leaked"
+        );
+        ensure!(
+            !lab.handle.tcp_flow_pins.contains(&s.key),
+            "old local pin leaked"
+        );
+        Ok(())
+    })
+}
+
+pub(super) fn cancel(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (mut s, accepted) = settle(lab, true, false).await?;
+        let duplicate = duplicate_stream(&accepted)?;
+        let mut flow = s.adopt(lab, accepted).await?;
+        let result = adopt(&lab.handle, duplicate, s.key).await;
+        ensure!(
+            result.is_err(),
+            "same real child admitted a second native owner"
+        );
+        ensure!(
+            s.pins.get(&s.incarnation, 0)? == 1,
+            "duplicate refusal damaged original pin"
+        );
+        ensure!(lab.handle.tcp_flow_pins.contains(&s.key));
+        transfer(&mut s.client, flow.stream_mut(), UP).await?;
+        quiesce(flow.stream_mut(), &s.client).await?;
+        let before = metadata(&s.key)?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let slot = sender.clone().reserve_owned().await?;
+        let original_sink = lab.handle.retirement.sink.lock().replace(sender);
+        let mut retirement = Box::pin(flow.retire(Default::default()));
+        tokio::select! {
+            biased;
+            result = &mut retirement => anyhow::bail!("retirement crossed full admission: {result}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        ensure!(
+            s.pins.get(&s.incarnation, 0)? == 1,
+            "pending admission released native pin"
+        );
+        drop(retirement);
+        *lab.handle.retirement.sink.lock() = original_sink;
+        drop(slot);
+        drop(receiver);
+        // No await separates cancellation from these exact native/local checks.
+        ensure!(
+            s.pins.get(&s.incarnation, 0).is_err(),
+            "cancelled admission leaked native pin"
+        );
+        ensure!(
+            !lab.handle.tcp_flow_pins.contains(&s.key),
+            "cancelled admission leaked local refcount"
+        );
+        assert_authority(&s.key, before.0.incarnation)
+    })
+}
+
+pub(super) fn new_syn(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (s, accepted) = settle(lab, true, true).await?;
+        let flow = s.adopt(lab, accepted).await?;
+        superseding_syn(lab, flow, s).await
+    })
 }
 
 async fn adopt(
@@ -227,15 +274,23 @@ fn live_pins() -> anyhow::Result<HashMap<aya::maps::MapData, u64, u8>> {
     )?)?)
 }
 
+pub(super) fn pin_drop_error(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Manual, async |lab| {
+        native_pin_error(lab, false).await
+    })
+}
+
+pub(super) fn pin_retire_error(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Manual, async |lab| {
+        native_pin_error(lab, true).await
+    })
+}
+
 /// Keep an actually adopted guard across replacement of the real removal
 /// worker. Only the exact native pin key is removed to force kernel ENOENT.
-async fn native_pin_error(
-    handle: &ControlPlaneHandle,
-    accepted: TcpStream,
-    key: TuplesKey,
-    incarnation: u64,
-    case: &str,
-) -> anyhow::Result<()> {
+async fn native_pin_error(lab: &Lab, retire: bool) -> anyhow::Result<()> {
+    let (s, accepted) = settle(lab, false, false).await?;
+    let (handle, key, incarnation) = (&lab.handle, s.key, s.incarnation);
     fn start(
         handle: &ControlPlaneHandle,
     ) -> (
@@ -275,7 +330,7 @@ async fn native_pin_error(
         let _backend = handle.ebpf.write().await;
         pins.remove(&incarnation)?;
     }
-    if case == "lifetime-pin-retire-error" {
+    if retire {
         ensure!(
             !flow.retire(Default::default()).await,
             "native release failure was confirmed retired"
@@ -595,18 +650,16 @@ async fn close_and_retire(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn superseding_syn(
-    handle: &ControlPlaneHandle,
-    listener: &TcpListener,
-    client_ns: &OwnedFd,
-    old: TcpFlowGuard,
-    client: TcpStream,
-    source: SocketAddr,
-    target: SocketAddr,
-    key: TuplesKey,
-    old_incarnation: u64,
-) -> anyhow::Result<()> {
+async fn superseding_syn(lab: &Lab, old: TcpFlowGuard, s: Settled) -> anyhow::Result<()> {
+    let (handle, listener, client_ns) = (&lab.handle, &lab.listener, &lab.client_ns);
+    let target = lab.target;
+    let Settled {
+        client,
+        source,
+        key,
+        incarnation: old_incarnation,
+        ..
+    } = s;
     // A real RST frees the client's tuple without waiting for TIME_WAIT, while
     // the accepted old FD and its native guard remain alive until exact release.
     let linger = libc::linger {

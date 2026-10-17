@@ -9,9 +9,8 @@ use honk_ebpf_common::{OutboundIndex, RedirectEntry};
 use std::io::{BufRead, Write};
 use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-mod native_direct;
+pub(super) mod native_direct;
 
 const UP: &[u8] = b"client bytes through the original request route";
 const DOWN: &[u8] = b"server bytes through the original request route";
@@ -68,24 +67,8 @@ impl SynTap {
         };
         let (source_ip, target_ip) = (octets(source.ip()), octets(target.ip()));
         let mut bytes = [0u8; 2048];
-        loop {
-            let length = unsafe {
-                libc::recv(
-                    self.0.as_raw_fd(),
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len(),
-                    0,
-                )
-            };
-            if length < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    return Ok(syns);
-                }
-                return Err(error.into());
-            }
-            let Some((src, dst, tcp)) = tcp_segment(&bytes[..length as usize], target.is_ipv6())
-            else {
+        while let Some(length) = recv_frame(&self.0, &mut bytes)? {
+            let Some((src, dst, tcp)) = tcp_segment(&bytes[..length], target.is_ipv6()) else {
                 continue;
             };
             if src == source_ip
@@ -97,6 +80,7 @@ impl SynTap {
                 syns.push(u32::from_be_bytes(tcp[4..8].try_into().unwrap()));
             }
         }
+        Ok(syns)
     }
 }
 
@@ -106,18 +90,24 @@ fn daens_wire() -> anyhow::Result<Wire> {
     crate::daens::with_daens_netns("capture dae0peer", || Wire::on("dae0peer"))
 }
 
-fn conn_key(source: SocketAddr, target: SocketAddr) -> TuplesKey {
-    crate::control::connection::build_tuples_key(
-        target.ip(),
-        target.port(),
-        source.ip(),
-        source.port(),
-        6,
-    )
+/// The original SYN's SYNACK, caught while the client gate holds it.
+pub(super) async fn gated_synack(
+    client: &mut Client,
+    wire: &Wire,
+    source: SocketAddr,
+    target: SocketAddr,
+) -> anyhow::Result<Vec<u8>> {
+    tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
+        tokio::select! {
+            result = client.crossed_gate() => anyhow::bail!("client crossed SYNACK gate: {result}"),
+            frame = wire.synack(source, target) => frame,
+        }
+    })
+    .await
+    .context("original SYNACK deadline")?
 }
 
-/// The original SYN's SYNACK, caught while the client gate holds it, with the one
-/// client SYN that produced it.
+/// The original SYNACK with the one client SYN that produced it.
 async fn original_synack(
     client: &mut Client,
     wire: &Wire,
@@ -125,14 +115,7 @@ async fn original_synack(
     source: SocketAddr,
     target: SocketAddr,
 ) -> anyhow::Result<(Vec<u8>, Vec<u32>)> {
-    let synack = tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
-        tokio::select! {
-            result = client.crossed_gate() => anyhow::bail!("client crossed SYNACK gate: {result}"),
-            frame = wire.synack(source, target) => frame,
-        }
-    })
-    .await
-    .context("original SYNACK deadline")??;
+    let synack = gated_synack(client, wire, source, target).await?;
     let syns = tap.drain(source, target)?;
     ensure!(
         syns.len() == 1,
@@ -266,13 +249,16 @@ fn port_plan(port: u16, outbound: &str, must: bool) -> anyhow::Result<RoutingPus
     ControlPlane::compile_routing_plan(&config, &router)
 }
 
-fn client_socket(ns: &OwnedFd, ip: IpAddr, gated: bool) -> anyhow::Result<TcpSocket> {
+fn client_socket(ns: &OwnedFd, ip: IpAddr, gated: bool, reuse: bool) -> anyhow::Result<TcpSocket> {
     in_test_netns(ns, || -> anyhow::Result<_> {
         let socket = if ip.is_ipv4() {
             TcpSocket::new_v4()?
         } else {
             TcpSocket::new_v6()?
         };
+        if reuse {
+            socket.set_reuseaddr(true)?;
+        }
         socket.bind(SocketAddr::new(ip, 0))?;
         if gated {
             hold_synack(socket.as_raw_fd(), true)?;
@@ -285,7 +271,7 @@ type Connect = Pin<Box<dyn Future<Output = std::io::Result<TcpStream>>>>;
 
 /// LAN: a client in the client namespace. WAN: a second process in the host/router
 /// namespace, so its PID is not the control plane's exemption.
-enum Client {
+pub(super) enum Client {
     Lan {
         gate: Option<OwnedFd>,
         connect: Connect,
@@ -294,8 +280,13 @@ enum Client {
 }
 
 impl Client {
-    fn lan(ns: &OwnedFd, ip: IpAddr, target: SocketAddr) -> anyhow::Result<(Self, SocketAddr)> {
-        let socket = client_socket(ns, ip, true)?;
+    pub(super) fn lan(
+        ns: &OwnedFd,
+        ip: IpAddr,
+        target: SocketAddr,
+        reuse: bool,
+    ) -> anyhow::Result<(Self, SocketAddr)> {
+        let socket = client_socket(ns, ip, true, reuse)?;
         let source = socket.local_addr()?;
         let gate = Some(socket.as_fd().try_clone_to_owned()?);
         let connect: Connect = Box::pin(socket.connect(target));
@@ -323,7 +314,7 @@ impl Client {
         }
     }
 
-    fn release(&mut self) -> anyhow::Result<()> {
+    pub(super) fn release(&mut self) -> anyhow::Result<()> {
         match self {
             Self::Lan { gate, .. } => {
                 let gate = gate.take().context("SYNACK gate already released")?;
@@ -333,7 +324,7 @@ impl Client {
         }
     }
 
-    async fn handshake(&mut self) -> anyhow::Result<Option<TcpStream>> {
+    pub(super) async fn handshake(&mut self) -> anyhow::Result<Option<TcpStream>> {
         match self {
             Self::Lan { connect, .. } => Ok(Some(
                 tokio::time::timeout(NETNS_TEST_TIMEOUT, connect.as_mut())
@@ -347,17 +338,7 @@ impl Client {
 
     async fn exchange(&mut self, stream: Option<TcpStream>) -> anyhow::Result<()> {
         match (self, stream) {
-            (_, Some(mut stream)) => {
-                stream.write_all(UP).await?;
-                let mut received = vec![0; DOWN.len()];
-                stream.read_exact(&mut received).await?;
-                ensure!(received == DOWN, "client received the wrong bytes");
-                let mut rest = Vec::new();
-                stream.read_to_end(&mut rest).await?;
-                ensure!(rest.is_empty(), "relay sent unexpected trailing bytes");
-                stream.shutdown().await?;
-                Ok(())
-            }
+            (_, Some(mut stream)) => exchange_stream(&mut stream).await,
             (Self::Wan(helper), None) => {
                 helper.expect("done").await?;
                 helper.exit()
@@ -367,9 +348,22 @@ impl Client {
     }
 }
 
+/// The client half of every relayed exchange: UP out, DOWN back, then a clean close.
+async fn exchange_stream(stream: &mut TcpStream) -> anyhow::Result<()> {
+    stream.write_all(UP).await?;
+    let mut received = vec![0; DOWN.len()];
+    stream.read_exact(&mut received).await?;
+    ensure!(received == DOWN, "client received the wrong bytes");
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await?;
+    ensure!(rest.is_empty(), "relay sent unexpected trailing bytes");
+    stream.shutdown().await?;
+    Ok(())
+}
+
 /// The WAN client process. Its stdout lines carry the fixture's tiny protocol; its
 /// stdin line releases the SYNACK gate.
-struct Helper {
+pub(super) struct Helper {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -499,49 +493,42 @@ fn netns_tcp_wan_retransmit_client_helper() -> anyhow::Result<()> {
                 release.await??;
                 return Ok(());
             }
-            stream.write_all(UP).await?;
-            let mut received = vec![0; DOWN.len()];
-            stream.read_exact(&mut received).await?;
-            ensure!(received == DOWN, "helper received the wrong bytes");
-            let mut rest = Vec::new();
-            stream.read_to_end(&mut rest).await?;
-            ensure!(rest.is_empty(), "relay sent unexpected trailing bytes");
-            stream.shutdown().await?;
+            exchange_stream(&mut stream).await?;
             println!("{TAG} done");
             Ok::<_, anyhow::Error>(())
         })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn exercise(
-    handle: &ControlPlaneHandle,
-    listener: &TcpListener,
-    client_ns: &OwnedFd,
-    server_ns: &OwnedFd,
-    client: IpAddr,
-    wan_ip: IpAddr,
-    target: SocketAddr,
-    server: std::net::TcpListener,
-    dials: &AtomicUsize,
-    case: &str,
-) -> anyhow::Result<()> {
-    if case.contains("native") {
-        return native_direct::exercise(
-            handle,
-            client_ns,
-            server_ns,
-            client,
-            wan_ip,
-            target,
-            server,
-            dials,
-            case.contains("wan"),
-        )
-        .await;
-    }
-    let wan = case.contains("wan");
-    let policy = case.ends_with("policy");
-    let server = TcpListener::from_std(server)?;
+pub(super) fn lan(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Forward, async |lab| {
+        proxy(lab, false, false).await
+    })
+}
+
+pub(super) fn lan_policy(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Forward, async |lab| {
+        proxy(lab, false, true).await
+    })
+}
+
+pub(super) fn wan(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Forward, async |lab| {
+        proxy(lab, true, false).await
+    })
+}
+
+pub(super) fn wan_policy(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Forward, async |lab| {
+        proxy(lab, true, true).await
+    })
+}
+
+/// Both families' proxy cases: the client SYN retries with its SYNACK gated, and the
+/// original request's route must survive; `policy` republishes routing before the retry.
+async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
+    let (handle, listener, target, dials) = (&lab.handle, &lab.listener, lab.target, &lab.dials);
+    let (client_ns, client, wan_ip) = (&lab.client_ns, lab.client, lab.wan);
+    let server = lab.server()?;
     let tap = SynTap::new()?;
     let wire = if wan {
         daens_wire()?
@@ -551,7 +538,7 @@ pub(super) async fn exercise(
     let (mut client_side, source) = if wan {
         Client::wan(wan_ip, target).await?
     } else {
-        Client::lan(client_ns, client, target)?
+        Client::lan(client_ns, client, target, false)?
     };
     let (synack, mut syns) = original_synack(&mut client_side, &wire, &tap, source, target).await?;
     let isn = syns[0];
@@ -709,9 +696,7 @@ pub(super) async fn exercise(
             if wan {
                 let mut helper = Helper::spawn("fresh", wan_ip, target)?;
                 let fresh_source: SocketAddr = helper.expect("bound").await?.parse()?;
-                let fresh_key = crate::control::connection::build_tuples_key(
-                    target.ip(), target.port(), fresh_source.ip(), fresh_source.port(), 6,
-                );
+                let fresh_key = conn_key(fresh_source, target);
                 tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                     loop {
                         if let Some(state) = handle.ebpf.read().await.conn_state_lookup(&fresh_key)? {
@@ -727,7 +712,7 @@ pub(super) async fn exercise(
                 }).await.context("fresh WAN tuple never reached the new policy")??;
                 return Ok(());
             }
-            let socket = client_socket(client_ns, client, false)?;
+            let socket = client_socket(client_ns, client, false, false)?;
             let (_stream, accepted) = tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                 tokio::join!(socket.connect(target), listener.accept())
             }).await.context("fresh tuple handshake deadline")?;
