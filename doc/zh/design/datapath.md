@@ -148,7 +148,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 运行内核偏移、hook 原型与 loader 使用同一份选定的 `HONK_VMLINUX_BTF`。Request 可能继承 SockMap 包装后的协议，因此不能用转换 helper 的协议指针相等性判断 request 归属。有界前缀读取复用既有 328 字节 route-witness scratch，成功或出错后均清空整个 scratch；字段布局超出容量时拒绝启动。IPv4/child hook 在加载时必需；IPv6 hook 在发布实际绑定的 IPv6 TCP listener 前必需，只有 `EAFNOSUPPORT` 允许 listener 缺席。当前 Aya API 下，已绑定的模块化 IPv6 会被拒绝而非静默降级：需使用内建 IPv6 或确实不可用的 IPv6 栈。IPv4-only 启动后再启用 IPv6，需要重启。
 
-自有 `daens` 关闭并校验 SYN cookies、request migration 与 Fast Open。只有缺失的 `tcp_syncookies` key 可作为内核未提供该功能处理；检查、写入或校验错误仍然致命。缺失必需的 BTF target/offset/attachment 会拒绝启动。证明缺失、过期、分配失败或被新 owner 替代时，关闭 accepted socket，不授权删除 tuple。Request 证明在 120 秒后过期；已取得证明的 child storage 跟随实际 socket 生命周期。Backlog 溢出依赖客户端重试，不猜测 cookie 归属。
+自有 `daens` 关闭并校验 SYN cookies、request migration 与 Fast Open。只有缺失的 `tcp_syncookies` key 可作为内核未提供该功能处理；检查、写入或校验错误仍然致命。缺失必需的 BTF target/offset/attachment 会拒绝启动。证明缺失、过期、分配失败或被新 owner 替代时，关闭 accepted socket，不授权删除 tuple。Request 证明在 120 秒后过期；已取得证明的 child storage 跟随实际 socket 生命周期。Backlog 溢出依赖客户端重试，不猜测 cookie 归属；因此 LAN 主机发送大量不完成握手的 SYN 时，可占满透明 listener 的 backlog，在这些 request 过期前延迟新的被拦截 TCP 连接。
 
 归属检查内联在 TC 分类程序中，会提高 verifier 成本。在 Linux 6.12 上，`wan_egress_l2` 约需验证 472k 条指令（接近内核 100 万上限的一半），引入归属证明前约为 115k；启动时间的大部分花在加载四个路由目标上。给分类程序增加状态检查的改动，应报告改动前后的 `verified_insns`。实测把 helper 拆成 static 或 global BPF 函数并不能降低该成本：增长来自 verifier 的状态路径，而不是重复代码。
 
