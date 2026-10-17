@@ -108,10 +108,11 @@ impl TcpPublisher {
         }
         // Zero is exclusion only, never fresh-publication authority. Cached
         // SYNs neither allocate an incarnation nor gain replacement permission.
-        if crate::maps::TCP_PUBLISHING
-            .insert(key, 0, BPF_NOEXIST as u64)
-            .is_err()
-        {
+        if let Err(error) = crate::maps::TCP_PUBLISHING.insert(key, 0, BPF_NOEXIST as u64) {
+            // A concurrent same-tuple SYN is ordinary exclusion, not saturation.
+            if error != -crate::errno::EEXIST {
+                crate::maps::increment_bpf_stat(BpfStatsKey::TcpPublisherClaimFailure);
+            }
             return false;
         }
         self.claimed = 1;

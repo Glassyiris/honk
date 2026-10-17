@@ -539,10 +539,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return pass_through_classified(ctx);
         }
     }
-    if crate::contrack::tuple_unavailable(
-        &pkt.tuples.five,
-        pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph),
-    ) {
+    // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
+    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five, false) {
         return Err(TC_ACT_SHOT);
     }
     let mut tcp_publisher = crate::contrack::TcpPublisher::new(
@@ -983,12 +981,6 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto == IPPROTO_TCP {
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        if crate::contrack::tuple_unavailable(
-            &reversed_key,
-            crate::contrack::is_new_tcp_connection(&pkt.tcph),
-        ) {
-            return Err(TC_ACT_SHOT);
-        }
         let mut tcp_publisher = crate::contrack::TcpPublisher::new(
             &reversed_key,
             crate::contrack::TcpSynRole::ObservedReverse,

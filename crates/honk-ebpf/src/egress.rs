@@ -158,9 +158,6 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         IPPROTO_TCP => {
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            if crate::contrack::tuple_unavailable(&reversed_key, is_new_tcp_connection(&pkt.tcph)) {
-                return Err(TC_ACT_SHOT);
-            }
             let mut tcp_publisher = crate::contrack::TcpPublisher::new(
                 &reversed_key,
                 crate::contrack::TcpSynRole::ObservedReverse,
@@ -847,10 +844,8 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     {
         return Err(TC_ACT_OK);
     }
-    if crate::contrack::tuple_unavailable(
-        &pkt.tuples.five,
-        pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph),
-    ) {
+    // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
+    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five, false) {
         return Err(TC_ACT_SHOT);
     }
     let mut tcp_publisher = crate::contrack::TcpPublisher::new(

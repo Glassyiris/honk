@@ -90,7 +90,7 @@ UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启�
 | 项 | 控制方式 | 当前不变量 |
 | --- | --- | --- |
 | eBPF 目标文件 | 内嵌目标文件或 `--bpf-object PATH` | 启用 `ebpf` feature 时，`build.rs` 提供由 `include_bytes!` 内嵌的目标文件；该参数在运行时替换这些字节。未启用 `ebpf` 的构建使用 mock 后端。 |
-| 内核 BTF | `HONK_VMLINUX_BTF` 或常用路径搜索 | 未覆盖时，依次选择 `/sys/kernel/btf/vmlinux`、`/usr/lib/debug/boot/vmlinux` 中首个可读文件。所选 BTF 统一提供内核字段偏移、Aya loader 的目标 BTF 和 tracing 函数签名。BTF 缺失、无效或 TCP 证明必需的字段/签名不兼容时拒绝启动。内核 argv 捕获不可用时仍可回退到线程 `comm`，但不能绕过 TCP 证明要求。 |
+| 内核 BTF | `HONK_VMLINUX_BTF` 或 `/sys/kernel/btf/vmlinux` | 未覆盖时读取 `/sys/kernel/btf/vmlinux`。只接受原始 BTF；若只有 ELF 格式的 debug vmlinux，需先提取其 `.BTF` 段，再用该变量指向提取结果。所选 BTF 统一提供内核字段偏移、Aya loader 的目标 BTF 和 tracing 函数签名。BTF 缺失、无效或 TCP 证明必需的字段/签名不兼容时拒绝启动。内核 argv 捕获不可用时仍可回退到线程 `comm`，但不能绕过 TCP 证明要求。 |
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
 | Bypass mark | `global.so_mark_from_dae` | 拨号、探测、DNS 与下载使用的精确 socket mark；零值选择默认 `0x100`。修改需重启，见[套接字 mark](./global.md#套接字-mark)。 |
 | TPROXY mark | 编译期常量与配置校验 | `TPROXY_MARK = 0x08000000`；`global.tproxy_mark` 必须等于该值。 |
@@ -209,7 +209,7 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | 从 DNS 或嗅探结果学习的 IP，以及活动 policy 的域名谓词位图索引；已知但全零的条目仍会显示。 |
 | `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
 
-实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
+实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、TCP 归属发布失败计数（request 证明、child 证明存储，以及 SYN 发布排他的资源错误）、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
 
 `routing-handoff` 在读取前检查[handoff ABI](../design/datapath.md#map-清单)；请将工具与引擎/对象一起升级。
 

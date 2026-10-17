@@ -307,7 +307,7 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
             AuxScanResult::default(),
         ]
     };
-    let mut failures = [0; 3];
+    let mut failures = [0; 6];
     let mut aux_warned = [false; 3];
     let mut pressure_warned = [false; 4];
     for (utilization, pressure, scans, aux_expected, occupancy_expected) in [

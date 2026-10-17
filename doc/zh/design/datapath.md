@@ -109,7 +109,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
 | `SOCKET_IDENTITY` | 不克隆的 `SK_STORAGE`，保存 socket 首次捕获的 PID/可执行文件 basename。存储跟随实际 socket 生命周期，不受固定 hash 项数或用户态过期清理约束。WAN TC 只查询；cgroup create/connect/sendmsg 同步捕获缺失的身份。 |
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 插入/内核删除计数，结合实际用户态删除计数估算占用。此路径不再由内核删除 tuple，故内核删除计数保持零。 |
-| `BPF_STATS_MAP` | 五个计数器：UDP/TCP conn-state overflow、redirect/handoff 插入失败，以及 socket 身份捕获拒绝。 |
+| `BPF_STATS_MAP` | 八个计数器：UDP/TCP conn-state overflow、redirect/handoff 插入失败、socket 身份捕获拒绝、request 证明插入失败、child 证明存储失败，以及普通同 tuple 竞争之外的 SYN 排他失败。TCP 归属计数增长时 janitor 会告警，`honk-tool bpf stats` 会打印它们。 |
 | `EVENT_RINGBUF` | 262,144 字节 ring，记录为 80 字节，包含功能性的 tuple/incarnation 过期提示。Producer 直接预留并初始化 ring 存储，不再经有界 TC 栈复制事件。 |
 | `UDP_DECISION_SEQUENCE` | NFQUEUE 决策身份的单槽 pinned allocator 状态；协议细节见 [NFQUEUE](./nfqueue.md)。 |
 | `FLOW_INCARNATION_SEQUENCE` | 按代持有、spin-lock 保护、不可回绕的 56 位身份域，以 `u64` 表示；独立于持久化 UDP decision token。 |
@@ -149,6 +149,8 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 运行内核偏移、hook 原型与 loader 使用同一份选定的 `HONK_VMLINUX_BTF`。Request 可能继承 SockMap 包装后的协议，因此不能用转换 helper 的协议指针相等性判断 request 归属。有界前缀读取复用既有 328 字节 route-witness scratch，成功或出错后均清空整个 scratch；字段布局超出容量时拒绝启动。IPv4/child hook 在加载时必需；IPv6 hook 在发布实际绑定的 IPv6 TCP listener 前必需，只有 `EAFNOSUPPORT` 允许 listener 缺席。当前 Aya API 下，已绑定的模块化 IPv6 会被拒绝而非静默降级：需使用内建 IPv6 或确实不可用的 IPv6 栈。IPv4-only 启动后再启用 IPv6，需要重启。
 
 自有 `daens` 关闭并校验 SYN cookies、request migration 与 Fast Open。只有缺失的 `tcp_syncookies` key 可作为内核未提供该功能处理；检查、写入或校验错误仍然致命。缺失必需的 BTF target/offset/attachment 会拒绝启动。证明缺失、过期、分配失败或被新 owner 替代时，关闭 accepted socket，不授权删除 tuple。Request 证明在 120 秒后过期；已取得证明的 child storage 跟随实际 socket 生命周期。Backlog 溢出依赖客户端重试，不猜测 cookie 归属。
+
+归属检查内联在 TC 分类程序中，会提高 verifier 成本。在 Linux 6.12 上，`wan_egress_l2` 约需验证 556k 条指令（超过内核 100 万上限的一半），引入归属证明前约为 115k；启动时间的大部分花在加载四个路由目标上。给分类程序增加状态检查的改动，应报告改动前后的 `verified_insns`。实测把 helper 拆成 static 或 global BPF 函数并不能降低该成本：增长来自 verifier 的状态路径，而不是重复代码。
 
 `crates/honk-ebpf-common/src/event.rs` — 固定布局的 ring event，包括 conntrack overflow 与 UDP decision-token exhaustion。
 `crates/honk-ebpf-common/src/dae_ip.rs` — `In6Addr` union 与 v4-mapped helper。
@@ -216,7 +218,7 @@ LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 N
 
 ### 主机发起的 WAN UDP
 
-`wan_egress` 只分类本机生成的流量；转发数据包具有真实 ingress ifindex，因此原样放行。带有 honk 自有 mark 的套接字以及匹配控制平面 socket 身份的流量也会 bypass。对于具有已发布连接状态的存活非 DNS UDP 流，程序使用只查询的缓存路由路径。miss 时只运行一次路由，并发布完整状态，后续数据包再使用缓存。DNS 保持短生命周期，不创建该 UDP 缓存项。
+`wan_egress` 只分类本机生成的流量；转发数据包具有真实 ingress ifindex，因此原样放行。带有 honk 自有 mark 的套接字以及匹配控制平面 socket 身份的流量也会 bypass。对于具有已发布连接状态的存活非 DNS UDP 流，程序使用只查询的缓存路由路径。miss 时只运行一次路由，并发布完整状态，后续数据包再使用缓存。DNS 保持短生命周期，不创建该 UDP 缓存项。若准备 redirect 失败（handoff/redirect map 已满或归属不匹配），WAN TCP 与 UDP 数据包会被丢弃，不会原生放行；map 已满由现有插入失败计数记录。
 
 ## 准入顺序
 

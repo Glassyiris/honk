@@ -204,9 +204,10 @@ pub static CONN_STATE_MAP: HashMap<
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
-/// Conn UDP/TCP, redirect/handoff insertion, and socket identity capture failures.
+/// Conn UDP/TCP, redirect/handoff insertion, socket identity capture, TCP
+/// request/child proof publication and non-collision SYN claim failures.
 #[btf_map]
-pub static BPF_STATS_MAP: Array<u64, 5> = Array::new();
+pub static BPF_STATS_MAP: Array<u64, { BpfStatsKey::COUNT as usize }> = Array::new();
 
 #[inline(always)]
 pub fn increment_bpf_stat(key: BpfStatsKey) {

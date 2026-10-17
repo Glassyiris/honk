@@ -5,7 +5,8 @@ use std::ops::Range;
 
 pub(super) const BTF_HEADER_LEN: usize = 24;
 
-const VMLINUX_BTF_PATHS: [&str; 2] = ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
+// Only raw BTF parses here; an ELF debug vmlinux needs HONK_VMLINUX_BTF pointed at its extracted `.BTF`.
+const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
 const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
 
 pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
@@ -17,10 +18,9 @@ pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
             )
         })?
     } else {
-        VMLINUX_BTF_PATHS
-            .iter()
-            .find_map(|path| std::fs::read(path).ok())
-            .context("kernel BTF unavailable in default paths; set HONK_VMLINUX_BTF")?
+        std::fs::read(VMLINUX_BTF_PATH).with_context(|| {
+            format!("reading kernel BTF from {VMLINUX_BTF_PATH}; set {VMLINUX_BTF_ENV}")
+        })?
     };
     let btf = aya::Btf::parse(&data, Default::default()).context("parsing selected kernel BTF")?;
     Ok((data, btf))

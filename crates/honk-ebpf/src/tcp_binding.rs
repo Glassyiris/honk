@@ -3,7 +3,7 @@
 use crate::flow::{conn_incarnation, handoff_incarnation, handoff_snapshot, redirect_incarnation};
 use crate::maps::{
     CONN_STATE_MAP, CONNTRACK_ARGS_MAP, PARAM, PKT_SCRATCH_KEY, TCP_REQUEST_BINDINGS,
-    TCP_SOCKET_BINDING, request_retiring, tuple_retiring,
+    TCP_SOCKET_BINDING, increment_bpf_stat, request_retiring, tuple_retiring,
 };
 use aya_ebpf::{
     Global,
@@ -25,7 +25,8 @@ use core::{ffi::c_void, mem, ptr};
 use honk_ebpf_common::{
     RedirectTuple, TPROXY_MARK,
     conn::{
-        TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT, TCP_SYN_REQUEST_SEEN,
+        BpfStatsKey, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT,
+        TCP_SYN_REQUEST_SEEN,
     },
     dae_ip::In6Addr,
     redirect_need::{
@@ -419,6 +420,7 @@ fn route_request(sk: *mut c_void, skb: *const u8, request: *mut c_void, ipv6: bo
         syn_isn,
     };
     if TCP_REQUEST_BINDINGS.insert(&key, &binding, 1).is_err() {
+        increment_bpf_stat(BpfStatsKey::TcpRequestProofInsertFailure);
         unsafe { bpf_spin_lock(&mut (*conn).lock) };
         let state = unsafe { &mut (*conn).value };
         if state.incarnation == incarnation && state.tcp_request_count != 0 {
@@ -477,7 +479,7 @@ pub fn honk_tcp_create_openreq_child(ctx: FExitContext) -> u32 {
         return 0;
     }
     let mut binding = binding;
-    let _ = unsafe {
+    let stored = unsafe {
         bpf_sk_storage_get(
             (&raw const TCP_SOCKET_BINDING).cast_mut().cast(),
             child.cast(),
@@ -485,6 +487,9 @@ pub fn honk_tcp_create_openreq_child(ctx: FExitContext) -> u32 {
             BPF_SK_STORAGE_GET_F_CREATE as u64,
         )
     };
+    if stored.is_null() {
+        increment_bpf_stat(BpfStatsKey::TcpChildProofStorageFailure);
+    }
     0
 }
 

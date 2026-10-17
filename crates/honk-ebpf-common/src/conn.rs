@@ -117,6 +117,13 @@ pub enum BpfStatsKey {
     RedirectTrackInsertFailure = 2,
     RoutingHandoffInsertFailure = 3,
     SocketIdentityCaptureFailure = 4,
+    TcpRequestProofInsertFailure = 5,
+    TcpChildProofStorageFailure = 6,
+    TcpPublisherClaimFailure = 7,
+}
+
+impl BpfStatsKey {
+    pub const COUNT: u32 = 8;
 }
 
 /// CONN_STATE_MAP capacity, shared by the eBPF map and userspace pressure gauge.

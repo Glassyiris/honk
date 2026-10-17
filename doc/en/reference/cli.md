@@ -90,7 +90,7 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 | Item | Control | Current invariant |
 | --- | --- | --- |
 | eBPF object | Embedded object or `--bpf-object PATH` | With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`; the option replaces those bytes at runtime. Builds without `ebpf` use the mock backend. |
-| Kernel BTF | `HONK_VMLINUX_BTF` or common-path search | Without an override, selects the first readable file from `/sys/kernel/btf/vmlinux`, then `/usr/lib/debug/boot/vmlinux`. The selected BTF supplies kernel-field offsets, the Aya loader target and tracing signatures. Missing/invalid BTF or incompatible mandatory TCP-proof fields/signatures refuses startup. Unavailable kernel argv capture can still fall back to thread `comm`, without bypassing the TCP-proof requirements. |
+| Kernel BTF | `HONK_VMLINUX_BTF` or `/sys/kernel/btf/vmlinux` | Without an override, reads `/sys/kernel/btf/vmlinux`. Only raw BTF is accepted; for an ELF debug vmlinux, extract its `.BTF` section and point the override at it. The selected BTF supplies kernel-field offsets, the Aya loader target and tracing signatures. Missing/invalid BTF or incompatible mandatory TCP-proof fields/signatures refuses startup. Unavailable kernel argv capture can still fall back to thread `comm`, without bypassing the TCP-proof requirements. |
 | Pin root | `--bpf-pin-root PATH` | Defaults to `/sys/fs/bpf` and is passed to the real backend for pinned maps. |
 | Bypass mark | `global.so_mark_from_dae` | Exact socket mark for dials, probes, DNS and downloads; zero selects the default `0x100`. Changes require restart. See [socket marks](./global.md#socket-marks). |
 | TPROXY mark | Compiled constant plus validated config | `TPROXY_MARK = 0x08000000`; `global.tproxy_mark` must equal this value. |
@@ -209,7 +209,7 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | Learned IP and active-policy domain-predicate bitmap indices, from DNS or sniffed evidence; known-zero entries remain visible. |
 | `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
 
-The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.
+The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, TCP ownership publication failures (request proof, child proof storage, and SYN-claim resource errors), the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.
 
 `routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries; upgrade the tool with the engine/object.
 

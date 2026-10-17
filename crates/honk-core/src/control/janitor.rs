@@ -205,7 +205,7 @@ impl BpfJanitor {
                 ..AuxScanResult::default()
             }; 3];
 
-            let mut last_aux_failures = [0u64; 3];
+            let mut last_aux_failures = [0u64; 6];
             let mut aux_pressure_warned = [false; 3];
             let mut pressure_warned = [false; 4];
 
@@ -407,7 +407,7 @@ impl BpfJanitor {
         utilization: f64,
         pressure_active: bool,
         aux_scans: [AuxScanResult; 3],
-        last_aux_failures: &mut [u64; 3],
+        last_aux_failures: &mut [u64; 6],
         aux_pressure_warned: &mut [bool; 3],
         pressure_warned: &mut [bool; 4],
     ) {
@@ -418,6 +418,9 @@ impl BpfJanitor {
         let redirect_failures = stat(BpfStatsKey::RedirectTrackInsertFailure);
         let handoff_failures = stat(BpfStatsKey::RoutingHandoffInsertFailure);
         let identity_failures = stat(BpfStatsKey::SocketIdentityCaptureFailure);
+        let request_proof_failures = stat(BpfStatsKey::TcpRequestProofInsertFailure);
+        let child_proof_failures = stat(BpfStatsKey::TcpChildProofStorageFailure);
+        let publisher_claim_failures = stat(BpfStatsKey::TcpPublisherClaimFailure);
         drop(ebpf);
 
         // The overflow counters are cumulative and this runs every few
@@ -438,7 +441,14 @@ impl BpfJanitor {
                 tcp_overflow
             );
         }
-        let aux_failures = [redirect_failures, handoff_failures, identity_failures];
+        let aux_failures = [
+            redirect_failures,
+            handoff_failures,
+            identity_failures,
+            request_proof_failures,
+            child_proof_failures,
+            publisher_claim_failures,
+        ];
         if aux_failures[..2]
             .iter()
             .zip(last_aux_failures[..2].iter())
@@ -453,6 +463,18 @@ impl BpfJanitor {
             warn!(
                 identity_failures,
                 "BPF janitor: socket identity capture failures increased; socket operations were denied"
+            );
+        }
+        if aux_failures[3..]
+            .iter()
+            .zip(last_aux_failures[3..].iter())
+            .any(|(current, previous)| current > previous)
+        {
+            warn!(
+                request_proof_failures,
+                child_proof_failures,
+                publisher_claim_failures,
+                "BPF janitor: TCP ownership publication failures increased; affected connections were refused"
             );
         }
         *last_aux_failures = aux_failures;

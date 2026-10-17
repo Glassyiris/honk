@@ -748,6 +748,13 @@ fn print_ordinary_stats(pin_root: &Path) -> anyhow::Result<()> {
          routing_handoff={handoff_failures}"
     );
     println!("socket identity capture failures: {identity_failures}");
+    let request_proof: u64 = read_value(fd, &5u32.to_ne_bytes())?.unwrap_or(0);
+    let child_proof: u64 = read_value(fd, &6u32.to_ne_bytes())?.unwrap_or(0);
+    let publisher_claim: u64 = read_value(fd, &7u32.to_ne_bytes())?.unwrap_or(0);
+    println!(
+        "tcp ownership failures: request_proof={request_proof} \
+         child_proof={child_proof} publisher_claim={publisher_claim}"
+    );
     Ok(())
 }
 

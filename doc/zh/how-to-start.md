@@ -56,7 +56,7 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-`pname(...)` 路由需要 cgroup v2。缺少 cgroup v2 时，其余功能仍可启动，但进程名路由会被禁用。
+必须启用 cgroup v2。真实 datapath 会在根 cgroup 上挂载 socket 身份 hook，缺少时直接拒绝启动。运行内核还必须提供原始 BTF（`/sys/kernel/btf/vmlinux` 或 `HONK_VMLINUX_BTF`），并允许在 `tcp_v4_route_req`、`tcp_v4_reqsk_destructor` 和 `tcp_create_openreq_child` 上挂 fentry/fexit，用于 TCP request 归属证明。若有已绑定的 IPv6 TCP listener，还需要对应的 IPv6 函数，因此要求内置 IPv6（`CONFIG_IPV6=y`）；模块化 IPv6 会被拒绝，不会降级为仅 IPv4。
 
 ### bpffs
 
