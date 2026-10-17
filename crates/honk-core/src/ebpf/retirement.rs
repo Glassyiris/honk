@@ -350,43 +350,13 @@ fn auxiliaries_match(
         .is_none_or(|entry| entry.incarnation == incarnation && entry.decision_token == token)
 }
 
-fn expiry_hint_conn_expired(
-    proto: u8,
+fn expiry_hint_auxiliary_plan(
     incarnation: u64,
     now_ns: u64,
-    current: Option<&ConnState>,
-) -> Result<bool, UdpDecisionCommitResult> {
-    let Some(state) = current else {
-        return Ok(false);
-    };
-    match validate_conn_retirement(
-        state,
-        proto,
-        RetireKind::ExpiryHint {
-            incarnation,
-            now_ns,
-        },
-    ) {
-        Ok(()) => Ok(true),
-        Err(UdpDecisionCommitResult::StateMismatch) => Ok(false),
-        Err(result) => Err(result),
-    }
-}
-
-struct ExpiryHintAuxiliaryRemoval {
-    handoff: bool,
-    redirect: bool,
-    unchanged: UdpDecisionCommitResult,
-}
-
-fn expiry_hint_auxiliary_removal(
-    incarnation: u64,
-    now_ns: u64,
-    current: Option<&ConnState>,
-    handoff: Option<&RoutingHandoffEntry>,
-    track: Option<&RedirectEntry>,
-) -> Result<ExpiryHintAuxiliaryRemoval, UdpDecisionCommitResult> {
+    owners: &Owners<'_>,
+) -> Result<RetirePlan, UdpDecisionCommitResult> {
     use UdpDecisionCommitResult::*;
+    let (current, handoff, track) = (owners.conn, owners.handoff, owners.redirect);
     let unchanged = if current.is_none() && handoff.is_none() && track.is_none() {
         Missing
     } else {
@@ -401,14 +371,14 @@ fn expiry_hint_auxiliary_removal(
     if token.is_some_and(|token| !auxiliaries_match(incarnation, token, handoff, track)) {
         return Err(TokenMismatch);
     }
-    Ok(ExpiryHintAuxiliaryRemoval {
+    Ok(RetirePlan {
         handoff: handoff.is_some_and(|entry| {
             now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
         }),
         redirect: track.is_some_and(|entry| {
             now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
         }),
-        unchanged,
+        ..RetirePlan::auxiliary(unchanged)
     })
 }
 
@@ -534,23 +504,10 @@ pub(crate) fn plan_retirement(
         RetireKind::ExpiryHint {
             incarnation,
             now_ns,
-        } => {
-            if expiry_hint_conn_expired(proto, incarnation, now_ns, owners.conn)? {
-                return conn_plan(request.kind);
-            }
-            let removal = expiry_hint_auxiliary_removal(
-                incarnation,
-                now_ns,
-                owners.conn,
-                owners.handoff,
-                owners.redirect,
-            )?;
-            Ok(RetirePlan {
-                handoff: removal.handoff,
-                redirect: removal.redirect,
-                ..RetirePlan::auxiliary(removal.unchanged)
-            })
-        }
+        } => match conn_plan(request.kind) {
+            Err(Missing | StateMismatch) => expiry_hint_auxiliary_plan(incarnation, now_ns, owners),
+            plan => plan,
+        },
         RetireKind::Tcp { .. } | RetireKind::Udp { .. } | RetireKind::ExpiredConn { .. } => {
             conn_plan(request.kind)
         }

@@ -325,20 +325,30 @@ fn expiry_hint_checks_incarnation_and_strict_protocol_deadlines() {
             last_seen_ns: 10,
             ..Default::default()
         };
-        assert_eq!(
-            expiry_hint_conn_expired(proto, 1, u64::MAX, None),
-            Ok(false),
-        );
+        let hint_conn = |incarnation, now_ns, conn| {
+            let request = RetireRequest {
+                key: TuplesKey {
+                    l4proto: proto,
+                    ..Default::default()
+                },
+                kind: RetireKind::ExpiryHint {
+                    incarnation,
+                    now_ns,
+                },
+            };
+            let owners = Owners {
+                conn,
+                handoff: None,
+                redirect: None,
+                request: None,
+            };
+            plan_retirement(&request, &owners).map(|plan| plan.conn)
+        };
+        assert_eq!(hint_conn(1, u64::MAX, None), Ok(false));
         for (now_ns, expired) in [(0, false), (10 + timeout, false), (11 + timeout, true)] {
             assert_eq!(conn_expired(proto, &state, now_ns), expired);
-            assert_eq!(
-                expiry_hint_conn_expired(proto, 1, now_ns, Some(&state)),
-                Ok(expired),
-            );
-            assert_eq!(
-                expiry_hint_conn_expired(proto, 2, now_ns, Some(&state)),
-                Err(Superseded),
-            );
+            assert_eq!(hint_conn(1, now_ns, Some(&state)), Ok(expired));
+            assert_eq!(hint_conn(2, now_ns, Some(&state)), Err(Superseded));
             assert_eq!(
                 validate_conn_retirement(
                     &state,
@@ -427,12 +437,15 @@ fn auxiliary_ownership_and_hint_expiry_truth_table() {
                     (REDIRECT_TRACK_TIMEOUT_NS, true, false),
                     (REDIRECT_TRACK_TIMEOUT_NS + 1, true, true),
                 ] {
-                    let result = expiry_hint_auxiliary_removal(
+                    let result = expiry_hint_auxiliary_plan(
                         1,
                         now_ns,
-                        current,
-                        handoff.as_ref(),
-                        track.as_ref(),
+                        &Owners {
+                            conn: current,
+                            handoff: handoff.as_ref(),
+                            redirect: track.as_ref(),
+                            request: None,
+                        },
                     );
                     if if current.is_some() {
                         conn_mismatches[h][t]
@@ -442,12 +455,12 @@ fn auxiliary_ownership_and_hint_expiry_truth_table() {
                         assert!(matches!(result, Err(TokenMismatch)));
                         continue;
                     }
-                    let removal = result.unwrap();
-                    assert_eq!(removal.handoff, matches!(h, 1 | 2) && handoff_expired,);
-                    assert_eq!(removal.redirect, matches!(t, 1 | 2) && track_expired,);
-                    if !(removal.handoff || removal.redirect) {
+                    let plan = result.unwrap();
+                    assert_eq!(plan.handoff, matches!(h, 1 | 2) && handoff_expired,);
+                    assert_eq!(plan.redirect, matches!(t, 1 | 2) && track_expired,);
+                    if !(plan.handoff || plan.redirect) {
                         assert_eq!(
-                            removal.unchanged,
+                            plan.unchanged,
                             if current.is_none() && handoff.is_none() && track.is_none() {
                                 crate::ebpf::UdpDecisionCommitResult::Missing
                             } else {
