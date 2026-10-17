@@ -4,8 +4,8 @@ use aya_ebpf::btf_maps::{
 };
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
-    BpfStatsKey, ConnState, ConntrackArgs, FlowIncarnationSequence, FlowMapValue,
-    MAX_CONN_STATE_NUM, ParseTransportCtx, RetirementFence, UdpDecisionSequence,
+    BpfStatsKey, ConnState, FlowIncarnationSequence, FlowMapValue, MAX_CONN_STATE_NUM,
+    ParseTransportCtx, RetirementFence, UdpDecisionSequence,
 };
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
@@ -235,7 +235,7 @@ pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();
 pub static PKT_SCRATCH_KEY: PerCpuArray<ParsedPacket, 1> = PerCpuArray::new();
 
 #[btf_map]
-pub static CONNTRACK_ARGS_MAP: PerCpuArray<ConntrackArgs, 1> = PerCpuArray::new();
+pub static CONNTRACK_ARGS_MAP: PerCpuArray<crate::contrack::ConntrackArgs, 1> = PerCpuArray::new();
 
 #[btf_map]
 pub static PARSE_CTX_MAP: PerCpuArray<ParseTransportCtx, 1> = PerCpuArray::new();

@@ -44,6 +44,7 @@ use network_types::{
 };
 
 use crate::{
+    auxiliary::{AuxPrep, redirect_needs_publish},
     maps::{
         CLIENT_REPLY_TRACK, PARAM, PKT_SCRATCH_KEY, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP,
         increment_bpf_stat,
@@ -58,28 +59,13 @@ use crate::{
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
-/// Handoff write modes for [`redirect_lan_packet_to_control_plane`].
-///
-/// `HANDOFF_WRITE_ALWAYS`: new TCP SYN publishes its immutable ownership snapshot.
-/// `HANDOFF_WRITE_SKIP`: established TCP on the cached-routing path.
-///   Userspace never looks up handoffs for these packets, so writing one
-///   would just sit in the map until the janitor sweeps it.
-///   `REDIRECT_TRACK` is refreshed only when stale.
-/// `HANDOFF_WRITE_REFRESH`: UDP that may need tuple fallback, on the first
-///   packet and cached path alike. Write when absent or stale so userspace
-///   can recover metadata on an endpoint-pool miss. Raw must UDP53 uses its
-///   per-packet carrier instead and is excluded by the redirect helper.
-const HANDOFF_WRITE_ALWAYS: u8 = 0;
-const HANDOFF_WRITE_SKIP: u8 = 1;
-const HANDOFF_WRITE_REFRESH: u8 = 2;
-
 #[inline(always)]
 fn redirect_lan_packet_to_control_plane(
     ctx: &TcContext,
     _link_h_len: u32,
     pkt: &ParsedPacket,
     routing_meta_raw: u64,
-    handoff_mode: u8,
+    policy: AuxPrep,
     decision_token: u32,
     routing_generation: u64,
     trace_id: u32,
@@ -138,17 +124,9 @@ fn redirect_lan_packet_to_control_plane(
     // that userspace may look up publish a tuple handoff.
     let raw_must_dns = dns_route_mark != 0 && unsafe { routing_meta.data.must != 0 };
     let write_handoff = !raw_must_dns
-        && match handoff_mode {
-            HANDOFF_WRITE_ALWAYS => true,
-            HANDOFF_WRITE_REFRESH => !crate::auxiliary::refresh_handoff(
-                &pkt.tuples.five,
-                decision_token,
-                incarnation,
-                now,
-            )
-            .map_err(|_| TC_ACT_SHOT)?,
-            _ => false,
-        };
+        && policy
+            .handoff_needs_publish(&pkt.tuples.five, decision_token, incarnation, now)
+            .map_err(|_| TC_ACT_SHOT)?;
     if write_handoff {
         let scratch = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0).ok_or(TC_ACT_SHOT)?;
         let scratch = unsafe { &mut *scratch };
@@ -170,37 +148,21 @@ fn redirect_lan_packet_to_control_plane(
         }
         handoff.result.decision_token = decision_token;
         handoff.result.mac.copy_from_slice(&pkt.ethh.src_addr);
-        crate::auxiliary::publish_handoff(
-            &pkt.tuples.five,
-            scratch,
-            handoff_mode == HANDOFF_WRITE_ALWAYS,
-        )
-        .map_err(|_| TC_ACT_SHOT)?;
+        crate::auxiliary::publish_handoff(&pkt.tuples.five, scratch, policy == AuxPrep::Publish)
+            .map_err(|_| TC_ACT_SHOT)?;
     }
 
     // Keep reverse-path framing stable and refresh cached ownership lazily.
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
-    let cached_syn = pkt.l4proto == IPPROTO_TCP
-        && crate::contrack::is_new_tcp_connection(&pkt.tcph)
-        && handoff_mode == HANDOFF_WRITE_SKIP;
-    if cached_syn && crate::flow::handoff_incarnation(&pkt.tuples.five) != Some(incarnation) {
-        return Err(TC_ACT_SHOT);
-    }
-    let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
-        true
-    } else {
-        !crate::auxiliary::refresh_redirect(
-            &pkt.tuples.five,
-            &redirect_tuple,
-            decision_token,
-            incarnation,
-            now,
-        )
-        .map_err(|_| TC_ACT_SHOT)?
-    };
-    if cached_syn && write_track {
-        return Err(TC_ACT_SHOT);
-    }
+    let write_track = redirect_needs_publish(
+        &pkt.tuples.five,
+        &redirect_tuple,
+        policy,
+        decision_token,
+        incarnation,
+        now,
+    )
+    .map_err(|_| TC_ACT_SHOT)?;
     if write_track {
         // Built in per-CPU scratch, not on the stack: the LAN classifier is at
         // the verifier's combined stack limit.
@@ -219,16 +181,11 @@ fn redirect_lan_packet_to_control_plane(
         scratch.redirect.outbound = unsafe { routing_meta.data.outbound };
         scratch.redirect.decision_token = decision_token;
         scratch.redirect.incarnation = incarnation;
-        crate::auxiliary::publish_redirect(
-            &pkt.tuples.five,
-            scratch,
-            handoff_mode == HANDOFF_WRITE_ALWAYS,
-        )
-        .map_err(|_| TC_ACT_SHOT)?;
+        crate::auxiliary::publish_redirect(&pkt.tuples.five, scratch, policy == AuxPrep::Publish)
+            .map_err(|_| TC_ACT_SHOT)?;
     }
-    if pkt.l4proto == IPPROTO_TCP
-        && handoff_mode == HANDOFF_WRITE_ALWAYS
-        && !crate::contrack::commit_tcp_intercept(
+    if policy == AuxPrep::Publish
+        && !crate::contrack::tcp::commit_tcp_intercept(
             &pkt.tuples.five,
             u32::from_be_bytes(pkt.tcph.seq),
             incarnation,
@@ -288,16 +245,16 @@ fn stage_udp_decision(
     let mark = unsafe { routing_meta.data.mark };
     let must = unsafe { routing_meta.data.must };
     let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
-        crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+        crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
         return Err(TC_ACT_SHOT);
     };
     unsafe {
         ptr::write_bytes(scratch_ptr, 0, 1);
     }
     let scratch = unsafe { &mut *scratch_ptr };
-    let Some(decision_token) = crate::contrack::allocate_udp_decision_token(&pkt.tuples.five)
+    let Some(decision_token) = crate::contrack::udp::allocate_udp_decision_token(&pkt.tuples.five)
     else {
-        crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+        crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
         return Err(TC_ACT_SHOT);
     };
     pkt.trace_id = crate::route::capture(
@@ -317,7 +274,11 @@ fn stage_udp_decision(
     scratch.redirect.decision_token = decision_token;
     scratch.redirect.incarnation = pkt.incarnation;
     if crate::auxiliary::publish_redirect(&pkt.tuples.five, scratch, false).is_err() {
-        crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, decision_token);
+        crate::contrack::udp::abort_udp_preparing(
+            &pkt.tuples.five,
+            pkt.incarnation,
+            decision_token,
+        );
         return Err(TC_ACT_SHOT);
     }
 
@@ -336,11 +297,15 @@ fn stage_udp_decision(
         .mac
         .copy_from_slice(&pkt.ethh.src_addr);
     if crate::auxiliary::publish_handoff(&pkt.tuples.five, scratch, false).is_err() {
-        crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, decision_token);
+        crate::contrack::udp::abort_udp_preparing(
+            &pkt.tuples.five,
+            pkt.incarnation,
+            decision_token,
+        );
         return Err(TC_ACT_SHOT);
     }
 
-    crate::contrack::populate_udp_conn_state(
+    crate::contrack::udp::populate_udp_conn_state(
         &mut scratch.state,
         routing_meta,
         &pkt.ethh.src_addr,
@@ -349,8 +314,12 @@ fn stage_udp_decision(
         pkt.incarnation,
     );
     scratch.state.trace_id = pkt.trace_id;
-    if !crate::contrack::publish_claimed_udp_state(&pkt.tuples.five, &scratch.state) {
-        crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, decision_token);
+    if !crate::contrack::udp::publish_claimed_udp_state(&pkt.tuples.five, &scratch.state) {
+        crate::contrack::udp::abort_udp_preparing(
+            &pkt.tuples.five,
+            pkt.incarnation,
+            decision_token,
+        );
         return Err(TC_ACT_SHOT);
     }
 
@@ -412,7 +381,7 @@ fn cached_udp_decision(
             link_h_len,
             pkt,
             meta_raw,
-            HANDOFF_WRITE_SKIP,
+            AuxPrep::RedirectOnly,
             state.decision_token,
             0,
             state.trace_id,
@@ -438,7 +407,7 @@ fn cached_udp_decision(
         link_h_len,
         pkt,
         meta_raw,
-        HANDOFF_WRITE_REFRESH,
+        AuxPrep::Refresh,
         state.decision_token,
         0,
         state.trace_id,
@@ -540,12 +509,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
     }
     // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
-    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five, false) {
+    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
         return Err(TC_ACT_SHOT);
     }
-    let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
         &pkt.tuples.five,
-        crate::contrack::TcpSynRole::InterceptedForward,
+        crate::contrack::tcp::TcpSynRole::InterceptedForward,
     );
     if pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph) {
         if !tcp_publisher.acquire(ctx, &pkt.tcph) {
@@ -555,7 +524,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     if pkt.l4proto == IPPROTO_TCP && !tcp_publisher.is_fresh() {
-        let tcp_state = crate::contrack::mark_tcp_seen(
+        let tcp_state = crate::contrack::tcp::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
             0u8,
@@ -573,7 +542,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             Some(state) => state,
             None => {
                 if crate::contrack::is_new_tcp_connection(&pkt.tcph)
-                    || crate::contrack::tuple_unavailable(&pkt.tuples.five, false)
+                    || crate::contrack::tuple_unavailable(&pkt.tuples.five)
                 {
                     return Err(TC_ACT_SHOT);
                 }
@@ -614,7 +583,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             link_h_len,
             pkt,
             unsafe { tcp_state.meta.raw },
-            HANDOFF_WRITE_SKIP,
+            AuxPrep::tcp(&tcp_publisher),
             0,
             0,
             tcp_state.trace_id,
@@ -629,7 +598,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let mut tcp_state: Option<&mut ConnState> = None;
 
     if pkt.l4proto == IPPROTO_TCP {
-        tcp_state = crate::contrack::mark_tcp_seen(
+        tcp_state = crate::contrack::tcp::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
             0u8,
@@ -648,7 +617,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
     } else {
         if !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five)
-            && let Some(state) = crate::contrack::lookup_udp_seen(&pkt.tuples.five)
+            && let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five)
         {
             return cached_udp_decision(ctx, link_h_len, pkt, state);
         }
@@ -657,10 +626,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // Only a fresh TCP publication captures the immutable accept-time handoff.
     // UDP tuple handoffs are refreshed only when userspace may need them;
     // raw must UDP53 is authoritative from its per-packet carrier.
-    let handoff_mode = if pkt.l4proto == IPPROTO_TCP {
-        HANDOFF_WRITE_ALWAYS
+    let aux_policy = if pkt.l4proto == IPPROTO_TCP {
+        AuxPrep::Publish
     } else {
-        HANDOFF_WRITE_REFRESH
+        AuxPrep::Refresh
     };
 
     let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
@@ -714,11 +683,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         pkt.l4proto == IPPROTO_UDP && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five);
     let udp_claimed = if pkt.l4proto == IPPROTO_UDP && !short_lived_udp {
         if let Some(incarnation) =
-            crate::contrack::claim_udp_preparing(&pkt.tuples.five, &pkt.ethh.src_addr)
+            crate::contrack::udp::claim_udp_preparing(&pkt.tuples.five, &pkt.ethh.src_addr)
         {
             pkt.incarnation = incarnation;
             true
-        } else if let Some(state) = crate::contrack::lookup_udp_seen(&pkt.tuples.five) {
+        } else if let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five) {
             return cached_udp_decision(ctx, link_h_len, pkt, state);
         } else {
             return Err(TC_ACT_SHOT);
@@ -755,7 +724,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         Err(_error) => {
             error!(ctx, target: "honk", "lan_ingress route fail: {}", _error);
             if udp_claimed {
-                crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
             }
             return Err(TC_ACT_SHOT);
         }
@@ -812,7 +781,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 offload_direct,
             );
             state.meta = meta;
-            if !crate::contrack::publish_tcp_routing(&pkt.tuples.five, state) {
+            if !crate::contrack::tcp::publish_tcp_routing(&pkt.tuples.five, state) {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -840,7 +809,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 || !udp_claimed
             {
                 if udp_claimed {
-                    crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+                    crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
                 }
                 Err(TC_ACT_SHOT)
             } else {
@@ -864,11 +833,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         );
         if udp_claimed {
             let Some(scratch_ptr) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
-                crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
                 return Err(TC_ACT_SHOT);
             };
             let state = unsafe { &mut (*scratch_ptr).state };
-            crate::contrack::populate_udp_conn_state(
+            crate::contrack::udp::populate_udp_conn_state(
                 state,
                 meta,
                 &pkt.ethh.src_addr,
@@ -877,9 +846,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 pkt.incarnation,
             );
             state.trace_id = pkt.trace_id;
-            udp_published = crate::contrack::publish_claimed_udp_state(&pkt.tuples.five, state);
+            udp_published =
+                crate::contrack::udp::publish_claimed_udp_state(&pkt.tuples.five, state);
             if !udp_published {
-                crate::contrack::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
+                crate::contrack::udp::abort_udp_preparing(&pkt.tuples.five, pkt.incarnation, 0);
             }
         } else {
             // Every ordinary fresh LAN UDP flow must own a Preparing claim.
@@ -950,7 +920,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             crate::contrack::build_routing_meta(meta_outbound, mark, redirect_must, pkt.tuples.dscp)
                 .raw
         },
-        handoff_mode,
+        aux_policy,
         0,
         routing_generation,
         pkt.trace_id,
@@ -981,9 +951,9 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto == IPPROTO_TCP {
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+        let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
             &reversed_key,
-            crate::contrack::TcpSynRole::ObservedReverse,
+            crate::contrack::tcp::TcpSynRole::ObservedReverse,
         );
         if crate::contrack::is_new_tcp_connection(&pkt.tcph) {
             if !tcp_publisher.acquire(ctx, &pkt.tcph) {
@@ -991,7 +961,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             }
             pkt.incarnation = tcp_publisher.incarnation;
         }
-        let _ = crate::contrack::mark_tcp_seen(
+        let _ = crate::contrack::tcp::mark_tcp_seen(
             &reversed_key,
             &pkt.tcph,
             1u8,
@@ -1005,7 +975,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             0,
             &tcp_publisher,
         );
-        if crate::contrack::tuple_unavailable(&reversed_key, false) {
+        if crate::contrack::tuple_unavailable(&reversed_key) {
             return Err(TC_ACT_SHOT);
         }
     } else if pkt.l4proto == IPPROTO_UDP {
@@ -1017,10 +987,10 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        if crate::contrack::tuple_unavailable(&reversed_key, false) {
+        if crate::contrack::tuple_unavailable(&reversed_key) {
             return Err(TC_ACT_SHOT);
         }
-        let _ = crate::contrack::mark_udp_seen(
+        let _ = crate::contrack::udp::mark_udp_seen(
             &reversed_key,
             1u8,
             None,
@@ -1033,7 +1003,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             0,
             0,
         );
-        if crate::contrack::tuple_unavailable(&reversed_key, false) {
+        if crate::contrack::tuple_unavailable(&reversed_key) {
             return Err(TC_ACT_SHOT);
         }
     }
@@ -1164,7 +1134,7 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     }
     let mut canonical: TuplesKey = unsafe { mem::zeroed() };
     crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut canonical);
-    if crate::contrack::tuple_unavailable(&canonical, false) {
+    if crate::contrack::tuple_unavailable(&canonical) {
         return Err(TC_ACT_SHOT);
     }
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five).reverse();

@@ -25,13 +25,22 @@ pub unsafe fn copy_payload<T: Copy>(dst: *mut T, src: *const T) {
     }
 }
 
+/// The projection runs under the value lock: volatile field reads only, no call or helper.
+#[inline(always)]
+unsafe fn locked_read<T, R>(ptr: *mut FlowMapValue<T>, project: impl FnOnce(*const T) -> R) -> R {
+    unsafe {
+        bpf_spin_lock(&mut (*ptr).lock);
+        let result = project(&raw const (*ptr).value);
+        bpf_spin_unlock(&mut (*ptr).lock);
+        result
+    }
+}
+
 #[inline(always)]
 unsafe fn snapshot<T: Copy>(ptr: *mut FlowMapValue<T>) -> T {
     let mut result = core::mem::MaybeUninit::<T>::uninit();
     unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        copy_payload(result.as_mut_ptr(), &raw const (*ptr).value);
-        bpf_spin_unlock(&mut (*ptr).lock);
+        locked_read(ptr, |value| copy_payload(result.as_mut_ptr(), value));
         result.assume_init()
     }
 }
@@ -66,17 +75,13 @@ pub struct AuxiliaryIdentity {
 #[inline(always)]
 pub fn conn_lifecycle(key: &TuplesKey) -> Option<ConnLifecycle> {
     let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let value = &raw const (*ptr).value;
-        let result = ConnLifecycle {
+    Some(unsafe {
+        locked_read(ptr, |value| ConnLifecycle {
             incarnation: (&raw const (*value).incarnation).read_volatile(),
             last_seen_ns: (&raw const (*value).last_seen_ns).read_volatile(),
             state: (&raw const (*value).state).read_volatile(),
-        };
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(result)
-    }
+        })
+    })
 }
 
 pub struct TcpSynState {
@@ -91,10 +96,8 @@ pub struct TcpSynState {
 #[inline(always)]
 pub fn tcp_syn_state(key: &TuplesKey) -> Option<TcpSynState> {
     let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let value = &raw const (*ptr).value;
-        let result = TcpSynState {
+    Some(unsafe {
+        locked_read(ptr, |value| TcpSynState {
             incarnation: (&raw const (*value).incarnation).read_volatile(),
             tcp_syn_isn: (&raw const (*value).tcp_syn_isn).read_volatile(),
             tcp_request_count: (&raw const (*value).tcp_request_count).read_volatile(),
@@ -103,73 +106,60 @@ pub fn tcp_syn_state(key: &TuplesKey) -> Option<TcpSynState> {
             published: (&raw const (*value).meta.raw).read_volatile()
                 & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED
                 != 0,
-        };
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(result)
-    }
+        })
+    })
 }
 
 #[inline(always)]
 pub fn redirect_identity(key: &RedirectTuple) -> Option<AuxiliaryIdentity> {
     let ptr = REDIRECT_TRACK.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let value = &raw const (*ptr).value;
-        let result = AuxiliaryIdentity {
+    Some(unsafe {
+        locked_read(ptr, |value| AuxiliaryIdentity {
             incarnation: (&raw const (*value).incarnation).read_volatile(),
             last_seen_ns: (&raw const (*value).last_seen_ns).read_volatile(),
             decision_token: (&raw const (*value).decision_token).read_volatile(),
-        };
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(result)
-    }
+        })
+    })
 }
 
 #[inline(always)]
 pub fn handoff_identity(key: &TuplesKey) -> Option<AuxiliaryIdentity> {
     let ptr = ROUTING_HANDOFF_MAP.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let value = &raw const (*ptr).value;
-        let result = AuxiliaryIdentity {
+    Some(unsafe {
+        locked_read(ptr, |value| AuxiliaryIdentity {
             incarnation: (&raw const (*value).incarnation).read_volatile(),
             last_seen_ns: (&raw const (*value).last_seen_ns).read_volatile(),
             decision_token: (&raw const (*value).result.decision_token).read_volatile(),
-        };
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(result)
-    }
+        })
+    })
 }
 
 #[inline(always)]
 pub fn conn_incarnation(key: &TuplesKey) -> Option<u64> {
     let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let incarnation = (&raw const (*ptr).value.incarnation).read_volatile();
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(incarnation)
-    }
+    Some(unsafe {
+        locked_read(ptr, |value| {
+            (&raw const (*value).incarnation).read_volatile()
+        })
+    })
 }
 
 #[inline(always)]
 pub fn handoff_incarnation(key: &TuplesKey) -> Option<u64> {
     let ptr = ROUTING_HANDOFF_MAP.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let incarnation = (&raw const (*ptr).value.incarnation).read_volatile();
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(incarnation)
-    }
+    Some(unsafe {
+        locked_read(ptr, |value| {
+            (&raw const (*value).incarnation).read_volatile()
+        })
+    })
 }
 
 #[inline(always)]
 pub fn redirect_incarnation(key: &RedirectTuple) -> Option<u64> {
     let ptr = REDIRECT_TRACK.get_ptr_mut(key)?;
-    unsafe {
-        bpf_spin_lock(&mut (*ptr).lock);
-        let incarnation = (&raw const (*ptr).value.incarnation).read_volatile();
-        bpf_spin_unlock(&mut (*ptr).lock);
-        Some(incarnation)
-    }
+    Some(unsafe {
+        locked_read(ptr, |value| {
+            (&raw const (*value).incarnation).read_volatile()
+        })
+    })
 }

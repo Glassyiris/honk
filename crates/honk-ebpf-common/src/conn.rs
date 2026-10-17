@@ -1,5 +1,3 @@
-use core::mem;
-
 use crate::{RoutingMeta, TASK_COMM_LEN};
 use network_types::{
     eth::EthHdr,
@@ -123,7 +121,30 @@ pub enum BpfStatsKey {
 }
 
 impl BpfStatsKey {
-    pub const COUNT: u32 = 8;
+    pub const ALL: [Self; 8] = [
+        Self::UdpConnOverflow,
+        Self::TcpConnOverflow,
+        Self::RedirectTrackInsertFailure,
+        Self::RoutingHandoffInsertFailure,
+        Self::SocketIdentityCaptureFailure,
+        Self::TcpRequestProofInsertFailure,
+        Self::TcpChildProofStorageFailure,
+        Self::TcpPublisherClaimFailure,
+    ];
+    pub const COUNT: u32 = Self::ALL.len() as u32;
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UdpConnOverflow => "udp_conn_overflow",
+            Self::TcpConnOverflow => "tcp_conn_overflow",
+            Self::RedirectTrackInsertFailure => "redirect_track_insert_failure",
+            Self::RoutingHandoffInsertFailure => "routing_handoff_insert_failure",
+            Self::SocketIdentityCaptureFailure => "socket_identity_capture_failure",
+            Self::TcpRequestProofInsertFailure => "tcp_request_proof_insert_failure",
+            Self::TcpChildProofStorageFailure => "tcp_child_proof_storage_failure",
+            Self::TcpPublisherClaimFailure => "tcp_publisher_claim_failure",
+        }
+    }
 }
 
 /// CONN_STATE_MAP capacity, shared by the eBPF map and userspace pressure gauge.
@@ -135,6 +156,10 @@ pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;
 pub const TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s
 pub const TCP_CONN_STATE_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10 s
 pub const UDP_CONN_STATE_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s backstop
+
+/// Auxiliary tuple-metadata expiry shared by the datapath, retirement and janitor.
+pub const ROUTING_HANDOFF_TIMEOUT_NS: u64 = 30_000_000_000;
+pub const REDIRECT_TRACK_TIMEOUT_NS: u64 = 120_000_000_000;
 
 /// UDP traffic in either port-53 direction does not own ordinary conn-state.
 #[inline(always)]
@@ -270,95 +295,6 @@ pub struct ParseTransportCtx {
     pub l4proto: u8,          // Actual L4 protocol
     pub listener_l4proto: u8, // Listener protocol
     pub is_fragmented: u8,
-}
-
-/// CT_ARGS_HAS_* bit flags.
-pub const CT_ARGS_HAS_ROUTING: u8 = 1 << 0;
-pub const CT_ARGS_HAS_MAC: u8 = 1 << 1;
-pub const CT_ARGS_HAS_PNAME: u8 = 1 << 2;
-pub const CT_ARGS_TCP_FRESH_SYN: u8 = 1 << 3;
-pub const CT_ARGS_TCP_INTERCEPTED: u8 = 1 << 4;
-pub const CT_ARGS_TCP_PENDING_SYN: u8 = 1 << 5;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ConntrackArgs {
-    pub flags: u8, // CT_ARGS_HAS_* bit mask
-    pub outbound: u8,
-    pub must: u8,
-    pub dscp: u8,
-    pub mark: u32,
-    pub pid: u32,
-    pub mac: [u8; 6],
-    pub padding: [u8; 2],
-    pub pname: [u8; TASK_COMM_LEN],
-    pub trace_id: u32,
-    pub incarnation: u64,
-    pub tcp_syn_isn: u32,
-    pub tcp_padding: u32,
-}
-
-const _: () = assert!(core::mem::size_of::<ConntrackArgs>() == 56);
-const _: () = assert!(core::mem::offset_of!(ConntrackArgs, trace_id) == 36);
-const _: () = assert!(core::mem::offset_of!(ConntrackArgs, incarnation) == 40);
-const _: () = assert!(core::mem::offset_of!(ConntrackArgs, tcp_syn_isn) == 48);
-const _: () = assert!(core::mem::offset_of!(ConntrackArgs, tcp_padding) == 52);
-
-impl ConntrackArgs {
-    #[inline(always)]
-    pub fn has_routing(&self) -> bool {
-        (self.flags & CT_ARGS_HAS_ROUTING) != 0
-    }
-
-    #[inline(always)]
-    pub fn has_mac(&self) -> bool {
-        (self.flags & CT_ARGS_HAS_MAC) != 0
-    }
-
-    #[inline(always)]
-    pub fn has_pname(&self) -> bool {
-        (self.flags & CT_ARGS_HAS_PNAME) != 0
-    }
-
-    #[inline(always)]
-    pub fn set(
-        &mut self,
-        dscp: u8,
-        pid: u32,
-        routing: Option<(&u8, &u32, &u8)>,
-        mac: Option<&[u8; 6]>,
-        pname: Option<&[u8; TASK_COMM_LEN]>,
-    ) {
-        *self = unsafe { mem::zeroed() };
-        self.dscp = dscp;
-        self.pid = pid;
-
-        if let Some((outbound, mark, must)) = routing {
-            self.flags |= CT_ARGS_HAS_ROUTING;
-            self.outbound = *outbound;
-            self.mark = *mark;
-            self.must = *must;
-        }
-
-        if let Some(mac_addr) = mac {
-            self.flags |= CT_ARGS_HAS_MAC;
-            self.mac.copy_from_slice(mac_addr);
-        }
-
-        if let Some(pname_bytes) = pname {
-            self.flags |= CT_ARGS_HAS_PNAME;
-            self.pname.copy_from_slice(pname_bytes);
-        }
-    }
-
-    #[inline(always)]
-    pub fn pname_or_null(&self) -> Option<&[u8; TASK_COMM_LEN]> {
-        if self.has_pname() {
-            Some(&self.pname)
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(not(target_arch = "bpf"))]

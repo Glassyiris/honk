@@ -324,11 +324,10 @@ pub fn native_syn_owner(ctx: &TcContext, tuples: &TuplesKey, isn: u32) -> u64 {
         return SYN_OWNER_REFUSE;
     };
     const _: () = assert!(
-        mem::size_of::<bpf_sock_tuple>() <= mem::size_of::<honk_ebpf_common::conn::ConntrackArgs>()
+        mem::size_of::<bpf_sock_tuple>() <= mem::size_of::<crate::contrack::ConntrackArgs>()
     );
     const _: () = assert!(
-        mem::align_of::<bpf_sock_tuple>()
-            <= mem::align_of::<honk_ebpf_common::conn::ConntrackArgs>()
+        mem::align_of::<bpf_sock_tuple>() <= mem::align_of::<crate::contrack::ConntrackArgs>()
     );
     let tuple = scratch.cast::<bpf_sock_tuple>();
     unsafe { ptr::write_bytes(tuple, 0, 1) };

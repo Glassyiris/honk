@@ -13,7 +13,10 @@ use network_types::tcp::TcpHdr;
 use crate::{
     action::{TC_ACT_OK, TC_ACT_SHOT},
     auxiliary::{publish_handoff, publish_redirect},
-    contrack::{TcpPublisher, TcpSynRole, is_new_tcp_connection, mark_tcp_seen},
+    contrack::{
+        is_new_tcp_connection,
+        tcp::{TcpPublisher, TcpSynRole, mark_tcp_seen},
+    },
     flow::{conn_incarnation, conn_snapshot, copy_payload, handoff_snapshot, redirect_snapshot},
     maps::{
         CONN_STATE_MAP, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, UDP_DECISION_SCRATCH_MAP,
@@ -115,7 +118,7 @@ fn publish_syn(
     scratch.redirect.decision_token = 0;
     scratch.redirect.from_wan = direction as u8;
     publish_redirect(key, scratch, true).ok()?;
-    if !crate::contrack::commit_tcp_intercept(key, u32::from_be_bytes(tcp.seq), incarnation) {
+    if !crate::contrack::tcp::commit_tcp_intercept(key, u32::from_be_bytes(tcp.seq), incarnation) {
         return None;
     }
     unsafe { (&raw mut (*ctx).cb[4]).write_volatile(7) };

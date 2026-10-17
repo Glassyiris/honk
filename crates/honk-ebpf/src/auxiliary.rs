@@ -16,12 +16,13 @@ use aya_ebpf_bindings::{
 use core::mem;
 use honk_ebpf_common::{
     FlowMapValue, RedirectEntry, RedirectTuple, RoutingHandoffEntry, Tuples, TuplesKey,
-    conn::BpfStatsKey,
+    conn::{BpfStatsKey, REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS},
 };
 use network_types::eth::EthHdr;
 
 use crate::{
-    contrack::{AUXILIARY_MAP_REFRESH_INTERVAL_NS, auxiliary_expired},
+    contrack::{tcp::TcpSyn, tcp_live_pinned},
+    event::send_flow_expired,
     flow::{
         AuxiliaryIdentity, copy_payload, handoff_identity, redirect_identity, redirect_snapshot,
     },
@@ -32,6 +33,34 @@ use crate::{
 };
 
 pub const IDENTITY_MISMATCH: i32 = -2;
+
+/// Cached packets skip timestamp writes while an entry is fresher than one second.
+/// A concurrent writer may publish a later timestamp after this invocation reads the
+/// clock, so flow ages saturate at zero.
+const AUXILIARY_MAP_REFRESH_INTERVAL_NS: u64 = 1_000_000_000;
+
+#[inline(always)]
+pub fn auxiliary_expired(
+    key: &TuplesKey,
+    incarnation: u64,
+    elapsed_ns: u64,
+    handoff: bool,
+) -> bool {
+    let expired = elapsed_ns
+        > if handoff {
+            ROUTING_HANDOFF_TIMEOUT_NS
+        } else {
+            REDIRECT_TRACK_TIMEOUT_NS
+        };
+    let expired = expired
+        && !(!handoff
+            && key.l4proto == crate::transport::IPPROTO_TCP
+            && tcp_live_pinned(incarnation));
+    if expired {
+        send_flow_expired(key, incarnation);
+    }
+    expired
+}
 
 #[inline(always)]
 fn stateless_publication(key: &TuplesKey, token: u32, incarnation: u64) -> bool {
@@ -376,11 +405,78 @@ pub fn publish_handoff(
         })
 }
 
+/// How one packet may touch an auxiliary map element.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RedirectPrep {
+pub enum AuxPrep {
+    /// Sole fresh-SYN publisher; may replace the stable element.
     Publish,
+    /// Refresh a live owner, inserting when absent.
     Refresh,
+    /// Retransmitted SYN: the complete original publication must already exist.
     Existing,
+    /// Established TCP and UDP Proxy: userspace needs no tuple handoff.
+    RedirectOnly,
+}
+
+impl AuxPrep {
+    #[inline(always)]
+    pub fn tcp(syn: &crate::contrack::tcp::TcpPublisher) -> Self {
+        if syn.is_fresh() {
+            Self::Publish
+        } else if syn.syn == TcpSyn::NonSyn {
+            Self::RedirectOnly
+        } else {
+            Self::Existing
+        }
+    }
+
+    #[inline(always)]
+    pub fn handoff_needs_publish(
+        self,
+        key: &TuplesKey,
+        token: u32,
+        incarnation: u64,
+        now: u64,
+    ) -> Result<bool, i32> {
+        match self {
+            Self::Publish => Ok(true),
+            Self::Refresh => refresh_handoff(key, token, incarnation, now).map(|hit| !hit),
+            Self::Existing => require_handoff(key, incarnation).map(|()| false),
+            Self::RedirectOnly => Ok(false),
+        }
+    }
+}
+
+/// A retransmitted SYN reuses its original handoff and never completes a missing one.
+#[inline(always)]
+pub fn require_handoff(key: &TuplesKey, incarnation: u64) -> Result<(), i32> {
+    if crate::flow::handoff_incarnation(key) == Some(incarnation) {
+        Ok(())
+    } else {
+        Err(IDENTITY_MISMATCH)
+    }
+}
+
+/// Settles the redirect element under `prep`; `Ok(true)` means a payload must be published.
+#[inline(always)]
+pub fn redirect_needs_publish(
+    key: &TuplesKey,
+    redirect_key: &RedirectTuple,
+    prep: AuxPrep,
+    token: u32,
+    incarnation: u64,
+    now: u64,
+) -> Result<bool, i32> {
+    if prep == AuxPrep::Publish {
+        return Ok(true);
+    }
+    if refresh_redirect(key, redirect_key, token, incarnation, now)? {
+        Ok(false)
+    } else if prep == AuxPrep::Existing {
+        Err(IDENTITY_MISMATCH)
+    } else {
+        Ok(true)
+    }
 }
 
 /// Prepare a packet for redirection to the control plane.
@@ -401,7 +497,7 @@ pub fn prep_redirect_to_control_plane(
     tuples: &Tuples,
     ethh: &EthHdr,
     from_wan: u8,
-    mode: RedirectPrep,
+    mode: AuxPrep,
     outbound: u8,
     decision_token: u32,
     incarnation: u64,
@@ -410,10 +506,10 @@ pub fn prep_redirect_to_control_plane(
     if tuples.five.l4proto == crate::transport::IPPROTO_TCP && param.tcp_daens_netns_id < 0 {
         return IDENTITY_MISMATCH;
     }
-    if mode == RedirectPrep::Existing
-        && crate::flow::handoff_incarnation(&tuples.five) != Some(incarnation)
+    if mode == AuxPrep::Existing
+        && let Err(error) = require_handoff(&tuples.five, incarnation)
     {
-        return IDENTITY_MISMATCH;
+        return error;
     }
 
     // bpf_redirect_peer is NOT supported in egress direction;
@@ -422,28 +518,16 @@ pub fn prep_redirect_to_control_plane(
 
     if !use_redirect_peer {
         if link_h_len == 0 {
-            let l3proto = ctx.skb.protocol() as u16;
-            let zero_mac: [u8; 6] = [0; 6];
+            // h_source (zero) and h_proto are adjacent: one store covers both.
+            let mut tail = [0u8; 8];
+            tail[6..].copy_from_slice(&(ctx.skb.protocol() as u16).to_ne_bytes());
             let ret =
                 unsafe { bpf_skb_change_head(ctx.skb.skb, mem::size_of::<EthHdr>() as u32, 0) };
             if ret != 0 {
                 return ret as i32;
             }
             unsafe {
-                bpf_skb_store_bytes(
-                    ctx.skb.skb,
-                    12, // offsetof(struct ethhdr, h_proto)
-                    &l3proto as *const u16 as *const _,
-                    mem::size_of::<u16>() as u32,
-                    0,
-                );
-                bpf_skb_store_bytes(
-                    ctx.skb.skb,
-                    6, // offsetof(struct ethhdr, h_source)
-                    zero_mac.as_ptr() as *const _,
-                    6,
-                    0,
-                );
+                bpf_skb_store_bytes(ctx.skb.skb, 6, tail.as_ptr() as *const _, 8, 0);
             }
         }
 
@@ -460,22 +544,17 @@ pub fn prep_redirect_to_control_plane(
 
     let redirect_tuple = RedirectTuple::from_tuples(&tuples.five);
     let now = unsafe { bpf_ktime_get_ns() };
-    if mode != RedirectPrep::Publish {
-        match crate::auxiliary::refresh_redirect(
-            &tuples.five,
-            &redirect_tuple,
-            decision_token,
-            incarnation,
-            now,
-        ) {
-            Ok(true) => return 0,
-            Ok(false) => {
-                if mode == RedirectPrep::Existing {
-                    return IDENTITY_MISMATCH;
-                }
-            }
-            Err(error) => return error,
-        }
+    match redirect_needs_publish(
+        &tuples.five,
+        &redirect_tuple,
+        mode,
+        decision_token,
+        incarnation,
+        now,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return 0,
+        Err(error) => return error,
     }
 
     let mut zero = 0u32;
@@ -505,7 +584,7 @@ pub fn prep_redirect_to_control_plane(
     }
     // else: L3-only — MACs stay zero.
 
-    match crate::auxiliary::publish_redirect(&tuples.five, scratch, mode == RedirectPrep::Publish) {
+    match crate::auxiliary::publish_redirect(&tuples.five, scratch, mode == AuxPrep::Publish) {
         Ok(()) => 0,
         Err(error) => error,
     }

@@ -12,7 +12,8 @@ use honk_ebpf_common::conn::{FlowMapValue, RetirementFence, UdpDecisionState};
 
 use crate::action::{TC_ACT_OK, TC_ACT_SHOT};
 use crate::contrack::{
-    abort_udp_preparing, allocate_flow_incarnation, claim_udp_preparing, publish_claimed_udp_state,
+    allocate_flow_incarnation,
+    udp::{abort_udp_preparing, claim_udp_preparing, publish_claimed_udp_state},
 };
 use crate::maps::{
     CONN_STATE_MAP, REDIRECT_TRACK, RETIRE_ACTIVE, RETIRE_FENCE, ROUTING_HANDOFF_MAP,

@@ -25,8 +25,9 @@ use network_types::eth::EthHdr;
 
 use crate::{
     contrack::{
-        copy_reversed_tuples, is_new_tcp_connection, is_short_lived_udp_traffic, lookup_udp_seen,
-        mark_tcp_seen, mark_udp_seen,
+        copy_reversed_tuples, is_new_tcp_connection, is_short_lived_udp_traffic,
+        tcp::mark_tcp_seen,
+        udp::{lookup_udp_seen, mark_udp_seen},
     },
     maps::{
         OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, ROUTING_HANDOFF_MAP,
@@ -42,7 +43,7 @@ use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict,
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
 use crate::auxiliary::{
-    IDENTITY_MISMATCH as TOKEN_IDENTITY_MISMATCH, RedirectPrep, prep_redirect_to_control_plane,
+    AuxPrep, IDENTITY_MISMATCH as TOKEN_IDENTITY_MISMATCH, prep_redirect_to_control_plane,
 };
 
 #[inline(always)]
@@ -158,9 +159,9 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         IPPROTO_TCP => {
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+            let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
                 &reversed_key,
-                crate::contrack::TcpSynRole::ObservedReverse,
+                crate::contrack::tcp::TcpSynRole::ObservedReverse,
             );
             if is_new_tcp_connection(&pkt.tcph) {
                 if !tcp_publisher.acquire(ctx, &pkt.tcph) {
@@ -182,7 +183,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 0,
                 &tcp_publisher,
             );
-            if crate::contrack::tuple_unavailable(&reversed_key, false) {
+            if crate::contrack::tuple_unavailable(&reversed_key) {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -199,7 +200,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             }
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            if crate::contrack::tuple_unavailable(&reversed_key, false) {
+            if crate::contrack::tuple_unavailable(&reversed_key) {
                 return Err(TC_ACT_SHOT);
             }
             // A reply leaving dae0 answers a flow honk already owns. Creating a
@@ -223,7 +224,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                     0,    // routing_meta_flags
                 );
             }
-            if crate::contrack::tuple_unavailable(&reversed_key, false) {
+            if crate::contrack::tuple_unavailable(&reversed_key) {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -240,7 +241,7 @@ fn do_tproxy_wan_egress_tcp(
     ctx: &TcContext,
     link_h_len: u32,
     pkt: &mut crate::transport::ParsedPacket,
-    syn: &crate::contrack::TcpPublisher,
+    syn: &crate::contrack::tcp::TcpPublisher,
 ) -> Verdict {
     let tuples = &pkt.tuples;
     let ethh = &pkt.ethh;
@@ -390,7 +391,7 @@ fn do_tproxy_wan_egress_tcp(
                 return Err(TC_ACT_OK);
             }
         } else {
-            if wire_pure_syn || crate::contrack::tuple_unavailable(&tuples.five, false) {
+            if wire_pure_syn || crate::contrack::tuple_unavailable(&tuples.five) {
                 return Err(TC_ACT_SHOT);
             }
             // No state at all — pass through.
@@ -411,19 +412,20 @@ fn do_tproxy_wan_egress_tcp(
         return Err(TC_ACT_SHOT);
     }
 
+    let aux = if fresh_publication {
+        AuxPrep::Publish
+    } else if wire_pure_syn {
+        AuxPrep::Existing
+    } else {
+        AuxPrep::Refresh
+    };
     let prepare_result = prep_redirect_to_control_plane(
         ctx,
         link_h_len,
         tuples,
         ethh,
         1,
-        if fresh_publication {
-            RedirectPrep::Publish
-        } else if wire_pure_syn {
-            RedirectPrep::Existing
-        } else {
-            RedirectPrep::Refresh
-        },
+        aux,
         outbound,
         0,
         pkt.incarnation,
@@ -474,7 +476,7 @@ fn do_tproxy_wan_egress_tcp(
         }
         crate::auxiliary::publish_handoff(&tuples.five, unsafe { &mut *scratch }, true)
             .map_err(|_| TC_ACT_SHOT)?;
-        if !crate::contrack::commit_tcp_intercept(
+        if !crate::contrack::tcp::commit_tcp_intercept(
             &tuples.five,
             u32::from_be_bytes(tcph.seq),
             pkt.incarnation,
@@ -541,7 +543,7 @@ fn fast_path_decision(
         tuples,
         ethh,
         1,
-        RedirectPrep::Refresh,
+        AuxPrep::Refresh,
         outbound,
         decision_token,
         incarnation,
@@ -562,9 +564,9 @@ fn fast_path_decision(
     // per-packet. A tuple handoff could be overwritten before this skb arrives.
     if !(dns_route_mark != 0 && must) {
         let now = unsafe { bpf_ktime_get_ns() };
-        let write_handoff =
-            !crate::auxiliary::refresh_handoff(&tuples.five, decision_token, incarnation, now)
-                .map_err(|_| TC_ACT_SHOT)?;
+        let write_handoff = AuxPrep::Refresh
+            .handoff_needs_publish(&tuples.five, decision_token, incarnation, now)
+            .map_err(|_| TC_ACT_SHOT)?;
         if write_handoff {
             let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
                 increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
@@ -750,7 +752,7 @@ fn do_tproxy_wan_egress_udp(
             routing_meta_flags,
         );
         if state.is_none() {
-            if crate::contrack::tuple_unavailable(&tuples.five, false)
+            if crate::contrack::tuple_unavailable(&tuples.five)
                 || crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
             {
                 return Err(TC_ACT_SHOT);
@@ -845,12 +847,12 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_OK);
     }
     // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
-    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five, false) {
+    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
         return Err(TC_ACT_SHOT);
     }
-    let mut tcp_publisher = crate::contrack::TcpPublisher::new(
+    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
         &pkt.tuples.five,
-        crate::contrack::TcpSynRole::InterceptedForward,
+        crate::contrack::tcp::TcpSynRole::InterceptedForward,
     );
     if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
         if !tcp_publisher.acquire(ctx, &pkt.tcph) {
