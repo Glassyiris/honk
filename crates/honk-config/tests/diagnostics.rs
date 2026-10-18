@@ -430,6 +430,97 @@ mod config_loaders {
     }
 
     #[test]
+    fn structured_loaders_record_explicit_group_option_presence() {
+        let root = serde_json::json!({"groups": [
+            {"name": "set", "policy": "urltest", "tolerance": 7, "interrupt_connections": true},
+            {"name": "unset", "policy": "urltest"}
+        ]});
+        for (extension, text) in [
+            ("json", serde_json::to_string(&root).unwrap()),
+            ("yaml", serde_yaml::to_string(&root).unwrap()),
+            ("toml", toml::to_string(&root).unwrap()),
+        ] {
+            let file = tempfile::Builder::new()
+                .suffix(&format!(".{extension}"))
+                .tempfile()
+                .unwrap();
+            std::fs::write(file.path(), text).unwrap();
+            let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+            let own = |index: usize| config.groups[index].own;
+            assert_eq!(config.groups[0].tolerance, 7, "{extension}");
+            assert!(
+                own(0).tolerance && own(0).interrupt_connections,
+                "{extension}"
+            );
+            assert!(
+                !own(1).tolerance && !own(1).interrupt_connections,
+                "{extension}"
+            );
+        }
+        let config = Config::from_json_str(&serde_json::to_string(&root).unwrap()).unwrap();
+        assert!(config.groups[0].own.tolerance && !config.groups[1].own.tolerance);
+    }
+
+    #[test]
+    fn structured_group_field_failure_names_the_field() {
+        let root = serde_json::json!({"groups": [
+            {"name": "fine"},
+            {"name": "bad", "policy": "PRIVATE_POLICY"}
+        ]});
+        for (extension, text) in [
+            ("json", serde_json::to_string(&root).unwrap()),
+            ("yaml", serde_yaml::to_string(&root).unwrap()),
+            ("toml", toml::to_string(&root).unwrap()),
+        ] {
+            let file = tempfile::Builder::new()
+                .suffix(&format!(".{extension}"))
+                .tempfile()
+                .unwrap();
+            std::fs::write(file.path(), text).unwrap();
+            let error = Config::from_file_with_detailed_diagnostics(
+                file.path().to_str().unwrap(),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.diagnostic.setting.to_string(),
+                "groups[2].policy",
+                "{extension}"
+            );
+            assert!(!format!("{error:?}").contains("PRIVATE_POLICY"));
+        }
+    }
+
+    #[test]
+    fn rewriting_a_structured_config_keeps_unset_group_options_unset() {
+        let root = serde_json::json!({"groups": [
+            {"name": "set", "policy": "urltest", "tolerance": 7, "interrupt_connections": false},
+            {"name": "unset", "policy": "urltest"}
+        ]});
+        for extension in ["json", "yaml", "toml"] {
+            let file = tempfile::Builder::new()
+                .suffix(&format!(".{extension}"))
+                .tempfile()
+                .unwrap();
+            let path = file.path().to_str().unwrap();
+            let source = Config::from_json_str(&root.to_string()).unwrap();
+            source.to_file(path).unwrap();
+            let config = Config::from_file(path).unwrap();
+            let own = |index: usize| config.groups[index].own;
+            assert!(
+                own(0).tolerance && own(0).interrupt_connections,
+                "{extension}"
+            );
+            assert!(
+                !own(1).tolerance && !own(1).interrupt_connections,
+                "{extension}"
+            );
+            assert_eq!(config.groups[0].tolerance, 7, "{extension}");
+            assert!(!config.groups[0].interrupt_connections, "{extension}");
+        }
+    }
+
+    #[test]
     fn legacy_cache_file_keys_warn_in_dae_and_structured_input() {
         let dae = "experimental { cache_file { enabled: true\n path: 'cache.db' }\n cache_file { cache_id: 'gw' } }\n";
         let mut diagnostics = Vec::new();

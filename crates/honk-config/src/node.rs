@@ -357,22 +357,18 @@ fn identity_field(value: &str) -> Cow<'_, str> {
 /// A group of nodes for load balancing / failover.
 ///
 /// Modeled after sing-box's outbound groups, plus the built-in Score policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(remote = "Self")]
 pub struct Group {
-    #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
     pub name: String,
     /// Configured client icon, passed through without fetching or normalization.
-    #[serde(default)]
     pub icon: Option<String>,
     /// Group selection policy.
-    #[serde(default)]
     pub policy: GroupPolicy,
     /// Node UUIDs that belong to this group.
-    #[serde(default)]
     pub nodes: Vec<uuid::Uuid>,
     /// Filter expressions for member resolution.
-    #[serde(default)]
     pub filters: Vec<String>,
     /// Tags of nested sub-groups (sing-box style nested outbounds): each
     /// tag names another group whose current selection becomes a member
@@ -381,37 +377,32 @@ pub struct Group {
     ///
     /// Accepts either an array (`groups = ["hk", "jp"]`) or a single
     /// delimited string (`groups = "hk|jp"` or `"hk, jp"`).
-    #[serde(default, deserialize_with = "deserialize_group_tags")]
     pub groups: Vec<String>,
     /// Initial Selector member tag (node or subgroup) when no valid runtime choice exists.
     /// Missing/non-member defaults use the first existing member; health does not replace a choice.
-    #[serde(default)]
     pub default: Option<String>,
     /// Explicit fallback for the caller when the group's policy has no available selection.
     /// Can be "direct", "block", another group name, or a node name.
-    #[serde(default)]
     pub final_outbound: Option<String>,
     /// URL for health checks (overrides global tcp_check_url).
-    #[serde(default)]
     pub check_url: Option<String>,
     /// Retained interval metadata; runtime checks use the global interval.
-    #[serde(default)]
     pub check_interval: Option<u64>,
     /// Minimum latency difference (ms) before switching the URLTest selection.
     /// Default: 50; the runtime applies a minimum of one millisecond.
-    #[serde(default = "default_tolerance")]
+    /// Serialized only when `own.tolerance` is set.
+    #[serde(skip_serializing)]
     pub tolerance: u64,
     /// URLTest inactivity threshold in seconds; `None` uses 1800 seconds.
     /// Zero makes the group immediately idle between selections.
-    #[serde(default)]
     pub idle_timeout: Option<u64>,
     /// Close owned connections when the selected member changes.
-    #[serde(default)]
+    /// Serialized only when `own.interrupt_connections` is set.
+    #[serde(skip_serializing)]
     pub interrupt_connections: bool,
     /// Which defaulted options the group's own source sets.
     #[serde(skip)]
     pub own: OwnOptions,
-    #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -443,6 +434,90 @@ impl Default for Group {
 pub struct OwnOptions {
     pub tolerance: bool,
     pub interrupt_connections: bool,
+}
+
+impl Serialize for Group {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(flatten, serialize_with = "Group::serialize")]
+            group: &'a Group,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tolerance: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            interrupt_connections: Option<bool>,
+        }
+        Wire {
+            group: self,
+            tolerance: self.own.tolerance.then_some(self.tolerance),
+            interrupt_connections: self
+                .own
+                .interrupt_connections
+                .then_some(self.interrupt_connections),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Group {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The two options are `Option` here so that which ones the source set is recorded.
+        #[derive(Deserialize)]
+        #[serde(rename = "Group")]
+        struct Wire {
+            #[serde(default = "uuid::Uuid::new_v4")]
+            id: uuid::Uuid,
+            name: String,
+            #[serde(default)]
+            icon: Option<String>,
+            #[serde(default)]
+            policy: GroupPolicy,
+            #[serde(default)]
+            nodes: Vec<uuid::Uuid>,
+            #[serde(default)]
+            filters: Vec<String>,
+            #[serde(default, deserialize_with = "deserialize_group_tags")]
+            groups: Vec<String>,
+            #[serde(default)]
+            default: Option<String>,
+            #[serde(default)]
+            final_outbound: Option<String>,
+            #[serde(default)]
+            check_url: Option<String>,
+            #[serde(default)]
+            check_interval: Option<u64>,
+            #[serde(default)]
+            tolerance: Option<u64>,
+            #[serde(default)]
+            idle_timeout: Option<u64>,
+            #[serde(default)]
+            interrupt_connections: Option<bool>,
+            #[serde(default = "chrono::Utc::now")]
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Group {
+            id: wire.id,
+            name: wire.name,
+            icon: wire.icon,
+            policy: wire.policy,
+            nodes: wire.nodes,
+            filters: wire.filters,
+            groups: wire.groups,
+            default: wire.default,
+            final_outbound: wire.final_outbound,
+            check_url: wire.check_url,
+            check_interval: wire.check_interval,
+            tolerance: wire.tolerance.unwrap_or_else(default_tolerance),
+            idle_timeout: wire.idle_timeout,
+            interrupt_connections: wire.interrupt_connections.unwrap_or_default(),
+            own: OwnOptions {
+                tolerance: wire.tolerance.is_some(),
+                interrupt_connections: wire.interrupt_connections.is_some(),
+            },
+            created_at: wire.created_at,
+        })
+    }
 }
 
 impl Group {
