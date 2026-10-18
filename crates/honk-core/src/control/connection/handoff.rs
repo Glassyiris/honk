@@ -331,7 +331,7 @@ pub(in crate::control) struct RetireAck {
 }
 
 pub(in crate::control) struct TcpFlowGuard {
-    stream: TcpStream,
+    stream: Option<TcpStream>,
     pub(in crate::control) tuples: TuplesKey,
     pub(in crate::control) incarnation: u64,
     pin: FlowPin,
@@ -353,7 +353,7 @@ impl TcpFlowGuard {
     ) -> Self {
         let pin_key = TcpFlowKey::from_tuples(&tuples);
         Self {
-            stream,
+            stream: Some(stream),
             tuples,
             incarnation,
             pin: FlowPin::new(pins, pin_key, kernel),
@@ -365,7 +365,16 @@ impl TcpFlowGuard {
     }
 
     pub(in crate::control) fn stream_mut(&mut self) -> &mut TcpStream {
-        &mut self.stream
+        self.stream
+            .as_mut()
+            .expect("accepted socket is closed only by retirement")
+    }
+
+    /// Fully close the accepted socket while its redirect entry still exists,
+    /// so the client's reply or RST reaches daens instead of the host
+    /// forwarding path.
+    pub(in crate::control) fn close_transport(&mut self) {
+        self.stream = None;
     }
 
     #[cfg(test)]

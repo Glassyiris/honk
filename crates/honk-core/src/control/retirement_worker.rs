@@ -27,14 +27,16 @@ enum Retirement {
 }
 
 impl Retirement {
-    async fn drain_io(&self, pool: &UdpEndpointPool) -> anyhow::Result<()> {
-        if let Self::Udp(removal) = self {
-            anyhow::ensure!(
+    async fn drain_io(&mut self, pool: &UdpEndpointPool) -> anyhow::Result<()> {
+        match self {
+            Self::Udp(removal) => anyhow::ensure!(
                 pool.wait_removal_io(removal).await,
                 "UDP retirement did not complete owned I/O: token={}, generation={}",
                 removal.owner.token,
                 removal.generation
-            );
+            ),
+            Self::Tcp(retirement) => retirement.flow.close_transport(),
+            Self::Hint(_) => {}
         }
         Ok(())
     }
@@ -325,7 +327,7 @@ mod tests {
     use crate::control::connection::handoff::RetireAck;
     use crate::ebpf::{TcpPin, mock::MockEbpfBackend};
     use honk_ebpf_common::conn::{ConnState, TcpState};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn ingress_reports_closed_hints_until_real_producers_drain() {
@@ -491,6 +493,85 @@ mod tests {
             0
         );
         assert!(fatal_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_retirement_closes_accepted_socket_before_backend_retirement() -> anyhow::Result<()>
+    {
+        tcp_retirement_client_view(false).await
+    }
+
+    #[tokio::test]
+    async fn tcp_retirement_resets_client_with_unread_data_before_backend_retirement()
+    -> anyhow::Result<()> {
+        tcp_retirement_client_view(true).await
+    }
+
+    async fn tcp_retirement_client_view(unread_client_data: bool) -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let (accepted, peer) = tokio::join!(
+            listener.accept(),
+            TcpStream::connect(listener.local_addr()?)
+        );
+        let stream = accepted?.0;
+        let mut peer = peer?;
+        let key = connection::build_tuples_key(
+            "203.0.113.2".parse()?,
+            443,
+            "192.0.2.1".parse()?,
+            50001,
+            6,
+        );
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+        let pool = Arc::new(UdpEndpointPool::new());
+        let pins = Arc::new(TcpFlowPins::default());
+        let port = Arc::new(RetirementPort::default());
+        let (_hint_tx, hint_rx) = mpsc::channel(1);
+        *port.hints.lock() = Some(hint_rx);
+        let flow = TcpFlowGuard::new(
+            stream,
+            key,
+            72,
+            Arc::clone(&pins),
+            Arc::new(ConnectionTracker::new()),
+            Arc::clone(&port),
+            TcpPin::Model,
+        );
+        let (fatal_tx, _fatal_rx) = mpsc::unbounded_channel();
+        let worker = spawn_retirement_worker(
+            Arc::clone(&pool),
+            Arc::clone(&backend),
+            Arc::new(ConnectionTracker::new()),
+            fatal_tx,
+            pins,
+            Arc::clone(&port),
+        );
+        let held = backend.write().await;
+        if unread_client_data {
+            peer.write_all(b"x").await?;
+        }
+        let retiring = tokio::spawn(flow.retire(RetireAck::default()));
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+            .await
+            .expect("client must see the close before the backend retires the flow");
+        if unread_client_data {
+            assert_eq!(
+                read.expect_err("a full close with unread data resets the client")
+                    .kind(),
+                std::io::ErrorKind::ConnectionReset
+            );
+        } else {
+            assert_eq!(read?, 0);
+        }
+        assert!(!retiring.is_finished());
+        drop(held);
+        let _ = retiring.await;
+        port.sink.lock().take();
+        assert!(pool.shutdown().await.joined);
+        tokio::time::timeout(Duration::from_secs(2), worker).await??;
         Ok(())
     }
 }
