@@ -16,8 +16,8 @@ use crate::dns::outcome::{DnsOutcome, RequestRoute};
 use crate::dns::query::IngressProfile;
 use crate::dns::response::native;
 use crate::native_api::{
-    ApiError, ErrorCode, NativeState, error, invalid_query, parse_query, timestamp,
-    types::RequestId,
+    ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, invalid_query, parse_query,
+    timestamp, types::RequestId,
 };
 
 pub(crate) const MAX_RECORDS: usize = 512;
@@ -249,6 +249,7 @@ impl DnsHistory {
         filter: Filter,
         limit: usize,
         cursor: Option<&str>,
+        secrets: &ListenerSecrets,
         id: &RequestId,
     ) -> Result<Response, ApiError> {
         // ponytail: at most 512 records under one lock; indexed snapshots only if this ceiling grows.
@@ -329,9 +330,12 @@ impl DnsHistory {
                 .map(|sequence| self.cursor(sequence, &filter, limit)),
             records: rows,
         };
+        let multiple = page.records.len() > 1;
+        let mut page = serde_json::to_value(&page).map_err(|_| unavailable(id))?;
+        secrets.mask_value(&mut page);
         let bytes = records::json_size(&page).map_err(|_| unavailable(id))?;
         // A single record is served whole; see `records::page_row`.
-        if bytes > MAX_JSON_BYTES && page.records.len() > 1 {
+        if bytes > MAX_JSON_BYTES && multiple {
             return Err(unavailable(id));
         }
         let mut body = Vec::with_capacity(bytes);
@@ -456,11 +460,14 @@ pub(super) async fn serve(
         qtype,
         source,
     };
-    state
-        .observation
-        .dns
-        .log
-        .page(filter, limit, query.get("cursor").map(String::as_str), id)
+    let secrets = state.observation.configuration.current_secrets();
+    state.observation.dns.log.page(
+        filter,
+        limit,
+        query.get("cursor").map(String::as_str),
+        &secrets,
+        id,
+    )
 }
 
 #[cfg(test)]
@@ -470,6 +477,7 @@ impl DnsHistory {
             Filter::default(),
             MAX_PAGE_SIZE,
             None,
+            &ListenerSecrets::new(&[], ""),
             &RequestId("dns-log-test".into()),
         )
         .unwrap()
@@ -480,6 +488,9 @@ impl DnsHistory {
 mod tests {
     use super::*;
 
+    fn no_secrets() -> ListenerSecrets {
+        ListenerSecrets::new(&[], "")
+    }
     fn capture(store: &DnsHistory, name: &str, source: Option<SocketAddr>) {
         let query = crate::dns::forwarder::build_dns_query(name, 1);
         let response = crate::dns::response::build_dns_refused(&query);
@@ -518,37 +529,42 @@ mod tests {
             source: Some(source.ip()),
             ..Default::default()
         };
-        let first = value(store.page(filter(), 1, None, &id).unwrap()).await;
+        let first = value(store.page(filter(), 1, None, &no_secrets(), &id).unwrap()).await;
         assert_eq!(first["total"], 3);
         assert_eq!(first["records"][0]["src"], "[2001:db8::12]:53210");
         assert_eq!(first["records"][0]["question"]["name"], "newer.example.");
         let cursor = first["next_cursor"].as_str().unwrap();
-        let second = value(store.page(filter(), 1, Some(cursor), &id).unwrap()).await;
+        let second = value(
+            store
+                .page(filter(), 1, Some(cursor), &no_secrets(), &id)
+                .unwrap(),
+        )
+        .await;
         assert_eq!(second["records"][0]["question"]["name"], "older.example.");
         let status =
             |result: Result<Response, ApiError>| result.unwrap_err().into_response().status();
         assert_eq!(
-            status(store.page(Filter::default(), 1, Some(cursor), &id)),
+            status(store.page(Filter::default(), 1, Some(cursor), &no_secrets(), &id)),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            status(store.page(filter(), 2, Some(cursor), &id)),
+            status(store.page(filter(), 2, Some(cursor), &no_secrets(), &id)),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            status(store.page(filter(), 1, Some("1:forged:forged"), &id)),
+            status(store.page(filter(), 1, Some("1:forged:forged"), &no_secrets(), &id)),
             StatusCode::GONE
         );
         let other = DnsHistory::new("second-instance".into(), true);
         capture(&other, "older.example", Some(source));
         capture(&other, "newer.example", Some(source));
         assert_eq!(
-            status(other.page(filter(), 1, Some(cursor), &id)),
+            status(other.page(filter(), 1, Some(cursor), &no_secrets(), &id)),
             StatusCode::GONE
         );
         store.set_limit(1);
         assert_eq!(
-            status(store.page(filter(), 1, Some(cursor), &id)),
+            status(store.page(filter(), 1, Some(cursor), &no_secrets(), &id)),
             StatusCode::GONE
         );
         assert_eq!(value(store.page_for_test()).await["total"], 1);
@@ -609,7 +625,7 @@ mod tests {
         };
         let page = value(
             store
-                .page(filter, 1, None, &RequestId("test".into()))
+                .page(filter, 1, None, &no_secrets(), &RequestId("test".into()))
                 .unwrap(),
         )
         .await;
@@ -663,7 +679,12 @@ mod tests {
             );
         }
         let id = RequestId("test".into());
-        let page = value(store.page(Filter::default(), 1, None, &id).unwrap()).await;
+        let page = value(
+            store
+                .page(Filter::default(), 1, None, &no_secrets(), &id)
+                .unwrap(),
+        )
+        .await;
         let count = page["total"].as_u64().unwrap();
         assert!(count > 0 && count < 150);
         assert_eq!(
@@ -700,7 +721,13 @@ mod tests {
         loop {
             let page = value(
                 store
-                    .page(Filter::default(), MAX_PAGE_SIZE, cursor.as_deref(), &id)
+                    .page(
+                        Filter::default(),
+                        MAX_PAGE_SIZE,
+                        cursor.as_deref(),
+                        &no_secrets(),
+                        &id,
+                    )
                     .unwrap(),
             )
             .await;
@@ -754,7 +781,7 @@ mod tests {
         loop {
             let page = value(
                 store
-                    .page(Filter::default(), 2, cursor.as_deref(), &id)
+                    .page(Filter::default(), 2, cursor.as_deref(), &no_secrets(), &id)
                     .unwrap(),
             )
             .await;

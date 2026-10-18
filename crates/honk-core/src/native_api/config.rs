@@ -223,7 +223,7 @@ impl ListenerSecrets {
         changed
     }
 
-    fn mask_value(&self, value: &mut Value) -> bool {
+    pub(in crate::native_api) fn mask_value(&self, value: &mut Value) -> bool {
         let masked = match value {
             Value::Array(values) => values
                 .iter_mut()

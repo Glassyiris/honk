@@ -5,8 +5,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, canonical_name, full_detail,
-    invalid_query, json_response, parameters, records, timestamp, unavailable,
+    ApiError, ListenerSecrets, MAX_RESPONSE_BYTES, NativeState, RequestId, canonical_name,
+    full_detail, invalid_query, json_response, parameters, records, timestamp, unavailable,
 };
 use crate::dns::cache::{CacheUsage, ExactCacheEntry};
 
@@ -94,7 +94,8 @@ pub(super) async fn serve(
         if snapshot.filters != filters || snapshot.limit != limit {
             return Err(invalid_query(id));
         }
-        return page(snapshot, position, limit, id).map(|(response, _)| response);
+        let secrets = state.observation.configuration.current_secrets();
+        return page(snapshot, position, limit, &secrets, id).map(|(response, _)| response);
     }
     let full = || super::super::catalog::snapshot_unavailable(id);
     if snapshots.len() == 8 {
@@ -153,7 +154,8 @@ pub(super) async fn serve(
         bytes,
         wall,
     };
-    let (response, more) = page(&snapshot, 0, limit, id)?;
+    let secrets = state.observation.configuration.current_secrets();
+    let (response, more) = page(&snapshot, 0, limit, &secrets, id)?;
     if more {
         snapshots.push_back(snapshot);
     }
@@ -178,6 +180,7 @@ fn page(
     snapshot: &Snapshot,
     offset: usize,
     limit: usize,
+    secrets: &ListenerSecrets,
     id: &RequestId,
 ) -> Result<(Response, bool), ApiError> {
     let mut end = offset.saturating_add(limit).min(snapshot.entries.len());
@@ -259,6 +262,7 @@ fn page(
         "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor,
         "usage":{"entries":usage.entries.to_string(),"entry_capacity":usage.entry_capacity.to_string()}}),
         cap,
+        secrets,
         id,
     )?;
     Ok((response, more))

@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ApiError, ErrorCode, NativeState, error, full_detail, invalid_query, timestamp,
-    types::RequestId,
+    ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, full_detail, invalid_query,
+    timestamp, types::RequestId,
 };
 use crate::dns::{
     DiagnosticError, DiagnosticFailure,
@@ -285,6 +285,7 @@ pub(super) async fn query(
         rows.push(row);
     }
     bounded_response(
+        state,
         &json!({"domain": domain, "cache_mode": cache_mode, "query_time": query_time, "results": rows}),
         id,
     )
@@ -322,12 +323,24 @@ impl Write for BoundedJson {
         Ok(())
     }
 }
-fn bounded_response(value: &impl Serialize, id: &RequestId) -> Result<Response, ApiError> {
-    json_response(value, MAX_RESPONSE_BYTES, id)
+fn bounded_response(
+    state: &NativeState,
+    value: &impl Serialize,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let secrets = state.observation.configuration.current_secrets();
+    json_response(value, MAX_RESPONSE_BYTES, &secrets, id)
 }
-fn json_response(value: &impl Serialize, cap: usize, id: &RequestId) -> Result<Response, ApiError> {
+fn json_response(
+    value: &impl Serialize,
+    cap: usize,
+    secrets: &ListenerSecrets,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let mut value = serde_json::to_value(value).map_err(|_| unavailable(id))?;
+    secrets.mask_value(&mut value);
     let mut writer = BoundedJson(Vec::new(), cap);
-    serde_json::to_writer(&mut writer, value).map_err(|_| unavailable(id))?;
+    serde_json::to_writer(&mut writer, &value).map_err(|_| unavailable(id))?;
     Ok((
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(writer.0),
@@ -377,6 +390,7 @@ pub(super) async fn delete_name(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
+        state,
         &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
@@ -397,7 +411,7 @@ pub(super) async fn delete_entry(
         ))
         .await
         .map_err(|_| unavailable(id))?;
-    bounded_response(&json!({"deleted":result.deleted}), id)
+    bounded_response(state, &json!({"deleted":result.deleted}), id)
 }
 
 pub(super) async fn flush(
@@ -413,6 +427,7 @@ pub(super) async fn flush(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
+        state,
         &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
