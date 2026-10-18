@@ -180,13 +180,15 @@ impl super::GroupManager {
                     observation: None,
                 };
             };
-            if group.policy != honk_config::group::GroupPolicy::URLTest {
+            let pinned = group.policy == honk_config::group::GroupPolicy::URLTest
+                && self.selector_member(group, context.network).is_some();
+            if group.policy != honk_config::group::GroupPolicy::URLTest || pinned {
                 return observation::decision(
                     group,
                     context.health_family,
                     super::SelectionEffects::Peek,
                     || {
-                        observation::reason("not_urltest");
+                        observation::reason(if pinned { "pinned" } else { "not_urltest" });
                         self.score_selection_plan(
                             Vec::new(),
                             super::SelectionPlanMode::Authoritative,
