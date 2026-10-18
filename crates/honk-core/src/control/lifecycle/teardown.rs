@@ -225,7 +225,17 @@ impl ControlPlane {
         {
             let mut slot = self.ui_download.lock().await;
             if let Some(download) = slot.as_mut() {
-                retain_error(&mut fatal, cleanup_stage(download.stop_and_join()).await);
+                let mut stopping = std::pin::pin!(download.stop_and_join());
+                let result = match tokio::time::timeout(STAGE_TIMEOUT, &mut stopping).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            "external UI download exceeded its stop deadline; waiting for extraction"
+                        );
+                        stopping.await
+                    }
+                };
+                retain_error(&mut fatal, result);
             }
             slot.take();
         }

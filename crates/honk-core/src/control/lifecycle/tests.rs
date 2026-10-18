@@ -401,3 +401,26 @@ async fn shutdown_detaches_hooks_only_after_udp_cleanup() -> anyhow::Result<()> 
     assert_eq!(detached.load(Ordering::Relaxed), 1);
     Ok(())
 }
+
+#[cfg(feature = "clash-api")]
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_a_slow_ui_download_past_the_stage_deadline() -> anyhow::Result<()> {
+    let mut plane = mock_plane(crate::ebpf::mock::MockEbpfBackend::new()).await;
+    let (release, parked) = tokio::sync::oneshot::channel::<()>();
+    *plane.ui_download.lock().await = Some(crate::clash_api::ui::UiDownloadTask::from_handle(
+        tokio::spawn(async move {
+            let _ = parked.await;
+        }),
+    ));
+    let slot = Arc::clone(&plane.ui_download);
+    let shutdown = plane.shutdown_runtime(None, None);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut shutdown => panic!("shutdown abandoned the UI download owner: {result:?}"),
+        () = tokio::time::sleep(STAGE_TIMEOUT + Duration::from_secs(1)) => {}
+    }
+    release.send(()).unwrap();
+    shutdown.await?;
+    assert!(slot.lock().await.is_none());
+    Ok(())
+}

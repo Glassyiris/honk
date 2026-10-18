@@ -95,6 +95,14 @@ impl UiDownloadTask {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_handle(handle: JoinHandle<()>) -> Self {
+        Self {
+            stop: watch::channel(false).0,
+            handle: Some(handle),
+        }
+    }
 }
 
 impl Drop for UiDownloadTask {
