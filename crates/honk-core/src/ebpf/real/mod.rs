@@ -76,7 +76,7 @@ pub struct RealEbpfBackend {
     retirement_failed: bool,
     #[cfg(test)]
     retirement_faults: retirement::RetirementFaults,
-    tcp_bindings: Option<tcp_binding::TcpBindings>,
+    tcp_proof_link: Option<aya::programs::sock_ops::SockOpsLink>,
     /// Runtime probe for `BPF_MAP_LOOKUP_BATCH` (janitor map scans).
     cap_lookup_batch: BatchCapability,
     cap_flow_lookup_batch: BatchCapability,
@@ -119,10 +119,6 @@ impl RealEbpfBackend {
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
         self.listeners_published = false;
-        for fd in std::iter::once(tcp4_fd).chain(tcp6_fd) {
-            // The caller retains the actual listeners through publication.
-            tcp_binding::publish_listener(self.bpf_mut()?, unsafe { BorrowedFd::borrow_raw(fd) })?;
-        }
         let entries = std::iter::once((0u32, tcp4_fd)).chain(tcp6_fd.map(|fd| (1u32, fd)));
         let entries = entries.chain(
             udp4_fds
@@ -359,7 +355,7 @@ impl RealEbpfBackend {
 
     fn hash_remove_present<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<bool> {
         #[cfg(test)]
-        if name != RETIRE_FENCE_MAP && name != "REQUEST_FENCE" {
+        if name != RETIRE_FENCE_MAP {
             retirement::inject_indexed_fault(&mut self.retirement_faults.delete, "delete")?;
         }
         match self.hash_map_mut::<K, V>(name)?.remove(key) {
@@ -657,23 +653,6 @@ impl EbpfBackend for RealEbpfBackend {
         self.expiry_hints.take()
     }
 
-    fn tcp_request_for_each_chunk(
-        &self,
-        _chunk_size: usize,
-        visit: &mut super::TcpRequestChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            bpf_lookup_batch_scan_cb(
-                self.bpf()?,
-                &self.cap_lookup_batch,
-                "TCP_REQUEST_BINDINGS",
-                visit
-            )?,
-            "safe TCP request enumeration requires BPF_MAP_LOOKUP_BATCH support"
-        );
-        Ok(())
-    }
-
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
         validate_loaded_udp_decision_sequence(self.bpf()?).map(|_| ())
     }
@@ -909,7 +888,7 @@ impl EbpfBackend for RealEbpfBackend {
             "Detaching BPF hooks (lan_ingress, lan_egress, wan_egress, wan_ingress, bond slaves, bridge slaves, cgroup, dae0, sk_lookup)"
         );
         self.interface_links.clear();
-        self.tcp_bindings = None;
+        self.tcp_proof_link = None;
         self.cgroup_sock_links.clear();
         self.cgroup_sock_addr_links.clear();
         self.dae0_ingress_link = None;
@@ -1020,17 +999,10 @@ impl EbpfBackend for RealEbpfBackend {
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
         self.listeners_published = false;
-        let bindings = self
-            .tcp_bindings
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("required TCP ownership hooks are not attached"))?;
-        if tcp6_fd.is_some() {
-            bindings.attach_ipv6(
-                self.bpf
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("eBPF object unavailable"))?,
-            )?;
-        }
+        anyhow::ensure!(
+            self.tcp_proof_link.is_some(),
+            "required TCP ownership hooks are not attached"
+        );
         self.publish_listener_socket_maps(tcp4_fd, tcp6_fd, udp4_fds, udp6_fds)
     }
 

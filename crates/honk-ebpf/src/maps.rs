@@ -9,7 +9,7 @@ use honk_ebpf_common::conn::{
 };
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
-    RoutingHandoffEntry, SocketIdentity, TcpRequestKey, TcpSocketBinding, TuplesKey,
+    RoutingHandoffEntry, SocketIdentity, TcpSocketBinding, TuplesKey,
 };
 use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, RoutingPolicyDescriptor};
 #[cfg(feature = "routing-test")]
@@ -88,24 +88,7 @@ pub static RETIRE_FENCE: HashMap<TuplesKey, RetirementFence, 65536, 1> = HashMap
 pub static RETIRE_GRACE_ROOT: ArrayOfMaps<Array<u32, 1>, 1> = ArrayOfMaps::new();
 
 #[btf_map]
-pub static TCP_REQUEST_BINDINGS: HashMap<TcpRequestKey, TcpSocketBinding, 65536, 1> =
-    HashMap::new();
-
-#[btf_map]
-pub static REQUEST_FENCE: HashMap<TcpRequestKey, u64, 65536, 1> = HashMap::new();
-
-#[btf_map]
 pub static TCP_LIVE_PINS: HashMap<u64, u8, 65536, 1> = HashMap::new();
-
-#[inline(always)]
-pub fn request_retiring(key: &TcpRequestKey) -> bool {
-    let mut zero = 0u32;
-    unsafe { core::ptr::write_volatile(&mut zero, 0) };
-    RETIRE_ACTIVE
-        .get(unsafe { core::ptr::read_volatile(&zero) })
-        .is_none_or(|active| *active != 0)
-        && unsafe { REQUEST_FENCE.get(key).is_some() }
-}
 
 #[btf_map]
 pub static TCP_SOCKET_BINDING: SkStorage<TcpSocketBinding> = SkStorage::new();
@@ -204,8 +187,8 @@ pub static CONN_STATE_MAP: HashMap<
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
-/// Conn UDP/TCP, redirect/handoff insertion, socket identity capture, TCP
-/// request/child proof publication and non-collision SYN claim failures.
+/// Conn UDP/TCP, redirect/handoff insertion, socket identity capture, TCP child proof
+/// storage and non-collision SYN claim failures.
 #[btf_map]
 pub static BPF_STATS_MAP: Array<u64, { BpfStatsKey::COUNT as usize }> = Array::new();
 

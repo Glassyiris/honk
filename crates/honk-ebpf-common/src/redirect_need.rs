@@ -77,20 +77,7 @@ const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_id) == 56
 const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, trace_padding) == 60);
 const _: () = assert!(core::mem::offset_of!(RoutingHandoffEntry, incarnation) == 64);
 
-pub const TCP_BINDING_LISTENER: u32 = 1;
 pub const TCP_BINDING_CHILD: u32 = 2;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub struct TcpRequestKey {
-    pub address: u64,
-    pub cookie: u64,
-}
-
-const _: () = assert!(core::mem::size_of::<TcpRequestKey>() == 16);
-const _: () = assert!(core::mem::align_of::<TcpRequestKey>() == 8);
-const _: () = assert!(core::mem::offset_of!(TcpRequestKey, address) == 0);
-const _: () = assert!(core::mem::offset_of!(TcpRequestKey, cookie) == 8);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -136,7 +123,5 @@ unsafe impl aya::Pod for RoutingHandoffEntry {}
 unsafe impl aya::Pod for DomainRouting {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for SocketIdentity {}
-#[cfg(not(target_arch = "bpf"))]
-unsafe impl aya::Pod for TcpRequestKey {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for TcpSocketBinding {}

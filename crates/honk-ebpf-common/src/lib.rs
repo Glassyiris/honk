@@ -8,7 +8,6 @@ pub mod event;
 pub mod receive_trace;
 pub mod redirect_need;
 pub mod routing_policy;
-pub mod tcp_binding;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
 pub use crate::conn::{
@@ -17,7 +16,7 @@ pub use crate::conn::{
 };
 pub use crate::redirect_need::{
     DomainRouting, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult, SocketIdentity,
-    TCP_BINDING_CHILD, TCP_BINDING_LISTENER, TcpRequestKey, TcpSocketBinding, Tuples, TuplesKey,
+    TCP_BINDING_CHILD, TcpSocketBinding, Tuples, TuplesKey,
 };
 pub use routing_policy::{
     KernelRouteOutput, KernelRouteWitness, ROUTE_FACT_DESTINATION, ROUTE_FACT_DOMAIN,

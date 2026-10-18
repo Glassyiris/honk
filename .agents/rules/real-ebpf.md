@@ -43,8 +43,9 @@ from `must` alone or change the persistent 12-byte allocator ABI.
 TCP cached-SYN classification queries the FD-owned daens by its explicit
 host-relative namespace ID, never the packet namespace or an assumed ID zero.
 ABI sizes: ConnState 72 bytes (80 with its lock wrapper), TcpSocketBinding 120
-with syn_isn at offset 116, TcpBindingOffsets 32, DaeParam 44. Proof selection,
-IPv6 and sysctl rules live in `AGENTS.md` (Notes for agents).
+with syn_isn at offset 116, DaeParam 44. The sock_ops child proof compares the
+owned daens netns cookie and reads no kernel structure. Proof selection, IPv6
+and sysctl rules live in `AGENTS.md` (Notes for agents).
 
 Socket process identity is native non-cloned `SK_STORAGE`, captured once by
 create/connect/sendmsg and reclaimed only with the actual socket object. The
@@ -59,7 +60,7 @@ gate (`.github/ci/run-vm-gate.sh floor`); `test-netns` retains `test-routing` as
 its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
 The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
-TCP accepted-FD/request and tuple-reuse ownership, UDP fullcone source ownership,
+TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
 native lifecycle, route-only watcher and SO_MARK socket checks. Exact nonempty
 selections in the guest gate must remain intact.
 

@@ -87,7 +87,6 @@ pub fn conn_lifecycle(key: &TuplesKey) -> Option<ConnLifecycle> {
 pub struct TcpSynState {
     pub incarnation: u64,
     pub tcp_syn_isn: u32,
-    pub tcp_request_count: u32,
     pub tcp_syn_flags: u16,
     pub state: u8,
     pub published: bool,
@@ -100,7 +99,6 @@ pub fn tcp_syn_state(key: &TuplesKey) -> Option<TcpSynState> {
         locked_read(ptr, |value| TcpSynState {
             incarnation: (&raw const (*value).incarnation).read_volatile(),
             tcp_syn_isn: (&raw const (*value).tcp_syn_isn).read_volatile(),
-            tcp_request_count: (&raw const (*value).tcp_request_count).read_volatile(),
             tcp_syn_flags: (&raw const (*value).tcp_syn_flags).read_volatile(),
             state: (&raw const (*value).state).read_volatile(),
             published: (&raw const (*value).meta.raw).read_volatile()

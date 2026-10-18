@@ -2,8 +2,8 @@
 //!
 //! Mirrors Go's `startConnStateJanitor` from `daed/wing/dae-core/control/control_plane.go`.
 //! The janitor runs on a configurable tick interval and performs periodic cleanup
-//! of conn-state, redirect tracking, routing handoff, and immutable TCP request
-//! proofs. Socket identity storage is reclaimed by the kernel with the socket,
+//! of conn-state, redirect tracking, and routing handoff. Socket identity
+//! storage is reclaimed by the kernel with the socket,
 //! never by this janitor.
 //!
 //! All swept maps are plain hashes: the kernel never evicts on its own
@@ -309,9 +309,6 @@ impl BpfJanitor {
                                 }
                                 AuxMap::RoutingHandoff => {
                                     self.cleanup_routing_handoff_at(now_ns, tuning).await
-                                }
-                                AuxMap::TcpRequestBindings => {
-                                    self.cleanup_tcp_requests_at(now_ns, tuning).await
                                 }
                             }
                         } else {

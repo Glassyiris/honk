@@ -1,152 +1,50 @@
-//! Bind a SYN incarnation to its request object, then to the actual child socket.
+//! Accepted-child ownership proof and the native SYN-owner lookup.
+//!
+//! `honk_tcp_passive` binds an accepted child to the SYN published for its tuple once the
+//! handshake completes; `native_syn_owner` lets TC decide whether a retransmitted SYN belongs
+//! to that publication. Neither reads kernel memory, so both load on kernels that lack
+//! CONFIG_BPF_EVENTS and in-kernel BTF.
 
-use crate::flow::{conn_incarnation, handoff_incarnation, handoff_snapshot, redirect_incarnation};
+use crate::flow::{handoff_incarnation, handoff_snapshot, redirect_incarnation, tcp_syn_state};
 use crate::maps::{
-    CONN_STATE_MAP, CONNTRACK_ARGS_MAP, PARAM, PKT_SCRATCH_KEY, TCP_REQUEST_BINDINGS,
-    TCP_SOCKET_BINDING, increment_bpf_stat, request_retiring, tuple_retiring,
+    CONN_STATE_MAP, CONNTRACK_ARGS_MAP, PARAM, TCP_SOCKET_BINDING, increment_bpf_stat,
+    tuple_retiring,
 };
+use crate::transport::IPPROTO_TCP;
 use aya_ebpf::{
     Global,
     bindings::BPF_SK_STORAGE_GET_F_CREATE,
-    helpers::{bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_sk_storage_get},
-    macros::{fentry, fexit},
-    programs::{FEntryContext, FExitContext, TcContext},
+    helpers::{bpf_ktime_get_ns, bpf_sk_storage_get},
+    macros::sock_ops,
+    programs::{SockOpsContext, TcContext},
 };
 use aya_ebpf_bindings::{
     bindings::{
-        bpf_sock, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
-        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
+        BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, bpf_sock, bpf_sock_ops, bpf_sock_tuple,
+        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
     helpers::{
-        bpf_sk_fullsock, bpf_sk_release, bpf_skc_lookup_tcp, bpf_spin_lock, bpf_spin_unlock,
+        bpf_get_netns_cookie, bpf_sk_fullsock, bpf_sk_release, bpf_skc_lookup_tcp, bpf_spin_lock,
+        bpf_spin_unlock,
     },
 };
-use core::{ffi::c_void, mem, ptr};
+use core::{mem, ptr};
 use honk_ebpf_common::{
-    RedirectTuple, TPROXY_MARK,
+    RedirectTuple,
     conn::{
-        BpfStatsKey, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT,
-        TCP_SYN_REQUEST_SEEN,
+        BpfStatsKey, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT, TcpState,
     },
     dae_ip::In6Addr,
-    redirect_need::{
-        TCP_BINDING_CHILD, TCP_BINDING_LISTENER, TcpRequestKey, TcpSocketBinding, TuplesKey,
-    },
-    tcp_binding::TcpBindingOffsets,
+    redirect_need::{TCP_BINDING_CHILD, TcpSocketBinding, TuplesKey},
 };
 
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
+
+/// `SO_NETNS_COOKIE` of the owned daens, set at load. Zero matches no namespace: without a
+/// daens there is no interception to prove (`TcpPublisher::acquire` refuses such SYNs).
 #[unsafe(no_mangle)]
-pub static TCP_BINDING_OFFSETS: Global<TcpBindingOffsets> = Global::new(TcpBindingOffsets {
-    skb_head: 0,
-    skb_network_header: 0,
-    skb_transport_header: 0,
-    skb_tail: 0,
-    skb_mark: 0,
-    skb_priority: 0,
-    socket_cookie: 0,
-    request_rcv_isn: 0,
-});
-
-#[inline(always)]
-unsafe fn read<T: Copy>(base: *const u8, offset: u32) -> Option<T> {
-    unsafe { bpf_probe_read_kernel(base.add(offset as usize).cast::<T>()) }.ok()
-}
-
-#[inline(always)]
-fn listener(sk: *mut c_void) -> bool {
-    let binding = unsafe {
-        bpf_sk_storage_get(
-            (&raw const TCP_SOCKET_BINDING).cast_mut().cast(),
-            sk.cast(),
-            ptr::null_mut(),
-            0,
-        )
-    }
-    .cast::<TcpSocketBinding>();
-    !binding.is_null() && unsafe { (*binding).kind == TCP_BINDING_LISTENER }
-}
-
-#[inline(always)]
-fn skb_tuple(skb: *const u8, ipv6: bool) -> Option<(TuplesKey, u64, u32)> {
-    let offsets = TCP_BINDING_OFFSETS.load();
-    let mark: u32 = unsafe { read(skb, offsets.skb_mark)? };
-    if mark & 0xff00_0000 != TPROXY_MARK {
-        return None;
-    }
-    let priority: u32 = unsafe { read(skb, offsets.skb_priority)? };
-    let incarnation = ((priority as u64) << 24) | (mark & 0x00ff_ffff) as u64;
-    if incarnation == 0 {
-        return None;
-    }
-    let head: *const u8 = unsafe { read(skb, offsets.skb_head)? };
-    if head.is_null() {
-        return None;
-    }
-    let network: u16 = unsafe { read(skb, offsets.skb_network_header)? };
-    let transport: u16 = unsafe { read(skb, offsets.skb_transport_header)? };
-    let tail: u32 = unsafe { read(skb, offsets.skb_tail)? };
-    let network = network as u32;
-    let transport = transport as u32;
-    let minimum = if ipv6 { 40 } else { 20 };
-    if network + minimum > tail || transport < network + minimum || transport + 20 > tail {
-        return None;
-    }
-    let version: u8 = unsafe { read(head, network)? };
-    let flags: u8 = unsafe { read(head, transport + 13)? };
-    if flags & 0x12 != 0x02 {
-        return None;
-    }
-    let (src_ip, dst_ip) = if ipv6 {
-        if version >> 4 != 6 {
-            return None;
-        }
-        (
-            In6Addr {
-                u6_addr8: unsafe { read(head, network + 8)? },
-            },
-            In6Addr {
-                u6_addr8: unsafe { read(head, network + 24)? },
-            },
-        )
-    } else {
-        if version >> 4 != 4
-            || version & 0x0f < 5
-            || transport < network + ((version & 0x0f) as u32 * 4)
-        {
-            return None;
-        }
-        let protocol: u8 = unsafe { read(head, network + 9)? };
-        if protocol != 6 {
-            return None;
-        }
-        (
-            In6Addr::from_ipv4_bytes(unsafe { read(head, network + 12)? }),
-            In6Addr::from_ipv4_bytes(unsafe { read(head, network + 16)? }),
-        )
-    };
-    Some((
-        TuplesKey {
-            src_ip,
-            dst_ip,
-            src_port: u16::from_be(unsafe { read(head, transport)? }),
-            dst_port: u16::from_be(unsafe { read(head, transport + 2)? }),
-            l4proto: 6,
-            padding: [0; 3],
-        },
-        incarnation,
-        u32::from_be(unsafe { read(head, transport + 4)? }),
-    ))
-}
-
-#[inline(always)]
-fn current(tuples: &TuplesKey, incarnation: u64) -> bool {
-    if incarnation == 0 || tuple_retiring(tuples) {
-        return false;
-    }
-    conn_incarnation(tuples) == Some(incarnation)
-        && handoff_incarnation(tuples) == Some(incarnation)
-        && redirect_incarnation(&RedirectTuple::from_tuples(tuples)) == Some(incarnation)
-}
+pub static TCP_DAENS_NETNS_COOKIE: Global<u64> = Global::new(0);
 
 #[inline(always)]
 fn same_tuple(left: &TuplesKey, right: &TuplesKey) -> bool {
@@ -158,6 +56,9 @@ fn same_tuple(left: &TuplesKey, right: &TuplesKey) -> bool {
         && left.l4proto == right.l4proto
 }
 
+/// Shared by the producer (`honk_tcp_passive`) and the TC consumer: the binding is acceptable
+/// when tuple, ISN and incarnation agree with the live conn/handoff/redirect publication. Only
+/// the producer additionally requires the conn to be Active, so a Closing child keeps its proof.
 #[inline(always)]
 fn valid_proof(binding: &TcpSocketBinding, tuples: &TuplesKey, isn: u32) -> bool {
     let now = unsafe { bpf_ktime_get_ns() };
@@ -196,90 +97,19 @@ pub const SYN_OWNER_ABSENT: u64 = 0;
 pub const SYN_OWNER_FRESH: u64 = u64::MAX - 1;
 pub const SYN_OWNER_REFUSE: u64 = u64::MAX;
 
-macro_rules! some_or_refuse {
-    ($value:expr) => {
-        match $value {
-            Some(value) => value,
-            None => return SYN_OWNER_REFUSE,
-        }
-    };
-}
-
-// Keep common-socket field access separate from validated raw field probes.
+// Keep common-socket field access in its own subprogram.
 #[inline(never)]
 fn socket_state(sk: *const bpf_sock) -> u32 {
     unsafe { (*sk).state }
 }
 
-#[inline(always)]
-fn read_native_request(sk: *mut bpf_sock, cookie: &mut u64, isn: &mut u32) -> bool {
-    const CAPACITY: u32 = mem::size_of::<honk_ebpf_common::KernelRouteWitness>() as u32;
-    let offsets = TCP_BINDING_OFFSETS.load();
-    if offsets.socket_cookie > CAPACITY - 8 || offsets.request_rcv_isn > CAPACITY - 4 {
-        return false;
-    }
-    let cookie_end = offsets.socket_cookie + 8;
-    let isn_end = offsets.request_rcv_isn + 4;
-    let length = if cookie_end > isn_end {
-        cookie_end
-    } else {
-        isn_end
-    };
-    let mut zero = 0u32;
-    unsafe { ptr::write_volatile(&mut zero, 0) };
-    let Some(packet) = PKT_SCRATCH_KEY.get_ptr_mut(unsafe { ptr::read_volatile(&zero) }) else {
-        return false;
-    };
-    // ponytail: reuse the dead 328-byte witness; larger prefixes need dedicated scratch.
-    // The lookup reference pins the request even when SockMap wraps sk_prot.
-    let witness = unsafe { &raw mut (*packet).route_witness };
-    let bytes = witness.cast::<u8>();
-    let result = unsafe {
-        aya_ebpf_bindings::helpers::bpf_probe_read_kernel(bytes.cast(), length, sk.cast())
-    };
-    if result == 0 {
-        *cookie =
-            unsafe { ptr::read_unaligned(bytes.add(offsets.socket_cookie as usize).cast::<u64>()) };
-        *isn = unsafe {
-            ptr::read_unaligned(bytes.add(offsets.request_rcv_isn as usize).cast::<u32>())
-        };
-    }
-    // A failed probe may have partially copied kernel pointers. Never let the
-    // prefix survive in the readable packet scratch or a later route witness.
-    unsafe { ptr::write_bytes(witness, 0, 1) };
-    result == 0
-}
-
+/// A listener or a pending request owns nothing: the SYN is judged from the tuple's own
+/// publication. Only an established child carries a binding to check.
 #[inline(always)]
 fn inspect_syn_owner(sk: *mut bpf_sock, tuples: &TuplesKey, isn: u32) -> u64 {
     match socket_state(sk) {
-        12 => {
-            let mut cookie = 0u64;
-            let mut request_isn = 0u32;
-            if !read_native_request(sk, &mut cookie, &mut request_isn) {
-                return SYN_OWNER_REFUSE;
-            }
-            if cookie == 0 {
-                return SYN_OWNER_REFUSE;
-            }
-            let key = TcpRequestKey {
-                address: sk as u64,
-                cookie,
-            };
-            if request_retiring(&key) {
-                return SYN_OWNER_REFUSE;
-            }
-            if request_isn != isn {
-                return SYN_OWNER_FRESH;
-            }
-            let binding = some_or_refuse!(unsafe { TCP_REQUEST_BINDINGS.get(&key) });
-            if !valid_proof(binding, tuples, isn) {
-                return SYN_OWNER_REFUSE;
-            }
-            binding.handoff.incarnation
-        }
         6 => SYN_OWNER_FRESH, // TIME_WAIT is never child storage authority.
-        10 => SYN_OWNER_ABSENT,
+        10 | 12 => SYN_OWNER_ABSENT,
         _ => {
             let full = unsafe { bpf_sk_fullsock(sk) };
             if full.is_null() {
@@ -309,7 +139,7 @@ fn inspect_syn_owner(sk: *mut bpf_sock, tuples: &TuplesKey, isn: u32) -> u64 {
     }
 }
 
-/// Only a referenced request or child can authorize native cached-SYN reuse.
+/// Only an established child can authorize native cached-SYN reuse.
 #[inline(always)]
 pub fn native_syn_owner(ctx: &TcContext, tuples: &TuplesKey, isn: u32) -> u64 {
     let nsid = PARAM.load().tcp_daens_netns_id;
@@ -357,203 +187,105 @@ pub fn native_syn_owner(ctx: &TcContext, tuples: &TuplesKey, isn: u32) -> u64 {
     result
 }
 
+// `#[inline(never)]` keeps each family in its own subprogram, and the volatile word loads keep
+// every ctx read a constant-offset access: a merged 64-bit copy of `remote_ip6` is rewritten
+// through a modified ctx pointer, which the verifier rejects ("dereference of modified ctx ptr").
+#[inline(never)]
+fn fill_addresses_v4(ops: *const bpf_sock_ops, key: &mut TuplesKey) {
+    let (remote, local) = unsafe {
+        (
+            (&raw const (*ops).remote_ip4).read_volatile(),
+            (&raw const (*ops).local_ip4).read_volatile(),
+        )
+    };
+    key.src_ip = In6Addr::from_ipv4_bytes(remote.to_ne_bytes());
+    key.dst_ip = In6Addr::from_ipv4_bytes(local.to_ne_bytes());
+}
+
+#[inline(never)]
+fn fill_addresses_v6(ops: *const bpf_sock_ops, key: &mut TuplesKey) {
+    unsafe {
+        key.src_ip = In6Addr {
+            u6_addr32: [
+                (&raw const (*ops).remote_ip6[0]).read_volatile(),
+                (&raw const (*ops).remote_ip6[1]).read_volatile(),
+                (&raw const (*ops).remote_ip6[2]).read_volatile(),
+                (&raw const (*ops).remote_ip6[3]).read_volatile(),
+            ],
+        };
+        key.dst_ip = In6Addr {
+            u6_addr32: [
+                (&raw const (*ops).local_ip6[0]).read_volatile(),
+                (&raw const (*ops).local_ip6[1]).read_volatile(),
+                (&raw const (*ops).local_ip6[2]).read_volatile(),
+                (&raw const (*ops).local_ip6[3]).read_volatile(),
+            ],
+        };
+    }
+}
+
+/// Publish the accepted child's binding. The child's local address is the SYN's destination,
+/// so the key matches the one TC published, with the client as source.
 #[inline(always)]
-fn route_request(sk: *mut c_void, skb: *const u8, request: *mut c_void, ipv6: bool) {
-    if sk.is_null() || skb.is_null() || request.is_null() || !listener(sk) {
+fn bind_child(ctx: &SockOpsContext) {
+    let ops = ctx.ops;
+    let owned = TCP_DAENS_NETNS_COOKIE.load();
+    if owned == 0 || unsafe { bpf_get_netns_cookie(ops.cast()) } != owned {
         return;
     }
-    let Some((tuples, incarnation, syn_isn)) = skb_tuple(skb, ipv6) else {
+    let sk = unsafe { (*ops).__bindgen_anon_2.sk };
+    if sk.is_null() {
+        return;
+    }
+    let mut key = TuplesKey {
+        src_ip: In6Addr::zero(),
+        dst_ip: In6Addr::zero(),
+        // remote_port is network order in the high half; local_port is host order.
+        src_port: u16::from_be((unsafe { (*ops).remote_port } >> 16) as u16),
+        dst_port: unsafe { (*ops).local_port } as u16,
+        l4proto: IPPROTO_TCP,
+        padding: [0; 3],
+    };
+    match unsafe { (*ops).family } {
+        AF_INET => fill_addresses_v4(ops, &mut key),
+        AF_INET6 => fill_addresses_v6(ops, &mut key),
+        _ => return,
+    }
+    let active = tcp_syn_state(&key).is_some_and(|s| s.state == TcpState::TcpStateActive as u8);
+    let Some(handoff) = handoff_snapshot(&key) else {
         return;
     };
-    if !current(&tuples, incarnation) {
-        return;
-    }
-    let Some(handoff) = handoff_snapshot(&tuples) else {
-        return;
-    };
-    if handoff.incarnation != incarnation {
-        return;
-    }
-    let actual_isn: Option<u32> =
-        unsafe { read(request.cast(), TCP_BINDING_OFFSETS.load().request_rcv_isn) };
-    if actual_isn != Some(syn_isn) {
-        return;
-    }
-    let cookie = unsafe { bpf_get_socket_cookie(request) };
-    if cookie == 0 {
-        return;
-    }
-    let key = TcpRequestKey {
-        address: request as u64,
-        cookie,
-    };
-    if request_retiring(&key) || tuple_retiring(&tuples) {
-        return;
-    }
-    // Exact proofs are immutable and already accounted; never reserve twice.
-    if unsafe { TCP_REQUEST_BINDINGS.get(&key).is_some() } {
-        return;
-    }
-    let Some(conn) = CONN_STATE_MAP.get_ptr_mut(&tuples) else {
-        return;
-    };
-    unsafe { bpf_spin_lock(&mut (*conn).lock) };
-    let state = unsafe { &mut (*conn).value };
-    let reserved = state.incarnation == incarnation
-        && state.tcp_syn_isn == syn_isn
-        && state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT != 0
-        && (state.tcp_syn_flags & TCP_SYN_REQUEST_SEEN == 0 || state.tcp_request_count != 0)
-        && state.tcp_request_count < u32::MAX;
-    if reserved {
-        state.tcp_syn_flags |= TCP_SYN_REQUEST_SEEN;
-        state.tcp_request_count += 1;
-    }
-    unsafe { bpf_spin_unlock(&mut (*conn).lock) };
-    if !reserved {
-        return;
-    }
-    let binding = TcpSocketBinding {
-        tuples,
+    // The callback runs when the handshake completes: rcv_nxt is the client ISN + 1.
+    let isn = unsafe { (*ops).rcv_nxt }.wrapping_sub(1);
+    let mut binding = TcpSocketBinding {
+        tuples: key,
         handoff,
         kind: TCP_BINDING_CHILD,
-        syn_isn,
+        syn_isn: isn,
     };
-    if TCP_REQUEST_BINDINGS.insert(&key, &binding, 1).is_err() {
-        increment_bpf_stat(BpfStatsKey::TcpRequestProofInsertFailure);
-        unsafe { bpf_spin_lock(&mut (*conn).lock) };
-        let state = unsafe { &mut (*conn).value };
-        if state.incarnation == incarnation && state.tcp_request_count != 0 {
-            state.tcp_request_count -= 1;
-        }
-        unsafe { bpf_spin_unlock(&mut (*conn).lock) };
+    if !active || !valid_proof(&binding, &key, isn) {
+        return;
     }
-}
-
-#[fentry]
-pub fn honk_tcp_v4_route_req(ctx: FEntryContext) -> u32 {
-    route_request(ctx.arg(0), ctx.arg(1), ctx.arg(3), false);
-    0
-}
-
-#[fentry]
-pub fn honk_tcp_v6_route_req(ctx: FEntryContext) -> u32 {
-    route_request(ctx.arg(0), ctx.arg(1), ctx.arg(3), true);
-    0
-}
-
-#[fexit]
-pub fn honk_tcp_create_openreq_child(ctx: FExitContext) -> u32 {
-    let request: *mut c_void = ctx.arg(1);
-    let child: *mut c_void = ctx.arg(3);
-    if child.is_null() || request.is_null() || !listener(ctx.arg(0)) {
-        return 0;
-    }
-    let cookie = unsafe { bpf_get_socket_cookie(request) };
-    if cookie == 0 {
-        return 0;
-    }
-    let key = TcpRequestKey {
-        address: request as u64,
-        cookie,
-    };
-    if request_retiring(&key) {
-        return 0;
-    }
-    let Some(binding) = (unsafe { TCP_REQUEST_BINDINGS.get(&key) }) else {
-        return 0;
-    };
-    let binding = *binding;
-    if !valid_proof(&binding, &binding.tuples, binding.syn_isn) {
-        return 0;
-    }
-    let actual_isn: Option<u32> =
-        unsafe { read(request.cast(), TCP_BINDING_OFFSETS.load().request_rcv_isn) };
-    if actual_isn != Some(binding.syn_isn) {
-        return 0;
-    }
-    // inet_csk_clone_lock copies ir_cookie before this exit, but not the endpoints.
-    let inherited: Option<u64> =
-        unsafe { read(child.cast(), TCP_BINDING_OFFSETS.load().socket_cookie) };
-    if inherited != Some(cookie) {
-        return 0;
-    }
-    let mut binding = binding;
+    // One call links a fully copied element: TC readers never observe a partial binding.
     let stored = unsafe {
         bpf_sk_storage_get(
             (&raw const TCP_SOCKET_BINDING).cast_mut().cast(),
-            child.cast(),
-            ptr::from_mut(&mut binding).cast(),
+            sk.cast(),
+            (&raw mut binding).cast(),
             BPF_SK_STORAGE_GET_F_CREATE as u64,
         )
     };
     if stored.is_null() {
         increment_bpf_stat(BpfStatsKey::TcpChildProofStorageFailure);
     }
-    0
 }
 
-#[inline(always)]
-fn destroy_request(request: *mut c_void) {
-    if request.is_null() {
-        return;
+/// Every other op fires for each host TCP socket and must stay inert; an unproven child is
+/// refused by userspace adoption, so the verdict is always "continue".
+#[sock_ops]
+pub fn honk_tcp_passive(ctx: SockOpsContext) -> u32 {
+    if ctx.op() == BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB {
+        bind_child(&ctx);
     }
-    let Some(cookie) =
-        (unsafe { read::<u64>(request.cast(), TCP_BINDING_OFFSETS.load().socket_cookie) })
-    else {
-        return;
-    };
-    if cookie == 0 {
-        return;
-    }
-    let key = TcpRequestKey {
-        address: request as u64,
-        cookie,
-    };
-    if request_retiring(&key) {
-        return;
-    }
-    let Some(binding) = (unsafe { TCP_REQUEST_BINDINGS.get(&key) }) else {
-        return;
-    };
-    if binding.kind != TCP_BINDING_CHILD {
-        return;
-    }
-    let tuples = binding.tuples;
-    let incarnation = binding.handoff.incarnation;
-    // A tuple fence also protects this accounting borrow. The post-grace owner
-    // must remove the retained proof and finish its decrement, never just delete it.
-    if tuple_retiring(&tuples) {
-        return;
-    }
-    let Some(conn) = CONN_STATE_MAP.get_ptr_mut(&tuples) else {
-        return;
-    };
-    unsafe { bpf_spin_lock(&mut (*conn).lock) };
-    let state = unsafe { &(*conn).value };
-    let accounted = state.incarnation != incarnation || state.tcp_request_count != 0;
-    unsafe { bpf_spin_unlock(&mut (*conn).lock) };
-    if !accounted {
-        return;
-    }
-    if TCP_REQUEST_BINDINGS.remove(&key).is_err() {
-        return;
-    }
-    unsafe { bpf_spin_lock(&mut (*conn).lock) };
-    let state = unsafe { &mut (*conn).value };
-    if state.incarnation == incarnation && state.tcp_request_count != 0 {
-        state.tcp_request_count -= 1;
-    }
-    unsafe { bpf_spin_unlock(&mut (*conn).lock) };
-}
-
-#[fentry]
-pub fn honk_tcp_v4_reqsk_destructor(ctx: FEntryContext) -> u32 {
-    destroy_request(ctx.arg(0));
-    0
-}
-
-#[fentry]
-pub fn honk_tcp_v6_reqsk_destructor(ctx: FEntryContext) -> u32 {
-    destroy_request(ctx.arg(0));
-    0
+    1
 }

@@ -22,7 +22,6 @@ fn retirement_release_failure_retains_applied_counts_and_releases_other_fences()
             conn: 2,
             redirect: 2,
             handoff: 2,
-            request: 0
         }
     );
     assert_eq!(
@@ -269,7 +268,6 @@ fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_f
                 conn: 2,
                 redirect: 2,
                 handoff: 2,
-                request: 0,
             }
         );
         assert_eq!(
@@ -432,7 +430,6 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
             conn: 1,
             handoff: 1,
             redirect: 1,
-            request: 0
         }
     );
     assert_eq!(result, UdpDecisionCommitResult::Applied);
@@ -508,7 +505,6 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
                 conn: 1,
                 handoff: 1,
                 redirect: 1,
-                request: 0
             }
         );
         assert_eq!(result, UdpDecisionCommitResult::Applied);
@@ -777,7 +773,6 @@ fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> any
             conn: 1,
             handoff: 1,
             redirect: 1,
-            request: 0
         }
     );
     assert_eq!(result, UdpDecisionCommitResult::Applied);

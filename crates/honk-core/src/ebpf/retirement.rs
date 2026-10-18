@@ -5,7 +5,8 @@ use super::{
     udp_state_is_legacy_userspace_owned, udp_state_is_staged, udp_state_is_userspace_owned,
 };
 use honk_ebpf_common::conn::{REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS};
-use honk_ebpf_common::redirect_need::{TcpRequestKey, TcpSocketBinding};
+#[cfg(test)]
+use honk_ebpf_common::redirect_need::TcpSocketBinding;
 use honk_ebpf_common::{ConnState, RedirectEntry, RoutingHandoffEntry, TuplesKey};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -72,11 +73,6 @@ pub enum RetireKind<'a> {
         expected: &'a RoutingHandoffEntry,
         expired_before_ns: u64,
     },
-    ExpiredRequest {
-        request: &'a TcpRequestKey,
-        expected: &'a TcpSocketBinding,
-        expired_before_ns: u64,
-    },
     ExpiryHint {
         incarnation: u64,
         now_ns: u64,
@@ -84,33 +80,24 @@ pub enum RetireKind<'a> {
 }
 
 /// Owner entries a request's mutation decision reads, so executors fetch only those.
-pub(crate) struct OwnerReads<'a> {
+pub(crate) struct OwnerReads {
     pub conn: bool,
     pub handoff: bool,
     pub redirect: bool,
-    pub request: Option<&'a TcpRequestKey>,
 }
 
-impl<'a> RetireKind<'a> {
-    pub(crate) fn owner_reads(&self) -> OwnerReads<'a> {
+impl RetireKind<'_> {
+    pub(crate) fn owner_reads(&self) -> OwnerReads {
         match *self {
             Self::ExpiredRedirect { .. } => OwnerReads {
                 conn: false,
                 handoff: false,
                 redirect: true,
-                request: None,
             },
             Self::ExpiredHandoff { .. } => OwnerReads {
                 conn: false,
                 handoff: true,
                 redirect: false,
-                request: None,
-            },
-            Self::ExpiredRequest { request, .. } => OwnerReads {
-                conn: false,
-                handoff: false,
-                redirect: false,
-                request: Some(request),
             },
             Self::Tcp { .. }
             | Self::Udp { .. }
@@ -119,7 +106,6 @@ impl<'a> RetireKind<'a> {
                 conn: true,
                 handoff: true,
                 redirect: true,
-                request: None,
             },
         }
     }
@@ -130,7 +116,6 @@ pub struct RetireCounts {
     pub conn: u64,
     pub redirect: u64,
     pub handoff: u64,
-    pub request: u64,
 }
 
 impl RetireCounts {
@@ -140,7 +125,6 @@ impl RetireCounts {
             conn: self.conn - before.conn,
             redirect: self.redirect - before.redirect,
             handoff: self.handoff - before.handoff,
-            request: self.request - before.request,
         }
     }
 }
@@ -150,7 +134,6 @@ impl std::ops::AddAssign for RetireCounts {
         self.conn += other.conn;
         self.redirect += other.redirect;
         self.handoff += other.handoff;
-        self.request += other.request;
     }
 }
 
@@ -186,6 +169,7 @@ pub struct RetireError {
     pub source: anyhow::Error,
 }
 
+#[cfg(feature = "ebpf")]
 pub(crate) fn tuple_matches(a: &TuplesKey, b: &TuplesKey) -> bool {
     (unsafe { a.src_ip.u6_addr8 == b.src_ip.u6_addr8 && a.dst_ip.u6_addr8 == b.dst_ip.u6_addr8 })
         && a.src_port == b.src_port
@@ -234,13 +218,6 @@ fn handoff_matches(a: &RoutingHandoffEntry, b: &RoutingHandoffEntry, cutoff: u64
         && x.pid == y.pid
         && x.dscp == y.dscp
         && x.decision_token == y.decision_token
-}
-
-fn request_matches(a: &TcpSocketBinding, b: &TcpSocketBinding, cutoff: u64) -> bool {
-    a.kind == b.kind
-        && a.syn_isn == b.syn_isn
-        && tuple_matches(&a.tuples, &b.tuples)
-        && handoff_matches(&a.handoff, &b.handoff, cutoff)
 }
 
 pub(crate) fn conn_state_timeout_ns(proto: u8, state: &ConnState) -> u64 {
@@ -388,17 +365,14 @@ pub(crate) struct Owners<'a> {
     pub conn: Option<&'a ConnState>,
     pub handoff: Option<&'a RoutingHandoffEntry>,
     pub redirect: Option<&'a RedirectEntry>,
-    pub request: Option<&'a TcpSocketBinding>,
 }
 
 /// Mutation set for an authorized retirement. Executors apply it in field
-/// order (auxiliaries, request proof, conn) so a failure part-way never leaves
-/// a conn whose auxiliaries survive it, and count each delete as it happens.
+/// order (auxiliaries, conn) so a failure part-way never leaves a conn whose
+/// auxiliaries survive it, and count each delete as it happens.
 pub(crate) struct RetirePlan {
     pub handoff: bool,
     pub redirect: bool,
-    /// Conn incarnation whose request count the deleted request proof releases.
-    pub request: Option<u64>,
     pub conn: bool,
     /// Outcome when the deciding removal finds its entry already gone.
     unchanged: UdpDecisionCommitResult,
@@ -409,7 +383,6 @@ impl RetirePlan {
         Self {
             handoff: false,
             redirect: false,
-            request: None,
             conn: false,
             unchanged,
         }
@@ -420,7 +393,7 @@ impl RetirePlan {
         let decided = if self.conn {
             removed.conn
         } else {
-            removed.handoff + removed.redirect + removed.request
+            removed.handoff + removed.redirect
         };
         if decided != 0 {
             UdpDecisionCommitResult::Applied
@@ -484,23 +457,6 @@ pub(crate) fn plan_retirement(
             }
             Some(_) => Err(Superseded),
         },
-        RetireKind::ExpiredRequest {
-            expected,
-            expired_before_ns,
-            ..
-        } => match owners.request {
-            None => Err(Missing),
-            Some(current)
-                if tuple_matches(&request.key, &current.tuples)
-                    && request_matches(current, expected, expired_before_ns) =>
-            {
-                Ok(RetirePlan {
-                    request: Some(current.handoff.incarnation),
-                    ..RetirePlan::auxiliary(Applied)
-                })
-            }
-            Some(_) => Err(Superseded),
-        },
         RetireKind::ExpiryHint {
             incarnation,
             now_ns,
@@ -512,22 +468,6 @@ pub(crate) fn plan_retirement(
             conn_plan(request.kind)
         }
     }
-}
-
-/// Release one in-flight TCP request from its conn owner's count when the
-/// deleted proof belonged to that same incarnation; true when `state` changed.
-pub(crate) fn release_request_count(
-    state: &mut ConnState,
-    incarnation: u64,
-) -> anyhow::Result<bool> {
-    if state.incarnation != incarnation {
-        return Ok(false);
-    }
-    state.tcp_request_count = state
-        .tcp_request_count
-        .checked_sub(1)
-        .ok_or_else(|| anyhow::anyhow!("TCP request accounting underflow"))?;
-    Ok(true)
 }
 
 pub(crate) enum RedirectEffect {

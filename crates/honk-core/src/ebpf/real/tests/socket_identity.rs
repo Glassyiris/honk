@@ -1,4 +1,11 @@
+use super::raw_bpf::{EXIT, MOV64_IMM, insn, load_program};
 use super::*;
+use aya_obj::generated::{
+    bpf_attach_type::BPF_CGROUP_SOCK_OPS,
+    bpf_attr,
+    bpf_cmd::{BPF_PROG_ATTACH, BPF_PROG_DETACH},
+    bpf_prog_type::BPF_PROG_TYPE_SOCK_OPS,
+};
 use honk_ebpf_common::conn::BpfStatsKey;
 
 #[tokio::test]
@@ -192,4 +199,77 @@ fn unavailable_cgroup_capture_refuses_startup() {
     })
     .join()
     .expect("startup refusal in private mount namespace");
+}
+
+/// A legacy (flags=0, not a link) root-cgroup sock_ops program that is detached on drop.
+struct LegacySockOps {
+    cgroup: std::fs::File,
+    program: std::os::fd::OwnedFd,
+}
+
+impl LegacySockOps {
+    fn attach(cgroup: std::fs::File) -> std::io::Result<Self> {
+        let program = load_program(
+            BPF_PROG_TYPE_SOCK_OPS,
+            &[insn(MOV64_IMM, 0, 0, 0, 1), insn(EXIT, 0, 0, 0, 0)],
+        )?;
+        let foreign = Self { cgroup, program };
+        foreign.syscall(BPF_PROG_ATTACH as _)?;
+        Ok(foreign)
+    }
+
+    fn syscall(&self, command: core::ffi::c_long) -> std::io::Result<()> {
+        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+        attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = self.cgroup.as_raw_fd() as u32;
+        attr.__bindgen_anon_5.attach_bpf_fd = self.program.as_raw_fd() as u32;
+        attr.__bindgen_anon_5.attach_type = BPF_CGROUP_SOCK_OPS as u32;
+        unsafe { syscall::bpf_syscall(command, &mut attr) }
+            .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))
+    }
+}
+
+impl Drop for LegacySockOps {
+    fn drop(&mut self) {
+        if let Err(error) = self.syscall(BPF_PROG_DETACH as _)
+            && !std::thread::panicking()
+        {
+            panic!("detach foreign sock_ops program: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable VM, root, cgroup v2, Linux 6.12+, and an eBPF build"]
+async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
+    let cgroup = std::fs::File::open(detect_cgroup_path().expect("cgroup2 mount")).unwrap();
+    let foreign = LegacySockOps::attach(cgroup).expect("install legacy root sock_ops program");
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-sock-ops-slot-{}", std::process::id()));
+    let links_before = held_bpf_link_count();
+    let programs_before = cgroup_attached_prog_count(foreign.cgroup.as_raw_fd());
+
+    let result = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        Some("lo"),
+        "lo",
+        true,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "startup allowed an occupied root sock_ops slot"
+    );
+    assert_eq!(
+        held_bpf_link_count(),
+        links_before,
+        "failed startup retained attachments"
+    );
+    assert_eq!(
+        cgroup_attached_prog_count(foreign.cgroup.as_raw_fd()),
+        programs_before,
+        "failed startup retained cgroup programs"
+    );
+    std::fs::remove_dir_all(pin_root).unwrap();
 }

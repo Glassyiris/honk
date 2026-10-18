@@ -43,7 +43,7 @@ unsafe impl<T: aya::Pod> aya::Pod for FlowMapValue<T> {}
 /// Layout (repr(C), total 72 bytes):
 ///   offset 0:  is_wan_ingress_direction: u8
 ///   offset 1:  state: u8 (`TcpState` for TCP, `UdpDecisionState` for UDP)
-///   offset 2:  tcp_syn_flags: u16 (committed redirect/request history)
+///   offset 2:  tcp_syn_flags: u16 (ORIGINAL_INTERCEPT eligibility)
 ///   offset 4:  decision_token: u32 (nonzero only for staged UDP flows)
 ///   offset 8:  last_seen_ns: u64 (monotonic timestamp from bpf_ktime_get_ns)
 ///   offset 16: meta: RoutingMeta (cached routing decision)
@@ -54,7 +54,7 @@ unsafe impl<T: aya::Pod> aya::Pod for FlowMapValue<T> {}
 ///   offset 52: trace_id: u32 (immutable route witness, independent of decision_token)
 ///   offset 56: incarnation: u64 (generation-owned identity, independent of UDP tokens)
 ///   offset 64: tcp_syn_isn: u32 (host-order original sequence, including zero)
-///   offset 68: tcp_request_count: u32 (exact reserved/published request proofs)
+///   offset 68: reserved: u32 (always zero)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnState {
@@ -71,7 +71,7 @@ pub struct ConnState {
     pub trace_id: u32,
     pub incarnation: u64,
     pub tcp_syn_isn: u32,
-    pub tcp_request_count: u32,
+    pub reserved: u32,
 }
 
 const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 72);
@@ -91,12 +91,11 @@ const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid)
 const _: () = assert!(core::mem::offset_of!(ConnState, trace_id) == 52);
 const _: () = assert!(core::mem::offset_of!(ConnState, incarnation) == 56);
 const _: () = assert!(core::mem::offset_of!(ConnState, tcp_syn_isn) == 64);
-const _: () = assert!(core::mem::offset_of!(ConnState, tcp_request_count) == 68);
+const _: () = assert!(core::mem::offset_of!(ConnState, reserved) == 68);
 
 /// The original forward SYN committed both handoff and redirect before delivery.
 /// Native/direct and failed/incomplete publications never set this eligibility bit.
 pub const TCP_SYN_ORIGINAL_INTERCEPT: u16 = 1 << 0;
-pub const TCP_SYN_REQUEST_SEEN: u16 = 1 << 1;
 
 const _: () = assert!(core::mem::offset_of!(FlowMapValue<ConnState>, lock) == 0);
 const _: () = assert!(core::mem::offset_of!(FlowMapValue<ConnState>, value) == 8);
@@ -115,19 +114,17 @@ pub enum BpfStatsKey {
     RedirectTrackInsertFailure = 2,
     RoutingHandoffInsertFailure = 3,
     SocketIdentityCaptureFailure = 4,
-    TcpRequestProofInsertFailure = 5,
-    TcpChildProofStorageFailure = 6,
-    TcpPublisherClaimFailure = 7,
+    TcpChildProofStorageFailure = 5,
+    TcpPublisherClaimFailure = 6,
 }
 
 impl BpfStatsKey {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::UdpConnOverflow,
         Self::TcpConnOverflow,
         Self::RedirectTrackInsertFailure,
         Self::RoutingHandoffInsertFailure,
         Self::SocketIdentityCaptureFailure,
-        Self::TcpRequestProofInsertFailure,
         Self::TcpChildProofStorageFailure,
         Self::TcpPublisherClaimFailure,
     ];
@@ -140,7 +137,6 @@ impl BpfStatsKey {
             Self::RedirectTrackInsertFailure => "redirect_track_insert_failure",
             Self::RoutingHandoffInsertFailure => "routing_handoff_insert_failure",
             Self::SocketIdentityCaptureFailure => "socket_identity_capture_failure",
-            Self::TcpRequestProofInsertFailure => "tcp_request_proof_insert_failure",
             Self::TcpChildProofStorageFailure => "tcp_child_proof_storage_failure",
             Self::TcpPublisherClaimFailure => "tcp_publisher_claim_failure",
         }

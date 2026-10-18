@@ -2,12 +2,11 @@
 use super::*;
 use crate::ebpf::retirement::{
     Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit,
-    release_request_count, retire_staged_udp, tuple_matches,
+    retire_staged_udp, tuple_matches,
 };
 use crate::ebpf::udp_state_is_staged;
 use aya::maps::ArrayOfMaps;
 use honk_ebpf_common::conn::RetirementFence;
-use honk_ebpf_common::redirect_need::TcpSocketBinding;
 
 const IPPROTO_TCP: u8 = libc::IPPROTO_TCP as u8;
 const IPPROTO_UDP: u8 = libc::IPPROTO_UDP as u8;
@@ -83,21 +82,12 @@ impl RealEbpfBackend {
         keys: &[(TuplesKey, u32)],
         operation: impl FnOnce(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.with_retirement_fences_and_requests(keys, &[], operation)
-    }
-
-    pub(super) fn with_retirement_fences_and_requests<T>(
-        &mut self,
-        keys: &[(TuplesKey, u32)],
-        requests: &[honk_ebpf_common::redirect_need::TcpRequestKey],
-        operation: impl FnOnce(&mut Self) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
         anyhow::ensure!(
             !self.retirement_failed,
             "retirement ownership is unresolved"
         );
         anyhow::ensure!(
-            keys.len() <= RETIRE_BATCH_CAPACITY && requests.len() <= RETIRE_BATCH_CAPACITY,
+            keys.len() <= RETIRE_BATCH_CAPACITY,
             "retirement batch exceeds capacity"
         );
         anyhow::ensure!(
@@ -112,9 +102,6 @@ impl RealEbpfBackend {
         // Backend W serializes operation ownership; fixed storage avoids per-key allocation.
         let mut acquired = [None; RETIRE_BATCH_CAPACITY];
         let mut count = 0;
-        let mut acquired_requests: [Option<honk_ebpf_common::redirect_need::TcpRequestKey>;
-            RETIRE_BATCH_CAPACITY] = [None; RETIRE_BATCH_CAPACITY];
-        let mut request_count = 0;
         let mut failure = None;
         let mut value = None;
         let mut unresolved = false;
@@ -159,55 +146,12 @@ impl RealEbpfBackend {
             }
         }
         if failure.is_none() {
-            for key in requests {
-                if acquired_requests[..request_count]
-                    .iter()
-                    .flatten()
-                    .any(|previous| {
-                        previous.address == key.address && previous.cookie == key.cookie
-                    })
-                {
-                    continue;
-                }
-                #[cfg(test)]
-                let acquisition =
-                    inject_indexed_fault(&mut self.retirement_faults.acquire, "request acquire")
-                        .and_then(|()| self.hash_insert_noexist("REQUEST_FENCE", key, &owner));
-                #[cfg(not(test))]
-                let acquisition = self.hash_insert_noexist("REQUEST_FENCE", key, &owner);
-                match acquisition {
-                    Ok(()) => {
-                        acquired_requests[request_count] = Some(*key);
-                        request_count += 1;
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        match self.hash_lookup::<_, u64>("REQUEST_FENCE", key) {
-                            Ok(None) => {}
-                            Ok(Some(_)) => unresolved = true,
-                            Err(error) => {
-                                unresolved = true;
-                                combine_error(&mut failure, error);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        if failure.is_none() {
             match self.grace_barrier().and_then(|()| {
                 for key in acquired[..count].iter().flatten() {
                     let current = self.hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, key)?;
                     anyhow::ensure!(
                         current.is_some_and(|fence| fence.owner == owner),
                         "retirement fence owner {owner} changed before mutation"
-                    );
-                }
-                for key in acquired_requests[..request_count].iter().flatten() {
-                    anyhow::ensure!(
-                        self.hash_lookup::<_, u64>("REQUEST_FENCE", key)? == Some(owner),
-                        "request fence owner {owner} changed before mutation"
                     );
                 }
                 operation(self)
@@ -228,25 +172,6 @@ impl RealEbpfBackend {
                 anyhow::ensure!(
                     self.hash_remove_present::<_, RetirementFence>(RETIRE_FENCE_MAP, key)?,
                     "retirement fence owner {owner} disappeared during release"
-                );
-                Ok(())
-            })();
-            if let Err(error) = release {
-                unresolved = true;
-                combine_error(&mut failure, error);
-            }
-        }
-        for key in acquired_requests[..request_count].iter().flatten() {
-            let release = (|| {
-                #[cfg(test)]
-                inject_indexed_fault(&mut self.retirement_faults.release, "request release")?;
-                anyhow::ensure!(
-                    self.hash_lookup::<_, u64>("REQUEST_FENCE", key)? == Some(owner),
-                    "request fence owner {owner} disappeared or changed"
-                );
-                anyhow::ensure!(
-                    self.hash_remove_present::<_, u64>("REQUEST_FENCE", key)?,
-                    "request fence owner {owner} disappeared during release"
                 );
                 Ok(())
             })();
@@ -287,11 +212,6 @@ impl RealEbpfBackend {
                 return Ok(());
             }
             let mut keys = [(TuplesKey::default(), 0); RETIRE_BATCH_CAPACITY];
-            let mut request_keys = [honk_ebpf_common::redirect_need::TcpRequestKey {
-                address: 0,
-                cookie: 0,
-            }; RETIRE_BATCH_CAPACITY];
-            let mut request_count = 0;
             for (index, request) in requests.iter().enumerate() {
                 anyhow::ensure!(
                     request.key.padding == [0; 3]
@@ -320,19 +240,6 @@ impl RealEbpfBackend {
                     RetireKind::ExpiredConn { expected, .. } => expected.decision_token,
                     RetireKind::ExpiredRedirect { expected, .. } => expected.decision_token,
                     RetireKind::ExpiredHandoff { expected, .. } => expected.result.decision_token,
-                    RetireKind::ExpiredRequest {
-                        expected,
-                        request: request_key,
-                        ..
-                    } => {
-                        anyhow::ensure!(
-                            tuple_matches(&request.key, &expected.tuples),
-                            "request proof tuple mismatch"
-                        );
-                        request_keys[request_count] = *request_key;
-                        request_count += 1;
-                        expected.handoff.result.decision_token
-                    }
                     RetireKind::ExpiryHint { incarnation, .. } => {
                         anyhow::ensure!(incarnation != 0, "invalid expiry incarnation");
                         0
@@ -340,16 +247,12 @@ impl RealEbpfBackend {
                 };
                 keys[index] = (request.key, token);
             }
-            self.with_retirement_fences_and_requests(
-                &keys[..requests.len()],
-                &request_keys[..request_count],
-                |backend| {
-                    for (request, outcome) in requests.iter().zip(outcomes) {
-                        *outcome = backend.retire_one(request, &mut counts)?.into();
-                    }
-                    Ok(())
-                },
-            )
+            self.with_retirement_fences(&keys[..requests.len()], |backend| {
+                for (request, outcome) in requests.iter().zip(outcomes) {
+                    *outcome = backend.retire_one(request, &mut counts)?.into();
+                }
+                Ok(())
+            })
         })();
         let result = match run {
             Ok(()) => Ok(counts),
@@ -382,17 +285,10 @@ impl RealEbpfBackend {
         } else {
             None
         };
-        let binding = match reads.request {
-            Some(proof) => {
-                self.hash_lookup::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", proof)?
-            }
-            None => None,
-        };
         let owners = Owners {
             conn: conn.as_ref(),
             handoff: handoff.as_ref(),
             redirect: redirect.as_ref(),
-            request: binding.as_ref(),
         };
         let plan = match plan_retirement(request, &owners) {
             Ok(plan) => plan,
@@ -420,16 +316,6 @@ impl RealEbpfBackend {
                     "REDIRECT_TRACK",
                     &track_key,
                 )?);
-        }
-        if let (Some(incarnation), Some(proof)) = (plan.request, reads.request)
-            && self.hash_remove_present::<_, TcpSocketBinding>("TCP_REQUEST_BINDINGS", proof)?
-        {
-            counts.request += 1;
-            if let Some(mut state) = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
-                && release_request_count(&mut state, incarnation)?
-            {
-                self.flow_insert("CONN_STATE_MAP", key, &state)?;
-            }
         }
         if plan.conn {
             counts.conn += u64::from(

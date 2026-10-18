@@ -13,7 +13,8 @@ explicitly authorized Linux host with root access.
   a maintenance window. Do not use a shared production gateway as the first
   canary.
 - For the privileged canary only: root or passwordless `sudo`, a supported
-  Linux kernel with BTF, and the target interfaces, routes, and DNS clients.
+  Linux kernel with cgroup v2 and raw BTF (in-kernel, or an external file via
+  `HONK_VMLINUX_BTF`), and the target interfaces, routes, and DNS clients.
 - Rust stable plus the project nightly toolchain, `rust-src`, `bpf-linker`,
   CMake, C/C++ compiler, libclang/bindgen dependencies, and `readelf`.
 - Exact paths for the active binary, config, BPF object, and persisted state

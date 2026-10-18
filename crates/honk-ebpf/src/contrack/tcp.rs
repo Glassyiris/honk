@@ -10,6 +10,7 @@ use crate::{
     maps::{
         CONN_STATE_MAP, CONNTRACK_ARGS_MAP, TCP_PUBLISHING, increment_bpf_stat, tuple_retiring,
     },
+    tcp_binding::{SYN_OWNER_ABSENT, SYN_OWNER_FRESH, SYN_OWNER_REFUSE, native_syn_owner},
 };
 use aya_ebpf_bindings::{
     bindings::BPF_NOEXIST,
@@ -18,7 +19,7 @@ use aya_ebpf_bindings::{
 use honk_ebpf_common::{
     conn::{
         BpfStatsKey, ConnState, FlowMapValue, OCCUPANCY_INSERTS, TCP_SYN_ORIGINAL_INTERCEPT,
-        TCP_SYN_REQUEST_SEEN, TcpState, tcp_conn_state_expired,
+        TcpState, tcp_conn_state_expired,
     },
     redirect_need::TuplesKey,
 };
@@ -41,10 +42,9 @@ pub enum TcpSyn {
     NonSyn = 0,
     /// Sole publisher replacing the entry seen at claim time.
     Fresh = 1,
-    /// Retransmission of a complete original publication.
+    /// Retransmission of a publication that still owns its tuple: a complete original
+    /// publication, or one no child has consumed yet.
     Cached = 2,
-    /// Retransmission of a publication no request has consumed yet.
-    Pending = 4,
 }
 
 /// The NOEXIST claim spans classification and the final tuple-map access.
@@ -136,30 +136,27 @@ impl TcpPublisher {
             return self.select_fresh();
         }
         let isn = u32::from_be_bytes(tcph.seq);
-        use crate::tcp_binding::{SYN_OWNER_ABSENT, SYN_OWNER_FRESH, SYN_OWNER_REFUSE};
-        let owner = crate::tcp_binding::native_syn_owner(ctx, key, isn);
+        let owner = native_syn_owner(ctx, key, isn);
         if owner == SYN_OWNER_REFUSE {
             return false;
         } else if owner == SYN_OWNER_FRESH {
             return self.select_fresh();
         } else if owner == SYN_OWNER_ABSENT {
-            if state.tcp_syn_isn != isn {
+            // No listener or pending request is read: whatever request exists is judged by the
+            // tuple's own publication, and its child is proven at establishment.
+            if state.tcp_syn_isn != isn
+                || state.state != TcpState::TcpStateActive as u8
+                || tcp_live_pinned(state.incarnation)
+            {
                 return self.select_fresh();
-            } else if state.tcp_syn_flags & TCP_SYN_REQUEST_SEEN != 0 {
-                if state.tcp_request_count != 0 {
-                    return false;
-                }
-                return self.select_fresh();
-            } else {
-                if state.tcp_request_count != 0
-                    || state.state != TcpState::TcpStateActive as u8
-                    || !pending_syn_publication(key, state.incarnation)
-                {
-                    return false;
-                }
-                self.incarnation = state.incarnation;
-                self.syn = TcpSyn::Pending;
             }
+            match pending_syn_publication(key, state.incarnation) {
+                Publication::Missing => return false,
+                Publication::Stale => return self.select_fresh(),
+                Publication::Valid => {}
+            }
+            self.incarnation = state.incarnation;
+            self.syn = TcpSyn::Cached;
         } else {
             if state.incarnation != owner || state.tcp_syn_isn != isn {
                 return false;
@@ -178,29 +175,46 @@ impl TcpPublisher {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Publication {
+    Valid,
+    /// Present and consistent but aged out: a new SYN may replace it.
+    Stale,
+    /// Absent or inconsistent: ownership cannot be established, so the SYN is refused.
+    Missing,
+}
+
 #[inline(always)]
-fn pending_syn_publication(key: &TuplesKey, incarnation: u64) -> bool {
+fn pending_syn_publication(key: &TuplesKey, incarnation: u64) -> Publication {
     if tuple_retiring(key) {
-        return false;
+        return Publication::Missing;
     }
     let Some(handoff) = crate::flow::handoff_identity(key) else {
-        return false;
+        return Publication::Missing;
     };
     let Some(redirect) =
         crate::flow::redirect_identity(&honk_ebpf_common::RedirectTuple::from_tuples(key))
     else {
-        return false;
+        return Publication::Missing;
     };
     let now = unsafe { bpf_ktime_get_ns() };
-    incarnation != 0
-        && handoff.incarnation == incarnation
-        && redirect.incarnation == incarnation
-        && handoff.decision_token == 0
-        && redirect.decision_token == 0
-        && now >= handoff.last_seen_ns
-        && now >= redirect.last_seen_ns
-        && !auxiliary_expired(key, incarnation, now - handoff.last_seen_ns, true)
-        && !auxiliary_expired(key, incarnation, now - redirect.last_seen_ns, false)
+    if incarnation == 0
+        || handoff.incarnation != incarnation
+        || redirect.incarnation != incarnation
+        || handoff.decision_token != 0
+        || redirect.decision_token != 0
+        || now < handoff.last_seen_ns
+        || now < redirect.last_seen_ns
+    {
+        return Publication::Missing;
+    }
+    if auxiliary_expired(key, incarnation, now - handoff.last_seen_ns, true)
+        || auxiliary_expired(key, incarnation, now - redirect.last_seen_ns, false)
+    {
+        Publication::Stale
+    } else {
+        Publication::Valid
+    }
 }
 
 impl Drop for TcpPublisher {
@@ -265,10 +279,7 @@ fn syn_owner_holds(state: &ConnState, args: &ConntrackArgs, syn: TcpSyn) -> bool
     syn == TcpSyn::NonSyn
         || (state.incarnation == args.incarnation
             && state.tcp_syn_isn == args.tcp_syn_isn
-            && state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT != 0
-            && ((syn as u8) & (TcpSyn::Pending as u8) == 0
-                || (state.tcp_syn_flags & TCP_SYN_REQUEST_SEEN == 0
-                    && state.tcp_request_count == 0)))
+            && state.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT != 0)
 }
 
 /// Existing-entry path for established packets and retransmitted SYNs.
@@ -413,7 +424,7 @@ fn __mark_tcp_seen(
     };
     let ptr_opt = CONN_STATE_MAP.get_ptr_mut(key);
     match syn {
-        TcpSyn::NonSyn | TcpSyn::Cached | TcpSyn::Pending => {
+        TcpSyn::NonSyn | TcpSyn::Cached => {
             observe_tcp(key, args, ptr_opt, output, now, fin_rst, syn)
         }
         TcpSyn::Fresh => publish_fresh_tcp(key, args, ptr_opt, output, now, expected_incarnation),
@@ -493,7 +504,6 @@ pub fn commit_tcp_intercept(key: &TuplesKey, syn_isn: u32, incarnation: u64) -> 
         && current.tcp_syn_isn == syn_isn
         && current.is_wan_ingress_direction == 0
         && current.tcp_syn_flags == 0
-        && current.tcp_request_count == 0
         && (unsafe { current.meta.raw } & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED != 0);
     if owned {
         current.tcp_syn_flags = TCP_SYN_ORIGINAL_INTERCEPT;

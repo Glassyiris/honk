@@ -107,7 +107,6 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                     );
                     let failed = backend.conn_state_lookup(&key).unwrap().unwrap();
                     assert_eq!(failed.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT, 0);
-                    assert_eq!(failed.tcp_request_count, 0);
                     take_filler(&mut backend, handoff_map, 0);
                     assert_eq!(
                         run(&backend, side, &bytes, SkbInput::default()).verdict,
@@ -117,7 +116,6 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                     let committed: ConnState = backend.conn_state_lookup(&key).unwrap().unwrap();
                     assert_ne!(committed.incarnation, failed.incarnation);
                     assert_ne!(committed.tcp_syn_flags & TCP_SYN_ORIGINAL_INTERCEPT, 0);
-                    assert_eq!(committed.tcp_request_count, 0);
                     assert_eq!(handoff(&backend, &key).incarnation, committed.incarnation);
                     assert_eq!(
                         backend
@@ -133,7 +131,6 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                     );
                     let pending = backend.conn_state_lookup(&key).unwrap().unwrap();
                     assert_eq!(pending.incarnation, committed.incarnation);
-                    assert_eq!(pending.tcp_request_count, 0);
                     backend
                         .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
                             "ROUTING_HANDOFF_MAP",
@@ -151,14 +148,6 @@ fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
                             .unwrap()
                             .incarnation,
                         committed.incarnation
-                    );
-                    assert_eq!(
-                        backend
-                            .conn_state_lookup(&key)
-                            .unwrap()
-                            .unwrap()
-                            .tcp_request_count,
-                        0
                     );
                     assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
                     backend

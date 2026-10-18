@@ -249,7 +249,8 @@ pub(crate) fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyho
             let _ = set_sysctl(key, val);
         }
 
-        // Stateless cookies, request migration and early children cannot retain this SYN's proof.
+        // The child proof derives its ISN from `rcv_nxt` at the passive callback, which is only
+        // established for ordinary handshakes; keep the other child-creation paths off.
         for (key, optional) in [
             ("net.ipv4.tcp_syncookies", true),
             ("net.ipv4.tcp_migrate_req", false),
@@ -425,6 +426,36 @@ pub(crate) fn daens_netns_id() -> anyhow::Result<i32> {
     use std::os::fd::AsFd as _;
 
     Ok(netlink::NlSock::new()?.ensure_netns_id(daens_fd()?.as_fd())?)
+}
+
+/// `SO_NETNS_COOKIE` of the owned daens: the id `bpf_get_netns_cookie` reports for sockets
+/// living there, which is how sock_ops tells honk's listeners from every other host socket.
+#[cfg(feature = "ebpf")]
+pub(crate) fn daens_netns_cookie() -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+    use std::os::fd::AsRawFd as _;
+
+    with_daens_netns("read daens netns cookie", || {
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+            .context("create daens cookie probe socket")?;
+        let mut cookie = 0u64;
+        let mut length = size_of::<u64>() as libc::socklen_t;
+        // SAFETY: `cookie` and `length` outlive the call and describe a u64 option value.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NETNS_COOKIE,
+                (&raw mut cookie).cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("SO_NETNS_COOKIE (Linux 5.14 or newer required)");
+        }
+        Ok(cookie)
+    })
 }
 
 /// Run `f` with the calling thread temporarily switched into the `daens`

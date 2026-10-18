@@ -37,13 +37,11 @@ pub(super) fn validate_object(obj: &[u8]) -> anyhow::Result<()> {
             "incompatible locked value BTF for {map}; rebuild the eBPF object"
         );
     }
-    for map in ["TCP_SOCKET_BINDING", "TCP_REQUEST_BINDINGS"] {
-        let value = object_map_value_type(&object, &btf, map)?;
-        anyhow::ensure!(
-            tcp_proof_btf_matches(&btf, value),
-            "incompatible native proof BTF for {map}; rebuild the eBPF object"
-        );
-    }
+    let value = object_map_value_type(&object, &btf, "TCP_SOCKET_BINDING")?;
+    anyhow::ensure!(
+        tcp_proof_btf_matches(&btf, value),
+        "incompatible native proof BTF for TCP_SOCKET_BINDING; rebuild the eBPF object"
+    );
     Ok(())
 }
 
@@ -122,11 +120,7 @@ fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
                 ("trace_id", 4, offset_of!(ConnState, trace_id)),
                 ("incarnation", 8, offset_of!(ConnState, incarnation)),
                 ("tcp_syn_isn", 4, offset_of!(ConnState, tcp_syn_isn)),
-                (
-                    "tcp_request_count",
-                    4,
-                    offset_of!(ConnState, tcp_request_count),
-                ),
+                ("reserved", 4, offset_of!(ConnState, reserved)),
             ][..],
         ),
         (
@@ -228,11 +222,9 @@ pub(super) fn validate_loaded_maps(bpf: &Ebpf) -> anyhow::Result<()> {
         ("ROUTING_HANDOFF_MAP", BPF_MAP_TYPE_HASH, 40, 80, 65536, 1),
         ("RETIRE_ACTIVE", BPF_MAP_TYPE_ARRAY, 4, 4, 1, 0),
         ("RETIRE_FENCE", BPF_MAP_TYPE_HASH, 40, 16, 65536, 1),
-        ("REQUEST_FENCE", BPF_MAP_TYPE_HASH, 16, 8, 65536, 1),
         ("TCP_LIVE_PINS", BPF_MAP_TYPE_HASH, 8, 1, 65536, 1),
         ("FLOW_INCARNATION_SEQUENCE", BPF_MAP_TYPE_ARRAY, 4, 16, 1, 0),
         ("RETIRE_GRACE_ROOT", BPF_MAP_TYPE_ARRAY_OF_MAPS, 4, 4, 1, 0),
-        ("TCP_REQUEST_BINDINGS", BPF_MAP_TYPE_HASH, 16, 120, 65536, 1),
         ("TCP_PUBLISHING", BPF_MAP_TYPE_HASH, 40, 8, 65536, 1),
         ("TCP_SOCKET_BINDING", BPF_MAP_TYPE_SK_STORAGE, 4, 120, 0, 1),
     ] {
@@ -302,7 +294,7 @@ mod tests {
                     ("trace_id", 9, 52),
                     ("incarnation", 2, 56),
                     ("tcp_syn_isn", 9, 64),
-                    ("tcp_request_count", 9, 68),
+                    ("reserved", 9, 68),
                 ][..],
             ),
             (

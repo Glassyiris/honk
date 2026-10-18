@@ -1,6 +1,6 @@
-//! A client kernel's SYN retry must retain the native request's incarnation and
-//! original routing snapshot. Ordinary proxy cases also require the accepted
-//! child to forward real payload.
+//! A client kernel's SYN retry must retain the original publication's incarnation and
+//! routing snapshot. Ordinary proxy cases also require the accepted child to forward
+//! real payload.
 
 use super::super::support::bytes_of;
 use super::*;
@@ -51,21 +51,26 @@ impl TcpOutbound for ForwardDial {
 }
 
 /// Raw capture inside daens: a SYN seen here already crossed the host production TC.
-struct SynTap(OwnedFd);
+pub(super) struct SynTap(OwnedFd);
 
 impl SynTap {
-    fn new() -> anyhow::Result<Self> {
+    pub(super) fn new() -> anyhow::Result<Self> {
         crate::daens::with_daens_netns("tap daens SYNs", || Ok(Self(packet_socket()?)))
     }
 
-    /// Sequence numbers of client pure SYNs for this connection since the last call.
-    fn drain(&self, source: SocketAddr, target: SocketAddr) -> anyhow::Result<Vec<u32>> {
+    /// Client pure SYNs toward `target` from `source_ip` since the last call, as
+    /// (source port, ISN). Draining consumes every queued frame.
+    pub(super) fn drain_syns(
+        &self,
+        source_ip: IpAddr,
+        target: SocketAddr,
+    ) -> anyhow::Result<Vec<(u16, u32)>> {
         let mut syns = Vec::new();
         let octets = |ip: IpAddr| match ip {
             IpAddr::V4(ip) => ip.octets().to_vec(),
             IpAddr::V6(ip) => ip.octets().to_vec(),
         };
-        let (source_ip, target_ip) = (octets(source.ip()), octets(target.ip()));
+        let (source_ip, target_ip) = (octets(source_ip), octets(target.ip()));
         let mut bytes = [0u8; 2048];
         while let Some(length) = recv_frame(&self.0, &mut bytes)? {
             let Some((src, dst, tcp)) = tcp_segment(&bytes[..length], target.is_ipv6()) else {
@@ -73,14 +78,26 @@ impl SynTap {
             };
             if src == source_ip
                 && dst == target_ip
-                && u16::from_be_bytes([tcp[0], tcp[1]]) == source.port()
                 && u16::from_be_bytes([tcp[2], tcp[3]]) == target.port()
                 && tcp[13] & 0x12 == 0x02
             {
-                syns.push(u32::from_be_bytes(tcp[4..8].try_into().unwrap()));
+                syns.push((
+                    u16::from_be_bytes([tcp[0], tcp[1]]),
+                    u32::from_be_bytes(tcp[4..8].try_into().unwrap()),
+                ));
             }
         }
         Ok(syns)
+    }
+
+    /// Sequence numbers of client pure SYNs for this connection since the last call.
+    pub(super) fn drain(&self, source: SocketAddr, target: SocketAddr) -> anyhow::Result<Vec<u32>> {
+        Ok(self
+            .drain_syns(source.ip(), target)?
+            .into_iter()
+            .filter(|(port, _)| *port == source.port())
+            .map(|(_, isn)| isn)
+            .collect())
     }
 }
 
@@ -152,20 +169,14 @@ async fn await_retry(
 }
 
 #[derive(Debug)]
-struct Lineage {
-    conn: ConnState,
-    handoff: RoutingHandoffEntry,
-    redirect: RedirectEntry,
-    requests: Vec<(TcpRequestKey, TcpSocketBinding)>,
+pub(super) struct Lineage {
+    pub(super) conn: ConnState,
+    pub(super) handoff: RoutingHandoffEntry,
+    pub(super) redirect: RedirectEntry,
 }
 
 impl Lineage {
-    async fn read(
-        handle: &ControlPlaneHandle,
-        key: &TuplesKey,
-        source: SocketAddr,
-        target: SocketAddr,
-    ) -> anyhow::Result<Self> {
+    pub(super) async fn read(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Result<Self> {
         let backend = handle.ebpf.read().await;
         Ok(Self {
             conn: backend
@@ -177,19 +188,12 @@ impl Lineage {
             redirect: backend
                 .redirect_track_lookup(&RedirectTuple::from_tuples(key))?
                 .context("redirect missing")?,
-            requests: request_snapshot()?
-                .into_iter()
-                .filter(|(_, binding)| {
-                    binding.tuples.src_port == source.port()
-                        && binding.tuples.dst_port == target.port()
-                })
-                .collect(),
         })
     }
 }
 
 // Lifecycle timestamps may legitimately refresh; every routing byte may not.
-fn routing_view(lineage: &Lineage) -> impl PartialEq + '_ {
+pub(super) fn routing_view(lineage: &Lineage) -> impl PartialEq + '_ {
     let conn = &lineage.conn;
     let (mut handoff, mut redirect) = (lineage.handoff, lineage.redirect);
     handoff.last_seen_ns = 0;
@@ -207,11 +211,6 @@ fn routing_view(lineage: &Lineage) -> impl PartialEq + '_ {
         ),
         bytes_of(&handoff).to_vec(),
         bytes_of(&redirect).to_vec(),
-        lineage
-            .requests
-            .iter()
-            .map(|(key, binding)| (key, bytes_of(binding).to_vec()))
-            .collect::<Vec<_>>(),
     )
 }
 
@@ -298,7 +297,7 @@ impl Client {
         let source = helper.expect("bound").await?.parse()?;
         Ok((Self::Wan(helper), source))
     }
-    async fn retry_count(&mut self) -> anyhow::Result<u32> {
+    pub(super) async fn retry_count(&mut self) -> anyhow::Result<u32> {
         match self {
             Self::Lan { gate, .. } => {
                 tcp_retries(gate.as_ref().context("client gate released")?.as_raw_fd())
@@ -524,7 +523,7 @@ pub(super) fn wan_policy(family: &str) -> anyhow::Result<()> {
 }
 
 /// Both families' proxy cases: the client SYN retries with its SYNACK gated, and the
-/// original request's route must survive; `policy` republishes routing before the retry.
+/// original publication's route must survive; `policy` republishes routing before the retry.
 async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
     let (handle, listener, target, dials) = (&lab.handle, &lab.listener, lab.target, &lab.dials);
     let (client_ns, client, wan_ip) = (&lab.client_ns, lab.client, lab.wan);
@@ -544,19 +543,14 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
     let isn = syns[0];
     let key = conn_key(source, target);
 
-    // The original SYN's request is real; the client then retries with SYNACK gated.
-    let original = Lineage::read(handle, &key, source, target).await?;
-    ensure!(
-        original.requests.len() == 1,
-        "expected one native request for the original SYN, found {:?}",
-        original.requests
-    );
+    // The original SYN's publication is real; the client then retries with SYNACK gated.
+    let original = Lineage::read(handle, &key).await?;
     let incarnation = original.conn.incarnation;
     ensure!(
         incarnation != 0
+            && original.conn.tcp_syn_isn == isn
             && original.handoff.incarnation == incarnation
-            && original.redirect.incarnation == incarnation
-            && original.requests[0].1.handoff.incarnation == incarnation,
+            && original.redirect.incarnation == incarnation,
         "original SYN did not publish one coherent incarnation: {original:?}"
     );
 
@@ -582,7 +576,7 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
     await_retry(&tap, source, target, &mut syns).await?;
 
     // The retry already crossed host TC: this read follows its publication decision.
-    let retry = Lineage::read(handle, &key, source, target).await?;
+    let retry = Lineage::read(handle, &key).await?;
     let mut violations = Vec::new();
     compare(&original, &retry, &mut violations);
 
@@ -597,12 +591,6 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
             peer == source && accepted.local_addr()? == target,
             "wrong transparent socket endpoints"
         );
-        let (request, original_binding) = &original.requests[0];
-        expect(
-            &mut violations,
-            request_snapshot()?.iter().all(|(other, _)| other != request),
-            || "completed handshake retained its native request proof".into(),
-        );
         let ownership = handle
             .ebpf
             .read()
@@ -616,32 +604,27 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
                 return Ok(());
             }
         };
-        tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
-            loop {
-                let state = handle.ebpf.read().await.conn_state_lookup(&key)?
-                    .context("completed request lost its conn owner")?;
-                ensure!(state.incarnation == incarnation, "request completion changed its owner");
-                if state.tcp_request_count == 0 {
-                    ensure!(state.tcp_syn_flags & honk_ebpf_common::conn::TCP_SYN_REQUEST_SEEN != 0,
-                        "request completion forgot its prior request lifetime");
-                    return Ok::<_, anyhow::Error>(());
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.context("completed request retained pending accounting")??;
         expect(
             &mut violations,
-            bytes_of(&binding) == bytes_of(original_binding),
-            || {
-                format!(
-                    "accepted FD proof differs from the original request proof: {binding:?} vs {original_binding:?}"
-                )
-            },
+            binding.handoff.incarnation == incarnation && binding.syn_isn == isn,
+            || format!("accepted FD proves a different SYN: {binding:?}"),
         );
         expect(
             &mut violations,
             bytes_of(&binding.tuples) == bytes_of(&key),
             || "accepted FD proves different endpoints".into(),
+        );
+        let (mut proven, mut published) = (binding.handoff, original.handoff);
+        proven.last_seen_ns = 0;
+        published.last_seen_ns = 0;
+        expect(
+            &mut violations,
+            bytes_of(&proven) == bytes_of(&published),
+            || {
+                format!(
+                    "accepted FD handoff differs from the original publication: {proven:?} vs {published:?}"
+                )
+            },
         );
         if !violations.is_empty() {
             return Ok(());

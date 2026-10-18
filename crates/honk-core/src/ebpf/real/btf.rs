@@ -126,28 +126,6 @@ impl<'a> Btf<'a> {
         }
         None
     }
-    pub(super) fn function_proto(&self, name: &str) -> Option<usize> {
-        let function = self.find_type(12, name)?;
-        let prototype = self.resolve_modifiers(self.u32_at(function.checked_add(8)?)?)?;
-        (self.kind(prototype)? == 13).then_some(prototype)
-    }
-
-    pub(super) fn pointer_to(&self, type_id: u32, name: &str) -> bool {
-        let Some(pointer) = self.resolve_modifiers(type_id) else {
-            return false;
-        };
-        if self.kind(pointer) != Some(2) {
-            return false;
-        }
-        let Some(target) = self
-            .u32_at(pointer + 8)
-            .and_then(|id| self.resolve_modifiers(id))
-        else {
-            return false;
-        };
-        self.kind(target) == Some(4)
-            && self.u32_at(target).and_then(|offset| self.string(offset)) == Some(name)
-    }
 
     pub(super) fn unsigned_integer_width(&self, type_id: u32, width: u32) -> bool {
         let Some(cursor) = self.resolve_modifiers(type_id) else {
