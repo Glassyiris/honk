@@ -139,7 +139,7 @@ async fn http_fixture() -> (
         NodeProtocol::Socks5,
         Arc::new(DirectConnectHandler),
     ));
-    let prober = Arc::new(crate::control::probers::ProxyHttpProber::new(
+    let prober = Arc::new(crate::control::probers::http::ProxyHttpProber::new(
         cp.config_handle(),
         Arc::new(registry),
         cp.runtime_registry(),

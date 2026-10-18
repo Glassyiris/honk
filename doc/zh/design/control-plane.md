@@ -21,7 +21,7 @@
     - `routing_matcher.rs` — [原子路由发布](./routing.md#同步槽与原子发布)与[内核规则 lowering](./routing.md#受限原生后端)。
     - `quic.rs`、`packet_sniffer.rs`、`tcp_sniff.rs` — 分别负责 QUIC 解密/重组、逐流嗅探会话与 TCP 负缓存。
     - `udp_endpoint/mod.rs` — `UdpEndpointPool`；[endpoint 事务](#udp-endpoint-流水线)。
-    - `probers.rs` — `ProxyHttpProber`、`ProxyUdpProber`；[健康探测](./groups.md#健康状态与探测)。
+    - `probers.rs` — `ProxyUdpProber`；`probers/http.rs` — `ProxyHttpProber`；[健康探测](./groups.md#健康状态与探测)。
     - `janitor.rs` — `BpfJanitor` 的调度与压力策略；`janitor/sweep.rs` 持有 [map 维护](./datapath.md#用户空间维护与计数)的有界扫描与 fenced retirement；`janitor/health.rs` 持有 map 压力与 BPF 失败计数告警。
     - `retirement_worker.rs` — joined TCP/UDP/hint 退役所有权；`drain.rs` 持有 `DrainTracker` 与[已接受流的排空](#reload-与运行时-generation)。
 

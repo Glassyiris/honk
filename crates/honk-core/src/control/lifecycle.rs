@@ -236,7 +236,7 @@ impl ControlPlane {
                 c.global.tcp_check_http_method.clone()
             };
             if !check_url.is_empty() {
-                let prober = Arc::new(ProxyHttpProber::new(
+                let prober = Arc::new(super::probers::http::ProxyHttpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
