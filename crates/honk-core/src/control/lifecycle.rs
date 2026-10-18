@@ -444,17 +444,6 @@ impl ControlPlane {
                             .await
                     }
                 }
-                if let Some(queue) = epoch.queue.as_mut()
-                    && let Err(error) = queue.check_startup_health().await
-                {
-                    self.cleanup_nfqueue_startup_failure(&mut epoch.queue).await;
-                    epoch.queue = None;
-                    self.degrade_nfqueue_startup(
-                        &mut epoch.listeners.nfqueue_enabled,
-                        error.into(),
-                    )
-                    .await;
-                }
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -479,6 +468,15 @@ impl ControlPlane {
     }
 
     async fn open_epoch(&mut self, epoch: &mut RuntimeEpoch) -> anyhow::Result<()> {
+        #[cfg(feature = "ebpf")]
+        if let Some(queue) = epoch.queue.as_mut()
+            && let Err(error) = queue.check_startup_health().await
+        {
+            self.cleanup_nfqueue_startup_failure(&mut epoch.queue).await;
+            epoch.queue = None;
+            self.degrade_nfqueue_startup(&mut epoch.listeners.nfqueue_enabled, error.into())
+                .await;
+        }
         #[cfg(feature = "ebpf")]
         let queue_ready = epoch
             .queue
