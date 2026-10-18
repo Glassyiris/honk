@@ -321,6 +321,8 @@ The independent, opt-in `native-api` feature (build with `--features native-api`
 
 `observe/flows/producer.rs` owns FlowGuard updates and generic selection evidence shared by TCP/UDP and DNS. DNS wire input models live with the other records; `observe/flows/dns.rs` retains only its lookup/catalog scopes and DNS-specific capture. `auth.rs` owns sessions, bounded admission and one tracked blocking job; its storage child publishes short-lived credential state without holding that state lock across KDF or SQL.
 
+`native_api/events/http.rs` owns event query/cursor parsing, Accept negotiation and HTTP stream responses shared with logs; replay, signing, subscriptions and frame-budget accounting remain in `native_api/events.rs`.
+
 `control/connection/observation.rs` owns TCP/UDP evidence assembly from captured handoff, route, selection and transport facts. Connection orchestration does not construct wire records or re-evaluate current configuration for historical evidence; disabled recording avoids capture allocation, and exact connection closure remains independent of recording.
 
 `DnsRecorder` owns the concrete client DNS history in `observe/dns/history.rs`; recording epochs, ingress admission and byte/count eviction stay in the engine. `native_api/dns/log.rs` reads one lock-held view for cursor-bound filtering, listener-secret masking and whole-record JSON pages.

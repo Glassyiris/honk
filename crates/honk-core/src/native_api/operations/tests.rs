@@ -441,7 +441,7 @@ async fn events_describe_only_accepted_transitions_in_order() {
         .header("accept", "text/event-stream")
         .body(Body::empty())
         .unwrap();
-    let response = events::serve(&state, request, &RequestId("test".into()))
+    let response = events::http::serve(&state, request, &RequestId("test".into()))
         .await
         .unwrap();
     let mut stream = response.into_body().into_data_stream();

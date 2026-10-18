@@ -187,7 +187,7 @@ impl LogStore {
     }
 
     fn response(self: &Arc<Self>, request: &Request, id: &RequestId) -> Result<Response, ApiError> {
-        Ok(events::stream_response(self.subscribe(request, id)?))
+        Ok(events::http::stream_response(self.subscribe(request, id)?))
     }
 
     #[cfg(test)]
@@ -214,7 +214,7 @@ impl LogStore {
         }) {
             return Err(invalid(id));
         }
-        let cursor = events::request_cursor(request, id)?;
+        let cursor = events::http::request_cursor(request, id)?;
         let filter = events::Filter::logs(level, target);
         if !self.allowed {
             return Err(error(
@@ -509,7 +509,7 @@ pub(super) async fn serve(
             super::settings::Demand::LOGS,
             || state.observation.logs.subscribe(&request, id),
         )?;
-        Ok(events::stream_response(subscription))
+        Ok(events::http::stream_response(subscription))
     } else {
         state.observation.logs.response(&request, id)
     }

@@ -308,6 +308,8 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 `observe/flows/producer.rs` 持有 FlowGuard 更新及 TCP/UDP、DNS 共用的组选择证据投影。DNS wire 输入模型归入统一 record；`observe/flows/dns.rs` 保留 lookup/catalog scope 与 DNS 专属捕获。`auth.rs` 持有会话、有界准入和唯一受跟踪的阻塞任务；storage 子模块发布短时持有的凭据状态，不跨 KDF 或 SQL 持有状态锁。
 
+`native_api/events/http.rs` 负责事件 query/cursor 解析、Accept 协商以及与日志共用的 HTTP 流响应；replay、签名、订阅和帧预算核算仍归 `native_api/events.rs` 所有。
+
 `control/connection/observation.rs` 根据已捕获的 handoff、route、selection 和 transport 事实组装 TCP/UDP 证据。连接编排不构造 wire record，也不使用当前配置重算历史；关闭记录时不分配 capture，精确连接关闭仍独立于记录。
 
 `DnsRecorder` 在 `observe/dns/history.rs` 中持有具体的客户端 DNS 历史；记录 epoch、入口准入及按字节/条数淘汰归引擎所有。`native_api/dns/log.rs` 读取同一持锁视图，完成 cursor 绑定的过滤、listener secret 遮蔽及完整记录的 JSON 分页投影。

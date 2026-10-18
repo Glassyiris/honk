@@ -1,4 +1,5 @@
 use super::*;
+use axum::{body::Body, response::IntoResponse};
 use futures::{FutureExt, StreamExt};
 
 fn hub() -> Arc<EventHub> {
@@ -7,10 +8,6 @@ fn hub() -> Arc<EventHub> {
 
 fn all() -> Filter {
     Filter::new(63, None)
-}
-
-fn request_id() -> RequestId {
-    RequestId("test-request".into())
 }
 
 fn subscribe(hub: &Arc<EventHub>, filter: Filter, cursor: Option<&str>) -> Subscription {
@@ -464,76 +461,6 @@ async fn flow_filter_keeps_global_events_but_excludes_other_flows() {
             .starts_with("event: runtime.updated\n")
     );
     assert_eq!(cursor(&next(&mut resumed).await), cursor(&live));
-}
-
-#[test]
-fn request_validation_rejects_ambiguous_filters_headers_and_accept() {
-    for uri in [
-        "/api/v1/events?unknown=1",
-        "/api/v1/events?kinds=flow.updated&kinds=flow.gap",
-        "/api/v1/events?kinds=flow.updated,flow.updated",
-        "/api/v1/events?kinds=flow.updated,unknown",
-        "/api/v1/events?kinds=",
-        "/api/v1/events?flow_id=",
-    ] {
-        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
-        assert_eq!(
-            request_options(&request, &request_id())
-                .err()
-                .unwrap()
-                .into_response()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
-    for accept in [
-        "application/json",
-        "text/event-stream;q=0, */*;q=1",
-        "invalid",
-        "text/event-stream;q=NaN",
-        "text/event-stream;q=1e0",
-        "text/event-stream;q=0.0001",
-        "text/event-stream;q=1.001",
-        "text/event-stream;q=1;q=0",
-        "te xt/event-stream",
-    ] {
-        let request = Request::builder()
-            .header(header::ACCEPT, accept)
-            .body(Body::empty())
-            .unwrap();
-        assert!(request_options(&request, &request_id()).is_err());
-    }
-    for accept in [
-        "text/event-stream",
-        "*/*",
-        "application/json, text/event-stream;q=0.5",
-        "text/event-stream;charset=utf-8",
-        "text/event-stream;charset=\"utf-8\";q=1.000",
-    ] {
-        let request = Request::builder()
-            .header(header::ACCEPT, accept)
-            .body(Body::empty())
-            .unwrap();
-        assert!(request_options(&request, &request_id()).is_ok());
-    }
-    let request = Request::builder()
-        .header("last-event-id", "first")
-        .header("last-event-id", "second")
-        .body(Body::empty())
-        .unwrap();
-    assert!(request_options(&request, &request_id()).is_err());
-    let first = Request::builder()
-        .uri("/api/v1/events?kinds=flow.updated,flow.gap")
-        .body(Body::empty())
-        .unwrap();
-    let second = Request::builder()
-        .uri("/api/v1/events?kinds=flow.gap,flow.updated")
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(
-        request_options(&first, &request_id()).unwrap().0.binding,
-        request_options(&second, &request_id()).unwrap().0.binding
-    );
 }
 
 #[tokio::test]

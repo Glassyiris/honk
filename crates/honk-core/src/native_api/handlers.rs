@@ -516,7 +516,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             resource(
                 get(
                     |State(state): App, Extension(id): Id, request: Request| async move {
-                        respond(events::serve(&state, request, &id).await, id)
+                        respond(events::http::serve(&state, request, &id).await, id)
                     },
                 ),
                 &["GET"],
