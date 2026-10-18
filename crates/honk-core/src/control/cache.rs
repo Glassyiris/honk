@@ -71,6 +71,7 @@ impl ControlPlane {
                         .map(|group| group.name.clone())
                         .collect(),
                     nodes: config.nodes.iter().map(|node| node.name.clone()).collect(),
+                    clash: crate::state::startup::clash_owner_active(&config),
                 }
             };
             crate::state::import::import_cache_db(&state, &legacy, &scope);

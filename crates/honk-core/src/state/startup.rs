@@ -110,6 +110,15 @@ pub(crate) struct ClaimedState {
     pub(crate) subscriptions: Option<subscription::SubscriptionStore>,
 }
 
+/// Whether the Clash API owns the persisted mode and GLOBAL rows.
+pub(crate) fn clash_owner_active(config: &Config) -> bool {
+    let experimental = &config.experimental;
+    experimental.cache_file.stores_mode()
+        && cfg!(feature = "clash-api")
+        && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
+        && !experimental.clash_api.external_controller.is_empty()
+}
+
 /// Startup changes to the state db, made with the instance lock held: the
 /// reset of a corrupt non-strict db, clearing disabled owners' tables, and the
 /// legacy `.sub` import and removal. The previous instance has exited, so a
@@ -132,10 +141,7 @@ pub(crate) fn claim_state(
         let owners = state::ActiveOwners {
             cache: experimental.cache_file.stores_selections(),
             dns: experimental.cache_file.stores_dns(),
-            clash: experimental.cache_file.stores_mode()
-                && cfg!(feature = "clash-api")
-                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
-                && !experimental.clash_api.external_controller.is_empty(),
+            clash: clash_owner_active(config),
             subscriptions: config.global.store_subscribe,
         };
         if let Err(error) = state::clear_inactive(state, owners) {
