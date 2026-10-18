@@ -478,3 +478,50 @@ async fn slow_public_file_readers_release_capacity_at_the_connection_deadline() 
     );
     app.shutdown().await;
 }
+
+#[tokio::test]
+async fn directory_ui_honors_a_wildcard_that_accepts_the_gzip_sibling() {
+    let directory = tempfile::tempdir().unwrap();
+    let ui = directory.path().join("ui");
+    std::fs::create_dir_all(ui.join("assets")).unwrap();
+    for (path, content) in [
+        ("index.html", "plain index"),
+        ("index.html.gz", "gzip index"),
+        ("assets/app.js", "plain asset"),
+        ("assets/app.js.gz", "gzip asset"),
+    ] {
+        std::fs::write(ui.join(path), content).unwrap();
+    }
+    let app =
+        TestApp::new(|config| config.experimental.native_api.ui = ui.to_str().unwrap().into())
+            .await;
+    for (path, gzip, plain) in [
+        ("/ui/assets/app.js", "gzip asset", "plain asset"),
+        ("/ui/deep/navigation", "gzip index", "plain index"),
+    ] {
+        for (encoding, content_encoding, body) in [
+            ("*;q=1, identity;q=0", Some("gzip"), gzip),
+            ("*", Some("gzip"), gzip),
+            ("*;q=0.5, gzip;q=0", None, plain),
+            ("*;q=0", None, plain),
+        ] {
+            let response = app
+                .client
+                .get(app.url(path))
+                .header("accept-encoding", encoding)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path} {encoding}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-encoding")
+                    .map(|value| value.to_str().unwrap()),
+                content_encoding,
+                "{path} {encoding}"
+            );
+            assert_eq!(response.text().await.unwrap(), body, "{path} {encoding}");
+        }
+    }
+}
