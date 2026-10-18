@@ -64,7 +64,7 @@ pub(super) enum UdpSlowPathWork {
         udp_permit: tokio::sync::OwnedSemaphorePermit,
         response: Vec<u8>,
         #[cfg(feature = "native-api")]
-        query: Option<Bytes>,
+        query: Bytes,
         #[cfg(feature = "native-api")]
         ingress: crate::dns::query::IngressProfile,
         #[cfg(feature = "native-api")]
@@ -187,10 +187,7 @@ fn begin_udp_dns_query(
                     udp_permit,
                     response: crate::dns::response::build_dns_refused(data.as_slice()),
                     #[cfg(feature = "native-api")]
-                    query: dns_controller
-                        .dns_service()
-                        .observation_enabled()
-                        .then(|| data.into_bytes()),
+                    query: data.into_bytes(),
                     #[cfg(feature = "native-api")]
                     ingress: validated.ingress(),
                     #[cfg(feature = "native-api")]
@@ -662,10 +659,10 @@ impl UdpLoopState {
                         );
                     };
                     #[cfg(feature = "native-api")]
-                    if let Some(raw) = query.as_deref() {
+                    {
                         let operation = std::pin::pin!(operation);
                         let operation = crate::observe::flows::dns::client_scope(
-                            raw,
+                            &query,
                             ingress,
                             crate::dns::query::DnsRequestMeta::new(
                                 Some(src_addr.ip()),
@@ -681,17 +678,6 @@ impl UdpLoopState {
                             crate::observe::vocab::ConnectionState::Closed,
                             "dns_refusal_completed",
                         );
-                    } else {
-                        operation.await;
-                        observation.finish(
-                            crate::observe::vocab::ConnectionState::Closed,
-                            "dns_refusal_completed",
-                        );
-                    }
-                    #[cfg(not(feature = "native-api"))]
-                    operation.await;
-                    #[cfg(feature = "native-api")]
-                    if let Some(query) = query {
                         dns_controller.dns_service().observer.observe_client(
                             &query,
                             ingress,
@@ -701,6 +687,8 @@ impl UdpLoopState {
                             started.elapsed(),
                         );
                     }
+                    #[cfg(not(feature = "native-api"))]
+                    operation.await;
                 });
             }
         }

@@ -154,3 +154,89 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
         assert!(destination.validated_dns.is_none());
     }
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn transparent_dns_refusal_records_flow_evidence_without_dns_log() {
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    let mut config = honk_config::Config::default();
+    config.global.nfqueue_enable = false;
+    config.global.store_subscribe = false;
+    config.experimental.native_api.enabled = true;
+    config.experimental.native_api.record_dns_log = false;
+    config.experimental.native_api.listen = api_addr.to_string();
+    config.experimental.native_api.secret = "refusal-flow-test".into();
+    config.ensure_builtin_nodes();
+    let mut plane = crate::control::tests::support::control_plane(config);
+    let state = Arc::new(
+        crate::native_api::NativeState::new(
+            &mut plane,
+            api_addr,
+            std::time::SystemTime::now(),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap(),
+    );
+    let native = Arc::clone(&state.observation);
+    let api_server = crate::native_api::NativeServer::start(api_listener, state);
+    native.attach_for_test();
+    let loop_state = UdpLoopState::new(&plane, false);
+    let _held: Vec<_> = (0..2048)
+        .map(|_| plane.dns_controller.try_admit_query(false).unwrap())
+        .collect();
+
+    let query = dns_query_payload();
+    let work = begin_udp_dns_query(
+        &plane.dns_controller,
+        &plane.stats,
+        DatagramPayload::Borrowed(&query),
+        validate_exact_dns_query(&query).unwrap(),
+    );
+    assert!(matches!(work, UdpSlowPathWork::DnsRefused { .. }));
+    loop_state.spawn_work(addr("127.0.0.1:40000"), addr("127.0.0.1:53"), work);
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let steps = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page: serde_json::Value = client
+                .get(format!("http://{api_addr}/api/v1/flows"))
+                .bearer_auth("refusal-flow-test")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(flow) = page["flows"]
+                .as_array()
+                .and_then(|flows| flows.first())
+                .filter(|flow| flow["state"] == "closed")
+            {
+                let detail: serde_json::Value = client
+                    .get(format!(
+                        "http://{api_addr}/api/v1/flows/{}",
+                        flow["id"].as_str().unwrap()
+                    ))
+                    .bearer_auth("refusal-flow-test")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                break detail["trace"]["steps"].as_array().unwrap().clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(steps.iter().any(|step| {
+        step["stage"] == "dns"
+            && step["data"]["status"] == "rejected"
+            && step["data"]["error"] == "admission_refused"
+    }));
+    api_server.shutdown().await;
+}
