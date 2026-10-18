@@ -177,6 +177,13 @@ impl ControlPlane {
         error.map_or(Ok(()), Err)
     }
 
+    /// Rolls back a startup that failed before `run`; the original error stays first.
+    pub(crate) async fn abort_startup(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.shutdown_runtime(None, Some(error))
+            .await
+            .expect_err("a retained startup error fails the rollback")
+    }
+
     // Tests enter without an epoch, like a startup that failed before binding.
     pub(in crate::control) async fn shutdown_runtime(
         &mut self,

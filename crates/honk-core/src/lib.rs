@@ -748,6 +748,20 @@ pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
     );
 }
 
+/// Startup failed after the backend, watcher and maintenance owners went live;
+/// the singleton lock must outlive their joined cleanup.
+async fn abort_startup(
+    control_plane: &mut control::ControlPlane,
+    subscriptions: subscription::SubscriptionSupervisor,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let error = control_plane.abort_startup(error).await;
+    if let Err(shutdown) = subscriptions.shutdown().await {
+        warn!(%shutdown, "subscription startup state failed to stop");
+    }
+    error
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "native-api")]
     let started_at = std::time::SystemTime::now();
@@ -759,8 +773,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut diagnostics = Vec::new();
     #[cfg(feature = "native-api")]
     let mut native_sources = None;
-    #[cfg(feature = "native-api")]
-    let mut database = None;
     #[cfg(not(feature = "native-api"))]
     anyhow::ensure!(
         cli.store == ConfigStore::File,
@@ -769,6 +781,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     // Everything else in `run` drops before it.
     let _instance_lock = instance_lock(mock_mode)?;
+    #[cfg(feature = "native-api")]
+    let mut database = None;
     let startup = (|| -> anyhow::Result<_> {
         #[cfg(feature = "native-api")]
         let mut config = if cli.store == ConfigStore::Db {
@@ -1475,12 +1489,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mode_state: mode::SharedModeState =
         std::sync::Arc::new(parking_lot::RwLock::new(mode_value));
     control_plane.set_mode_state(mode_state.clone());
-    control_plane.start_datapath_flags_coordinator()?;
+    if let Err(error) = control_plane.start_datapath_flags_coordinator() {
+        return Err(abort_startup(&mut control_plane, subscription_supervisor, error).await);
+    }
 
     #[cfg(feature = "native-api")]
     let mut native = match native_observation {
-        Some(observation) => Some(
-            native_api::NativeRuntime::start(
+        Some(observation) => {
+            match native_api::NativeRuntime::start(
                 &mut control_plane,
                 observation,
                 started_at,
@@ -1488,8 +1504,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 engine_level,
                 &native_log_binding,
             )
-            .await?,
-        ),
+            .await
+            {
+                Ok(native) => Some(native),
+                Err(error) => {
+                    return Err(
+                        abort_startup(&mut control_plane, subscription_supervisor, error).await,
+                    );
+                }
+            }
+        }
         None => None,
     };
 
