@@ -1657,3 +1657,31 @@ fn lowercase_copies_only_names_that_change() {
     assert_eq!(lowercase("WWW.Example.com"), "www.example.com");
     assert_eq!(lowercase("É.example"), "é.example");
 }
+
+#[test]
+fn shared_matchers_intern_exact_ordered_lists_among_many_distinct_ones() {
+    use ipnet::IpNet;
+
+    let list = |index: u32| -> Vec<IpNet> {
+        vec![
+            IpNet::new(
+                IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + index)),
+                32,
+            )
+            .unwrap(),
+            "192.0.2.0/24".parse().unwrap(),
+        ]
+    };
+    let mut shared = SharedMatchers::default();
+    let first: Vec<_> = (0..20_000).map(|index| shared.ip(list(index))).collect();
+    for index in [0, 1, 9_999, 19_999] {
+        assert!(Arc::ptr_eq(&first[index as usize], &shared.ip(list(index))));
+    }
+    let mut reversed = list(0);
+    reversed.reverse();
+    assert!(!Arc::ptr_eq(&first[0], &shared.ip(reversed)));
+
+    let mut rebuilt = SharedMatchers::default();
+    rebuilt.offer(&first);
+    assert!(Arc::ptr_eq(&first[7], &rebuilt.ip(list(7))));
+}
