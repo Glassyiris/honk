@@ -119,6 +119,8 @@ impl Outbounds<'_> {
     /// is `None`: `Router::route_action` for the outbound name, then the
     /// authoritative group/leaf resolution for the node to dial. `setting`
     /// names the detour's setting in the log, and `purpose` the download in errors.
+    /// `strict_resolver`, when set, is the only resolver the host is looked up
+    /// with, without the system fallback; unusable, it leaves the address unknown.
     pub(crate) async fn decide(
         &self,
         detour: Option<&str>,
@@ -126,15 +128,22 @@ impl Outbounds<'_> {
         purpose: &str,
         (host, port): (&str, u16),
         original: Option<&ScoreContinuation>,
+        strict_resolver: Option<&str>,
     ) -> anyhow::Result<Decision> {
         let host_ip = parse_host_ip(host);
-        let resolved_ip = match host_ip {
-            Some(ip) => Some(ip),
-            None => honk_outbound::bootstrap::resolve(host)
-                .await
-                .ok()
-                .and_then(|addresses| addresses.into_iter().next()),
+        let resolved = match (host_ip, strict_resolver) {
+            (Some(ip), _) => Ok(vec![ip]),
+            (None, Some(resolver)) => {
+                match honk_outbound::bootstrap::BootstrapResolver::parse(resolver) {
+                    Some(resolver) => resolver.query(host).await,
+                    None => Err(std::io::ErrorKind::NotFound.into()),
+                }
+            }
+            (None, None) => honk_outbound::bootstrap::resolve(host).await,
         };
+        let resolved_ip = resolved
+            .ok()
+            .and_then(|addresses| addresses.into_iter().next());
         let dst_ip = resolved_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let domain = host_ip.is_none().then(|| host.to_string());
         let info = ConnectionInfo {
@@ -353,10 +362,10 @@ impl Outbounds<'_> {
         purpose: &str,
         request: &Request<'_>,
     ) -> Result<(Reply, Option<String>), Failed> {
-        let detour = match detour {
+        let (detour, strict_resolver) = match detour {
             Detour::Direct => return Ok((fetch_direct(request).await?, None)),
-            Detour::Routing => None,
-            Detour::Group(group) => Some(group),
+            Detour::Routing => (None, None),
+            Detour::Group(group) => (Some(group), request.bootstrap),
         };
         let host = request.url.host_str().ok_or("invalid_source")?;
         let port = request
@@ -366,7 +375,14 @@ impl Outbounds<'_> {
         let by = request.deadline.headers;
         let decision = timeout_at(
             by,
-            self.decide(detour, setting, purpose, (host, port), None),
+            self.decide(
+                detour,
+                setting,
+                purpose,
+                (host, port),
+                None,
+                strict_resolver,
+            ),
         )
         .await
         .map_err(|_| "download_timeout")?

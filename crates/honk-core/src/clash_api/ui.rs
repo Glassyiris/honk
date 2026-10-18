@@ -222,6 +222,7 @@ async fn decide_route(
             "external UI download",
             (host, port),
             original,
+            None,
         )
         .await
         .map(|decision| decision.route)

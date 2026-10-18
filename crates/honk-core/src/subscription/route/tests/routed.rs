@@ -234,11 +234,8 @@ async fn a_group_override_goes_through_the_group_whatever_the_rules_say() {
     assert_eq!(requests.lock().len(), 1);
 }
 
-/// The fetch is the Score business it was planned as: admitted before it
-/// runs, so the next selection rotates off the node it used.
-#[tokio::test]
-async fn a_score_group_fetch_is_admitted_and_rotates_the_next_selection() {
-    let (address, _) = server().await;
+/// Group `score` holds two nodes dialed through [`Tunnel`], and no rule applies.
+fn scored_routing() -> (SharedOutbounds, Arc<AtomicUsize>, [Node; 2]) {
     let nodes = ["a", "b"].map(|name| {
         let mut node = Node {
             name: name.into(),
@@ -280,26 +277,42 @@ async fn a_score_group_fetch_is_admitted_and_rotates_the_next_selection() {
             honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
         ))),
     };
-    let selected = |routing: &SharedOutbounds| {
-        let routing = routing.clone();
-        async move {
-            let decision = routing
-                .outbounds()
-                .decide(
-                    Some("score"),
-                    "subscription.download_detour",
-                    "subscription download",
-                    ("127.0.0.1", address.port()),
-                    None,
-                )
-                .await
-                .unwrap();
-            match decision.route {
-                crate::download_route::Route::Proxy { node, .. } => node.id,
-                _ => panic!("the Score group resolves to a proxy leaf"),
-            }
-        }
-    };
+    (routing, dials, nodes)
+}
+
+async fn decide_score(
+    routing: &SharedOutbounds,
+    host: &str,
+    strict_resolver: Option<&str>,
+) -> crate::download_route::Route {
+    routing
+        .outbounds()
+        .decide(
+            Some("score"),
+            "subscription.download_detour",
+            "subscription download",
+            (host, 80),
+            None,
+            strict_resolver,
+        )
+        .await
+        .unwrap()
+        .route
+}
+
+async fn selected(routing: &SharedOutbounds) -> uuid::Uuid {
+    match decide_score(routing, "127.0.0.1", None).await {
+        crate::download_route::Route::Proxy { node, .. } => node.id,
+        _ => panic!("the Score group resolves to a proxy leaf"),
+    }
+}
+
+/// The fetch is the Score business it was planned as: admitted before it
+/// runs, so the next selection rotates off the node it used.
+#[tokio::test]
+async fn a_score_group_fetch_is_admitted_and_rotates_the_next_selection() {
+    let (address, _) = server().await;
+    let (routing, dials, nodes) = scored_routing();
     assert_eq!(selected(&routing).await, nodes[0].id);
     assert_eq!(
         selected(&routing).await,
@@ -321,6 +334,28 @@ async fn a_score_group_fetch_is_admitted_and_rotates_the_next_selection() {
     assert_eq!(dials.load(Ordering::SeqCst), 1);
     assert_eq!(starts(), 1, "the executed fetch was admitted");
     assert_eq!(selected(&routing).await, nodes[1].id);
+}
+
+/// A forced group's host is never looked up through the system resolver when
+/// the request names its own resolver, whose failure leaves the family unknown.
+#[tokio::test]
+async fn a_forced_group_with_a_strict_resolver_never_falls_back_to_system_dns() {
+    honk_outbound::bootstrap::set_global(None);
+    let (routing, _, _) = scored_routing();
+    let family = |route| match route {
+        crate::download_route::Route::Proxy { feedback, .. } => {
+            feedback.unwrap().context().target_family
+        }
+        _ => panic!("the Score group resolves to a proxy leaf"),
+    };
+    assert!(
+        family(decide_score(&routing, "localhost", None).await).is_some(),
+        "without a strict resolver /etc/hosts answers"
+    );
+    assert_eq!(
+        family(decide_score(&routing, "localhost", Some("")).await),
+        None
+    );
 }
 
 /// On a fresh install the rules may send a subscription to a group of the
