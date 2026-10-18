@@ -234,6 +234,95 @@ async fn a_group_override_goes_through_the_group_whatever_the_rules_say() {
     assert_eq!(requests.lock().len(), 1);
 }
 
+/// The fetch is the Score business it was planned as: admitted before it
+/// runs, so the next selection rotates off the node it used.
+#[tokio::test]
+async fn a_score_group_fetch_is_admitted_and_rotates_the_next_selection() {
+    let (address, _) = server().await;
+    let nodes = ["a", "b"].map(|name| {
+        let mut node = Node {
+            name: name.into(),
+            outbound: OutboundConfig::from_protocol(NodeProtocol::Socks5),
+            address: "192.0.2.1".into(),
+            port: 1080,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    });
+    let config = Config {
+        groups: vec![Group {
+            name: "score".into(),
+            policy: honk_config::group::GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        }],
+        nodes: nodes.to_vec(),
+        ..Default::default()
+    };
+    let dials = Arc::new(AtomicUsize::new(0));
+    let mut proxy_registry = ProxyRegistry::new();
+    proxy_registry.register(ProtocolEntry::new(
+        NodeProtocol::Socks5,
+        Arc::new(Tunnel {
+            dials: Arc::clone(&dials),
+        }),
+    ));
+    let routing = SharedOutbounds {
+        router: Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+        group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+            &config.groups,
+            &config.nodes,
+        )))),
+        config: Arc::new(RwLock::new(Arc::new(config))),
+        proxy_registry: Arc::new(proxy_registry),
+        runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
+        ))),
+    };
+    let selected = |routing: &SharedOutbounds| {
+        let routing = routing.clone();
+        async move {
+            let decision = routing
+                .outbounds()
+                .decide(
+                    Some("score"),
+                    "subscription.download_detour",
+                    "subscription download",
+                    ("127.0.0.1", address.port()),
+                    None,
+                )
+                .await
+                .unwrap();
+            match decision.route {
+                crate::download_route::Route::Proxy { node, .. } => node.id,
+                _ => panic!("the Score group resolves to a proxy leaf"),
+            }
+        }
+    };
+    assert_eq!(selected(&routing).await, nodes[0].id);
+    assert_eq!(
+        selected(&routing).await,
+        nodes[0].id,
+        "an unbegun plan does not rotate"
+    );
+    let starts = || {
+        routing
+            .group_manager
+            .read()
+            .score_state()
+            .root_business_starts()
+    };
+    assert_eq!(starts(), 0);
+    manager(routing.clone())
+        .fetch(&subscription(address, "score"))
+        .await
+        .unwrap();
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    assert_eq!(starts(), 1, "the executed fetch was admitted");
+    assert_eq!(selected(&routing).await, nodes[1].id);
+}
+
 /// On a fresh install the rules may send a subscription to a group of the
 /// nodes it supplies itself. The fetch fails with a specific error and never
 /// goes direct.

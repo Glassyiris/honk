@@ -15,8 +15,8 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::{
-    ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
-    SharedGroupManager,
+    ScoreAttempt, ScoreContinuation, ScoreOutcome, ScoreSelectionContext, ScoreTarget,
+    SelectionNetwork, SharedGroupManager,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry, TcpOutbound};
 use honk_outbound::runtime::{
@@ -72,25 +72,11 @@ pub(crate) struct NoUsableNode {
 /// Where the download goes.
 pub(crate) enum Route {
     Direct {
-        #[cfg_attr(
-            not(feature = "clash-api"),
-            allow(
-                dead_code,
-                reason = "only the Clash UI download reports Score feedback"
-            )
-        )]
         feedback: Option<ScoreAttempt>,
     },
     Block,
     Proxy {
         node: Box<Node>,
-        #[cfg_attr(
-            not(feature = "clash-api"),
-            allow(
-                dead_code,
-                reason = "only the Clash UI download reports Score feedback"
-            )
-        )]
         feedback: Option<ScoreAttempt>,
     },
 }
@@ -385,33 +371,70 @@ impl Outbounds<'_> {
         .await
         .map_err(|_| "download_timeout")?
         .map_err(Failed::Route)?;
-        let reply = match decision.route {
+        let (node, feedback) = match decision.route {
             Route::Block => return Err("route_blocked".into()),
-            Route::Direct { .. } => fetch_direct(request).await?,
-            Route::Proxy { node, .. } => {
-                let tunnel = match timeout_at(by, self.tunnel(&node, (host, port))).await {
-                    Err(_) => return Err("download_timeout".into()),
-                    Ok(Err(error)) => {
-                        debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
-                        return Err("connection_failed".into());
-                    }
-                    Ok(Ok(tunnel)) => tunnel,
-                };
-                let reply = match timeout_at(by, tunnel.dial()).await {
-                    Err(_) => Err("download_timeout"),
-                    Ok(Err(error)) => {
-                        debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
-                        Err("connection_failed")
-                    }
-                    Ok(Ok(stream)) => get(stream, request).await,
-                };
-                if let Err(error) = tunnel.close().await {
-                    debug!(%error, "{purpose} tunnel did not close cleanly");
-                }
-                reply?
-            }
+            Route::Direct { feedback } => (None, feedback),
+            Route::Proxy { node, feedback } => (Some(node), feedback),
         };
+        let business = feedback
+            .as_ref()
+            .map(ScoreAttempt::begin)
+            .transpose()
+            .map_err(|_| {
+                Failed::Route(
+                    anyhow::Error::new(NoUsableNode {
+                        outbound: decision.group.clone().unwrap_or_default(),
+                    })
+                    .context(purpose.to_owned()),
+                )
+            })?;
+        let reply = match node {
+            None => fetch_direct(request).await,
+            Some(node) => self.fetch_through(&node, purpose, request).await,
+        };
+        if let Some(business) = business {
+            business.finish(match &reply {
+                Ok(_) => ScoreOutcome::Success,
+                Err("download_timeout") => ScoreOutcome::Timeout,
+                Err(_) => ScoreOutcome::Cancelled,
+            });
+        }
+        let reply = reply?;
         Ok((reply, decision.group))
+    }
+
+    async fn fetch_through(
+        &self,
+        node: &Node,
+        purpose: &str,
+        request: &Request<'_>,
+    ) -> Result<Reply, &'static str> {
+        let host = request.url.host_str().ok_or("invalid_source")?;
+        let port = request
+            .url
+            .port_or_known_default()
+            .ok_or("invalid_source")?;
+        let by = request.deadline.headers;
+        let tunnel = match timeout_at(by, self.tunnel(node, (host, port))).await {
+            Err(_) => return Err("download_timeout"),
+            Ok(Err(error)) => {
+                debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
+                return Err("connection_failed");
+            }
+            Ok(Ok(tunnel)) => tunnel,
+        };
+        let reply = match timeout_at(by, tunnel.dial()).await {
+            Err(_) => Err("download_timeout"),
+            Ok(Err(error)) => {
+                debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
+                Err("connection_failed")
+            }
+            Ok(Ok(stream)) => get(stream, request).await,
+        };
+        if let Err(error) = tunnel.close().await {
+            debug!(%error, "{purpose} tunnel did not close cleanly");
+        }
+        reply
     }
 }
 
