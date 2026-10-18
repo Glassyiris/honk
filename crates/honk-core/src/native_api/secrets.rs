@@ -2,7 +2,7 @@
 
 use honk_config::{
     Config,
-    parser::{SourceSnapshot, cursor::Document, lexer::Source},
+    parser::{SourceSnapshot, source_edit::visit_listener_secret_values},
 };
 use serde_json::{Value, json};
 
@@ -27,49 +27,13 @@ impl ListenerSecrets {
             values.push(native_secret.to_owned());
         }
         for source in sources.iter().filter(|source| source.contains_api_secret) {
-            let Ok(document) = Document::parse(
-                Source::new(&source.content, source.source.clone()),
-                &mut Vec::new(),
-            ) else {
-                if !source.content.is_empty() {
-                    values.push(source.content.to_string());
-                }
-                continue;
-            };
-            for field in document
-                .sections()
-                .filter(|root| root.header() == "experimental")
-                .filter_map(|root| root.body())
-                .flatten()
-                .filter(|section| matches!(section.header().trim(), "native_api" | "clash_api"))
-                .filter_map(|section| section.body())
-                .flatten()
-            {
-                let span = field.header_span();
-                let Some((key, value)) = source.content[span.start..span.end].split_once(':')
-                else {
-                    continue;
-                };
-                if key.trim() != "secret" {
-                    continue;
-                }
-                let value = value.trim();
-                let start = span.start + source.content[span.start..span.end].trim_end().len()
-                    - value.len();
-                let end = start + value.len();
-                let quoted = document
-                    .tokens()
-                    .iter()
-                    .flat_map(|token| &token.quoted)
-                    .any(|quote| quote.start == start && quote.end == end);
-                let value = if quoted {
-                    &source.content[start + 1..end - 1]
-                } else {
-                    value
-                };
+            let parsed = visit_listener_secret_values(source, |value| {
                 if value.len() >= MIN_MASKED_SECRET {
                     values.push(value.to_owned());
                 }
+            });
+            if parsed.is_err() && !source.content.is_empty() {
+                values.push(source.content.to_string());
             }
         }
         values.sort_unstable();

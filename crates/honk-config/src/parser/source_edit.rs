@@ -543,6 +543,28 @@ pub fn strip_listener_secrets(content: &str) -> Result<String, SourceEditError> 
     Ok(output)
 }
 
+pub fn visit_listener_secret_values(
+    source: &SourceSnapshot,
+    mut visit: impl FnMut(&str),
+) -> Result<(), SourceEditError> {
+    let document = Document::parse_attempt(
+        Source::new(&source.content, source.source.clone()),
+        &mut Vec::new(),
+        true,
+    )
+    .map_err(|_| SourceEditError::default())?;
+    for (_, block) in listener_blocks(&document) {
+        for field in block.body().into_iter().flatten() {
+            if let Some((key, value)) = Text::segment(&field).kv()
+                && key.raw() == "secret"
+            {
+                visit(value.unquote().raw());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Put listener secrets back into content without any; an empty value is not
 /// written. Each goes into the last block of its API.
 pub fn restore_listener_secrets(

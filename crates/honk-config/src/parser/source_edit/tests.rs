@@ -748,6 +748,29 @@ fn restored_listener_secrets_preserve_quotes_and_backslashes() {
 }
 
 #[test]
+fn listener_secret_values_are_visited_unquoted_and_unparsable_sources_fail() {
+    let content = "experimental {\n    native_api {\n        secret: 'first token'\n        secret: \"quoted\\\"token\" # comment\n        secret: bare-token\n    }\n    clash_api { secret: clash-token }\n}\nglobal { log_level: info }\n";
+    let loaded = managed_source(content);
+    let mut values = Vec::new();
+    visit_listener_secret_values(&loaded.sources[0], |value| values.push(value.to_owned()))
+        .unwrap();
+    assert_eq!(
+        values,
+        [
+            "first token",
+            "quoted\\\"token",
+            "bare-token",
+            "clash-token"
+        ]
+    );
+    let mut broken = loaded.sources[0].clone();
+    broken.content = Arc::from("experimental { native_api { secret: 'unfinished\n");
+    let mut visited = false;
+    assert!(visit_listener_secret_values(&broken, |_| visited = true).is_err());
+    assert!(!visited);
+}
+
+#[test]
 fn restored_secret_in_a_compact_block_parses() {
     let restored = restore_listener_secrets(
         "experimental { native_api { enabled: true } }\n",
