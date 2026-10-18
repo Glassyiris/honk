@@ -210,12 +210,12 @@ fn sqlite_errors_carry_only_the_result_code() {
 }
 
 #[test]
-fn an_idle_cache_does_not_wake_the_flusher() {
+fn an_idle_cache_does_not_wake_the_writer() {
     let directory = tempfile::tempdir().unwrap();
     let db = CacheDb::in_dir(directory.path());
-    let wakeups = || db.flush.wakeups.load(std::sync::atomic::Ordering::Relaxed);
+    let wakeups = || db.timer_wakeups.load(std::sync::atomic::Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(350));
-    assert_eq!(wakeups(), 0, "the flusher woke with nothing pending");
+    assert_eq!(wakeups(), 0, "the writer woke with nothing pending");
 
     db.save_clash_mode("Direct");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);

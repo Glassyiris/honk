@@ -3,7 +3,8 @@
 //!
 //! One writer thread owns the cache-class connection, so readers never wait
 //! behind a write batch. Point writes (selectors, Clash state) are coalesced
-//! in `pending` and read from there until the writer has committed them.
+//! in `pending` and read from there until the writer has committed them; the
+//! writer flushes them `FLUSH_INTERVAL` after the first one arrives.
 //! Write failures are logged and never fatal.
 //!
 //! Each batch checks the page budget (`StateDb::cache_budget_pages`) inside its
@@ -13,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Instant;
 
 use honk_outbound::group::{SelectionNetwork, SelectorMember};
 use rusqlite::{Connection, params};
@@ -24,6 +26,7 @@ const CHANNEL_CAPACITY: usize = 256;
 pub(crate) const MAX_DNS_ROWS: i64 = 4096;
 const DNS_BUDGET_ROWS: i64 = 2048;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const POINTS: &str = "state cache point-write batch";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheDbError {
@@ -78,7 +81,7 @@ pub(crate) struct Maintenance {
 }
 
 enum Write {
-    Set(Key, String),
+    Wake,
     Barrier(mpsc::Sender<Result<(), CacheDbError>>),
     Delays(Vec<(String, u64, u64)>),
     DeleteDelaysBefore(u64),
@@ -104,31 +107,6 @@ fn unix(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn flush_pending_writes(
-    pending: &Mutex<HashMap<Key, PendingWrite>>,
-    writer: &mpsc::SyncSender<Write>,
-) -> Result<(), CacheDbError> {
-    let snapshot = pending
-        .lock()
-        .map_err(|_| CacheDbError::Closed)?
-        .iter()
-        .map(|(key, value)| (key.clone(), value.sequence))
-        .collect::<HashMap<_, _>>();
-    if snapshot.is_empty() {
-        return Ok(());
-    }
-    let (ack, result) = mpsc::channel();
-    writer
-        .send(Write::Barrier(ack))
-        .map_err(|_| CacheDbError::Closed)?;
-    result.recv().map_err(|_| CacheDbError::Closed)??;
-    pending
-        .lock()
-        .map_err(|_| CacheDbError::Closed)?
-        .retain(|key, value| snapshot.get(key) != Some(&value.sequence));
-    Ok(())
-}
-
 /// Whether the batch in `transaction` leaves the db within the page budget,
 /// pruning DNS rows first; the caller rolls back a batch that does not fit.
 fn fits(transaction: &Connection, budget_pages: i64) -> rusqlite::Result<bool> {
@@ -145,12 +123,14 @@ fn fits(transaction: &Connection, budget_pages: i64) -> rusqlite::Result<bool> {
 
 struct Writer {
     connection: Connection,
-    latest: HashMap<Key, String>,
+    pending: Arc<Mutex<HashMap<Key, PendingWrite>>>,
     budget_pages: i64,
     /// Batches skipped for the page budget; the first one is logged.
     skipped: u64,
     points_failing: bool,
     delays_failing: bool,
+    #[cfg(test)]
+    timer_wakeups: Arc<std::sync::atomic::AtomicU64>,
     // The directory lock must outlive the writer connection.
     _state: Arc<StateDb>,
 }
@@ -163,8 +143,39 @@ impl Writer {
         }
     }
 
+    fn pending_len(&self) -> usize {
+        self.pending.lock().map_or(0, |pending| pending.len())
+    }
+
+    /// Writes the pending points; returns when the next flush is due.
+    fn flush_points(&mut self) -> Option<Instant> {
+        match self.write_points() {
+            Ok(()) => note_success(&mut self.points_failing, POINTS),
+            Err(error) => note_failure(&mut self.points_failing, POINTS, CacheDbError::from(error)),
+        }
+        (self.pending_len() > 0).then(|| Instant::now() + FLUSH_INTERVAL)
+    }
+
+    /// Keeps the first-pending deadline fixed while writes keep arriving, and
+    /// flushes once it has passed.
+    fn reschedule(&mut self, due: Option<Instant>) -> Option<Instant> {
+        match (self.pending_len(), due) {
+            (0, _) => None,
+            (_, None) => Some(Instant::now() + FLUSH_INTERVAL),
+            (_, Some(at)) if Instant::now() >= at => self.flush_points(),
+            (_, due) => due,
+        }
+    }
+
     fn write_points(&mut self) -> rusqlite::Result<()> {
-        if self.latest.is_empty() {
+        let batch: Vec<(Key, u64, String)> = match self.pending.lock() {
+            Ok(pending) => pending
+                .iter()
+                .map(|(key, write)| (key.clone(), write.sequence, write.value.clone()))
+                .collect(),
+            Err(_) => return Ok(()),
+        };
+        if batch.is_empty() {
             return Ok(());
         }
         let transaction = self.connection.transaction()?;
@@ -174,7 +185,7 @@ impl Writer {
             )?;
             let mut clash = transaction
                 .prepare("INSERT OR REPLACE INTO clash_state (key, value) VALUES (?1, ?2)")?;
-            for (key, value) in &self.latest {
+            for (key, _, value) in &batch {
                 match key {
                     Key::Selector(group, network) => {
                         selector.execute(params![group, network, value])?;
@@ -191,7 +202,16 @@ impl Writer {
             drop(transaction);
             self.skip();
         }
-        self.latest.clear();
+        if let Ok(mut pending) = self.pending.lock() {
+            for (key, sequence, _) in batch {
+                if pending
+                    .get(&key)
+                    .is_some_and(|write| write.sequence == sequence)
+                {
+                    pending.remove(&key);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -287,20 +307,30 @@ fn note_success(failing: &mut bool, what: &'static str) {
 }
 
 fn run_writer(mut writer: Writer, receiver: mpsc::Receiver<Write>) {
-    const POINTS: &str = "state cache point-write batch";
-    while let Ok(write) = receiver.recv() {
+    let mut due: Option<Instant> = None;
+    loop {
+        let write = match due {
+            None => match receiver.recv() {
+                Ok(write) => write,
+                Err(_) => break,
+            },
+            Some(at) => match receiver.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(write) => write,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    #[cfg(test)]
+                    writer
+                        .timer_wakeups
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    due = writer.flush_points();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+        };
         match write {
-            Write::Set(key, value) => {
-                writer.latest.insert(key, value);
-                if writer.latest.len() >= 64 {
-                    match writer.write_points() {
-                        Ok(()) => note_success(&mut writer.points_failing, POINTS),
-                        Err(error) => note_failure(
-                            &mut writer.points_failing,
-                            POINTS,
-                            CacheDbError::from(error),
-                        ),
-                    }
+            Write::Wake => {
+                if writer.pending_len() >= 64 {
+                    due = writer.flush_points();
                 }
             }
             Write::Barrier(ack) => {
@@ -311,6 +341,7 @@ fn run_writer(mut writer: Writer, receiver: mpsc::Receiver<Write>) {
                     note_success(&mut writer.points_failing, POINTS);
                 }
                 let _ = ack.send(result.map_err(CacheDbError::from));
+                due = None;
             }
             Write::Delays(samples) => {
                 const WHAT: &str = "state cache delay batch";
@@ -376,6 +407,7 @@ fn run_writer(mut writer: Writer, receiver: mpsc::Receiver<Write>) {
                 let _ = release.recv();
             }
         }
+        due = writer.reschedule(due);
     }
     if let Err(error) = writer.write_points() {
         tracing::warn!(error = %CacheDbError::from(error), "state cache final point-write flush failed");
@@ -394,54 +426,6 @@ impl Drop for CacheDbWriterGuard {
     }
 }
 
-/// Wakes the flusher only while a point write is pending, so an idle cache
-/// costs no timer wakeups.
-#[derive(Default)]
-struct FlushSignal {
-    /// `(pending, closed)`.
-    state: Mutex<(bool, bool)>,
-    ready: std::sync::Condvar,
-    #[cfg(test)]
-    wakeups: std::sync::atomic::AtomicU64,
-}
-
-impl FlushSignal {
-    fn notify(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.0 = true;
-            self.ready.notify_one();
-        }
-    }
-
-    fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.1 = true;
-            self.ready.notify_one();
-        }
-    }
-
-    /// Blocks until a write is pending; `false` once the cache is closed.
-    fn wait(&self) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        while !state.0 && !state.1 {
-            state = match self.ready.wait(state) {
-                Ok(state) => state,
-                Err(_) => return false,
-            };
-        }
-        if state.1 {
-            return false;
-        }
-        state.0 = false;
-        #[cfg(test)]
-        self.wakeups
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
-    }
-}
-
 pub struct CacheDb {
     /// Reader connection; writes go through `writer`.
     conn: Mutex<Connection>,
@@ -451,7 +435,8 @@ pub struct CacheDb {
     /// Set once the writer thread is gone or the pending map is poisoned;
     /// neither recovers, so only the first rejection is an ERROR.
     writer_lost: std::sync::atomic::AtomicBool,
-    flush: Arc<FlushSignal>,
+    #[cfg(test)]
+    timer_wakeups: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     write_attempted: std::sync::atomic::AtomicBool,
     _state: Arc<StateDb>,
@@ -462,7 +447,6 @@ impl Drop for CacheDb {
         if let Err(error) = self.flush_pending() {
             tracing::warn!(%error, "state cache final point-write flush failed");
         }
-        self.flush.close();
     }
 }
 
@@ -470,46 +454,24 @@ impl CacheDb {
     /// Opens the reader and writer connections and starts the writer thread.
     pub fn open(state: Arc<StateDb>) -> Result<Self, StateError> {
         let reader = state.connect(Class::Cache)?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(test)]
+        let timer_wakeups = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let thread = Writer {
             connection: state.connect(Class::Cache)?,
-            latest: HashMap::new(),
+            pending: Arc::clone(&pending),
             budget_pages: state.cache_budget_pages(),
             skipped: 0,
             points_failing: false,
             delays_failing: false,
+            #[cfg(test)]
+            timer_wakeups: Arc::clone(&timer_wakeups),
             _state: Arc::clone(&state),
         };
-        let pending = Arc::new(Mutex::new(HashMap::new()));
         let (writer, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
         std::thread::Builder::new()
             .name("honk-cache-db-writer".into())
             .spawn(move || run_writer(thread, receiver))
-            .map_err(|_| StateError::Unavailable)?;
-        let flush_pending = Arc::downgrade(&pending);
-        let flush_writer = writer.clone();
-        let flush = Arc::new(FlushSignal::default());
-        let signal = Arc::clone(&flush);
-        std::thread::Builder::new()
-            .name("honk-cache-db-flusher".into())
-            .spawn(move || {
-                const WHAT: &str = "state cache periodic point-write flush";
-                let mut failing = false;
-                // A pending write reaches SQLite within `FLUSH_INTERVAL`.
-                while signal.wait() {
-                    std::thread::sleep(FLUSH_INTERVAL);
-                    let Some(pending) = flush_pending.upgrade() else {
-                        break;
-                    };
-                    match flush_pending_writes(&pending, &flush_writer) {
-                        Ok(()) => note_success(&mut failing, WHAT),
-                        Err(error) => note_failure(&mut failing, WHAT, error),
-                    }
-                    // Writes that arrived during the flush wait for the next round.
-                    if pending.lock().is_ok_and(|pending| !pending.is_empty()) {
-                        signal.notify();
-                    }
-                }
-            })
             .map_err(|_| StateError::Unavailable)?;
         Ok(Self {
             _state: state,
@@ -518,7 +480,8 @@ impl CacheDb {
             writer,
             next_sequence: std::sync::atomic::AtomicU64::new(1),
             writer_lost: std::sync::atomic::AtomicBool::new(false),
-            flush,
+            #[cfg(test)]
+            timer_wakeups,
             #[cfg(test)]
             write_attempted: std::sync::atomic::AtomicBool::new(false),
         })
@@ -552,31 +515,34 @@ impl CacheDb {
             writer_lost!(self, "state cache pending-write lock poisoned");
             return;
         };
-        let previous = pending.insert(
-            key.clone(),
-            PendingWrite {
-                sequence,
-                value: value.clone(),
-            },
-        );
-        if let Err(error) = self.writer.send(Write::Set(key.clone(), value)) {
-            match previous {
-                Some(value) => {
-                    pending.insert(key, value);
+        let previous = pending.insert(key.clone(), PendingWrite { sequence, value });
+        // A full queue already guarantees the writer will look at `pending`.
+        match self.writer.try_send(Write::Wake) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+            Err(error) => {
+                match previous {
+                    Some(value) => {
+                        pending.insert(key, value);
+                    }
+                    None => {
+                        pending.remove(&key);
+                    }
                 }
-                None => {
-                    pending.remove(&key);
-                }
+                writer_lost!(self, %error, "state cache writer closed; point write rejected");
             }
-            writer_lost!(self, %error, "state cache writer closed; point write rejected");
-            return;
         }
-        drop(pending);
-        self.flush.notify();
     }
 
     fn flush_pending(&self) -> Result<(), CacheDbError> {
-        flush_pending_writes(&self.pending, &self.writer)
+        if self
+            .pending
+            .lock()
+            .map_err(|_| CacheDbError::Closed)?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.request(Write::Barrier)
     }
 
     fn request(
