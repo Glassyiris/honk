@@ -1,6 +1,7 @@
 use super::*;
 use crate::dns::PinnedNameResolver;
 use crate::observe::catalog::member_id;
+use honk_config::group::GroupPolicy;
 
 pub(super) struct Specification {
     pub(super) target: Target,
@@ -123,7 +124,6 @@ fn plan(
     let members: Vec<_> = if let Some(group) = &group {
         match request.members.as_ref() {
             Some(Members::Scope(MemberScope::Leaves)) => {
-                // Only this scope expands descendants; a child group otherwise probes its one selected leaf.
                 if !manager.probe_plan_within_limit(group, MAX_RESULTS) {
                     return Err(too_large());
                 }
@@ -179,6 +179,15 @@ fn plan(
             .saturating_mul(request.transport.len())
             > MAX_RESULTS
     {
+        return Err(too_large());
+    }
+    if members.iter().any(|member| {
+        matches!(member, GroupMember::Group(child)
+            if (child.policy != GroupPolicy::Selector
+                || !child.groups.is_empty()
+                || child.final_outbound.is_some())
+                && !manager.probe_plan_within_limit(&child.name, MAX_RESULTS))
+    }) {
         return Err(too_large());
     }
     let before = selections(&manager, &identity, group.as_deref());

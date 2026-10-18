@@ -256,6 +256,10 @@ async fn a_large_group_is_probed_by_member_subset_and_a_child_group_by_its_selec
     config.nodes.extend(nodes);
     for group in [
         json!({"name":"big","nodes":ids}),
+        json!({"name":"wide","nodes":ids}),
+        json!({"name":"parent2","groups":["wide"]}),
+        json!({"name":"automatic","policy":"urltest","nodes":ids}),
+        json!({"name":"parent3","groups":["automatic"]}),
         json!({"name":"c1","nodes":&ids[..100]}),
         json!({"name":"c2","nodes":&ids[100..200]}),
         json!({"name":"c3","nodes":&ids[200..]}),
@@ -289,11 +293,21 @@ async fn a_large_group_is_probed_by_member_subset_and_a_child_group_by_its_selec
         leaves,
         [&ids[0], &ids[100], &ids[200]].map(|id| Some(id.as_str()))
     );
+    let wide_child = plan("parent2", json!("direct")).await.unwrap();
+    assert_eq!(wide_child.result.results.len(), 1);
+    assert_eq!(
+        wide_child.result.results[0]
+            .resolved_leaf_node_id
+            .as_deref(),
+        Some(ids[0].as_str())
+    );
     for (group, members) in [
         ("big", json!("direct")),
         ("big", json!("leaves")),
         ("big", json!(&ids[..65])),
         ("parent", json!("leaves")),
+        ("parent2", json!("leaves")),
+        ("parent3", json!("direct")),
     ] {
         let error = plan(group, members).await.err().unwrap();
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);

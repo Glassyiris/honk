@@ -105,9 +105,6 @@ impl GroupManager {
         let node = match member {
             GroupMember::Node(node) => node,
             GroupMember::Group(group) => {
-                if !self.probe_plan_within_limit(&group.name, 256) {
-                    return None;
-                }
                 let plan = self.peek_selection_plan_for_domain(&group.name, domain, ip);
                 match plan.nodes.as_slice() {
                     [node] => *node,
@@ -710,12 +707,17 @@ mod native_probe_tests {
     }
 
     #[test]
-    fn native_probe_bounds_nested_planner_inputs_before_candidate_expansion() {
-        let nodes = nodes();
+    fn native_probe_caps_leaf_expansion_but_not_selected_child_inputs() {
+        let nodes: Vec<_> = (1..=300)
+            .map(|id| Node {
+                id: Uuid::from_u128(id),
+                name: format!("node-{id}"),
+                ..Default::default()
+            })
+            .collect();
         let child = Group {
             name: "large".into(),
-            policy: GroupPolicy::URLTest,
-            nodes: vec![nodes[0].id; 256],
+            nodes: nodes.iter().map(|node| node.id).collect(),
             ..Default::default()
         };
         let parent = Group {
@@ -725,12 +727,13 @@ mod native_probe_tests {
         };
         let manager = GroupManager::new(&[parent, child], &nodes);
         assert!(!manager.probe_plan_within_limit("parent", 256));
-        assert!(manager.probe_plan_within_limit("parent", 258));
+        assert!(manager.probe_plan_within_limit("parent", 302));
         let member = GroupMember::Group(manager.group("large").unwrap());
-        assert!(
+        assert_eq!(
             manager
                 .probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
-                .is_none()
+                .map(|node| node.id),
+            Some(nodes[0].id)
         );
     }
 

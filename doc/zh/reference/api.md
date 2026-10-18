@@ -265,7 +265,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/测量共享 30 秒 deadline。最终 transport owner 清理即使超期也必须等待 join，因此 operation 总耗时可能超过 30 秒。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。即使已有 4 个 active job，也立即返回 202 与 `queued` 操作；202 只表示 daemon 接管。测量开始前结束的 job 以 `probe_cancelled`、`probe_deadline`、`unsupported_value`（本地解析被拒绝，或节点不能向探测端口转发 UDP）或 `engine_unavailable` 失败；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。最终清理失败时 operation 以 `probe_cleanup_failed` 失败，`result` 保持 null，已完成的测量放在 `error.details`。
 
-直接成员中的子组只通过其当前选中的一个叶子节点探测，不会展开，因此父组的开销不随后代数量增长；目标组自身的规模只受 64 个成员和 256 行结果限制（更大的组可用 `members` 列表分批，每批最多 64 个 ID）。只有 `members: "leaves"` 会遍历后代，并且当该组图超过 256 项时同样被拒绝。
+直接成员中的子组通过其选中的一个叶子节点探测；选择该叶子可能展开后代，除没有子组且未设置 `final` 的 Selector 外，规划图超过 256 项即拒绝。目标组仍受 64 个成员和 256 行结果限制（更大的组可用 `members` 列表分批，每批最多 64 个 ID），`members: "leaves"` 还会在整组图超过 256 项时被拒绝。
 
 ### DNS 查询、缓存与结果历史
 
