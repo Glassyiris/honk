@@ -288,6 +288,7 @@ impl std::ops::Deref for AnyTlsPool {
 /// tune by load test).
 pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;
 
+#[cfg(feature = "flow-observation")]
 struct StreamObservation {
     observer: crate::runtime::flow_observation::FlowObserver,
     uot: bool,
@@ -365,6 +366,7 @@ pub(crate) struct AnyTlsSession {
     rx_frame_seq: AtomicU64,
     silence: parking_lot::Mutex<Option<(u64, crate::SharedError)>>,
     task_scope: crate::runtime::TaskScope,
+    #[cfg(feature = "flow-observation")]
     observations: parking_lot::Mutex<HashMap<u32, StreamObservation>>,
 }
 
@@ -412,6 +414,7 @@ impl AnyTlsSession {
             rx_frame_seq: AtomicU64::new(0),
             silence: parking_lot::Mutex::new(None),
             task_scope: crate::runtime::TaskScope::capture(),
+            #[cfg(feature = "flow-observation")]
             observations: parking_lot::Mutex::new(HashMap::new()),
         });
         session.inbound_payload_budget.register(&session);
@@ -434,11 +437,8 @@ impl AnyTlsSession {
         Ok(session)
     }
 
+    #[cfg(feature = "flow-observation")]
     fn observe_request(&self, sid: u32, uot: bool) {
-        // Inert builds register no observers; skip the per-frame lock.
-        if !cfg!(feature = "flow-observation") {
-            return;
-        }
         let mut observations = self.observations.lock();
         let Some(observation) = observations.get_mut(&sid) else {
             return;
@@ -460,6 +460,7 @@ impl AnyTlsSession {
         }
     }
 
+    #[cfg(feature = "flow-observation")]
     fn observe_synack(&self, sid: u32, accepted: bool) {
         let mut observations = self.observations.lock();
         let Some(observation) = observations.get_mut(&sid) else {
@@ -480,9 +481,22 @@ impl AnyTlsSession {
         }
     }
 
+    #[cfg(feature = "flow-observation")]
     fn end_observation(&self, sid: u32) {
         self.observations.lock().remove(&sid);
     }
+
+    #[cfg(not(feature = "flow-observation"))]
+    #[inline]
+    fn observe_request(&self, _sid: u32, _uot: bool) {}
+
+    #[cfg(not(feature = "flow-observation"))]
+    #[inline]
+    fn observe_synack(&self, _sid: u32, _accepted: bool) {}
+
+    #[cfg(not(feature = "flow-observation"))]
+    #[inline]
+    fn end_observation(&self, _sid: u32) {}
 
     #[cfg(test)]
     fn flush_initial_settings_for_test(&self) -> std::io::Result<()> {
@@ -784,6 +798,7 @@ impl AnyTlsSession {
             anyhow::bail!("AnyTLS session {} is closed", self.seq);
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(feature = "flow-observation")]
         if let Some(observer) = crate::runtime::flow_observation::current() {
             self.observations.lock().insert(
                 sid,
@@ -1076,6 +1091,7 @@ impl AnyTlsSession {
             handle.abort();
         }
         self.clear_synack_pending();
+        #[cfg(feature = "flow-observation")]
         self.observations.lock().clear();
         self.writer_q.close();
         if let Some(notify) = self.capacity_notify.get() {
