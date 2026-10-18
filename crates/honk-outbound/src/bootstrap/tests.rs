@@ -124,6 +124,7 @@ async fn silent_aaaa_keeps_a_answer_within_family_budget() {
     assert_eq!(ips, vec![a]);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn truncated_udp_answer_retries_over_tcp() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -153,12 +154,23 @@ async fn truncated_udp_answer_retries_over_tcp() {
         truncated[2] |= 0x02;
         vec![truncated]
     });
+    let stall = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tcp_started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let peer_stall = std::sync::Arc::clone(&stall);
+    let peer_started = std::sync::Arc::clone(&tcp_started);
     tokio::spawn(async move {
         loop {
             let (mut stream, _) = tcp.accept().await.unwrap();
+            let stall = std::sync::Arc::clone(&peer_stall);
+            let tcp_started = std::sync::Arc::clone(&peer_started);
             tokio::spawn(async move {
                 let mut query = vec![0; stream.read_u16().await.unwrap() as usize];
                 stream.read_exact(&mut query).await.unwrap();
+                tcp_started.notify_waiters();
+                if stall.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = stream.read_u8().await;
+                    return;
+                }
                 let response = addr_response(&query, &[a]);
                 stream.write_u16(response.len() as u16).await.unwrap();
                 stream.write_all(&response).await.unwrap();
@@ -167,8 +179,83 @@ async fn truncated_udp_answer_retries_over_tcp() {
     });
 
     let resolver = BootstrapResolver::parse(&format!("udp://{server}")).unwrap();
-    let ips = resolver.query("many-records.invalid").await.unwrap();
+    #[cfg(feature = "flow-observation")]
+    let events = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    #[cfg(feature = "flow-observation")]
+    let parent = uuid::Uuid::new_v4();
+    #[cfg(feature = "flow-observation")]
+    let observer = {
+        use crate::runtime::flow_observation::{FlowContext, FlowObserver};
+        let events = std::sync::Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 19,
+                attempt_id: None,
+                lookup_id: Some(parent),
+                dns_purpose: "proxy_server",
+            },
+            std::sync::Arc::new(move |_, event| events.lock().push(event)),
+        )
+    };
+    let query = resolver.query("many-records.invalid");
+    #[cfg(feature = "flow-observation")]
+    let ips = observer.scope(query).await.unwrap();
+    #[cfg(not(feature = "flow-observation"))]
+    let ips = query.await.unwrap();
     assert_eq!(ips, vec![a]);
+    #[cfg(feature = "flow-observation")]
+    {
+        use crate::runtime::flow_observation::FlowEvent;
+
+        let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
+        set_global(Some(resolver));
+        let ech = observer.scope(query_ech_config("ech.invalid")).await;
+        set_global(None);
+        assert_eq!(ech.unwrap(), None);
+
+        stall.store(true, std::sync::atomic::Ordering::Release);
+        let error = observer
+            .scope(resolver.query_family("timeout.invalid", 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut cancelled = Box::pin(observer.scope(resolver.query_family("cancel.invalid", 1)));
+        tokio::select! {
+            result = &mut cancelled => panic!("silent TCP peer completed: {result:?}"),
+            _ = tcp_started.notified() => {}
+        }
+        drop(cancelled);
+
+        let events = events.lock();
+        let lookups: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::Dns(lookup) => Some(lookup),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lookups.len(), 10);
+        for lookup in &lookups {
+            assert_eq!(lookup.parent_lookup_id, Some(parent));
+            let transport = if lookup.status == "started" {
+                "udp"
+            } else {
+                "tcp"
+            };
+            assert_eq!(lookup.upstream_transport, Some(transport));
+            assert_eq!(lookup.carrier_transport, Some(transport));
+        }
+        for (status, count) in [("succeeded", 3), ("failed", 1), ("cancelled", 1)] {
+            assert_eq!(
+                lookups
+                    .iter()
+                    .filter(|lookup| lookup.status == status)
+                    .count(),
+                count
+            );
+        }
+    }
 }
 
 /// Replies to `query` that must be rejected: a wrong ID, and the right ID
@@ -203,7 +290,7 @@ async fn udp_exchange_accepts_only_the_reply_matching_the_query() {
     let resolver = BootstrapResolver::parse(&format!("udp://{spoof_only}")).unwrap();
     let accepted = tokio::time::timeout(
         Duration::from_millis(300),
-        resolver.query_raw("node.example.com", 1),
+        resolver.query_raw("node.example.com", 1, None),
     )
     .await;
     assert!(
