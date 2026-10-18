@@ -64,8 +64,9 @@ LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，
 ### 源码组织
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  用户态 `Router`、按优先级排序的编译规则、`route_action`、`GeositeMatcher`
-  以及 `BinaryLpmTrie`/Geo 资源辅助代码。`geo.rs` 在每次构建 `Router` 时只解析
+  用户态 `Router`、按优先级排序的编译规则、`route_action` 以及
+  `BinaryLpmTrie`/Geo 资源辅助代码。`domain.rs` 负责域名 matcher、
+  `GeositeMatcher` 与构建期内部去重表。`geo.rs` 在每次构建 `Router` 时只解析
   一次 `geoip.dat`/`geosite.dat`，且只解码被引用的类别。`category@attr` 在首个
   `@` 处分隔，并以不区分大小写的方式筛选属性键。
   启动时，流量路由与 DNS 路由共用同一份 Geo 资源快照；两者完成编译后即释放

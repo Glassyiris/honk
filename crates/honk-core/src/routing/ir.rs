@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use ipnet::IpNet;
 
-use super::{BinaryLpmTrie, GeositeDomain, GeositeMatcher};
+use super::{
+    BinaryLpmTrie,
+    domain::{GeositeDomain, GeositeMatcher},
+};
 
 /// One canonical condition in a compiled routing rule.
 #[derive(Debug, Clone)]

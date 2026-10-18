@@ -1,3 +1,4 @@
+use super::domain::{GeositeDomain, glob_to_regex, lowercase};
 use super::*;
 use honk_config::routing::{RoutingCondition, RoutingOutbound};
 

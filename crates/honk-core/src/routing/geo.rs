@@ -1,3 +1,4 @@
+use super::domain::GeositeDomain;
 use super::*;
 use sha2::{Digest, Sha256};
 use std::io::Read as _;

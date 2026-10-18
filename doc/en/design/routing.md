@@ -76,8 +76,9 @@ predicate ID within one policy.
 ### Source organization
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  userspace `Router`, priority-ordered compiled routes, `route_action`,
-  `GeositeMatcher`, and the `BinaryLpmTrie`/geo-asset helpers. `geo.rs` parses
+  userspace `Router`, priority-ordered compiled routes, `route_action`, and the
+  `BinaryLpmTrie`/geo-asset helpers. `domain.rs` owns the domain matchers,
+  `GeositeMatcher`, and the build-local interner. `geo.rs` parses
   `geoip.dat`/`geosite.dat` once per `Router` build and decodes only referenced
   codes; `category@attr` splits at the first `@` and filters attribute keys
   case-insensitively.
