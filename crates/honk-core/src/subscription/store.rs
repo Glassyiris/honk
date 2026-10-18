@@ -190,6 +190,9 @@ impl StoredBodies {
 
     /// The stored body, not yet read, so its length can be checked first.
     pub(crate) fn find(&self, sub: &Subscription) -> io::Result<Option<StoredBody<'_>>> {
+        if !sub.cache {
+            return Ok(None);
+        }
         let key = subscription_filename(sub);
         let Some((blob, length)) = open_body(&self.connection, &key).map_err(io::Error::other)?
         else {
