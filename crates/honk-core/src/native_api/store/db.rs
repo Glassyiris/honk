@@ -21,8 +21,8 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::super::ApiError;
-use super::super::config::ListenerSecrets;
 use super::super::config_write::WriteError;
+use super::super::secrets::ListenerSecrets;
 use crate::configuration::{MAX_SOURCE_BYTES, MAX_SOURCES, digest};
 use crate::state::{StateDb, StateError, log_sql};
 

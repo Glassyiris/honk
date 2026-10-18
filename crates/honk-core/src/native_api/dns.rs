@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, full_detail, invalid_query,
+    ApiError, ErrorCode, NativeState, error, full_detail, invalid_query, secrets::ListenerSecrets,
     timestamp, types::RequestId,
 };
 use crate::dns::{

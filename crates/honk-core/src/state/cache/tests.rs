@@ -299,7 +299,7 @@ fn cache_writes_stop_at_the_budget_so_a_large_revision_still_commits() {
     )
     .unwrap()
     .sources;
-    let none = crate::native_api::config::ListenerSecrets::new(&[], "");
+    let none = crate::native_api::secrets::ListenerSecrets::new(&[], "");
     store
         .initialize(&initial, &none, &Default::default(), "startup")
         .unwrap();

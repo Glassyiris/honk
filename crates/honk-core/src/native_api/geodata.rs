@@ -173,7 +173,7 @@ fn route(settings: &NativeApiConfig, sources: Option<&Sources>) -> Route {
 
 /// A URL as `source_redacted` and `fetched_url_redacted` show it, listener
 /// secrets masked; None when it cannot be shown safely.
-pub(crate) fn redact(url: &str, secrets: &config::ListenerSecrets) -> Option<String> {
+pub(crate) fn redact(url: &str, secrets: &super::secrets::ListenerSecrets) -> Option<String> {
     display_url(url, |text| secrets.contains(text)).map(|url| secrets.mask(&url).0)
 }
 

@@ -1130,49 +1130,6 @@ async fn redaction_flag_is_unknown_in_config_write_bodies() {
     fixture.shutdown().await;
 }
 
-#[test]
-fn listener_masking_preserves_wire_identifiers_and_enums() {
-    use super::ListenerSecrets;
-
-    let mut value = json!({
-        "id": "12345678-abcd-1234-abcd-123456789012",
-        "next_cursor": "12345678-abcd-1234-abcd-123456789012:1",
-        "network": "tcp",
-        "chain": ["node-with-secret"],
-        "trace_status": "complete",
-        "trace": {"status": "complete", "missing": [], "steps": [
-            {"chain": "traffic", "rule_id": "instance-1:2:rule:0", "expression": "pname(node-with-secret)"}
-        ]}
-    });
-    let original = value.clone();
-    assert!(ListenerSecrets::new(&[], "with-secret").mask_value(&mut value));
-    assert_eq!(value["id"], original["id"]);
-    assert_eq!(value["next_cursor"], original["next_cursor"]);
-    assert_eq!(value["network"], "tcp");
-    assert_eq!(value["chain"][0], "node-<redacted>");
-    assert_eq!(value["trace"]["steps"][0]["chain"], "traffic");
-    assert_eq!(value["trace"]["steps"][0]["rule_id"], "instance-1:2:rule:0");
-    assert_eq!(value["trace_status"], "partial");
-    assert_eq!(value["trace"]["missing"], json!(["redacted"]));
-    let mut value = json!({"network": "tcp", "expression": "pname(tcpsecret)"});
-    assert!(ListenerSecrets::new(&[], "tcpsecret").mask_value(&mut value));
-    assert_eq!(value["network"], "tcp");
-    assert_eq!(value["expression"], "pname(<redacted>)");
-    assert_eq!(
-        ListenerSecrets::new(&[], "abababab").mask("ababababab"),
-        ("<redacted>".into(), true)
-    );
-    // Below the minimum a secret is left alone rather than shredding common substrings.
-    assert_eq!(
-        ListenerSecrets::new(&[], "tcp").mask("l4proto(tcp)"),
-        ("l4proto(tcp)".into(), false)
-    );
-    let secret = "quoted\"token";
-    let mut value = json!({"expression": format!("pname({secret:?})")});
-    assert!(ListenerSecrets::new(&[], secret).mask_value(&mut value));
-    assert_eq!(value["expression"], "pname(\"<redacted>\")");
-}
-
 #[tokio::test]
 async fn connection_projection_masks_listener_values_without_losing_flow_references() {
     use crate::connection_tracker::ConnectionEntry;
@@ -1227,30 +1184,6 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
     assert!(!value.to_string().contains(SECRET));
     drop(state);
     fixture.shutdown().await;
-}
-
-#[test]
-fn malformed_credential_source_is_withheld_without_panicking() {
-    let content = "experimental { native_api { secret: 'unfinished\n";
-    let source = honk_config::parser::SourceSnapshot {
-        path: PathBuf::from("/config/auth.dae"),
-        content: Arc::from(content),
-        parent: None,
-        source: honk_config::diagnostic::DiagnosticSources::new(None).root(),
-        contains_api_secret: true,
-        loaded_at: SystemTime::now(),
-    };
-    let sources = [source];
-    let secrets = super::ListenerSecrets::new(&sources, "listener-token");
-    assert_eq!(secrets.mask(content), ("<redacted>\n".into(), true));
-    assert_eq!(
-        secrets.mask(&format!("before\n{content}after")),
-        ("before\n<redacted>\nafter".into(), true)
-    );
-    assert_eq!(
-        secrets.mask("ordinary content"),
-        ("ordinary content".into(), false)
-    );
 }
 
 #[test]

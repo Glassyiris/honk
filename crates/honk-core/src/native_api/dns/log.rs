@@ -16,7 +16,7 @@ use crate::dns::outcome::{DnsOutcome, RequestRoute};
 use crate::dns::query::IngressProfile;
 use crate::dns::response::native;
 use crate::native_api::{
-    ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, invalid_query, parse_query,
+    ApiError, ErrorCode, NativeState, error, invalid_query, parse_query, secrets::ListenerSecrets,
     timestamp, types::RequestId,
 };
 

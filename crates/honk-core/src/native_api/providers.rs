@@ -169,7 +169,7 @@ impl Provider {
     ) -> Self {
         let secrets = match sources {
             Some(sources) => sources.secrets_with(config),
-            None => super::config::ListenerSecrets::from_config(config),
+            None => super::secrets::ListenerSecrets::from_config(config),
         };
         for value in std::iter::once(&mut self.name).chain(self.url_redacted.iter_mut()) {
             *value = secrets.mask(value).0;

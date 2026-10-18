@@ -11,7 +11,7 @@ use honk_config::error::DetailedConfigError;
 use honk_config::parser::source_edit::strip_listener_secrets;
 use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 
-use super::super::config::ListenerSecrets;
+use super::super::secrets::ListenerSecrets;
 use super::db::{DbStore, StoreError, StoredSecrets};
 use crate::configuration::SourceUpdate;
 use crate::state::StateDb;
