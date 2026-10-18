@@ -46,26 +46,23 @@ const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 pub(crate) struct DnsApi {
     rate: super::security::RequestRate,
     snapshots: tokio::sync::Mutex<VecDeque<cache::Snapshot>>,
-    log: Arc<log::DnsHistory>,
     pub(crate) recorder: Arc<DnsRecorder>,
 }
 
 impl DnsApi {
     pub(crate) fn new(instance_id: String, recording: bool, flows: Weak<FlowStore>) -> Self {
-        let log = Arc::new(log::DnsHistory::new(instance_id.clone(), recording));
         Self {
-            recorder: Arc::new(DnsRecorder::new(instance_id, flows, log.clone())),
-            log,
+            recorder: Arc::new(DnsRecorder::new(instance_id, flows, recording)),
             rate: super::security::RequestRate::new(),
             snapshots: tokio::sync::Mutex::new(VecDeque::new()),
         }
     }
 
     pub(crate) fn set_log_limit(&self, limit: usize) {
-        self.log.set_limit(limit);
+        self.recorder.history().set_limit(limit);
     }
     pub(crate) fn set_recording(&self, recording: bool) {
-        self.log.set_recording(recording);
+        self.recorder.history().set_recording(recording);
     }
     pub(crate) fn query_capability(&self) -> Value {
         json!({"available":true,"record_types":TYPES.iter().map(|&value| records::record_type(value)).collect::<Vec<_>>(),
@@ -76,11 +73,11 @@ impl DnsApi {
         json!({"available":true,"read":true,"delete_entry":true,"delete_name":true,"flush":true,"entry_kinds":["positive","negative"]})
     }
     pub(crate) fn log_capability(&self) -> Value {
-        self.log.capability()
+        log::capability(self.recorder.history())
     }
     #[cfg(test)]
-    pub(crate) fn log_for_test(&self) -> &log::DnsHistory {
-        &self.log
+    pub(crate) fn log_page_for_test(&self) -> Response {
+        log::page_for_test(self.recorder.history())
     }
 }
 

@@ -136,7 +136,7 @@ impl Values {
             level: Level::configured(&config.global.log_level),
             level_overridden: false,
             logs: super::logs::MAX_RECORDS,
-            dns: super::dns::log::MAX_RECORDS,
+            dns: crate::observe::dns::history::MAX_RECORDS,
             flows: crate::observe::flows::MAX_RECORDS,
             retention: crate::observe::flows::TERMINAL_TTL.as_secs(),
             overridden: false,
@@ -422,7 +422,7 @@ impl Settings {
             let Some(count) = dns.max_records else {
                 return Err(invalid(id));
             };
-            if !(MIN_RECORDS..=super::dns::log::MAX_RECORDS).contains(&count) {
+            if !(MIN_RECORDS..=crate::observe::dns::history::MAX_RECORDS).contains(&count) {
                 return Err(invalid(id));
             }
             unadvertised |= !settings.record_dns_log;

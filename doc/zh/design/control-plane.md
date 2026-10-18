@@ -310,6 +310,8 @@ UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认�
 
 `control/connection/observation.rs` 根据已捕获的 handoff、route、selection 和 transport 事实组装 TCP/UDP 证据。连接编排不构造 wire record，也不使用当前配置重算历史；关闭记录时不分配 capture，精确连接关闭仍独立于记录。
 
+`DnsRecorder` 在 `observe/dns/history.rs` 中持有具体的客户端 DNS 历史；记录 epoch、入口准入及按字节/条数淘汰归引擎所有。`native_api/dns/log.rs` 读取同一持锁视图，完成 cursor 绑定的过滤、listener secret 遮蔽及完整记录的 JSON 分页投影。
+
 `observe/flows/dns.rs` 与 outbound flow observer 为 scoped/retained 工作绑定实际 lookup、attempt 与 generation 身份。会话 attachment、逻辑 open/readiness 重试与新物理连接、协议确认分开。可选异步 scope 借用调用方 pin 的操作，不复制大型 future 状态；pin 不越过操作的所有权/析构边界。内核证据使用不可变编译字典与报文绑定 witness；UDP receive priority 来自原生辅助元数据，或严格对应 syscall/batch 的 receiver-owned fallback。丢失只改变证据，不改变路由或报文交付。
 
 既有原生 sampler 通过 `DatapathFlagsHandle` 同步实际 flow 需求，保留模式/NFQUEUE 位，仅在后端写入成功后提交追踪准入。等待后端所有权后重新读取需求，sampler 停止并 join 后再同步一次；不新增 writer、timer 或路由重编译。内核对每次调用复用同一 flags 快照来控制可选 witness 生产，已保留的捕获与真实路由判定不受后续需求变化重解释。

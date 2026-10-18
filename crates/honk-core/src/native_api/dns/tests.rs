@@ -576,7 +576,7 @@ async fn query_cache_and_log_mask_listener_secrets_but_keep_identity() {
     });
     state.observation.dns.set_log_limit(64);
     state.observation.dns.set_recording(true);
-    state.observation.dns.log.capture(
+    state.observation.dns.recorder.history().capture(
         &query_wire,
         IngressProfile::Udp {
             advertised_size: 512,

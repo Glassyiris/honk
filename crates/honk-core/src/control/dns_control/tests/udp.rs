@@ -24,7 +24,7 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
             crate::dns::query::validate_exact_dns_query(&query).unwrap(),
         )
         .await;
-    let response = api.log_for_test().page_for_test();
+    let response = api.log_page_for_test();
     let bytes = axum::body::to_bytes(response.into_body(), 262144)
         .await
         .unwrap();

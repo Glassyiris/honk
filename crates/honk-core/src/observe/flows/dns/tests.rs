@@ -15,31 +15,8 @@ use honk_config::{
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 
-struct Unrecorded;
-
-impl crate::observe::DnsLog for Unrecorded {
-    fn recording(&self) -> bool {
-        false
-    }
-
-    fn capture(
-        &self,
-        _: &[u8],
-        _: IngressProfile,
-        _: Option<SocketAddr>,
-        _: Option<&DnsOutcome>,
-        _: &[u8],
-        _: Duration,
-    ) {
-    }
-}
-
 fn recorder(instance: String, store: &Arc<FlowStore>) -> Arc<DnsRecorder> {
-    Arc::new(DnsRecorder::new(
-        instance,
-        Arc::downgrade(store),
-        Arc::new(Unrecorded),
-    ))
+    Arc::new(DnsRecorder::new(instance, Arc::downgrade(store), false))
 }
 
 async fn fixture() -> (

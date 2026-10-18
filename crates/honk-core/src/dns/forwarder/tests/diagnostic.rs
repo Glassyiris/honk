@@ -211,7 +211,7 @@ async fn source_resolution_logs_real_ipv6_client_but_diagnostic_does_not() {
         )
         .await
         .unwrap();
-    let page = api.log_for_test().page_for_test();
+    let page = api.log_page_for_test();
     let body = axum::body::to_bytes(page.into_body(), 262_144)
         .await
         .unwrap();
