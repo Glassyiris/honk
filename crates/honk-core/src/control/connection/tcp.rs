@@ -194,6 +194,7 @@ impl ControlPlaneHandle {
     async fn pin_tcp_dns_route(
         &self,
         handoff: &super::handoff::HandoffResult,
+        #[cfg(feature = "native-api")] record_route: bool,
     ) -> anyhow::Result<TcpDnsRoute> {
         let config = self.config.read().await;
         let backend = self.ebpf.read().await;
@@ -221,7 +222,7 @@ impl ControlPlaneHandle {
             matched_rule: None,
             reroute_by_sniffed_domain: false,
             #[cfg(feature = "native-api")]
-            native_route: None,
+            native_route: record_route.then(super::observation::RouteObservation::kernel),
         };
         drop(backend);
         Ok(TcpDnsRoute {
@@ -320,7 +321,14 @@ impl ControlPlaneHandle {
                     if handoff.outbound == OutboundIndex::Block as u8 {
                         None
                     } else if handoff.must != 0 {
-                        Some(self.pin_tcp_dns_route(handoff).await?)
+                        Some(
+                            self.pin_tcp_dns_route(
+                                handoff,
+                                #[cfg(feature = "native-api")]
+                                observation.is_recording(),
+                            )
+                            .await?,
+                        )
                     } else {
                         self.dns_controller
                             .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)

@@ -1149,3 +1149,26 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
     })
     .await?
 }
+
+#[tokio::test]
+async fn pinned_tcp_dns_route_keeps_kernel_route_observation() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new("direct", "ip").await?;
+    let generation = fixture.handle.ebpf.read().await.routing_policy_generation();
+    let handoff = super::super::handoff::HandoffResult::from(RoutingHandoffEntry {
+        routing_generation: generation,
+        result: RoutingResult {
+            outbound: OutboundIndex::Direct as u8,
+            must: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let route = fixture.handle.pin_tcp_dns_route(&handoff, true).await?;
+    assert!(route.decision.native_route.is_some());
+    let route = fixture.handle.pin_tcp_dns_route(&handoff, false).await?;
+    assert!(route.decision.native_route.is_none());
+    fixture.task.abort();
+    fixture.finish_removals().await?;
+    fixture.server.shutdown().await;
+    Ok(())
+}
