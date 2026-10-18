@@ -1,5 +1,6 @@
 //! eBPF backend abstraction.
 
+pub mod map_snapshot;
 pub mod maps;
 pub mod mock;
 pub mod probe;

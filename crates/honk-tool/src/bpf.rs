@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Args;
+use honk_core::ebpf::map_snapshot::{self, BatchError, BatchSpec};
 use honk_ebpf_common::conn::{BpfStatsKey, ConnState};
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::redirect_need::{DomainRouting, RoutingHandoffEntry, TuplesKey};
@@ -28,7 +29,6 @@ const BPF_MAP_LOOKUP_ELEM: i64 = 1;
 const BPF_MAP_GET_NEXT_KEY: i64 = 4;
 const BPF_MAP_GET_FD_BY_ID: i64 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: i64 = 15;
-const BPF_MAP_LOOKUP_BATCH: i64 = 24;
 const BPF_F_LOCK: u64 = 4;
 const BPF_BATCH_CHUNK: usize = 64;
 
@@ -40,19 +40,6 @@ struct BpfAttr {
     value_or_next: u64,
     flags: u64,
     next_key: u64,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct BpfBatchAttr {
-    in_batch: u64,
-    out_batch: u64,
-    keys: u64,
-    values: u64,
-    count: u32,
-    map_fd: u32,
-    elem_flags: u64,
-    flags: u64,
 }
 
 #[repr(C)]
@@ -144,87 +131,6 @@ fn map_entries(fd: RawFd, key_len: usize, value_len: usize) -> io::Result<Vec<(V
         prev = Some(key);
     }
     Ok(out)
-}
-
-fn map_entries_batch(
-    fd: RawFd,
-    key_len: usize,
-    value_len: usize,
-    elem_flags: u64,
-) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    map_entries_batch_with(fd, key_len, value_len, elem_flags, bpf)
-}
-
-fn map_entries_batch_with(
-    fd: RawFd,
-    key_len: usize,
-    value_len: usize,
-    elem_flags: u64,
-    mut lookup: impl FnMut(i64, &mut BpfBatchAttr) -> io::Result<i64>,
-) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut out = Vec::new();
-    let mut keys = vec![0u8; key_len * BPF_BATCH_CHUNK];
-    let mut values = vec![0u8; value_len * BPF_BATCH_CHUNK];
-    // Hash cursors are opaque bucket positions, not keys; the kernel may write only four bytes.
-    let mut previous = vec![0u8; key_len.max(4)];
-    let mut next = vec![0u8; previous.len()];
-    let mut has_previous = false;
-    loop {
-        let mut attr = BpfBatchAttr {
-            in_batch: if has_previous {
-                previous.as_ptr() as u64
-            } else {
-                0
-            },
-            out_batch: next.as_mut_ptr() as u64,
-            keys: keys.as_mut_ptr() as u64,
-            values: values.as_mut_ptr() as u64,
-            count: BPF_BATCH_CHUNK as u32,
-            map_fd: fd as u32,
-            elem_flags,
-            ..Default::default()
-        };
-        let terminal = match lookup(BPF_MAP_LOOKUP_BATCH, &mut attr) {
-            Ok(_) => false,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => true,
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-                ) =>
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "safe external map snapshot requires BPF_MAP_LOOKUP_BATCH with elem_flags={elem_flags:#x}: {error}"
-                    ),
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let count = attr.count as usize;
-        if count > BPF_BATCH_CHUNK || (count == 0 && !terminal) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "BPF_MAP_LOOKUP_BATCH returned invalid count {count} (terminal={terminal})"
-                ),
-            ));
-        }
-        for index in 0..count {
-            out.push((
-                keys[index * key_len..(index + 1) * key_len].to_vec(),
-                values[index * value_len..(index + 1) * value_len].to_vec(),
-            ));
-        }
-        // Short successful batches are not terminal; ENOENT can carry the final entries.
-        if terminal {
-            return Ok(out);
-        }
-        std::mem::swap(&mut previous, &mut next);
-        next.fill(0);
-        has_previous = true;
-    }
 }
 
 fn flow_payload<T: Copy>(bytes: &[u8]) -> T {
@@ -579,6 +485,27 @@ fn matches_ip(key: &TuplesKey, ip: &Option<IpAddr>) -> bool {
     }
 }
 
+fn batch_error(error: BatchError, elem_flags: u64) -> io::Error {
+    match error {
+        BatchError::Errno { errno, .. }
+            if matches!(errno, libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) =>
+        {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "safe external map snapshot requires BPF_MAP_LOOKUP_BATCH with elem_flags={elem_flags:#x}: {}",
+                    io::Error::from_raw_os_error(errno)
+                ),
+            )
+        }
+        BatchError::Errno { errno, .. } => io::Error::from_raw_os_error(errno),
+        BatchError::InvalidCount { count, terminal } => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("BPF_MAP_LOOKUP_BATCH returned invalid count {count} (terminal={terminal})"),
+        ),
+    }
+}
+
 fn flow_entries<K: Copy, V: Copy>(args: &ShowArgs, name: &str) -> anyhow::Result<Vec<(K, V)>> {
     let fd = open(&args.pin_root, name)?;
     let (key_len, value_len) = (
@@ -586,15 +513,35 @@ fn flow_entries<K: Copy, V: Copy>(args: &ShowArgs, name: &str) -> anyhow::Result
         std::mem::size_of::<FlowMapValue<V>>(),
     );
     query_map_layout(fd, name, 1, key_len as u32, value_len as u32)?;
-    Ok(map_entries_batch(fd, key_len, value_len, BPF_F_LOCK)?
-        .into_iter()
-        .map(|(kb, vb)| {
-            (
-                unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const K) },
-                flow_payload(&vb),
-            )
-        })
-        .collect())
+    let mut entries = Vec::new();
+    let visit = |keys: &[u8], values: &[u8]| {
+        entries.extend(
+            keys.chunks_exact(key_len)
+                .zip(values.chunks_exact(value_len))
+                .map(|(key, value)| {
+                    (
+                        unsafe { std::ptr::read_unaligned(key.as_ptr() as *const K) },
+                        flow_payload(value),
+                    )
+                }),
+        );
+        true
+    };
+    unsafe {
+        map_snapshot::scan(
+            BatchSpec {
+                fd,
+                key_len,
+                value_len,
+                chunk: BPF_BATCH_CHUNK,
+                elem_flags: BPF_F_LOCK,
+            },
+            |_, _| true,
+            visit,
+        )
+    }
+    .map_err(|error| batch_error(error, BPF_F_LOCK))?;
+    Ok(entries)
 }
 
 fn show(args: ShowArgs) -> anyhow::Result<()> {

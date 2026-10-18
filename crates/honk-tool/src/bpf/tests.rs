@@ -1,82 +1,8 @@
 use super::*;
 
 #[test]
-fn batch_attr_matches_kernel_abi() {
-    assert_eq!(std::mem::size_of::<BpfBatchAttr>(), 56);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, in_batch), 0);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, out_batch), 8);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, keys), 16);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, values), 24);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, count), 32);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, map_fd), 36);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, elem_flags), 40);
-    assert_eq!(std::mem::offset_of!(BpfBatchAttr, flags), 48);
-    assert_eq!(BPF_MAP_LOOKUP_BATCH, 24);
+fn batch_lock_flag_matches_kernel_abi() {
     assert_eq!(BPF_F_LOCK, 4);
-}
-
-#[test]
-fn batch_preserves_partial_cursor_and_final_enoent_entries() {
-    let mut calls = 0;
-    let expected = [
-        (vec![0x11; 16], vec![0x22; 8]),
-        (vec![0x33; 16], vec![0x44; 8]),
-    ];
-    let entries = map_entries_batch_with(17, 16, 8, BPF_F_LOCK, |_, attr| {
-        let next = unsafe { std::slice::from_raw_parts_mut(attr.out_batch as *mut u8, 16) };
-        assert_eq!(next, &[0; 16]);
-        if calls == 0 {
-            assert_eq!(attr.in_batch, 0);
-            next[..4].copy_from_slice(&9u32.to_ne_bytes());
-        } else {
-            assert_eq!(calls, 1, "short successful batches must continue to ENOENT");
-            let previous = unsafe { std::slice::from_raw_parts(attr.in_batch as *const u8, 16) };
-            assert_eq!(&previous[..4], &9u32.to_ne_bytes());
-            assert_eq!(&previous[4..], &[0; 12]);
-        }
-        let (key, value) = &expected[calls];
-        unsafe {
-            std::slice::from_raw_parts_mut(attr.keys as *mut u8, 16).copy_from_slice(key);
-            std::slice::from_raw_parts_mut(attr.values as *mut u8, 8).copy_from_slice(value);
-        }
-        attr.count = 1;
-        calls += 1;
-        if calls == 1 {
-            Ok(0)
-        } else {
-            Err(io::Error::from_raw_os_error(libc::ENOENT))
-        }
-    })
-    .unwrap();
-    assert_eq!(entries.as_slice(), expected.as_slice());
-}
-
-#[test]
-fn batch_accepts_empty_terminal_and_rejects_invalid_progress() {
-    let entries = map_entries_batch_with(17, 1, 8, BPF_F_LOCK, |_, attr| {
-        let cursor = unsafe { std::slice::from_raw_parts(attr.out_batch as *const u8, 4) };
-        assert_eq!(cursor, &[0; 4]);
-        attr.count = 0;
-        Err(io::Error::from_raw_os_error(libc::ENOENT))
-    })
-    .unwrap();
-    assert!(entries.is_empty());
-    for (count, terminal) in [
-        (0, false),
-        (BPF_BATCH_CHUNK as u32 + 1, false),
-        (u32::MAX, true),
-    ] {
-        let error = map_entries_batch_with(17, 16, 8, BPF_F_LOCK, |_, attr| {
-            attr.count = count;
-            if terminal {
-                Err(io::Error::from_raw_os_error(libc::ENOENT))
-            } else {
-                Ok(0)
-            }
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
 }
 
 #[test]
@@ -91,19 +17,14 @@ fn batch_errors_never_return_partial_or_fallback_success() {
             libc::EIO,
             libc::ENOSPC,
         ] {
-            for after_partial in [false, true] {
-                let mut calls = 0;
-                let error = map_entries_batch_with(17, 16, 8, elem_flags, |_, attr| {
-                    calls += 1;
-                    if after_partial && calls == 1 {
-                        attr.count = 1;
-                        return Ok(0);
-                    }
-                    attr.count = u32::MAX;
-                    Err(io::Error::from_raw_os_error(errno))
-                })
-                .unwrap_err();
-                assert_eq!(calls, if after_partial { 2 } else { 1 });
+            for after_progress in [false, true] {
+                let error = batch_error(
+                    BatchError::Errno {
+                        errno,
+                        after_progress,
+                    },
+                    elem_flags,
+                );
                 if matches!(errno, libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) {
                     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
                 } else {
@@ -112,6 +33,14 @@ fn batch_errors_never_return_partial_or_fallback_success() {
             }
         }
     }
+    let error = batch_error(
+        BatchError::InvalidCount {
+            count: BPF_BATCH_CHUNK + 1,
+            terminal: false,
+        },
+        BPF_F_LOCK,
+    );
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]
