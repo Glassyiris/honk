@@ -344,6 +344,23 @@ impl ControlPlane {
                 if declaring_sources_replaced(current_config.as_ref(), &new_config) {
                     *config = Arc::new(new_config);
                 }
+                let group_manager = self.group_manager.read().clone();
+                let cleared: Vec<_> = config
+                    .groups
+                    .iter()
+                    .filter_map(|group| {
+                        group_manager
+                            .clear_override(
+                                &group.name,
+                                honk_outbound::group::SelectorNetworks::Both,
+                            )
+                            .ok()
+                    })
+                    .collect();
+                drop(config);
+                for update in cleared {
+                    update.run_callbacks_without_interrupt();
+                }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(ReloadOutcome::Noop { generation });
             }

@@ -2070,6 +2070,67 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
 }
 
 #[tokio::test]
+async fn accepted_noop_activation_clears_automatic_pins_and_keeps_selector_choices() {
+    use honk_outbound::group::{SelectionNetwork, SelectorMember, SelectorNetworks};
+    let cp = test_cp().await;
+    let mut config = cp.config.read().await.as_ref().clone();
+    config.ensure_builtin_nodes();
+    config.nodes = [("a", 9), ("b", 10)]
+        .map(|(name, port)| canonical_socks5(name, "127.0.0.1", port, None))
+        .to_vec();
+    config.groups = [
+        ("auto", GroupPolicy::URLTest),
+        ("sel", GroupPolicy::Selector),
+    ]
+    .map(|(name, policy)| Group {
+        name: name.into(),
+        nodes: config.nodes.iter().map(|node| node.id).collect(),
+        policy,
+        ..Default::default()
+    })
+    .to_vec();
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    let accepted = cp.config.read().await.as_ref().clone();
+    let manager = cp.group_manager.read().clone();
+    manager
+        .publish_override(
+            "auto",
+            &SelectorMember::Node(accepted.nodes[1].id),
+            SelectorNetworks::Both,
+        )
+        .unwrap()
+        .run_callbacks();
+    manager
+        .set_selector_choice("sel", "b", SelectorNetworks::Both)
+        .unwrap();
+    assert!(manager.has_override("auto", SelectionNetwork::Tcp));
+
+    let generation = cp
+        .dns_controller
+        .runtime_provider()
+        .current_generation()
+        .get();
+    assert_eq!(
+        cp.apply_runtime_config(accepted, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Noop { generation }
+    );
+
+    assert!(Arc::ptr_eq(&cp.group_manager.read(), &manager));
+    for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
+        assert!(!manager.has_override("auto", network));
+        assert_eq!(
+            manager.get_selector_choice("sel", network).as_deref(),
+            Some("b")
+        );
+    }
+}
+
+#[tokio::test]
 async fn reload_preserves_group_identity_by_name_not_position() {
     let cp = test_cp().await;
     let mut config = cp.config.read().await.as_ref().clone();
