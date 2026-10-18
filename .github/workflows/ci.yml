@@ -1362,10 +1362,10 @@ jobs:
       - name: Test independent native API
         run: |
           set -euo pipefail
-          test_name=authentication_precedes_capability_and_query_validation
+          test_name=security::authentication_precedes_capability_and_query_validation
           test "$(cargo test -p honk-core --no-default-features --features native-api --test native_api_test "$test_name" -- --exact --list --format terse)" = "$test_name: test"
           env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY cargo test -p honk-core --no-default-features --features native-api --test native_api_test
-          test_name=native_and_clash_tokens_do_not_cross_authorize
+          test_name=security::native_and_clash_tokens_do_not_cross_authorize
           test "$(cargo test -p honk-core --no-default-features --features native-api,clash-api --test native_api_test "$test_name" -- --exact --list --format terse)" = "$test_name: test"
           env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY cargo test -p honk-core --no-default-features --features native-api,clash-api --test native_api_test "$test_name" -- --exact
           test_name=ui::embedded_ui_preserves_assets_head_and_safe_navigation
