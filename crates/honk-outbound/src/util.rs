@@ -198,6 +198,25 @@ pub async fn connect_marked(
     })
 }
 
+/// Connect to the first of the already-resolved `addrs` that accepts, racing
+/// them the way [`connect_marked`] does.
+pub async fn connect_marked_resolved(
+    addrs: &[SocketAddr],
+    mark: Option<u32>,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
+    crate::address_race::race_resolved_addrs(addrs, |addr| {
+        connect_marked_addr(addr, mark, connect_timeout)
+    })
+    .await
+    .unwrap_or_else(|| {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no address",
+        ))
+    })
+}
+
 /// Connect to a proxy server from the control plane, bypassing eBPF re-routing.
 pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Result<TcpStream> {
     connect_marked(addr, Some(bypass_mark()), connect_timeout).await

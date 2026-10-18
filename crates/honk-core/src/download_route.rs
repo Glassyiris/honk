@@ -483,22 +483,34 @@ pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'stati
                 .map_err(|_| "resolution_failed")?
         }
     };
-    for ip in addresses {
-        let connected = timeout_at(
-            by,
-            honk_outbound::util::connect_marked_addr(
-                SocketAddr::new(ip, port),
-                Some(honk_outbound::util::bypass_mark()),
-                by.saturating_duration_since(Instant::now()),
-            ),
-        )
-        .await
-        .map_err(|_| "download_timeout")?;
-        if let Ok(stream) = connected {
-            return get(Box::new(stream), request).await;
-        }
-    }
-    Err("connection_failed")
+    let addresses: Vec<_> = addresses
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    let stream = connect_direct(&addresses, by).await?;
+    get(Box::new(stream), request).await
+}
+
+/// A connection to the first of `addresses` that accepts, racing them like a
+/// proxy server's, so a blackholed address does not use up the deadline.
+async fn connect_direct(
+    addresses: &[SocketAddr],
+    by: Instant,
+) -> Result<tokio::net::TcpStream, &'static str> {
+    timeout_at(
+        by,
+        honk_outbound::util::connect_marked_resolved(
+            addresses,
+            Some(honk_outbound::util::bypass_mark()),
+            by.saturating_duration_since(Instant::now()),
+        ),
+    )
+    .await
+    .map_err(|_| "download_timeout")?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::TimedOut => "download_timeout",
+        _ => "connection_failed",
+    })
 }
 
 async fn get(
@@ -541,4 +553,51 @@ async fn get(
     )
     .await
     .map_err(|error| error.stage)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
+    /// A listener whose accept queue is full, so further connects hang.
+    fn blackhole() -> (socket2::Socket, Vec<std::net::TcpStream>) {
+        let listener =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        listener
+            .bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+            .unwrap();
+        listener.listen(0).unwrap();
+        let address = listener.local_addr().unwrap().as_socket().unwrap();
+        let fillers = (0..4)
+            .map(|_| {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                socket.set_nonblocking(true).unwrap();
+                let _ = socket.connect(&address.into());
+                socket.into()
+            })
+            .collect();
+        (listener, fillers)
+    }
+
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_use_up_the_deadline() {
+        let (blackhole, _fillers) = blackhole();
+        let first = blackhole.local_addr().unwrap().as_socket().unwrap();
+        let healthy = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), first.port()))
+            .await
+            .unwrap();
+        let second = healthy.local_addr().unwrap();
+
+        let stream =
+            super::connect_direct(&[first, second], Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), second);
+    }
 }
