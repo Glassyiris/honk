@@ -164,6 +164,24 @@ impl ConnectionObservation {
         self.flow()?.observer(generation(), None, purpose)
     }
 
+    pub(super) fn selection_observer(&self) -> Option<FlowObserver> {
+        let generation = self.recorded.as_ref()?.selection.as_ref()?.generation;
+        self.observer(|| generation, "dial_target")
+    }
+
+    pub(super) fn observe_tcp_plan(
+        &mut self,
+        observer: Option<&FlowObserver>,
+        build: impl FnOnce() -> crate::control::reload::ResolvedScorePlan,
+    ) -> crate::control::reload::ResolvedScorePlan {
+        let plan = match observer {
+            Some(observer) => observer.sync_scope(build),
+            None => build(),
+        };
+        self.selection_observed(plan.observation.as_ref(), plan.health_family);
+        plan
+    }
+
     pub(super) fn routing_started(&self) {
         if let Some(flow) = self.flow() {
             flow.transition(

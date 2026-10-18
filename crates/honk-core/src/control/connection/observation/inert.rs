@@ -40,6 +40,20 @@ impl ConnectionObservation {
     }
 
     #[inline]
+    pub(super) fn selection_observer(&self) -> Option<FlowObserver> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn observe_tcp_plan(
+        &mut self,
+        _observer: Option<&FlowObserver>,
+        build: impl FnOnce() -> crate::control::reload::ResolvedScorePlan,
+    ) -> crate::control::reload::ResolvedScorePlan {
+        build()
+    }
+
+    #[inline]
     pub(super) fn routing_started(&self) {}
 
     #[inline]

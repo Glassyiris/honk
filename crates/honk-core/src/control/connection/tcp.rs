@@ -536,10 +536,7 @@ impl ControlPlaneHandle {
                 if let Some((generation, catalog)) = &pinned_native {
                     observation.pin_selection(*generation, catalog, &generation_config);
                 }
-                #[cfg(feature = "native-api")]
-                let selection_observer = pinned_native.as_ref().and_then(|(generation, _)| {
-                    observation.observer(|| *generation, "dial_target")
-                });
+                let selection_observer = observation.selection_observer();
                 let (
                     mut candidates,
                     selection_mode,
@@ -558,15 +555,7 @@ impl ControlPlaneHandle {
                             mode_constraint,
                         )
                     };
-                    #[cfg(feature = "native-api")]
-                    let plan = match &selection_observer {
-                        Some(observer) => observer.sync_scope(select),
-                        None => select(),
-                    };
-                    #[cfg(not(feature = "native-api"))]
-                    let plan = select();
-                    #[cfg(feature = "native-api")]
-                    observation.selection_observed(plan.observation.as_ref(), plan.health_family);
+                    let plan = observation.observe_tcp_plan(selection_observer.as_ref(), select);
                     unpack_tcp_score_plan(plan)
                 };
                 // Only an unmeasured URLTest group is allowed to speculate. Its
@@ -697,16 +686,8 @@ impl ControlPlaneHandle {
                                     original.as_ref(),
                                 )
                             };
-                            #[cfg(feature = "native-api")]
-                            let mut plan = match &selection_observer {
-                                Some(observer) => observer.sync_scope(select),
-                                None => select(),
-                            };
-                            #[cfg(not(feature = "native-api"))]
-                            let mut plan = select();
-                            #[cfg(feature = "native-api")]
-                            observation
-                                .selection_observed(plan.observation.as_ref(), plan.health_family);
+                            let mut plan =
+                                observation.observe_tcp_plan(selection_observer.as_ref(), select);
                             // URLTest retains its existing fresh retry-round budget.
                             let mut retry_deadline =
                                 tokio::time::Instant::now() + overall_dial_timeout;
@@ -727,22 +708,8 @@ impl ControlPlaneHandle {
                                         original,
                                     )
                                 };
-                                #[cfg(feature = "native-api")]
-                                {
-                                    plan = match &selection_observer {
-                                        Some(observer) => observer.sync_scope(select),
-                                        None => select(),
-                                    };
-                                }
-                                #[cfg(not(feature = "native-api"))]
-                                {
-                                    plan = select();
-                                }
-                                #[cfg(feature = "native-api")]
-                                observation.selection_observed(
-                                    plan.observation.as_ref(),
-                                    plan.health_family,
-                                );
+                                plan = observation
+                                    .observe_tcp_plan(selection_observer.as_ref(), select);
                                 retry_deadline = dial_deadline;
                             }
                             let (
