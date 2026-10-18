@@ -1125,6 +1125,153 @@ async fn null_returns_to_the_built_in_sources() {
     fixture.shutdown().await;
 }
 
+/// Holds the state db's writer from an OS thread until released, or for 5 s.
+fn hold_state_writer(
+    fixture: &Fixture,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let db = fixture
+        .state
+        .upgrade()
+        .unwrap()
+        .geodata
+        .as_ref()
+        .unwrap()
+        .db();
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _connection = db.strict();
+        held.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(5));
+    });
+    holding.recv().unwrap();
+    (release, holder)
+}
+
+const MIXED: &str = r#"{"record_flows":"on","geodata":{"auto_update":{"enabled":false}}}"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_blocked_geodata_commit_does_not_stall_settings_or_the_runtime() {
+    let fixture = Fixture::new_with_state(Access::Admin, setup_rules).await;
+    let (release, holder) = hold_state_writer(&fixture);
+    let pending = tokio::spawn(
+        fixture
+            .request(Method::PATCH, SETTINGS)
+            .header("content-type", "application/json")
+            .body(MIXED)
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let during = fixture.get(SETTINGS).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(during["recording"]["flows"]["mode"], "auto");
+    assert_eq!(during["geodata"]["auto_update"]["enabled"], true);
+    assert!(!pending.is_finished());
+    release.send(()).unwrap();
+    let landed = ok(pending.await.unwrap().unwrap()).await;
+    holder.join().unwrap();
+    assert_eq!(landed["recording"]["flows"]["mode"], "on");
+    assert_eq!(landed["geodata"]["auto_update"]["enabled"], false);
+    assert_eq!(
+        fixture.get(SETTINGS).await["recording"]["flows"]["mode"],
+        "on"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_dropped_request_still_lands_its_geodata_commit_and_settings() {
+    let fixture = Fixture::new_with_state(Access::Admin, setup_rules).await;
+    let (release, holder) = hold_state_writer(&fixture);
+    let pending = tokio::spawn(
+        fixture
+            .request(Method::PATCH, SETTINGS)
+            .header("content-type", "application/json")
+            .body(MIXED)
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pending.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let mut landed = Value::Null;
+    for _ in 0..50 {
+        landed = fixture.get(SETTINGS).await;
+        if landed["recording"]["flows"]["mode"] == "on" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(landed["recording"]["flows"]["mode"], "on");
+    assert_eq!(landed["geodata"]["auto_update"]["enabled"], false);
+    fixture.shutdown().await;
+}
+
+const GEODATA_ONLY: &str = r#"{"geodata":{"auto_update":{"enabled":false}}}"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_blocked_geodata_commit_does_not_hold_the_config_lock() {
+    let fixture = Fixture::new_with_state(Access::Admin, setup_rules).await;
+    let (release, holder) = hold_state_writer(&fixture);
+    let pending = tokio::spawn(
+        fixture
+            .request(Method::PATCH, SETTINGS)
+            .header("content-type", "application/json")
+            .body(GEODATA_ONLY)
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = fixture.state.upgrade().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), state.config.write())
+            .await
+            .is_ok(),
+        "a reload writer queued behind the commit"
+    );
+    assert!(!pending.is_finished());
+    release.send(()).unwrap();
+    let landed = ok(pending.await.unwrap().unwrap()).await;
+    holder.join().unwrap();
+    assert_eq!(landed["geodata"]["auto_update"]["enabled"], false);
+    drop(state);
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn shutdown_during_a_commit_answers_unavailable_after_the_geodata_is_stored() {
+    let fixture = Fixture::new_with_state(Access::Admin, setup_rules).await;
+    let (release, holder) = hold_state_writer(&fixture);
+    let pending = tokio::spawn(
+        fixture
+            .request(Method::PATCH, SETTINGS)
+            .header("content-type", "application/json")
+            .body(MIXED)
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = fixture.state.upgrade().unwrap();
+    state.observation.settings.shutdown(&state.observation);
+    drop(state);
+    release.send(()).unwrap();
+    let response = pending.await.unwrap().unwrap();
+    holder.join().unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "temporarily_unavailable");
+    assert_eq!(error["error"]["details"]["geodata_stored"], true);
+    assert_eq!(
+        fixture.get(SETTINGS).await["geodata"]["auto_update"]["enabled"],
+        false
+    );
+    fixture.shutdown().await;
+}
+
 /// Group `proxy` exists in the configuration; the file routes downloads through it.
 fn setup_group(root: &Path, files: &mut HashMap<&'static str, String>) {
     setup_rules(root, files);

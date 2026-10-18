@@ -406,6 +406,8 @@ fn read_status(db: &StateDb) -> Status {
 pub(crate) struct Sources {
     db: Arc<StateDb>,
     stored: Mutex<Stored>,
+    /// Serializes `apply`, which stores without holding `stored`.
+    writer: Mutex<()>,
     status: Mutex<Status>,
     changed: tokio::sync::Notify,
 }
@@ -439,6 +441,7 @@ impl Sources {
         let sources = Self {
             db,
             stored: Mutex::new(stored),
+            writer: Mutex::new(()),
             status: Mutex::new(status),
             changed: tokio::sync::Notify::new(),
         };
@@ -449,6 +452,11 @@ impl Sources {
 
     pub(crate) fn effective(&self) -> Effective {
         effective(&self.stored.lock())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> Arc<StateDb> {
+        Arc::clone(&self.db)
     }
 
     /// Stores each URL and the route the configuration file names, over
@@ -493,9 +501,11 @@ impl Sources {
     }
 
     /// Stores a patch, or deletes everything stored for `None`. The schedule
-    /// follows a changed `auto_update` at once.
+    /// follows a changed `auto_update` at once. The write holds only `writer`,
+    /// so readers of `stored` never wait on the state db.
     pub(crate) fn apply(&self, patch: Option<Patch>) -> rusqlite::Result<Effective> {
-        let mut stored = self.stored.lock();
+        let _writer = self.writer.lock();
+        let stored = self.stored.lock().clone();
         let current = effective(&stored);
         let next = match patch {
             None => Stored::default(),
@@ -529,9 +539,8 @@ impl Sources {
         };
         self.write(&next)?;
         let schedule_changed = next.auto_update != stored.auto_update;
-        *stored = next;
-        let effective = effective(&stored);
-        drop(stored);
+        let effective = effective(&next);
+        *self.stored.lock() = next;
         if schedule_changed {
             self.reschedule(SystemTime::now());
         }

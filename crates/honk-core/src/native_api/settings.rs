@@ -242,6 +242,8 @@ impl Drop for StreamLease {
 
 pub(crate) struct Settings {
     values: Mutex<Values>,
+    /// Serializes PATCHes across their durable commit, which runs unlocked.
+    gate: Arc<tokio::sync::Mutex<()>>,
     // General attachment and each diagnostic demand expire independently.
     attachment: Arc<Mutex<[Attachment; 4]>>,
     stopped: std::sync::atomic::AtomicBool,
@@ -250,6 +252,7 @@ impl Settings {
     pub(crate) fn new(config: &Config) -> Self {
         Self {
             values: Mutex::new(Values::configured(config)),
+            gate: Arc::default(),
             attachment: Arc::new(Mutex::new(std::array::from_fn(|_| Attachment::default()))),
             stopped: std::sync::atomic::AtomicBool::new(false),
         }
@@ -374,24 +377,19 @@ impl Settings {
         patch: Patch,
         id: &RequestId,
     ) -> Result<Value, ApiError> {
-        self.patch_with(owner, settings, patch, id, || Ok(()))
+        self.check(settings, patch, id)?;
+        self.land(owner, settings, patch, id)
     }
 
-    /// Applies `patch` once it is valid and `commit` succeeded, so a stored
-    /// change made by `commit` and this one land together or not at all.
-    fn patch_with(
-        &self,
-        owner: &NativeObservation,
+    /// The values `patch` yields over `current`, and whether it names a
+    /// recorder or setting the configuration does not advertise.
+    fn staged(
+        current: Values,
         settings: &honk_config::experimental::NativeApiConfig,
         patch: Patch,
         id: &RequestId,
-        commit: impl FnOnce() -> Result<(), ApiError>,
-    ) -> Result<Value, ApiError> {
-        let mut current = self.values.lock();
-        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(invalid(id));
-        }
-        let mut next = *current;
+    ) -> Result<(Values, bool), ApiError> {
+        let mut next = current;
         // A bound or schema error is 400 even when the same patch also names
         // an unadvertised field, so 422 waits until every value is checked.
         let mut unadvertised = false;
@@ -457,10 +455,45 @@ impl Settings {
                 next.modes[index] = mode;
             }
         }
-        if unadvertised {
+        Ok((next, unadvertised))
+    }
+
+    /// Rejects `patch` that is invalid or unadvertised now, before anything is stored.
+    fn check(
+        &self,
+        settings: &honk_config::experimental::NativeApiConfig,
+        patch: Patch,
+        id: &RequestId,
+    ) -> Result<(), ApiError> {
+        let current = self.values.lock();
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(invalid(id));
+        }
+        if Self::staged(*current, settings, patch, id)?.1 {
             return Err(unsupported(id));
         }
-        commit()?;
+        Ok(())
+    }
+
+    /// Applies a patch that `check` accepted, over the values as they are now.
+    /// A recorder that a reload disallowed meanwhile stays gated by `allowed`.
+    fn land(
+        &self,
+        owner: &NativeObservation,
+        settings: &honk_config::experimental::NativeApiConfig,
+        patch: Patch,
+        id: &RequestId,
+    ) -> Result<Value, ApiError> {
+        let mut current = self.values.lock();
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(super::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::TemporarilyUnavailable,
+                "Runtime settings were not applied because the service is shutting down",
+                id,
+            ));
+        }
+        let (mut next, _) = Self::staged(*current, settings, patch, id)?;
         next.overridden = true;
         next.apply(owner);
         *current = next;
@@ -468,7 +501,7 @@ impl Settings {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Patch {
     record_flows: Option<RecorderMode>,
@@ -478,18 +511,18 @@ struct Patch {
     dns_log: Option<DnsPatch>,
     flows: Option<FlowPatch>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LogPatch {
     level: Option<Level>,
     buffered_records: Option<usize>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsPatch {
     max_records: Option<usize>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FlowPatch {
     max_flows: Option<usize>,
@@ -592,38 +625,72 @@ pub(super) async fn patch(
     {
         return Err(invalid(id));
     }
-    let active = state.config.read().await;
-    let commit = || match (geodata, state.geodata.as_ref()) {
-        (Some(_), None) => Err(unsupported(id)),
-        (Some((_, false)), Some(_)) => Err(super::error(
-            StatusCode::CONFLICT,
-            ErrorCode::StateConflict,
-            "geodata.download.group_id is not a current group",
-            id,
-        )),
-        (Some((patch, true)), Some(sources)) => sources.apply(patch).map(drop).map_err(|_| {
-            super::error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::TemporarilyUnavailable,
-                "Geodata settings could not be stored",
-                id,
-            )
-        }),
-        _ => Ok(()),
-    };
-    let settings = if others {
+    let gate = Arc::clone(&state.observation.settings.gate)
+        .lock_owned()
+        .await;
+    let staged: Option<Patch> = if others {
         let patch: Patch = super::body::decode_value(value, "", || invalid(id))?;
-        state.observation.settings.patch_with(
-            &state.observation,
-            &state.settings,
-            patch,
-            id,
-            commit,
-        )?
+        state
+            .observation
+            .settings
+            .check(&state.settings, patch, id)?;
+        Some(patch)
     } else {
-        commit()?;
-        state.observation.settings.snapshot()
+        None
     };
+    let stored = match geodata {
+        None => None,
+        Some((patch, current)) => {
+            let Some(sources) = state.geodata.clone() else {
+                return Err(unsupported(id));
+            };
+            if !current {
+                return Err(super::error(
+                    StatusCode::CONFLICT,
+                    ErrorCode::StateConflict,
+                    "geodata.download.group_id is not a current group",
+                    id,
+                ));
+            }
+            Some((sources, patch))
+        }
+    };
+    let owner = Arc::clone(&state.observation);
+    let config = state.settings.clone();
+    let request_id = id.clone();
+    let unavailable = |id: &RequestId| {
+        super::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::TemporarilyUnavailable,
+            "Geodata settings could not be stored",
+            id,
+        )
+    };
+    // The commit and the in-memory landing run to completion on a blocking
+    // thread even if this request is dropped, and keep the gate until then.
+    let settings = tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        let geodata_stored = stored.is_some();
+        if let Some((sources, patch)) = stored {
+            sources.apply(patch).map_err(|_| unavailable(&request_id))?;
+        }
+        match staged {
+            Some(patch) => owner
+                .settings
+                .land(&owner, &config, patch, &request_id)
+                .map_err(|error| {
+                    if geodata_stored {
+                        error.with_details(json!({"geodata_stored":true}))
+                    } else {
+                        error
+                    }
+                }),
+            None => Ok(owner.settings.snapshot()),
+        }
+    })
+    .await
+    .map_err(|_| unavailable(id))??;
+    let active = state.config.read().await;
     Ok(Json(with_geodata(state, settings, &active)).into_response())
 }
 
