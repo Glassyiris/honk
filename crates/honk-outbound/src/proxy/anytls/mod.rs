@@ -363,6 +363,7 @@ pub(crate) struct AnyTlsSession {
     /// deadline distinguish a silently-dead session from one whose server is
     /// merely slow to open a stream.
     rx_frame_seq: AtomicU64,
+    silence: parking_lot::Mutex<Option<(u64, crate::SharedError)>>,
     task_scope: crate::runtime::TaskScope,
     observations: parking_lot::Mutex<HashMap<u32, StreamObservation>>,
 }
@@ -409,6 +410,7 @@ impl AnyTlsSession {
             inbound_budget_epoch: AtomicU64::new(0),
             demux: Mutex::new(None),
             rx_frame_seq: AtomicU64::new(0),
+            silence: parking_lot::Mutex::new(None),
             task_scope: crate::runtime::TaskScope::capture(),
             observations: parking_lot::Mutex::new(HashMap::new()),
         });
@@ -501,6 +503,23 @@ impl AnyTlsSession {
         self.synack_pending.lock().sids.insert(sid, None);
     }
 
+    fn silence_incident(&self, sid: u32, marker: u64) -> crate::SharedError {
+        let mut silence = self.silence.lock();
+        if let Some((previous, error)) = &*silence
+            && *previous == marker
+        {
+            return error.clone();
+        }
+        let error = crate::SharedError::fanout(
+            crate::proxy::NodeFailure(anyhow::anyhow!(
+                "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
+            ))
+            .into(),
+        );
+        *silence = Some((marker, error.clone()));
+        error
+    }
+
     /// The SYN is on the wire; start its deadline. A fast peer may have
     /// acked while the frame sat in the queue — then there is nothing to arm.
     /// `activity_marker` is the inbound frame count sampled just before the
@@ -522,7 +541,8 @@ impl AnyTlsSession {
                 return;
             }
             let budget_waiting = session.inbound_budget_epoch.load(Ordering::SeqCst) & 1 != 0;
-            if budget_waiting || session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker {
+            let frame_seq = session.rx_frame_seq.load(Ordering::Relaxed);
+            if budget_waiting || frame_seq > activity_marker {
                 // SYNACK follows the target dial; UoT instead opens the
                 // proxy's magic service, so its failure stays node-scoped.
                 let error = anyhow::anyhow!("stream open not acknowledged");
@@ -540,21 +560,14 @@ impl AnyTlsSession {
                 // stop offering the carrier, fail only this open, and retire the
                 // carrier if it stays silent through the grace period.
                 crate::session::ManagedSession::begin_drain(&*session);
-                let silent_marker = session.rx_frame_seq.load(Ordering::Relaxed);
-                let error = anyhow::anyhow!("stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}");
-                session
-                    .dispatch_error(
-                        sid,
-                        crate::SharedError::new(anyhow::Error::new(crate::proxy::NodeFailure(error))),
-                    )
-                    .await;
+                let silent_marker = frame_seq;
+                let incident = session.silence_incident(sid, silent_marker);
+                session.dispatch_error(sid, incident.clone()).await;
                 tokio::time::sleep(SILENT_SESSION_GRACE).await;
                 if !session.is_closed()
                     && session.rx_frame_seq.load(Ordering::Relaxed) == silent_marker
                 {
-                    session.fail(anyhow::anyhow!(
-                        "session silent for {SILENT_SESSION_GRACE:?} after stream {sid} SYNACK timeout"
-                    ));
+                    session.fail_shared(incident);
                 }
             }
         });
@@ -1030,9 +1043,13 @@ impl AnyTlsSession {
     /// Record the first physical-failure reason and close: streams
     /// report the reason after draining queued data.
     fn fail(&self, reason: anyhow::Error) {
-        let _ = self.terminal_error.set(crate::SharedError::fanout(
+        self.fail_shared(crate::SharedError::fanout(
             crate::proxy::NodeFailure(reason).into(),
         ));
+    }
+
+    fn fail_shared(&self, error: crate::SharedError) {
+        let _ = self.terminal_error.set(error);
         self.close();
     }
 

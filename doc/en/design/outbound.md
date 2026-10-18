@@ -1014,6 +1014,8 @@ is dead: a loss burst silences every stream at once, and TCP delivers afterwards
 In that case, only the pending open is reset and the session leaves rotation.
 The session and its streams retire only after another ten seconds of silence,
 so the pool redials instead of reusing a dead carrier.
+All opens that time out in one silent window and its eventual retirement share
+one node-failure episode in Score, rather than one strike per affected stream.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor (`anytls_min_idle_session`) and `anytls_idle_session_timeout` feed one node-local janitor.

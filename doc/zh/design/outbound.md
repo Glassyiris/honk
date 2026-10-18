@@ -857,6 +857,8 @@ least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每�
 则只重置该 stream。窗口内完全静默不表示 carrier 已失效：突发丢包会让所有 stream
 同时静默，之后 TCP 仍会送达。此时只重置该 open，并让 session 退出轮转。
 仅当再静默十秒才连同其 stream 一起退役，pool 会重新拨号，而不继续复用已失效的 carrier。
+同一静默窗口内超时的所有 open 及其最终退役共用一个 Score 节点故障 episode，
+不会按受影响的 stream 数量重复累加故障次数。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor（`anytls_min_idle_session`）与 `anytls_idle_session_timeout` 输入同一个节点局部 janitor。Selector 或
