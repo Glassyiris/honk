@@ -1,5 +1,6 @@
 use super::*;
 mod connectivity;
+mod dns;
 mod fingerprint;
 mod policy;
 mod subscription;

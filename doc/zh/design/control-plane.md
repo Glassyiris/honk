@@ -250,6 +250,8 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 候选构建仅在路由输入及内容指纹未变时复用不可变用户态 `Router` 与编译 DNS router。Hosts 及被引用的 Geo 资源在解析前计算指纹；内容变化会强制替换。仅当完整 `RoutingPushPlan` 与 learned-domain projection 字节均未变时，才跳过 native 路由发布；数据路径健康状态仍会强制执行恢复性发布。
 
+`control/reload/dns.rs` 持有 hosts/policy 准备、DNS router/hosts 复用与候选 forwarder 构建；`transaction.rs` 保留 generation 绑定、发布锁、fence 与退役顺序。
+
 `DnsServiceProvider` 是一致的 DNS generation pointer。请求 lease 保留其 generation 的 forwarder、projection、transport pool 和出站运行时，直到退役。出站 registry 同样按 generation 持有：未变化的 node runtime 只在提交点转移，旧 registry 把这些 runtime 标记为已移出，然后开始优雅退役。现有 stream 与 `Ready` UDP endpoint 保持引用，同时旧 reusable pool 停止接受新工作并排空。
 
 编译路由发布有独立于 DNS runtime generation 的[进程生命周期上限](./routing.md#同步槽与原子发布)。发布后，排队中的 UDP53 与原始 `must` TCP53 元数据可能按上述准入规则被拒绝；已准入 DNS 查询仍按固定代际排空。

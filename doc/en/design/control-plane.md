@@ -264,6 +264,8 @@ Pre-commit failures leave the active code and facts intact. After a fenced publi
 
 Candidate construction reuses the immutable userspace `Router` and compiled DNS router only when their routing inputs and content fingerprints are unchanged. Hosts and referenced geo assets are fingerprinted before parsing; changed content forces a replacement. Native routing publication is skipped only when the complete `RoutingPushPlan` and learned-domain projection bytes are unchanged; datapath health still forces recovery publication.
 
+`control/reload/dns.rs` owns hosts/policy preparation, DNS router/hosts reuse, and candidate forwarder construction; `transaction.rs` retains generation binding, publication locks, fences, and retirement ordering.
+
 Compiled-routing publication has a [process-lifetime ceiling](./routing.md#synchronous-slots-and-atomic-publication), separate from DNS runtime generations. Publication can reject queued UDP53 and raw-`must` TCP53 metadata under the admission rules above; already admitted DNS queries retain their generation leases.
 
 `DnsServiceProvider` is the coherent DNS-generation pointer. A request lease retains its generation's forwarder, projection, transport pools, and outbound runtime until retirement. The outbound registry is also generation-owned: unchanged node runtimes transfer only at the commit point, the old registry marks those runtimes as moved, and then begins graceful retirement. Existing streams and `Ready` UDP endpoints keep their references while old reusable pools stop accepting new work and drain.
