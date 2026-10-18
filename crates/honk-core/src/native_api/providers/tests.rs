@@ -833,3 +833,16 @@ async fn refresh_publishes_configured_xhttp_transport_in_node_catalog() {
     fixture.stop().await;
     origin.stop().await;
 }
+
+#[test]
+fn retained_bytes_charge_the_owned_route_and_error_json() {
+    let bare = Provider::inline(0);
+    let mut owned = bare.clone();
+    owned.download = Some(json!({"route": "group", "group_id": "g".repeat(64)}));
+    owned.last_error = Some(ProviderError {
+        code: "rejected",
+        message: "rejected",
+        details: Some(json!({"diagnostic_code": "d".repeat(100)})),
+    });
+    assert!(owned.retained_bytes() >= bare.retained_bytes() + 64 + 100);
+}

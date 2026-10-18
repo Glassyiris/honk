@@ -189,6 +189,31 @@ impl Provider {
                     + traffic.download_bytes.as_ref().map_or(0, String::capacity)
                     + traffic.total_bytes.as_ref().map_or(0, String::capacity)
             })
+            + self.download.as_ref().map_or(0, json_heap)
+            + self
+                .last_error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .map_or(0, json_heap)
+    }
+}
+
+/// Heap `value` owns beyond its inline slot. A map is charged whole 11-entry nodes, the
+/// `BTreeMap` layout; an ordered map would differ by a small constant.
+fn json_heap(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(items) => {
+            items.capacity() * size_of::<Value>() + items.iter().map(json_heap).sum::<usize>()
+        }
+        Value::Object(map) => {
+            map.len().div_ceil(11) * 11 * size_of::<(String, Value)>()
+                + map
+                    .iter()
+                    .map(|(key, value)| key.capacity() + json_heap(value))
+                    .sum::<usize>()
+        }
+        _ => 0,
     }
 }
 
