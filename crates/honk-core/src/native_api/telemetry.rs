@@ -1,7 +1,7 @@
 //! One sampler's bounded, process-local memory and traffic observations.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::{Component, Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
@@ -490,21 +490,28 @@ async fn cgroup_scope(directory: &Path) -> &'static str {
     }
 }
 
-fn bpf_memlock(fdinfo: &str) -> Option<u64> {
-    let bpf = fdinfo
-        .lines()
-        .any(|line| line.starts_with("map_type:") || line.starts_with("prog_type:"));
-    bpf.then(|| {
+/// The object an fdinfo describes, as (kind, kernel id), and the memlock it is charged.
+fn bpf_object(fdinfo: &str) -> Option<((&'static str, u64), u64)> {
+    let field = |name: &str| {
         fdinfo
             .lines()
-            .find_map(|line| unsigned(line.strip_prefix("memlock:")?))
-    })?
+            .find_map(|line| unsigned(line.strip_prefix(name)?))
+    };
+    let key = if fdinfo.lines().any(|line| line.starts_with("map_type:")) {
+        ("map", field("map_id:")?)
+    } else if fdinfo.lines().any(|line| line.starts_with("prog_type:")) {
+        ("prog", field("prog_id:")?)
+    } else {
+        return None;
+    };
+    Some((key, field("memlock:")?))
 }
 
-/// Sums the memlock charged to this process's own BPF maps and programs; needs no BTF.
+/// Sums the memlock charged to this process's own BPF maps and programs, once per kernel
+/// object however many descriptors reference it; needs no BTF.
 fn ebpf_bytes(proc_self: &Path) -> Option<u64> {
     let fdinfo = proc_self.join("fdinfo");
-    std::fs::read_dir(proc_self.join("fd"))
+    let objects: HashMap<_, _> = std::fs::read_dir(proc_self.join("fd"))
         .ok()?
         .flatten()
         .filter(|entry| {
@@ -516,9 +523,10 @@ fn ebpf_bytes(proc_self: &Path) -> Option<u64> {
             })
         })
         .filter_map(|entry| {
-            bpf_memlock(&std::fs::read_to_string(fdinfo.join(entry.file_name())).ok()?)
+            bpf_object(&std::fs::read_to_string(fdinfo.join(entry.file_name())).ok()?)
         })
-        .reduce(u64::saturating_add)
+        .collect();
+    objects.into_values().reduce(u64::saturating_add)
 }
 
 async fn read_memory(proc_self: &Path) -> MemoryReading {
