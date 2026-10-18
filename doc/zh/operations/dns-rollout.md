@@ -34,7 +34,10 @@
    会停止进程并移除所有临时资源。
 3. 使用正常 service manager 暂停已安装服务。把当前 binary 与 config 复制到带
    时间戳、只读的回滚路径。
-4. 服务暂停期间备份持久化状态（`<data_dir>/state/` 或 `cache.db`），保留 owner 与 mode。记录三个回滚 artifact 的
+4. 服务暂停期间备份持久化状态（`<data_dir>/state/` 或 `cache.db`），保留 owner 与 mode。启用
+   `global.store_subscribe` 时，还要备份旧订阅存储，即在 `<data_dir>/.sub`、
+   `/var/share/honk/.sub`、`./.sub` 中找到的第一个私有 `.sub` 目录：带状态数据库的候选版本
+   首次启动会导入并删除其中的 `*.sub` 正文。记录 binary、config、状态与 `.sub` 备份的
    checksum。不要删除、改写、compact 或迁移数据库。
 5. 重启旧版本并验证其 UDP/TCP DNS smoke 后再继续，确认回滚文件可用。
 
@@ -69,7 +72,7 @@
 1. 正常停止候选版本并保留日志。不要清理 BPF 状态或修改持久化状态。
 2. 从已验证的回滚副本恢复旧 binary 与 config。仅当灰度损坏或替换了数据库时才
    恢复数据库备份；通常保留当前数据库。带状态数据库的候选版本首次启动时会导入
-   并删除 `cache.db`，因此回滚到没有状态数据库的版本时，需要恢复 `cache.db` 备份。
+   并删除 `cache.db`，启用 `global.store_subscribe` 时还会删除旧 `.sub` 订阅正文，因此回滚到没有状态数据库的版本时，需要恢复 `cache.db` 与 `.sub` 备份。
 3. 使用旧 config 与 BPF object 启动旧 binary。再触发一次常规 config reload，
    使其重新推送旧 routing generation；重新开放流量前从日志验证 generation commit。
 4. 重复 UDP/TCP DNS、路由，以及原本已配置时的 Clash smoke。确认主机健康，并把
