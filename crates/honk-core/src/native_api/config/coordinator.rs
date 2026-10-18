@@ -613,12 +613,27 @@ impl Worker {
                     .first()
                     .and_then(|main| accepted.ids.get(&main.path))
                     .cloned();
-                (accepted.ids.clone(), main)
+                (
+                    accepted.ids.clone(),
+                    main,
+                    !accepted.update.dependencies.is_empty(),
+                )
             });
+        let capture = if accepted.as_ref().is_some_and(|(_, _, captured)| *captured) {
+            let active = self.active.read().await.clone();
+            let deferred = self
+                .subscriptions
+                .deferred_subscriptions()
+                .await
+                .map_err(|_| unavailable())?;
+            Some((active, self.data_dir.clone(), deferred))
+        } else {
+            None
+        };
         tokio::task::spawn_blocking(move || {
             let (ids, main) = accepted
                 .as_ref()
-                .map_or((None, None), |(ids, main)| (Some(ids), main.as_deref()));
+                .map_or((None, None), |(ids, main, _)| (Some(ids), main.as_deref()));
             let reject = |error, diagnostics: &[DetailedDiagnostic], sources: &[SourceSnapshot]| {
                 config_error(error, diagnostics, sources, main, ids)
             };
@@ -635,6 +650,24 @@ impl Worker {
             let loaded = store
                 .load(&HashMap::new(), &mut diagnostics)
                 .map_err(|error| reject(error, &diagnostics, &[]))?;
+            // Reload admission permits unavailable geo assets; failed fingerprint capture
+            // must not tighten that contract or retain a stale dependency baseline.
+            let dependencies = capture
+                .and_then(|(active, data_dir, deferred)| {
+                    offline::capture_for_coordinator(
+                        loaded.clone(),
+                        store.dependency_root(),
+                        &active,
+                        &data_dir,
+                        SourceLimits::DEFAULT,
+                        &mut Vec::new(),
+                        &deferred,
+                        None,
+                    )
+                    .ok()
+                    .map(|captured| captured.dependencies)
+                })
+                .unwrap_or_default();
             let mut config = crate::admit_operator_config(
                 loaded.config,
                 loaded.sources[0].source.clone(),
@@ -646,7 +679,7 @@ impl Worker {
                 config,
                 Some(SourceUpdate {
                     sources: loaded.sources,
-                    dependencies: Vec::new(),
+                    dependencies,
                     geo_sources: None,
                 }),
                 diagnostics,

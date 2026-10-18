@@ -1411,6 +1411,75 @@ async fn identical_bytes_over_a_changed_loaded_file_are_not_a_success() {
     server.close().await;
 }
 
+#[tokio::test]
+async fn an_update_follows_a_reload_over_an_externally_edited_dependency() {
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::geodata::an_update_follows_a_reload_over_an_externally_edited_dependency",
+    ) {
+        return;
+    }
+    let server = AssetServer::new(geosite("new.example"), geoip(203), false).await;
+    let fixture = Fixture::new_custom(Access::Admin, false, |root, files| {
+        // Real reloads resolve assets through the process-wide data directory.
+        honk_config::paths::set_data_dir(root.join("state")).unwrap();
+        setup(root, files, server.address);
+    })
+    .await;
+    let hosts = fixture.path("hosts.rules");
+    std::fs::write(&hosts, "full:alias.test 192.0.2.1\n").unwrap();
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = format!(
+        "{}dns {{\n use_host: '{}'\n}}\n",
+        fixture.originals["main.dae"],
+        hosts.display()
+    );
+    let write = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&write).await["status"], "succeeded");
+    let written = fixture.get(CONFIG).await;
+    std::fs::write(&hosts, "full:alias.test 192.0.2.2\n").unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let reloaded = fixture.get(CONFIG).await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_ne!(reloaded["revision"], written["revision"]);
+    let updated = fixture.get(CONFIG).await;
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    assert_eq!(fixture.get(CONFIG).await["revision"], updated["revision"]);
+    fixture.shutdown().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn a_reload_keeps_runtime_admission_when_a_geo_asset_cannot_be_captured() {
+    if crate::native_api::logs::tests::run_isolated(
+        "native_api::config::tests::geodata::a_reload_keeps_runtime_admission_when_a_geo_asset_cannot_be_captured",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new_custom(Access::Admin, false, |root, files| {
+        honk_config::paths::set_data_dir(root.join("state")).unwrap();
+        setup_rules(root, files);
+    })
+    .await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = format!("{}# Capture dependencies.\n", fixture.originals["main.dae"]);
+    let write = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&write).await["status"], "succeeded");
+    let asset = fixture.path("state/geosite.dat");
+    std::fs::remove_file(&asset).unwrap();
+    // A regular proc file whose reads fail even when the test runs as root.
+    std::os::unix::fs::symlink("/proc/self/mem", &asset).unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&reload).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    fixture.shutdown().await;
+}
+
 /// A reload keeps a router whose asset bytes are unchanged, so it can go on
 /// naming a packaged file after an identical copy starts shadowing it.
 #[tokio::test]

@@ -199,6 +199,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 ### 配置来源、校验与操作
 
 只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，源 `path` 与规则 `file` 保留规范化的入口目录相对名称（例如 `config.d/routing.dae`），源 `absolute_path` 另行提供规范化绝对路径；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。因此 capabilities 中 `config.max_bytes` 为 61440，即 65536 字节正文上限扣除 4096 字节创建信封后单次请求能携带的最大替换或新建内容；`config_validate.max_bytes` 为 8 MiB 预算，因为完整校验还计入从磁盘读取的依赖。`resources.config` 不含 `content` 字段；替换或新建正文超过 `config.max_bytes` 时返回 `413 request_too_large`。
+Reload 会刷新此前已捕获的依赖指纹；来源与指纹未变化时保留原配置 revision。
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的配置数据。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。写入内容含有被遮蔽的值（原文或 JSON 转义写法）时返回 `403 permission_denied`。不足八字节的值既不遮蔽也不拒绝写入，可以写进普通源，读取时原样返回。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能用于编辑后回写。
 
