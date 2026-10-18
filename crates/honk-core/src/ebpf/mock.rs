@@ -121,6 +121,8 @@ pub struct MockEbpfBackend {
     #[cfg(test)]
     fail_next_quiesce: bool,
     #[cfg(test)]
+    pub quiesce_datapath_ready: std::sync::Arc<parking_lot::Mutex<Vec<bool>>>,
+    #[cfg(test)]
     datapath_flags_fault_nth: Option<usize>,
     #[cfg(test)]
     datapath_flags_writes_after_arm: usize,
@@ -661,6 +663,8 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.quiesce_datapath_ready.lock().push(self.datapath_ready);
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_quiesce) {
             anyhow::bail!("injected quiesce failure");

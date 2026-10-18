@@ -1,9 +1,9 @@
 use super::*;
 
 impl ControlPlane {
-    // Startup can fail before an epoch exists.
-    // Always retire shared network owners; only listener/task joins need an epoch.
-    pub(super) async fn stop_network_epoch(
+    // Closes every NFQUEUE/UDP source of admitted work while the hooks are still
+    // attached; callers detach or finish `stop_network_epoch` only afterward.
+    pub(super) async fn quiesce_udp_epoch(
         &mut self,
         mut epoch: Option<&mut RuntimeEpoch>,
     ) -> anyhow::Result<()> {
@@ -28,11 +28,9 @@ impl ControlPlane {
                 );
             }
             epoch.stop.send_replace(true);
-            if let Some(listener) = epoch.dns.as_mut() {
+            if let Some(listener) = epoch.dns.as_ref() {
                 listener.stop_accepting();
-                retain_error(&mut error, cleanup_stage(listener.abort_and_join()).await);
             }
-            epoch.dns.take();
             while let Some(result) = epoch.ingress.join_next().await {
                 retain_error(&mut error, result.map_err(anyhow::Error::from));
             }
@@ -59,6 +57,27 @@ impl ControlPlane {
             })
             .await,
         );
+        let udp = self.udp_pool.shutdown().await;
+        if !udp.joined || !udp.graceful {
+            error.get_or_insert_with(|| anyhow::anyhow!("UDP quiescence required forced cleanup"));
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    // Startup can fail before an epoch exists.
+    // Always retire shared network owners; only listener/task joins need an epoch.
+    // Runs after `quiesce_udp_epoch`.
+    pub(super) async fn stop_network_epoch(
+        &mut self,
+        mut epoch: Option<&mut RuntimeEpoch>,
+    ) -> anyhow::Result<()> {
+        let mut error = None;
+        if let Some(epoch) = epoch.as_mut() {
+            if let Some(listener) = epoch.dns.as_mut() {
+                retain_error(&mut error, cleanup_stage(listener.abort_and_join()).await);
+            }
+            epoch.dns.take();
+        }
         let registry = self.runtime_registry.read().clone();
         registry.begin_retirement();
         if let Some(epoch) = epoch.as_mut() {
@@ -84,10 +103,6 @@ impl ControlPlane {
             }
         }
         self.retirement.sink.lock().take();
-        let udp = self.udp_pool.shutdown().await;
-        if !udp.joined || !udp.graceful {
-            error.get_or_insert_with(|| anyhow::anyhow!("UDP quiescence required forced cleanup"));
-        }
         if let Some(epoch) = epoch {
             match join_retirement_owner(&mut epoch.removals, "flow retirement worker").await {
                 Ok(hints) => *self.retirement.hints.lock() = hints,
@@ -165,7 +180,7 @@ impl ControlPlane {
     // Tests enter without an epoch, like a startup that failed before binding.
     pub(in crate::control) async fn shutdown_runtime(
         &mut self,
-        epoch: Option<&mut RuntimeEpoch>,
+        mut epoch: Option<&mut RuntimeEpoch>,
         mut fatal: Option<anyhow::Error>,
     ) -> anyhow::Result<()> {
         if fatal.is_some() {
@@ -179,6 +194,10 @@ impl ControlPlane {
             EnginePhase::Draining
         });
         retain_error(&mut fatal, self.fence_runtime().await);
+        retain_error(
+            &mut fatal,
+            self.quiesce_udp_epoch(epoch.as_deref_mut()).await,
+        );
         #[cfg(feature = "ebpf")]
         if let Some(watcher) = self.iface_watcher.take() {
             watcher.shutdown(STAGE_TIMEOUT).await;

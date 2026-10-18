@@ -462,7 +462,13 @@ impl ControlPlane {
         if let Err(error) = prepared {
             // Preparation has not opened admission. Cleanup must not borrow the
             // terminal process shutdown path or discard retained API owners.
-            if let Err(cleanup) = self.stop_network_epoch(Some(&mut epoch)).await {
+            let mut cleanup = None;
+            retain_error(&mut cleanup, self.quiesce_udp_epoch(Some(&mut epoch)).await);
+            retain_error(
+                &mut cleanup,
+                self.stop_network_epoch(Some(&mut epoch)).await,
+            );
+            if let Some(cleanup) = cleanup {
                 return Err(cleanup
                     .context("runtime candidate cleanup failed")
                     .context(error));
@@ -716,14 +722,14 @@ fn reap_tcp(result: Option<Result<(), tokio::task::JoinError>>) -> EpochEvent {
 impl ControlPlane {
     async fn fence_runtime(&self) -> anyhow::Result<()> {
         let mut error = None;
+        if let Some(flags) = self.datapath_flags.as_ref() {
+            retain_error(&mut error, flags.fence_nfqueue().await);
+        }
         retain_error(
             &mut error,
             self.ebpf.write().await.set_datapath_ready(false),
         );
         self.drain_tracker.start_rejecting();
-        if let Some(flags) = self.datapath_flags.as_ref() {
-            retain_error(&mut error, flags.fence_nfqueue().await);
-        }
         error.map_or(Ok(()), Err)
     }
 

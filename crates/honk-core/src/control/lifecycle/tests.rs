@@ -345,3 +345,59 @@ fn udp_trace_is_reported_until_a_listener_generation_traces() {
     super::record_udp_trace(&degradations, false);
     assert!(traced());
 }
+
+async fn mock_plane(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlane {
+    let plane = crate::control::tests::support::control_plane(Config::default());
+    *plane.ebpf.write().await = Box::new(backend);
+    plane
+}
+
+#[tokio::test]
+async fn shutdown_quiesces_nfqueue_before_closing_datapath_admission() -> anyhow::Result<()> {
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let observed = backend.quiesce_datapath_ready.clone();
+    let mut plane = mock_plane(backend).await;
+    plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::native(),
+    )));
+    plane.start_datapath_flags_coordinator()?;
+    plane.initialize_datapath_flags(true, true).await?;
+    {
+        let mut ebpf = plane.ebpf.write().await;
+        ebpf.publish_listener_sockets(0, None, &[], &[])?;
+        ebpf.set_datapath_ready(true)?;
+    }
+    plane.shutdown_runtime(None, None).await?;
+    assert_eq!(
+        *observed.lock(),
+        [true],
+        "NFQUEUE quiescence must complete while datapath admission is still closed to passthrough"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_detaches_hooks_only_after_udp_cleanup() -> anyhow::Result<()> {
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let detached = backend.detach_calls.clone();
+    let mut plane = mock_plane(backend).await;
+    let (release, parked) = tokio::sync::oneshot::channel::<()>();
+    assert!(plane.udp_pool.spawn_slow_path(async move {
+        let _ = parked.await;
+    }));
+    let shutdown = plane.shutdown_runtime(None, None);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut shutdown => panic!("shutdown finished with parked UDP cleanup: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    assert_eq!(
+        detached.load(Ordering::Relaxed),
+        0,
+        "hooks must stay attached until admitted UDP ownership drains"
+    );
+    release.send(()).unwrap();
+    shutdown.await?;
+    assert_eq!(detached.load(Ordering::Relaxed), 1);
+    Ok(())
+}
