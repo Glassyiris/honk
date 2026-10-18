@@ -348,6 +348,16 @@ impl ControlPlane {
                 let cleared: Vec<_> = config
                     .groups
                     .iter()
+                    // An unpinned group needs no write lock or update; this keeps the
+                    // identical reload allocation-free.
+                    .filter(|group| {
+                        [
+                            honk_outbound::group::SelectionNetwork::Tcp,
+                            honk_outbound::group::SelectionNetwork::Udp,
+                        ]
+                        .into_iter()
+                        .any(|network| group_manager.has_override(&group.name, network))
+                    })
                     .filter_map(|group| {
                         group_manager
                             .clear_override(
