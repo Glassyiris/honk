@@ -1,3 +1,4 @@
+use super::validation::CandidateCheck;
 use super::*;
 
 #[test]

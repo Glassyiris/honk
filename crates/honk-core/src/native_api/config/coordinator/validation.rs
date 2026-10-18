@@ -61,6 +61,188 @@ impl Worker {
                 "generation_id":format!("{instance}:{generation}"),"validated_at":timestamp(SystemTime::now())}))
         }).await.map_err(|_|unavailable())?
     }
+
+    pub(super) async fn candidate_check(&self) -> Result<CandidateCheck, ApiError> {
+        let active = self.active.read().await.clone();
+        Ok(CandidateCheck {
+            store: self.store.clone(),
+            secrets: self.service.secrets_with(&active),
+            active,
+            log_files: self.log_files.clone(),
+            data_dir: self.data_dir.clone(),
+            deferred: self
+                .subscriptions
+                .deferred_subscriptions()
+                .await
+                .map_err(|_| unavailable())?,
+        })
+    }
+}
+
+/// What a candidate validates against, captured before blocking work.
+pub(super) struct CandidateCheck {
+    pub(super) store: SourceStore,
+    /// The set the source listing's `writable` uses, so a write it offers is not refused here.
+    pub(super) secrets: ListenerSecrets,
+    pub(super) active: Arc<Config>,
+    pub(super) log_files: LogFiles,
+    pub(super) data_dir: PathBuf,
+    pub(super) deferred: Vec<honk_config::subscription::Subscription>,
+}
+
+impl CandidateCheck {
+    /// Full validation of a candidate, refusing anything the write or the following reload
+    /// must not admit. `write` is a source write of `content` at `target` over `accepted`;
+    /// `None` is a whole-tree candidate.
+    pub(super) fn validate(
+        &self,
+        loaded: LoadedConfig,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        write: Option<(&Accepted, &Path, &str)>,
+        fallback: Option<&str>,
+        ids: Option<&HashMap<PathBuf, String>>,
+    ) -> Result<offline::ValidatedConfig, ApiError> {
+        let active = &self.active;
+        let parsed_sources = loaded.sources.clone();
+        let validated = offline::validate_for_coordinator(
+            loaded,
+            self.store.dependency_root(),
+            active,
+            &self.data_dir,
+            SourceLimits::DEFAULT,
+            diagnostics,
+            &self.deferred,
+            None,
+            &[],
+        )
+        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, ids))?;
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+        {
+            return Err(diagnostics_error(
+                diagnostics,
+                &validated.sources,
+                fallback,
+                ids,
+            ));
+        }
+        let mut written = &validated.sources[0];
+        let refusal = if let Some((accepted, target, content)) = write {
+            let old_credentials: Vec<_> = accepted
+                .update
+                .sources
+                .iter()
+                .filter(|source| source.contains_api_secret)
+                .map(|source| (&source.path, &source.content))
+                .collect();
+            let new_credentials: Vec<_> = validated
+                .sources
+                .iter()
+                .filter(|source| source.contains_api_secret)
+                .map(|source| (&source.path, &source.content))
+                .collect();
+            // The target's own declaration implies a changed credential set, so it goes first.
+            let refusal = if validated
+                .sources
+                .iter()
+                .any(|source| source.path == target && source.contains_api_secret)
+            {
+                Some(WriteRefusal::ListenerSecretSource)
+            } else if self.secrets.contains(content) {
+                Some(WriteRefusal::ListenerSecretInContent)
+            } else if old_credentials != new_credentials {
+                Some(WriteRefusal::CredentialSourcesChanged)
+            } else {
+                None
+            };
+            if let Some(source) = validated
+                .sources
+                .iter()
+                .find(|source| source.path == target)
+            {
+                written = source;
+            }
+            refusal
+        } else {
+            None
+        };
+        let refusal = refusal.or_else(|| {
+            (validated.config.experimental.native_api != active.experimental.native_api
+                || validated.config.experimental.clash_api.secret
+                    != active.experimental.clash_api.secret
+                || (matches!(self.store, SourceStore::Db(_))
+                    && validated.config.global.data_dir != active.global.data_dir))
+                .then_some(WriteRefusal::ListenerSettingsChanged)
+        });
+        if let Some(reason) = refusal {
+            return Err(denied().with_reason(reason));
+        }
+        // The reload would reject these, and a rejected reload leaves the written file
+        // ahead of the accepted hash; refuse before writing.
+        let restart = restart_diagnostics(
+            active,
+            &validated.config,
+            &self.log_files,
+            &written.source,
+            Severity::Error,
+        );
+        if !restart.is_empty() {
+            diagnostics.extend(restart);
+            return Err(diagnostics_error(
+                diagnostics,
+                &validated.sources,
+                fallback,
+                ids,
+            ));
+        }
+        Ok(validated)
+    }
+
+    pub(super) fn recheck(
+        &self,
+        overlay: &HashMap<PathBuf, Arc<str>>,
+        validated: &offline::ValidatedConfig,
+    ) -> Result<(), WriteError> {
+        unchanged(
+            &self.store,
+            overlay,
+            validated,
+            &self.active,
+            &self.data_dir,
+            &self.deferred,
+        )
+    }
+}
+
+/// Fails with `Conflict` unless `store` still yields `validated`: the same documents, loading
+/// without errors, over the same dependencies.
+pub(super) fn unchanged(
+    store: &SourceStore,
+    overlay: &HashMap<PathBuf, Arc<str>>,
+    validated: &offline::ValidatedConfig,
+    active: &Config,
+    data_dir: &Path,
+    deferred: &[honk_config::subscription::Subscription],
+) -> Result<(), WriteError> {
+    let mut notices = Vec::new();
+    let loaded = store
+        .load(overlay, &mut notices)
+        .map_err(|_| WriteError::Conflict)?;
+    if notices
+        .iter()
+        .any(|notice| notice.severity == Severity::Error)
+        || !same_source_documents(&validated.sources, &loaded.sources)
+    {
+        return Err(WriteError::Conflict);
+    }
+    let dependencies = validated
+        .recapture_dependencies(active, data_dir, SourceLimits::DEFAULT, deferred)
+        .map_err(|_| WriteError::Conflict)?;
+    if validated.dependencies != dependencies {
+        return Err(WriteError::Conflict);
+    }
+    Ok(())
 }
 
 /// Restart-only settings the candidate changes, as diagnostics on `source`. The reload
