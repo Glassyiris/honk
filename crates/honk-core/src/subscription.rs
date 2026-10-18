@@ -422,7 +422,7 @@ fn subscription_request_headers(sub: &Subscription) -> anyhow::Result<http::Head
 /// original origin and cross-origin hops drop credentials.
 async fn fetch_following(
     sub: &Subscription,
-    hop: route::Hop<'_>,
+    mut hop: route::Hop<'_>,
 ) -> anyhow::Result<(Vec<u8>, SubscriptionUserinfo)> {
     let deadline = tokio::time::Instant::now() + SUBSCRIPTION_TIMEOUT;
     let mut url = reqwest::Url::parse(&sub.url)?;
@@ -557,7 +557,11 @@ impl SubscriptionManager {
             let routing = self.routing.get().ok_or_else(|| {
                 anyhow::anyhow!("subscription '{}': routing is not ready yet", sub.name)
             })?;
-            fetch_following(sub, route::Hop::Routed(routing)).await?
+            let hop = route::Hop::Routed {
+                routing,
+                original: None,
+            };
+            fetch_following(sub, hop).await?
         };
         let content = finish_attempt(
             String::from_utf8(body).map_err(|_| {

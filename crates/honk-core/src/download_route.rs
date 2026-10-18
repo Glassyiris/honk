@@ -15,8 +15,8 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::{
-    ScoreAttempt, ScoreContinuation, ScoreOutcome, ScoreSelectionContext, ScoreTarget,
-    SelectionNetwork, SharedGroupManager,
+    ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreSelectionContext,
+    ScoreTarget, SelectionNetwork, SharedGroupManager,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry, TcpOutbound};
 use honk_outbound::runtime::{
@@ -354,13 +354,16 @@ impl Outbounds<'_> {
     /// node the detour or the routing rules choose, whose tunnel is closed
     /// after. Also returns the group the route went through. `setting` and
     /// `purpose` are as in [`Self::decide`]. Setup has to finish by the
-    /// deadline's `headers`.
+    /// deadline's `headers`. `original` is the first admitted Score business of
+    /// a redirect chain; later hops of the chain continue it instead of
+    /// starting new business.
     pub(crate) async fn fetch(
         &self,
         detour: Detour<'_>,
         setting: &str,
         purpose: &str,
         request: &Request<'_>,
+        original: &mut Option<ScoreContinuation>,
     ) -> Result<(Reply, Option<String>), Failed> {
         let (detour, strict_resolver) = match detour {
             Detour::Direct => return Ok((fetch_direct(request).await?, None)),
@@ -380,7 +383,7 @@ impl Outbounds<'_> {
                 setting,
                 purpose,
                 (host, port),
-                None,
+                original.as_ref(),
                 strict_resolver,
             ),
         )
@@ -392,28 +395,18 @@ impl Outbounds<'_> {
             Route::Direct { feedback } => (None, feedback),
             Route::Proxy { node, feedback } => (Some(node), feedback),
         };
-        let business = feedback
-            .as_ref()
-            .map(ScoreAttempt::begin)
-            .transpose()
-            .map_err(|_| {
-                Failed::Route(
-                    anyhow::Error::new(NoUsableNode {
-                        outbound: decision.group.clone().unwrap_or_default(),
-                    })
-                    .context(purpose.to_owned()),
-                )
-            })?;
+        let business = admit(
+            feedback.as_ref(),
+            original,
+            decision.group.as_deref(),
+            purpose,
+        )?;
         let reply = match node {
             None => fetch_direct(request).await,
             Some(node) => self.fetch_through(&node, purpose, request).await,
         };
         if let Some(business) = business {
-            business.finish(match &reply {
-                Ok(_) => ScoreOutcome::Success,
-                Err("download_timeout") => ScoreOutcome::Timeout,
-                Err(_) => ScoreOutcome::Cancelled,
-            });
+            business.finish(settlement(&reply));
         }
         let reply = reply?;
         Ok((reply, decision.group))
@@ -451,6 +444,41 @@ impl Outbounds<'_> {
             debug!(%error, "{purpose} tunnel did not close cleanly");
         }
         reply
+    }
+}
+
+/// Admits the planned Score business before the download runs. Admission is
+/// refused when the selected node left its pool since the plan, so the route
+/// has no usable node. The first admitted business of a chain becomes its
+/// `original`.
+pub(crate) fn admit(
+    feedback: Option<&ScoreAttempt>,
+    original: &mut Option<ScoreContinuation>,
+    group: Option<&str>,
+    purpose: &str,
+) -> Result<Option<ScoreBusinessGuard>, Failed> {
+    let business = feedback.map(ScoreAttempt::begin).transpose().map_err(|_| {
+        Failed::Route(
+            anyhow::Error::new(NoUsableNode {
+                outbound: group.unwrap_or_default().to_owned(),
+            })
+            .context(purpose.to_owned()),
+        )
+    })?;
+    if let Some(business) = &business {
+        original.get_or_insert_with(|| business.continuation());
+    }
+    Ok(business)
+}
+
+/// The Score settlement of a finished download. A download has no client side
+/// to disconnect, so every failure is the carrier's or target's, never a
+/// cancellation, as for the external UI download.
+pub(crate) fn settlement(reply: &Result<Reply, &'static str>) -> ScoreOutcome {
+    match reply {
+        Ok(_) => ScoreOutcome::Success,
+        Err("download_timeout") => ScoreOutcome::Timeout,
+        Err(_) => ScoreOutcome::Other,
     }
 }
 

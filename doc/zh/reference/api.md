@@ -630,7 +630,7 @@ Readonly／Peek 使用已提交参与者，不重新排名。Apply 初始化并�
 | 字段 | 含义 |
 | --- | --- |
 | `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及各作用域中最快的当前赚取周期 `q`：通常为 16；若该组近期每秒至少两条业务且作用域近期试用大多成功则为 8（尚无作用域时为 0）。它不能作为合并作用域预算公式的分母：每个作用域在创建时固定冷启动额度 `B`，每个原始开始按当时的 `q` 累积 `1/q`；每个作用域的 `spent + reserved` 不超过 `B` 加已赚额度的整数部分。 |
-| `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、不增加可选额度的延续尝试。`recovery` 包含 TCP 替代、DNS 改路／UDP 转 TCP 和 UI 重定向，不限于出错后的重试；它既不是可选试用，也不是新原始业务。普通非试用没有来源桶。 |
+| `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、不增加可选额度的延续尝试。`recovery` 包含 TCP 替代、DNS 改路／UDP 转 TCP 以及 UI 与订阅重定向，不限于出错后的重试；它既不是可选试用，也不是新原始业务。普通非试用没有来源桶。 |
 | `trialStarts`、`spent`、`reserved` | 已开始可选试用、累计已支出 token，以及尚未开始的 token 预留。开始只支出一次，开始后取消不退款。 |
 | `coldAllowance`、`coldAvailable`、`earnedAvailable` | 固定初始额度与当前可用额度的合计。每作用域最多保留八个未花费已赚 token。时间、读取、目标变动与证据过期不赚额度，保留作用域在 reload／成员变化后不重置。 |
 | `budgetBlocked`、`inFlightBlocked`、`refunded`、`expired` | 预留被拒计数（`budgetBlocked` 也计入作用域因试用反复失败而暂停时拒绝的候选）、最后引用释放／未开始失效的退款数，以及在途跟踪项过期数。只有未开始预留可退款；跟踪过期不退回已开始工作的支出。 |

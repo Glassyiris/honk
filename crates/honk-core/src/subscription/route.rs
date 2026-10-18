@@ -3,6 +3,7 @@
 //! group it names, like every other download honk makes itself.
 
 use honk_config::subscription::Subscription;
+use honk_outbound::group::ScoreContinuation;
 use tokio::time::Instant;
 
 use crate::download_route::{Detour, Failed, NoUsableNode, Request};
@@ -40,15 +41,19 @@ pub(super) enum Hop<'a> {
     /// Straight to the host on the marked client, outside routing.
     Direct(&'a marked_http::Client),
     /// Through the subscription's route, decided again for every redirect
-    /// because its host usually differs.
-    Routed(&'a Routing),
+    /// because its host usually differs. `original` is the chain's first
+    /// admitted Score business, which later hops continue.
+    Routed {
+        routing: &'a Routing,
+        original: Option<ScoreContinuation>,
+    },
 }
 
 impl Hop<'_> {
     /// One GET of `url` that reads only the body of an answer that is
     /// neither followed nor failed.
     pub(super) async fn get(
-        &self,
+        &mut self,
         subscription: &Subscription,
         url: &reqwest::Url,
         headers: &http::HeaderMap,
@@ -67,7 +72,7 @@ impl Hop<'_> {
                     }
                 }
             }
-            Self::Routed(routing) => {
+            Self::Routed { routing, original } => {
                 let request = Request {
                     url,
                     headers,
@@ -83,6 +88,7 @@ impl Hop<'_> {
                         "subscription.download_detour",
                         "subscription download",
                         &request,
+                        original,
                     )
                     .await;
                 match fetched {

@@ -647,7 +647,7 @@ async fn exchange(
     let (reply, group) = match routed {
         None => (download_route::fetch_direct(&request).await?, None),
         Some((outbounds, detour)) => outbounds
-            .fetch(detour, DETOUR_SETTING, PURPOSE, &request)
+            .fetch(detour, DETOUR_SETTING, PURPOSE, &request, &mut None)
             .await
             .map_err(|failed| match failed {
                 Failed::Route(_) => "group_unavailable",

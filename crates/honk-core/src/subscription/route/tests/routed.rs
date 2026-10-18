@@ -336,6 +336,77 @@ async fn a_score_group_fetch_is_admitted_and_rotates_the_next_selection() {
     assert_eq!(selected(&routing).await, nodes[1].id);
 }
 
+/// Redirect hops continue the first hop's business: they are not new starts
+/// that advance Score rotation again.
+#[tokio::test]
+async fn a_redirect_chain_is_one_score_business() {
+    let (address, requests) = serve(|path| {
+        if path == "/sub" {
+            redirect("302 Found", "/next")
+        } else {
+            ok()
+        }
+    })
+    .await;
+    let (routing, dials, _) = scored_routing();
+    manager(routing.clone())
+        .fetch(&subscription(address, "score"))
+        .await
+        .unwrap();
+    assert_eq!(requests.lock().len(), 2);
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        routing
+            .group_manager
+            .read()
+            .score_state()
+            .root_business_starts(),
+        1
+    );
+}
+
+/// Admission is refused for a plan that was already spent, as for a node that
+/// left its pool; that route has no usable node and the download never runs.
+#[tokio::test]
+async fn a_refused_score_admission_leaves_no_usable_node() {
+    let (routing, _, _) = scored_routing();
+    let crate::download_route::Route::Proxy { feedback, .. } =
+        decide_score(&routing, "127.0.0.1", None).await
+    else {
+        panic!("the Score group resolves to a proxy leaf");
+    };
+    let feedback = feedback.unwrap();
+    let mut original = None;
+    let admit = |original: &mut _| {
+        crate::download_route::admit(
+            Some(&feedback),
+            original,
+            Some("score"),
+            "subscription download",
+        )
+    };
+    let _admitted = admit(&mut original).ok().unwrap();
+    assert!(original.is_some(), "the first admission is the original");
+    let Err(crate::download_route::Failed::Route(error)) = admit(&mut original) else {
+        panic!("the spent plan is refused");
+    };
+    let unusable = error
+        .downcast_ref::<crate::download_route::NoUsableNode>()
+        .unwrap();
+    assert_eq!(unusable.outbound, "score");
+}
+
+/// A carrier that cannot be dialed is a failure of that node, not a client
+/// cancellation that Score would ignore.
+#[test]
+fn a_failed_download_settles_as_failure_not_cancellation() {
+    use crate::download_route::settlement;
+    use honk_outbound::group::ScoreOutcome;
+    assert_eq!(settlement(&Err("connection_failed")), ScoreOutcome::Other);
+    assert_eq!(settlement(&Err("tls_failed")), ScoreOutcome::Other);
+    assert_eq!(settlement(&Err("download_timeout")), ScoreOutcome::Timeout);
+}
+
 /// A forced group's host is never looked up through the system resolver when
 /// the request names its own resolver, whose failure leaves the family unknown.
 #[tokio::test]
