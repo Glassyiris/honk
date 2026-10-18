@@ -684,10 +684,15 @@ pub(crate) fn export_to(data_dir: &Path, out: &Path, with_secrets: bool) -> anyh
         .and_then(|()| std::fs::hard_link(&staged, out));
     let _ = std::fs::remove_file(&staged);
     published.map_err(|error| anyhow::anyhow!("write {}: {error}", out.display()))?;
-    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
-    }
+    File::open(publication_dir(out))?.sync_all()?;
     Ok(())
+}
+
+/// A bare relative `out` has an empty parent, which names the current directory.
+fn publication_dir(out: &Path) -> &Path {
+    out.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn head_and_parent(connection: &Connection) -> Result<Option<(i64, Option<i64>)>, StoreError> {
