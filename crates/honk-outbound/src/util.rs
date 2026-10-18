@@ -167,9 +167,11 @@ pub async fn connect_marked(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    // Boxed: marked hosts/nameserver resolution and its lookup observation are
-    // several KiB, and every dial wrapper above this one would embed them.
-    let resolution = Box::pin(crate::bootstrap::resolve(host));
+    let resolution = crate::bootstrap::resolve(host);
+    // Lookup observation enlarges the resolver future embedded by every dial
+    // wrapper above this one; inert builds keep their unboxed resolver.
+    #[cfg(feature = "flow-observation")]
+    let resolution = Box::pin(resolution);
     let (resolution, selection) =
         crate::runtime::flow_observation::observe_resolution(resolution).await;
     let addrs: Vec<_> = resolution?
