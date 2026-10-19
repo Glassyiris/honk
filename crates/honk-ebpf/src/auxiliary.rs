@@ -231,15 +231,8 @@ pub fn refresh_handoff(
     let Some(snapshot) = handoff_identity(key) else {
         return Ok(false);
     };
-    if snapshot.decision_token != token
-        || snapshot.incarnation != incarnation
-        || auxiliary_expired(
-            key,
-            snapshot.incarnation,
-            now.saturating_sub(snapshot.last_seen_ns),
-            true,
-        )
-    {
+    // Idle handoff age cannot revoke the live conn's matching ownership.
+    if snapshot.decision_token != token || snapshot.incarnation != incarnation {
         return Err(IDENTITY_MISMATCH);
     }
     if now.saturating_sub(snapshot.last_seen_ns) < AUXILIARY_MAP_REFRESH_INTERVAL_NS {

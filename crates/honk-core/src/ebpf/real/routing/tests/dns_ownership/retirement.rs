@@ -9,6 +9,7 @@ use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 mod publication;
 mod reverse_syn;
 mod stable_values;
+mod udp_keepalive;
 
 const TC_ACT_PIPE: u32 = 3;
 const LAST_INCARNATION: u64 = 0x00ff_ffff_ffff_ffff;
