@@ -8,6 +8,7 @@ use honk_ebpf_common::conn::{
 };
 use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
 
+mod admission;
 mod cadence;
 mod cursor;
 mod redirect_retention;

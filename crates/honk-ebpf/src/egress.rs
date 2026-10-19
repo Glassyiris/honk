@@ -213,19 +213,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             if dae0_ifindex != 0 && skb_ingress_ifindex(ctx) == dae0_ifindex {
                 let _ = lookup_udp_seen(&reversed_key);
             } else {
-                mark_udp_seen(
-                    &reversed_key,
-                    1u8,  // is_wan_ingress_direction
-                    None, // outbound
-                    None, // mark
-                    None, // must
-                    None, // mac
-                    0,    // dscp
-                    None, // pname
-                    0,    // pid
-                    0,    // trace_id
-                    0,    // routing_meta_flags
-                );
+                crate::contrack::udp::observe_reverse_udp(&reversed_key);
             }
             if crate::contrack::tuple_unavailable(&reversed_key) {
                 return Err(TC_ACT_SHOT);

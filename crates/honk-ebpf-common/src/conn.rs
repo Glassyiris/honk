@@ -117,10 +117,11 @@ pub enum BpfStatsKey {
     TcpChildProofStorageFailure = 5,
     TcpPublisherClaimFailure = 6,
     NewFlowRateLimited = 7,
+    UdpReverseLearningSuspended = 8,
 }
 
 impl BpfStatsKey {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::UdpConnOverflow,
         Self::TcpConnOverflow,
         Self::RedirectTrackInsertFailure,
@@ -129,6 +130,7 @@ impl BpfStatsKey {
         Self::TcpChildProofStorageFailure,
         Self::TcpPublisherClaimFailure,
         Self::NewFlowRateLimited,
+        Self::UdpReverseLearningSuspended,
     ];
     pub const COUNT: u32 = Self::ALL.len() as u32;
 
@@ -142,6 +144,7 @@ impl BpfStatsKey {
             Self::TcpChildProofStorageFailure => "tcp_child_proof_storage_failure",
             Self::TcpPublisherClaimFailure => "tcp_publisher_claim_failure",
             Self::NewFlowRateLimited => "new_flow_rate_limited",
+            Self::UdpReverseLearningSuspended => "udp_reverse_learning_suspended",
         }
     }
 }

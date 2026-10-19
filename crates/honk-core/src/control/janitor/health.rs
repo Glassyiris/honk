@@ -74,7 +74,9 @@ impl BpfJanitor {
         }
         for key in BpfStatsKey::ALL {
             let message = match key {
-                BpfStatsKey::UdpConnOverflow | BpfStatsKey::TcpConnOverflow => continue,
+                BpfStatsKey::UdpConnOverflow
+                | BpfStatsKey::TcpConnOverflow
+                | BpfStatsKey::UdpReverseLearningSuspended => continue,
                 BpfStatsKey::RedirectTrackInsertFailure
                 | BpfStatsKey::RoutingHandoffInsertFailure => {
                     "BPF janitor: auxiliary map insert failures increased"

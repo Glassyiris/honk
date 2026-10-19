@@ -135,6 +135,7 @@ pub struct MockEbpfBackend {
     pub bpf_stats: HashMap<u32, u64>,
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
+    pub admission_pressure: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub listener_sockets_published: bool,
     listener_socket_slots: HashMap<u32, std::os::fd::RawFd>,
     #[cfg(test)]
@@ -1086,6 +1087,11 @@ impl EbpfBackend for MockEbpfBackend {
         ))
     }
 
+    fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
+        self.admission_pressure.store(pressured, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     fn retire_batch(
         &mut self,
         requests: &[RetireRequest<'_>],
@@ -1317,6 +1323,7 @@ impl EbpfBackend for MockEbpfBackend {
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.datapath_ready = false;
+        self.admission_pressure.store(false, std::sync::atomic::Ordering::Relaxed);
         self.listener_sockets_published = false;
         self.listener_socket_slots.clear();
         self.routing_generation = None;

@@ -71,6 +71,16 @@ pub fn datapath_flags() -> u32 {
     DATAPATH_FLAGS_MAP.get(0).copied().unwrap_or(0)
 }
 
+/// Only conn-state occupancy gates reverse UDP learning; auxiliary pressure
+/// must not change the semantics of incoming UDP services.
+#[btf_map]
+pub static ADMISSION_PRESSURE: Array<u32, 1> = Array::new();
+
+#[inline(always)]
+pub fn admission_pressure() -> bool {
+    ADMISSION_PRESSURE.get(0).is_some_and(|pressure| *pressure != 0)
+}
+
 /// Persistent across process reloads so no live held skb can observe token reuse.
 #[btf_map]
 pub static UDP_DECISION_SEQUENCE: Array<UdpDecisionSequence, 1, 0> = Array::new();

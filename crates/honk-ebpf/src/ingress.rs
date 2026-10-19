@@ -984,19 +984,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if crate::contrack::tuple_unavailable(&reversed_key) {
             return Err(TC_ACT_SHOT);
         }
-        let _ = crate::contrack::udp::mark_udp_seen(
-            &reversed_key,
-            1u8,
-            None,
-            None,
-            None,
-            None,
-            0,
-            None,
-            0,
-            0,
-            0,
-        );
+        crate::contrack::udp::observe_reverse_udp(&reversed_key);
         if crate::contrack::tuple_unavailable(&reversed_key) {
             return Err(TC_ACT_SHOT);
         }

@@ -915,6 +915,10 @@ impl EbpfBackend for RealEbpfBackend {
         ))
     }
 
+    fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
+        self.array_set("ADMISSION_PRESSURE", 0, &u32::from(pressured))
+    }
+
     fn set_outbound_alive(
         &mut self,
         outbound: u8,

@@ -321,3 +321,19 @@ pub fn mark_udp_seen(
         Some(unsafe { &mut *result })
     }
 }
+
+/// Reverse observations cannot claim new conn capacity while the janitor's
+/// conn-only pressure latch is set. Existing forward authority stays untouched.
+#[inline(always)]
+pub fn observe_reverse_udp(key: &TuplesKey) {
+    if super::is_short_lived_udp_traffic(key) {
+        return;
+    }
+    if crate::maps::admission_pressure() {
+        if lookup_udp_seen(key).is_none() {
+            crate::maps::increment_bpf_stat(BpfStatsKey::UdpReverseLearningSuspended);
+        }
+    } else {
+        let _ = mark_udp_seen(key, 1, None, None, None, None, 0, None, 0, 0, 0);
+    }
+}

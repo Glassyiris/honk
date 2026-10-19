@@ -843,6 +843,9 @@ pub trait EbpfBackend: Send + Sync {
         Ok((0, 0))
     }
 
+    /// Publish the janitor's conn-only reverse-UDP admission latch.
+    fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()>;
+
     /// Stream REDIRECT_TRACK in bounded chunks. The callback can stop at a
     /// chunk boundary so callers can retain a wall-clock budget.
     fn redirect_track_for_each_chunk(

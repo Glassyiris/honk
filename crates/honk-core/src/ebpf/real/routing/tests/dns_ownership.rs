@@ -29,6 +29,7 @@ mod trace;
 mod udp_commit;
 mod udp_group;
 mod udp_listeners;
+mod udp_reverse;
 
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;

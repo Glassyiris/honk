@@ -2,13 +2,20 @@ use super::*;
 use anyhow::Context;
 use tokio::time::Instant;
 
+const ADMISSION_PRESSURE_EXIT_WATERMARK: f64 = 0.60;
+
+pub(super) fn admission_pressured(active: bool, utilization: f64) -> bool {
+    utilization >= if active { ADMISSION_PRESSURE_EXIT_WATERMARK } else { CONN_STATE_ELEVATED_WATERMARK }
+}
+
 pub(super) struct TickState {
     pub(super) pressure: PressureState,
-    gauge: OccupancyGauge,
+    pub(super) gauge: OccupancyGauge,
     aux_scan_results: [AuxScanResult; AuxMap::COUNT],
     health: HealthLatches,
     last_cleanup: Instant,
     last_health_check: Instant,
+    admission_pressure: bool,
 }
 
 impl TickState {
@@ -23,6 +30,7 @@ impl TickState {
             health: HealthLatches::default(),
             last_cleanup: now,
             last_health_check: now,
+            admission_pressure: false,
         }
     }
 }
@@ -58,6 +66,12 @@ impl BpfJanitor {
                 (counters, userspace_deletes),
             )
         };
+        let admission_pressure = admission_pressured(state.admission_pressure, conn_utilization);
+        if admission_pressure != state.admission_pressure {
+            self.ebpf.write().await.set_admission_pressure(admission_pressure)
+                .context("publishing reverse UDP admission pressure")?;
+            state.admission_pressure = admission_pressure;
+        }
         let utilization = conn_utilization.max(aux_utilization);
         update_pressure_state(&mut state.pressure, overflow_delta, utilization);
         let backlog = state
