@@ -211,12 +211,13 @@ pub fn is_new_tcp_connection(tcph: &TcpHdr) -> bool {
 /// Expiry refuses this invocation rather than masquerading as a lookup miss.
 #[inline(always)]
 pub fn tuple_unavailable(key: &TuplesKey) -> bool {
-    available_tuple_lifecycle(key).is_err()
+    available_tuple_lifecycle(key, None).is_err()
 }
 
 #[inline(always)]
 pub(crate) fn available_tuple_lifecycle(
     key: &TuplesKey,
+    now: Option<u64>,
 ) -> Result<Option<crate::flow::ConnLifecycle>, ()> {
     if tuple_retiring(key) {
         return Err(());
@@ -224,7 +225,7 @@ pub(crate) fn available_tuple_lifecycle(
     let Some(state) = crate::flow::conn_lifecycle(key) else {
         return Ok(None);
     };
-    let now = unsafe { bpf_ktime_get_ns() };
+    let now = now.unwrap_or_else(|| unsafe { bpf_ktime_get_ns() });
     let expired = if key.l4proto == crate::transport::IPPROTO_TCP {
         state.state == TcpState::TcpStateClosing as u8
             && now.saturating_sub(state.last_seen_ns) > TCP_CONN_STATE_CLOSING_TIMEOUT_NS

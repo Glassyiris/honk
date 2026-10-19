@@ -220,6 +220,18 @@ pub fn lookup_udp_seen(key: &TuplesKey) -> Option<&'static mut ConnState> {
     lookup_udp_seen_at(key, unsafe { bpf_ktime_get_ns() })
 }
 
+/// A live hit already decided expiry and renewal under one lock. A failed
+/// lookup may be a fence/expired hit, never permission to replace that owner.
+#[inline(always)]
+pub fn lookup_udp_available(key: &TuplesKey) -> Result<Option<&'static mut ConnState>, ()> {
+    match lookup_udp_seen(key) {
+        Some(state) if state.state == UdpDecisionState::Preparing as u8 => Err(()),
+        Some(state) => Ok(Some(state)),
+        None if tuple_retiring(key) || CONN_STATE_MAP.get_ptr(key).is_some() => Err(()),
+        None => Ok(None),
+    }
+}
+
 /// Queued decisions keep a userspace-owned clock until their final state is published.
 #[inline(always)]
 pub fn renew_udp_reply(
@@ -368,6 +380,22 @@ pub fn observe_reverse_udp(key: &TuplesKey) {
         }
     } else {
         let _ = mark_udp_seen(key, 1, None, None, None, None, 0, None, 0, 0, 0);
+    }
+}
+
+/// Established replies decide availability and renewal in one lock. Only a
+/// genuine miss reaches learning, and dae0 replies remain lookup-only.
+#[inline(always)]
+pub fn reverse_udp_available(key: &TuplesKey, learn: bool) -> bool {
+    match lookup_udp_available(key) {
+        Err(()) => false,
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            if learn {
+                observe_reverse_udp(key);
+            }
+            !super::tuple_unavailable(key)
+        }
     }
 }
 

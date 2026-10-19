@@ -160,7 +160,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
             let tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&reversed_key);
-            mark_tcp_seen(
+            let seen = mark_tcp_seen(
                 &reversed_key,
                 &pkt.tcph,
                 None, // outbound
@@ -173,7 +173,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 0,
                 &tcp_publisher,
             );
-            if crate::contrack::tuple_unavailable(&reversed_key) {
+            if seen.is_none() && crate::contrack::tuple_unavailable(&reversed_key) {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -190,19 +190,12 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             }
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            if crate::contrack::tuple_unavailable(&reversed_key) {
-                return Err(TC_ACT_SHOT);
-            }
             // A reply leaving dae0 answers a flow honk already owns. Creating a
             // WAN-direction entry for a peer the client never contacted would
             // make the client's first packet to that peer bypass the proxy.
             let dae0_ifindex = PARAM.load().dae0_ifindex;
-            if dae0_ifindex != 0 && skb_ingress_ifindex(ctx) == dae0_ifindex {
-                let _ = lookup_udp_seen(&reversed_key);
-            } else {
-                crate::contrack::udp::observe_reverse_udp(&reversed_key);
-            }
-            if crate::contrack::tuple_unavailable(&reversed_key) {
+            let learn = dae0_ifindex == 0 || skb_ingress_ifindex(ctx) != dae0_ifindex;
+            if !crate::contrack::udp::reverse_udp_available(&reversed_key, learn) {
                 return Err(TC_ACT_SHOT);
             }
         }

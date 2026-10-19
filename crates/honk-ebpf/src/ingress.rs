@@ -510,8 +510,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return pass_through_classified(ctx);
         }
     }
-    // TCP fence/expiry refusal happens inside conntrack and its post-miss check.
-    if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
+    // Ordinary UDP combines availability with its cached lookup below.
+    if pkt.l4proto != IPPROTO_TCP
+        && (pkt.l4proto != IPPROTO_UDP
+            || crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five))
+        && crate::contrack::tuple_unavailable(&pkt.tuples.five)
+    {
         return Err(TC_ACT_SHOT);
     }
     let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&pkt.tuples.five);
@@ -608,9 +612,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if tcp_state.is_none() && crate::maps::tuple_retiring(&pkt.tuples.five) {
             return Err(TC_ACT_SHOT);
         }
-    } else {
-        if !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five)
-            && let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five)
+    } else if !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five) {
+        // Refusal is not a miss: expired/Preparing tuples never reach probing
+        // or new-flow publication.
+        if let Some(state) = crate::contrack::udp::lookup_udp_available(&pkt.tuples.five)
+            .map_err(|_| TC_ACT_SHOT)?
         {
             return cached_udp_decision(ctx, link_h_len, pkt, state);
         }
@@ -937,7 +943,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
         let tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&reversed_key);
-        let _ = crate::contrack::tcp::mark_tcp_seen(
+        let seen = crate::contrack::tcp::mark_tcp_seen(
             &reversed_key,
             &pkt.tcph,
             None,
@@ -950,7 +956,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             0,
             &tcp_publisher,
         );
-        if crate::contrack::tuple_unavailable(&reversed_key) {
+        if seen.is_none() && crate::contrack::tuple_unavailable(&reversed_key) {
             return Err(TC_ACT_SHOT);
         }
     } else if pkt.l4proto == IPPROTO_UDP {
@@ -962,11 +968,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        if crate::contrack::tuple_unavailable(&reversed_key) {
-            return Err(TC_ACT_SHOT);
-        }
-        crate::contrack::udp::observe_reverse_udp(&reversed_key);
-        if crate::contrack::tuple_unavailable(&reversed_key) {
+        if !crate::contrack::udp::reverse_udp_available(&reversed_key, true) {
             return Err(TC_ACT_SHOT);
         }
     }
@@ -1066,11 +1068,11 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     }
     let mut canonical: TuplesKey = unsafe { mem::zeroed() };
     crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut canonical);
-    let lifecycle =
-        crate::contrack::available_tuple_lifecycle(&canonical).map_err(|_| TC_ACT_SHOT)?;
+    let now = unsafe { bpf_ktime_get_ns() };
+    let lifecycle = crate::contrack::available_tuple_lifecycle(&canonical, Some(now))
+        .map_err(|_| TC_ACT_SHOT)?;
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five).reverse();
 
-    let now = unsafe { bpf_ktime_get_ns() };
     let entry = match crate::auxiliary::reverse_redirect(&canonical, &redirect_tuple, now)
         .map_err(|_| TC_ACT_SHOT)?
     {
