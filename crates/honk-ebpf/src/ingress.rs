@@ -48,7 +48,7 @@ use crate::{
     route::{OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT},
     sk,
     transport::{
-        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet,
+        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, parse_packet,
         udp_has_quic_long_header,
     },
 };
@@ -491,6 +491,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
+        if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
+            return Err(TC_ACT_SHOT);
+        }
         return pass_through_classified(ctx);
     }
 
@@ -1152,13 +1155,13 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 14))
+    crate::fragment::record(flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 14)))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 0))
+    crate::fragment::record(flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 0)))
 }
 
 #[unsafe(no_mangle)]

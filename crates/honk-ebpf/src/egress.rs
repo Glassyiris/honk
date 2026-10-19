@@ -35,7 +35,10 @@ use crate::{
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     socket_identity,
-    transport::{ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PASS_NDP_REDIRECT, parse_packet},
+    transport::{
+        ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_NDP_REDIRECT,
+        parse_packet,
+    },
 };
 
 use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
@@ -799,6 +802,9 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // that ctx.skb.skb is a valid non-null pointer.
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
+        if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
+            return Err(TC_ACT_SHOT);
+        }
         // Unsupported or malformed traffic is left untouched.
         return Err(TC_ACT_OK);
     }
@@ -885,11 +891,11 @@ pub fn lan_egress_l3(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 14))
+    crate::fragment::record(flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 14)))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 0))
+    crate::fragment::record(flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 0)))
 }

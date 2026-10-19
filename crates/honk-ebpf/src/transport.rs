@@ -69,6 +69,7 @@ pub struct ParsedPacket {
     pub routing_input: honk_ebpf_common::RoutingInput,
     pub route_witness: honk_ebpf_common::KernelRouteWitness,
     pub trace_id: u32,
+    pub frag_id: u32,
     pub incarnation: u64,
 }
 
@@ -293,6 +294,7 @@ impl ParseTransportExt for ParseTransportCtx {
 
             let frag_off = u16::from_be_bytes(self.iph.frags);
             self.is_fragmented = ((frag_off & 0x2000) != 0) as u8;
+            self.frag_id = u16::from_be_bytes(self.iph.id) as u32;
             if frag_off & 0x1FFF != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
@@ -368,6 +370,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     }
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
+                    self.frag_id = u32::from_be(fragh.identification);
                     offset += mem::size_of::<FragHdr>() as u32;
                     let frag_off = u16::from_be(fragh.frag_off);
                     self.is_fragmented |= (frag_off & 0x0001) as u8;
@@ -511,6 +514,7 @@ impl ParseTransportExt for ParseTransportCtx {
 
             let frag_off = u16::from_be_bytes(iph.frags);
             self.is_fragmented = ((frag_off & 0x2000) != 0) as u8;
+            self.frag_id = u16::from_be_bytes(iph.id) as u32;
             if frag_off & 0x1FFF != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
@@ -565,6 +569,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     let fragh = unsafe { &*fragh_ptr };
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
+                    self.frag_id = u32::from_be(fragh.identification);
                     offset += mem::size_of::<FragHdr>() as u32;
                     let frag_off = u16::from_be(fragh.frag_off);
                     self.is_fragmented |= (frag_off & 0x0001) as u8;
@@ -676,10 +681,17 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
         None => return ERR_MALFORMED,
     };
 
+    // Wrappers read this after the program body; a packet that never reaches the
+    // parse must not inherit the previous packet's fragmentation.
+    out.is_fragmented = 0;
     if let Err(e) = tctx.parse(ctx, link_h_len) {
+        if e == PARSE_FRAGMENT as c_long {
+            // Later fragments are identified by address pair, protocol and ID.
+            out.frag_id = tctx.frag_id;
+            tctx.fill_tuples(&mut out.tuples);
+        }
         return e;
     }
-
     if tctx.l4proto == IPPROTO_ICMPV6 {
         return if tctx.icmp6h.type_ == 137 {
             PASS_NDP_REDIRECT
@@ -695,6 +707,7 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
     out.l4proto = tctx.l4proto;
     out.listener_l4proto = tctx.listener_l4proto;
     out.is_fragmented = tctx.is_fragmented;
+    out.frag_id = tctx.frag_id;
     out.incarnation = 0;
     tctx.fill_tuples(&mut out.tuples);
     0

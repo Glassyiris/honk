@@ -5,8 +5,8 @@ use aya_ebpf::btf_maps::{
 };
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
-    BpfStatsKey, ConnState, FlowIncarnationSequence, FlowMapValue, MAX_CONN_STATE_NUM,
-    ParseTransportCtx, RetirementFence, UdpDecisionSequence,
+    BpfStatsKey, ConnState, FlowIncarnationSequence, FlowMapValue, FragmentKey, FragmentVerdict,
+    MAX_CONN_STATE_NUM, ParseTransportCtx, RetirementFence, UdpDecisionSequence,
 };
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::DaeEvent;
@@ -138,6 +138,12 @@ pub struct NewFlowWindow {
 /// forgets a source's recent count.
 #[btf_map]
 pub static NEW_FLOW_RATE: LruPerCpuHashMap<In6Addr, NewFlowWindow, 16384> = LruPerCpuHashMap::new();
+
+/// Datagrams whose first fragment was redirected or dropped; later fragments
+/// of the same datagram are dropped too. Forgetting an entry only lets later
+/// fragments pass as they did before the record existed.
+#[btf_map]
+pub static FRAG_VERDICT: LruHashMap<FragmentKey, FragmentVerdict, 4096> = LruHashMap::new();
 
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
