@@ -615,8 +615,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     } else if !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five) {
         // Refusal is not a miss: expired/Preparing tuples never reach probing
         // or new-flow publication.
-        if let Some(state) = crate::contrack::udp::lookup_udp_available(&pkt.tuples.five)
-            .map_err(|_| TC_ACT_SHOT)?
+        if let Some(state) =
+            crate::contrack::udp::lookup_udp_available(&pkt.tuples.five).map_err(|_| TC_ACT_SHOT)?
         {
             return cached_udp_decision(ctx, link_h_len, pkt, state);
         }

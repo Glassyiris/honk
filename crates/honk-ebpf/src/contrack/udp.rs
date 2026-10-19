@@ -223,7 +223,7 @@ pub fn lookup_udp_seen(key: &TuplesKey) -> Option<&'static mut ConnState> {
 /// A live hit already decided expiry and renewal under one lock. A failed
 /// lookup may be a fence/expired hit, never permission to replace that owner.
 #[inline(always)]
-pub fn lookup_udp_available(key: &TuplesKey) -> Result<Option<&'static mut ConnState>, ()> {
+pub(crate) fn lookup_udp_available(key: &TuplesKey) -> Result<Option<&'static mut ConnState>, ()> {
     match lookup_udp_seen(key) {
         Some(state) if state.state == UdpDecisionState::Preparing as u8 => Err(()),
         Some(state) => Ok(Some(state)),

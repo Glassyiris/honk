@@ -1,12 +1,12 @@
 //! One backend-exclusive retirement protocol for every tuple-map deletion.
 use super::*;
 use crate::ebpf::retirement::{
-    Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit,
-    retire_staged_udp, tuple_matches,
+    Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit, retire_staged_udp,
 };
 use crate::ebpf::udp_state_is_staged;
 use aya::maps::ArrayOfMaps;
 use honk_ebpf_common::conn::RetirementFence;
+use std::collections::HashSet;
 
 const IPPROTO_TCP: u8 = libc::IPPROTO_TCP as u8;
 const IPPROTO_UDP: u8 = libc::IPPROTO_UDP as u8;
@@ -99,14 +99,23 @@ impl RealEbpfBackend {
             anyhow::bail!("retirement operation owner exhausted");
         };
         self.retirement_owner = owner;
-        // One heap buffer keeps wide batches off the blocking worker's stack.
+        // Keep wide batches off the blocking worker's stack and preserve
+        // acquisition order without scanning every previously acquired key.
         let mut acquired = Vec::with_capacity(keys.len());
+        let mut seen = HashSet::with_capacity(keys.len());
         let mut failure = None;
         let mut value = None;
         let mut unresolved = false;
         self.array_set("RETIRE_ACTIVE", 0, &1u32)?;
         for (key, token) in keys {
-            if acquired.iter().any(|previous| tuple_matches(previous, key)) {
+            let identity = (
+                unsafe { key.src_ip.u6_addr8 },
+                unsafe { key.dst_ip.u6_addr8 },
+                key.src_port,
+                key.dst_port,
+                key.l4proto,
+            );
+            if !seen.insert(identity) {
                 continue;
             }
             let mut canonical = *key;
