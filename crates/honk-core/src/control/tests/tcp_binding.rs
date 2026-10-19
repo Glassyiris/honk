@@ -1,13 +1,17 @@
-//! Real SYN/request/accepted-FD proof. Packet replay only releases a captured SYNACK;
-//! the original SYN and final ACK traverse the production TC and request hooks.
+//! Real SYN/accepted-FD proof. Packet replay only releases a captured SYNACK or replays a
+//! captured SYN; every SYN and the final ACK traverse the production TC and sock_ops hook.
 
 use super::support::TestRetirement;
 use super::support::netns::{
     build_lab, lab_config, pinned_hash_snapshot, pinned_map, run_isolated,
 };
-use super::support::wire::{Wire, hold_synack, packet_socket, recv_frame, tcp_segment};
+use super::support::wire::{
+    Wire, hold_synack, packet_socket, recv_frame, syn_isn, tcp_segment, with_source_port,
+    with_syn_isn,
+};
 use super::{
-    NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder, udp_test_node,
+    NETNS_TEST_TIMEOUT, configure_test_edge, fresh_test_netns, in_test_netns, udp_test_forwarder,
+    udp_test_node,
 };
 use crate::control::{ControlPlane, ControlPlaneHandle};
 use crate::daens;
@@ -18,12 +22,15 @@ use anyhow::{Context, ensure};
 use aya::maps::{Array, HashMap};
 use honk_config::node::Node;
 use honk_ebpf_common::{
-    FlowMapValue, RedirectTuple,
+    FlowMapValue, RedirectEntry, RedirectTuple,
     conn::{ConnState, FlowIncarnationSequence, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS},
-    redirect_need::{RoutingHandoffEntry, TcpRequestKey, TcpSocketBinding, TuplesKey},
+    redirect_need::{RoutingHandoffEntry, TCP_BINDING_CHILD, TuplesKey},
 };
 use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
-use retransmit::{Client, gated_synack};
+use maps::{
+    MAP_LOCK, await_conn, conn_map, handoff_map, mutate_conn, mutate_handoff, redirect_map,
+};
+use retransmit::{Client, Lineage, SynTap, gated_synack, routing_view};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
@@ -35,8 +42,11 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
+mod callback;
 mod lifetime;
+mod maps;
 mod retransmit;
+mod syn_state;
 
 const CHILD: &str = "HONK_TCP_BINDING_CHILD";
 const ROOT: &str = "/sys/fs/bpf/tcp-binding";
@@ -53,8 +63,9 @@ enum Kind {
     Manual,
 }
 
-// Cases whose branch is family-independent (shared fexit/userspace code, no v4/v6
-// hook of its own) run once on v4; `accepted` covers the v6 hooks.
+// Cases whose branch is family-independent (shared TC/userspace code, no v4/v6 ctx read or
+// socket lookup of its own) run once on v4; `accepted`, the absent-owner and the full-child
+// cases cover both families.
 macro_rules! kernel_case {
     ($name:ident, [$($family:literal),+], $case:path) => {
         #[test]
@@ -70,7 +81,7 @@ macro_rules! kernel_case {
     };
 }
 
-// Ablate route_request's skb incarnation capture or the fexit storage CREATE.
+// Ablate the sock_ops child storage CREATE or the TC SYN publication it proves.
 kernel_case!(
     netns_tcp_accepted_fd_proves_original_syn,
     ["v4", "v6"],
@@ -82,54 +93,96 @@ kernel_case!(
     ["v4"],
     queued_closed_child
 );
-// Ablate the fexit current-incarnation check before child storage CREATE.
+// Ablate the callback's read of the live incarnation: the child binds the replacement.
 kernel_case!(
-    netns_tcp_superseded_request_cannot_prove_later_child,
+    netns_tcp_superseded_syn_binds_replacement_incarnation,
     ["v4"],
-    superseded_request
+    superseded_syn
 );
-// Ablate serve_connection's required FD ownership lookup (tuple fallback must fail).
+// Ablate the callback's age check of the live handoff.
 kernel_case!(
-    netns_tcp_missing_request_proof_refuses_adoption,
+    netns_tcp_aged_handoff_leaves_child_unproven,
     ["v4", "v6"],
-    missing_proof
+    aged_handoff
 );
-// Ablate the fexit request-proof age check.
+// Ablate one callback predicate at a time (ISN, ORIGINAL_INTERCEPT, handoff).
 kernel_case!(
-    netns_tcp_expired_request_proof_refuses_adoption,
-    ["v4", "v6"],
-    expired_proof
+    netns_tcp_callback_rejects_each_invalid_publication,
+    ["v4"],
+    callback::predicates
 );
-// Ablate the required FD lookup: a cookie-created child has no original SYN proof.
+// Restore an Active requirement in the callback: a FIN before the final ACK unproves the child.
 kernel_case!(
-    netns_tcp_forced_syn_cookie_child_is_unproven,
+    netns_tcp_closing_publication_still_proves_child,
+    ["v4"],
+    callback::closing
+);
+// Ablate the callback's netns guard.
+kernel_case!(
+    netns_tcp_foreign_netns_twin_is_not_proven,
+    ["v4"],
+    callback::foreign_twin
+);
+// A cookie-created child still binds from the final ACK's sequence number.
+kernel_case!(
+    netns_tcp_forced_syn_cookie_child_is_proven,
     ["v4", "v6"],
     cookie_child
 );
-// Ablate the required FD lookup, replacing it with tuple authority.
-kernel_case!(
-    netns_tcp_full_request_storage_fails_closed,
-    ["v4", "v6"],
-    request_storage_full
-);
-// Ablate the required FD lookup, replacing it with tuple authority.
+// Ablate the storage-failure fail-closed path: no tuple authority may replace the proof.
 kernel_case!(
     netns_tcp_child_storage_allocation_failure_fails_closed,
     ["v4"],
     child_storage_full
 );
-// Ablate destroy_request's exact address/cookie removal.
+
+// SYN classification once the request is not read: each case pins the exact action.
 kernel_case!(
-    netns_tcp_request_destruction_removes_exact_proof,
+    netns_tcp_absent_owner_after_request_history_is_cached,
     ["v4", "v6"],
-    request_destroyed
+    syn_state::absent_after_history
 );
-// Controlled ordering: hold the exact request fence across final ACK and accept,
-// not a claim that a reader was paused concurrently inside a kernel hook.
 kernel_case!(
-    netns_tcp_request_fence_refuses_child_and_preserves_proof,
+    netns_tcp_request_a_fresh_b_cached_b_leaves_ack_a_unproven,
+    ["v4"],
+    syn_state::request_a_then_b
+);
+kernel_case!(
+    netns_tcp_stale_publication_gets_fresh_syn,
+    ["v4"],
+    syn_state::stale
+);
+kernel_case!(
+    netns_tcp_missing_handoff_refuses_syn,
+    ["v4"],
+    syn_state::missing_handoff
+);
+kernel_case!(
+    netns_tcp_missing_redirect_refuses_syn,
+    ["v4"],
+    syn_state::missing_redirect
+);
+kernel_case!(
+    netns_tcp_closing_tuple_same_isn_gets_fresh_syn,
+    ["v4"],
+    syn_state::closing
+);
+// Ablate the live-pin branch: the existing superseding_syn case reaches Fresh through
+// Closing and a new ISN instead.
+kernel_case!(
+    netns_tcp_pinned_tuple_same_isn_gets_fresh_syn,
+    ["v4"],
+    lifetime::pinned_same_isn
+);
+kernel_case!(
+    netns_tcp_full_child_syn_follows_stored_isn,
     ["v4", "v6"],
-    request_fenced
+    syn_state::full_child
+);
+kernel_case!(
+    netns_tcp_full_child_without_storage_refuses_syn,
+    ["v4", "v6"],
+    syn_state::full_child_unproven
 );
 
 // Ablate the cold native-pin consult in auxiliary/Closing age refusal.
@@ -185,9 +238,9 @@ kernel_case!(
 );
 
 // Ablate the shared fresh-versus-cached SYN classification: a client retry must
-// neither mint a new incarnation nor replace the original request's route.
+// neither mint a new incarnation nor replace the original publication's route.
 kernel_case!(
-    netns_tcp_retransmitted_syn_keeps_original_request_and_route,
+    netns_tcp_retransmitted_syn_keeps_original_incarnation_and_route,
     ["v4", "v6"],
     retransmit::lan
 );
@@ -200,7 +253,7 @@ kernel_case!(
 // WAN is a genuine second process in the router namespace: this test process is the
 // control plane, whose PID the datapath deliberately exempts.
 kernel_case!(
-    netns_tcp_wan_retransmitted_syn_keeps_original_request_and_route,
+    netns_tcp_wan_retransmitted_syn_keeps_original_incarnation_and_route,
     ["v4", "v6"],
     retransmit::wan
 );
@@ -221,7 +274,7 @@ kernel_case!(
 );
 
 kernel_case!(
-    netns_tcp_namespace_disables_request_shortcuts,
+    netns_tcp_namespace_disables_handshake_shortcuts,
     ["v4", "v6"],
     namespace
 );
@@ -317,7 +370,7 @@ impl Lab {
             SocketAddr::new("0.0.0.0".parse()?, config.global.tproxy_port),
             config.global.tproxy_mark,
         )?;
-        // Only an actual missing IPv6 family may omit the proof; a v6 scenario needs its listener.
+        // Only an actual missing IPv6 family may omit the listener; a v6 scenario needs it.
         let tcp6 = match crate::control::sockets::bind_tproxy_tcp(
             SocketAddr::new("::".parse()?, config.global.tproxy_port),
             config.global.tproxy_mark,
@@ -443,7 +496,7 @@ fn namespace(family: &str) -> anyhow::Result<()> {
     let _net = Net::build(family, Kind::Proxy)?;
     let _dae0 = daens::create_dae0_link()?;
     daens::setup_daens_namespace(honk_ebpf_common::TPROXY_MARK, 12345)?;
-    daens::with_daens_netns("verify request shortcut settings", || {
+    daens::with_daens_netns("verify handshake shortcut settings", || {
         for name in ["tcp_syncookies", "tcp_migrate_req", "tcp_fastopen"] {
             match std::fs::read_to_string(format!("/proc/sys/net/ipv4/{name}")) {
                 Ok(value) => ensure!(value.trim() == "0", "{name} remains enabled"),
@@ -462,12 +515,22 @@ fn namespace(family: &str) -> anyhow::Result<()> {
 struct Handshake<'a> {
     lab: &'a Lab,
     wire: Wire,
-    client: Client,
+    /// The client's own edge: replays SYNs exactly as its kernel emitted them.
+    inject: Wire,
+    /// SYNs that crossed host TC into the daens.
+    tap: SynTap,
+    /// (client port, ISN) of every SYN `tap` has reported from this client address.
+    arrived: Vec<(u16, u32)>,
+    /// Distinct client ports already used as ordering markers by `assert_refused`.
+    markers: u16,
+    client: Option<Client>,
     synack: Vec<u8>,
+    syn: Vec<u8>,
+    isn: u32,
     source: SocketAddr,
     key: TuplesKey,
     original: ConnState,
-    request: Option<(TcpRequestKey, TcpSocketBinding)>,
+    handoff: RoutingHandoffEntry,
 }
 
 /// Both ends of the completed handshake; `stream` is the transparent accepted FD.
@@ -479,56 +542,62 @@ struct Child {
 
 impl<'a> Handshake<'a> {
     async fn open(lab: &'a Lab, reuse: bool) -> anyhow::Result<Self> {
+        let tap = SynTap::new()?;
+        let inject = in_test_netns(&lab.client_ns, || Wire::on("honk-c0"))?;
         let wire = Wire::on("honk-lan0")?;
         let (mut client, source) = Client::lan(&lab.client_ns, lab.client, lab.target, reuse)?;
         let synack = gated_synack(&mut client, &wire, source, lab.target).await?;
-        let key = conn_key(source, lab.target);
-        let request = request_snapshot()?.into_iter().find(|(_, binding)| {
-            binding.tuples.src_port == source.port() && binding.tuples.dst_port == lab.target.port()
-        });
-        let original = lab
-            .handle
-            .ebpf
-            .read()
+        let syn = tokio::time::timeout(NETNS_TEST_TIMEOUT, inject.syn(source, lab.target))
             .await
+            .context("client SYN capture deadline")??;
+        let isn = syn_isn(&syn, lab.target.is_ipv6())?;
+        let arrived = tap.drain_syns(source.ip(), lab.target)?;
+        ensure!(
+            arrived == [(source.port(), isn)],
+            "expected only the original SYN {isn:#x} in the daens, saw {arrived:x?}"
+        );
+        let key = conn_key(source, lab.target);
+        let backend = lab.handle.ebpf.read().await;
+        let original = backend
             .conn_state_lookup(&key)?
             .context("real SYN did not publish conn-state")?;
+        let handoff = backend
+            .routing_handoff_lookup(&key)?
+            .context("real SYN did not publish a handoff")?;
+        drop(backend);
         ensure!(original.incarnation != 0, "real SYN has no incarnation");
+        ensure!(
+            original.tcp_syn_isn == isn,
+            "conn-state stored ISN {:#x} but the wire carried {isn:#x}",
+            original.tcp_syn_isn
+        );
         Ok(Self {
             lab,
             wire,
-            client,
+            inject,
+            tap,
+            client: Some(client),
             synack,
+            syn,
+            isn,
             source,
             key,
             original,
-            request,
+            handoff,
+            arrived,
+            markers: 0,
         })
     }
 
-    fn proof(&self) -> anyhow::Result<(TcpRequestKey, TcpSocketBinding)> {
-        let (request, binding) = self
-            .request
-            .context("real SYN did not capture request proof")?;
-        ensure!(
-            binding.handoff.incarnation == self.original.incarnation,
-            "request captured a different SYN"
-        );
-        Ok((request, binding))
-    }
-
-    fn expect_no_proof(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.request.is_none(),
-            "failure fixture unexpectedly captured a request proof"
-        );
-        Ok(())
+    fn ipv6(&self) -> bool {
+        self.lab.target.is_ipv6()
     }
 
     async fn release(&mut self) -> anyhow::Result<Child> {
-        self.client.release()?;
+        let client = self.client.as_mut().context("client already closed")?;
+        client.release()?;
         self.wire.replay(&self.synack)?;
-        let connected = self.client.handshake().await;
+        let connected = client.handshake().await;
         let accepted = tokio::time::timeout(NETNS_TEST_TIMEOUT, self.lab.listener.accept()).await;
         let client = connected?.context("LAN client lost its stream")?;
         let (stream, peer) = accepted.context("accept deadline")??;
@@ -544,29 +613,49 @@ impl<'a> Handshake<'a> {
     }
 
     async fn assert_proven(&self, child: &Child) -> anyhow::Result<()> {
+        self.assert_proven_as(child, self.original.incarnation)
+            .await
+    }
+
+    /// The accepted FD carries the SYN's own identity under `incarnation`: tuple, wire ISN
+    /// and handoff equal what TC published, apart from the age stamp.
+    async fn assert_proven_as(&self, child: &Child, incarnation: u64) -> anyhow::Result<()> {
         let TcpSocketOwnership::Kernel(binding) = self.lab.ownership(&child.stream).await? else {
             anyhow::bail!("real backend returned model ownership")
         };
-        let (_, request) = self.proof()?;
         ensure!(
-            binding.handoff.incarnation == self.original.incarnation,
-            "accepted FD did not preserve its SYN incarnation"
+            binding.kind == TCP_BINDING_CHILD,
+            "accepted FD storage is not a child proof"
+        );
+        ensure!(
+            binding.handoff.incarnation == incarnation,
+            "accepted FD bound incarnation {} instead of {incarnation}",
+            binding.handoff.incarnation
+        );
+        ensure!(
+            binding.syn_isn == self.isn,
+            "accepted FD stored ISN {:#x} but the wire carried {:#x}",
+            binding.syn_isn,
+            self.isn
         );
         ensure!(
             super::support::bytes_of(&binding.tuples) == super::support::bytes_of(&self.key),
             "accepted FD captured different SYN endpoints"
         );
+        let (mut proven, mut published) = (binding.handoff, self.handoff);
+        published.incarnation = incarnation;
+        proven.last_seen_ns = 0;
+        published.last_seen_ns = 0;
         ensure!(
-            super::support::bytes_of(&binding.handoff)
-                == super::support::bytes_of(&request.handoff),
-            "accepted FD did not preserve the immutable SYN handoff"
+            super::support::bytes_of(&proven) == super::support::bytes_of(&published),
+            "accepted FD did not preserve the SYN handoff: {proven:?} vs {published:?}"
         );
         Ok(())
     }
 
     /// The child has no FD ownership, so admission must refuse it and leave the
-    /// tuple's `authority` incarnation untouched.
-    async fn unproven(&self, child: Child, authority: u64) -> anyhow::Result<()> {
+    /// tuple's `authority` publications untouched.
+    async fn unproven(&self, child: Child, authority: Authority) -> anyhow::Result<()> {
         ensure!(
             self.lab.ownership(&child.stream).await.is_err(),
             "unproven child unexpectedly has FD ownership"
@@ -578,6 +667,24 @@ impl<'a> Handshake<'a> {
     }
 }
 
+/// The incarnation each native publication must still carry after a refusal.
+#[derive(Clone, Copy)]
+struct Authority {
+    conn: u64,
+    handoff: Option<u64>,
+    redirect: u64,
+}
+
+impl Authority {
+    fn all(incarnation: u64) -> Self {
+        Self {
+            conn: incarnation,
+            handoff: Some(incarnation),
+            redirect: incarnation,
+        }
+    }
+}
+
 fn conn_key(source: SocketAddr, target: SocketAddr) -> TuplesKey {
     crate::control::connection::build_tuples_key(
         target.ip(),
@@ -586,13 +693,6 @@ fn conn_key(source: SocketAddr, target: SocketAddr) -> TuplesKey {
         source.port(),
         6,
     )
-}
-
-fn request_map() -> anyhow::Result<HashMap<aya::maps::MapData, TcpRequestKey, TcpSocketBinding>> {
-    Ok(HashMap::try_from(pinned_map(
-        Path::new(ROOT),
-        "TCP_REQUEST_BINDINGS",
-    )?)?)
 }
 
 /// A real boot clock cannot represent a 120s-old proof before uptime120s.
@@ -627,71 +727,74 @@ fn accepted(family: &str) -> anyhow::Result<()> {
             hs.original.incarnation == FIRST_PUBLISHED_INCARNATION,
             "SYN did not retain the configured full-width incarnation"
         );
-        let (request, _) = hs.proof()?;
         let child = hs.release().await?;
-        ensure!(
-            request_snapshot()?.iter().all(|(key, _)| *key != request),
-            "unfenced completed accept retained native request proof"
-        );
         hs.assert_proven(&child).await?;
-        let result = tokio::time::timeout(
-            NETNS_TEST_TIMEOUT,
-            lab.handle.serve_connection(child.stream, child.peer),
-        )
-        .await?;
-        ensure!(
-            lab.dials.load(Ordering::SeqCst) == 1,
-            "proven child did not reach its one outbound consumer: {result:?}"
-        );
-        drop(child.client);
-        Ok(())
+        admit(lab, child).await
     })
+}
+
+/// The proven child reaches its one outbound consumer through real adoption.
+async fn admit(lab: &Lab, child: Child) -> anyhow::Result<()> {
+    let result = tokio::time::timeout(
+        NETNS_TEST_TIMEOUT,
+        lab.handle.serve_connection(child.stream, child.peer),
+    )
+    .await?;
+    ensure!(
+        lab.dials.load(Ordering::SeqCst) == 1,
+        "proven child did not reach its one outbound consumer: {result:?}"
+    );
+    drop(child.client);
+    Ok(())
 }
 
 fn queued_closed_child(family: &str) -> anyhow::Result<()> {
     run_child(family, Kind::Proxy, async |lab: &Lab| {
         let mut hs = Handshake::open(lab, false).await?;
-        hs.proof()?;
         let child = hs.release().await?;
         hs.assert_proven(&child).await?;
         // Only competing tuple authority is injected; the old child's storage
         // remains the real hook-created immutable proof while queued for admission.
         let incarnation = supersede(&lab.handle, &hs.key).await?;
         drop(child.client);
-        refused_without_cleanup(lab, child.stream, child.peer, &hs.key, incarnation).await
+        refused_without_cleanup(
+            lab,
+            child.stream,
+            child.peer,
+            &hs.key,
+            Authority::all(incarnation),
+        )
+        .await
     })
 }
 
-fn superseded_request(family: &str) -> anyhow::Result<()> {
+/// Supersession keeps the ISN, so a child accepted afterwards proves the replacement.
+fn superseded_syn(family: &str) -> anyhow::Result<()> {
     run_child(family, Kind::Proxy, async |lab: &Lab| {
         let mut hs = Handshake::open(lab, false).await?;
-        hs.proof()?;
-        let authority = supersede(&lab.handle, &hs.key).await?;
+        let replacement = supersede(&lab.handle, &hs.key).await?;
+        ensure!(
+            replacement != hs.original.incarnation,
+            "fixture did not replace the incarnation"
+        );
         let child = hs.release().await?;
-        hs.unproven(child, authority).await
+        hs.assert_proven_as(&child, replacement).await?;
+        admit(lab, child).await
     })
 }
 
-fn missing_proof(family: &str) -> anyhow::Result<()> {
-    run_child(family, Kind::Proxy, async |lab: &Lab| {
-        let mut requests = request_map()?;
-        let mut hs = Handshake::open(lab, false).await?;
-        requests.remove(&hs.proof()?.0)?;
-        let child = hs.release().await?;
-        hs.unproven(child, hs.original.incarnation).await
-    })
-}
-
-fn expired_proof(family: &str) -> anyhow::Result<()> {
+/// The callback reads the LIVE handoff's age, not the SYN's.
+fn aged_handoff(family: &str) -> anyhow::Result<()> {
     run_child(family, Kind::Proxy, async |lab: &Lab| {
         await_established_age().await?;
-        let mut requests = request_map()?;
         let mut hs = Handshake::open(lab, false).await?;
-        let (request, mut expired) = hs.proof()?;
-        expired.handoff.last_seen_ns = 1;
-        requests.insert(request, expired, 2)?;
+        let aged = monotonic_ns()?
+            .checked_sub(TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1)
+            .context("kernel uptime too short to age the handoff")?;
+        mutate_handoff(&lab.handle, &hs.key, |handoff| handoff.last_seen_ns = aged).await?;
         let child = hs.release().await?;
-        hs.unproven(child, hs.original.incarnation).await
+        hs.unproven(child, Authority::all(hs.original.incarnation))
+            .await
     })
 }
 
@@ -706,104 +809,39 @@ fn cookie_child(family: &str) -> anyhow::Result<()> {
             cookie_count()
         })?;
         let mut hs = Handshake::open(lab, false).await?;
-        hs.expect_no_proof()?;
         let child = hs.release().await?;
         ensure!(
             daens::with_daens_netns("observe forced cookie child", cookie_count)? > before,
             "fixture did not send a SYN cookie"
         );
-        hs.unproven(child, hs.original.incarnation).await
-    })
-}
-
-fn request_storage_full(family: &str) -> anyhow::Result<()> {
-    run_child(family, Kind::Proxy, async |lab: &Lab| {
-        let mut requests = request_map()?;
-        for cookie in 1..=65536 {
-            requests.insert(
-                TcpRequestKey { address: 1, cookie },
-                TcpSocketBinding::default(),
-                1,
-            )?;
-        }
-        let mut hs = Handshake::open(lab, false).await?;
-        hs.expect_no_proof()?;
-        let child = hs.release().await?;
-        hs.unproven(child, hs.original.incarnation).await
+        hs.assert_proven(&child).await?;
+        admit(lab, child).await
     })
 }
 
 fn child_storage_full(family: &str) -> anyhow::Result<()> {
     run_child(family, Kind::Proxy, async |lab: &Lab| {
         let mut hs = Handshake::open(lab, false).await?;
-        hs.proof()?;
-        let optmem =
-            daens::with_daens_netns("deny child storage allocation", || -> anyhow::Result<_> {
-                let old = std::fs::read_to_string("/proc/sys/net/core/optmem_max")?;
-                std::fs::write("/proc/sys/net/core/optmem_max", "0")?;
-                Ok(old)
-            })?;
-        let child = hs.release().await;
-        daens::with_daens_netns("restore child storage allocation", || {
-            std::fs::write("/proc/sys/net/core/optmem_max", optmem).map_err(anyhow::Error::from)
+        let child = release_without_storage(&mut hs).await?;
+        hs.unproven(child, Authority::all(hs.original.incarnation))
+            .await
+    })
+}
+
+/// Completes the handshake while the daens cannot allocate socket storage, so the child
+/// exists without any proof.
+async fn release_without_storage(hs: &mut Handshake<'_>) -> anyhow::Result<Child> {
+    let optmem =
+        daens::with_daens_netns("deny child storage allocation", || -> anyhow::Result<_> {
+            let old = std::fs::read_to_string("/proc/sys/net/core/optmem_max")?;
+            std::fs::write("/proc/sys/net/core/optmem_max", "0")?;
+            Ok(old)
         })?;
-        hs.unproven(child?, hs.original.incarnation).await
-    })
-}
-
-fn request_destroyed(family: &str) -> anyhow::Result<()> {
-    run_child(family, Kind::Proxy, async |lab: &Lab| {
-        let hs = Handshake::open(lab, false).await?;
-        let (request, _) = hs.proof()?;
-        let Handshake {
-            client,
-            wire,
-            synack,
-            ..
-        } = hs;
-        drop(client);
-        wire.replay(&synack)?;
-        tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
-            while request_snapshot()?.iter().any(|(key, _)| *key == request) {
-                tokio::task::yield_now().await;
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("RST did not destroy exact request proof")??;
-        ensure!(
-            lab.dials.load(Ordering::SeqCst) == 0,
-            "destroyed request reached outbound"
-        );
-        Ok(())
-    })
-}
-
-fn request_fenced(family: &str) -> anyhow::Result<()> {
-    run_child(family, Kind::Proxy, async |lab: &Lab| {
-        let root = Path::new(ROOT);
-        let mut hs = Handshake::open(lab, false).await?;
-        let (request, _) = hs.proof()?;
-        let mut fences =
-            HashMap::<_, TcpRequestKey, u64>::try_from(pinned_map(root, "REQUEST_FENCE")?)?;
-        let mut active = Array::<_, u32>::try_from(pinned_map(root, "RETIRE_ACTIVE")?)?;
-        // No tuple fence: the real final ACK may complete, but its request-map
-        // readers and destructor must leave immutable proof to the fence owner.
-        active.set(0, 1, 0)?;
-        fences.insert(request, 0x7465_7374_u64, 1)?;
-        let child = hs.release().await?;
-        ensure!(
-            request_snapshot()?.iter().any(|(key, _)| *key == request),
-            "fenced completed accept lost native request proof"
-        );
-        ensure!(
-            lab.ownership(&child.stream).await.is_err(),
-            "request fence allowed child proof publication"
-        );
-        fences.remove(&request)?;
-        active.set(0, 0, 0)?;
-        hs.unproven(child, hs.original.incarnation).await
-    })
+    let child = hs.release().await;
+    daens::with_daens_netns("restore child storage allocation", || {
+        std::fs::write("/proc/sys/net/core/optmem_max", optmem).map_err(anyhow::Error::from)
+    })?;
+    child
 }
 
 async fn refused_without_cleanup(
@@ -811,7 +849,7 @@ async fn refused_without_cleanup(
     accepted: TcpStream,
     peer: SocketAddr,
     key: &TuplesKey,
-    incarnation: u64,
+    authority: Authority,
 ) -> anyhow::Result<()> {
     let result = tokio::time::timeout(
         NETNS_TEST_TIMEOUT,
@@ -828,21 +866,21 @@ async fn refused_without_cleanup(
         backend
             .conn_state_lookup(key)?
             .map(|value| value.incarnation)
-            == Some(incarnation),
+            == Some(authority.conn),
         "rejected adoption deleted/rebound conn-state"
     );
     ensure!(
         backend
             .routing_handoff_lookup(key)?
             .map(|value| value.incarnation)
-            == Some(incarnation),
+            == authority.handoff,
         "rejected adoption consumed authoritative handoff"
     );
     ensure!(
         backend
             .redirect_track_lookup(&RedirectTuple::from_tuples(key))?
             .map(|value| value.incarnation)
-            == Some(incarnation),
+            == Some(authority.redirect),
         "rejected adoption deleted authoritative redirect"
     );
     Ok(())
@@ -875,10 +913,6 @@ fn cookie_count() -> anyhow::Result<u64> {
         }
     }
     anyhow::bail!("TcpExt counters missing")
-}
-
-fn request_snapshot() -> anyhow::Result<Vec<(TcpRequestKey, TcpSocketBinding)>> {
-    pinned_hash_snapshot(Path::new(ROOT), "TCP_REQUEST_BINDINGS", 0)
 }
 
 async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Result<u64> {

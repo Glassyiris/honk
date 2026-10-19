@@ -107,7 +107,6 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
                         conn: 1,
                         handoff: 1,
                         redirect: 1,
-                        request: 0,
                     }
                 );
                 assert_eq!(result, UdpDecisionCommitResult::Applied);

@@ -59,30 +59,6 @@ fn snapshots_reject_changed_owner_payload_and_future_timestamps() {
         result.dscp = 1,
         result.decision_token = 1,
     );
-    let request = TcpSocketBinding {
-        handoff: RoutingHandoffEntry {
-            last_seen_ns: 10,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    changed!(request_matches, request;
-        kind = 1,
-        syn_isn = 1,
-        tuples.src_port = 1,
-        tuples.dst_port = 1,
-        tuples.l4proto = 1,
-        handoff.incarnation = 1,
-    );
-    for source in [false, true] {
-        let mut current = request;
-        if source {
-            current.tuples.src_ip[0] = 1;
-        } else {
-            current.tuples.dst_ip[0] = 1;
-        }
-        assert!(!request_matches(&current, &request, 10));
-    }
 }
 
 #[test]
@@ -340,7 +316,6 @@ fn expiry_hint_checks_incarnation_and_strict_protocol_deadlines() {
                 conn,
                 handoff: None,
                 redirect: None,
-                request: None,
             };
             plan_retirement(&request, &owners).map(|plan| plan.conn)
         };
@@ -444,7 +419,6 @@ fn auxiliary_ownership_and_hint_expiry_truth_table() {
                             conn: current,
                             handoff: handoff.as_ref(),
                             redirect: track.as_ref(),
-                            request: None,
                         },
                     );
                     if if current.is_some() {
@@ -538,7 +512,6 @@ fn flow_plan_removes_auxiliaries_with_conn_and_refuses_foreign_owners() {
         conn,
         handoff,
         redirect,
-        request: None,
     };
     let plan = plan_retirement(
         &request,
@@ -574,12 +547,11 @@ fn flow_plan_removes_auxiliaries_with_conn_and_refuses_foreign_owners() {
 
 #[test]
 fn auxiliary_plans_decide_from_their_own_snapshot() {
-    let (_, handoff, track) = flow_owners();
+    let (_, _, track) = flow_owners();
     let none = Owners {
         conn: None,
         handoff: None,
         redirect: None,
-        request: None,
     };
     let expire = |kind| RetireRequest {
         key: TuplesKey::default(),
@@ -612,45 +584,6 @@ fn auxiliary_plans_decide_from_their_own_snapshot() {
         ..owners
     };
     assert_eq!(plan_retirement(&redirect, &owners).err(), Some(Superseded));
-
-    let binding = TcpSocketBinding {
-        handoff,
-        ..Default::default()
-    };
-    let proof = TcpRequestKey::default();
-    let request = expire(RetireKind::ExpiredRequest {
-        request: &proof,
-        expected: &binding,
-        expired_before_ns: 0,
-    });
-    let owners = Owners {
-        request: Some(&binding),
-        redirect: None,
-        ..owners
-    };
-    assert_eq!(plan_retirement(&request, &owners).unwrap().request, Some(1));
-    let moved = RetireRequest {
-        key: TuplesKey {
-            src_port: 9,
-            ..Default::default()
-        },
-        ..request
-    };
-    assert_eq!(plan_retirement(&moved, &owners).err(), Some(Superseded));
-}
-
-#[test]
-fn request_release_only_touches_the_proof_owners_incarnation() {
-    let mut state = ConnState {
-        incarnation: 4,
-        tcp_request_count: 1,
-        ..Default::default()
-    };
-    assert!(!release_request_count(&mut state, 5).unwrap());
-    assert_eq!(state.tcp_request_count, 1);
-    assert!(release_request_count(&mut state, 4).unwrap());
-    assert_eq!(state.tcp_request_count, 0);
-    assert!(release_request_count(&mut state, 4).is_err());
 }
 
 #[test]

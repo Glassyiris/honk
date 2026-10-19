@@ -21,11 +21,10 @@ impl RealEbpfBackend {
         );
         layout::validate_object(obj)?;
         let (kernel_data, kernel_btf) = btf::load_kernel()?;
-        let tcp_binding_offsets = tcp_binding::offsets(&kernel_data)?;
-        let ipv6_proof = tcp_binding::ipv6_proof(&kernel_data);
         let process_name_offsets = process_name::detect(&kernel_data);
         let pname_mode = process_name::select_capture_mode(obj, &kernel_btf, process_name_offsets);
         let tcp_daens_netns_id = crate::daens::daens_netns_id()?;
+        let tcp_daens_netns_cookie = crate::daens::daens_netns_cookie()?;
         let ipv6_sockets_available =
             u8::from(crate::netlink::ipv6_socket_available().context("probe IPv6 socket family")?);
 
@@ -128,7 +127,7 @@ impl RealEbpfBackend {
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
-            .override_global("TCP_BINDING_OFFSETS", &tcp_binding_offsets, true)
+            .override_global("TCP_DAENS_NETNS_COOKIE", &tcp_daens_netns_cookie, true)
             .override_global("IPV6_SOCKETS_AVAILABLE", &ipv6_sockets_available, true)
             .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
         if matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
@@ -153,6 +152,8 @@ impl RealEbpfBackend {
             "UDP_DECISION_EPOCH",
             "UDP_DECISION_INFLIGHT",
             "UDP_DECISION_RETIRE_FENCE",
+            "TCP_REQUEST_BINDINGS",
+            "REQUEST_FENCE",
         ] {
             if let Err(error) = std::fs::remove_file(pin_root.join(name))
                 && error.kind() != std::io::ErrorKind::NotFound
@@ -198,7 +199,6 @@ impl RealEbpfBackend {
                 .map_err(|error| {
                     anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}")
                 })?;
-        let tcp_bindings = tcp_binding::attach(&mut bpf, kernel_btf, ipv6_proof)?;
         match pname_mode {
             process_name::PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")
@@ -267,7 +267,8 @@ impl RealEbpfBackend {
                 })?;
             cgroup_sock_addr_links.push(p.take_link(link_id)?);
         }
-        info!("Attached 5 required cgroup programs to {}", cgroup_path);
+        let tcp_proof_link = tcp_binding::attach(&mut bpf, &cgroup_file)?;
+        info!("Attached 6 required cgroup programs to {}", cgroup_path);
         // Initialize outbound connectivity map: all entries are alive by default.
         // This map is updated by health checks; until then we must not drop
         // proxy-bound traffic. Skipping entries here marks every outbound
@@ -567,7 +568,7 @@ impl RealEbpfBackend {
             retirement_failed: false,
             #[cfg(test)]
             retirement_faults: Default::default(),
-            tcp_bindings: Some(tcp_bindings),
+            tcp_proof_link: Some(tcp_proof_link),
             cap_lookup_batch: BatchCapability::new(),
             cap_flow_lookup_batch: BatchCapability::new(),
             tcp_live_pins,

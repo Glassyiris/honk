@@ -538,7 +538,6 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
                     conn: 1,
                     redirect: 1,
                     handoff: 1,
-                    request: 0
                 }
             );
             assert_eq!(
@@ -757,7 +756,6 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
                 conn: 1,
                 handoff: 1,
                 redirect: 1,
-                request: 0
             }
         );
         assert_eq!(result, UdpDecisionCommitResult::Applied);

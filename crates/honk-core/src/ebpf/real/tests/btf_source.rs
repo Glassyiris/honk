@@ -11,45 +11,8 @@ fn kernel_btf_override_controls_startup() {
         let missing = directory.path().join("missing.btf");
         let data = std::fs::read("/sys/kernel/btf/vmlinux").unwrap();
         std::fs::write(&valid, &data).unwrap();
-        let oversized = directory.path().join("oversized-request.btf");
-        let (structure, member_offset) = {
-            let btf = btf::Btf::parse(&data).unwrap();
-            let structure = btf.find_type(4, "tcp_request_sock").unwrap();
-            let old_offset = btf.member_offset("tcp_request_sock", "rcv_isn").unwrap();
-            let members = btf.u32_at(structure + 4).unwrap() & 0xffff;
-            let positions: Vec<_> = (0..members as usize)
-                .map(|index| structure + 12 + index * 12 + 8)
-                .filter(|offset| btf.u32_at(*offset) == Some(old_offset * 8))
-                .collect();
-            assert_eq!(positions.len(), 1, "unique rcv_isn member offset");
-            (structure, positions[0])
-        };
-        let capacity = core::mem::size_of::<honk_ebpf_common::KernelRouteWitness>() as u32;
-        let mut oversized_data = data.clone();
-        oversized_data[structure + 8..structure + 12]
-            .copy_from_slice(&(capacity + 64).to_ne_bytes());
-        oversized_data[member_offset..member_offset + 4]
-            .copy_from_slice(&((capacity + 4) * 8).to_ne_bytes());
-        std::fs::write(&oversized, oversized_data).unwrap();
-        let v4_only = directory.path().join("v4-only.btf");
-        let mut v4_data = data;
-        for name in ["tcp_v6_route_req", "tcp_v6_reqsk_destructor"] {
-            let at = v4_data
-                .windows(name.len())
-                .position(|value| value == name.as_bytes())
-                .expect("built-in IPv6 BTF fixture");
-            v4_data[at] = b'_';
-        }
-        std::fs::write(&v4_only, v4_data).unwrap();
         std::fs::write(&invalid, b"not kernel BTF").unwrap();
-        for (case, path) in [
-            ("partial-v6", valid.clone()),
-            ("valid", valid),
-            ("missing", missing),
-            ("invalid", invalid),
-            ("v4-only", v4_only),
-            ("oversized-request", oversized),
-        ] {
+        for (case, path) in [("valid", valid), ("missing", missing), ("invalid", invalid)] {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--ignored",
@@ -65,10 +28,10 @@ fn kernel_btf_override_controls_startup() {
         }
         return;
     };
-    let valid = matches!(case.as_str(), "valid" | "v4-only" | "partial-v6");
+    let valid = case == "valid";
 
     let empty = tempfile::tempdir().unwrap();
-    if matches!(case.as_str(), "valid" | "partial-v6") {
+    if valid {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).unwrap();
         nix::mount::mount(
             None::<&str>,
@@ -116,7 +79,7 @@ fn kernel_btf_override_controls_startup() {
                     return;
                 }
             };
-            if case == "valid" {
+            if valid {
                 let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                 receiver
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
@@ -145,7 +108,6 @@ fn kernel_btf_override_controls_startup() {
                     );
                     assert_eq!(packet.length, 3);
                 }
-                use honk_ebpf_common::redirect_need::{TCP_BINDING_LISTENER, TcpSocketBinding};
                 let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let tcp6 = std::net::TcpListener::bind("[::1]:0").unwrap();
                 backend
@@ -153,99 +115,7 @@ fn kernel_btf_override_controls_startup() {
                     .unwrap();
                 backend.set_datapath_ready(true).unwrap();
                 backend.set_datapath_ready(false).unwrap();
-                let storage = aya::maps::SkStorage::<_, TcpSocketBinding>::try_from(
-                    backend.bpf().unwrap().map("TCP_SOCKET_BINDING").unwrap(),
-                )
-                .unwrap();
-                assert_eq!(storage.get(&tcp4, 0).unwrap().kind, TCP_BINDING_LISTENER);
-                assert_eq!(storage.get(&tcp6, 0).unwrap().kind, TCP_BINDING_LISTENER);
                 backend.clear_listener_sockets().unwrap();
-            }
-            if case == "v4-only" {
-                use honk_ebpf_common::redirect_need::{TCP_BINDING_LISTENER, TcpSocketBinding};
-                let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let tcp6 = std::net::TcpListener::bind("[::1]:0").unwrap();
-                assert!(
-                    backend
-                        .publish_listener_sockets(
-                            tcp4.as_raw_fd(),
-                            Some(tcp6.as_raw_fd()),
-                            &[],
-                            &[]
-                        )
-                        .is_err()
-                );
-                assert!(backend.set_datapath_ready(true).is_err());
-                let storage = aya::maps::SkStorage::<_, TcpSocketBinding>::try_from(
-                    backend.bpf().unwrap().map("TCP_SOCKET_BINDING").unwrap(),
-                )
-                .unwrap();
-                assert!(storage.get(&tcp4, 0).is_err());
-                assert!(storage.get(&tcp6, 0).is_err());
-                let mut sockets = AyaSockMap::try_from(
-                    backend
-                        .bpf_mut()
-                        .unwrap()
-                        .map_mut("LISTEN_SOCKET_MAP")
-                        .unwrap(),
-                )
-                .unwrap();
-                for slot in [0, 1] {
-                    assert!(RealEbpfBackend::sockmap_slot_is_empty(
-                        &sockets.clear_index(&slot).unwrap_err()
-                    ));
-                }
-                backend
-                    .publish_listener_sockets(tcp4.as_raw_fd(), None, &[], &[])
-                    .unwrap();
-                backend.set_datapath_ready(true).unwrap();
-                backend.set_datapath_ready(false).unwrap();
-                let storage = aya::maps::SkStorage::<_, TcpSocketBinding>::try_from(
-                    backend.bpf().unwrap().map("TCP_SOCKET_BINDING").unwrap(),
-                )
-                .unwrap();
-                assert_eq!(storage.get(&tcp4, 0).unwrap().kind, TCP_BINDING_LISTENER);
-                assert!(storage.get(&tcp6, 0).is_err());
-                for name in ["honk_tcp_v6_route_req", "honk_tcp_v6_reqsk_destructor"] {
-                    assert!(backend.bpf().unwrap().program(name).unwrap().fd().is_err());
-                }
-                backend.clear_listener_sockets().unwrap();
-            }
-            if case == "partial-v6" {
-                let mut destructor = None;
-                let mut lookup = None;
-                for (name, program) in backend.bpf_mut().unwrap().programs_mut() {
-                    match name {
-                        "honk_tcp_v6_reqsk_destructor" => destructor = Some(program),
-                        "tproxy_sk_lookup" => lookup = Some(program),
-                        _ => {}
-                    }
-                }
-                std::mem::swap(destructor.unwrap(), lookup.unwrap());
-                let links = held_bpf_link_count();
-                let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let tcp6 = std::net::TcpListener::bind("[::1]:0").unwrap();
-                assert!(
-                    backend
-                        .publish_listener_sockets(
-                            tcp4.as_raw_fd(),
-                            Some(tcp6.as_raw_fd()),
-                            &[],
-                            &[]
-                        )
-                        .is_err()
-                );
-                assert_eq!(held_bpf_link_count(), links);
-                assert!(backend.set_datapath_ready(true).is_err());
-                let storage = aya::maps::SkStorage::<
-                    _,
-                    honk_ebpf_common::redirect_need::TcpSocketBinding,
-                >::try_from(
-                    backend.bpf().unwrap().map("TCP_SOCKET_BINDING").unwrap()
-                )
-                .unwrap();
-                assert!(storage.get(&tcp4, 0).is_err());
-                assert!(storage.get(&tcp6, 0).is_err());
             }
             backend.detach_hooks().unwrap();
             backend.cleanup().await.unwrap();

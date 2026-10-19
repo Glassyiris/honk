@@ -91,7 +91,7 @@ fn flow_payload_decodes_fixed_wire_offsets_without_lock_header() {
     let bytes = &mut bytes[1..81];
     bytes[..8].fill(0xa5);
     bytes[9] = 6;
-    bytes[10..12].copy_from_slice(&3u16.to_ne_bytes());
+    bytes[10..12].copy_from_slice(&1u16.to_ne_bytes());
     bytes[12..16].copy_from_slice(&42u32.to_ne_bytes());
     bytes[16..24].copy_from_slice(&456u64.to_ne_bytes());
     bytes[60..64].copy_from_slice(&123u32.to_ne_bytes());
@@ -104,9 +104,9 @@ fn flow_payload_decodes_fixed_wire_offsets_without_lock_header() {
     assert_eq!(conn.last_seen_ns, 456);
     assert_eq!(conn.trace_id, 123);
     assert_eq!(conn.incarnation, 789);
-    assert_eq!(conn.tcp_syn_flags, 3);
+    assert_eq!(conn.tcp_syn_flags, 1);
     assert_eq!(conn.tcp_syn_isn, u32::MAX);
-    assert_eq!(conn.tcp_request_count, 2);
+    assert_eq!(conn.reserved, 2);
 
     bytes[8..].fill(0);
     bytes[8..16].copy_from_slice(&321u64.to_ne_bytes());
@@ -140,6 +140,7 @@ fn ordinary_stats_print_all_canonical_keys_and_zero_missing_counters() {
     let mut reads = 0;
     let mut output = Vec::new();
     print_ordinary_stats_with(
+        stats_cardinality_info(BpfStatsKey::COUNT),
         |key| {
             let index = u32::from_ne_bytes(key.try_into().unwrap());
             assert_eq!(index, reads);
@@ -158,11 +159,35 @@ fn ordinary_stats_print_all_canonical_keys_and_zero_missing_counters() {
             "redirect_track_insert_failure: 12\n",
             "routing_handoff_insert_failure: 13\n",
             "socket_identity_capture_failure: 0\n",
-            "tcp_request_proof_insert_failure: 15\n",
-            "tcp_child_proof_storage_failure: 16\n",
-            "tcp_publisher_claim_failure: 17\n",
+            "tcp_child_proof_storage_failure: 15\n",
+            "tcp_publisher_claim_failure: 16\n",
         )
     );
+}
+
+fn stats_cardinality_info(max_entries: u32) -> [u32; 6] {
+    let mut info = [0; 6];
+    info[4] = max_entries;
+    info
+}
+
+#[test]
+fn ordinary_stats_refuse_other_cardinality_before_any_read() {
+    for found in [BpfStatsKey::COUNT - 1, BpfStatsKey::COUNT + 1] {
+        let mut reads = 0;
+        let mut output = Vec::new();
+        print_ordinary_stats_with(
+            stats_cardinality_info(found),
+            |_| {
+                reads += 1;
+                Ok(Some(1))
+            },
+            &mut output,
+        )
+        .expect_err("mismatched statistics map was accepted");
+        assert_eq!(reads, 0);
+        assert!(output.is_empty());
+    }
 }
 
 struct SysfsFixture(tempfile::TempDir);

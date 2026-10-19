@@ -56,12 +56,12 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-必须启用 cgroup v2。真实 datapath 会在根 cgroup 上挂载 socket 身份 hook，缺少时直接拒绝启动。运行内核还必须提供原始 BTF（`/sys/kernel/btf/vmlinux` 或 `HONK_VMLINUX_BTF`），并允许在 `tcp_v4_route_req`、`tcp_v4_reqsk_destructor` 和 `tcp_create_openreq_child` 上挂 fentry/fexit，用于 TCP request 归属证明。若有已绑定的 IPv6 TCP listener，还需要对应的 IPv6 函数，因此要求内置 IPv6（`CONFIG_IPV6=y`）；模块化 IPv6 会被拒绝，不会降级为仅 IPv4。
+必须启用 cgroup v2 与 `CONFIG_CGROUP_BPF`。真实 datapath 会在根 cgroup 上挂载 socket 身份 hook 与 TCP `sock_ops` 程序 `honk_tcp_passive`，缺少时直接拒绝启动。若根 cgroup 的 `sock_ops` 槽位已被旧式（flags=0）程序占用，例如用 `bpftool cgroup attach` 挂载的程序，启动同样失败。`honk_tcp_passive` 会被主机上每一次 TCP `sock_ops` 回调调用（每条连接若干次），对不属于 honk 命名空间的 socket 立即返回。TCP 归属证明不需要内核自带 BTF、不需要 ftrace，也不要求内置 IPv6，因此只有外部原始 BTF 文件的内核也能运行。启动时总会加载原始 BTF（eBPF 加载器的目标 BTF，以及进程名与接收追踪的偏移），来源为 `/sys/kernel/btf/vmlinux` 或 `HONK_VMLINUX_BTF` 指定的文件。
 
-这些 TCP 归属 hook 额外需要下列内核选项；32 位内核会被拒绝：
+只有可选的 `native-api` UDP 接收追踪回退（UDP 接收优先级辅助元数据不可用时使用）会挂载 fentry/fexit 程序。它需要内核自带 BTF（`HONK_VMLINUX_BTF` 不能替代）与 ftrace，缺少时降级运行：
 
 ```text
-CONFIG_DEBUG_INFO_BTF=y   # 除非由 HONK_VMLINUX_BTF 提供 BTF
+CONFIG_DEBUG_INFO_BTF=y
 CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
 ```

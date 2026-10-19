@@ -205,9 +205,9 @@ pub(in crate::control::tests) fn pinned_map(root: &Path, name: &str) -> anyhow::
     Ok(Map::from_map_data(MapData::from_pin(root.join(name))?)?)
 }
 
-/// Bucket-protected copies for external readers that cannot exclude native
-/// request destruction or userspace tuple retirement. Never fall back to
-/// GET_NEXT_KEY plus singleton LOOKUP_ELEM, even for immutable request values.
+/// Bucket-protected copies for external readers that cannot exclude userspace tuple
+/// retirement. Never fall back to GET_NEXT_KEY plus singleton LOOKUP_ELEM, even for
+/// values that look immutable.
 pub(in crate::control::tests) fn pinned_hash_snapshot<K: aya::Pod, V: aya::Pod>(
     root: &Path,
     name: &str,

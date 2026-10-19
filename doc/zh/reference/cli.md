@@ -80,7 +80,7 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
 | `MIMALLOC_PURGE_DELAY` | 启用 `mimalloc` 的 `honk-core` | mimalloc 自带的 purge 延迟（毫秒）：已释放页面在归还 OS 前保持 committed 的时间。honk 启动时设为 `100`（mimalloc v3 默认 `1000`），在连接、探测与 DNS 的频繁分配场景下降低 RSS，批量 relay 的吞吐与 CPU 无可测量变化。环境变量中设置的任何值都优先，包括无法解析的值（此时保持 mimalloc 的 `1000`）。`0` 立即归还（RSS 最低、CPU 略增），`-1` 从不归还。 |
 | `TOKIO_WORKER_THREADS` | `honk-core` | Tokio 自带的 worker 数量。`honk-core` 使用默认的多线程 runtime，因此默认等于核数。必须是正整数：`0` 或非数字会使 Tokio 在启动时 panic。每个 worker 持有独立的 allocator 堆，在多核网关上调低该值可降低 RSS（实验室，4 核主机，120 条连接加 DNS：16 个 worker 约 85 MiB，8 个约 66 MiB，4 个约 60 MiB，CPU 差异在噪声内）。relay 路径运行在这些 worker 上，按流量取值。 |
-| `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖进程名路由、TCP 归属证明和原生 UDP 接收追踪共用的原始内核 BTF。文件必须匹配运行中的内核。显式指定的文件不可读或无效时，拒绝真实后端启动，不会静默回退到其他文件。 |
+| `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖进程名路由和原生 UDP 接收追踪共用的原始内核 BTF。文件必须匹配运行中的内核。显式指定的文件不可读或无效时，拒绝真实后端启动，不会静默回退到其他文件。TCP 归属证明不读取内核结构，也不依赖它。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
 
 UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启；设置为 `false` 可关闭。见[全局配置参考](./global.md)与 [NFQUEUE 设计](../design/nfqueue.md)。
@@ -90,7 +90,7 @@ UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启�
 | 项 | 控制方式 | 当前不变量 |
 | --- | --- | --- |
 | eBPF 目标文件 | 内嵌目标文件或 `--bpf-object PATH` | 启用 `ebpf` feature 时，`build.rs` 提供由 `include_bytes!` 内嵌的目标文件；该参数在运行时替换这些字节。未启用 `ebpf` 的构建使用 mock 后端。 |
-| 内核 BTF | `HONK_VMLINUX_BTF` 或 `/sys/kernel/btf/vmlinux` | 未覆盖时读取 `/sys/kernel/btf/vmlinux`。只接受原始 BTF；若只有 ELF 格式的 debug vmlinux，需先提取其 `.BTF` 段，再用该变量指向提取结果。所选 BTF 统一提供内核字段偏移、Aya loader 的目标 BTF 和 tracing 函数签名。BTF 缺失、无效或 TCP 证明必需的字段/签名不兼容时拒绝启动。内核 argv 捕获不可用时仍可回退到线程 `comm`，但不能绕过 TCP 证明要求。 |
+| 内核 BTF | `HONK_VMLINUX_BTF` 或 `/sys/kernel/btf/vmlinux` | 未覆盖时读取 `/sys/kernel/btf/vmlinux`。只接受原始 BTF；若只有 ELF 格式的 debug vmlinux，需先提取其 `.BTF` 段，再用该变量指向提取结果。所选 BTF 统一提供内核字段偏移、Aya loader 的目标 BTF 和接收追踪的函数签名。BTF 缺失或无效时拒绝启动。内核 argv 捕获不可用时仍可回退到线程 `comm`。原生 UDP 接收追踪另需内核自带 BTF 与 ftrace，缺少时降级运行；外部文件不能替代它们。 |
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
 | Bypass mark | `global.so_mark_from_dae` | 拨号、探测、DNS 与下载使用的精确 socket mark；零值选择默认 `0x100`。修改需重启，见[套接字 mark](./global.md#套接字-mark)。 |
 | TPROXY mark | 编译期常量与配置校验 | `TPROXY_MARK = 0x08000000`；`global.tproxy_mark` 必须等于该值。 |
@@ -209,9 +209,9 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | 从 DNS 或嗅探结果学习的 IP，以及活动 policy 的域名谓词位图索引；已知但全零的条目仍会显示。 |
 | `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
 
-实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、TCP 归属发布失败计数（request 证明、child 证明存储，以及 SYN 发布排他的资源错误）、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
+实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、TCP 归属发布失败计数（child 证明存储，以及 SYN 发布排他的资源错误）、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
 
-`BPF_STATS_MAP` 的普通计数器使用共享的规范标签逐行输出，例如 `udp_conn_overflow: 0`；计数值与单位不变。
+`BPF_STATS_MAP` 的普通计数器使用共享的规范标签逐行输出，例如 `udp_conn_overflow: 0`；标签与单位不变。该 map 共七个槽位，移除 request 证明计数器时已重新编号，因此 `stats` 会拒绝其他大小的 map，而不是错误标注：请将工具与引擎/对象一起升级。
 
 `routing-handoff` 在读取前检查[handoff ABI](../design/datapath.md#map-清单)；请将工具与引擎/对象一起升级。
 

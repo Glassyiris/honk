@@ -19,6 +19,8 @@ struct Settled {
     key: TuplesKey,
     incarnation: u64,
     pins: HashMap<aya::maps::MapData, u64, u8>,
+    syn: Vec<u8>,
+    inject: Wire,
 }
 
 /// `aged` waits until the real boot clock can represent an expired tuple; `reuse` lets
@@ -28,7 +30,6 @@ async fn settle(lab: &Lab, aged: bool, reuse: bool) -> anyhow::Result<(Settled, 
         await_established_age().await?;
     }
     let mut hs = Handshake::open(lab, reuse).await?;
-    hs.proof()?;
     let Child {
         stream: mut accepted,
         mut client,
@@ -53,6 +54,8 @@ async fn settle(lab: &Lab, aged: bool, reuse: bool) -> anyhow::Result<(Settled, 
         key,
         incarnation,
         pins,
+        syn: hs.syn,
+        inject: hs.inject,
     };
     Ok((settled, accepted))
 }
@@ -235,6 +238,62 @@ pub(super) fn new_syn(family: &str) -> anyhow::Result<()> {
         let (s, accepted) = settle(lab, true, true).await?;
         let flow = s.adopt(lab, accepted).await?;
         superseding_syn(lab, flow, s).await
+    })
+}
+
+/// The SYN's ISN returns on a tuple whose old child is gone but still natively pinned:
+/// the pin must force a fresh incarnation without moving to it. A real RST would also
+/// leave Closing, which alone makes the SYN fresh, so Active is restored first.
+pub(super) fn pinned_same_isn(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let (s, accepted) = settle(lab, false, false).await?;
+        let flow = s.adopt(lab, accepted).await?;
+        let Settled {
+            client,
+            key,
+            incarnation,
+            pins,
+            syn,
+            inject,
+            ..
+        } = s;
+        let isn = syn_isn(&syn, lab.target.is_ipv6())?;
+        reset_close(client)?;
+        await_conn(&lab.handle, &key, "real RST reached Closing", |conn| {
+            conn.state == TcpState::TcpStateClosing as u8
+        })
+        .await?;
+        mutate_conn(&lab.handle, &key, |conn| {
+            conn.state = TcpState::TcpStateActive as u8;
+        })
+        .await?;
+        inject.replay(&syn)?;
+        let fresh = await_conn(&lab.handle, &key, "pinned tuple got a fresh SYN", |conn| {
+            conn.incarnation != incarnation
+        })
+        .await?;
+        ensure!(
+            fresh.tcp_syn_isn == isn,
+            "fresh publication lost the SYN's ISN"
+        );
+        ensure!(
+            pins.get(&incarnation, 0)? == 1 && pins.get(&fresh.incarnation, 0).is_err(),
+            "the fresh incarnation moved or inherited the old native pin"
+        );
+        ensure!(
+            lab.handle.tcp_flow_pins.contains(&key),
+            "fresh SYN dropped the old local pin"
+        );
+        drop(flow);
+        ensure!(
+            pins.get(&incarnation, 0).is_err(),
+            "old native pin outlived its guard"
+        );
+        ensure!(
+            !lab.handle.tcp_flow_pins.contains(&key),
+            "old local pin leaked"
+        );
+        Ok(())
     })
 }
 
@@ -637,18 +696,9 @@ async fn close_and_retire(
     Ok(())
 }
 
-async fn superseding_syn(lab: &Lab, old: TcpFlowGuard, s: Settled) -> anyhow::Result<()> {
-    let (handle, listener, client_ns) = (&lab.handle, &lab.listener, &lab.client_ns);
-    let target = lab.target;
-    let Settled {
-        client,
-        source,
-        key,
-        incarnation: old_incarnation,
-        ..
-    } = s;
-    // A real RST frees the client's tuple without waiting for TIME_WAIT, while
-    // the accepted old FD and its native guard remain alive until exact release.
+/// A real RST frees the client's tuple without waiting for TIME_WAIT, while the accepted
+/// FD and any native guard on it stay alive.
+fn reset_close(client: TcpStream) -> anyhow::Result<()> {
     let linger = libc::linger {
         l_onoff: 1,
         l_linger: 0,
@@ -666,6 +716,20 @@ async fn superseding_syn(lab: &Lab, old: TcpFlowGuard, s: Settled) -> anyhow::Re
         "set client RST close"
     );
     drop(client);
+    Ok(())
+}
+
+async fn superseding_syn(lab: &Lab, old: TcpFlowGuard, s: Settled) -> anyhow::Result<()> {
+    let (handle, listener, client_ns) = (&lab.handle, &lab.listener, &lab.client_ns);
+    let target = lab.target;
+    let Settled {
+        client,
+        source,
+        key,
+        incarnation: old_incarnation,
+        ..
+    } = s;
+    reset_close(client)?;
     tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
         while metadata(&key)?.0.state != TcpState::TcpStateClosing as u8 {
             tokio::task::yield_now().await;

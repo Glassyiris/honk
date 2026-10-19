@@ -286,3 +286,50 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     stop_removals(pool, &port, worker, fatal).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn adoption_retries_a_child_proof_that_is_still_being_published() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let destination = listener.local_addr()?;
+    let retries = ControlPlaneHandle::CHILD_PROOF_RETRIES;
+    for (pending, adopted) in [(retries, true), (retries + 1, false)] {
+        let mock = MockEbpfBackend::default();
+        mock.adopt_proof_pending
+            .store(pending, std::sync::atomic::Ordering::Relaxed);
+        let plane = ControlPlane::new(
+            honk_config::Config::default(),
+            Box::new(mock),
+            Router::new(&[], "direct")?,
+            Arc::new(ProxyRegistry::default_resolver()?),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+            crate::control::tests::support::test_dns_forwarder(),
+        )?;
+        let handle = plane.spawn_handle();
+        let client = tokio::net::TcpStream::connect(destination).await?;
+        let source = client.local_addr()?;
+        let (stream, _) = listener.accept().await?;
+        crate::control::tests::store_active_tcp_flow(&handle, destination, source).await?;
+        let tuples = build_tuples_key(
+            destination.ip(),
+            destination.port(),
+            source.ip(),
+            source.port(),
+            6,
+        );
+        let result = handle
+            .adopt_tcp_flow(
+                stream,
+                tuples,
+                #[cfg(feature = "native-api")]
+                &ConnectionObservation::default(),
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            adopted,
+            "{pending} pending refusals against {} retries",
+            ControlPlaneHandle::CHILD_PROOF_RETRIES
+        );
+    }
+    Ok(())
+}

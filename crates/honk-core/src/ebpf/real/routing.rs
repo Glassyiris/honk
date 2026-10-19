@@ -630,7 +630,7 @@ impl RealEbpfBackend {
             retirement_owner: 0,
             retirement_failed: false,
             retirement_faults: Default::default(),
-            tcp_bindings: None,
+            tcp_proof_link: None,
             cap_lookup_batch: BatchCapability::new(),
             cap_flow_lookup_batch: BatchCapability::new(),
             tcp_live_pins,

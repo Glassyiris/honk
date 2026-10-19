@@ -657,14 +657,27 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
 
 fn print_ordinary_stats(pin_root: &Path) -> anyhow::Result<()> {
     let fd = unsafe { OwnedFd::from_raw_fd(open(pin_root, "BPF_STATS_MAP")?) };
-    print_ordinary_stats_with(|key| read_value(fd.as_raw_fd(), key), io::stdout().lock())?;
-    Ok(())
+    let info = map_info(fd.as_raw_fd(), "BPF_STATS_MAP")?;
+    print_ordinary_stats_with(
+        info,
+        |key| read_value(fd.as_raw_fd(), key),
+        io::stdout().lock(),
+    )
 }
 
+// A map from an engine with different key numbering would print counters under wrong labels.
 fn print_ordinary_stats_with(
+    info: [u32; 6],
     mut read: impl FnMut(&[u8]) -> io::Result<Option<u64>>,
     mut output: impl io::Write,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        info[4] == BpfStatsKey::COUNT,
+        "unexpected map layout for BPF_STATS_MAP: expected max_entries={} found {}; \
+         the running engine and honk-tool disagree on the statistics keys",
+        BpfStatsKey::COUNT,
+        info[4]
+    );
     for key in BpfStatsKey::ALL {
         let value = read(&(key as u32).to_ne_bytes())?.unwrap_or(0);
         writeln!(output, "{}: {value}", key.label())?;

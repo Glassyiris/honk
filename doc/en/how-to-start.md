@@ -56,12 +56,12 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-cgroup v2 is required. The real datapath attaches socket-identity hooks to the root cgroup and refuses to start without them. The running kernel must also expose raw BTF (`/sys/kernel/btf/vmlinux` or `HONK_VMLINUX_BTF`) and allow fentry/fexit on `tcp_v4_route_req`, `tcp_v4_reqsk_destructor` and `tcp_create_openreq_child` for TCP request ownership. A bound IPv6 TCP listener additionally needs the IPv6 variants, which requires built-in IPv6 (`CONFIG_IPV6=y`); modular IPv6 is refused rather than downgraded to IPv4-only.
+cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup and refuses to start without them. A legacy (flags=0) program already holding the root cgroup's `sock_ops` slot, for example one attached with `bpftool cgroup attach`, also makes startup fail. `honk_tcp_passive` is entered for every TCP `sock_ops` callback on the host, a few per connection, and returns at once unless the socket belongs to honk's namespace. TCP ownership proof needs no in-kernel BTF, no ftrace and no built-in IPv6, so a kernel that only has an external raw BTF file can run it. Startup always loads raw BTF (the eBPF loader's target BTF, plus the process-name and receive-trace offsets), from `/sys/kernel/btf/vmlinux` or the file named by `HONK_VMLINUX_BTF`.
 
-Those TCP ownership hooks add these kernel requirements; 32-bit kernels are refused:
+Only the optional `native-api` UDP receive-trace fallback, used when UDP receive-priority ancillary metadata is unavailable, attaches fentry/fexit programs. It needs the in-kernel BTF (`HONK_VMLINUX_BTF` does not substitute) and ftrace, and degrades without them:
 
 ```text
-CONFIG_DEBUG_INFO_BTF=y   # unless HONK_VMLINUX_BTF supplies the BTF
+CONFIG_DEBUG_INFO_BTF=y
 CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
 ```

@@ -1,6 +1,6 @@
 //! Raw AF_PACKET capture and replay for the real-kernel TCP fixtures.
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -91,6 +91,42 @@ pub(in crate::control::tests) fn tcp_segment(
     (tcp.len() >= 20).then_some((source, destination, tcp))
 }
 
+fn tcp_offset(frame: &[u8], ipv6: bool) -> anyhow::Result<usize> {
+    let (_, _, tcp) =
+        tcp_segment(frame, ipv6).context("frame is not TCP over the expected family")?;
+    Ok(frame.len() - tcp.len())
+}
+
+/// The sequence number of a captured SYN, which is the client's ISN.
+pub(in crate::control::tests) fn syn_isn(frame: &[u8], ipv6: bool) -> anyhow::Result<u32> {
+    let at = tcp_offset(frame, ipv6)? + 4;
+    Ok(u32::from_be_bytes(frame[at..at + 4].try_into()?))
+}
+
+/// A copy of `frame` carrying another ISN; `Wire::replay` recomputes the checksum.
+pub(in crate::control::tests) fn with_syn_isn(
+    frame: &[u8],
+    ipv6: bool,
+    isn: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let at = tcp_offset(frame, ipv6)? + 4;
+    let mut frame = frame.to_vec();
+    frame[at..at + 4].copy_from_slice(&isn.to_be_bytes());
+    Ok(frame)
+}
+
+/// A copy of `frame` from another client port.
+pub(in crate::control::tests) fn with_source_port(
+    frame: &[u8],
+    ipv6: bool,
+    port: u16,
+) -> anyhow::Result<Vec<u8>> {
+    let at = tcp_offset(frame, ipv6)?;
+    let mut frame = frame.to_vec();
+    frame[at..at + 2].copy_from_slice(&port.to_be_bytes());
+    Ok(frame)
+}
+
 pub(in crate::control::tests) struct Wire {
     fd: OwnedFd,
     address: libc::sockaddr_ll,
@@ -117,11 +153,8 @@ impl Wire {
         Ok(Self { fd, address })
     }
 
-    pub(in crate::control::tests) async fn synack(
-        &self,
-        source: SocketAddr,
-        target: SocketAddr,
-    ) -> anyhow::Result<Vec<u8>> {
+    /// The next captured TCP frame of the given family accepted by `wanted`.
+    async fn capture(&self, ipv6: bool, wanted: impl Fn(&[u8]) -> bool) -> anyhow::Result<Vec<u8>> {
         let mut bytes = [0u8; 2048];
         loop {
             let Some(length) = recv_frame(&self.fd, &mut bytes)? else {
@@ -129,16 +162,40 @@ impl Wire {
                 continue;
             };
             let frame = &bytes[..length];
-            let Some((_, _, tcp)) = tcp_segment(frame, source.is_ipv6()) else {
+            let Some((_, _, tcp)) = tcp_segment(frame, ipv6) else {
                 continue;
             };
-            if u16::from_be_bytes([tcp[0], tcp[1]]) == target.port()
-                && u16::from_be_bytes([tcp[2], tcp[3]]) == source.port()
-                && tcp[13] & 0x12 == 0x12
-            {
+            if wanted(tcp) {
                 return Ok(frame.to_vec());
             }
         }
+    }
+
+    pub(in crate::control::tests) async fn synack(
+        &self,
+        source: SocketAddr,
+        target: SocketAddr,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.capture(source.is_ipv6(), |tcp| {
+            u16::from_be_bytes([tcp[0], tcp[1]]) == target.port()
+                && u16::from_be_bytes([tcp[2], tcp[3]]) == source.port()
+                && tcp[13] & 0x12 == 0x12
+        })
+        .await
+    }
+
+    /// The client's pure SYN, captured on the client's own edge.
+    pub(in crate::control::tests) async fn syn(
+        &self,
+        source: SocketAddr,
+        target: SocketAddr,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.capture(source.is_ipv6(), |tcp| {
+            u16::from_be_bytes([tcp[0], tcp[1]]) == source.port()
+                && u16::from_be_bytes([tcp[2], tcp[3]]) == target.port()
+                && tcp[13] & 0x12 == 0x02
+        })
+        .await
     }
 
     pub(in crate::control::tests) fn replay(&self, frame: &[u8]) -> anyhow::Result<()> {

@@ -8,9 +8,7 @@ use crate::ebpf::{
     conn_state_timeout_ns,
 };
 use honk_ebpf_common::TuplesKey;
-use honk_ebpf_common::conn::{
-    REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
-};
+use honk_ebpf_common::conn::{REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
@@ -74,7 +72,7 @@ impl BpfJanitor {
                     chunk
                         .iter()
                         .map(&mut request)
-                        .filter(|request| !pins.blocks(request)),
+                        .filter(|request| !pins.contains(&request.key)),
                 );
                 if requests.is_empty() {
                     continue;
@@ -129,7 +127,7 @@ impl BpfJanitor {
                         if expired.len() == tuning.candidates {
                             break;
                         }
-                        if stale(&entry.0, &entry.1) && !pins.blocks(&request(entry)) {
+                        if stale(&entry.0, &entry.1) && !pins.contains(&request(entry).key) {
                             expired.push(*entry);
                         }
                     }
@@ -269,36 +267,6 @@ impl BpfJanitor {
                 "BPF janitor: removed routing handoff entries"
             );
         }
-        Ok(scan)
-    }
-
-    pub(super) async fn cleanup_tcp_requests_at(
-        &self,
-        now_ns: u64,
-        tuning: ScanTuning,
-    ) -> anyhow::Result<AuxScanResult> {
-        let (scan, retired) = self
-            .sweep(
-                "tcp-request-bindings",
-                tuning,
-                |ebpf, visit| ebpf.tcp_request_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
-                move |_, binding| {
-                    now_ns.saturating_sub(binding.handoff.last_seen_ns)
-                        > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-                },
-                move |(request, expected)| RetireRequest {
-                    key: expected.tuples,
-                    kind: RetireKind::ExpiredRequest {
-                        request,
-                        expected,
-                        expired_before_ns: now_ns
-                            .saturating_sub(TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS),
-                    },
-                },
-                |counts| counts.request,
-            )
-            .await;
-        retired?;
         Ok(scan)
     }
 }

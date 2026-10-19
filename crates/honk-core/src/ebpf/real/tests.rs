@@ -1,6 +1,8 @@
 use super::*;
 
 mod btf_source;
+mod mandatory_helpers;
+mod raw_bpf;
 mod retirement;
 mod socket_identity;
 
@@ -210,16 +212,16 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         },
     );
 
-    // Five cgroup capture links + wan_ingress/wan_egress on lo.
+    // Five cgroup identity links + the sock_ops child-proof link + wan_ingress/wan_egress on lo.
     let held = held_bpf_link_count();
     assert!(
-        held >= 7,
-        "expected >= 7 held bpf links after load, got {held}"
+        held >= 8,
+        "expected >= 8 held bpf links after load, got {held}"
     );
     assert_eq!(
         cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
-        baseline + 5,
-        "all 5 cgroup capture programs must stay attached after load"
+        baseline + 6,
+        "all 5 cgroup capture programs and the sock_ops proof must stay attached after load"
     );
 
     let lo_ifindex = std::fs::read_to_string("/sys/class/net/lo/ifindex")
@@ -269,6 +271,62 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
 }
 
+/// Counts tracing links held by this process. Unlike `held_bpf_link_count`, only a vanished
+/// fd (ENOENT) is tolerated: any other read failure must not look like "no links".
+fn held_tracing_link_count() -> anyhow::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir("/proc/self/fdinfo")? {
+        let info = match std::fs::read_to_string(entry?.path()) {
+            Ok(info) => info,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        count += usize::from(info.lines().any(|line| {
+            line.strip_prefix("link_type:")
+                .is_some_and(|kind| kind.trim() == "tracing")
+        }));
+    }
+    Ok(count)
+}
+
+/// OpenWrt-class kernels without ftrace cannot create tracing links, so startup must not need
+/// one. Routing freplace links appear on policy publication and receive_trace is lazy.
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn bare_load_holds_no_tracing_links() {
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-tracing-link-test-{}", std::process::id()));
+    assert_eq!(
+        held_tracing_link_count().expect("count tracing links before load"),
+        0,
+        "tracing links already held before load"
+    );
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        None,
+        "lo",
+        false,
+    )
+    .await
+    .expect("backend load");
+    assert_eq!(
+        held_tracing_link_count().expect("count tracing links after load"),
+        0,
+        "bare load attached a tracing link"
+    );
+    backend.detach_hooks().expect("detach hooks");
+    backend.cleanup().await.expect("cleanup");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
+    std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
 #[cfg(feature = "native-api")]
 #[tokio::test]
 #[ignore = "requires root; run via just test-netns"]
@@ -293,6 +351,8 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
         "UDP_DECISION_EPOCH",
         "UDP_DECISION_INFLIGHT",
         "UDP_DECISION_RETIRE_FENCE",
+        "TCP_REQUEST_BINDINGS",
+        "REQUEST_FENCE",
     ];
     aya::maps::HashMap::<_, u64, [u8; 32]>::create(65536, 1)
         .unwrap()
@@ -310,6 +370,12 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
         .unwrap()
         .pin(pin_root.join(obsolete[3]))
         .unwrap();
+    for name in &obsolete[4..] {
+        aya::maps::HashMap::<_, u64, u64>::create(65536, 1)
+            .unwrap()
+            .pin(pin_root.join(name))
+            .unwrap();
+    }
 
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,

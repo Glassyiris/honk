@@ -81,7 +81,7 @@ impl Retirement {
             },
             _ => return None,
         };
-        (!pins.blocks(&request)).then_some(request)
+        (!pins.contains(&request.key)).then_some(request)
     }
 
     fn settle(self, ok: bool, pool: &UdpEndpointPool, tracker: &ConnectionTracker) {

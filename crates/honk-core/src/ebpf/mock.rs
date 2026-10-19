@@ -11,8 +11,7 @@ use super::TcpSocketOwnership;
 #[cfg(test)]
 use super::retirement::retire_fixture;
 use super::retirement::{
-    Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit,
-    release_request_count, retire_staged_udp,
+    Owners, RedirectEffect, account_retirement, plan_retirement, plan_udp_commit, retire_staged_udp,
 };
 #[cfg(test)]
 use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
@@ -72,6 +71,9 @@ pub struct MockEbpfBackend {
     trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
     pub route_witnesses: HashMap<u32, KernelRouteWitness>,
     next_trace_id: u32,
+    /// Remaining `adopt_tcp` calls that report the child proof as not published yet.
+    #[cfg(test)]
+    pub adopt_proof_pending: std::sync::atomic::AtomicU32,
     /// TCP connection states (TuplesKey → ConnState)
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
@@ -80,8 +82,6 @@ pub struct MockEbpfBackend {
     pub redirect_tracks: HashMap<[u8; 40], RedirectEntry>,
     /// Routing handoff table (TuplesKey → RoutingHandoffEntry).
     pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
-    /// Explicit request-proof fixtures, not simulated kernel socket ownership.
-    pub tcp_request_bindings: HashMap<(u64, u64), TcpSocketBinding>,
     /// Tuple fences retained by model fixtures for allocator conflict checks.
     retire_fences: HashMap<[u8; 40], RetirementFence>,
     #[cfg(test)]
@@ -239,7 +239,7 @@ impl MockEbpfBackend {
         &mut self,
         request: &RetireRequest<'_>,
         counts: &mut RetireCounts,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
+    ) -> UdpDecisionCommitResult {
         let raw = Self::tuples_key_bytes(&request.key);
         let track_raw = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(&request.key));
         let reads = request.kind.owner_reads();
@@ -255,20 +255,14 @@ impl MockEbpfBackend {
             .redirect
             .then(|| self.redirect_tracks.get(&track_raw).copied())
             .flatten();
-        let binding = reads.request.and_then(|proof| {
-            self.tcp_request_bindings
-                .get(&(proof.address, proof.cookie))
-                .copied()
-        });
         let owners = Owners {
             conn: conn.as_ref(),
             handoff: handoff.as_ref(),
             redirect: redirect.as_ref(),
-            request: binding.as_ref(),
         };
         let plan = match plan_retirement(request, &owners) {
             Ok(plan) => plan,
-            Err(result) => return Ok(result),
+            Err(result) => return result,
         };
         let before = *counts;
         if plan.handoff {
@@ -277,17 +271,6 @@ impl MockEbpfBackend {
         if plan.redirect {
             counts.redirect += u64::from(self.redirect_tracks.remove(&track_raw).is_some());
         }
-        if let (Some(incarnation), Some(proof)) = (plan.request, reads.request)
-            && self
-                .tcp_request_bindings
-                .remove(&(proof.address, proof.cookie))
-                .is_some()
-        {
-            counts.request += 1;
-            if let Some(state) = self.tcp_conn_states.get_mut(&raw) {
-                release_request_count(state, incarnation)?;
-            }
-        }
         if plan.conn {
             counts.conn += u64::from(
                 self.conn_states_mut(request.key.l4proto)
@@ -295,7 +278,7 @@ impl MockEbpfBackend {
                     .is_some(),
             );
         }
-        Ok(plan.outcome((*counts).since(before)))
+        plan.outcome((*counts).since(before))
     }
 
     fn retire_model_batch(
@@ -320,7 +303,7 @@ impl MockEbpfBackend {
             }
             #[cfg(not(test))]
             let _ = index;
-            *outcome = self.retire_model_request(request, counts)?.into();
+            *outcome = self.retire_model_request(request, counts).into();
         }
         Ok(())
     }
@@ -919,6 +902,18 @@ impl EbpfBackend for MockEbpfBackend {
         tuples: &TuplesKey,
         _errors: super::TcpPinErrorSink,
     ) -> anyhow::Result<super::TcpAdoption> {
+        #[cfg(test)]
+        if self
+            .adopt_proof_pending
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(super::TcpChildProofPending.into());
+        }
         let current = self
             .conn_state_lookup(tuples)?
             .ok_or_else(|| anyhow::anyhow!("accepted TCP flow has no conn-state: {tuples:?}"))?;
@@ -939,27 +934,6 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>> {
         None
-    }
-
-    fn tcp_request_for_each_chunk(
-        &self,
-        chunk_size: usize,
-        visit: &mut super::TcpRequestChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (&(address, cookie), binding) in &self.tcp_request_bindings {
-            chunk.push((TcpRequestKey { address, cookie }, *binding));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
-        Ok(())
     }
 
     fn retire_batch(
@@ -1229,7 +1203,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.udp_conn_states.clear();
         self.redirect_tracks.clear();
         self.routing_handoffs.get_mut().clear();
-        self.tcp_request_bindings.clear();
         self.retire_fences.clear();
         self.route_witnesses.clear();
         self.outbound_alive.clear();
@@ -1424,7 +1397,6 @@ mod batch_retirement_tests {
                     conn: 1,
                     handoff: 1,
                     redirect: 1,
-                    request: 0
                 }
             );
             assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
@@ -1764,7 +1736,6 @@ mod batch_retirement_tests {
                 conn: 1,
                 redirect: 1,
                 handoff: 1,
-                request: 0
             }
         );
     }
@@ -1810,99 +1781,6 @@ mod batch_retirement_tests {
         let error = backend.retire_batch(&[], &mut outcomes).unwrap_err();
         assert_eq!(error.counts, RetireCounts::default());
         assert_eq!(outcomes, [RetireOutcome::NotRun]);
-    }
-
-    #[test]
-    fn request_expiry_uses_immutable_owner_and_scan_chunks() {
-        let mut backend = MockEbpfBackend::new();
-        let key = TuplesKey {
-            l4proto: 6,
-            ..Default::default()
-        };
-        let proof = TcpRequestKey {
-            address: 10,
-            cookie: 11,
-        };
-        let old = TcpSocketBinding {
-            tuples: key,
-            kind: TCP_BINDING_CHILD,
-            handoff: RoutingHandoffEntry {
-                incarnation: 1,
-                last_seen_ns: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let fresh = TcpSocketBinding {
-            handoff: RoutingHandoffEntry {
-                incarnation: 2,
-                ..old.handoff
-            },
-            ..old
-        };
-        backend
-            .tcp_request_bindings
-            .insert((proof.address, proof.cookie), fresh);
-        backend
-            .tcp_conn_state_store(
-                &key,
-                &ConnState {
-                    incarnation: 2,
-                    tcp_request_count: 1,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let mut scanned = 0;
-        backend
-            .tcp_request_for_each_chunk(1, &mut |chunk| {
-                assert_eq!(chunk.len(), 1);
-                assert_eq!(chunk[0].0.cookie, proof.cookie);
-                scanned += chunk.len();
-                false
-            })
-            .unwrap();
-        assert_eq!(scanned, 1);
-        let (counts, outcome) = retire_fixture(
-            &mut backend,
-            key,
-            RetireKind::ExpiredRequest {
-                request: &proof,
-                expected: &old,
-                expired_before_ns: 1,
-            },
-        );
-        assert_eq!(counts.request, 0);
-        assert_eq!(outcome, UdpDecisionCommitResult::Superseded);
-        assert_eq!(
-            backend
-                .conn_state_lookup(&key)
-                .unwrap()
-                .unwrap()
-                .tcp_request_count,
-            1
-        );
-        let (counts, outcome) = retire_fixture(
-            &mut backend,
-            key,
-            RetireKind::ExpiredRequest {
-                request: &proof,
-                expected: &fresh,
-                expired_before_ns: 1,
-            },
-        );
-        assert_eq!(counts.request, 1);
-        assert_eq!(outcome, UdpDecisionCommitResult::Applied);
-        assert_eq!(
-            backend
-                .conn_state_lookup(&key)
-                .unwrap()
-                .unwrap()
-                .tcp_request_count,
-            0
-        );
-        assert!(backend.tcp_request_bindings.is_empty());
-        assert!(backend.take_expiry_hints().is_none());
     }
 }
 

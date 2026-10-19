@@ -20,6 +20,13 @@ pub struct TcpAdoption {
     pub pin: TcpPin,
 }
 
+/// The accepted child has no proof: either sock_ops has not published it yet (it does so after
+/// the kernel queued the child, so a running acceptor can win that race by microseconds) or it
+/// never will. Callers retry briefly before treating the child as unproven.
+#[derive(Debug, thiserror::Error)]
+#[error("accepted TCP child is unproven: no proof published")]
+pub struct TcpChildProofPending;
+
 pub enum TcpPin {
     Model,
     #[cfg(feature = "ebpf")]
@@ -79,7 +86,6 @@ pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> boo
 pub type RedirectTrackChunkVisitor<'a> = dyn FnMut(&[(RedirectTuple, RedirectEntry)]) -> bool + 'a;
 pub type RoutingHandoffChunkVisitor<'a> =
     dyn FnMut(&[(TuplesKey, RoutingHandoffEntry)]) -> bool + 'a;
-pub type TcpRequestChunkVisitor<'a> = dyn FnMut(&[(TcpRequestKey, TcpSocketBinding)]) -> bool + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPushPhase {
@@ -709,11 +715,6 @@ pub trait EbpfBackend: Send + Sync {
         fd: std::os::fd::BorrowedFd<'_>,
     ) -> anyhow::Result<TcpSocketOwnership>;
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>>;
-    fn tcp_request_for_each_chunk(
-        &self,
-        chunk_size: usize,
-        visit: &mut TcpRequestChunkVisitor<'_>,
-    ) -> anyhow::Result<()>;
 
     /// Validate the pinned allocator map and its locked value before admission.
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()>;

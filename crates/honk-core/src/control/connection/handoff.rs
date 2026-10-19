@@ -220,11 +220,6 @@ impl TcpFlowPins {
             .contains_key(&TcpFlowKey::from_tuples(tuples))
     }
 
-    pub(in crate::control) fn blocks(&self, request: &crate::ebpf::RetireRequest<'_>) -> bool {
-        !matches!(request.kind, crate::ebpf::RetireKind::ExpiredRequest { .. })
-            && self.contains(&request.key)
-    }
-
     fn retain(&self, key: TcpFlowKey) {
         *self.inner.lock().entry(key).or_default() += 1;
     }
@@ -504,6 +499,11 @@ impl ControlPlaneHandle {
             }))
     }
 
+    /// sock_ops publishes a child's proof after the kernel queued it; measured on x86 the gap is
+    /// under 20 us, so a few millisecond-granular retries cover it without delaying a real refusal.
+    const CHILD_PROOF_RETRIES: u32 = 3;
+    const CHILD_PROOF_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
     pub(in crate::control) async fn adopt_tcp_flow(
         &self,
         stream: TcpStream,
@@ -511,12 +511,22 @@ impl ControlPlaneHandle {
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
         use std::os::fd::AsFd;
-        let backend = self.ebpf.read().await;
-        let adoption = backend.adopt_tcp(
-            stream.as_fd(),
-            &tuples,
-            Arc::clone(&self.retirement.pin_errors),
-        )?;
+        let mut retries = Self::CHILD_PROOF_RETRIES;
+        let (backend, adoption) = loop {
+            let backend = self.ebpf.read().await;
+            match backend.adopt_tcp(
+                stream.as_fd(),
+                &tuples,
+                Arc::clone(&self.retirement.pin_errors),
+            ) {
+                Err(error) if retries > 0 && error.is::<crate::ebpf::TcpChildProofPending>() => {
+                    retries -= 1;
+                    drop(backend);
+                    tokio::time::sleep(Self::CHILD_PROOF_RETRY_DELAY).await;
+                }
+                result => break (backend, result?),
+            }
+        };
         // The local pin joins the native pin before releasing backendR.
         let flow = TcpFlowGuard::new(
             stream,

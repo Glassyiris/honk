@@ -10,7 +10,8 @@
 
 - 一台可丢弃或隔离的授权主机、带外恢复通道和维护窗口。不要把共享生产网关
   作为首次灰度主机。
-- 仅特权灰度需要 root 或免密 `sudo`、带 BTF 的受支持 Linux 内核，以及真实
+- 仅特权灰度需要 root 或免密 `sudo`、带 cgroup v2 与原始 BTF 的受支持 Linux
+  内核（内核自带，或通过 `HONK_VMLINUX_BTF` 指定外部文件），以及真实
   smoke 所需的目标接口、路由与 DNS 客户端。
 - Rust stable、项目 nightly toolchain、`rust-src`、`bpf-linker`、CMake、C/C++
   编译器、libclang/bindgen 依赖与 `readelf`。

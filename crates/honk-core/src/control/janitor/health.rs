@@ -10,22 +10,16 @@ use tracing::warn;
 pub(super) enum AuxMap {
     RedirectTrack,
     RoutingHandoff,
-    TcpRequestBindings,
 }
 
 impl AuxMap {
-    pub(super) const ALL: [Self; 3] = [
-        Self::RedirectTrack,
-        Self::RoutingHandoff,
-        Self::TcpRequestBindings,
-    ];
+    pub(super) const ALL: [Self; 2] = [Self::RedirectTrack, Self::RoutingHandoff];
     pub(super) const COUNT: usize = Self::ALL.len();
 
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::RedirectTrack => "redirect-track",
             Self::RoutingHandoff => "routing-handoff",
-            Self::TcpRequestBindings => "tcp-request-bindings",
         }
     }
 }
@@ -88,8 +82,7 @@ impl BpfJanitor {
                 BpfStatsKey::SocketIdentityCaptureFailure => {
                     "BPF janitor: socket identity capture failures increased; affected sockets lost process-name matching"
                 }
-                BpfStatsKey::TcpRequestProofInsertFailure
-                | BpfStatsKey::TcpChildProofStorageFailure
+                BpfStatsKey::TcpChildProofStorageFailure
                 | BpfStatsKey::TcpPublisherClaimFailure => {
                     "BPF janitor: TCP ownership publication failures increased; affected connections were refused"
                 }

@@ -451,7 +451,7 @@ fn do_tproxy_wan_egress_tcp(
         };
     }
 
-    // Only fresh publication captures the immutable request/child snapshot.
+    // Only fresh publication captures the immutable handoff snapshot.
     if fresh_publication {
         let Some(scratch) = UDP_DECISION_SCRATCH_MAP.get_ptr_mut(0) else {
             increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
