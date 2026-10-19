@@ -514,10 +514,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
         return Err(TC_ACT_SHOT);
     }
-    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
-        &pkt.tuples.five,
-        crate::contrack::tcp::TcpSynRole::InterceptedForward,
-    );
+    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&pkt.tuples.five);
     if pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph) {
         // Before any conn/aux element exists, so a rejected flood leaves no state behind.
         if crate::new_flow_limit::exceeded(&pkt.tuples.five.src_ip) {
@@ -533,7 +530,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let tcp_state = crate::contrack::tcp::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
-            0u8,
             None,
             None,
             None,
@@ -607,7 +603,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         tcp_state = crate::contrack::tcp::mark_tcp_seen(
             &pkt.tuples.five,
             &pkt.tcph,
-            0u8,
             None,
             None,
             None,
@@ -949,20 +944,10 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto == IPPROTO_TCP {
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
         crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-        let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
-            &reversed_key,
-            crate::contrack::tcp::TcpSynRole::ObservedReverse,
-        );
-        if crate::contrack::is_new_tcp_connection(&pkt.tcph) {
-            if !tcp_publisher.acquire(ctx, &pkt.tcph) {
-                return Err(TC_ACT_SHOT);
-            }
-            pkt.incarnation = tcp_publisher.incarnation;
-        }
+        let tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&reversed_key);
         let _ = crate::contrack::tcp::mark_tcp_seen(
             &reversed_key,
             &pkt.tcph,
-            1u8,
             None,
             None,
             None,

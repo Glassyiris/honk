@@ -1,7 +1,7 @@
 //! TC egress programs ported from daed/wing/dae-core/control/kern/tproxy.c
 //!
 //! Contains:
-//! - `tproxy_lan_egress_l2` / `tproxy_lan_egress_l3` — update reverse conn state
+//! - `tproxy_lan_egress_l2` / `tproxy_lan_egress_l3` — refresh forward lifecycle from replies
 //! - `tproxy_wan_egress_l2` / `tproxy_wan_egress_l3` — routing + redirect to control plane
 
 #![allow(clippy::too_many_arguments)]
@@ -130,8 +130,8 @@ pub fn redirect_to_control_plane_egress() -> Verdict {
     Ok(unsafe { bpf_redirect(param.dae0_ifindex, 0) } as c_long)
 }
 
-/// LAN egress: update reverse-direction connection tracking state so the
-/// server/local FIN/RST keeps the client-side lifecycle in sync.
+/// LAN egress: server/local FIN/RST must keep the existing client-side TCP
+/// lifecycle in sync; unsolicited reverse SYNs have no publication authority.
 ///
 /// Also drops NDP REDIRECT packets originated from localhost to prevent
 /// kernel ND proxy from interfering with dae's routing.
@@ -162,20 +162,10 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         IPPROTO_TCP => {
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
-                &reversed_key,
-                crate::contrack::tcp::TcpSynRole::ObservedReverse,
-            );
-            if is_new_tcp_connection(&pkt.tcph) {
-                if !tcp_publisher.acquire(ctx, &pkt.tcph) {
-                    return Err(TC_ACT_SHOT);
-                }
-                pkt.incarnation = tcp_publisher.incarnation;
-            }
+            let tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&reversed_key);
             mark_tcp_seen(
                 &reversed_key,
                 &pkt.tcph,
-                1u8,  // is_wan_ingress_direction
                 None, // outbound
                 None, // mark
                 None, // must
@@ -327,7 +317,6 @@ fn do_tproxy_wan_egress_tcp(
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
             tcph,
-            0u8, // is_wan_ingress_direction
             outbound_ptr,
             mark_ptr,
             must_ptr,
@@ -354,7 +343,6 @@ fn do_tproxy_wan_egress_tcp(
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
             tcph,
-            0u8,  // is_wan_ingress_direction
             None, // outbound
             None, // mark
             None, // must
@@ -844,10 +832,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
         return Err(TC_ACT_SHOT);
     }
-    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
-        &pkt.tuples.five,
-        crate::contrack::tcp::TcpSynRole::InterceptedForward,
-    );
+    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&pkt.tuples.five);
     if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
         if !tcp_publisher.acquire(ctx, &pkt.tcph) {
             return Err(TC_ACT_SHOT);

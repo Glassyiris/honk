@@ -27,12 +27,6 @@ use network_types::tcp::TcpHdr;
 
 const TCP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TcpSynRole {
-    InterceptedForward,
-    ObservedReverse,
-}
-
 /// What this invocation may do with a wire SYN, decided once by [`TcpPublisher::acquire`].
 /// Identity and the replacement CAS precondition stay in the publisher/scratch so
 /// the claim guard fits its existing 32-byte share of the BPF call-chain stack.
@@ -54,21 +48,19 @@ pub struct TcpPublisher {
     expected_incarnation: u64,
     pub syn: TcpSyn,
     claimed: u8,
-    role: TcpSynRole,
 }
 
 const _: () = assert!(core::mem::size_of::<TcpPublisher>() == 32);
 
 impl TcpPublisher {
     #[inline(always)]
-    pub fn new(key: &TuplesKey, role: TcpSynRole) -> Self {
+    pub fn new(key: &TuplesKey) -> Self {
         Self {
             key: core::ptr::NonNull::from(key),
             incarnation: 0,
             expected_incarnation: 0,
             syn: TcpSyn::NonSyn,
             claimed: 0,
-            role,
         }
     }
 
@@ -115,15 +107,11 @@ impl TcpPublisher {
 
     #[inline(always)]
     pub fn acquire(&mut self, ctx: &aya_ebpf::programs::TcContext, tcph: &TcpHdr) -> bool {
-        let intercepted = self.role == TcpSynRole::InterceptedForward;
         if !is_new_tcp_connection(tcph)
-            || (intercepted && crate::maps::PARAM.load().tcp_daens_netns_id < 0)
+            || crate::maps::PARAM.load().tcp_daens_netns_id < 0
             || !self.claim()
         {
             return false;
-        }
-        if !intercepted {
-            return self.select_fresh();
         }
         let key = unsafe { self.key.as_ref() };
         let Some(state) = crate::flow::tcp_syn_state(key) else {
@@ -353,7 +341,6 @@ fn publish_fresh_tcp(
     *new_state = unsafe { core::mem::zeroed() };
     new_state.incarnation = incarnation;
     new_state.tcp_syn_isn = args.tcp_syn_isn;
-    new_state.is_wan_ingress_direction = args.is_wan_ingress_direction;
     new_state.state = TcpState::TcpStateActive as u8;
     new_state.last_seen_ns = now;
     new_state.pid = args.pid;
@@ -502,7 +489,6 @@ pub fn commit_tcp_intercept(key: &TuplesKey, syn_isn: u32, incarnation: u64) -> 
     let current = unsafe { &mut (*ptr).value };
     let owned = current.incarnation == incarnation
         && current.tcp_syn_isn == syn_isn
-        && current.is_wan_ingress_direction == 0
         && current.tcp_syn_flags == 0
         && (unsafe { current.meta.raw } & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED != 0);
     if owned {
@@ -518,7 +504,6 @@ pub fn commit_tcp_intercept(key: &TuplesKey, syn_isn: u32, incarnation: u64) -> 
 pub fn mark_tcp_seen(
     key: &TuplesKey,
     tcph: &TcpHdr,
-    is_wan_ingress_direction: u8,
     outbound: Option<&u8>,
     mark: Option<&u32>,
     must: Option<&u8>,
@@ -549,16 +534,10 @@ pub fn mark_tcp_seen(
             return None;
         }
         args.incarnation = syn.incarnation;
-        // Only an intercepted forward SYN records an interception proof.
-        args.tcp_syn_isn = if syn.role == TcpSynRole::InterceptedForward {
-            u32::from_be_bytes(tcph.seq)
-        } else {
-            0
-        };
+        args.tcp_syn_isn = u32::from_be_bytes(tcph.seq);
         expected_incarnation = syn.expected_incarnation;
     }
 
-    args.is_wan_ingress_direction = (is_wan_ingress_direction != 0) as u8;
     let key_ptr: *const TuplesKey = key;
     let args_ptr: *mut ConntrackArgs = args;
     let result = __mark_tcp_seen(

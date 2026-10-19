@@ -47,8 +47,7 @@ pub struct ConntrackArgs {
     trace_id: u32,
     incarnation: u64,
     tcp_syn_isn: u32,
-    is_wan_ingress_direction: u8,
-    tcp_padding: [u8; 3],
+    tcp_padding: [u8; 4],
 }
 
 impl ConntrackArgs {

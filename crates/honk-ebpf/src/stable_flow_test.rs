@@ -15,7 +15,7 @@ use crate::{
     auxiliary::{publish_handoff, publish_redirect},
     contrack::{
         is_new_tcp_connection,
-        tcp::{TcpPublisher, TcpSynRole, mark_tcp_seen},
+        tcp::{TcpPublisher, mark_tcp_seen},
     },
     flow::{conn_incarnation, conn_snapshot, copy_payload, handoff_snapshot, redirect_snapshot},
     maps::{
@@ -82,7 +82,7 @@ fn publish_syn(
     {
         return None;
     }
-    let mut publisher = TcpPublisher::new(key, TcpSynRole::InterceptedForward);
+    let mut publisher = TcpPublisher::new(key);
     if !publisher.acquire_fresh() {
         return None;
     }
@@ -94,7 +94,6 @@ fn publish_syn(
     mark_tcp_seen(
         key,
         &tcp,
-        0,
         Some(&scratch.handoff.result.outbound),
         Some(&scratch.handoff.result.mark),
         Some(&scratch.handoff.result.must),

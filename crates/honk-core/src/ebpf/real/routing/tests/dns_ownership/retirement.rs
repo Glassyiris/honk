@@ -7,6 +7,7 @@ use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
 mod publication;
+mod reverse_syn;
 mod stable_values;
 
 const TC_ACT_PIPE: u32 = 3;
@@ -223,7 +224,7 @@ fn retirement_fence_prevents_missing_tuple_publication_and_reply_fallback() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_directions() {
+fn forward_syn_publisher_refuses_busy_and_releases_for_reuse_while_reverse_syn_is_ignored() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
         for name in ["lan_egress_l2", "wan_ingress_l2"] {
@@ -252,7 +253,7 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
             };
             assert_eq!(
                 run(&backend, side, &syn, SkbInput::default()).verdict,
-                TC_ACT_SHOT,
+                if reverse { TC_ACT_PIPE } else { TC_ACT_SHOT },
                 "{side} {src}"
             );
             assert_eq!(owned_values(&backend, &key), before);
@@ -287,8 +288,12 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
                     .unwrap()
                     .unwrap()
                     .incarnation;
-                assert_ne!(current, previous);
-                assert_ne!(current, 0);
+                if reverse {
+                    assert_eq!(current, previous, "{side} reverse SYN must not publish");
+                } else {
+                    assert_ne!(current, previous);
+                    assert_ne!(current, 0);
+                }
                 assert_eq!(
                     backend
                         .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
