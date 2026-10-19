@@ -9,9 +9,11 @@
 //! All swept maps are plain hashes: the kernel never evicts on its own
 //! (silent LRU eviction could re-route or break live flows mid-flight), so
 //! occupancy management lives here. Accepted TCP owners pin conn-state and
-//! redirect metadata for their full relay lifetime; unpinned TCP ACTIVE and
-//! UDP entries keep the 120-second userspace backstop, while TCP CLOSING uses
-//! the datapath's strict 10-second rule. Conn, redirect and handoff occupancy
+//! redirect metadata for their full relay lifetime. Unpinned TCP ACTIVE and
+//! UDP conn-state keep the 120-second backstop; TCP CLOSING uses 10 seconds.
+//! Unpinned TCP and stateless UDP/53 redirects need only 30 seconds because
+//! the next forward packet can rebuild them without losing conn authority.
+//! Conn, redirect and handoff occupancy
 //! jointly select the cadence and candidate bound: 60 s below 70%, 15 s below
 //! 85%, and every two-second tick / 4096 candidates under pressure. A bounded
 //! auxiliary scan keeps that aggressive cadence until its backlog is drained.

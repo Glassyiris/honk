@@ -10,6 +10,7 @@ use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
 
 mod cadence;
 mod cursor;
+mod redirect_retention;
 
 const IPPROTO_TCP: u8 = 6;
 

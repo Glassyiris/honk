@@ -13,6 +13,26 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
 
+// Conn-state survives this shorter auxiliary deadline: a late TCP packet must
+// still be intercepted rather than routed as an untracked native flow.
+pub(super) const UNPINNED_REDIRECT_TIMEOUT_NS: u64 = 30_000_000_000;
+
+fn redirect_timeout_ns(
+    key: &honk_ebpf_common::RedirectTuple,
+    entry: &honk_ebpf_common::RedirectEntry,
+) -> u64 {
+    if key.l4proto == libc::IPPROTO_TCP as u8
+        || (key.l4proto == libc::IPPROTO_UDP as u8
+            && honk_ebpf_common::conn::is_stateless_udp_ports(key.src_port, key.dst_port)
+            && entry.decision_token == 0
+            && entry.incarnation == 0)
+    {
+        UNPINNED_REDIRECT_TIMEOUT_NS
+    } else {
+        REDIRECT_TRACK_TIMEOUT_NS
+    }
+}
+
 impl BpfJanitor {
     pub(super) async fn run_blocking_read<T, F>(&self, label: &'static str, work: F) -> Option<T>
     where
@@ -230,8 +250,8 @@ impl BpfJanitor {
                 1,
                 tuning,
                 |ebpf, cursor, visit| ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
-                move |_, entry| {
-                    now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
+                move |key, entry| {
+                    now_ns.saturating_sub(entry.last_seen_ns) > redirect_timeout_ns(key, entry)
                 },
                 move |(key, expected)| RetireRequest {
                     key: TuplesKey {
@@ -244,7 +264,7 @@ impl BpfJanitor {
                     },
                     kind: RetireKind::ExpiredRedirect {
                         expected,
-                        expired_before_ns: now_ns.saturating_sub(REDIRECT_TRACK_TIMEOUT_NS),
+                        expired_before_ns: now_ns.saturating_sub(redirect_timeout_ns(key, expected)),
                     },
                 },
                 |counts| counts.redirect,
