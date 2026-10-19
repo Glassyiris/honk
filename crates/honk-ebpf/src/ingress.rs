@@ -14,6 +14,7 @@ use core::{
 
 use crate::{
     action::{TC_ACT_OK, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten},
+    egress::wan_outbound_is_alive,
     log_shim::*,
     maps::LISTEN_SOCKET_MAP,
     transport::ParsedPacket,
@@ -398,7 +399,7 @@ fn cached_udp_decision(
 
     // Direct/block cached UDP flows still require the outbound health gate;
     // unlike cached TCP, neither has a control-plane exemption here.
-    if !lan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
+    if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
         return Err(TC_ACT_SHOT);
     }
     redirect_lan_packet_to_control_plane(
@@ -423,11 +424,6 @@ fn pass_through_classified(ctx: &TcContext) -> Verdict {
     ctx.skb
         .set_mark(unsafe { (*ctx.skb.skb).mark } | CLASSIFIED_MARK);
     Err(TC_ACT_OK)
-}
-
-#[inline(always)]
-fn lan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    crate::egress::wan_outbound_is_alive(ctx, outbound, l4proto, dport)
 }
 
 /// Confirm that a wildcard socket match names a host-local route. Socket
@@ -891,7 +887,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
     // Direct bypasses the health gate; block and proxy outbounds do not.
     if outbound != OUTBOUND_DIRECT
-        && !lan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port)
+        && !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port)
     {
         return Err(TC_ACT_SHOT);
     }
