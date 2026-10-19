@@ -80,7 +80,7 @@ impl BpfJanitor {
         let result = tokio::task::spawn_blocking(move || {
             let mut counts = RetireCounts::default();
             let mut requests = Vec::with_capacity(JANITOR_DELETE_CHUNK);
-            let mut outcomes = [RetireOutcome::NotRun; JANITOR_DELETE_CHUNK];
+            let mut outcomes = vec![RetireOutcome::NotRun; JANITOR_DELETE_CHUNK.min(entries.len())];
             #[cfg(test)]
             if let Some(hook) = before_delete_hook {
                 hook();

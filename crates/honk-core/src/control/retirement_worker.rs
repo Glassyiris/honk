@@ -254,6 +254,7 @@ pub(in crate::control) fn spawn_retirement_worker(
         };
         let mut slots = Vec::with_capacity(RETIRE_BATCH_CAPACITY);
         let mut requests = Vec::with_capacity(RETIRE_BATCH_CAPACITY);
+        let mut outcomes = vec![RetireOutcome::NotRun; RETIRE_BATCH_CAPACITY];
         while let Some(first) = ingress.next().await {
             slots.push(first.into());
             ingress.fill(&mut slots);
@@ -293,7 +294,6 @@ pub(in crate::control) fn spawn_retirement_worker(
                 }
             }
             requests.extend(slots.iter().filter_map(|slot| slot.request));
-            let mut outcomes = [RetireOutcome::NotRun; RETIRE_BATCH_CAPACITY];
             let batch_ok = requests.is_empty()
                 || match backend.retire_batch(&requests, &mut outcomes[..requests.len()]) {
                     Ok(_) => true,

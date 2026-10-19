@@ -10,7 +10,7 @@ use honk_ebpf_common::redirect_need::TcpSocketBinding;
 use honk_ebpf_common::{ConnState, RedirectEntry, RoutingHandoffEntry, TuplesKey};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const RETIRE_BATCH_CAPACITY: usize = 128;
+pub const RETIRE_BATCH_CAPACITY: usize = 1024;
 
 /// Cumulative conn-state entries physically deleted by userspace retirement,
 /// for the janitor's occupancy gauge. eBPF-side inserts/deletes are counted by
@@ -528,13 +528,14 @@ pub(crate) fn retire_staged_udp(
         &mut [RetireOutcome],
     ) -> Result<RetireCounts, RetireError>,
 ) -> anyhow::Result<()> {
+    let capacity = RETIRE_BATCH_CAPACITY.min(staged.len());
+    let mut requests = Vec::with_capacity(capacity);
+    let mut outcomes = vec![RetireOutcome::NotRun; capacity];
     for chunk in staged.chunks(RETIRE_BATCH_CAPACITY) {
-        let mut requests =
-            [RetireRequest::pending_udp(TuplesKey::default(), 0, None); RETIRE_BATCH_CAPACITY];
-        let mut outcomes = [RetireOutcome::NotRun; RETIRE_BATCH_CAPACITY];
-        for (request, (key, token, incarnation)) in requests.iter_mut().zip(chunk) {
-            *request = RetireRequest::pending_udp(*key, *token, Some(*incarnation));
-        }
+        requests.clear();
+        requests.extend(chunk.iter().map(|(key, token, incarnation)| {
+            RetireRequest::pending_udp(*key, *token, Some(*incarnation))
+        }));
         let outcomes = &mut outcomes[..chunk.len()];
         retire(&requests[..chunk.len()], outcomes)?;
         for (outcome, (_, token, _)) in outcomes.iter().zip(chunk) {

@@ -99,17 +99,15 @@ impl RealEbpfBackend {
             anyhow::bail!("retirement operation owner exhausted");
         };
         self.retirement_owner = owner;
-        // Backend W serializes operation ownership; fixed storage avoids per-key allocation.
-        let mut acquired = [None; RETIRE_BATCH_CAPACITY];
-        let mut count = 0;
+        // One heap buffer keeps wide batches off the blocking worker's stack.
+        let mut acquired = Vec::with_capacity(keys.len());
         let mut failure = None;
         let mut value = None;
         let mut unresolved = false;
         self.array_set("RETIRE_ACTIVE", 0, &1u32)?;
         for (key, token) in keys {
-            if acquired[..count]
+            if acquired
                 .iter()
-                .flatten()
                 .any(|previous| tuple_matches(previous, key))
             {
                 continue;
@@ -128,8 +126,7 @@ impl RealEbpfBackend {
             let acquisition = self.hash_insert_noexist(RETIRE_FENCE_MAP, &canonical, &fence);
             match acquisition {
                 Ok(()) => {
-                    acquired[count] = Some(canonical);
-                    count += 1;
+                    acquired.push(canonical);
                 }
                 Err(error) => {
                     failure = Some(error);
@@ -147,7 +144,7 @@ impl RealEbpfBackend {
         }
         if failure.is_none() {
             match self.grace_barrier().and_then(|()| {
-                for key in acquired[..count].iter().flatten() {
+                for key in &acquired {
                     let current = self.hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, key)?;
                     anyhow::ensure!(
                         current.is_some_and(|fence| fence.owner == owner),
@@ -160,7 +157,7 @@ impl RealEbpfBackend {
                 Err(error) => failure = Some(error),
             }
         }
-        for key in acquired[..count].iter().flatten() {
+        for key in &acquired {
             let release = (|| {
                 #[cfg(test)]
                 inject_indexed_fault(&mut self.retirement_faults.release, "release")?;
@@ -211,8 +208,8 @@ impl RealEbpfBackend {
             if requests.is_empty() {
                 return Ok(());
             }
-            let mut keys = [(TuplesKey::default(), 0); RETIRE_BATCH_CAPACITY];
-            for (index, request) in requests.iter().enumerate() {
+            let mut keys = Vec::with_capacity(requests.len());
+            for request in requests {
                 anyhow::ensure!(
                     request.key.padding == [0; 3]
                         && matches!(request.key.l4proto, IPPROTO_TCP | IPPROTO_UDP),
@@ -245,7 +242,7 @@ impl RealEbpfBackend {
                         0
                     }
                 };
-                keys[index] = (request.key, token);
+                keys.push((request.key, token));
             }
             self.with_retirement_fences(&keys[..requests.len()], |backend| {
                 for (request, outcome) in requests.iter().zip(outcomes) {
