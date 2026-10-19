@@ -27,12 +27,14 @@ mod network;
 mod new_flow_rate;
 mod refresh;
 mod retirement;
+mod tcx;
 mod trace;
 mod udp_commit;
 mod udp_group;
 mod udp_listeners;
 mod udp_reverse;
 
+const TC_ACT_UNSPEC: u32 = u32::MAX;
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
 const TC_ACT_REDIRECT: u32 = 7;
@@ -288,7 +290,7 @@ fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) ->
             repeat: 1,
             ..Default::default()
         })
-        .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {name}: {error}"));
+        .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {name}: {error:?}"));
     let returned: __sk_buff = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
     Run {
         verdict: result.return_value,

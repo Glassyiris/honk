@@ -30,13 +30,19 @@ fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
                 backend.set_admission_pressure(false).unwrap();
                 let key = tuple(client, target, 42000, 443, IPPROTO_UDP);
                 let reply = packet(target, client, IPPROTO_UDP, 443, 42000, 0, 0);
-                assert_eq!(run(&backend, name, &reply, SkbInput::default()).verdict, 3);
+                assert_eq!(
+                    run(&backend, name, &reply, SkbInput::default()).verdict,
+                    TC_ACT_UNSPEC
+                );
                 let mut old = backend.conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(old.is_wan_ingress_direction, 1);
                 old.last_seen_ns = clock_ns() - 2_000_000_000;
                 backend.flow_insert("CONN_STATE_MAP", &key, &old).unwrap();
                 backend.set_admission_pressure(true).unwrap();
-                assert_eq!(run(&backend, name, &reply, SkbInput::default()).verdict, 3);
+                assert_eq!(
+                    run(&backend, name, &reply, SkbInput::default()).verdict,
+                    TC_ACT_UNSPEC
+                );
                 let refreshed = backend.conn_state_lookup(&key).unwrap().unwrap();
                 assert_eq!(refreshed.incarnation, old.incarnation);
                 assert!(refreshed.last_seen_ns > old.last_seen_ns);
@@ -49,7 +55,7 @@ fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
                 let fresh_reply = packet(target, client, IPPROTO_UDP, 443, 42001, 0, 0);
                 assert_eq!(
                     run(&backend, name, &fresh_reply, SkbInput::default()).verdict,
-                    3
+                    TC_ACT_UNSPEC
                 );
                 assert!(
                     backend.conn_state_lookup(&fresh_key).unwrap().is_none(),
@@ -64,7 +70,7 @@ fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
                 backend.set_admission_pressure(false).unwrap();
                 assert_eq!(
                     run(&backend, name, &fresh_reply, SkbInput::default()).verdict,
-                    3
+                    TC_ACT_UNSPEC
                 );
                 assert_eq!(
                     backend
@@ -139,7 +145,7 @@ fn reverse_udp_observation_never_overwrites_forward_authority() {
                         let expected_verdict = if state == UdpDecisionState::Preparing {
                             TC_ACT_SHOT
                         } else {
-                            3
+                            TC_ACT_UNSPEC
                         };
                         assert_eq!(
                             run(&backend, name, &reply, SkbInput::default()).verdict,

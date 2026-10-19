@@ -21,7 +21,7 @@ use std::ptr;
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
 const TC_ACT_REDIRECT: u32 = 7;
-const TC_ACT_PIPE: u32 = 3;
+const TC_ACT_UNSPEC: u32 = u32::MAX;
 const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -412,7 +412,7 @@ fn ndp_redirect_l2_contract() {
         fixture
             .run("lan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
             .return_value,
-        TC_ACT_OK,
+        TC_ACT_UNSPEC,
         "forwarded ICMPv6 Redirect passes"
     );
     assert_eq!(
@@ -423,7 +423,7 @@ fn ndp_redirect_l2_contract() {
                 SkbInput::default()
             )
             .return_value,
-        TC_ACT_OK,
+        TC_ACT_UNSPEC,
         "other ICMPv6 remains untouched"
     );
     assert_eq!(
@@ -467,7 +467,7 @@ fn ndp_redirect_l2_contract() {
                 SkbInput::default()
             )
             .return_value,
-        TC_ACT_OK,
+        TC_ACT_UNSPEC,
         "non-initial IPv6 fragment passes for kernel reassembly"
     );
     let truncated = ipv6_packet(src6, dst6, IPPROTO_ICMPV6, &[]);
@@ -541,7 +541,7 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
     ] {
         let before = outbound_stats(&fixture.bpf, TEST_OUTBOUND);
         let run = fixture.run("dae0_ingress", &wrong_reply, SkbInput::default());
-        assert_eq!(run.return_value, TC_ACT_OK);
+        assert_eq!(run.return_value, TC_ACT_UNSPEC);
         let after = outbound_stats(&fixture.bpf, TEST_OUTBOUND);
         assert_eq!(after.rx_packets, before.rx_packets);
         assert_eq!(after.rx_bytes, before.rx_bytes);
@@ -564,7 +564,7 @@ fn proxy_replies_do_not_create_reverse_udp_state() {
         };
         assert_eq!(
             fixture.run("lan_egress_l2", &reply, input).return_value,
-            TC_ACT_PIPE
+            TC_ACT_UNSPEC
         );
         let state: Option<ConnState> = get_hash(
             &fixture.bpf,
@@ -611,7 +611,7 @@ fn replies_from_uncontacted_peers_reach_the_client() {
         udp_packet([198, 51, 100, 9], client, 3478, 41001, 19),
     ] {
         let run = fixture.run("dae0_ingress", &packet, SkbInput::default());
-        assert_eq!(run.return_value, TC_ACT_OK);
+        assert_eq!(run.return_value, TC_ACT_UNSPEC);
     }
 
     // The contacted peer's reply keeps its exact record and attribution.

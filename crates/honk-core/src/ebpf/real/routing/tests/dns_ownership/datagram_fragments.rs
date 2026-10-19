@@ -154,7 +154,11 @@ fn later_fragments_of_a_redirected_or_dropped_datagram_are_dropped() {
                     ] {
                         assert_eq!(
                             verdict(&backend, side, &other),
-                            TC_ACT_OK,
+                            if side_index == 0 {
+                                TC_ACT_OK
+                            } else {
+                                TC_ACT_UNSPEC
+                            },
                             "{context}: {label}"
                         );
                     }

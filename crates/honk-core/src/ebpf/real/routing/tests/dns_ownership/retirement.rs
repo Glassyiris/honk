@@ -11,7 +11,6 @@ mod reverse_syn;
 mod stable_values;
 mod udp_keepalive;
 
-const TC_ACT_PIPE: u32 = 3;
 const LAST_INCARNATION: u64 = 0x00ff_ffff_ffff_ffff;
 const PEERS: [(IpAddr, IpAddr); 2] = [
     (
@@ -116,8 +115,8 @@ fn retirement_fence_refuses_forward_reverse_and_reply_writers_without_mutation()
                 for (index, (side, reverse, expected)) in [
                     ("lan_ingress_l2", false, TC_ACT_REDIRECT),
                     ("wan_egress_l2", false, TC_ACT_REDIRECT),
-                    ("lan_egress_l2", true, TC_ACT_PIPE),
-                    ("wan_ingress_l2", true, TC_ACT_PIPE),
+                    ("lan_egress_l2", true, TC_ACT_UNSPEC),
+                    ("wan_ingress_l2", true, TC_ACT_UNSPEC),
                     ("dae0_ingress", true, TC_ACT_REDIRECT),
                 ]
                 .into_iter()
@@ -235,8 +234,8 @@ fn forward_syn_publisher_refuses_busy_and_releases_for_reuse_while_reverse_syn_i
         for (index, (side, reverse, expected)) in [
             ("lan_ingress_l2", false, TC_ACT_REDIRECT),
             ("wan_egress_l2", false, TC_ACT_REDIRECT),
-            ("lan_egress_l2", true, TC_ACT_PIPE),
-            ("wan_ingress_l2", true, TC_ACT_PIPE),
+            ("lan_egress_l2", true, TC_ACT_UNSPEC),
+            ("wan_ingress_l2", true, TC_ACT_UNSPEC),
         ]
         .into_iter()
         .enumerate()
@@ -254,7 +253,7 @@ fn forward_syn_publisher_refuses_busy_and_releases_for_reuse_while_reverse_syn_i
             };
             assert_eq!(
                 run(&backend, side, &syn, SkbInput::default()).verdict,
-                if reverse { TC_ACT_PIPE } else { TC_ACT_SHOT },
+                if reverse { TC_ACT_UNSPEC } else { TC_ACT_SHOT },
                 "{side} {src}"
             );
             assert_eq!(owned_values(&backend, &key), before);

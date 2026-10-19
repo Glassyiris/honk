@@ -41,7 +41,7 @@ use crate::{
     },
 };
 
-use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
+use crate::action::{TC_ACT_OK, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
 
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
@@ -147,12 +147,12 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if ret < 0 || (ret == PASS_NDP_REDIRECT && skb_ingress_ifindex(ctx) == NOWHERE_IFINDEX) {
             return Err(TC_ACT_SHOT);
         }
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Broadcast/multicast (DHCPOFFER, mDNS, NetBIOS) is never conn-tracked.
     if crate::transport::dst_is_special(pkt, link_h_len) {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     match pkt.l4proto {
@@ -186,7 +186,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             }
             // Skip DNS traffic to reduce state churn.
             if u16::from_be_bytes(pkt.udph.src) == 53 || u16::from_be_bytes(pkt.udph.dst) == 53 {
-                return Err(TC_ACT_PIPE);
+                return Err(TC_ACT_UNSPEC);
             }
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
@@ -209,7 +209,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         _ => {}
     }
 
-    Ok(TC_ACT_PIPE)
+    Ok(TC_ACT_UNSPEC)
 }
 
 /// WAN egress TCP handler: route new connections and cache the decision;
@@ -250,7 +250,7 @@ fn do_tproxy_wan_egress_tcp(
         if let Some(pid_pname) = pid_pname_opt {
             let param = PARAM.load();
             if pid_pname.pid == param.control_plane_pid {
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
 
             handoff_pname = Some(&pid_pname.pname);
@@ -330,7 +330,7 @@ fn do_tproxy_wan_egress_tcp(
                 return Err(TC_ACT_SHOT);
             }
             if outbound == OUTBOUND_DIRECT && mark == 0 {
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
             return Err(TC_ACT_SHOT);
         }
@@ -364,14 +364,14 @@ fn do_tproxy_wan_egress_tcp(
                 pkt.incarnation = conn.incarnation;
             } else {
                 // No cached routing — direct connection, pass through.
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
         } else {
             if wire_pure_syn || crate::contrack::tuple_unavailable(&tuples.five) {
                 return Err(TC_ACT_SHOT);
             }
             // No state at all — pass through.
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
     }
 
@@ -611,7 +611,7 @@ fn do_tproxy_wan_egress_udp(
     if let Some(pid_pname) = pid_pname_opt {
         let param = PARAM.load();
         if pid_pname.pid == param.control_plane_pid {
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
     }
 
@@ -627,7 +627,7 @@ fn do_tproxy_wan_egress_udp(
             return Err(TC_ACT_SHOT);
         }
         if conn_state.is_wan_ingress_direction != 0 {
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
 
         let meta_raw = unsafe { conn_state.meta.raw };
@@ -735,7 +735,7 @@ fn do_tproxy_wan_egress_udp(
                 return Err(TC_ACT_SHOT);
             }
             if outbound == OUTBOUND_DIRECT && mark == 0 {
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
             return Err(TC_ACT_SHOT);
         }
@@ -780,7 +780,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return Err(TC_ACT_SHOT);
         }
         // Unsupported or malformed traffic is left untouched.
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // An owned queue carrier must not escape through a WAN-role bridge port either.
@@ -791,12 +791,12 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
     if !crate::maps::datapath_ready() {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Broadcast/multicast is never re-routed into daens.
     if crate::transport::dst_is_special(pkt, link_h_len) {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Bypass locally-generated traffic destined for the honk host itself.
@@ -807,7 +807,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let dst_ip = pkt.tuples.five.dst_ip;
         let dst_ipv4 = unsafe { dst_ip.u6_addr32[3] };
         if dst_ip.is_v4_mapped() && dst_ipv4 == param.local_ip {
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
     }
 
@@ -841,7 +841,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     match pkt.l4proto {
         IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
         IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
-        _ => Ok(TC_ACT_OK),
+        _ => Ok(TC_ACT_UNSPEC),
     }
 }
 

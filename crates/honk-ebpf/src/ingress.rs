@@ -13,7 +13,7 @@ use core::{
 };
 
 use crate::{
-    action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, Verdict, flatten},
+    action::{TC_ACT_OK, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten},
     log_shim::*,
     maps::LISTEN_SOCKET_MAP,
     transport::ParsedPacket,
@@ -475,7 +475,7 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
 #[inline(never)]
 fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if !crate::maps::datapath_ready() {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
     // Bridge master/slave double attachment must not reclassify either an
     // already-final packet or a held packet carrying its unique queue token.
@@ -930,7 +930,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             error!(ctx, target: "honk", "parse_transport error: {}, dropping", ret);
             return Err(TC_ACT_SHOT);
         }
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     if pkt.l4proto == IPPROTO_TCP {
@@ -957,7 +957,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let src_port = u16::from_be_bytes(pkt.udph.src);
         let dst_port = u16::from_be_bytes(pkt.udph.dst);
         if src_port == 53 || dst_port == 53 {
-            return Err(TC_ACT_PIPE);
+            return Err(TC_ACT_UNSPEC);
         }
 
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
@@ -971,7 +971,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
     }
 
-    Ok(TC_ACT_PIPE)
+    Ok(TC_ACT_UNSPEC)
 }
 
 // #[inline(never)]: standalone program, no deep call chain.
@@ -1062,7 +1062,7 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
         None => return Err(TC_ACT_SHOT),
     };
     if parse_packet(ctx, ETH_HLEN, pkt) != 0 {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
     let mut canonical: TuplesKey = unsafe { mem::zeroed() };
     crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut canonical);
@@ -1087,7 +1087,7 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
         // No outbound owns this reply, so it is not counted against one.
         None => match client_reply_entry(pkt, redirect_tuple) {
             Some(entry) => entry,
-            None => return Err(TC_ACT_OK),
+            None => return Err(TC_ACT_UNSPEC),
         },
     };
 

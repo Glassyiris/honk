@@ -78,6 +78,8 @@ fn direct_mode_normalizes_nonmust_proxy_in_lan_and_wan_tcp_udp() {
                     let context = format!("{side} {label} {destination} must={must}");
                     let expected = if must && label == "TCP following" {
                         TC_ACT_REDIRECT
+                    } else if wan && label == "TCP following" {
+                        TC_ACT_UNSPEC
                     } else {
                         expected_verdict
                     };
@@ -164,7 +166,12 @@ fn rule_direct_prefix_offload_preserves_global_handoffs() {
                                 "{context}"
                             );
                         } else {
-                            assert_eq!(result.verdict, TC_ACT_OK, "{context}");
+                            let expected = if wan && protocol == IPPROTO_TCP && tcp_flags == 0x10 {
+                                TC_ACT_UNSPEC
+                            } else {
+                                TC_ACT_OK
+                            };
+                            assert_eq!(result.verdict, expected, "{context}");
                             assert_eq!(
                                 result.mark,
                                 if wan { 0 } else { CLASSIFIED_MARK },

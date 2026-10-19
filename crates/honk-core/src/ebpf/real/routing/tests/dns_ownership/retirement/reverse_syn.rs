@@ -19,7 +19,7 @@ fn spoofed_reverse_syn_cannot_overwrite_a_proxied_tcp_flow() {
             for side in ["wan_ingress_l2", "lan_egress_l2"] {
                 assert_eq!(
                     run(&backend, side, &spoof, SkbInput::default()).verdict,
-                    TC_ACT_PIPE,
+                    TC_ACT_UNSPEC,
                     "{side} {src}"
                 );
                 let current = backend.conn_state_lookup(&key).unwrap().unwrap();
@@ -47,7 +47,7 @@ fn spoofed_reverse_syn_cannot_overwrite_a_proxied_tcp_flow() {
             for side in ["wan_ingress_l2", "lan_egress_l2"] {
                 assert_eq!(
                     run(&backend, side, &unsolicited, SkbInput::default()).verdict,
-                    TC_ACT_PIPE
+                    TC_ACT_UNSPEC
                 );
                 assert!(
                     backend.conn_state_lookup(&absent).unwrap().is_none(),

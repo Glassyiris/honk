@@ -59,7 +59,7 @@ fn local_udp_service_replies_bypass_routing_and_cache_the_socket_probe() {
             let reply = packet(local, client, IPPROTO_UDP, port, 44000, 0, 0);
             assert_eq!(
                 run(&backend, "wan_egress_l2", &reply, SkbInput::default()).verdict,
-                TC_ACT_OK,
+                TC_ACT_UNSPEC,
                 "single-arm local reply must not be redirected"
             );
             // A cached request must not depend on a fresh socket/FIB probe.
