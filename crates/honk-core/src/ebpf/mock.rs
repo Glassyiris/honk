@@ -27,6 +27,32 @@ use async_trait::async_trait;
 use honk_ebpf_common::*;
 use std::collections::HashMap;
 
+// Stable ordering models a kernel bucket cursor without relying on HashMap's
+// randomized order, which can change when a previous scan retires elements.
+fn scan_model<K, V: Copy>(
+    entries: impl Iterator<Item = ([u8; 40], V)>,
+    chunk_size: usize,
+    cursor: &mut super::FlowScanCursor,
+    decode: impl Fn(&[u8; 40]) -> K,
+    visit: &mut dyn FnMut(&[(K, V)]) -> bool,
+) {
+    let mut entries: Vec<_> = entries
+        .filter(|(key, _)| cursor.next_key.is_none_or(|next| *key >= next))
+        .collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    let size = chunk_size.max(1);
+    let mut chunk = Vec::with_capacity(size);
+    for (index, entries_chunk) in entries.chunks(size).enumerate() {
+        chunk.clear();
+        chunk.extend(entries_chunk.iter().map(|(key, value)| (decode(key), *value)));
+        cursor.next_key = entries.get((index + 1) * size).map(|(key, _)| *key);
+        if !visit(&chunk) {
+            return;
+        }
+    }
+    cursor.next_key = None;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockRoutingSnapshot {
     pub active_slot: u32,
@@ -1223,67 +1249,39 @@ impl EbpfBackend for MockEbpfBackend {
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut super::FlowScanCursor,
         visit: &mut super::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in &self.redirect_tracks {
-            chunk.push((Self::bytes_to_redirect_tuple(key), *entry));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
+        scan_model(
+            self.redirect_tracks.iter().map(|(key, value)| (*key, *value)),
+            chunk_size, cursor, Self::bytes_to_redirect_tuple, visit,
+        );
         Ok(())
     }
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut super::FlowScanCursor,
         visit: &mut super::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in self.routing_handoffs.lock().iter() {
-            chunk.push((Self::bytes_to_tuples_key(key), *entry));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
+        scan_model(
+            self.routing_handoffs.lock().iter().map(|(key, value)| (*key, *value)),
+            chunk_size, cursor, Self::bytes_to_tuples_key, visit,
+        );
         Ok(())
     }
 
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut super::FlowScanCursor,
         visit: &mut super::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in self
-            .tcp_conn_states
-            .iter()
-            .chain(self.udp_conn_states.iter())
-        {
-            chunk.push((Self::bytes_to_tuples_key(key), *entry));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
+        scan_model(
+            self.tcp_conn_states.iter().chain(self.udp_conn_states.iter()).map(|(key, value)| (*key, *value)),
+            chunk_size, cursor, Self::bytes_to_tuples_key, visit,
+        );
         Ok(())
     }
 

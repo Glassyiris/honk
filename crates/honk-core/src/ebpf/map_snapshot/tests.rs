@@ -21,6 +21,7 @@ fn collect(
     let mut entries = Vec::new();
     scan_with(
         spec,
+        &mut None,
         lookup,
         |_, _| true,
         |keys, values| {
@@ -163,6 +164,7 @@ fn capability_rejection_is_only_allowed_before_progress() {
         let mut seen = Vec::new();
         let completed = scan_with(
             spec(4, 4, 0),
+            &mut None,
             |attr| {
                 calls += 1;
                 attr.count = 1;
@@ -199,6 +201,7 @@ fn visitor_can_stop_the_scan() {
     let mut calls = 0;
     let completed = scan_with(
         spec(4, 4, 0),
+        &mut None,
         |attr| {
             calls += 1;
             attr.count = 1;
@@ -221,6 +224,7 @@ fn terminal_enoent_preserves_partial_count() {
         let mut returned = 0;
         let completed = scan_with(
             spec,
+            &mut None,
             |attr| {
                 attr.count = count;
                 Err(libc::ENOENT)
@@ -238,4 +242,22 @@ fn terminal_enoent_preserves_partial_count() {
         assert!(completed);
         assert_eq!(returned, (count as usize).min(spec.chunk));
     }
+}
+
+#[test]
+fn stopped_batch_resumes_at_saved_bucket_and_resets_at_end() {
+    let mut cursor = None;
+    scan_with(spec(4, 4, BPF_F_LOCK), &mut cursor, |attr| {
+        assert_eq!(attr.in_batch, 0);
+        unsafe { (attr.out_batch as *mut u32).write_unaligned(17) };
+        attr.count = 1;
+        Ok(())
+    }, |_, _| true, |_, _| false).unwrap();
+    assert_eq!(cursor, Some(17u32.to_ne_bytes()));
+    scan_with(spec(4, 4, BPF_F_LOCK), &mut cursor, |attr| {
+        assert_eq!(unsafe { (attr.in_batch as *const u32).read_unaligned() }, 17);
+        attr.count = 1;
+        Err(libc::ENOENT)
+    }, |_, _| true, |_, _| true).unwrap();
+    assert!(cursor.is_none());
 }

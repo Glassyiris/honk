@@ -536,6 +536,7 @@ fn flow_entries<K: Copy, V: Copy>(args: &ShowArgs, name: &str) -> anyhow::Result
                 chunk: BPF_BATCH_CHUNK,
                 elem_flags: BPF_F_LOCK,
             },
+            &mut None,
             |_, _| true,
             visit,
         )

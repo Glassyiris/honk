@@ -227,6 +227,7 @@ pub(in crate::control::tests) fn pinned_hash_snapshot<K: aya::Pod, V: aya::Pod>(
         name,
         elem_flags,
         None,
+        &mut None,
         &mut |chunk| {
             snapshot.extend_from_slice(chunk);
             true

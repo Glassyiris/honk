@@ -11,6 +11,21 @@ pub mod real;
 #[cfg(feature = "ebpf")]
 pub use real::TcpKernelPin;
 
+/// Resume state for a bounded traversal of one tuple map. A completed traversal
+/// resets it, so the next scan starts a new pass. Batch cursors name buckets,
+/// not keys that retirement can remove between scans.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlowScanCursor {
+    pub(crate) batch: Option<[u8; 4]>,
+    pub(crate) next_key: Option<[u8; 40]>,
+}
+
+impl FlowScanCursor {
+    pub(crate) fn is_start(self) -> bool {
+        self.batch.is_none() && self.next_key.is_none()
+    }
+}
+
 pub type TcpPinErrorSink =
     std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<anyhow::Error>>>>;
 
@@ -808,6 +823,7 @@ pub trait EbpfBackend: Send + Sync {
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut FlowScanCursor,
         visit: &mut ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 
@@ -832,12 +848,14 @@ pub trait EbpfBackend: Send + Sync {
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut FlowScanCursor,
         visit: &mut RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut FlowScanCursor,
         visit: &mut RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 }

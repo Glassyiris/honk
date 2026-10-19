@@ -135,6 +135,7 @@ pub struct BpfJanitor {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tcp_flow_pins: Arc<TcpFlowPins>,
     udp_pool: Option<Arc<UdpEndpointPool>>,
+    scan_cursors: [Arc<parking_lot::Mutex<crate::ebpf::FlowScanCursor>>; 3],
     #[cfg(test)]
     blocking_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -151,6 +152,7 @@ impl BpfJanitor {
             ebpf,
             tcp_flow_pins,
             udp_pool: None,
+            scan_cursors: std::array::from_fn(|_| Arc::default()),
             #[cfg(test)]
             blocking_read_hook: None,
             #[cfg(test)]

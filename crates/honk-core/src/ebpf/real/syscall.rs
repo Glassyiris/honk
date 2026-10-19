@@ -35,6 +35,22 @@ pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(),
     }
 }
 
+pub(super) fn next_flow_key(
+    fd: RawFd,
+    previous: Option<&[u8; 40]>,
+) -> anyhow::Result<Option<[u8; 40]>> {
+    let mut next = [0u8; 40];
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = previous.map_or(0, |key| key.as_ptr() as u64);
+    attr.__bindgen_anon_2.__bindgen_anon_1.next_key = next.as_mut_ptr() as u64;
+    match unsafe { bpf_syscall(BPF_MAP_GET_NEXT_KEY as c_long, &mut attr) } {
+        Ok(()) => Ok(Some(next)),
+        Err(errno) if errno == libc::ENOENT as c_long => Ok(None),
+        Err(errno) => anyhow::bail!("bpf get_next_key errno={errno}"),
+    }
+}
+
 pub(super) fn insert_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow::Result<()> {
     let value = 1u8;
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
@@ -95,7 +111,7 @@ fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
     data.fd().as_fd().as_raw_fd()
 }
 
-fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
+pub(super) fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
     bpf.map(name)
         .map(map_raw_fd)
         .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))
@@ -276,7 +292,7 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     map: &str,
     visit: &mut BatchVisitor<'_, K, V>,
 ) -> anyhow::Result<bool> {
-    bpf_lookup_batch_scan_cb_flags(bpf, cap, map, 0, visit)
+    bpf_lookup_batch_scan_cb_flags(bpf, cap, map, 0, &mut None, visit)
 }
 
 pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
@@ -284,12 +300,13 @@ pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
     cap: &BatchCapability,
     map: &str,
     elem_flags: u64,
+    cursor: &mut Option<[u8; 4]>,
     visit: &mut BatchVisitor<'_, K, V>,
 ) -> anyhow::Result<bool> {
     if cap.is_unsupported() {
         return Ok(false);
     }
-    scan_lookup_batch(map_fd(bpf, map)?, map, elem_flags, Some(cap), visit)
+    scan_lookup_batch(map_fd(bpf, map)?, map, elem_flags, Some(cap), cursor, visit)
 }
 
 /// Drive one `BPF_MAP_LOOKUP_BATCH` traversal of `fd`, holding each hash bucket
@@ -303,6 +320,7 @@ pub(crate) fn scan_lookup_batch<K: Pod, V: Pod>(
     map: &str,
     elem_flags: u64,
     cap: Option<&BatchCapability>,
+    cursor: &mut Option<[u8; 4]>,
     visit: &mut BatchVisitor<'_, K, V>,
 ) -> anyhow::Result<bool> {
     let (key_len, value_len) = (core::mem::size_of::<K>(), core::mem::size_of::<V>());
@@ -330,6 +348,7 @@ pub(crate) fn scan_lookup_batch<K: Pod, V: Pod>(
                 chunk: BPF_BATCH_CHUNK,
                 elem_flags,
             },
+            cursor,
             |result, count| {
                 clamp_batch_count(count);
                 cap.is_none_or(|cap| cap.observe(result.map_err(c_long::from)))

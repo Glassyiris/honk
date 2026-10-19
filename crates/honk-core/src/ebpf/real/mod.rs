@@ -310,12 +310,23 @@ impl RealEbpfBackend {
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
     ) -> anyhow::Result<()> {
+        self.flow_scan_from(name, chunk_size, &mut crate::ebpf::FlowScanCursor::default(), visit)
+    }
+
+    fn flow_scan_from<K: Pod, V: Pod>(
+        &self,
+        name: &str,
+        chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
+        visit: &mut ChunkVisitor<'_, K, V>,
+    ) -> anyhow::Result<()> {
         let mut projected = Vec::with_capacity(syscall::BPF_BATCH_CHUNK);
         if syscall::bpf_lookup_batch_scan_cb_flags::<K, FlowMapValue<V>>(
             self.bpf()?,
             &self.cap_flow_lookup_batch,
             name,
             aya_obj::generated::BPF_F_LOCK as u64,
+            &mut cursor.batch,
             &mut |chunk| {
                 projected.clear();
                 projected.extend(chunk.iter().map(|(key, value)| (*key, value.value)));
@@ -326,15 +337,22 @@ impl RealEbpfBackend {
         }
         // backend R excludes userspace reclamation; kernel never deletes tuple
         // elements. Enumerate keys only, then copy each payload under its lock.
-        let map = self.hash_map::<K, FlowMapValue<V>>(name)?;
+        anyhow::ensure!(core::mem::size_of::<K>() == 40, "tuple scan key must be 40 bytes");
+        let fd = syscall::map_fd(self.bpf()?, name)?;
+        let mut next = match cursor.next_key.take() {
+            Some(key) => Some(key),
+            None => syscall::next_flow_key(fd, None)?,
+        };
         projected.clear();
-        for key in map.keys() {
-            let key =
-                key.map_err(|error| anyhow::anyhow!("map '{name}' key iteration: {error}"))?;
+        while let Some(raw) = next {
+            let key = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<K>()) };
+            // Save an unvisited key, not one this sweep may retire after backend R.
+            next = syscall::next_flow_key(fd, Some(&raw))?;
             if let Some(value) = self.flow_lookup(name, &key)? {
                 projected.push((key, value));
                 if projected.len() == chunk_size.max(1) {
                     if !visit(&projected) {
+                        cursor.next_key = next;
                         return Ok(());
                     }
                     projected.clear();
@@ -848,25 +866,28 @@ impl EbpfBackend for RealEbpfBackend {
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut crate::ebpf::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("REDIRECT_TRACK", chunk_size, visit)
+        self.flow_scan_from("REDIRECT_TRACK", chunk_size, cursor, visit)
     }
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut crate::ebpf::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
+        self.flow_scan_from("ROUTING_HANDOFF_MAP", chunk_size, cursor, visit)
     }
 
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("CONN_STATE_MAP", chunk_size, visit)
+        self.flow_scan_from("CONN_STATE_MAP", chunk_size, cursor, visit)
     }
 
     fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {

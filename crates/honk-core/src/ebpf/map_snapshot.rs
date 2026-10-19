@@ -40,10 +40,11 @@ pub enum BatchError {
 /// buffer-size products must fit `usize`.
 pub unsafe fn scan(
     spec: BatchSpec,
+    cursor: &mut Option<[u8; 4]>,
     adapt_result: impl FnMut(Result<(), i32>, &mut u32) -> bool,
     visit: impl FnMut(&[u8], &[u8]) -> bool,
 ) -> Result<bool, BatchError> {
-    scan_with(spec, lookup_batch, adapt_result, visit)
+    scan_with(spec, cursor, lookup_batch, adapt_result, visit)
 }
 
 fn lookup_batch(attr: &mut BatchAttr) -> Result<(), i32> {
@@ -66,6 +67,7 @@ fn lookup_batch(attr: &mut BatchAttr) -> Result<(), i32> {
 
 fn scan_with(
     spec: BatchSpec,
+    cursor: &mut Option<[u8; 4]>,
     mut lookup: impl FnMut(&mut BatchAttr) -> Result<(), i32>,
     mut adapt_result: impl FnMut(Result<(), i32>, &mut u32) -> bool,
     mut visit: impl FnMut(&[u8], &[u8]) -> bool,
@@ -80,9 +82,9 @@ fn scan_with(
     let mut keys = vec![0u8; key_len * chunk];
     let mut values = vec![0u8; value_len * chunk];
     // Hash maps return a four-byte opaque bucket cursor, not a key.
-    let mut previous = [0u8; 4];
+    let mut previous = cursor.unwrap_or_default();
     let mut next = [0u8; 4];
-    let mut has_previous = false;
+    let mut has_previous = cursor.is_some();
     loop {
         let mut attr = BatchAttr {
             in_batch: if has_previous {
@@ -125,6 +127,7 @@ fn scan_with(
         if count > chunk || (count == 0 && !terminal) {
             return Err(BatchError::InvalidCount { count, terminal });
         }
+        *cursor = if terminal { None } else { Some(next) };
         if count > 0 && !visit(&keys[..count * key_len], &values[..count * value_len]) {
             return Ok(true);
         }

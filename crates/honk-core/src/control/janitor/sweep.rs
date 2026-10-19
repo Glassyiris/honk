@@ -117,10 +117,13 @@ impl BpfJanitor {
     async fn sweep<K, V>(
         &self,
         label: &'static str,
+        cursor_index: usize,
         tuning: ScanTuning,
-        for_each: impl FnOnce(&dyn EbpfBackend, &mut dyn FnMut(&[(K, V)]) -> bool) -> anyhow::Result<()>
-        + Send
-        + 'static,
+        for_each: impl FnOnce(
+            &dyn EbpfBackend,
+            &mut crate::ebpf::FlowScanCursor,
+            &mut dyn FnMut(&[(K, V)]) -> bool,
+        ) -> anyhow::Result<()> + Send + 'static,
         stale: impl Fn(&K, &V) -> bool + Send + 'static,
         request: impl for<'a> Fn(&'a (K, V)) -> RetireRequest<'a> + Copy + Send + 'static,
         pick_count: impl FnOnce(RetireCounts) -> u64 + Send,
@@ -130,13 +133,16 @@ impl BpfJanitor {
         V: Copy + Send + 'static,
     {
         let pins = Arc::clone(&self.tcp_flow_pins);
+        let cursor = Arc::clone(&self.scan_cursors[cursor_index]);
         let scanned = self
             .run_blocking_read(label, move |ebpf| {
+                let mut cursor = cursor.lock();
+                let from_start = cursor.is_start();
                 let deadline = Instant::now() + tuning.budget;
                 let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0;
                 let mut complete = true;
-                for_each(ebpf, &mut |chunk| {
+                for_each(ebpf, &mut cursor, &mut |chunk| {
                     total += chunk.len();
                     for entry in chunk {
                         if expired.len() == tuning.candidates {
@@ -149,7 +155,7 @@ impl BpfJanitor {
                     complete = expired.len() < tuning.candidates && Instant::now() < deadline;
                     complete
                 })?;
-                anyhow::Ok((expired, total, complete))
+                anyhow::Ok((expired, total, complete && from_start && cursor.is_start()))
             })
             .await;
         let (expired, total, complete) = match scanned {
@@ -185,8 +191,9 @@ impl BpfJanitor {
         let (scan, retired) = self
             .sweep(
                 "conn-state",
+                0,
                 tuning,
-                |ebpf, visit| ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
+                |ebpf, cursor, visit| ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
                 move |key, state| conn_expired(key.l4proto, state, now_ns),
                 move |(key, expected)| RetireRequest {
                     key: *key,
@@ -220,8 +227,9 @@ impl BpfJanitor {
         let (scan, retired) = self
             .sweep(
                 "redirect-track",
+                1,
                 tuning,
-                |ebpf, visit| ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
+                |ebpf, cursor, visit| ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
                 move |_, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
                 },
@@ -260,8 +268,9 @@ impl BpfJanitor {
         let (scan, retired) = self
             .sweep(
                 "routing-handoff",
+                2,
                 tuning,
-                |ebpf, visit| ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
+                |ebpf, cursor, visit| ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
                 move |_, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
                 },
