@@ -676,7 +676,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             && !probe.is_dae_socket
             && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
         {
-            crate::contrack::udp::observe_local_udp_reply(&pkt.tuples.five);
+            // No routing witness is consumed after this local-service exit.
+            // Its tuple keeps nested expiry hints off the bounded TC stack.
+            crate::contrack::udp::observe_local_udp_reply(
+                &pkt.tuples.five,
+                &mut pkt.route_witness.tuple,
+            );
             return pass_through_classified(ctx);
         }
     }

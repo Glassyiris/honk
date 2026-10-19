@@ -1,6 +1,6 @@
 //! Direct ring reservations keep event payloads off the bounded TC call-chain stack.
 
-use crate::maps::EVENT_RINGBUF;
+use crate::maps::{EVENT_RINGBUF, FLOW_EXPIRY_HINT, FlowExpiryHint};
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use honk_ebpf_common::event::DaeEvent;
 
@@ -47,9 +47,27 @@ pub fn send_dae_event(
     0
 }
 
-/// Advisory only: physical reclamation always belongs to fenced userspace retirement.
-#[inline(always)]
+/// At most one advisory hint per tuple owner per second on each CPU while
+/// cached. Physical reclamation always belongs to fenced userspace retirement.
+#[inline(never)]
 pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incarnation: u64) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    if let Some(previous) = FLOW_EXPIRY_HINT.get_ptr_mut(key) {
+        let previous = unsafe { &mut *previous };
+        if previous.incarnation == incarnation
+            && now.saturating_sub(previous.last_hint_ns) < 1_000_000_000
+        {
+            return;
+        }
+        previous.incarnation = incarnation;
+        previous.last_hint_ns = now;
+    } else {
+        let _ = FLOW_EXPIRY_HINT.insert(
+            key,
+            FlowExpiryHint { incarnation, last_hint_ns: now },
+            0,
+        );
+    }
     let Some(mut reservation) = EVENT_RINGBUF.reserve(0) else {
         return;
     };
@@ -57,7 +75,7 @@ pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incar
         reservation.as_mut_ptr().write_bytes(0, 1);
         reservation.assume_init_mut()
     };
-    event.timestamp = unsafe { bpf_ktime_get_ns() };
+    event.timestamp = now;
     event.type_ = honk_ebpf_common::event::DaeEventType::FlowExpired as u32;
     event.incarnation = incarnation;
     event.l4proto = key.l4proto;

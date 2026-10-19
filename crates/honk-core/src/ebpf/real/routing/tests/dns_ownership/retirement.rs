@@ -6,6 +6,7 @@ use aya::maps::RingBuf;
 use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_STATE_TIMEOUT_NS};
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
+mod expiry_hints;
 mod publication;
 mod reverse_syn;
 mod stable_values;

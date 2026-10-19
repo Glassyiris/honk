@@ -411,8 +411,7 @@ pub fn local_udp_reply_seen(key: &TuplesKey) -> bool {
 }
 
 #[inline(never)]
-pub fn observe_local_udp_reply(key: &TuplesKey) {
-    let mut reversed = TuplesKey::default();
-    super::copy_reversed_tuples(key, &mut reversed);
-    observe_reverse_udp(&reversed);
+pub fn observe_local_udp_reply(key: &TuplesKey, reversed: &mut TuplesKey) {
+    super::copy_reversed_tuples(key, reversed);
+    observe_reverse_udp(reversed);
 }

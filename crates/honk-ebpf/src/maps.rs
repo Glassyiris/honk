@@ -253,6 +253,18 @@ pub static OUTBOUND_STATS: PerCpuArray<
 #[btf_map]
 pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();
 
+#[repr(C)]
+pub struct FlowExpiryHint {
+    pub incarnation: u64,
+    pub last_hint_ns: u64,
+}
+
+/// Advisory hint suppression only. Each CPU retains the last hinted owner of
+/// a tuple; LRU eviction may forget it, while the janitor remains lossless.
+#[btf_map]
+pub static FLOW_EXPIRY_HINT: LruPerCpuHashMap<TuplesKey, FlowExpiryHint, 4096> =
+    LruPerCpuHashMap::new();
+
 #[btf_map]
 pub static PKT_SCRATCH_KEY: PerCpuArray<ParsedPacket, 1> = PerCpuArray::new();
 
