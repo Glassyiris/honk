@@ -146,7 +146,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 自有 `daens` 关闭并校验 SYN cookies、request migration 与 Fast Open。只有缺失的 `tcp_syncookies` key 可作为内核未提供该功能处理；检查、写入或校验错误仍然致命。无法完成 `sock_ops` 挂载（包括根 cgroup 槽位已被旧式 flags=0 程序占用）会拒绝启动。证明缺失、未证明、分配失败或被新 owner 替代时，关闭 accepted socket，不授权删除 tuple。已取得证明的 child storage 跟随实际 socket 生命周期，没有单独的过期。Backlog 溢出依赖客户端重试，不猜测 cookie 归属；因此 LAN 主机发送大量不完成握手的 SYN 时，可占满透明 listener 的 backlog，在这些 request 过期前延迟新的被拦截 TCP 连接。IPv4-only 启动后再启用 IPv6 仍需要重启：IPv6 socket 族探测在加载时固定，TCP6 listener 在启动时绑定。
 
-有两个窗口以重试或重新发布代替拒绝。内核先把 child 放入 accept 队列，再执行 `PASSIVE_ESTABLISHED_CB` 回调，因此已经在运行的 acceptor 可能在证明写入前看到该 child（x86 回环实测中位数约 1 µs、最坏约 17 µs；ARM64 仅有源码分析给出的上界）；`adopt_tcp_flow` 对缺失的证明间隔 1 ms 重试三次，之后才关闭 socket。仍存活的 request 的重传 SYN 若在 30 秒 handoff 时限之后到达（客户端的第 5、6 个 SYN，约 31 秒和 63 秒），会发现发布已老化，在旧 request 仍存活时发布新的 incarnation 与路由快照；ISN 匹配的 child 绑定到当时有效的 incarnation，因此沿用替代者的路由。
+有两个窗口以重试或重新发布代替拒绝。内核先把 child 放入 accept 队列，再执行 `PASSIVE_ESTABLISHED_CB` 回调，因此已经在运行的 acceptor 可能在证明写入前看到该 child（x86 回环实测中位数约 1 µs、最坏约 17 µs；ARM64 仅有源码分析给出的上界）；`adopt_tcp_flow` 对缺失的证明间隔 1 ms 重试三次，之后才关闭 socket。仍存活的 request 的重传 SYN 若在 30 秒 handoff 时限之后到达，会发现发布已老化，在旧 request 仍存活时发布新的 incarnation 与路由快照；ISN 匹配的 child 绑定到当时有效的 incarnation，因此沿用替代者的路由。
 
 归属检查内联在 TC 分类程序中，会提高 verifier 成本。在 Linux 6.12.94 aarch64 上，最大的分类程序需验证 464,596 条指令（`verified_insns`），而引入归属证明前的 beta.82 发行版为 74,469。早期在 TC 内读取 held request 的设计，`wan_egress_l2` 约为 472k，因此移除 request 读取几乎没有降低成本，该数值接近内核 100 万上限的一半。启动时间的大部分花在加载四个路由目标上。给分类程序增加状态检查的改动，应报告改动前后的 `verified_insns`。实测把 helper 拆成 static 或 global BPF 函数并不能降低该成本：增长来自 verifier 的状态路径，而不是重复代码。
 
