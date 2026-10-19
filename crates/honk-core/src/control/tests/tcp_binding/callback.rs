@@ -11,7 +11,6 @@ use honk_ebpf_common::conn::{TCP_SYN_ORIGINAL_INTERCEPT, TcpState};
 enum Fault {
     WrongIsn,
     NoOriginalIntercept,
-    Closing,
     NoHandoff,
     HandoffIncarnation,
 }
@@ -21,7 +20,6 @@ pub(super) fn predicates(family: &str) -> anyhow::Result<()> {
         for fault in [
             Fault::WrongIsn,
             Fault::NoOriginalIntercept,
-            Fault::Closing,
             Fault::NoHandoff,
             Fault::HandoffIncarnation,
         ] {
@@ -48,12 +46,6 @@ async fn reject(lab: &Lab, fault: Fault) -> anyhow::Result<()> {
             })
             .await?
         }
-        Fault::Closing => {
-            mutate_conn(&lab.handle, &key, |conn| {
-                conn.state = TcpState::TcpStateClosing as u8;
-            })
-            .await?
-        }
         Fault::NoHandoff => {
             let _backend = lab.handle.ebpf.write().await;
             handoff_map()?.remove(&key)?;
@@ -66,6 +58,21 @@ async fn reject(lab: &Lab, fault: Fault) -> anyhow::Result<()> {
     }
     let child = hs.release().await?;
     hs.unproven(child, authority).await
+}
+
+/// TC marks Closing on a FIN or RST it sees before, or on, the segment that completes the
+/// handshake, so a Closing publication must still prove its child.
+pub(super) fn closing(family: &str) -> anyhow::Result<()> {
+    run_child(family, Kind::Proxy, async |lab: &Lab| {
+        let mut hs = Handshake::open(lab, false).await?;
+        mutate_conn(&lab.handle, &hs.key, |conn| {
+            conn.state = TcpState::TcpStateClosing as u8;
+        })
+        .await?;
+        let child = hs.release().await?;
+        hs.assert_proven(&child).await?;
+        admit(lab, child).await
+    })
 }
 
 /// A child of a foreign namespace whose tuple and ISN equal a valid publication stays

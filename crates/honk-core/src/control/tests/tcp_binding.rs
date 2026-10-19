@@ -105,11 +105,17 @@ kernel_case!(
     ["v4", "v6"],
     aged_handoff
 );
-// Ablate one callback predicate at a time (ISN, ORIGINAL_INTERCEPT, Active, handoff).
+// Ablate one callback predicate at a time (ISN, ORIGINAL_INTERCEPT, handoff).
 kernel_case!(
     netns_tcp_callback_rejects_each_invalid_publication,
     ["v4"],
     callback::predicates
+);
+// Restore an Active requirement in the callback: a FIN before the final ACK unproves the child.
+kernel_case!(
+    netns_tcp_closing_publication_still_proves_child,
+    ["v4"],
+    callback::closing
 );
 // Ablate the callback's netns guard.
 kernel_case!(

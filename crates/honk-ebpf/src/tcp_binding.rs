@@ -5,7 +5,7 @@
 //! to that publication. Neither reads kernel memory, so both load on kernels that lack
 //! CONFIG_BPF_EVENTS and in-kernel BTF.
 
-use crate::flow::{handoff_incarnation, handoff_snapshot, redirect_incarnation, tcp_syn_state};
+use crate::flow::{handoff_incarnation, handoff_snapshot, redirect_incarnation};
 use crate::maps::{
     CONN_STATE_MAP, CONNTRACK_ARGS_MAP, PARAM, TCP_SOCKET_BINDING, increment_bpf_stat,
     tuple_retiring,
@@ -31,9 +31,7 @@ use aya_ebpf_bindings::{
 use core::{mem, ptr};
 use honk_ebpf_common::{
     RedirectTuple,
-    conn::{
-        BpfStatsKey, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT, TcpState,
-    },
+    conn::{BpfStatsKey, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TCP_SYN_ORIGINAL_INTERCEPT},
     dae_ip::In6Addr,
     redirect_need::{TCP_BINDING_CHILD, TcpSocketBinding, TuplesKey},
 };
@@ -57,8 +55,9 @@ fn same_tuple(left: &TuplesKey, right: &TuplesKey) -> bool {
 }
 
 /// Shared by the producer (`honk_tcp_passive`) and the TC consumer: the binding is acceptable
-/// when tuple, ISN and incarnation agree with the live conn/handoff/redirect publication. Only
-/// the producer additionally requires the conn to be Active, so a Closing child keeps its proof.
+/// when tuple, ISN and incarnation agree with the live conn/handoff/redirect publication. The
+/// conn need not be Active: TC marks Closing on any FIN/RST, including one it sees before the
+/// stack processes the handshake-completing segment (or carried by that segment itself).
 #[inline(always)]
 fn valid_proof(binding: &TcpSocketBinding, tuples: &TuplesKey, isn: u32) -> bool {
     let now = unsafe { bpf_ktime_get_ns() };
@@ -251,7 +250,6 @@ fn bind_child(ctx: &SockOpsContext) {
         AF_INET6 => fill_addresses_v6(ops, &mut key),
         _ => return,
     }
-    let active = tcp_syn_state(&key).is_some_and(|s| s.state == TcpState::TcpStateActive as u8);
     let Some(handoff) = handoff_snapshot(&key) else {
         return;
     };
@@ -263,7 +261,7 @@ fn bind_child(ctx: &SockOpsContext) {
         kind: TCP_BINDING_CHILD,
         syn_isn: isn,
     };
-    if !active || !valid_proof(&binding, &key, isn) {
+    if !valid_proof(&binding, &key, isn) {
         return;
     }
     // One call links a fully copied element: TC readers never observe a partial binding.
