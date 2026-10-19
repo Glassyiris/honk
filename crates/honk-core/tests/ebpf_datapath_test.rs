@@ -661,7 +661,7 @@ fn cached_route_health_and_pending_marks() {
             cached_state(TEST_OUTBOUND, 0, 0, false, false),
             false,
             0,
-            TC_ACT_SHOT,
+            TC_ACT_REDIRECT,
         ),
         (
             IPPROTO_TCP,
@@ -775,6 +775,50 @@ fn cached_route_health_and_pending_marks() {
             };
             assert_eq!(run.mark, expected_mark, "cached route row {index}");
         }
+    }
+}
+
+#[test]
+#[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
+fn wan_tcp_requires_fresh_policy_but_not_cached_outbound_health() {
+    let mut fixture = Fixture::load();
+    for (index, (fresh, alive, expected)) in [
+        (true, false, TC_ACT_SHOT),
+        (true, true, TC_ACT_SHOT),
+        (false, false, TC_ACT_REDIRECT),
+        (false, true, TC_ACT_REDIRECT),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sport = 42000 + index as u16;
+        let key = tuple([10, 0, 0, 3], [198, 51, 100, 3], sport, 443, IPPROTO_TCP);
+        if !fresh {
+            put_hash(
+                &mut fixture.bpf,
+                "CONN_STATE_MAP",
+                key,
+                cached_state(TEST_OUTBOUND, 0, 0, false, false),
+            )
+            .unwrap();
+        }
+        set_health(&mut fixture.bpf, TEST_OUTBOUND, IPPROTO_TCP, 443, alive);
+        // This production-object fixture has no compiled policy: fresh SYNs
+        // must fail closed even when health permits them. Routing fixtures
+        // exercise actual fresh admission against a selected dead group.
+        let packet = tcp_packet(
+            [10, 0, 0, 3],
+            [198, 51, 100, 3],
+            sport,
+            443,
+            if fresh { 0x02 } else { 0x10 },
+            7,
+        );
+        assert_eq!(
+            fixture.run("wan_egress_l2", &packet, SkbInput::default()).return_value,
+            expected,
+            "WAN TCP fresh={fresh} alive={alive}"
+        );
     }
 }
 

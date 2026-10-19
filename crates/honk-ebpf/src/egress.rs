@@ -384,7 +384,7 @@ fn do_tproxy_wan_egress_tcp(
         return Err(TC_ACT_SHOT);
     }
 
-    if !wan_outbound_is_alive(ctx, outbound, IPPROTO_TCP, tuples.five.dst_port) {
+    if fresh_publication && !wan_outbound_is_alive(ctx, outbound, IPPROTO_TCP, tuples.five.dst_port) {
         return Err(TC_ACT_SHOT);
     }
 

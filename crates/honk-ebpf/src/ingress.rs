@@ -572,14 +572,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
-        // TCP direct and block cached decisions bypass the WAN health gate;
-        // all other outbounds must be alive before redirecting.
-        if outbound != OUTBOUND_DIRECT
-            && outbound != OUTBOUND_BLOCK
-            && !lan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port)
-        {
-            return Err(TC_ACT_SHOT);
-        }
         return redirect_lan_packet_to_control_plane(
             ctx,
             link_h_len,
