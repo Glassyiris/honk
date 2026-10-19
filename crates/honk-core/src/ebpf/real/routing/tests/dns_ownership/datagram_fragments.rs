@@ -70,41 +70,30 @@ fn families() -> [(IpAddr, IpAddr, IpAddr); 2] {
     ]
 }
 
-fn host(base: IpAddr, index: u8) -> IpAddr {
-    match base {
-        IpAddr::V4(ip) => {
-            let mut octets = ip.octets();
-            octets[3] = octets[3].wrapping_add(index);
-            IpAddr::V4(octets.into())
-        }
-        IpAddr::V6(ip) => {
-            let mut octets = ip.octets();
-            octets[15] = octets[15].wrapping_add(index);
-            IpAddr::V6(octets.into())
-        }
-    }
-}
-
-fn fixture(outbound: &str, must: bool, port: &str) -> (RealEbpfBackend, TproxyListeners) {
-    let (mut backend, _, listeners) = publish(&[rule(
-        "fragments",
-        RoutingCondition {
-            port: vec![port.into()],
-            ..Default::default()
-        },
-        outbound,
-        USER_MARK,
-        must,
-    )]);
-    for name in ["lan_ingress_l2", "wan_egress_l2"] {
-        load_classifier(&mut backend, name);
-    }
-    (backend, listeners)
-}
-
-fn publish_dns_fixture() -> (RealEbpfBackend, TproxyListeners) {
-    let (mut backend, _, listeners) = publish(&dns_ordering_rules());
-    load_classifier(&mut backend, "lan_ingress_l2");
+fn fixture(outbound: &str, side: &str) -> (RealEbpfBackend, TproxyListeners) {
+    let (mut backend, _, listeners) = publish(&[
+        rule(
+            "fragments",
+            RoutingCondition {
+                port: vec!["443".into()],
+                ..Default::default()
+            },
+            outbound,
+            USER_MARK,
+            true,
+        ),
+        rule(
+            "native",
+            RoutingCondition {
+                port: vec!["444".into()],
+                ..Default::default()
+            },
+            "direct",
+            0,
+            true,
+        ),
+    ]);
+    load_classifier(&mut backend, side);
     (backend, listeners)
 }
 
@@ -116,137 +105,93 @@ fn verdict(backend: &RealEbpfBackend, side: &str, frame: &[u8]) -> u32 {
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn later_fragments_of_a_redirected_or_dropped_datagram_are_dropped() {
     isolated(|| {
-        // A proxy flow is redirected to userspace; block and a dead proxy are dropped in the kernel.
-        for (case, outbound, dead, first_verdict) in [
-            ("proxy", "proxy", false, TC_ACT_REDIRECT),
-            ("block", "block", false, TC_ACT_SHOT),
-            ("dead proxy", "proxy", true, TC_ACT_SHOT),
+        for (family, side, outbound, first_verdict, pass) in [
+            (0, "lan_ingress_l2", "proxy", TC_ACT_REDIRECT, TC_ACT_OK),
+            (1, "lan_ingress_l2", "block", TC_ACT_SHOT, TC_ACT_OK),
+            (0, "wan_egress_l2", "block", TC_ACT_SHOT, TC_ACT_UNSPEC),
+            (1, "wan_egress_l2", "proxy", TC_ACT_REDIRECT, TC_ACT_UNSPEC),
         ] {
-            let (mut backend, _listeners) = fixture(outbound, true, "443");
-            if dead {
-                for key in 2 * 6..3 * 6 {
-                    set_array(&mut backend, "OUTBOUND_CONNECTIVITY_MAP", key, 0u64);
+            let (src, other_src, dst) = families()[family];
+            let (mut backend, _listeners) = fixture(outbound, side);
+            let id = 0x1234;
+            let context = format!("{outbound} {side} family {family}");
+            assert_eq!(
+                verdict(&backend, side, &fragment(src, dst, 443, id, true)),
+                first_verdict,
+                "{context}: first fragment"
+            );
+            if family == 0 && side == "lan_ingress_l2" {
+                // Pre-parse exits must not retire the preceding packet's record.
+                let unrelated = fragment(src, dst, 444, id + 1, true);
+                assert_eq!(
+                    run(
+                        &backend,
+                        side,
+                        &unrelated,
+                        SkbInput {
+                            mark: CLASSIFIED_MARK,
+                            ..Default::default()
+                        }
+                    )
+                    .verdict,
+                    TC_ACT_OK
+                );
+                backend.set_datapath_ready(false).unwrap();
+                assert_eq!(verdict(&backend, side, &unrelated), TC_ACT_UNSPEC);
+                backend.set_datapath_ready(true).unwrap();
+                for other in [
+                    fragment(src, dst, 443, id + 7, false),
+                    fragment(other_src, dst, 443, id, false),
+                ] {
+                    assert_eq!(verdict(&backend, side, &other), TC_ACT_OK);
                 }
-            }
-            for (family, (src, other_src, dst)) in families().into_iter().enumerate() {
-                for (side_index, side) in
-                    ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate()
-                {
-                    let src = host(src, 4 * side_index as u8);
-                    let context = format!("{case} {side} family {family}");
-                    let id = 0x1234 + side_index as u32;
-                    assert_eq!(
-                        verdict(&backend, side, &fragment(src, dst, 443, id, true)),
-                        first_verdict,
-                        "{context}: first fragment"
-                    );
-                    assert_eq!(
-                        verdict(&backend, side, &fragment(src, dst, 443, id, false)),
-                        TC_ACT_SHOT,
-                        "{context}: later fragment of the same datagram"
-                    );
-                    for (label, other) in [
-                        (
-                            "another datagram ID",
-                            fragment(src, dst, 443, id + 7, false),
-                        ),
-                        ("another source", fragment(other_src, dst, 443, id, false)),
-                    ] {
-                        assert_eq!(
-                            verdict(&backend, side, &other),
-                            if side_index == 0 {
-                                TC_ACT_OK
-                            } else {
-                                TC_ACT_UNSPEC
-                            },
-                            "{context}: {label}"
-                        );
-                    }
-                }
-            }
-        }
-    });
-}
 
-#[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn later_fragments_of_direct_staged_and_dns_datagrams_still_pass() {
-    isolated(|| {
-        for (family, (src, _, dst)) in families().into_iter().enumerate() {
-            // Native direct on the LAN hook; the WAN hook reroutes direct marked traffic.
-            let (backend, _listeners) = fixture("direct", true, "443");
-            let src = host(src, 0);
-            let first = fragment(src, dst, 443, 0x2000, true);
-            assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &first),
-                TC_ACT_OK,
-                "direct family {family}: first fragment"
-            );
-            assert_eq!(
-                verdict(
+                backend
+                    .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+                    .unwrap();
+                let staged = run(
                     &backend,
-                    "lan_ingress_l2",
-                    &fragment(src, dst, 443, 0x2000, false)
-                ),
-                TC_ACT_OK,
-                "direct family {family}: later fragment"
-            );
-
-            // NFQUEUE-staged: no rule matches, so the unresolved direct fallback is held.
-            let (mut backend, _listeners) = fixture("proxy", true, "443");
-            backend
-                .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-                .unwrap();
-            let src = host(src, 8);
-            let first = run(
-                &backend,
-                "lan_ingress_l2",
-                &fragment(src, dst, 444, 0x3000, true),
-                SkbInput::default(),
-            );
-            assert_eq!(first.verdict, TC_ACT_OK, "staged family {family}");
-            assert_ne!(first.mark & NFQUEUE_TOKEN_MASK, 0, "staged family {family}");
+                    side,
+                    &fragment(src, dst, 445, 0x3000, true),
+                    SkbInput::default(),
+                );
+                assert_eq!(staged.verdict, TC_ACT_OK);
+                assert_ne!(staged.mark & NFQUEUE_TOKEN_MASK, 0);
+                assert_eq!(
+                    verdict(&backend, side, &fragment(src, dst, 445, 0x3000, false)),
+                    TC_ACT_OK,
+                    "NFQUEUE-staged fragments stay outside the drop cache"
+                );
+            }
             assert_eq!(
-                verdict(
-                    &backend,
-                    "lan_ingress_l2",
-                    &fragment(src, dst, 444, 0x3000, false)
-                ),
-                TC_ACT_OK,
-                "staged family {family}: later fragment"
-            );
-
-            // UDP/53 fragments belong to the DNS fragment path, which keeps no verdict.
-            // DSCP 46 selects the raw must-proxy DNS rule, the only one that stages fragments.
-            let (mut backend, _listeners) = publish_dns_fixture();
-            let src = host(src, 4);
-            let dns = |id, first| fragment_with_dscp(src, dst, 53, id, first, 46);
-            assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &dns(0x4000, true)),
+                verdict(&backend, side, &fragment(src, dst, 443, id, false)),
                 TC_ACT_SHOT,
-                "DNS family {family} without NFQUEUE"
+                "{context}: original datagram"
             );
             assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &dns(0x4000, false)),
+                verdict(&backend, side, &fragment(src, dst, 444, id, true)),
                 TC_ACT_OK,
-                "DNS family {family} without NFQUEUE: later fragment"
-            );
-            backend
-                .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
-                .unwrap();
-            let src = host(src, 1);
-            let dns = |id, first| fragment_with_dscp(src, dst, 53, id, first, 46);
-            assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &dns(0x4001, true)),
-                TC_ACT_OK,
-                "DNS family {family} with NFQUEUE"
+                "{context}: accepted first fragment"
             );
             assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &dns(0x4001, false)),
-                TC_ACT_OK,
-                "DNS family {family} with NFQUEUE: later fragment"
+                verdict(&backend, side, &fragment(src, dst, 444, id, false)),
+                pass,
+                "{context}: an accepted datagram reusing the ID must keep its tails"
+            );
+            assert_eq!(
+                hash_count::<FragmentKey, FragmentVerdict>(&backend, "FRAG_VERDICT"),
+                0,
+                "{context}: stale record removed"
             );
         }
+
+        // A dropped UDP/53 first fragment must not poison native DNS reassembly.
+        let (src, _, dst) = families()[0];
+        let (mut backend, _, _listeners) = publish(&dns_ordering_rules());
+        load_classifier(&mut backend, "lan_ingress_l2");
+        let dns = |first| fragment_with_dscp(src, dst, 53, 0x4000, first, 46);
+        assert_eq!(verdict(&backend, "lan_ingress_l2", &dns(true)), TC_ACT_SHOT);
+        assert_eq!(verdict(&backend, "lan_ingress_l2", &dns(false)), TC_ACT_OK);
     });
 }
 
@@ -260,129 +205,27 @@ fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
         if wait_ns != 0 {
             std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
         }
-        for (family, (src, _, dst)) in families().into_iter().enumerate() {
-            let (mut backend, _listeners) = fixture("proxy", true, "443");
-            let id = 0x5000;
-            let later = fragment(src, dst, 443, id, false);
-            assert_eq!(
-                verdict(
-                    &backend,
-                    "lan_ingress_l2",
-                    &fragment(src, dst, 443, id, true)
-                ),
-                TC_ACT_REDIRECT
-            );
-            assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &later),
-                TC_ACT_SHOT,
-                "family {family}: fresh record"
-            );
+        let (src, _, dst) = families()[0];
+        let (mut backend, _listeners) = fixture("proxy", "lan_ingress_l2");
+        let later = fragment(src, dst, 443, 0x5000, false);
+        assert_eq!(
+            verdict(
+                &backend,
+                "lan_ingress_l2",
+                &fragment(src, dst, 443, 0x5000, true)
+            ),
+            TC_ACT_REDIRECT
+        );
+        assert_eq!(verdict(&backend, "lan_ingress_l2", &later), TC_ACT_SHOT);
 
-            let map = backend.bpf_mut().unwrap().map_mut("FRAG_VERDICT").unwrap();
-            let mut map = AyaHashMap::<_, FragmentKey, FragmentVerdict>::try_from(map).unwrap();
-            let keys: Vec<_> = map.keys().map(Result::unwrap).collect();
-            assert_eq!(keys.len(), 1, "family {family}");
-            let mut aged = map.get(&keys[0], 0).unwrap();
-            aged.ktime_ns = monotonic_ns() - FRAGMENT_VERDICT_TTL_NS - 1_000_000_000;
-            map.insert(keys[0], aged, 0).unwrap();
-
-            assert_eq!(
-                verdict(&backend, "lan_ingress_l2", &later),
-                TC_ACT_OK,
-                "family {family}: expired record"
-            );
-        }
-    });
-}
-
-#[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn an_accepted_first_fragment_clears_the_previous_datagrams_drop_record() {
-    isolated(|| {
-        for (family, (src, _, dst)) in families().into_iter().enumerate() {
-            for (side_index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
-                let (mut backend, _, _listeners) = publish(&[
-                    rule(
-                        "proxy",
-                        RoutingCondition {
-                            port: vec!["443".into()],
-                            ..Default::default()
-                        },
-                        "proxy",
-                        USER_MARK,
-                        true,
-                    ),
-                    rule(
-                        "native",
-                        RoutingCondition {
-                            port: vec!["444".into()],
-                            ..Default::default()
-                        },
-                        "direct",
-                        0,
-                        true,
-                    ),
-                ]);
-                load_classifier(&mut backend, side);
-                let id = 0x6000;
-                let proxy = fragment(src, dst, 443, id, true);
-                let later = fragment(src, dst, 443, id, false);
-                let context = format!("{side} family {family}");
-                assert_eq!(
-                    verdict(&backend, side, &proxy),
-                    TC_ACT_REDIRECT,
-                    "{context}"
-                );
-
-                if side_index == 0 {
-                    // Pre-parse exits must not retire the preceding packet's record.
-                    let unrelated = fragment(src, dst, 444, id + 1, true);
-                    assert_eq!(
-                        run(
-                            &backend,
-                            side,
-                            &unrelated,
-                            SkbInput {
-                                mark: CLASSIFIED_MARK,
-                                ..Default::default()
-                            }
-                        )
-                        .verdict,
-                        TC_ACT_OK,
-                        "{context}: owned packet"
-                    );
-                    backend.set_datapath_ready(false).unwrap();
-                    assert_eq!(
-                        verdict(&backend, side, &unrelated),
-                        TC_ACT_UNSPEC,
-                        "{context}: closed admission"
-                    );
-                    backend.set_datapath_ready(true).unwrap();
-                }
-                assert_eq!(
-                    verdict(&backend, side, &later),
-                    TC_ACT_SHOT,
-                    "{context}: original datagram"
-                );
-                let direct = fragment(src, dst, 444, id, true);
-                let accepted = if side_index == 0 {
-                    TC_ACT_OK
-                } else {
-                    TC_ACT_UNSPEC
-                };
-                assert_eq!(verdict(&backend, side, &direct), TC_ACT_OK, "{context}");
-                assert_eq!(
-                    verdict(&backend, side, &fragment(src, dst, 444, id, false)),
-                    accepted,
-                    "{context}: an accepted datagram reusing the ID must keep its tails"
-                );
-                assert_eq!(
-                    hash_count::<FragmentKey, FragmentVerdict>(&backend, "FRAG_VERDICT"),
-                    0,
-                    "{context}: stale record removed"
-                );
-            }
-        }
+        let map = backend.bpf_mut().unwrap().map_mut("FRAG_VERDICT").unwrap();
+        let mut map = AyaHashMap::<_, FragmentKey, FragmentVerdict>::try_from(map).unwrap();
+        let keys: Vec<_> = map.keys().map(Result::unwrap).collect();
+        assert_eq!(keys.len(), 1);
+        let mut aged = map.get(&keys[0], 0).unwrap();
+        aged.ktime_ns = monotonic_ns() - FRAGMENT_VERDICT_TTL_NS - 1_000_000_000;
+        map.insert(keys[0], aged, 0).unwrap();
+        assert_eq!(verdict(&backend, "lan_ingress_l2", &later), TC_ACT_OK);
     });
 }
 

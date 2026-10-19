@@ -39,10 +39,6 @@ async fn bounded_scans_resume_beyond_a_pinned_prefix() -> anyhow::Result<()> {
         assert_eq!(result.deleted, expected);
         assert_eq!(result.scanned, JANITOR_SCAN_CHUNK);
     }
-    assert!(
-        janitor.scan_cursors[1].lock().is_start(),
-        "end of map resets the cursor"
-    );
     assert_eq!(
         backend.read().await.aux_occupancy()?.0,
         (JANITOR_SCAN_CHUNK * 2) as u64

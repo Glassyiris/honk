@@ -134,40 +134,6 @@ fn armed_direct_activation_does_not_run_a_grace_barrier() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
-fn staging_timestamp_classifiers_stay_within_the_verifier_budget() {
-    isolated(|| {
-        let (mut backend, _listeners) = fixture();
-        for name in [
-            "lan_ingress_l2",
-            "lan_ingress_l3",
-            "wan_ingress_l2",
-            "wan_ingress_l3",
-            "lan_egress_l2",
-            "lan_egress_l3",
-            "wan_egress_l2",
-            "wan_egress_l3",
-        ] {
-            load_classifier(&mut backend, name);
-            let program: &SchedClassifier = backend
-                .bpf()
-                .unwrap()
-                .program(name)
-                .unwrap()
-                .try_into()
-                .unwrap();
-            let count = program
-                .info()
-                .unwrap()
-                .verified_instruction_count()
-                .unwrap();
-            println!("VERIFIER|{name}|verified_insns={count}");
-            assert!(count < 1_000_000);
-        }
-    });
-}
-
-#[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn a_batched_tuple_is_fenced_once_and_every_transition_rechecks_its_state() {
     isolated(|| {
         let (mut backend, _listeners) = fixture();

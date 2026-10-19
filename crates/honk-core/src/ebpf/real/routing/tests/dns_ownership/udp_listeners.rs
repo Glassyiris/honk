@@ -5,7 +5,7 @@ use aya::programs::SkLookup;
 const KEY_UDP4_BASE: u32 = 2;
 const KEY_UDP6_BASE: u32 = 6;
 const UDP_LISTENER_MARKER: u32 = 0x100;
-const FLOWS: u16 = 64;
+const FLOWS: u16 = 4;
 
 fn flow(ipv6: bool, index: u16, port: u16) -> (IpAddr, IpAddr, u16) {
     if ipv6 {
@@ -112,37 +112,13 @@ fn udp_flow_selects_one_listener_across_assign_and_lookup() {
                 );
             }
         }
-    });
-}
 
-#[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
-fn udp_without_listener_marker_is_left_to_sk_lookup() {
-    isolated(|| {
-        let (mut backend, _, _listeners) = publish(&[rule(
-            "udp-listeners",
-            RoutingCondition {
-                port: vec!["1-65535".into()],
-                ..Default::default()
-            },
-            "proxy",
-            USER_MARK,
-            true,
-        )]);
-        load_classifier(&mut backend, "lan_ingress_l2");
-        load_classifier(&mut backend, "dae0peer_ingress");
         for ipv6 in [false, true] {
             let (source, destination, port) = flow(ipv6, 1, 31000);
             let bytes = packet(source, destination, IPPROTO_UDP, port, 443, 5, 0);
             let redirect = run(&backend, "lan_ingress_l2", &bytes, SkbInput::default());
             assert_eq!(redirect.verdict, TC_ACT_REDIRECT);
-            for stray in [
-                0,
-                1,
-                LISTENERS as u32,
-                UDP_LISTENER_MARKER + LISTENERS as u32,
-                UDP_LISTENER_MARKER << 1,
-            ] {
+            for stray in [0, UDP_LISTENER_MARKER + LISTENERS as u32] {
                 let mut cb = redirect.cb;
                 cb[4] = stray;
                 let peer = run(

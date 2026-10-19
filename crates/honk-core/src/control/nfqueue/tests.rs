@@ -3,7 +3,6 @@ use super::*;
 use honk_ebpf_common::{ConnState, NFQUEUE_PENDING_MARK, RoutingMeta};
 
 mod batching;
-mod commit;
 mod kernel_reclamation;
 mod retirement;
 

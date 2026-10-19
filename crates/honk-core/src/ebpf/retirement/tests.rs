@@ -476,32 +476,20 @@ fn flow_owners() -> (ConnState, RoutingHandoffEntry, RedirectEntry) {
 fn deletes_are_counted_for_success_and_partial_failure() {
     let counts = RetireCounts {
         conn: 3,
-        handoff: 5,
-        ..Default::default()
-    };
-    assert_eq!(conn_deletes(&Ok(counts)), 3);
-    assert_eq!(
-        conn_deletes(&Err(RetireError {
-            counts,
-            source: anyhow::anyhow!("fault after partial progress"),
-        })),
-        3,
-    );
-}
-
-#[test]
-fn auxiliary_tally_counts_success_and_partial_failure() {
-    let counts = RetireCounts {
-        conn: 3,
         redirect: 2,
         handoff: 5,
     };
     let mut tally = AuxDeleteTally::default();
-    tally.record(&Ok(counts));
-    tally.record(&Err(RetireError {
-        counts,
-        source: anyhow::anyhow!("fault after partial progress"),
-    }));
+    for result in [
+        Ok(counts),
+        Err(RetireError {
+            counts,
+            source: anyhow::anyhow!("fault after partial progress"),
+        }),
+    ] {
+        assert_eq!(conn_deletes(&result), 3);
+        tally.record(&result);
+    }
     assert_eq!((tally.redirect, tally.handoff), (4, 10));
 }
 

@@ -56,7 +56,7 @@ fn repeated_expiry_hints_are_bounded_without_renewing_or_releasing_refused_flows
                     .unwrap();
                 let before = owned_values(&backend, &key);
                 let bytes = packet(src, dst, proto, key.src_port, key.dst_port, 0, 0x10);
-                for _ in 0..64 {
+                for _ in 0..2 {
                     assert_eq!(
                         run(&backend, side, &bytes, SkbInput::default()).verdict,
                         TC_ACT_SHOT

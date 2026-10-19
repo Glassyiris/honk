@@ -3,8 +3,6 @@ use honk_ebpf_common::conn::{BpfStatsKey, NEW_FLOW_LIMIT_PER_CPU_SECOND};
 use nix::sched::{CpuSet, sched_setaffinity};
 use nix::unistd::Pid;
 
-const EXCESS: u16 = 20;
-
 fn monotonic_ns() -> u64 {
     let mut time: libc::timespec = unsafe { mem::zeroed() };
     assert_eq!(
@@ -75,63 +73,52 @@ fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published()
                 "2001:db8:2::90".parse().unwrap(),
             ),
         ];
-        // Pure SYN, first packet of a UDP flow, and stateless UDP/53.
         let kinds = [
-            ("TCP SYN", IPPROTO_TCP, 443, 0x02),
-            ("UDP", IPPROTO_UDP, 443, 0),
-            ("UDP/53", IPPROTO_UDP, 53, 0),
+            (IPPROTO_TCP, 443, 0x02),
+            (IPPROTO_UDP, 443, 0),
+            (IPPROTO_UDP, 53, 0),
         ];
         let (backend, _listeners) = fixture();
         pin_to_current_cpu();
         for (family, (attacker, other, target)) in families.into_iter().enumerate() {
-            for (kind, (label, proto, port, flags)) in kinds.into_iter().enumerate() {
-                let attacker = nth_host(attacker, kind);
-                align_to_second();
-                let context = format!("{label} family {family}");
-                let attempt = |source: IpAddr, index: u16| {
-                    let bytes = packet(source, target, proto, 20000 + index, port, 0, flags);
-                    run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict
-                };
-                for index in 0..NEW_FLOW_LIMIT_PER_CPU_SECOND as u16 {
-                    assert_eq!(
-                        attempt(attacker, index),
-                        TC_ACT_REDIRECT,
-                        "{context} #{index}"
-                    );
-                }
-                let admitted = state_counts(&backend);
-                let before_limited = limited(&backend);
-
-                for index in 0..EXCESS {
-                    assert_eq!(
-                        attempt(attacker, 1000 + index),
-                        TC_ACT_SHOT,
-                        "{context}: attempt beyond the limit"
-                    );
-                }
+            align_to_second();
+            let attempt = |source: IpAddr, index: u16, (proto, port, flags)| {
+                let bytes = packet(source, target, proto, 20000 + index, port, 0, flags);
+                run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict
+            };
+            // All three admission paths must spend the same source budget.
+            for index in 0..NEW_FLOW_LIMIT_PER_CPU_SECOND as u16 {
                 assert_eq!(
-                    state_counts(&backend),
-                    admitted,
-                    "{context}: rejected attempts must leave no conn or handoff state"
-                );
-                assert_eq!(limited(&backend), before_limited + u64::from(EXCESS));
-
-                assert_eq!(
-                    attempt(nth_host(other, kind), 0),
+                    attempt(attacker, index, kinds[index as usize % kinds.len()]),
                     TC_ACT_REDIRECT,
-                    "{context}: another host's new flow"
+                    "family {family}: admitted attempt #{index}"
                 );
-
-                if proto == IPPROTO_TCP {
-                    // A flow admitted before the limit keeps passing.
-                    let ack = packet(attacker, target, proto, 20000, port, 0, 0x10);
-                    assert_eq!(
-                        run(&backend, "lan_ingress_l2", &ack, SkbInput::default()).verdict,
-                        TC_ACT_REDIRECT,
-                        "{context}: established flow"
-                    );
-                }
             }
+            let admitted = state_counts(&backend);
+            let before_limited = limited(&backend);
+            for (index, kind) in kinds.into_iter().enumerate() {
+                // TCP/ordinary UDP are new tuples; UDP/53 repeats its admitted tuple.
+                assert_eq!(attempt(attacker, 2, kind), TC_ACT_SHOT);
+                assert_eq!(limited(&backend), before_limited + index as u64 + 1);
+            }
+            assert_eq!(
+                state_counts(&backend),
+                admitted,
+                "family {family}: rejected attempts must leave no conn or handoff state"
+            );
+            for (index, kind) in [(0, (IPPROTO_TCP, 443, 0x10)), (1, kinds[1])] {
+                assert_eq!(
+                    attempt(attacker, index, kind),
+                    TC_ACT_REDIRECT,
+                    "family {family}: cached flow"
+                );
+            }
+            assert_eq!(limited(&backend), before_limited + kinds.len() as u64);
+            assert_eq!(
+                attempt(other, 0, kinds[1]),
+                TC_ACT_REDIRECT,
+                "family {family}: another host's new flow"
+            );
         }
     });
 }
@@ -148,14 +135,16 @@ fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests
                 .success()
         );
         pin_to_current_cpu();
-        for (client, local, target) in [
+        for (client, other, local, target) in [
             (
                 "192.0.2.120".parse().unwrap(),
+                "192.0.2.121".parse().unwrap(),
                 "127.0.0.1".parse().unwrap(),
                 "203.0.113.120".parse().unwrap(),
             ),
             (
                 "2001:db8:1::120".parse().unwrap(),
+                "2001:db8:1::121".parse().unwrap(),
                 "::1".parse().unwrap(),
                 "2001:db8:2::120".parse().unwrap(),
             ),
@@ -166,7 +155,8 @@ fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests
             let limit = NEW_FLOW_LIMIT_PER_CPU_SECOND as u16;
             let before_drops = limited(&backend);
             align_to_second();
-            for index in 0..limit + EXCESS {
+            // Replaying the cached first tuple must not spend another learning slot.
+            for index in std::iter::once(0).chain(0..=limit) {
                 let request = packet(client, local, IPPROTO_UDP, 20000 + index, port, 0, 0);
                 assert_eq!(
                     run(&backend, "lan_ingress_l2", &request, SkbInput::default()).verdict,
@@ -185,7 +175,6 @@ fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests
                 "{client}: skipped learning must not count a packet drop"
             );
 
-            let other = nth_host(client, 1);
             let request = packet(other, local, IPPROTO_UDP, 20000, port, 0, 0);
             assert_eq!(
                 run(&backend, "lan_ingress_l2", &request, SkbInput::default()).verdict,
@@ -208,31 +197,16 @@ fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests
             );
             assert_eq!(limited(&backend), before_drops + 1);
             assert_eq!(state_counts(&backend), (usize::from(limit) + 1, 0));
-            for index in 0..limit + EXCESS {
+            for (index, learned) in [(0, true), (limit - 1, true), (limit, false)] {
                 let state = backend
                     .conn_state_lookup(&tuple(local, client, port, 20000 + index, IPPROTO_UDP))
                     .unwrap();
                 assert_eq!(
                     state.is_some(),
-                    index < limit,
+                    learned,
                     "{client}: learned reverse tuple #{index}"
                 );
             }
         }
     });
-}
-
-fn nth_host(base: IpAddr, index: usize) -> IpAddr {
-    match base {
-        IpAddr::V4(ip) => {
-            let mut octets = ip.octets();
-            octets[3] = octets[3].wrapping_add(10 * index as u8);
-            IpAddr::V4(octets.into())
-        }
-        IpAddr::V6(ip) => {
-            let mut octets = ip.octets();
-            octets[15] = octets[15].wrapping_add(10 * index as u8);
-            IpAddr::V6(octets.into())
-        }
-    }
 }

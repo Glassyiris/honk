@@ -27,55 +27,47 @@ fn idle_udp_handoff_renews_only_its_matching_owner_without_an_expiry_hint() {
         .unwrap();
         for (src, dst) in PEERS {
             for (direction, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
-                for age_s in [40, 90] {
-                    let key = tuple(
-                        src,
-                        dst,
-                        45800 + direction as u16 * 100 + age_s as u16,
-                        443,
-                        IPPROTO_UDP,
-                    );
-                    seed(&backend, side, &key, src, dst);
-                    let state = age_udp_conn(&mut backend, &key, age_s);
-                    let mut entry = handoff(&backend, &key);
-                    entry.last_seen_ns = state.last_seen_ns;
+                let key = tuple(src, dst, 45800 + direction as u16 * 100, 443, IPPROTO_UDP);
+                seed(&backend, side, &key, src, dst);
+                let state = age_udp_conn(&mut backend, &key, 40);
+                let mut entry = handoff(&backend, &key);
+                entry.last_seen_ns = state.last_seen_ns;
+                backend
+                    .flow_insert("ROUTING_HANDOFF_MAP", &key, &entry)
+                    .unwrap();
+                let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+                assert_eq!(
+                    run(&backend, side, &bytes, SkbInput::default()).verdict,
+                    TC_ACT_REDIRECT,
+                    "{side} {src} after idle"
+                );
+                let renewed = handoff(&backend, &key);
+                assert_eq!(renewed.incarnation, entry.incarnation);
+                assert_eq!(renewed.result.decision_token, entry.result.decision_token);
+                assert!(now_ns().saturating_sub(renewed.last_seen_ns) < 1_000_000_000);
+                while let Some(item) = ring.next() {
+                    let event: DaeEvent = unsafe { ptr::read_unaligned(item.as_ptr().cast()) };
+                    assert_ne!(event.type_, DaeEventType::FlowExpired as u32);
+                }
+                for mismatch_token in [false, true] {
+                    let mut foreign = entry;
+                    if mismatch_token {
+                        foreign.result.decision_token += 1;
+                    } else {
+                        foreign.incarnation += 1;
+                    }
                     backend
-                        .flow_insert("ROUTING_HANDOFF_MAP", &key, &entry)
+                        .flow_insert("ROUTING_HANDOFF_MAP", &key, &foreign)
                         .unwrap();
-                    let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
                     assert_eq!(
                         run(&backend, side, &bytes, SkbInput::default()).verdict,
-                        TC_ACT_REDIRECT,
-                        "{side} {src} after {age_s}s idle"
+                        TC_ACT_SHOT,
+                        "{side} {src} accepted a foreign handoff"
                     );
-                    let renewed = handoff(&backend, &key);
-                    assert_eq!(renewed.incarnation, entry.incarnation);
-                    assert_eq!(renewed.result.decision_token, entry.result.decision_token);
-                    assert!(now_ns().saturating_sub(renewed.last_seen_ns) < 1_000_000_000);
-                    while let Some(item) = ring.next() {
-                        let event: DaeEvent = unsafe { ptr::read_unaligned(item.as_ptr().cast()) };
-                        assert_ne!(event.type_, DaeEventType::FlowExpired as u32);
-                    }
-                    for mismatch_token in [false, true] {
-                        let mut foreign = entry;
-                        if mismatch_token {
-                            foreign.result.decision_token += 1;
-                        } else {
-                            foreign.incarnation += 1;
-                        }
-                        backend
-                            .flow_insert("ROUTING_HANDOFF_MAP", &key, &foreign)
-                            .unwrap();
-                        assert_eq!(
-                            run(&backend, side, &bytes, SkbInput::default()).verdict,
-                            TC_ACT_SHOT,
-                            "{side} {src} accepted a foreign handoff"
-                        );
-                        assert_eq!(
-                            format!("{:?}", handoff(&backend, &key)),
-                            format!("{foreign:?}")
-                        );
-                    }
+                    assert_eq!(
+                        format!("{:?}", handoff(&backend, &key)),
+                        format!("{foreign:?}")
+                    );
                 }
             }
         }
@@ -105,86 +97,57 @@ fn set_udp_reply_owner(backend: &mut RealEbpfBackend, key: &TuplesKey, state: u8
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn proxied_udp_replies_renew_exact_connection_liveness() {
+fn proxied_udp_replies_renew_liveness_and_allow_client_resumption() {
     isolated(|| {
-        use std::io::Write;
         let (mut backend, _, _listeners) = proxy_fixture();
         load_classifier(&mut backend, "dae0_ingress");
         for (src, dst) in PEERS {
-            for (index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
-                for token in [0, 29] {
-                    let key = tuple(
-                        src,
-                        dst,
-                        46100 + index as u16 * 100 + token as u16,
-                        443,
-                        IPPROTO_UDP,
+            for (index, (side, token)) in [
+                ("lan_ingress_l2", 0),
+                ("lan_ingress_l2", 29),
+                ("wan_egress_l2", 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let key = tuple(src, dst, 46100 + index as u16, 443, IPPROTO_UDP);
+                seed(&backend, side, &key, src, dst);
+                if token != 0 {
+                    set_udp_reply_owner(&mut backend, &key, UdpDecisionState::Proxy as u8, token);
+                }
+                let reply = packet(dst, src, IPPROTO_UDP, 443, key.src_port, 5, 0);
+                let state = age_udp_conn(&mut backend, &key, 100);
+                let resumes_client = side == "lan_ingress_l2" && token == 0;
+                if resumes_client {
+                    age_auxiliaries(&mut backend, &key, state.last_seen_ns);
+                }
+                assert_eq!(
+                    run(&backend, "dae0_ingress", &reply, SkbInput::default()).verdict,
+                    TC_ACT_REDIRECT
+                );
+                let renewed = backend.conn_state_lookup(&key).unwrap().unwrap();
+                assert_eq!(renewed.incarnation, state.incarnation);
+                assert_eq!(renewed.decision_token, token);
+                assert!(
+                    now_ns().saturating_sub(renewed.last_seen_ns) < 1_000_000_000,
+                    "{side} {src} token={token} did not renew from an exact reply"
+                );
+                if resumes_client {
+                    let client = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
+                    assert_eq!(
+                        run(&backend, side, &client, SkbInput::default()).verdict,
+                        TC_ACT_REDIRECT,
+                        "{src} resumed client packet was dropped after an exact reply"
                     );
-                    seed(&backend, side, &key, src, dst);
-                    if token != 0 {
-                        set_udp_reply_owner(
-                            &mut backend,
-                            &key,
-                            UdpDecisionState::Proxy as u8,
-                            token,
-                        );
-                    }
-                    let reply = packet(dst, src, IPPROTO_UDP, 443, key.src_port, 5, 0);
-                    let owner = handoff(&backend, &key).incarnation;
-                    let mut timings = [0; 32];
-                    for duration in &mut timings {
-                        age_udp_conn(&mut backend, &key, 100);
-                        let result = run(&backend, "dae0_ingress", &reply, SkbInput::default());
-                        assert_eq!(result.verdict, TC_ACT_REDIRECT);
-                        *duration = result.duration.as_nanos();
-                    }
-                    timings.sort_unstable();
-                    writeln!(
-                        std::io::stderr().lock(),
-                        "UDP reply aged-write {side} {src} token={token}: p50={}ns p90={}ns",
-                        timings[16],
-                        timings[28]
-                    )
-                    .unwrap();
-                    let renewed = backend.conn_state_lookup(&key).unwrap().unwrap();
-                    assert_eq!(renewed.incarnation, owner);
-                    assert_eq!(renewed.decision_token, token);
+                    let current = backend.conn_state_lookup(&key).unwrap().unwrap();
+                    assert_eq!(current.incarnation, state.incarnation);
+                    assert!(now_ns().saturating_sub(current.last_seen_ns) < 1_000_000_000);
                     assert!(
-                        now_ns().saturating_sub(renewed.last_seen_ns) < 1_000_000_000,
-                        "{side} {src} token={token} did not renew from an exact reply"
+                        now_ns().saturating_sub(handoff(&backend, &key).last_seen_ns)
+                            < 1_000_000_000
                     );
                 }
             }
-        }
-    });
-}
-
-#[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn client_udp_resumes_after_idle_connection_and_handoff_are_kept_alive_by_a_reply() {
-    isolated(|| {
-        let (mut backend, _, _listeners) = proxy_fixture();
-        load_classifier(&mut backend, "dae0_ingress");
-        for (src, dst) in PEERS {
-            let key = tuple(src, dst, 46300, 443, IPPROTO_UDP);
-            seed(&backend, "lan_ingress_l2", &key, src, dst);
-            let state = age_udp_conn(&mut backend, &key, 100);
-            age_auxiliaries(&mut backend, &key, state.last_seen_ns);
-            let reply = packet(dst, src, IPPROTO_UDP, 443, key.src_port, 5, 0);
-            assert_eq!(
-                run(&backend, "dae0_ingress", &reply, SkbInput::default()).verdict,
-                TC_ACT_REDIRECT
-            );
-            let client = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 5, 0);
-            assert_eq!(
-                run(&backend, "lan_ingress_l2", &client, SkbInput::default()).verdict,
-                TC_ACT_REDIRECT,
-                "{src} resumed client packet was dropped after an exact reply"
-            );
-            let current = backend.conn_state_lookup(&key).unwrap().unwrap();
-            assert_eq!(current.incarnation, state.incarnation);
-            assert!(now_ns().saturating_sub(current.last_seen_ns) < 1_000_000_000);
-            assert!(now_ns().saturating_sub(handoff(&backend, &key).last_seen_ns) < 1_000_000_000);
         }
     });
 }

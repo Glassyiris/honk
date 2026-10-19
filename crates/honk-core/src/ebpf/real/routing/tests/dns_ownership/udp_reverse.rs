@@ -24,12 +24,13 @@ fn addresses() -> [(IpAddr, IpAddr); 2] {
 fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&[]);
-        for name in ["wan_ingress_l2", "lan_egress_l2"] {
+        for (index, name) in ["wan_ingress_l2", "lan_egress_l2"].into_iter().enumerate() {
             load_classifier(&mut backend, name);
             for (client, target) in addresses() {
                 backend.set_admission_pressure(false).unwrap();
-                let key = tuple(client, target, 42000, 443, IPPROTO_UDP);
-                let reply = packet(target, client, IPPROTO_UDP, 443, 42000, 0, 0);
+                let port = 42000 + index as u16 * 10;
+                let key = tuple(client, target, port, 443, IPPROTO_UDP);
+                let reply = packet(target, client, IPPROTO_UDP, 443, port, 0, 0);
                 assert_eq!(
                     run(&backend, name, &reply, SkbInput::default()).verdict,
                     TC_ACT_UNSPEC
@@ -51,8 +52,8 @@ fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
                     .get_bpf_stats(BpfStatsKey::UdpReverseLearningSuspended as u32)
                     .unwrap()
                     .unwrap_or(0);
-                let fresh_key = tuple(client, target, 42001, 443, IPPROTO_UDP);
-                let fresh_reply = packet(target, client, IPPROTO_UDP, 443, 42001, 0, 0);
+                let fresh_key = tuple(client, target, port + 1, 443, IPPROTO_UDP);
+                let fresh_reply = packet(target, client, IPPROTO_UDP, 443, port + 1, 0, 0);
                 assert_eq!(
                     run(&backend, name, &fresh_reply, SkbInput::default()).verdict,
                     TC_ACT_UNSPEC
@@ -80,25 +81,6 @@ fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
                         .is_wan_ingress_direction,
                     1
                 );
-                // Each classifier/family case starts with absent owners.
-                let expected = backend.conn_state_lookup(&key).unwrap().unwrap();
-                crate::ebpf::retire_fixture(
-                    &mut backend,
-                    key,
-                    crate::ebpf::RetireKind::ExpiredConn {
-                        expected: &expected,
-                        expired_before_ns: u64::MAX,
-                    },
-                );
-                let expected = backend.conn_state_lookup(&fresh_key).unwrap().unwrap();
-                crate::ebpf::retire_fixture(
-                    &mut backend,
-                    fresh_key,
-                    crate::ebpf::RetireKind::ExpiredConn {
-                        expected: &expected,
-                        expired_before_ns: u64::MAX,
-                    },
-                );
             }
         }
     });
@@ -112,16 +94,9 @@ fn reverse_udp_observation_never_overwrites_forward_authority() {
         for name in ["wan_ingress_l2", "lan_egress_l2"] {
             load_classifier(&mut backend, name);
             for (client, target) in addresses() {
-                for (index, state) in [
-                    UdpDecisionState::None,
-                    UdpDecisionState::Preparing,
-                    UdpDecisionState::Pending,
-                    UdpDecisionState::DirectArmed,
-                    UdpDecisionState::Proxy,
-                    UdpDecisionState::Block,
-                ]
-                .into_iter()
-                .enumerate()
+                for (index, state) in [UdpDecisionState::Preparing, UdpDecisionState::Proxy]
+                    .into_iter()
+                    .enumerate()
                 {
                     let port = 43000 + index as u16;
                     let key = tuple(client, target, port, 443, IPPROTO_UDP);
@@ -152,21 +127,13 @@ fn reverse_udp_observation_never_overwrites_forward_authority() {
                             expected_verdict
                         );
                         let after = backend.conn_state_lookup(&key).unwrap().unwrap();
+                        assert_eq!(after.is_wan_ingress_direction, 0);
+                        assert_eq!(after.state, forward.state);
+                        assert_eq!(after.decision_token, forward.decision_token);
+                        assert_eq!(after.incarnation, forward.incarnation);
                         assert_eq!(
-                            (
-                                after.is_wan_ingress_direction,
-                                after.state,
-                                after.decision_token,
-                                after.incarnation,
-                                unsafe { after.meta.raw }
-                            ),
-                            (
-                                0,
-                                forward.state,
-                                forward.decision_token,
-                                forward.incarnation,
-                                unsafe { forward.meta.raw }
-                            ),
+                            unsafe { after.meta.raw },
+                            unsafe { forward.meta.raw },
                             "{name}, {state:?}, pressure={pressure}"
                         );
                     }

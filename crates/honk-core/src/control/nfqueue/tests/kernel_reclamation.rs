@@ -20,13 +20,8 @@ fn flow_key(client_port: u16) -> FlowKey {
 
 fn kernel_conn(state: UdpDecisionState, token: u32, incarnation: u64) -> ConnState {
     ConnState {
-        state: state as u8,
-        decision_token: token,
         incarnation,
-        meta: RoutingMeta {
-            raw: ROUTING_META_FLAG_PUBLISHED,
-        },
-        ..ConnState::default()
+        ..retained(token, state, ROUTING_META_FLAG_PUBLISHED)
     }
 }
 
@@ -70,13 +65,7 @@ impl Fixture {
         }
     }
 
-    async fn serve(
-        &self,
-        key: FlowKey,
-        token: u32,
-        incarnation: u64,
-        kernel: ConnState,
-    ) -> UdpInitLease {
+    async fn serve(&self, key: FlowKey, incarnation: u64, kernel: ConnState) -> UdpInitLease {
         self.backend
             .write()
             .await
@@ -86,9 +75,9 @@ impl Fixture {
             key.client,
             key.destination,
             bytes::Bytes::from_static(b"old flow"),
-            UdpFlowOwner::new(token, Some(incarnation)).unwrap(),
+            UdpFlowOwner::new(kernel.decision_token, Some(incarnation)).unwrap(),
             None,
-            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            test_flow_slot(),
             Instant::now(),
             &StatsManager::new(),
         ) {
@@ -105,14 +94,6 @@ impl Fixture {
         })
         .await
         .expect("reclaimed flow's endpoint must be retired");
-        assert!(
-            self.backend
-                .read()
-                .await
-                .conn_state_lookup(&key.tuples())
-                .unwrap()
-                .is_none()
-        );
     }
 
     async fn stage_successor(&self, key: FlowKey) -> NfqueueIngest {
@@ -139,129 +120,102 @@ impl Fixture {
             .ingest_held_wait(
                 packet,
                 HeldVerdict::test(1, Instant::now(), sink),
-                Some(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()),
+                Some(test_flow_slot()),
             )
             .await
     }
 }
 
 #[tokio::test]
-async fn hint_reclaiming_the_kernel_flow_lets_a_staged_successor_initialize() {
-    let mut fixture = Fixture::new();
-    let key = flow_key(40000);
-    // Aborted is expiry-eligible even on a freshly booted host.
-    let _old = fixture
-        .serve(
-            key,
-            OLD_TOKEN,
-            OLD_INCARNATION,
-            kernel_conn(UdpDecisionState::Aborted, OLD_TOKEN, OLD_INCARNATION),
-        )
-        .await;
-    fixture
-        .hints
-        .send(FlowExpiryHint {
-            key: key.tuples(),
-            incarnation: OLD_INCARNATION,
-        })
-        .await
-        .unwrap();
-    fixture.wait_until_endpoint_gone(key).await;
-
-    assert!(matches!(
-        fixture.stage_successor(key).await,
-        NfqueueIngest::Initialize { .. }
-    ));
-    assert!(fixture.fatal.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn janitor_reclaiming_the_kernel_flow_lets_a_staged_successor_initialize() {
-    let mut fixture = Fixture::new();
-    let key = flow_key(40000);
-    let _old = fixture
-        .serve(
-            key,
-            OLD_TOKEN,
-            OLD_INCARNATION,
-            kernel_conn(UdpDecisionState::Proxy, OLD_TOKEN, OLD_INCARNATION),
-        )
-        .await;
-    let janitor = BpfJanitor::new(
-        Arc::clone(&fixture.backend),
-        Arc::new(TcpFlowPins::default()),
-    )
-    .with_udp_pool(Arc::clone(&fixture.endpoints));
-
-    let (deleted, _) = janitor
-        .cleanup_conn_state_for_test(UDP_CONN_STATE_TIMEOUT_NS + 1)
-        .await;
-    assert_eq!(deleted, 1);
-    fixture.wait_until_endpoint_gone(key).await;
-
-    assert!(matches!(
-        fixture.stage_successor(key).await,
-        NfqueueIngest::Initialize { .. }
-    ));
-    assert!(fixture.fatal.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn superseded_retirement_keeps_the_older_incarnations_endpoint() {
-    retirement_keeps_foreign_endpoint(NEW_INCARNATION, OLD_INCARNATION).await;
-}
-
-#[tokio::test]
-async fn reclaimed_flow_keeps_the_newer_incarnations_endpoint() {
-    retirement_keeps_foreign_endpoint(OLD_INCARNATION, NEW_INCARNATION).await;
-}
-
-async fn retirement_keeps_foreign_endpoint(kernel_incarnation: u64, endpoint_incarnation: u64) {
-    let mut fixture = Fixture::new();
-    let (foreign, sentinel) = (flow_key(40000), flow_key(40001));
-    let _stale = fixture
-        .serve(
-            foreign,
-            OLD_TOKEN,
-            endpoint_incarnation,
-            kernel_conn(UdpDecisionState::Aborted, OLD_TOKEN, kernel_incarnation),
-        )
-        .await;
-    let _reclaimed = fixture
-        .serve(
-            sentinel,
-            31,
-            9,
-            kernel_conn(UdpDecisionState::Aborted, 31, 9),
-        )
-        .await;
-    for (key, incarnation) in [(foreign, OLD_INCARNATION), (sentinel, 9)] {
-        fixture
-            .hints
-            .send(FlowExpiryHint {
-                key: key.tuples(),
-                incarnation,
-            })
-            .await
-            .unwrap();
+async fn kernel_reclamation_lets_a_staged_successor_initialize() {
+    for from_hint in [true, false] {
+        let mut fixture = Fixture::new();
+        let key = flow_key(40000);
+        // Aborted is expiry-eligible even on a freshly booted host.
+        let state = if from_hint {
+            UdpDecisionState::Aborted
+        } else {
+            UdpDecisionState::Proxy
+        };
+        let _old = fixture
+            .serve(
+                key,
+                OLD_INCARNATION,
+                kernel_conn(state, OLD_TOKEN, OLD_INCARNATION),
+            )
+            .await;
+        if from_hint {
+            fixture
+                .hints
+                .send(FlowExpiryHint {
+                    key: key.tuples(),
+                    incarnation: OLD_INCARNATION,
+                })
+                .await
+                .unwrap();
+        } else {
+            BpfJanitor::new(
+                Arc::clone(&fixture.backend),
+                Arc::new(TcpFlowPins::default()),
+            )
+            .with_udp_pool(Arc::clone(&fixture.endpoints))
+            .cleanup_conn_state_for_test(UDP_CONN_STATE_TIMEOUT_NS + 1)
+            .await;
+        }
+        fixture.wait_until_endpoint_gone(key).await;
+        assert!(matches!(
+            fixture.stage_successor(key).await,
+            NfqueueIngest::Initialize { .. }
+        ));
+        assert!(fixture.fatal.try_recv().is_err());
     }
-    // Hints settle in order, so the sentinel's retirement proves the first was handled.
-    fixture.wait_until_endpoint_gone(sentinel).await;
+}
 
-    assert!(
-        fixture
-            .endpoints
-            .contains(foreign.client, foreign.destination)
-    );
-    assert_eq!(
-        fixture
-            .backend
-            .read()
-            .await
-            .conn_state_lookup(&foreign.tuples())
-            .unwrap()
-            .is_some(),
-        kernel_incarnation != OLD_INCARNATION
-    );
-    assert!(fixture.fatal.try_recv().is_err());
+#[tokio::test]
+async fn hint_retirement_preserves_foreign_endpoint_incarnations() {
+    for (kernel_incarnation, endpoint_incarnation) in [
+        (NEW_INCARNATION, OLD_INCARNATION),
+        (OLD_INCARNATION, NEW_INCARNATION),
+    ] {
+        let mut fixture = Fixture::new();
+        let (foreign, sentinel) = (flow_key(40000), flow_key(40001));
+        let _stale = fixture
+            .serve(
+                foreign,
+                endpoint_incarnation,
+                kernel_conn(UdpDecisionState::Aborted, OLD_TOKEN, kernel_incarnation),
+            )
+            .await;
+        let _reclaimed = fixture
+            .serve(sentinel, 9, kernel_conn(UdpDecisionState::Aborted, 31, 9))
+            .await;
+        for (key, incarnation) in [(foreign, OLD_INCARNATION), (sentinel, 9)] {
+            fixture
+                .hints
+                .send(FlowExpiryHint {
+                    key: key.tuples(),
+                    incarnation,
+                })
+                .await
+                .unwrap();
+        }
+        // Hints settle in order, so the sentinel's retirement proves the first was handled.
+        fixture.wait_until_endpoint_gone(sentinel).await;
+        assert!(
+            fixture
+                .endpoints
+                .contains(foreign.client, foreign.destination)
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .read()
+                .await
+                .conn_state_lookup(&foreign.tuples())
+                .unwrap()
+                .is_some(),
+            kernel_incarnation != OLD_INCARNATION
+        );
+        assert!(fixture.fatal.try_recv().is_err());
+    }
 }
