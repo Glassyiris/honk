@@ -106,6 +106,16 @@ pub enum UdpDecisionTransition {
     Block,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct UdpDecisionCommit {
+    pub key: TuplesKey,
+    pub token: u32,
+    pub transition: UdpDecisionTransition,
+}
+
+pub type UdpCommitApply<'a> = dyn FnMut() -> anyhow::Result<UdpDecisionCommitResult> + 'a;
+pub type UdpCommitVisit<'a> = dyn FnMut(usize, &mut UdpCommitApply<'_>) -> anyhow::Result<()> + 'a;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDecisionCommitResult {
     Applied,
@@ -637,7 +647,7 @@ pub trait EbpfBackend: Send + Sync {
     /// Locked snapshot of one tuple's conn state, for either protocol.
     fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     /// Raw fixture writes bypass fencing; production mutation goes through
-    /// `commit_udp_decision` and `retire_batch`.
+    /// `commit_udp_decision`, `commit_udp_batch` and `retire_batch`.
     #[cfg(test)]
     fn tcp_conn_state_store(&mut self, _key: &TuplesKey, _state: &ConnState) -> anyhow::Result<()> {
         anyhow::bail!("raw TCP conn-state fixture writes are unsupported")
@@ -695,6 +705,17 @@ pub trait EbpfBackend: Send + Sync {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult>;
+
+    /// Fence a bounded batch of initial UDP decisions once. After grace, visit
+    /// each item in order with its exact-owner recheck/mutation. The visitor may
+    /// skip an expired item or hold its cell lock across the apply call. Success
+    /// includes exact fence release; callers must not acknowledge before return.
+    /// ActivateDirect uses `commit_udp_decision`, never this fenced batch.
+    fn commit_udp_batch(
+        &mut self,
+        requests: &[UdpDecisionCommit],
+        visit: &mut UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()>;
 
     /// Retire captured owners under one bounded tuple-fence/grace batch.
     fn retire_batch(

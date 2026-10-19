@@ -1,0 +1,518 @@
+use super::*;
+use crate::ebpf::mock::MockEbpfBackend;
+
+fn deadline(fixture: &DecisionFixture, remaining: Duration) {
+    let cell = fixture.pending.matching_cell(fixture.identity).unwrap();
+    let mut state = cell.state.lock();
+    let CellState::Pending { started_at, .. } = &mut *state else {
+        panic!("pending fixture")
+    };
+    *started_at = Instant::now() - HARD_HOLD_TIMEOUT + remaining;
+}
+
+fn pair(mut mock: MockEbpfBackend) -> (DecisionFixture, UdpInitLease, PendingUdpIdentity) {
+    let key = FlowKey::new(
+        "192.0.2.10:40001".parse().unwrap(),
+        "198.51.100.20:443".parse().unwrap(),
+    );
+    mock.seed_staged_udp_flow(
+        &key.tuples(),
+        retained(42, UdpDecisionState::Pending, ROUTING_META_FLAG_PUBLISHED),
+    );
+    let fixture = pending_fixture_with(41, mock);
+    let lease = match fixture.pending.endpoints.reserve_owned_or_enqueue(
+        key.client,
+        key.destination,
+        bytes::Bytes::from_static(b"second"),
+        42,
+        None,
+        test_flow_slot(),
+        &fixture.stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("second flow must initialize"),
+    };
+    let identity = PendingUdpVerdicts::identity_for_lease(&lease);
+    fixture.pending.cells.insert(
+        key,
+        Arc::new(FlowCell::pending(
+            identity,
+            Instant::now(),
+            HeldVerdict::test(2, Instant::now(), Arc::clone(&fixture.sink)),
+            Arc::clone(&fixture.pending.flow_slots)
+                .try_acquire_owned()
+                .unwrap(),
+        )),
+    );
+    fixture.stats.increment_udp_nfqueue_active_flows();
+    (fixture, lease, identity)
+}
+
+#[tokio::test]
+async fn expired_dequeued_commit_never_enters_a_backend_batch() {
+    let mock = MockEbpfBackend::new();
+    let batches = Arc::clone(&mock.commit_batch_sizes);
+    let fixture = pending_fixture_with(32, mock);
+    deadline(&fixture, Duration::ZERO);
+    let operation = fixture
+        .pending
+        .activate_proxy(fixture.identity, &fixture.lease, 4, 0);
+    tokio::pin!(operation);
+    assert!(futures::poll!(&mut operation).is_pending());
+    assert!(
+        !fixture.pending.commits.is_idle(),
+        "expired request was admitted before dequeue"
+    );
+    assert!(matches!(
+        operation.await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+    assert!(batches.lock().is_empty());
+    assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn commit_rechecks_deadline_after_taking_backend_write_ownership() {
+    let mock = MockEbpfBackend::new();
+    let batches = Arc::clone(&mock.commit_batch_sizes);
+    let fixture = pending_fixture_with(33, mock);
+    deadline(&fixture, Duration::from_millis(50));
+    *fixture.pending.commits.after_lock_delay.lock() = Some(Duration::from_millis(100));
+    assert!(matches!(
+        fixture
+            .pending
+            .activate_proxy(fixture.identity, &fixture.lease, 4, 0)
+            .await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+    assert!(
+        batches.lock().is_empty(),
+        "expired lock owner reached the grace barrier"
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .read()
+            .await
+            .conn_state_lookup(&fixture.identity.tuples())
+            .unwrap()
+            .unwrap()
+            .state,
+        UdpDecisionState::Pending as u8
+    );
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn commit_rechecks_deadline_after_the_grace_period() {
+    let mut mock = MockEbpfBackend::new();
+    mock.commit_delay = Some(Duration::from_millis(100));
+    let batches = Arc::clone(&mock.commit_batch_sizes);
+    let trace = Arc::clone(&mock.commit_trace);
+    let fixture = pending_fixture_with(34, mock);
+    deadline(&fixture, Duration::from_millis(50));
+    assert!(matches!(
+        fixture
+            .pending
+            .activate_proxy(fixture.identity, &fixture.lease, 4, 0)
+            .await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+    assert_eq!(*batches.lock(), vec![1]);
+    assert!(
+        trace.lock().is_empty(),
+        "expired post-grace request mutated maps"
+    );
+    assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn each_batch_item_rechecks_its_own_deadline_before_applying() {
+    let mut mock = MockEbpfBackend::new();
+    mock.commit_item_delay = Some((1, Duration::from_millis(100)));
+    let batches = Arc::clone(&mock.commit_batch_sizes);
+    let trace = Arc::clone(&mock.commit_trace);
+    let (fixture, second, second_id) = pair(mock);
+    let second_cell = fixture.pending.matching_cell(second_id).unwrap();
+    {
+        let mut state = second_cell.state.lock();
+        let CellState::Pending { started_at, .. } = &mut *state else {
+            panic!("pending")
+        };
+        *started_at = Instant::now() - HARD_HOLD_TIMEOUT + Duration::from_millis(50);
+    }
+    let first = fixture
+        .pending
+        .activate_proxy(fixture.identity, &fixture.lease, 4, 0);
+    let second = fixture.pending.activate_proxy(second_id, &second, 4, 0);
+    let (first, second) = tokio::join!(biased; first, second);
+    assert!(first.is_ok());
+    assert!(matches!(
+        second,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+    assert_eq!(*batches.lock(), vec![2]);
+    assert_eq!(
+        *trace.lock(),
+        vec![(41, UdpDecisionTransition::ActivateProxy(4, 0))]
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .read()
+            .await
+            .conn_state_lookup(&second_id.tuples())
+            .unwrap()
+            .unwrap()
+            .state,
+        UdpDecisionState::Pending as u8
+    );
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn batched_direct_decisions_keep_arm_verdict_and_activation_order() {
+    let mock = MockEbpfBackend::new();
+    let batches = Arc::clone(&mock.commit_batch_sizes);
+    let trace = Arc::clone(&mock.commit_trace);
+    let (fixture, second, second_id) = pair(mock);
+    let first_cell = fixture.pending.matching_cell(fixture.identity).unwrap();
+    {
+        let mut state = first_cell.state.lock();
+        let CellState::Pending { verdicts, .. } = &mut *state else {
+            panic!("pending")
+        };
+        verdicts.push_back(HeldVerdict::test(
+            3,
+            Instant::now(),
+            Arc::clone(&fixture.sink),
+        ));
+    }
+    let first = fixture
+        .pending
+        .activate_direct(fixture.identity, fixture.lease, 0x1200);
+    let second = fixture.pending.activate_direct(second_id, second, 0x1200);
+    let (first, second) = tokio::join!(biased; first, second);
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(*batches.lock(), vec![2]);
+    assert_eq!(
+        *trace.lock(),
+        vec![
+            (41, UdpDecisionTransition::ArmDirect(0x1200)),
+            (42, UdpDecisionTransition::ArmDirect(0x1200)),
+            (41, UdpDecisionTransition::ActivateDirect(0x1200)),
+            (42, UdpDecisionTransition::ActivateDirect(0x1200)),
+        ]
+    );
+    assert_eq!(
+        *fixture.sink.lock(),
+        vec![
+            TestVerdict::Accept {
+                id: 1,
+                mark: CLASSIFIED_MARK | 0x1200
+            },
+            TestVerdict::Accept {
+                id: 3,
+                mark: CLASSIFIED_MARK | 0x1200
+            },
+            TestVerdict::Accept {
+                id: 2,
+                mark: CLASSIFIED_MARK | 0x1200
+            },
+        ]
+    );
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_direct_waiter_leaves_its_lease_and_work_with_the_joined_pump() {
+    let mut fixture = pending_fixture(35);
+    let pending = Arc::clone(&fixture.pending);
+    let mut operation = Box::pin(pending.activate_direct(fixture.identity, fixture.lease, 0x1200));
+    assert!(futures::poll!(&mut operation).is_pending());
+    // Cancellation must drop the waiter, not the admitted request's lease.
+    drop(operation);
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+    assert!(fixture.pending.commits.is_idle());
+    assert!(matches!(
+        &*fixture
+            .pending
+            .matching_cell(fixture.identity)
+            .unwrap()
+            .state
+            .lock(),
+        CellState::ActiveDirect { .. }
+    ));
+    assert_eq!(
+        fixture
+            .backend
+            .read()
+            .await
+            .conn_state_lookup(&fixture.identity.tuples())
+            .unwrap()
+            .unwrap()
+            .state,
+        UdpDecisionState::None as u8
+    );
+    assert_eq!(
+        *fixture.sink.lock(),
+        vec![TestVerdict::Accept {
+            id: 1,
+            mark: CLASSIFIED_MARK | 0x1200
+        }]
+    );
+    assert!(fixture.fatal.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn fence_release_failure_never_acknowledges_an_applied_batch_as_success() {
+    let mut mock = MockEbpfBackend::new();
+    mock.commit_release_fault = true;
+    let (mut fixture, second, second_id) = pair(mock);
+    let first = fixture
+        .pending
+        .activate_proxy(fixture.identity, &fixture.lease, 4, 0);
+    let second = fixture.pending.activate_proxy(second_id, &second, 4, 0);
+    let (first, second) = tokio::join!(biased; first, second);
+    assert!(matches!(first, Err(PendingUdpDecisionError::Fatal(_))));
+    assert!(matches!(second, Err(PendingUdpDecisionError::Fatal(_))));
+    assert_eq!(fixture.fatal.try_recv().unwrap().operation, "commit batch");
+    assert_eq!(
+        *fixture.sink.lock(),
+        vec![TestVerdict::Drop { id: 1 }, TestVerdict::Drop { id: 2 }]
+    );
+    let backend = fixture.backend.read().await;
+    assert!(
+        backend
+            .udp_flow_owner(
+                41,
+                backend
+                    .conn_state_lookup(&fixture.identity.tuples())
+                    .unwrap()
+            )
+            .is_err(),
+        "model admitted through unresolved fence ownership"
+    );
+    drop(backend);
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn shutdown_joins_an_inflight_commit_even_after_its_waiter_is_cancelled() {
+    let mut mock = MockEbpfBackend::new();
+    mock.commit_delay = Some(Duration::from_millis(100));
+    let fixture = pending_fixture_with(36, mock);
+    let started = Instant::now();
+    let mut operation = Box::pin(fixture.pending.activate_proxy(
+        fixture.identity,
+        &fixture.lease,
+        4,
+        0,
+    ));
+    assert!(futures::poll!(&mut operation).is_pending());
+    drop(operation);
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "shutdown detached a blocking commit"
+    );
+    assert!(fixture.pending.commits.is_idle());
+    assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+    assert_eq!(
+        fixture
+            .backend
+            .read()
+            .await
+            .conn_state_lookup(&fixture.identity.tuples())
+            .unwrap()
+            .unwrap()
+            .state,
+        UdpDecisionState::Proxy as u8
+    );
+    assert!(matches!(
+        fixture
+            .pending
+            .activate_proxy(fixture.identity, &fixture.lease, 4, 0)
+            .await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn applied_items_wait_for_fence_release_before_replying() {
+    let mut mock = MockEbpfBackend::new();
+    mock.commit_release_delay = Some(Duration::from_millis(100));
+    mock.commit_release_fault = true;
+    let fixture = pending_fixture_with(37, mock);
+    let started = Instant::now();
+    let result = fixture
+        .pending
+        .activate_proxy(fixture.identity, &fixture.lease, 4, 0)
+        .await;
+    assert!(matches!(result, Err(PendingUdpDecisionError::Fatal(_))));
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "applied item replied before fence release"
+    );
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn reload_cancels_a_pump_owned_lease_without_signalling_runtime_failure() {
+    let mut fixture = pending_fixture(38);
+    let mut operation = Box::pin(fixture.pending.activate_direct(
+        fixture.identity,
+        fixture.lease,
+        0x1200,
+    ));
+    assert!(futures::poll!(&mut operation).is_pending());
+    let pool = Arc::clone(&fixture.pending.endpoints);
+    let mut cancelling = Box::pin(pool.cancel_initializers_and_wait());
+    assert!(futures::poll!(&mut cancelling).is_pending());
+    assert!(matches!(
+        operation.await,
+        Err(PendingUdpDecisionError::StaleIdentity)
+    ));
+    assert!(cancelling.await);
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+    assert!(fixture.pending.commits.is_idle());
+    assert!(fixture.fatal.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn cancelling_an_owned_armed_flow_waits_for_activation_instead_of_killing_it() {
+    let fixture = pending_fixture(43);
+    let pending = Arc::clone(&fixture.pending);
+    let reader = fixture.backend.read().await;
+    let identity = fixture.identity;
+    let activation =
+        tokio::spawn(async move { pending.activate_direct(identity, fixture.lease, 0).await });
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    let (entered, blocked) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let backend = Arc::clone(&fixture.backend);
+    let blocker = tokio::spawn(async move {
+        let _writer = backend.write().await;
+        entered.send(()).unwrap();
+        released.await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    drop(reader);
+    blocked.await.unwrap();
+    assert!(matches!(
+        &*fixture
+            .pending
+            .matching_cell(identity)
+            .unwrap()
+            .state
+            .lock(),
+        CellState::Pending { armed: true, .. }
+    ));
+    let pending = Arc::clone(&fixture.pending);
+    let cancel = tokio::spawn(async move { pending.cancel(identity).await });
+    tokio::task::yield_now().await;
+    assert!(!cancel.is_finished(), "cancellation killed pump-owned work");
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    activation.await.unwrap().unwrap();
+    cancel.await.unwrap().unwrap();
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_expired_armed_cancellation_is_still_fatal() {
+    let mut fixture = pending_fixture(44);
+    let cell = fixture.pending.matching_cell(fixture.identity).unwrap();
+    {
+        let mut state = cell.state.lock();
+        let CellState::Pending {
+            started_at, armed, ..
+        } = &mut *state
+        else {
+            panic!("pending")
+        };
+        *armed = true;
+        *started_at = Instant::now() - HARD_HOLD_TIMEOUT;
+    }
+    assert!(matches!(
+        fixture.pending.cancel(fixture.identity).await,
+        Err(PendingUdpDecisionError::ArmedInProgress)
+    ));
+    assert_eq!(
+        fixture.fatal.try_recv().unwrap().operation,
+        "armed flow cancellation"
+    );
+    assert!(matches!(&*cell.state.lock(), CellState::Dead { .. }));
+    assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+}
+
+#[tokio::test]
+async fn cleanup_of_a_now_armed_request_does_not_stall_the_hold_watchdog() {
+    let mut fixture = pending_fixture(45);
+    fixture
+        .pending
+        .schedule_cleanup(CleanupRequest::Flow(fixture.identity));
+    let cell = fixture.pending.matching_cell(fixture.identity).unwrap();
+    {
+        let mut state = cell.state.lock();
+        let CellState::Pending { armed, .. } = &mut *state else {
+            panic!("pending")
+        };
+        *armed = true;
+    }
+    tokio::time::timeout(Duration::from_millis(20), fixture.pending.watchdog_tick())
+        .await
+        .expect("armed cleanup blocked the independent watchdog");
+    assert!(
+        fixture
+            .pending
+            .scheduled_cleanups
+            .lock()
+            .contains(&CleanupRequest::Flow(fixture.identity))
+    );
+    assert!(fixture.fatal.try_recv().is_err());
+    assert!(fixture.sink.lock().is_empty());
+}
+
+#[tokio::test]
+async fn terminal_verdicts_are_settled_before_another_batched_flow_waits_to_activate() {
+    let (fixture, second, second_id) = pair(MockEbpfBackend::new());
+    let reader = fixture.backend.read().await;
+    let operation = async {
+        tokio::join!(biased;
+            fixture.pending.activate_direct(fixture.identity, fixture.lease, 0),
+            fixture.pending.activate_proxy(second_id, &second, 4, 0),
+        )
+    };
+    tokio::pin!(operation);
+    assert!(futures::poll!(&mut operation).is_pending());
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    let backend = Arc::clone(&fixture.backend);
+    let (entered, blocked) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let blocker = tokio::spawn(async move {
+        let _writer = backend.write().await;
+        entered.send(()).unwrap();
+        released.await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    drop(reader);
+    blocked.await.unwrap();
+    assert_eq!(
+        fixture.sink.lock().first(),
+        Some(&TestVerdict::Drop { id: 2 })
+    );
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    let (direct, proxy) = operation.await;
+    direct.unwrap();
+    proxy.unwrap();
+    fixture.pending.shutdown_commit_pump().await.unwrap();
+}

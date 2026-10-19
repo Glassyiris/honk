@@ -624,6 +624,14 @@ impl EbpfBackend for RealEbpfBackend {
         }
     }
 
+    fn commit_udp_batch(
+        &mut self,
+        requests: &[crate::ebpf::UdpDecisionCommit],
+        visit: &mut crate::ebpf::UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()> {
+        self.commit_udp_decisions(requests, visit)
+    }
+
     fn retire_batch(
         &mut self,
         requests: &[RetireRequest<'_>],

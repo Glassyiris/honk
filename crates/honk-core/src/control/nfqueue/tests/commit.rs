@@ -12,7 +12,6 @@ async fn blocking_commit_leaves_the_worker_free_for_other_tasks() {
         identity,
         ..
     } = pending_fixture_with(31, mock);
-    let pending = Arc::new(pending);
     let ticks = Arc::new(AtomicU32::new(0));
     let ticker = tokio::spawn({
         let ticks = Arc::clone(&ticks);

@@ -437,6 +437,11 @@ impl UdpInitLease {
         self.cancellation.clone()
     }
 
+    #[cfg(feature = "ebpf")]
+    pub(in crate::control) fn initialization_cancelled(&self) -> bool {
+        !self.pool.initialization_epoch_is(self.initializer.epoch)
+    }
+
     pub(in crate::control) fn wait_cancellation(
         &self,
     ) -> impl Future<Output = ()> + Send + 'static {

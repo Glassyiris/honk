@@ -84,11 +84,23 @@ pub struct MockEbpfBackend {
     pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
     /// Tuple fences retained by model fixtures for allocator conflict checks.
     retire_fences: HashMap<[u8; 40], RetirementFence>,
-    /// Blocking time `commit_udp_decision` spends before applying, modelling the kernel grace wait.
+    /// Model grace latency; a batch waits once rather than once per item.
     #[cfg(test)]
     pub commit_delay: Option<std::time::Duration>,
     #[cfg(test)]
     pub commit_barrier_fault: bool,
+    #[cfg(test)]
+    pub commit_release_fault: bool,
+    #[cfg(test)]
+    pub commit_release_delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    pub commit_fence_unresolved: bool,
+    #[cfg(test)]
+    pub commit_item_delay: Option<(usize, std::time::Duration)>,
+    #[cfg(test)]
+    pub commit_batch_sizes: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
+    #[cfg(test)]
+    pub commit_trace: std::sync::Arc<parking_lot::Mutex<Vec<(u32, UdpDecisionTransition)>>>,
     #[cfg(test)]
     pub retire_fault_after: Option<usize>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
@@ -842,6 +854,11 @@ impl EbpfBackend for MockEbpfBackend {
         token: u32,
         state: Option<ConnState>,
     ) -> anyhow::Result<super::UdpFlowOwner> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.commit_fence_unresolved,
+            "retirement ownership is unresolved"
+        );
         let Some(state) = state else {
             anyhow::ensure!(token == 0, "model staged UDP admission has no conn-state");
             return super::UdpFlowOwner::new(token, None);
@@ -866,6 +883,11 @@ impl EbpfBackend for MockEbpfBackend {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.commit_fence_unresolved,
+            "retirement ownership is unresolved"
+        );
         #[cfg(test)]
         if let Some(delay) = self.commit_delay {
             std::thread::sleep(delay);
@@ -909,7 +931,87 @@ impl EbpfBackend for MockEbpfBackend {
             None => {}
         }
         self.udp_conn_states.insert(key_bytes, plan.state);
+        #[cfg(test)]
+        self.commit_trace.lock().push((token, transition));
         Ok(UdpDecisionCommitResult::Applied)
+    }
+
+    fn commit_udp_batch(
+        &mut self,
+        requests: &[super::UdpDecisionCommit],
+        visit: &mut super::UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.commit_fence_unresolved,
+            "retirement ownership is unresolved"
+        );
+        anyhow::ensure!(
+            requests.len() <= RETIRE_BATCH_CAPACITY,
+            "UDP commit batch exceeds capacity"
+        );
+        for request in requests {
+            validate_udp_decision_transition(request.transition)?;
+            anyhow::ensure!(
+                !matches!(request.transition, UdpDecisionTransition::ActivateDirect(_)),
+                "direct activation cannot enter a fenced batch"
+            );
+            anyhow::ensure!(
+                request.key.padding == [0; 3] && request.key.l4proto == libc::IPPROTO_UDP as u8,
+                "noncanonical UDP commit tuple"
+            );
+        }
+        #[cfg(test)]
+        let delay = self.commit_delay.take();
+        #[cfg(test)]
+        let fenced = requests.iter().any(|request| {
+            request.token != 0
+                && self
+                    .udp_conn_states
+                    .contains_key(&Self::tuples_key_bytes(&request.key))
+        });
+        let result = (|| {
+            #[cfg(test)]
+            {
+                self.commit_batch_sizes.lock().push(requests.len());
+                if let Some(delay) = delay
+                    && fenced
+                {
+                    std::thread::sleep(delay);
+                }
+                if fenced && std::mem::take(&mut self.commit_barrier_fault) {
+                    anyhow::bail!("injected UDP commit barrier failure");
+                }
+            }
+            for (index, request) in requests.iter().enumerate() {
+                #[cfg(test)]
+                if let Some((delayed, duration)) = self.commit_item_delay
+                    && delayed == index
+                {
+                    std::thread::sleep(duration);
+                }
+                visit(index, &mut || {
+                    self.commit_udp_decision(&request.key, request.token, request.transition)
+                })?;
+            }
+            #[cfg(test)]
+            if let Some(delay) = self.commit_release_delay
+                && fenced
+            {
+                std::thread::sleep(delay);
+            }
+            #[cfg(test)]
+            if fenced && std::mem::take(&mut self.commit_release_fault) {
+                self.commit_fence_unresolved = true;
+                anyhow::bail!("injected UDP commit fence release failure");
+            }
+            Ok(())
+        })();
+        #[cfg(test)]
+        {
+            self.commit_delay = delay;
+        }
+        result
     }
     fn adopt_tcp(
         &self,

@@ -165,3 +165,124 @@ fn staging_timestamp_classifiers_stay_within_the_verifier_budget() {
         }
     });
 }
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn a_batched_tuple_is_fenced_once_and_every_transition_rechecks_its_state() {
+    isolated(|| {
+        let (mut backend, _listeners) = fixture();
+        let (key, _, token) = stage(
+            &backend,
+            "192.0.2.10".parse().unwrap(),
+            "198.51.100.20".parse().unwrap(),
+            47002,
+        );
+        let requests = [
+            crate::ebpf::UdpDecisionCommit {
+                key,
+                token,
+                transition: UdpDecisionTransition::ArmDirect(0),
+            },
+            crate::ebpf::UdpDecisionCommit {
+                key,
+                token,
+                transition: UdpDecisionTransition::Block,
+            },
+        ];
+        backend.retirement_faults.acquire = Some(1);
+        let mut results = Vec::new();
+        backend
+            .commit_udp_batch(&requests, &mut |_, apply| {
+                results.push(apply()?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            results,
+            vec![
+                UdpDecisionCommitResult::Applied,
+                UdpDecisionCommitResult::StateMismatch
+            ]
+        );
+        assert_eq!(
+            backend.retirement_faults.acquire,
+            Some(0),
+            "tuple was fenced twice"
+        );
+        assert_eq!(
+            backend.conn_state_lookup(&key).unwrap().unwrap().state,
+            UdpDecisionState::DirectArmed as u8
+        );
+        assert!(
+            backend
+                .hash_lookup::<_, honk_ebpf_common::conn::RetirementFence>(
+                    crate::ebpf::RETIRE_FENCE_MAP,
+                    &key
+                )
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn a_batch_release_failure_reports_error_after_all_successful_mutations() {
+    isolated(|| {
+        let (mut backend, _listeners) = fixture();
+        let mut requests = Vec::new();
+        for port in [47003, 47004] {
+            let (key, _, token) = stage(
+                &backend,
+                "192.0.2.10".parse().unwrap(),
+                "198.51.100.20".parse().unwrap(),
+                port,
+            );
+            requests.push(crate::ebpf::UdpDecisionCommit {
+                key,
+                token,
+                transition: UdpDecisionTransition::ActivateProxy(2, 0),
+            });
+        }
+        backend.retirement_faults.release = Some(0);
+        let mut applied = 0;
+        let error = backend
+            .commit_udp_batch(&requests, &mut |_, apply| {
+                assert_eq!(apply()?, UdpDecisionCommitResult::Applied);
+                applied += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("release"));
+        assert_eq!(applied, 2);
+        assert!(backend.retirement_failed);
+        for request in &requests {
+            assert_eq!(
+                backend
+                    .conn_state_lookup(&request.key)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                UdpDecisionState::Proxy as u8
+            );
+        }
+        assert!(
+            backend
+                .hash_lookup::<_, honk_ebpf_common::conn::RetirementFence>(
+                    crate::ebpf::RETIRE_FENCE_MAP,
+                    &requests[0].key
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .hash_lookup::<_, honk_ebpf_common::conn::RetirementFence>(
+                    crate::ebpf::RETIRE_FENCE_MAP,
+                    &requests[1].key
+                )
+                .unwrap()
+                .is_none()
+        );
+    });
+}

@@ -20,6 +20,7 @@ use crate::ebpf::{EbpfBackend, UdpDecisionCommitResult, UdpDecisionTransition};
 use crate::stats::StatsManager;
 
 mod cell;
+mod commit;
 mod ingest;
 mod transition;
 pub(in crate::control) use cell::HeldVerdict;
@@ -103,6 +104,7 @@ pub(super) struct PendingUdpVerdicts {
     cleanup_drainer: tokio::sync::Mutex<()>,
     admission: AdmissionGate,
     empty: Notify,
+    commits: commit::CommitPump,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     endpoints: Arc<UdpEndpointPool>,
     stats: Arc<StatsManager>,
@@ -124,6 +126,7 @@ impl PendingUdpVerdicts {
                 cleanup_drainer: tokio::sync::Mutex::new(()),
                 admission: AdmissionGate::new(),
                 empty: Notify::new(),
+                commits: commit::CommitPump::new(),
                 ebpf,
                 endpoints,
                 stats,

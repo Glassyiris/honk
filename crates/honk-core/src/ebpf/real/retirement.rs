@@ -420,45 +420,106 @@ impl RealEbpfBackend {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         self.with_retirement_fences(&[(*key, token)], |backend| {
-            let Some(state) = backend.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
-                return Ok(UdpDecisionCommitResult::Missing);
-            };
-            if state.decision_token != token || state.incarnation != captured.incarnation {
-                return Ok(UdpDecisionCommitResult::TokenMismatch);
-            }
-            anyhow::ensure!(
-                state.incarnation != 0,
-                "UDP commit has no lifetime identity"
-            );
-            let handoff =
-                backend.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
-            let track_key = RedirectTuple::from_tuples(key);
-            let track = backend.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
-            let plan =
-                match plan_udp_commit(state, token, transition, handoff.as_ref(), track.as_ref()) {
-                    Ok(plan) => plan,
-                    Err(result) => return Ok(result),
-                };
-            if plan.remove_handoff {
-                backend.hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>(
-                    "ROUTING_HANDOFF_MAP",
-                    key,
-                )?;
-            }
-            match plan.redirect {
-                Some(RedirectEffect::Rewrite(track)) => {
-                    backend.flow_insert("REDIRECT_TRACK", &track_key, &track)?;
-                }
-                Some(RedirectEffect::Remove) => {
-                    backend.hash_remove::<_, FlowMapValue<RedirectEntry>>(
-                        "REDIRECT_TRACK",
-                        &track_key,
-                    )?;
-                }
-                None => {}
-            }
-            backend.flow_insert("CONN_STATE_MAP", key, &plan.state)?;
-            Ok(UdpDecisionCommitResult::Applied)
+            backend.commit_udp_checked(key, token, captured.incarnation, transition)
         })
+    }
+
+    pub(super) fn commit_udp_decisions(
+        &mut self,
+        requests: &[crate::ebpf::UdpDecisionCommit],
+        visit: &mut crate::ebpf::UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            requests.len() <= RETIRE_BATCH_CAPACITY,
+            "UDP commit batch exceeds capacity"
+        );
+        anyhow::ensure!(
+            !self.retirement_failed,
+            "retirement ownership is unresolved"
+        );
+        let mut captured = [None; RETIRE_BATCH_CAPACITY];
+        let mut keys = [(TuplesKey::default(), 0); RETIRE_BATCH_CAPACITY];
+        let mut count = 0;
+        for (index, request) in requests.iter().enumerate() {
+            validate_udp_decision_transition(request.transition)?;
+            anyhow::ensure!(
+                !matches!(request.transition, UdpDecisionTransition::ActivateDirect(_)),
+                "direct activation cannot enter a fenced batch"
+            );
+            anyhow::ensure!(
+                request.key.padding == [0; 3] && request.key.l4proto == IPPROTO_UDP,
+                "noncanonical UDP commit tuple"
+            );
+            if request.token != 0 {
+                captured[index] = self
+                    .flow_lookup::<_, ConnState>("CONN_STATE_MAP", &request.key)?
+                    .map(|state| state.incarnation);
+                if captured[index].is_some() {
+                    keys[count] = (request.key, request.token);
+                    count += 1;
+                }
+            }
+        }
+        let mut operation = |backend: &mut Self| {
+            for (index, request) in requests.iter().enumerate() {
+                visit(index, &mut || match (request.token, captured[index]) {
+                    (0, _) => Ok(UdpDecisionCommitResult::TokenMismatch),
+                    (_, None) => Ok(UdpDecisionCommitResult::Missing),
+                    (token, Some(incarnation)) => backend.commit_udp_checked(
+                        &request.key,
+                        token,
+                        incarnation,
+                        request.transition,
+                    ),
+                })?;
+            }
+            Ok(())
+        };
+        if count == 0 {
+            operation(self)
+        } else {
+            self.with_retirement_fences(&keys[..count], operation)
+        }
+    }
+
+    fn commit_udp_checked(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+        incarnation: u64,
+        transition: UdpDecisionTransition,
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
+        let Some(state) = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
+            return Ok(UdpDecisionCommitResult::Missing);
+        };
+        if state.decision_token != token || state.incarnation != incarnation {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        anyhow::ensure!(
+            state.incarnation != 0,
+            "UDP commit has no lifetime identity"
+        );
+        let handoff = self.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+        let track_key = RedirectTuple::from_tuples(key);
+        let track = self.flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &track_key)?;
+        let plan = match plan_udp_commit(state, token, transition, handoff.as_ref(), track.as_ref())
+        {
+            Ok(plan) => plan,
+            Err(result) => return Ok(result),
+        };
+        if plan.remove_handoff {
+            self.hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", key)?;
+        }
+        match plan.redirect {
+            Some(RedirectEffect::Rewrite(track)) => {
+                self.flow_insert("REDIRECT_TRACK", &track_key, &track)?
+            }
+            Some(RedirectEffect::Remove) => {
+                self.hash_remove::<_, FlowMapValue<RedirectEntry>>("REDIRECT_TRACK", &track_key)?
+            }
+            None => {}
+        }
+        self.flow_insert("CONN_STATE_MAP", key, &plan.state)?;
+        Ok(UdpDecisionCommitResult::Applied)
     }
 }

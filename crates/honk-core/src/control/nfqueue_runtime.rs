@@ -317,6 +317,7 @@ impl NfqueueRuntime {
         }
         self.pending.cancel_all().await;
         self.pending.wait_empty().await;
+        self.pending.shutdown_commit_pump().await?;
         observer_result
     }
 
@@ -333,6 +334,9 @@ impl NfqueueRuntime {
                 let _ = handle.await;
                 *task = None;
             }
+        }
+        if let Err(error) = self.pending.shutdown_commit_pump().await {
+            error!(%error, "NFQUEUE commit pump shutdown failed");
         }
     }
 

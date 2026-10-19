@@ -346,7 +346,7 @@ impl ControlPlaneHandle {
                     verdicts
                         .activate_direct(
                             *identity,
-                            &mut lease,
+                            lease,
                             mark.map_or(0, honk_outbound::proxy::DirectMark::get),
                         )
                         .await
@@ -386,13 +386,10 @@ impl ControlPlaneHandle {
                     return Ok(());
                 }
                 "block" => {
-                    verdicts
-                        .block(*identity, &mut lease)
-                        .await
-                        .inspect_err(|_| {
-                            #[cfg(feature = "native-api")]
-                            kernel_enforcement(observation, "drop", Some("block_failed"));
-                        })?;
+                    verdicts.block(*identity, lease).await.inspect_err(|_| {
+                        #[cfg(feature = "native-api")]
+                        kernel_enforcement(observation, "drop", Some("block_failed"));
+                    })?;
                     #[cfg(feature = "native-api")]
                     kernel_enforcement(observation, "drop", None);
                     if let Some(terminal) = &native_terminal {

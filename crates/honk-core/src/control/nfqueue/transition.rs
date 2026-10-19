@@ -2,60 +2,39 @@ use super::*;
 
 impl PendingUdpVerdicts {
     pub(in crate::control) async fn activate_direct(
-        &self,
+        self: &Arc<Self>,
         identity: PendingUdpIdentity,
-        lease: &mut UdpInitLease,
+        lease: UdpInitLease,
         direct_rule_mark: u32,
     ) -> Result<(), PendingUdpDecisionError> {
         if skb_mark_has_reserved_bits(direct_rule_mark) {
             return Err(PendingUdpDecisionError::ReservedDirectMark);
         }
-        if Self::identity_for_lease(lease) != identity {
+        if Self::identity_for_lease(&lease) != identity {
             return Err(PendingUdpDecisionError::StaleIdentity);
         }
-        let final_mark = direct_rule_mark | CLASSIFIED_MARK;
         let cell = self.matching_cell(identity)?;
+        self.commit_pending(
+            cell,
+            UdpDecisionTransition::ArmDirect(direct_rule_mark),
+            Some(lease),
+        )
+        .await
+    }
 
-        {
-            let mut backend = self.backend_before_deadline(&cell, identity).await?;
-            let mut state = cell.state.lock();
-            let CellState::Pending {
-                started_at,
-                armed,
-                cancelling,
-                ..
-            } = &mut *state
-            else {
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            };
-            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
-                drop(state);
-                drop(backend);
-                return Err(self.expire_unarmed_pending(&cell, identity));
-            }
-            if *armed {
+    pub(super) async fn finish_armed_direct(
+        &self,
+        cell: &Arc<FlowCell>,
+        identity: PendingUdpIdentity,
+        direct_rule_mark: u32,
+    ) -> Result<(), PendingUdpDecisionError> {
+        let final_mark = direct_rule_mark | CLASSIFIED_MARK;
+        loop {
+            if matches!(&*cell.state.lock(), CellState::Pending { started_at, .. } if started_at.elapsed() >= HARD_HOLD_TIMEOUT)
+            {
+                self.fail_armed(cell, identity);
                 return Err(PendingUdpDecisionError::ArmedInProgress);
             }
-            if *cancelling {
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            }
-            let result = blocking_section(|| {
-                backend.commit_udp_decision(
-                    &identity.tuples(),
-                    identity.owner.token,
-                    UdpDecisionTransition::ArmDirect(direct_rule_mark),
-                )
-            })
-            .map_err(|error| self.fatal_error("arm direct", format!("{error:#}")))?;
-            if result != UdpDecisionCommitResult::Applied {
-                self.record_commit_mismatch(result);
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            }
-            *armed = true;
-        }
-        cell.changed.notify_waiters();
-
-        loop {
             let batch = {
                 let mut state = cell.state.lock();
                 match &mut *state {
@@ -65,20 +44,17 @@ impl PendingUdpVerdicts {
                         ..
                     } => std::mem::take(verdicts),
                     _ => {
-                        let fatal = PendingUdpFatal::new(
+                        return Err(self.fatal_error(
                             "direct verdict",
-                            "armed correlator changed phase before activation",
-                        );
-                        self.signal_fatal(fatal.clone());
-                        return Err(fatal.into());
+                            "armed correlator changed phase before activation".into(),
+                        ));
                     }
                 }
             };
             for verdict in batch {
                 self.accept_one_fatal(verdict, final_mark)?;
             }
-
-            let mut backend = self.armed_backend_before_deadline(&cell, identity).await?;
+            let mut backend = self.armed_backend_before_deadline(cell, identity).await?;
             let mut state = cell.state.lock();
             let CellState::Pending {
                 armed: true,
@@ -87,17 +63,15 @@ impl PendingUdpVerdicts {
                 ..
             } = &mut *state
             else {
-                let fatal = PendingUdpFatal::new(
+                return Err(self.fatal_error(
                     "activate direct",
-                    "armed correlator changed phase before backend activation",
-                );
-                self.signal_fatal(fatal.clone());
-                return Err(fatal.into());
+                    "armed correlator changed phase before backend activation".into(),
+                ));
             };
             if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
                 drop(state);
                 drop(backend);
-                self.fail_armed(&cell, identity);
+                self.fail_armed(cell, identity);
                 return Err(PendingUdpDecisionError::ArmedInProgress);
             }
             if !verdicts.is_empty() {
@@ -115,12 +89,10 @@ impl PendingUdpVerdicts {
             .map_err(|error| self.fatal_error("activate direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
-                let fatal = PendingUdpFatal::new(
+                return Err(self.fatal_error(
                     "activate direct",
                     format!("backend rejected armed transition: {result:?}"),
-                );
-                self.signal_fatal(fatal.clone());
-                return Err(fatal.into());
+                ));
             }
             *state = CellState::ActiveDirect {
                 expires_at: Instant::now() + TERMINAL_GRACE,
@@ -129,20 +101,11 @@ impl PendingUdpVerdicts {
             break;
         }
         cell.changed.notify_waiters();
-
-        if !lease.commit_kernel_handoff() {
-            let fatal = PendingUdpFatal::new(
-                "direct endpoint handoff",
-                "backend activated after endpoint identity was retired",
-            );
-            self.signal_fatal(fatal.clone());
-            return Err(fatal.into());
-        }
         Ok(())
     }
 
     pub(in crate::control) async fn activate_proxy(
-        &self,
+        self: &Arc<Self>,
         identity: PendingUdpIdentity,
         lease: &UdpInitLease,
         final_outbound: u8,
@@ -152,127 +115,62 @@ impl PendingUdpVerdicts {
             return Err(PendingUdpDecisionError::StaleIdentity);
         }
         let cell = self.matching_cell(identity)?;
-        let verdicts = {
-            let mut backend = self.backend_before_deadline(&cell, identity).await?;
-            let mut state = cell.state.lock();
-            let CellState::Pending {
-                started_at,
-                armed: false,
-                cancelling: false,
-                verdicts,
-            } = &mut *state
-            else {
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            };
-            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
-                drop(state);
-                drop(backend);
-                return Err(self.expire_unarmed_pending(&cell, identity));
-            }
-            let result = blocking_section(|| {
-                backend.commit_udp_decision(
-                    &identity.tuples(),
-                    identity.owner.token,
-                    UdpDecisionTransition::ActivateProxy(final_outbound, final_rule_mark),
-                )
-            })
-            .map_err(|error| self.fatal_error("activate proxy", format!("{error:#}")))?;
-            if result != UdpDecisionCommitResult::Applied {
-                self.record_commit_mismatch(result);
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            }
-            let verdicts = std::mem::take(verdicts);
-            *state = CellState::Proxy {
-                expires_at: Instant::now() + TERMINAL_GRACE,
-            };
-            verdicts
-        };
-        cell.changed.notify_waiters();
-        for verdict in verdicts {
-            self.drop_one_fatal(verdict, DropOutcome::Proxy)?;
-        }
-        Ok(())
+        self.commit_pending(
+            cell,
+            UdpDecisionTransition::ActivateProxy(final_outbound, final_rule_mark),
+            None,
+        )
+        .await
     }
 
     pub(in crate::control) async fn block(
-        &self,
+        self: &Arc<Self>,
         identity: PendingUdpIdentity,
-        lease: &mut UdpInitLease,
+        lease: UdpInitLease,
     ) -> Result<(), PendingUdpDecisionError> {
-        if Self::identity_for_lease(lease) != identity {
+        if Self::identity_for_lease(&lease) != identity {
             return Err(PendingUdpDecisionError::StaleIdentity);
         }
         let cell = self.matching_cell(identity)?;
-        let verdicts = {
-            let mut backend = self.backend_before_deadline(&cell, identity).await?;
-            let mut state = cell.state.lock();
-            let CellState::Pending {
-                started_at,
-                armed: false,
-                cancelling: false,
-                verdicts,
-            } = &mut *state
-            else {
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            };
-            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
-                drop(state);
-                drop(backend);
-                return Err(self.expire_unarmed_pending(&cell, identity));
-            }
-            let result = blocking_section(|| {
-                backend.commit_udp_decision(
-                    &identity.tuples(),
-                    identity.owner.token,
-                    UdpDecisionTransition::Block,
-                )
-            })
-            .map_err(|error| self.fatal_error("block", format!("{error:#}")))?;
-            if result != UdpDecisionCommitResult::Applied {
-                self.record_commit_mismatch(result);
-                return Err(PendingUdpDecisionError::StaleIdentity);
-            }
-            let verdicts = std::mem::take(verdicts);
-            *state = CellState::Block {
-                expires_at: Instant::now() + TERMINAL_GRACE,
-            };
-            verdicts
-        };
-        cell.changed.notify_waiters();
-        for verdict in verdicts {
-            self.drop_one_fatal(verdict, DropOutcome::Block)?;
-        }
-        if !lease.commit_kernel_handoff() {
-            let fatal = PendingUdpFatal::new(
-                "block endpoint handoff",
-                "backend blocked after endpoint identity was retired",
-            );
-            self.signal_fatal(fatal.clone());
-            return Err(fatal.into());
-        }
-        Ok(())
+        self.commit_pending(cell, UdpDecisionTransition::Block, Some(lease))
+            .await
     }
 
     pub(in crate::control) async fn cancel(
         &self,
         identity: PendingUdpIdentity,
     ) -> Result<(), PendingUdpDecisionError> {
+        match self.cancel_unarmed(identity).await {
+            Err(PendingUdpDecisionError::ArmedInProgress) => {
+                let cell = self.matching_cell(identity)?;
+                self.wait_armed(&cell, identity).await
+            }
+            result => result,
+        }
+    }
+
+    pub(super) async fn cancel_unarmed(
+        &self,
+        identity: PendingUdpIdentity,
+    ) -> Result<(), PendingUdpDecisionError> {
         let cell = self.matching_cell(identity)?;
-        {
+        let armed = {
             let state = cell.state.lock();
             match &*state {
-                CellState::Pending { armed: true, .. } => {
-                    drop(state);
-                    self.fail_armed(&cell, identity);
-                    return Err(PendingUdpDecisionError::ArmedInProgress);
-                }
-                CellState::Pending { .. } => {}
+                CellState::Pending { armed, .. } => *armed,
                 _ => return Ok(()),
             }
+        };
+        if armed {
+            return Err(PendingUdpDecisionError::ArmedInProgress);
         }
-
         let (verdicts, mismatch) = {
-            let mut backend = self.backend_before_deadline(&cell, identity).await?;
+            let mut backend = self.backend_before_deadline(&cell).await?;
+            let armed = matches!(&*cell.state.lock(), CellState::Pending { armed: true, .. });
+            if armed {
+                drop(backend);
+                return Err(PendingUdpDecisionError::ArmedInProgress);
+            }
             let mut state = cell.state.lock();
             let CellState::Pending {
                 started_at,
@@ -281,13 +179,6 @@ impl PendingUdpVerdicts {
                 ..
             } = &mut *state
             else {
-                let armed = matches!(&*state, CellState::Pending { armed: true, .. });
-                drop(state);
-                drop(backend);
-                if armed {
-                    self.fail_armed(&cell, identity);
-                    return Err(PendingUdpDecisionError::ArmedInProgress);
-                }
                 return Ok(());
             };
             if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
@@ -331,6 +222,35 @@ impl PendingUdpVerdicts {
                 | UdpDecisionCommitResult::Missing
                 | UdpDecisionCommitResult::Superseded,
             ) => unreachable!("successful abort results are not mismatches"),
+        }
+    }
+
+    pub(super) async fn wait_armed(
+        &self,
+        cell: &Arc<FlowCell>,
+        identity: PendingUdpIdentity,
+    ) -> Result<(), PendingUdpDecisionError> {
+        loop {
+            let changed = cell.changed.notified();
+            let deadline = {
+                let state = cell.state.lock();
+                let CellState::Pending {
+                    armed: true,
+                    started_at,
+                    ..
+                } = &*state
+                else {
+                    return Ok(());
+                };
+                *started_at + HARD_HOLD_TIMEOUT
+            };
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)
+                .await
+                .is_err()
+            {
+                self.fail_armed(cell, identity);
+                return Err(PendingUdpDecisionError::ArmedInProgress);
+            }
         }
     }
 
