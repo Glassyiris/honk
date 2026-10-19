@@ -28,7 +28,7 @@ fn kernel_conn(state: UdpDecisionState, token: u32, incarnation: u64) -> ConnSta
 struct Fixture {
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
     endpoints: Arc<UdpEndpointPool>,
-    pending: PendingUdpVerdicts,
+    pending: Arc<PendingUdpVerdicts>,
     hints: mpsc::Sender<FlowExpiryHint>,
     fatal: mpsc::UnboundedReceiver<anyhow::Error>,
     _worker: crate::control::retirement_worker::RetirementWorker,
@@ -36,8 +36,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
-            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+        Self::with_backend(MockEbpfBackend::new())
+    }
+
+    fn with_backend(mock: MockEbpfBackend) -> Self {
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
         let endpoints = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
         let (pending, _) =
@@ -58,7 +61,7 @@ impl Fixture {
         Self {
             backend,
             endpoints,
-            pending,
+            pending: Arc::new(pending),
             hints,
             fatal,
             _worker: worker,
@@ -217,5 +220,45 @@ async fn hint_retirement_preserves_foreign_endpoint_incarnations() {
             kernel_incarnation != OLD_INCARNATION
         );
         assert!(fixture.fatal.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn reload_after_a_terminal_commit_hands_the_flow_to_the_kernel() {
+    for direct in [false, true] {
+        let key = flow_key(40002);
+        let kernel = kernel_conn(UdpDecisionState::Pending, OLD_TOKEN, OLD_INCARNATION);
+        let mut mock = MockEbpfBackend::new();
+        mock.seed_staged_udp_flow(&key.tuples(), kernel);
+        let mut fixture = Fixture::with_backend(mock);
+        let lease = fixture.serve(key, OLD_INCARNATION, kernel).await;
+        let identity = PendingUdpVerdicts::identity_for_lease(&lease);
+        fixture.pending.cells.insert(
+            key,
+            Arc::new(FlowCell::pending(
+                identity,
+                Instant::now(),
+                HeldVerdict::test(1, Instant::now(), Arc::new(Mutex::new(Vec::new()))),
+                Arc::clone(&fixture.pending.flow_slots)
+                    .try_acquire_owned()
+                    .unwrap(),
+            )),
+        );
+        let pending = Arc::clone(&fixture.pending);
+        let mut commit = Box::pin(async move {
+            if direct {
+                pending.activate_direct(identity, lease, 0x1200).await
+            } else {
+                pending.block(identity, lease).await
+            }
+        });
+        assert!(futures::poll!(&mut commit).is_pending());
+        let mut cancelling = Box::pin(fixture.endpoints.cancel_initializers_and_wait());
+        assert!(futures::poll!(&mut cancelling).is_pending());
+        assert!(commit.await.is_ok(), "direct={direct}");
+        assert!(cancelling.await);
+        fixture.wait_until_endpoint_gone(key).await;
+        fixture.pending.shutdown_commit_pump().await.unwrap();
+        assert!(fixture.fatal.try_recv().is_err(), "direct={direct}");
     }
 }

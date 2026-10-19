@@ -320,28 +320,6 @@ async fn fence_release_failure_never_acknowledges_an_applied_batch_as_success() 
 }
 
 #[tokio::test]
-async fn reload_cancels_a_pump_owned_lease_without_signalling_runtime_failure() {
-    let mut fixture = pending_fixture(38);
-    let mut operation = Box::pin(fixture.pending.activate_direct(
-        fixture.identity,
-        fixture.lease,
-        0x1200,
-    ));
-    assert!(futures::poll!(&mut operation).is_pending());
-    let pool = Arc::clone(&fixture.pending.endpoints);
-    let mut cancelling = Box::pin(pool.cancel_initializers_and_wait());
-    assert!(futures::poll!(&mut cancelling).is_pending());
-    assert!(matches!(
-        operation.await,
-        Err(PendingUdpDecisionError::StaleIdentity)
-    ));
-    assert!(cancelling.await);
-    fixture.pending.shutdown_commit_pump().await.unwrap();
-    assert!(fixture.pending.commits.is_idle());
-    assert!(fixture.fatal.try_recv().is_err());
-}
-
-#[tokio::test]
 async fn cancelling_an_owned_armed_flow_waits_for_activation_instead_of_killing_it() {
     let fixture = pending_fixture(43);
     let pending = Arc::clone(&fixture.pending);

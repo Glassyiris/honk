@@ -587,7 +587,9 @@ impl UdpInitLease {
 
     /// Retire a direct or blocked staged flow after its terminal conn_state is
     /// published. The exact tombstone prevents this tuple from being reused
-    /// until the removal worker acknowledges the kernel handoff.
+    /// until the removal worker acknowledges the kernel handoff. A reload that
+    /// cancelled initialization after the backend committed still hands off:
+    /// the userspace retirement path cannot reclaim a finished kernel state.
     #[cfg(any(feature = "ebpf", test))]
     pub(in crate::control) fn commit_kernel_handoff(&mut self) -> bool {
         let mut occupied = match self.pool.endpoints.entry(self.key) {
@@ -595,7 +597,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
-        if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) {
             return false;
         }
         if !matches!(
