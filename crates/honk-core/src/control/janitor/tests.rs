@@ -8,6 +8,8 @@ use honk_ebpf_common::conn::{
 };
 use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
 
+mod cadence;
+
 const IPPROTO_TCP: u8 = 6;
 
 #[test]
