@@ -106,10 +106,7 @@ impl RealEbpfBackend {
         let mut unresolved = false;
         self.array_set("RETIRE_ACTIVE", 0, &1u32)?;
         for (key, token) in keys {
-            if acquired
-                .iter()
-                .any(|previous| tuple_matches(previous, key))
-            {
+            if acquired.iter().any(|previous| tuple_matches(previous, key)) {
                 continue;
             }
             let mut canonical = *key;

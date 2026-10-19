@@ -577,6 +577,7 @@ fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
     retired_counts(result).conn
 }
 
+#[cfg(any(feature = "ebpf", test))]
 /// Redirect and handoff elements one backend's userspace removed. The datapath
 /// only inserts them, so this is what `aux_occupancy` subtracts from its counters.
 #[derive(Debug, Default)]
@@ -585,6 +586,7 @@ pub(crate) struct AuxDeleteTally {
     pub handoff: u64,
 }
 
+#[cfg(any(feature = "ebpf", test))]
 impl AuxDeleteTally {
     /// Count a finished batch, including deletes made before a failure.
     pub(crate) fn record(&mut self, result: &Result<RetireCounts, RetireError>) {

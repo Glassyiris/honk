@@ -285,7 +285,10 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
         .await?;
     assert_eq!(second.deleted, 1);
     assert_eq!(second.scanned, 1);
-    assert!(!second.complete, "a resumed tail is not an exact map cardinality");
+    assert!(
+        !second.complete,
+        "a resumed tail is not an exact map cardinality"
+    );
 
     Ok(())
 }
@@ -484,26 +487,34 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         // Replacing values below does not insert/remove keys or reorder buckets.
         let mut order = Vec::new();
         match map {
-            "conn" => model.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut crate::ebpf::FlowScanCursor::default(), &mut |chunk| {
-                order.extend(chunk.iter().map(|(key, _)| *key));
-                true
-            })?,
-            "redirect" => {
-                model.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, &mut crate::ebpf::FlowScanCursor::default(), &mut |chunk| {
+            "conn" => model.conn_state_for_each_chunk(
+                JANITOR_SCAN_CHUNK,
+                &mut crate::ebpf::FlowScanCursor::default(),
+                &mut |chunk| {
+                    order.extend(chunk.iter().map(|(key, _)| *key));
+                    true
+                },
+            )?,
+            "redirect" => model.redirect_track_for_each_chunk(
+                JANITOR_SCAN_CHUNK,
+                &mut crate::ebpf::FlowScanCursor::default(),
+                &mut |chunk| {
                     order.extend(
                         chunk
                             .iter()
                             .map(|(key, _)| test_tuple(key.src_port, IPPROTO_TCP)),
                     );
                     true
-                })?
-            }
-            "handoff" => {
-                model.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, &mut crate::ebpf::FlowScanCursor::default(), &mut |chunk| {
+                },
+            )?,
+            "handoff" => model.routing_handoff_for_each_chunk(
+                JANITOR_SCAN_CHUNK,
+                &mut crate::ebpf::FlowScanCursor::default(),
+                &mut |chunk| {
                     order.extend(chunk.iter().map(|(key, _)| *key));
                     true
-                })?
-            }
+                },
+            )?,
             _ => unreachable!(),
         }
         let stale = order[JANITOR_BASE_CANDIDATES];
@@ -692,13 +703,14 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         }
     );
     let mut remaining = 0;
-    backend
-        .read()
-        .await
-        .conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut crate::ebpf::FlowScanCursor::default(), &mut |chunk| {
+    backend.read().await.conn_state_for_each_chunk(
+        JANITOR_SCAN_CHUNK,
+        &mut crate::ebpf::FlowScanCursor::default(),
+        &mut |chunk| {
             remaining += chunk.len();
             true
-        })?;
+        },
+    )?;
     assert_eq!(remaining, 1);
     Ok(())
 }

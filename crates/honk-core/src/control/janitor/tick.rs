@@ -5,7 +5,12 @@ use tokio::time::Instant;
 const ADMISSION_PRESSURE_EXIT_WATERMARK: f64 = 0.60;
 
 pub(super) fn admission_pressured(active: bool, utilization: f64) -> bool {
-    utilization >= if active { ADMISSION_PRESSURE_EXIT_WATERMARK } else { CONN_STATE_ELEVATED_WATERMARK }
+    utilization
+        >= if active {
+            ADMISSION_PRESSURE_EXIT_WATERMARK
+        } else {
+            CONN_STATE_ELEVATED_WATERMARK
+        }
 }
 
 pub(super) struct TickState {
@@ -50,14 +55,16 @@ impl BpfJanitor {
             let tcp = ebpf
                 .get_bpf_stats(BpfStatsKey::TcpConnOverflow as u32)?
                 .unwrap_or(0);
-            let delta = udp > state.pressure.last_udp_overflow
-                || tcp > state.pressure.last_tcp_overflow;
+            let delta =
+                udp > state.pressure.last_udp_overflow || tcp > state.pressure.last_tcp_overflow;
             state.pressure.last_udp_overflow = udp;
             state.pressure.last_tcp_overflow = tcp;
             let counters = ebpf.conn_state_occupancy()?;
             let userspace_deletes = crate::ebpf::USERSPACE_CONN_STATE_DELETES
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let occupancy = state.gauge.estimate(counters.0, counters.1, userspace_deletes);
+            let occupancy = state
+                .gauge
+                .estimate(counters.0, counters.1, userspace_deletes);
             let (redirect, handoff) = ebpf.aux_occupancy()?;
             (
                 delta,
@@ -68,7 +75,10 @@ impl BpfJanitor {
         };
         let admission_pressure = admission_pressured(state.admission_pressure, conn_utilization);
         if admission_pressure != state.admission_pressure {
-            self.ebpf.write().await.set_admission_pressure(admission_pressure)
+            self.ebpf
+                .write()
+                .await
+                .set_admission_pressure(admission_pressure)
                 .context("publishing reverse UDP admission pressure")?;
             state.admission_pressure = admission_pressure;
         }

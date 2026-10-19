@@ -310,7 +310,12 @@ impl RealEbpfBackend {
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
     ) -> anyhow::Result<()> {
-        self.flow_scan_from(name, chunk_size, &mut crate::ebpf::FlowScanCursor::default(), visit)
+        self.flow_scan_from(
+            name,
+            chunk_size,
+            &mut crate::ebpf::FlowScanCursor::default(),
+            visit,
+        )
     }
 
     fn flow_scan_from<K: Pod, V: Pod>(
@@ -337,7 +342,10 @@ impl RealEbpfBackend {
         }
         // backend R excludes userspace reclamation; kernel never deletes tuple
         // elements. Enumerate keys only, then copy each payload under its lock.
-        anyhow::ensure!(core::mem::size_of::<K>() == 40, "tuple scan key must be 40 bytes");
+        anyhow::ensure!(
+            core::mem::size_of::<K>() == 40,
+            "tuple scan key must be 40 bytes"
+        );
         let fd = syscall::map_fd(self.bpf()?, name)?;
         let mut next = match cursor.next_key.take() {
             Some(key) => Some(key),

@@ -247,17 +247,34 @@ fn terminal_enoent_preserves_partial_count() {
 #[test]
 fn stopped_batch_resumes_at_saved_bucket_and_resets_at_end() {
     let mut cursor = None;
-    scan_with(spec(4, 4, BPF_F_LOCK), &mut cursor, |attr| {
-        assert_eq!(attr.in_batch, 0);
-        unsafe { (attr.out_batch as *mut u32).write_unaligned(17) };
-        attr.count = 1;
-        Ok(())
-    }, |_, _| true, |_, _| false).unwrap();
+    scan_with(
+        spec(4, 4, BPF_F_LOCK),
+        &mut cursor,
+        |attr| {
+            assert_eq!(attr.in_batch, 0);
+            unsafe { (attr.out_batch as *mut u32).write_unaligned(17) };
+            attr.count = 1;
+            Ok(())
+        },
+        |_, _| true,
+        |_, _| false,
+    )
+    .unwrap();
     assert_eq!(cursor, Some(17u32.to_ne_bytes()));
-    scan_with(spec(4, 4, BPF_F_LOCK), &mut cursor, |attr| {
-        assert_eq!(unsafe { (attr.in_batch as *const u32).read_unaligned() }, 17);
-        attr.count = 1;
-        Err(libc::ENOENT)
-    }, |_, _| true, |_, _| true).unwrap();
+    scan_with(
+        spec(4, 4, BPF_F_LOCK),
+        &mut cursor,
+        |attr| {
+            assert_eq!(
+                unsafe { (attr.in_batch as *const u32).read_unaligned() },
+                17
+            );
+            attr.count = 1;
+            Err(libc::ENOENT)
+        },
+        |_, _| true,
+        |_, _| true,
+    )
+    .unwrap();
     assert!(cursor.is_none());
 }

@@ -85,17 +85,20 @@ pub fn preparing_claim_interleaving_test(ctx: *mut __sk_buff) -> c_long {
         if ROUTING_HANDOFF_MAP
             .insert(key, FlowMapValue::new(scratch.handoff), BPF_NOEXIST as u64)
             .is_err()
-            || REDIRECT_TRACK
-                .insert(
-                    &scratch.redirect_key,
-                    FlowMapValue::new(scratch.redirect),
-                    BPF_NOEXIST as u64,
-                )
-                .is_err()
         {
             return TC_ACT_SHOT;
         }
         crate::auxiliary::aux_occupancy_add(honk_ebpf_common::conn::AUX_OCCUPANCY_HANDOFF_INSERTS);
+        if REDIRECT_TRACK
+            .insert(
+                &scratch.redirect_key,
+                FlowMapValue::new(scratch.redirect),
+                BPF_NOEXIST as u64,
+            )
+            .is_err()
+        {
+            return TC_ACT_SHOT;
+        }
         crate::auxiliary::aux_occupancy_add(honk_ebpf_common::conn::AUX_OCCUPANCY_REDIRECT_INSERTS);
         if mode == 5 {
             scratch.state.incarnation = aux_incarnation;

@@ -337,3 +337,21 @@ pub fn observe_reverse_udp(key: &TuplesKey) {
         let _ = mark_udp_seen(key, 1, None, None, None, None, 0, None, 0, 0, 0);
     }
 }
+
+// Keep reversed tuple storage off the LAN classifier's near-limit stack.
+#[inline(never)]
+pub fn local_udp_reply_seen(key: &TuplesKey) -> bool {
+    if super::is_short_lived_udp_traffic(key) {
+        return false;
+    }
+    let mut reversed = TuplesKey::default();
+    super::copy_reversed_tuples(key, &mut reversed);
+    lookup_udp_seen(&reversed).is_some_and(|state| state.is_wan_ingress_direction != 0)
+}
+
+#[inline(never)]
+pub fn observe_local_udp_reply(key: &TuplesKey) {
+    let mut reversed = TuplesKey::default();
+    super::copy_reversed_tuples(key, &mut reversed);
+    observe_reverse_udp(&reversed);
+}

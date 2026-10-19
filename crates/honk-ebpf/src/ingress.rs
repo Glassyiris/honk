@@ -647,6 +647,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
     // A local DNS listener must not short-circuit the configured traffic policy.
     if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port != 53 {
+        if crate::contrack::udp::local_udp_reply_seen(&pkt.tuples.five) {
+            return pass_through_classified(ctx);
+        }
         let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
         let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
             unsafe {
@@ -680,6 +683,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             && !probe.is_dae_socket
             && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
         {
+            crate::contrack::udp::observe_local_udp_reply(&pkt.tuples.five);
             return pass_through_classified(ctx);
         }
     }

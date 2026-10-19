@@ -34,7 +34,7 @@ fn scan_model<K, V: Copy>(
     chunk_size: usize,
     cursor: &mut super::FlowScanCursor,
     decode: impl Fn(&[u8; 40]) -> K,
-    visit: &mut dyn FnMut(&[(K, V)]) -> bool,
+    mut visit: impl FnMut(&[(K, V)]) -> bool,
 ) {
     let mut entries: Vec<_> = entries
         .filter(|(key, _)| cursor.next_key.is_none_or(|next| *key >= next))
@@ -44,7 +44,11 @@ fn scan_model<K, V: Copy>(
     let mut chunk = Vec::with_capacity(size);
     for (index, entries_chunk) in entries.chunks(size).enumerate() {
         chunk.clear();
-        chunk.extend(entries_chunk.iter().map(|(key, value)| (decode(key), *value)));
+        chunk.extend(
+            entries_chunk
+                .iter()
+                .map(|(key, value)| (decode(key), *value)),
+        );
         cursor.next_key = entries.get((index + 1) * size).map(|(key, _)| *key);
         if !visit(&chunk) {
             return;
@@ -1088,7 +1092,8 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
-        self.admission_pressure.store(pressured, std::sync::atomic::Ordering::Relaxed);
+        self.admission_pressure
+            .store(pressured, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -1259,8 +1264,13 @@ impl EbpfBackend for MockEbpfBackend {
         visit: &mut super::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
         scan_model(
-            self.redirect_tracks.iter().map(|(key, value)| (*key, *value)),
-            chunk_size, cursor, Self::bytes_to_redirect_tuple, visit,
+            self.redirect_tracks
+                .iter()
+                .map(|(key, value)| (*key, *value)),
+            chunk_size,
+            cursor,
+            Self::bytes_to_redirect_tuple,
+            visit,
         );
         Ok(())
     }
@@ -1272,8 +1282,14 @@ impl EbpfBackend for MockEbpfBackend {
         visit: &mut super::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
         scan_model(
-            self.routing_handoffs.lock().iter().map(|(key, value)| (*key, *value)),
-            chunk_size, cursor, Self::bytes_to_tuples_key, visit,
+            self.routing_handoffs
+                .lock()
+                .iter()
+                .map(|(key, value)| (*key, *value)),
+            chunk_size,
+            cursor,
+            Self::bytes_to_tuples_key,
+            visit,
         );
         Ok(())
     }
@@ -1285,8 +1301,14 @@ impl EbpfBackend for MockEbpfBackend {
         visit: &mut super::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
         scan_model(
-            self.tcp_conn_states.iter().chain(self.udp_conn_states.iter()).map(|(key, value)| (*key, *value)),
-            chunk_size, cursor, Self::bytes_to_tuples_key, visit,
+            self.tcp_conn_states
+                .iter()
+                .chain(self.udp_conn_states.iter())
+                .map(|(key, value)| (*key, *value)),
+            chunk_size,
+            cursor,
+            Self::bytes_to_tuples_key,
+            visit,
         );
         Ok(())
     }
@@ -1323,7 +1345,8 @@ impl EbpfBackend for MockEbpfBackend {
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.datapath_ready = false;
-        self.admission_pressure.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.admission_pressure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.listener_sockets_published = false;
         self.listener_socket_slots.clear();
         self.routing_generation = None;

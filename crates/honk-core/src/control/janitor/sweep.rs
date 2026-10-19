@@ -136,14 +136,15 @@ impl BpfJanitor {
     // Keep scan facts on retirement errors so conn-state drift still recalibrates.
     async fn sweep<K, V>(
         &self,
-        label: &'static str,
-        cursor_index: usize,
+        (label, cursor_index): (&'static str, usize),
         tuning: ScanTuning,
         for_each: impl FnOnce(
             &dyn EbpfBackend,
             &mut crate::ebpf::FlowScanCursor,
             &mut dyn FnMut(&[(K, V)]) -> bool,
-        ) -> anyhow::Result<()> + Send + 'static,
+        ) -> anyhow::Result<()>
+        + Send
+        + 'static,
         stale: impl Fn(&K, &V) -> bool + Send + 'static,
         request: impl for<'a> Fn(&'a (K, V)) -> RetireRequest<'a> + Copy + Send + 'static,
         pick_count: impl FnOnce(RetireCounts) -> u64 + Send,
@@ -210,10 +211,11 @@ impl BpfJanitor {
     ) -> anyhow::Result<(u64, usize)> {
         let (scan, retired) = self
             .sweep(
-                "conn-state",
-                0,
+                ("conn-state", 0),
                 tuning,
-                |ebpf, cursor, visit| ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
+                |ebpf, cursor, visit| {
+                    ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
+                },
                 move |key, state| conn_expired(key.l4proto, state, now_ns),
                 move |(key, expected)| RetireRequest {
                     key: *key,
@@ -246,10 +248,11 @@ impl BpfJanitor {
     ) -> anyhow::Result<AuxScanResult> {
         let (scan, retired) = self
             .sweep(
-                "redirect-track",
-                1,
+                ("redirect-track", 1),
                 tuning,
-                |ebpf, cursor, visit| ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
+                |ebpf, cursor, visit| {
+                    ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
+                },
                 move |key, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > redirect_timeout_ns(key, entry)
                 },
@@ -264,7 +267,8 @@ impl BpfJanitor {
                     },
                     kind: RetireKind::ExpiredRedirect {
                         expected,
-                        expired_before_ns: now_ns.saturating_sub(redirect_timeout_ns(key, expected)),
+                        expired_before_ns: now_ns
+                            .saturating_sub(redirect_timeout_ns(key, expected)),
                     },
                 },
                 |counts| counts.redirect,
@@ -287,10 +291,11 @@ impl BpfJanitor {
     ) -> anyhow::Result<AuxScanResult> {
         let (scan, retired) = self
             .sweep(
-                "routing-handoff",
-                2,
+                ("routing-handoff", 2),
                 tuning,
-                |ebpf, cursor, visit| ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit),
+                |ebpf, cursor, visit| {
+                    ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
+                },
                 move |_, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
                 },

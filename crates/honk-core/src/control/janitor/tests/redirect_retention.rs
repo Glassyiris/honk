@@ -18,23 +18,49 @@ async fn short_auxiliary_deadline_preserves_conn_and_other_udp_redirects() -> an
         let mut key = test_tuple(source, proto);
         key.src_ip[15] = port;
         key.dst_port = dest;
-        let entry = RedirectEntry { decision_token: token, incarnation, ..Default::default() };
+        let entry = RedirectEntry {
+            decision_token: token,
+            incarnation,
+            ..Default::default()
+        };
         model.redirect_track_store(&RedirectTuple::from_tuples(&key), &entry)?;
         if proto == IPPROTO_TCP {
-            model.tcp_conn_state_store(&key, &ConnState { incarnation, ..Default::default() })?;
-            if pinned { pins.retain_for_test(TcpFlowKey::from_tuples(&key)); }
+            model.tcp_conn_state_store(
+                &key,
+                &ConnState {
+                    incarnation,
+                    ..Default::default()
+                },
+            )?;
+            if pinned {
+                pins.retain_for_test(TcpFlowKey::from_tuples(&key));
+            }
         }
         cases.push((key, expired));
     }
     let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
     assert_eq!(janitor.cleanup_redirect_track_for_test(deadline).await.0, 0);
-    assert_eq!(janitor.cleanup_redirect_track_for_test(deadline + 1).await.0, 3);
+    assert_eq!(
+        janitor
+            .cleanup_redirect_track_for_test(deadline + 1)
+            .await
+            .0,
+        3
+    );
     let backend = backend.read().await;
     for (key, expired) in cases {
-        assert_eq!(backend.redirect_track_lookup(&RedirectTuple::from_tuples(&key))?.is_none(), expired);
+        assert_eq!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
+                .is_none(),
+            expired
+        );
         if key.l4proto == IPPROTO_TCP {
-            assert!(backend.conn_state_lookup(&key)?.is_some(), "redirect reclamation must not retire TCP authority");
+            assert!(
+                backend.conn_state_lookup(&key)?.is_some(),
+                "redirect reclamation must not retire TCP authority"
+            );
         }
     }
     Ok(())
@@ -50,12 +76,24 @@ async fn redirect_refresh_after_scan_supersedes_short_deadline_candidate() -> an
     let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
     let retained = Arc::clone(&backend);
     janitor.before_delete_hook = Some(Arc::new(move || {
-        retained.blocking_write().redirect_track_store(
-            &RedirectTuple::from_tuples(&key),
-            &RedirectEntry { last_seen_ns: now_ns, ..Default::default() },
-        ).unwrap();
+        retained
+            .blocking_write()
+            .redirect_track_store(
+                &RedirectTuple::from_tuples(&key),
+                &RedirectEntry {
+                    last_seen_ns: now_ns,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
     }));
     assert_eq!(janitor.cleanup_redirect_track_for_test(now_ns).await.0, 0);
-    assert!(backend.read().await.redirect_track_lookup(&RedirectTuple::from_tuples(&key))?.is_some());
+    assert!(
+        backend
+            .read()
+            .await
+            .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
+            .is_some()
+    );
     Ok(())
 }
