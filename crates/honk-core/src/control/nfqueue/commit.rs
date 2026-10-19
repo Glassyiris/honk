@@ -182,13 +182,13 @@ impl PendingUdpVerdicts {
     }
 
     fn discard_expired_commits(&self, batch: &mut Vec<CommitRequest>) {
-        batch.retain_mut(|request| {
-            if Instant::now() < request.deadline {
-                return true;
-            }
+        self.reject_expired_commits(take_expired_commits(batch));
+    }
+
+    fn reject_expired_commits(&self, expired: Vec<CommitRequest>) {
+        for mut request in expired {
             request.respond(Err(self.expire_commit(&request.cell)));
-            false
-        });
+        }
     }
 
     async fn process_commits(
@@ -218,8 +218,11 @@ impl PendingUdpVerdicts {
         if let Some(delay) = self.commits.after_lock_delay.lock().take() {
             std::thread::sleep(delay);
         }
-        self.discard_expired_commits(batch);
+        // Expiry drops held verdicts and retires endpoints; keep that I/O off backend W.
+        let expired = take_expired_commits(batch);
         if batch.is_empty() {
+            drop(backend);
+            self.reject_expired_commits(expired);
             return;
         }
         requests.extend(batch.iter().map(|request| UdpDecisionCommit {
@@ -235,6 +238,7 @@ impl PendingUdpVerdicts {
             })
         });
         drop(backend);
+        self.reject_expired_commits(expired);
         if let Err(error) = result {
             let fatal = PendingUdpFatal::new("commit batch", format!("{error:#}"));
             self.signal_fatal(fatal.clone());
@@ -377,6 +381,13 @@ impl PendingUdpVerdicts {
         }
         Ok(())
     }
+}
+
+fn take_expired_commits(batch: &mut Vec<CommitRequest>) -> Vec<CommitRequest> {
+    let now = Instant::now();
+    batch
+        .extract_if(.., |request| now >= request.deadline)
+        .collect()
 }
 
 #[cfg(test)]
