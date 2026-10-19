@@ -209,9 +209,19 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | 从 DNS 或嗅探结果学习的 IP，以及活动 policy 的域名谓词位图索引；已知但全零的条目仍会显示。 |
 | `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
 
-实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、TCP 归属发布失败计数（child 证明存储，以及 SYN 发布排他的资源错误）、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
+命令通过原始 `bpf(2)` 读取 pin，不加载程序或挂载 hook；通常需要 root 或合适的 BPF capability。`stats` 为下列计数器逐行输出规范标签与计数，并打印 `CONN_STATE_OCCUPANCY` 插入/删除水位计及非零的每出站包/字节计数。`BPF_STATS_MAP` 必须有九个槽位：工具/引擎版本不匹配时以 `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` 失败（旧版工具则相反），不错误标注计数器。请将工具与引擎/对象一起升级。
 
-`BPF_STATS_MAP` 的普通计数器使用共享的规范标签逐行输出，例如 `udp_conn_overflow: 0`；标签与单位不变。该 map 共七个槽位，移除 request 证明计数器时已重新编号，因此 `stats` 会拒绝其他大小的 map，而不是错误标注：请将工具与引擎/对象一起升级。
+| Key | 规范标签 | 计数对象 |
+| --- | --- | --- |
+| `0` | `udp_conn_overflow` | 不存在已有 tuple 时的 UDP conn-state 插入失败。 |
+| `1` | `tcp_conn_overflow` | TCP conn-state 插入失败。 |
+| `2` | `redirect_track_insert_failure` | Redirect-track 发布失败：map 插入失败或准备 scratch 不可用。 |
+| `3` | `routing_handoff_insert_failure` | Routing-handoff 发布失败：map 插入失败或准备 scratch 不可用。 |
+| `4` | `socket_identity_capture_failure` | socket 进程身份捕获或存储失败。 |
+| `5` | `tcp_child_proof_storage_failure` | 已接受 TCP child 的归属证明存储失败。 |
+| `6` | `tcp_publisher_claim_failure` | TCP SYN 发布排他声明插入失败，不含普通的同 tuple 竞争（`EEXIST`）。 |
+| `7` | `new_flow_rate_limited` | 被单源、每 CPU 新流限制丢弃的 LAN 流尝试。 |
+| `8` | `udp_reverse_learning_suspended` | conn 压力下，在 conn-state 查询未命中后被跳过的反向 UDP 学习尝试。 |
 
 `routing-handoff` 在读取前检查[handoff ABI](../design/datapath.md#map-清单)；请将工具与引擎/对象一起升级。
 

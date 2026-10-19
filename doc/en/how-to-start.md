@@ -40,11 +40,13 @@ CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
 CONFIG_BPF_JIT=y
 CONFIG_CGROUP_BPF=y
-CONFIG_NET_CLS_BPF=y|m
-CONFIG_NET_SCH_INGRESS=y|m
+CONFIG_NET_SCHED=y
 CONFIG_NET_CLS_ACT=y
+CONFIG_NET_XGRESS=y
 CONFIG_NET_NS=y
 ```
+
+The TCX backend needs `CONFIG_NET_XGRESS`, a hidden option selected by `CONFIG_NET_CLS_ACT`, not legacy `CONFIG_NET_CLS_BPF` or `CONFIG_NET_SCH_INGRESS`. See [hook and qdisc ownership](./design/datapath.md#interface-hook-sets).
 
 Held-first-packet UDP, which is enabled by default, additionally requires:
 

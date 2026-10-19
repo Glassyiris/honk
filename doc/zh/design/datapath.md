@@ -40,7 +40,7 @@ flowchart LR
 
 ### 接口挂钩集合
 
-以太网接口使用 `_l2` 程序；没有以太网头的接口使用 `_l3`。流量可能绕过 master qdisc，因此 bridge 和 bond slave 也安装等价且由进程持有的挂钩。
+以太网接口使用 `_l2` 程序；没有以太网头的接口使用 `_l3`。流量可能绕过 master 的挂钩，因此 bridge 和 bond slave 也安装等价且由进程持有的挂钩。
 
 | 拓扑 | LAN 侧挂钩 | WAN 侧挂钩 |
 | --- | --- | --- |
@@ -48,7 +48,11 @@ flowchart LR
 | LAN/WAN 共用接口的单网卡 | `lan_ingress` | `wan_egress`；跳过 `lan_egress` 和 `wan_ingress` |
 | 未配置 LAN 接口的纯 WAN | 无 | `wan_ingress` + `wan_egress` |
 
-`lan_ingress` 对转发的客户端流量分类。`wan_egress` 独立地对主机创建的流量分类。拓扑提供独立方向时，反向 ingress/egress 挂钩刷新连接状态。
+`lan_ingress` 对转发的客户端流量分类。`wan_egress` 独立地对主机创建的流量分类。拓扑提供独立方向时，反向 ingress/egress 挂钩刷新已有连接状态。只有正向 TCP SYN 发布 TCP 状态：反向的纯 SYN 既不创建也不刷新它。
+
+Linux 6.12+ 上，Aya 使用 FD 持有的 TCX BPF link；启动、重绑定和关闭只释放自有 link。honk 既不创建也不删除物理接口上的 `clsact` qdisc 或旧式 filter；不需要的遗留项请手动移除。启动时会重建遗留的 `dae0`/`dae0peer` 对。内核选项见[开始使用](../how-to-start.md#内核配置)。
+
+不写 mark 且不受所有权 guard 保护的直通退出点返回 `TC_ACT_UNSPEC`（`-1`，TCX `NEXT`），包括反向刷新与跳过 DNS，让后续 TCX 程序继续运行。最低支持内核上的 `TC_ACT_PIPE` 不是继续动作。写入 mark 的路径（包括显式写零的 WAN 路径）、LAN classified/pending 及 WAN 精确 socket-mark/classified 所有权 guard 返回 `TC_ACT_OK`（`0`，TCX `PASS`），终止链。
 
 ### 动态接口协调
 
@@ -60,19 +64,19 @@ flowchart LR
 
 | 程序 | 挂钩 | 内核职责 |
 | --- | --- | --- |
-| `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/控制平面及非 DNS 本地流量，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数，以及可选的歧义 UDP 暂存。 |
+| `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/控制平面及非 DNS 本地流量，执行单源新流限制，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数、分片 verdict 记录，以及可选的歧义 UDP 暂存。 |
 | `wan_ingress_l2`, `wan_ingress_l3` | WAN TC ingress | 刷新反向连接状态；单网卡拓扑不挂载。 |
-| `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态，但来自 `dae0` 的 UDP 包只刷新已有条目、不创建新条目；并抑制本机生成的 ICMPv6 Redirect 数据包；单网卡拓扑在共用接口上跳过。 |
+| `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态，不从 `dae0` 的 UDP 包创建新条目；抑制本机生成的 ICMPv6 Redirect。单网卡拓扑在共用接口上跳过。 |
 | `wan_egress_l2`, `wan_egress_l3` | WAN TC egress | 路由主机发起的 TCP/UDP，使用进程名与控制平面 bypass 数据，检查出站连通性，缓存决策并重定向代理流量。 |
-| `dae0_ingress` | 主机 `dae0` 的 TC ingress | 反查 `REDIRECT_TRACK`，恢复原始 MAC/接口交付，并统计 RX 流量。没有精确记录的 UDP 回复改用客户端的 `CLIENT_REPLY_TRACK` 帧信息，且不计入 RX。 |
-| `dae0peer_ingress` | `daens` `dae0peer` 的 TC ingress | 在链路 scrub 后恢复 UDP53 provenance 与 SYN incarnation；TC 只分配 UDP。TCP 先保留原生 established/TIME_WAIT 查找，再选择监听器。 |
+| `dae0_ingress` | 主机 `dae0` 的 TC ingress | 从 `REDIRECT_TRACK` 恢复回复帧信息与 RX 归属，或使用不计数的客户端回退；[续期符合条件的 UDP owner](#udp-生存期续期)。 |
+| `dae0peer_ingress` | `daens` `dae0peer` 的 TC ingress | 在链路 scrub 后恢复 UDP53 provenance 与 SYN incarnation；分配 UDP listener。TCP 保留原生 established/TIME_WAIT 查找。 |
 | `tproxy_sk_lookup` | `daens` 中的 `sk_lookup` | 用 `LISTEN_SOCKET_MAP` 中的透明监听器覆盖普通套接字查找。 |
 | `tproxy_wan_cg_sock_create` | cgroup `sock_create` | 保留套接字首次捕获的进程身份；捕获失败只计数，创建照常进行。 |
 | `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | 保留已有身份，缺失时在 connect 前捕获；捕获失败只计数，连接照常进行。 |
 | `tproxy_wan_cg_sendmsg4`, `tproxy_wan_cg_sendmsg6` | cgroup `sendmsg4`, `sendmsg6` | 保留已有身份，缺失时在发送前捕获；捕获失败只计数，发送照常进行。 |
 | `honk_tcp_passive` | cgroup2 根上的必需 `sock_ops` | 在自有 `daens` 内 child 的 `PASSIVE_ESTABLISHED_CB` 上，验证 child 的 tuple、ISN 与 conn/handoff/redirect incarnation，再把已证明的 handoff 写入 child 的 socket storage。 |
 
-`LISTEN_SOCKET_MAP` 的 key 固定为：`0` TCP4、`1` TCP6、`2..=5` UDP4、`6..=9` UDP6。UDP 用流稳定 hash 在每个地址族的四个监听器中选择一个。`tproxy_sk_lookup` 中读取 IPv4 和 IPv6 key 的函数保持为分离的 `#[inline(never)]` 子程序。在优化级别 2 下，内联会让 LLVM 把地址族分支变为按计算偏移读取 lookup context；verifier 会以解引用已修改 context 指针为由拒绝它。
+`LISTEN_SOCKET_MAP` 的 key 固定为：`0` TCP4、`1` TCP6、`2..=5` UDP4、`6..=9` UDP6。所有 UDP 路径共用 `udp_listener_index`，输入为源/目的地址的低位地址字及端口，均取主机字节序。`tproxy_sk_lookup`（`src/sk_lookup.rs`）的 IPv4/IPv6 context 读取须保留为分离的 `#[inline(never)]` 子程序：优化级别 2 下，内联可能产生计算偏移读取，被 verifier 以解引用已修改 context 指针为由拒绝。
 
 TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` 函数。它们不用 Aya 的 `#[tc]` 宏，因为该宏的结构化参数形状在 7.0 及更高版本内核上触发 verifier 拒绝。程序主体返回 `Verdict = Result<c_long, c_long>`（`action::Verdict`）：`Ok` 表示正常路径，`Err` 表示提前退出，但两者都携带真实的 `TC_ACT_*` 值，`flatten` 把任一变体归约为内核的 `i32` verdict。`flatten` 由 `action::flatten` 定义，`src/action.rs` 持有 `TC_ACT_*`。解析器与辅助函数的哨兵值（如 `transport::ERR_FALLBACK`、`ERR_FRAGMENT`、`PASS_UNSUPPORTED`）与 verdict 分离；`bpf_loop` 回调用于控制是否继续执行的返回值也独立。
 
@@ -81,10 +85,9 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 - `lan_ingress_l2/l3` — LAN 分类、路由和重定向，以及有序策略下的 DNS 所有权、`CLASSIFIED_MARK` 去重；NFQUEUE 已启用且 ready 时，仅将有歧义的非 DNS UDP 决策以唯一 token 暂存为 Pending；已启用但未 ready 时 fail-closed（`src/ingress.rs`）。
 - `wan_ingress_l2/l3` — 反向 conntrack 刷新，单网卡时跳过。
 - `lan_egress_l2/l3`、`wan_egress_l2/l3`（`src/egress.rs`）— 反向 conn state；本机流量路由（经实际 skb socket 的 `SOCKET_IDENTITY` 匹配 pname、控制面旁路、`OUTBOUND_CONNECTIVITY_MAP` 活性及重定向控制面）。存活的非 DNS WAN UDP 条目只查询缓存路由；未命中时求值一次路由，再发布完整 conntrack 元数据。
-- `dae0_ingress` — 回复路径：按 `RedirectEntry.outbound` 统计 RX 流量、重写 MAC 并重定向到原 LAN 接口。客户端从未联系过的对端发来的 UDP 回复使用仅含客户端的记录，不归属任何出站；来自 honk 自身链路地址的回复永不使用。
+- `dae0_ingress` — 重写回复 MAC，并重定向到原 LAN 接口。未知对端的 UDP 回复使用客户端帧信息，不归属任何出站；honk 自身链路源地址从不使用该回退。
 - LAN egress 仅抑制本机发起的 ICMPv6 Redirect，使用扩展头遍历后的 ICMPv6 header；转发的 Redirect 与其他 ICMPv6 仍放行。`honk-core/tests/ebpf_datapath_test.rs` 通过 `BPF_PROG_TEST_RUN` 检查 L2、通过隔离 TUN 接口检查 L3，并覆盖精确 tuple RX 计数与 cached-route 策略。
-- `dae0peer_ingress` — 在 `daens` 恢复 UDP53 路由/代际 provenance 与 TCP SYN incarnation；只有 UDP 使用 TC `bpf_sk_assign`。TCP 先经过原生 established/TIME_WAIT 处理，再进入现有 `sk_lookup` listener hook。
-- `tproxy_sk_lookup`（`src/sk_lookup.rs`）— 透明 listener：key 0/1 为 TCP4/TCP6，2..5 为 UDP4，6..9 为 UDP6。v4/v6 UDP listener-key 读取保留在 `#[inline(never)]` 子程序中。opt-level=2 时，LLVM 会把地址族分支转成通过计算 ctx offset 的 load，导致 verifier 报告 "dereference of modified ctx ptr"；新的分支选择 ctx 读取须保留此形态。
+- `dae0peer_ingress` — 恢复 UDP53 provenance 与 TCP SYN incarnation；按重定向点的 `cb[4]` 标记 `0x100 | index`，用 `bpf_sk_assign` 分配 UDP，不解析报文字节。缺少标记时 UDP 留给 `sk_lookup`；TCP SYN 保留其 `cb[3]`/`cb[4]` incarnation 载体及原生 established/TIME_WAIT 处理。
 - cgroup sock_create/connect4/6/sendmsg4/6（`src/cgroup.rs`）— 原生 socket storage 保留首次捕获的 `SocketIdentity{pid, pname}`，供进程名规则及控制面旁路使用；`pname` 通过运行时 kernel-BTF offset 读取 `argv[0]` 可执行文件 basename，限制为 15 字节，不可用或读取失败时回退到线程 `comm`。内核在 socket 对象销毁时回收 storage，不再有 release hook 或 cookie janitor。缺失必需的 cgroup/storage 支持会拒绝启动。这些 hook 挂在根 cgroup 上，因此身份捕获失败（storage 分配或 optmem 计费失败）不会拒绝宿主机操作：只计数，该 socket 的流量没有身份，进程名规则不会匹配它。honk 自身的 socket 仍通过 `dae_socket_mark` 识别。
 
 ## Map 清单
@@ -107,8 +110,13 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
 | `SOCKET_IDENTITY` | 不克隆的 `SK_STORAGE`，保存 socket 首次捕获的 PID/可执行文件 basename。存储跟随实际 socket 生命周期，不受固定 hash 项数或用户态过期清理约束。WAN TC 只查询；cgroup create/connect/sendmsg 同步捕获缺失的身份。 |
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 插入/内核删除计数，结合实际用户态删除计数估算占用。此路径不再由内核删除 tuple，故内核删除计数保持零。 |
-| `BPF_STATS_MAP` | 七个计数器：UDP/TCP conn-state overflow、redirect/handoff 插入失败、socket 身份捕获失败、child 证明存储失败，以及普通同 tuple 竞争之外的 SYN 排他失败。TCP 归属计数增长时 janitor 会告警，`honk-tool bpf stats` 会打印它们。 |
+| `AUX_OCCUPANCY` | 两槽 per-CPU redirect/handoff 插入计数器；用户态减去实际删除数。 |
+| `ADMISSION_PRESSURE` | Janitor 写入的 conn-state 压力锁存；辅助 map 压力不会将其置位。 |
+| `NEW_FLOW_RATE` | 16,384 项 per-CPU LRU hash，以 LAN 源地址为键。每个 CPU 为单源新流限制保存一个一秒 `(second, count)` 窗口。 |
+| `FRAG_VERDICT` | 4,096 项 LRU，以源、目的、协议与 IP identification 为键；见[分片处置记录](#重定向数据报的分片)。 |
+| `BPF_STATS_MAP` | 由 [`honk-tool bpf stats`](../reference/cli.md#bpf) 公开的计数器；标签与布局不匹配说明见该参考页。 |
 | `EVENT_RINGBUF` | 262,144 字节 ring，记录为 80 字节，包含功能性的 tuple/incarnation 过期提示。Producer 直接预留并初始化 ring 存储，不再经有界 TC 栈复制事件。 |
+| `FLOW_EXPIRY_HINT` | 私有的 4,096 项 per-CPU LRU hash，以 tuple 为键，保存最近一次提示的 incarnation 与时间戳。仅尽力抑制重复 `FlowExpired` 提示，从不持有流或提供回收授权。 |
 | `UDP_DECISION_SEQUENCE` | NFQUEUE 决策身份的单槽 pinned allocator 状态；协议细节见 [NFQUEUE](./nfqueue.md)。 |
 | `FLOW_INCARNATION_SEQUENCE` | 按代持有、spin-lock 保护、不可回绕的 56 位身份域，以 `u64` 表示；独立于持久化 UDP decision token。 |
 | `RETIRE_FENCE`、`RETIRE_ACTIVE` | 不预分配的 65,536 项规范 tuple fence 加单槽 active 标志；每个 fence 保存独立的操作 owner 与 decision token。 |
@@ -137,6 +145,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 `crates/honk-ebpf-common/src/conn.rs` — `ConnState`（含 `UdpDecisionState` 与 `decision_token`）、`ParseTransportCtx`、`BpfStatsKey`、`TcpState`，以及与用户态共享的辅助项过期时限。
 `crates/honk-ebpf/src/maps.rs` — 静态 TC map 声明与内核侧容量。
 `crates/honk-ebpf/src/contrack.rs` 持有 incarnation 分配、内核私有的 `ConntrackArgs` scratch 与共享的生命周期检查；`contrack/tcp.rs` 持有 SYN 分类与 TCP 发布，`contrack/udp.rs` 持有 UDP claim/发布/中止协议。`flow.rs` 持有加锁快照/投影；`auxiliary.rs` 持有辅助项过期、LAN 与 WAN 共用的 `AuxPrep` 发布策略、身份匹配的刷新与稳定发布。
+
 `crates/honk-ebpf/src/route.rs` — 静态 root/slot facade 与固定 ABI dispatch；生成的 policy code 由用户态加载。
 `crates/honk-ebpf/src/tcp_binding.rs` 与 `honk-core/src/ebpf/real/tcp_binding.rs` 持有必需的 SYN 发布桥与 `honk_tcp_passive` child 证明；二者都不读取内核内存，因此 TCP 不需要任何内核结构偏移。Peer ingress 恢复后，SYN 使用 mark 低 24 位与 priority 的 32 位携带 56 位身份；request 证明移除后，TCP 不再有该载体的读取方，写入方的移除推迟处理。身份耗尽后拒绝发布，不回绕。
 
@@ -148,7 +157,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 有两个窗口以重试或重新发布代替拒绝。内核先把 child 放入 accept 队列，再执行 `PASSIVE_ESTABLISHED_CB` 回调，因此已经在运行的 acceptor 可能在证明写入前看到该 child（x86 回环实测中位数约 1 µs、最坏约 17 µs；ARM64 仅有源码分析给出的上界）；`adopt_tcp_flow` 对缺失的证明间隔 1 ms 重试三次，之后才关闭 socket。仍存活的 request 的重传 SYN 若在 30 秒 handoff 时限之后到达，会发现发布已老化，在旧 request 仍存活时发布新的 incarnation 与路由快照；ISN 匹配的 child 绑定到当时有效的 incarnation，因此沿用替代者的路由。
 
-归属检查内联在 TC 分类程序中，会提高 verifier 成本。在 Linux 6.12.94 aarch64 上，最大的分类程序需验证 464,596 条指令（`verified_insns`），而引入归属证明前的 beta.82 发行版为 74,469。早期在 TC 内读取 held request 的设计，`wan_egress_l2` 约为 472k，因此移除 request 读取几乎没有降低成本，该数值接近内核 100 万上限的一半。启动时间的大部分花在加载四个路由目标上。给分类程序增加状态检查的改动，应报告改动前后的 `verified_insns`。实测把 helper 拆成 static 或 global BPF 函数并不能降低该成本：增长来自 verifier 的状态路径，而不是重复代码。
+历史归属证明构建中，最大的分类程序在 Linux 6.12.94 aarch64 上验证了 464,596 条指令（`verified_insns`），而引入归属证明前的 beta.82 发行版为 74,469。增加状态检查的改动应在同一 fixture 上报告改动前后的 `verified_insns`。
 
 `crates/honk-ebpf-common/src/event.rs` — 固定布局的 ring event，包括 conntrack overflow 与 UDP decision-token exhaustion。
 `crates/honk-ebpf-common/src/dae_ip.rs` — `In6Addr` union 与 v4-mapped helper。
@@ -178,15 +187,32 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 ### DNS 与本地监听器优先级
 
-LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后执行一次正常有序策略，不单独扫描 must 规则。[流量规则所有权](../reference/routing.md#出站目标与-must)决定原生、丢弃、原始转发或控制器路径。具体地址或通配地址的本地 `:53` 监听均不能覆盖该策略。端口 `53` 仍豁免 LAN 出站健康检查丢包，但不豁免已选用户 `must` 结果。
+LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后执行一次正常有序策略，不单独扫描 must 规则。[流量规则所有权](../reference/routing.md#出站目标与-must)决定原生、丢弃、原始转发或控制器路径。具体地址或通配地址的本地 `:53` 监听均不能覆盖该策略。端口 `53` 仍豁免 LAN ingress 与 WAN egress 上的出站健康检查丢包，但不豁免已选用户 `must` 结果。
 
 只有非 DNS 流量继续在流量策略之前探测本地 socket。探测使用报文所在的当前网络命名空间（负 netns ID），不是相对命名空间 ID `0`；匹配的非 honk socket 可以接收，通配匹配还要求完整 FIB 返回 `NOT_FWDED`。原有 TCP 纯 SYN 跳过探测的行为保留。解析后的目的端口 `53` 请求，在标记非零且完全匹配控制平面 bypass mark 时保留原生投递；普通请求继续执行路由，不探测本地监听器。后端回包仍受既有非 53 策略约束。空 bind 不代表关闭透明 DNS。
 
 实际本地 socket 的优先接收不等于所有网关地址强制直连。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面；需要时使用[显式用户规则](../reference/routing.md#显式本地路由)。
 
 原生直连仍受外部防火墙/NAT 影响；它与 `asis` 及客户端侧 anyfrom 回复的区别见[DNS 来源边界](./dns.md#入口路径)。
-LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 NFQUEUE](./nfqueue.md#lan-dns-分片)；未分片查询仍走 TC redirect。不创建普通 UDP conn-state 或 decision token；持久化路由代际计数器隔离重启前的排队元数据，不增加分片缓存或配置键。
+UDP53 不创建普通 UDP conn-state 或 decision token。LAN 查询分片需要控制器或原始组处理时，使用[内核重组与 NFQUEUE](./nfqueue.md#lan-dns-分片)；未分片查询仍走 TC redirect。持久化路由代际计数器隔离重启前的排队元数据。其他数据报遵循[分片处置记录](#重定向数据报的分片)。
 
+### 单源新流限制
+
+每个 LAN 源地址有始终开启、不可配置的 **256 次新流尝试/秒/CPU** 预算，使用固定一秒窗口：纯 TCP SYN（含重传）、未缓存流的首个普通 UDP 包，以及任一端口为 53 的每个被路由 UDP 包。direct 与代理流共用预算；同一个 NAT 路由器/接入点源地址后的所有客户端也共用预算。超额尝试在状态分配前丢弃，增加 `honk-tool bpf stats` 中的 `new_flow_rate_limited`，计数增长时 janitor 记录 WARN。本地服务回复学习共用预算，但不丢弃请求（见[反向学习](#反向-udp-学习与-conn-压力)）。LRU 淘汰会忘记近期计数；限制不覆盖主机发起的 WAN 流量、已缓存流的辅助项重建，以及大量伪造源地址。
+
+### 重定向数据报的分片
+
+在 `lan_ingress`/`wan_egress`，首个分片（more-fragments 置位、偏移 0）的 verdict 为 `TC_ACT_SHOT` 或 `TC_ACT_REDIRECT` 时，进入 `FRAG_VERDICT` 保留 30 秒；匹配的后续分片丢弃，不为代理重组。其他首片 verdict 清除旧记录，保留 direct/staged/pending 流量。任一端口为 53 的 UDP 被排除；LAN DNS 保留[原生重组](./nfqueue.md#lan-dns-分片)。无法解析的微小首片放行。后续片先到达、记录过期/被淘汰/无法插入，或 IPv6 链为 Fragment → Destination Options → UDP（首片与后续片协议键不同）时，后续片可能放行。
+
+### 反向 UDP 学习与 conn 压力
+
+本地非 honk UDP 请求原生放行；创建其反向回复 tuple 消耗[单源预算](#单源新流限制)，缓存命中的请求与回复绕过 socket/FIB 探测。预算耗尽时跳过学习，不丢弃请求，也不增加 `new_flow_rate_limited`，因此回复可能作为新流路由。`wan_ingress`/`lan_egress` 也学习反向 tuple，不受该预算约束；反向观察不覆盖正向所有权。即使本地服务关闭，持续请求仍会续期学习条目，保持原生绕过，直到 [UDP 空闲超时](#udp-生存期续期)。
+
+`ADMISSION_PRESSURE` 置位时，反向学习只查询：未命中增加 `udp_reverse_learning_suspended`，新观察到的服务回复可能作为新流路由，已有条目仍有效。压力之外，不请自来的反向观察可以抢先占据之后正向流的同一 tuple，使其原生放行。
+
+### UDP 生存期续期
+
+UDP conn state 的空闲超时为 120 秒，由正向流量、拓扑具备的 `wan_ingress`/`lan_egress` 反向 hook，以及经 `dae0_ingress`、精确匹配非 DNS `REDIRECT_TRACK` 的回复每秒至多续期一次。精确回复只在加锁检查身份/状态/fence 后续期匹配的存活 owner（含绑定 token 的代理流），不创建状态。无状态端口 53 UDP、`Preparing`、`Aborted`、已过期、`Pending`、`DirectArmed` 及 `CLIENT_REPLY_TRACK` 回退均不续期。代理回复在单网卡与双网卡网关上均有效；单网卡原生 direct 流量不增加反向 hook。用户态计时器见[长连接](../operations/long-connections.md)。
 
 ### 特殊与内部流量
 
@@ -200,7 +226,9 @@ LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 N
 
 ### 出站存活状态
 
-用户态把 group-OR 健康状态发布到 `OUTBOUND_CONNECTIVITY_MAP`。若新 LAN 流被路由到显式标为失效的槽，内核以 `TC_ACT_SHOT` 丢弃；这是有意的 fail-closed 行为。唯一的窄例外是：未配置 `final` 且只有一个唯一叶节点的 TCP 组保持槽开放，使真实流量可经同一代理尝试并验证恢复，而不会隐式回退到 `direct`。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。含有 `direct`/`block` 内建成员的组永不失活：内建节点不会被判定死亡，因此 group-OR 槽保持开放。LAN ingress 上的 TCP 和 UDP 目的端口 `53` 均豁免该健康检查丢包，但仍遵循上述 DNS 所有权规则。网关管理访问不再由自动地址规则保障。
+用户态把 group-OR 健康状态发布到 `OUTBOUND_CONNECTIVITY_MAP`。若新 LAN 流被路由到显式标为失效的槽，内核以 `TC_ACT_SHOT` 丢弃；这是有意的 fail-closed 行为。唯一的窄例外是：未配置 `final` 且只有一个唯一叶节点的 TCP 组保持槽开放，使真实流量可经同一代理尝试并验证恢复，而不会隐式回退到 `direct`。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。含有 `direct`/`block` 内建成员的组永不失活：内建节点不会被判定死亡，因此 group-OR 槽保持开放。LAN ingress 与 WAN egress 上的 TCP 和 UDP 目的端口 `53` 均豁免该健康检查丢包，但仍遵循上述 DNS 所有权规则；该豁免从不绕过已选策略。网关管理访问不再由自动地址规则保障。
+
+TCP 健康检查只作用于新 SYN 发布；已建立及缓存命中的重传 TCP 不受后续健康变化影响。UDP 在普通 LAN redirect 与 WAN 路由/缓存路径上逐包检查健康，但原生 direct 卸载和已提交、绑定 token 的 LAN `Proxy` redirect 除外。配置的 UDP block 保持 final。
 
 ### 路由时 direct 卸载
 
@@ -220,19 +248,21 @@ LAN UDP/53 分片需要控制器或原始组处理时，使用[内核重组与 N
 
 ## 准入顺序
 
-挂钩安装期间，`DATAPATH_STATE_MAP[0]` 保持为零。此状态下 TC 程序原样放行流量。控制平面绑定监听器，原子发布完整 TCP/UDP FD 集合，启动接收循环，建立所有已启用的 NFQUEUE readiness，之后才写入非零准入值。因此，不完整的监听器 generation 无法把流量重定向到不存在的套接字。
+`DATAPATH_STATE_MAP[0]` 保持为零、原样放行流量，直到所有挂钩安装完成、listener 绑定并发布完整 TCP/UDP FD 集合、接收循环启动，且已启用的 NFQUEUE ready。纯 WAN 部署也必须挂载 `dae0_ingress`；失败会在准入前中止启动。
 
 关闭时，系统先在适用时阻止新的 NFQUEUE 暂存，在拆除监听器前关闭 `DATAPATH_STATE_MAP[0]`，然后 drain 并 detach producer。准入 map 操作失败是 fatal，而不会在所有权不明确的状态下静默继续。
 
 ## 用户空间维护与计数
 
-`BpfJanitor` 每两秒唤醒一次。已接受 TCP relay 在其生命周期内 pin 对应的 `CONN_STATE_MAP` 和 `REDIRECT_TRACK` 项。未 pin 的 TCP closing 状态在 10 秒后过期；未 pin 的 active TCP 和 UDP 状态使用 120 秒 backstop。
+`BpfJanitor` 每两秒唤醒。已接受 TCP relay 在其生命周期内 pin conn 与 redirect 项；未 pin 的 closing TCP 在 10 秒后过期，未 pin 的 active TCP 使用 120 秒 backstop，UDP 遵循[空闲续期](#udp-生存期续期)。未 pin 的 TCP 及无状态 token/incarnation `0/0` UDP53 redirect 在 30 秒后回收，不删除 conn state；其他 redirect 保留内核的 120 秒过期。
 
-Conn-state sweep 通常每 60 秒运行。占用率达到 70% 时，间隔降为 15 秒；达到 85% 时进入 pressure mode，每个两秒 tick 都执行 sweep。内核 overflow 计数增长也会启动 pressure mode，作为 fail-closed 的最后保障。`CONN_STATE_OCCUPANCY` 合并 per-CPU 内核插入/删除、用户空间删除计数，以及 sweep 时的精确重新校准。有界 auxiliary map 扫描（`REDIRECT_TRACK`、`ROUTING_HANDOFF_MAP`）在最近一次扫描未完成或覆盖至少 85% 的 65,536 项容量时，使用 8 秒的激进清理周期。socket 身份不参与清扫。
+conn/redirect/handoff 的最高占用率决定每张 map 的清理节奏与候选预算：通常为 60 秒/1,024 项，70% 时为 15 秒/2,048 项，85% 时为两秒 tick/4,096 项。Overflow 计数增长、辅助扫描未完成或覆盖率 ≥85% 也会触发压力节奏。各 map 游标继续有界扫描，只有完整遍历才用新鲜插入/删除计数及用户态删除记录校准占用。独立的 `ADMISSION_PRESSURE` 锁存只取 conn-state 占用率（70% 置位、低于 60% 清除）。socket 身份不清扫。
 
-内核命中过期项时发出 advisory hint 并拒绝触发报文，不再先 lookup 后 delete。现有 removal worker 合并 TCP、UDP 和过期任务，每批最多 128 项；每个 tuple 只取得一次 fence，完成一次内核 grace 后重新验证捕获的所有权与过期条件，只释放自身 fence。Hint 不经过诊断日志限速；ring/queue 压力可能丢失 hint，由普通 sweep 兜底，过载下不承诺统一的短恢复时限。
+Overflow、conn/辅助占用或健康统计读取失败时，保留上次样本（初始为零），至多每 10 秒记录一次 WARN 并指明失败信号，不停止清扫。漏读 overflow 不计为退出压力所需的安静轮次；校准要求新鲜计数。日志区分 conn/redirect/handoff 占用，overflow WARN 要求计数确实增长。退役或准入压力发布失败仍为 fatal，并记录完整原因链。
 
-Janitor 的 conn/redirect/handoff 清理及暂存 UDP commit 共用该排他协议。TCP pin 在 backend 写锁内重新检查，该锁同时排除新的接管。错误也保留实际部分删除计数；无法解决的 fence 所有权禁止准入并触发 fatal。已准入的 worker/janitor 清理会在关闭告警后继续 join，不因超时而丢弃。
+内核过期会拒绝报文并发出 advisory hint，不删除状态。UDP handoff 若仍匹配存活 conn 的 token/incarnation，则即使超过其名义的 30 秒，也在加锁检查身份后原地续期，每秒至多一次；不匹配仍拒绝。`FLOW_EXPIRY_HINT` 将缓存中的 tuple/incarnation 合并为每 CPU 每秒一个提示；新 incarnation 重置抑制，淘汰/插入失败可丢失记录，ring 预留失败也消耗已记录的间隔。Hint 独立于诊断日志限速，不授予回收权；ring/queue 丢失由 janitor 清扫兜底，过载下不保证及时恢复。
+
+Removal worker 每批最多处理 1,024 项 TCP/UDP/过期请求，使用 [NFQUEUE fence/grace 协议](./nfqueue.md#精确-tuple-退役)，对规范 tuple 去重并保留首个 token 及获取/释放顺序。TCP pin 在后端写锁内复验，已准入的清理在关闭告警后继续 join。实际 UDP conn 删除触发[精确 endpoint 退役](./control-plane.md#tcp-中继与-conn-state-所有权)。
 
 每个出站的流量计数器均为 per-CPU。路由结果产生时，`lan_ingress` 对重定向和 direct 卸载结果都统计 TX 数据包与字节。`dae0_ingress` 在 `REDIRECT_TRACK` 识别返回流量所属出站后统计 RX 数据包与字节；经 `CLIENT_REPLY_TRACK` 交付的回复没有对应出站，不计数。未分类的直通流量与丢包没有出站计数。
 

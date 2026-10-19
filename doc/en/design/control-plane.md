@@ -158,7 +158,7 @@ Reload advances a cancellation epoch before waiting. Initializers capture that e
 
 A compatible same-name raw-group `Ready` session may persist across reload. This does not extend initializer lifetime: `Initializing` never survives reload, and stale queued route metadata still fails admission after a compiled-policy publication.
 
-For NFQUEUE ingress, client/destination-keyed `PendingUdpVerdicts` carries only token, endpoint generation, phase, FIFO verdict guards, and final direct mark. Endpoint admission takes owned `Bytes` for the one retained NFQUEUE payload allocation. Direct/block completion removes the initializer as a kernel handoff; proxy completion transfers its token/generation into `Ready`. The [NFQUEUE protocol](./nfqueue.md#terminal-transitions) defines ordered terminal transitions, the absolute deadline, and fatal failure handling.
+For NFQUEUE ingress, `PendingUdpVerdicts` owns token/generation, phase, FIFO verdict guards and final direct mark. Admission takes owned `Bytes` for the one retained payload; direct/block completion hands the initializer to the kernel, while proxy transfers its identity into `Ready`. Commit ordering, deadlines and lifecycle belong to the [NFQUEUE protocol](./nfqueue.md#terminal-transitions).
 
 ## Queue and descriptor budgets
 
@@ -209,7 +209,7 @@ Admission ceilings are distinct:
 | Port-53 ingress slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
 
-There is no separate 256-entry TCP slow-path ceiling. TCP accepts use the descriptor-derived flow budget. The existing removal worker multiplexes bounded TCP, UDP and expiry-hint inputs into batches of at most 128 with one kernel grace period per batch. UDP removal retains its 1024-message channel and deduplicating `removal_dirty` compensation; exact tombstones are acknowledged only after owned I/O and backend retirement finish.
+TCP accepts use the descriptor-derived flow budget, not a separate 256-entry ceiling. The [joined removal worker](./datapath.md#userspace-maintenance-and-accounting) serves TCP, UDP and expiry hints; UDP retains its 1024-message channel and deduplicating `removal_dirty` compensation. Exact tombstones are acknowledged only after owned I/O and backend retirement finish.
 
 Transparent TCP waits for either IP-family listener to become readable before reserving a shared flow permit, then completes the accept with a nonblocking syscall. An idle listener therefore consumes no flow capacity, while connections that arrive at the limit remain in the kernel listen backlog. The `tcp` object in `/stats` exposes `activeFlows`, `limit`, and `capacity.rejected`; the latter counts accept-loop waits for a permit rather than drops after accept. Startup warns when the elastic ceiling is below 256; raise the service `RLIMIT_NOFILE` limit for gateway deployments.
 
@@ -236,7 +236,7 @@ Janitor collection excludes pinned TCP before spending its candidate budget and 
 
 After I/O completes, the joined retirement worker owns admitted TCP retirement, its socket, tracker/close completion and outbound statistics guard even if the waiter is cancelled. Its `FlowPin` releases both local and exact native pins under the same backend write guard before checking external owners; a release failure cannot acknowledge cleanup. Cancellation before admission drops the native pin synchronously and leaves physical tuple reclamation to the atomic janitor, without claiming confirmation. The control plane's `RetirementPort` routes native Drop errors to the current worker epoch's critical channel and receives the hint receiver back through the joined worker handle. Worker and janitor shutdown join admitted work beyond warnings rather than aborting it.
 
-Ordinary UDP captures its validated `UdpFlowOwner` (token and optional nonzero kernel incarnation) only on cold endpoint admission, before asynchronous preparation; Ready enqueue adds no backend query. The captured identity survives initializer, endpoint and tombstone lifetimes. Token-zero UDP with either source or destination port 53 remains stateless; source-port-53 transport traffic is not reclassified as controller DNS. Malformed destination-53 fallback also remains stateless. Model execution never claims native socket proof.
+Ordinary UDP captures validated `UdpFlowOwner` (token and optional nonzero kernel incarnation) only at cold admission, before async preparation, and retains it through initializer, endpoint and tombstone; Ready enqueue adds no backend lookup. Token-zero UDP with either port 53 and malformed destination-53 fallback stay stateless; source-port-53 transport is not controller DNS, and model execution claims no native proof. A hint/janitor request that actually deletes the conn retires only its matching client/destination/incarnation endpoint through tombstone and acknowledgement, including partial deletion before a batch error. Auxiliary-only, `Missing` or `Superseded` results, foreign incarnations, stateless endpoints and identity-less owners do not authorize retirement.
 
 Cold NFQUEUE cell reconstruction retains its conn-state snapshot and invokes backend-owned UDP admission validation under the same read guard. Unresolved retirement ownership or an invalid allocator-domain identity cannot reconstruct an ActiveDirect acceptance; already admitted fast followers keep their existing no-lookup path.
 
@@ -252,7 +252,7 @@ SIGHUP uses an attempt-local diagnostic list. Load and operator-validation warni
 
 1. Fence NFQUEUE readiness and complete the synchronous kernel grace barrier.
 2. Reject new transparent admission.
-3. Cancel correlator cells and token-bound originals, advance the UDP initializer epoch, drain `Initializing` leases, wait for the correlator to become empty, and drain exact endpoint retirements.
+3. Cancel correlator cells and token-bound originals, advance the UDP initializer epoch, drain `Initializing` leases, wait for the correlator and admitted commit-pump work to become empty, and drain exact endpoint retirements.
 4. Under the publication guards below, call `EbpfBackend::publish_routing_plan(&plan, learned_domains)` when the compiled plan or learned facts changed, or datapath health requires recovery. The backend stages the inactive slot's generation-owned facts and generated functions and switches `ROUTING_POLICY_ROOT` last. A native explicit activation then resets mode using the already-owned backend, before publishing the replacement registry, DNS pointer, router, config, groups and projection. A post-root mode-reset failure commits the new generation as degraded and leaves admission fenced.
 5. Reopen pending admission and NFQUEUE last. Rule-derived feature bits live in the policy descriptor, not a separately published static-flags map.
 

@@ -13,6 +13,8 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
 
+Preserve [TCX finality](../../doc/en/design/datapath.md#interface-hook-sets): unguarded, mark-preserving passes continue with NEXT; mark writers and existing ownership guards terminate with PASS, never PIPE as continuation.
+
 `RoutingInput.flags` reuses the final 32-bit word for independent MAC presence
 and direct-finality permission captured from the caller's Rule-mode flags.
 Only domain-independent live prefixes may use that permission; Global retains
@@ -32,13 +34,11 @@ of the later process-name chains (measured on Linux 6.12.107, roughly 3× for th
 Keep the emitter's private tests in `control/routing_matcher/codegen/tests.rs`;
 real decision/load goldens remain in `ebpf/real/routing/tests/`.
 
-Token-zero WAN UDP publishes explicit userspace ownership in RoutingMeta bit 58;
-native unmarked WAN direct instead publishes OFFLOAD. WAN cached and fresh writers
-must check the canonical tuple fence before borrowing state. Retire owned
-conn-state, handoff and redirect metadata only after a successful synchronous
-kernel grace barrier and matching auxiliary tokens/incarnations. Preserve
-native/offloaded, missing and newer-token authority. Never infer WAN ownership
-from `must` alone or change the persistent 12-byte allocator ABI.
+Never infer token-zero WAN userspace ownership from `must`: keep its ownership bit distinct from OFFLOAD and check tuple fences before borrowing state. Retirement and initial staged commits follow the [fence/grace protocol](../../doc/en/design/nfqueue.md#exact-tuple-retirement), preserving the locked `DirectArmed` activation exception and frozen staged timestamps.
+
+Use coherent locked conn snapshots; a refused UDP lookup is not a publication miss, and auxiliary ownership/freshness checks remain independent. Capture WAN UDP socket identity before cached-route lookup so tuple reuse cannot bypass the control-plane identity check.
+
+Reserve UDP `cb[4]` for its listener marker without disturbing the TCP SYN incarnation carrier; every listener-selection path must use the shared host-byte-order tuple hash. Layout and admission contracts live in [datapath](../../doc/en/design/datapath.md), not duplicated constants here.
 
 TCP cached-SYN classification queries the FD-owned daens by its explicit
 host-relative namespace ID, never the packet namespace or an assumed ID zero.

@@ -62,7 +62,7 @@ nor a blocking worker selects the queue being sampled.
 
 ## Fragmented LAN DNS
 
-TC evaluates the offset-zero UDP/53 fragment with the ordinary traffic policy. Native `direct(must)`, `block(must)` and trusted exact control-plane marks retain their actions. Queries requiring the DNS controller or a raw must group keep their route/generation carrier in the host skb mark instead of crossing into `daens`; later fragments also stay in the host. Kernel IPv4/IPv6 defragmentation runs at priority `-400`, before the existing queue at `-250` and conntrack at `-200`. No userspace fragment buffer or fragment-ID map is used.
+TC evaluates the offset-zero UDP/53 fragment with the ordinary traffic policy. Native `direct(must)`, `block(must)` and trusted exact control-plane marks retain their actions. Queries requiring the DNS controller or a raw must group keep their route/generation carrier in the host skb mark instead of crossing into `daens`; later fragments also stay in the host. Kernel IPv4/IPv6 defragmentation runs at priority `-400`, before the queue at `-250` and conntrack at `-200`. DNS has no fragment cache; [non-DNS fragment retention](./datapath.md#fragments-of-redirected-datagrams) belongs to the datapath.
 
 The actor distinguishes these complete DNS datagrams from ordinary token-owned flows before success, overflow or rejection handling. It validates the carrier, current generation and admission epoch, confirms `NF_DROP` on the original, then publishes into the same bounded DNS/raw pipeline used by transparent socket ingress. Existing redirect metadata restores replies from the original destination. UDP checksums are verified before dispatch, allowing IPv4's zero checksum and honoring kernel checksum-partial metadata; IPv6 zero checksums without that metadata are rejected.
 
@@ -100,7 +100,9 @@ Proxy does not create a second routing path. It reuses the same `UdpInitLease` a
 
 ## Deadline and fatality
 
-Every packet has one absolute three-second deadline measured from raw-netlink listener receipt. Actor delay and every backend-lock wait consume that same budget, including the second lock acquisition between Direct Arm and Activate. Queue, correlator, slow-path, or deadline saturation drops fail closed rather than extending ownership or memory growth.
+Every packet has one absolute three-second receipt-to-verdict deadline measured from raw-netlink listener receipt. Actor delay, commit-queue wait and every backend-lock wait consume that same budget, including the second lock acquisition between Direct Arm and Activate. Queue, correlator, slow-path, or deadline saturation drops fail closed rather than extending ownership or memory growth.
+
+`PendingUdpVerdicts` owns a joined pump that batches up to 1,024 terminal requests, locks backend write → correlator cell, and releases the backend lock before endpoint kernel handoff. Synchronous backend work uses `block_in_place` on multi-thread runtimes and runs inline on current-thread runtimes. The pump retains direct/block leases across caller cancellation; it rechecks original deadlines at dequeue, after backend locking, after grace and before each item, expiring late requests without conn mutation. Cancellation waits for armed Direct completion under that same deadline.
 
 A watchdog checks held cells independently and enforces the hard hold bound. Stale token, endpoint-generation, or backend-state mismatches drop without mutating a newer incarnation. A verdict failure or any failure after Direct has armed is process-fatal because userspace can no longer safely infer which originals the kernel accepted.
 
@@ -112,16 +114,16 @@ Reload and shutdown share the same producer fence:
 
 1. Publish `DATAPATH_FLAG_NFQ_READY=false`. New flows that require staging now fail closed.
 2. Complete the synchronous `RETIRE_GRACE_ROOT` barrier, then remove residual `Preparing`, `Pending` and `Aborted` state in bounded, incarnation-checked tuple-fence batches. A delayed queue delivery subsequently fails token lookup; descriptor-generation publication still fences queued DNS fragments.
-3. Close correlator admission and drain or cancel verdict guards, initializer leases, scheduled token cleanups, endpoint tombstones, and retirement work before changing runtime ownership.
+3. Close correlator admission and drain or cancel verdict guards, initializer leases, scheduled token cleanups, endpoint tombstones, retirement work and admitted commits before changing runtime ownership. Final shutdown stops and joins the pump; reload retains it. Armed Direct commits can delay reload until their original three-second [receipt-to-verdict deadline](#deadline-and-fatality); cancellation neither aborts them early nor starts a fresh timeout.
 4. A successful reload publishes the replacement runtime generation and reopens correlator admission and readiness last. Shutdown detaches producers, closes queue ownership, and deletes `inet honk_nfqueue` last.
 
 Failure or ambiguity in listener, queue, watchdog, cleanup, verdict, or retirement lifecycle is fatal; the runtime never reopens staging on uncertain ownership.
 
 ### Exact tuple retirement
 
-Retirement publishes `RETIRE_ACTIVE` and inserts each `RETIRE_FENCE[tuple]` with `BPF_NOEXIST`. The value keeps a unique retirement-operation owner separate from its decision token. A successful same-inner update of the private `RETIRE_GRACE_ROOT` synchronously drains pre-fence non-sleepable readers. Under exclusion, the backend revalidates captured incarnation, token, state, handoff and redirect authority before deleting owned entries. A batch deduplicates tuple fences but retains each request's outcome. Every acquired fence is owner-checked on release; partial deletion counts and both operation/release failures are retained. Unresolved ownership inhibits further admission. Staged commits use this same fence/grace protocol.
+Retirement publishes `RETIRE_ACTIVE` and inserts `RETIRE_FENCE[tuple]` with `BPF_NOEXIST`, retaining separate operation-owner and decision-token identities. Successful same-inner replacement of `RETIRE_GRACE_ROOT` drains pre-fence non-sleepable readers; the backend then revalidates incarnation, token, state and auxiliary authority before deletion. Batches deduplicate fences but retain every request's outcome, partial deletion counts and operation/release errors; release checks the exact owner, and unresolved ownership inhibits admission. Initial `ArmDirect`/`ActivateProxy`/`Block` commits share this protocol, with one grace per batch. `ActivateDirect` alone updates immutable `DirectArmed` in place under native lock (`BPF_EXIST | BPF_F_LOCK`), without fence/grace: the backend write lock excludes other writers and the kernel never renews `Pending`/`DirectArmed` timestamps.
 
-WAN and LAN userspace UDP share this fence even with token zero: the endpoint retains its admission incarnation, and the WAN ownership bit distinguishes marked direct/must from native direct state. Matching auxiliaries are reclaimed before conn-state in the same transaction, including expired-conn cleanup, so a new incarnation can reuse the tuple. Foreign token/incarnation metadata is preserved and the operation refuses; missing or superseded conn ownership is not permission to delete another owner.
+WAN and LAN userspace UDP share this fence even with token zero: the endpoint retains its admission incarnation, and the WAN ownership bit distinguishes marked direct/must from native direct state. Reclaim matching auxiliaries before conn state, including on expiry; preserve foreign metadata and refuse missing/superseded ownership. Userspace [endpoint retirement](./control-plane.md#tcp-relay-and-conn-state-ownership) requires actual conn-deletion evidence.
 
 Before successful publication, a failed kernel producer records terminal `Aborted` with its captured incarnation and actual allocated token (zero if none was allocated). It does not delete tuple entries or convert a completed Pending/native/proxy/block decision. Preparing and Aborted followers cannot renew timestamps; Aborted cannot activate or forward and is immediately eligible for exact fenced hint/janitor cleanup. All physical tuple reclamation stays in the shared backend protocol.
 
@@ -143,6 +145,7 @@ When batch lookup is available, a short successful map batch is not proof of com
 | Kernel NFQUEUE | `4096` queued packets |
 | Userspace ingest actor | `256` entries and `8 MiB` retained queued payload |
 | Verdict correlator | `4096` live flow cells |
+| Commit pump queue | `4096` queued requests, one per live flow cell; reservation waits consume the [original deadline](#deadline-and-fatality) |
 | One flow cell | `64` held verdict guards, including the first packet |
 | UDP slow path | Effective startup budget capped at `256`; a permit is acquired only at actor dequeue |
 

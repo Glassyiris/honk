@@ -150,7 +150,7 @@ SOCKS5 UDP 在 source association 整个生命周期内保持 TCP `UDP ASSOCIATE
 Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 取消并排空 `Initializing` lease 及其保留资源，`Ready` endpoint 仍遵循既有生命周期。已有原始 UDP `Ready` 会话在语义分组名相同且符合该生命周期时可以保留，但 `Initializing` 不能跨 reload 存活。编译策略发布后，过期的排队路由元数据仍会被准入检查拒绝。每次 retirement（包括其 `Retiring` tombstone）和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
 编译后的流量计划成功变更，且旧策略或新策略包含直连 mark 时，才会退役直连 `Ready` endpoint，避免后续流量复用旧 socket mark；无变化、不相关重载，以及新旧策略均无直连 mark 的路由变更，都会保留这些端点。显式标记为用户态所有的 WAN UDP 决策（包括带 mark 的 `direct(must)`）会在 tuple/reader fence 下同时清理 token 为零的 conn state、handoff 与 redirect track；原生 LAN direct/offloaded 决策及更新的非零 token 保持不变。
 
-对于 NFQUEUE 入口，按 client/destination 建键的 `PendingUdpVerdicts` 只携带 token、endpoint generation、phase、FIFO verdict guard 与最终直连 mark。Endpoint 准入接收自有 `Bytes`，对应唯一保留的 NFQUEUE 载荷缓冲区。Direct/block 完成后移除 initializer 并交接给内核；proxy 完成后把 token/generation 转入 `Ready`。[NFQUEUE 协议](./nfqueue.md#终态转换)定义有序终态转换、绝对 deadline 与致命失败处理。
+对于 NFQUEUE 入口，`PendingUdpVerdicts` 持有 token/generation、phase、FIFO verdict guard 及最终直连 mark。准入接收自有 `Bytes`，对应唯一保留的 payload；direct/block 完成后把 initializer 交给内核，proxy 则将身份转入 `Ready`。Commit 顺序、deadline 与生命周期由 [NFQUEUE 协议](./nfqueue.md#终态转换)维护。
 
 ## Queue 与描述符预算
 
@@ -196,7 +196,7 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 | 端口 53 入口 slow path | `min(transient_dials, 256)` |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
 
-不存在单独的 256 条 TCP slow-path 上限。TCP accept 使用由描述符导出的流预算。现有 removal worker 合并有界 TCP、UDP 和 expiry-hint 输入，每批最多 128 项，共用一次内核 grace。UDP removal 保留 1024 条消息的 channel 与去重 `removal_dirty` 补偿；只有自有 I/O 和后端退役完成后才确认精确 tombstone。
+TCP accept 使用描述符导出的流预算，没有独立的 256 项上限。[Joined removal worker](./datapath.md#用户空间维护与计数) 处理 TCP、UDP 与 expiry hint；UDP 保留 1024 条消息的 channel 和去重 `removal_dirty` 补偿。只有自有 I/O 和后端退役完成后才确认精确 tombstone。
 
 透明 TCP 先等待任一 IP 族监听器变为可读，再预留共享流 permit，最后用非阻塞系统调用完成 accept。因此空闲监听器不占用流容量，达到上限后到达的连接仍留在内核 listen backlog。`/stats` 的 `tcp` 对象提供 `activeFlows`、`limit` 和 `capacity.rejected`；后者统计等待 permit 的 accept-loop，而不是 accept 后被丢弃的连接。动态上限低于 256 时启动会告警；网关部署应提高服务的 `RLIMIT_NOFILE` 限制。
 
@@ -222,7 +222,7 @@ Janitor 收集阶段在消耗 candidate budget 前排除 pinned TCP，并在 bac
 
 I/O 完成后，joined retirement worker 持有已准入 TCP 退役、socket、tracker/close completion 与出站统计 guard，即使等待方取消也不丢失所有权。其 `FlowPin` 在同一 backend 写 guard 内释放 local 与精确 native pin，然后才检查外部 owner；释放失败不能确认清理成功。准入前取消同步 Drop native pin，物理 tuple 回收交给原子 janitor，不声称已确认。控制面的 `RetirementPort` 将 native Drop 错误发往当前 worker epoch 的 critical channel，并通过 joined worker handle 收回 hint receiver。Worker 和 janitor 在关闭告警后仍 join 已准入工作，不执行 abort。
 
-普通 UDP 只在冷 endpoint 准入、异步准备前捕获已校验的 `UdpFlowOwner`（token 与可选的非零 kernel incarnation）；Ready enqueue 不增加 backend 查询。身份贯穿 initializer、endpoint 与 tombstone。Token-zero UDP 任一方向端口为 53 都保持无 conn-state；源端口 53 的 transport 流量不会因此变成控制器 DNS。畸形目的端口 53 回退也保持无状态。模型执行不声称具有原生 socket 证明。
+普通 UDP 只在冷准入、异步准备前捕获已校验的 `UdpFlowOwner`（token 与可选的非零 kernel incarnation），并贯穿 initializer、endpoint 与 tombstone；Ready enqueue 不增加 backend 查询。Token-zero UDP 任一端口为 53 及畸形目的端口 53 回退均保持无状态；源端口 53 的 transport 不是控制器 DNS，模型执行不声称原生证明。Hint/janitor 请求实际删除 conn 后，只通过 tombstone 与 acknowledgement 退役匹配 client/destination/incarnation 的 endpoint，包括 batch 错误前已完成的部分删除。仅涉及辅助项、`Missing`、`Superseded`、外来 incarnation、无状态 endpoint 或无身份 owner 均不授权退役。
 
 NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并调用 backend 自有的 UDP 准入校验。无法解决的 retirement 所有权或超出 allocator 范围的身份不能重建 ActiveDirect 放行；已准入的 fast follower 仍保留既有无查询路径。
 
@@ -238,7 +238,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 1. Fence NFQUEUE readiness，并完成同步内核 grace barrier。
 2. 拒绝新的透明代理准入。
-3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 变空，并排空精确 endpoint retirement。
+3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 及已准入的 commit-pump 工作变空，并排空精确 endpoint retirement。
 4. 编译 generation 的 `RoutingPushPlan`；在下述发布 guard 内，只有 compiled plan、learned facts 变化或数据路径健康需要恢复时才调用 `EbpfBackend::publish_routing_plan(&plan, learned_domains)`。后端选择 inactive slot，暂存由该 generation 持有的 IP/source/MAC/domain 事实 map（使用完整的 256 位谓词值），把生成函数附着到每个相关 target，最后切换 `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活使用已经持有的 backend 重置 mode，用户态再于同一串行边界内发布替代出站 registry、DNS runtime pointer、Router、配置、组与 projection snapshot；root 已提交后 mode reset 失败会提交新代为 degraded，并保持准入 fence。
 5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 

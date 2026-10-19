@@ -58,7 +58,7 @@ flowchart LR
 
 ## LAN DNS 分片
 
-TC 按普通流量策略判定 offset-zero 的 UDP/53 首片。原生 `direct(must)`、`block(must)` 和可信的精确控制平面 mark 保留原动作。需要 DNS 控制器或原始 must 组的查询不再进入 `daens`，而在 host skb mark 中携带路由/代际；后续片同样留在 host。内核 IPv4/IPv6 重组在优先级 `-400` 执行，早于现有队列 `-250` 和 conntrack `-200`。不增加用户态分片缓冲或 fragment-ID map。
+TC 按普通流量策略判定 offset-zero 的 UDP/53 首片。原生 `direct(must)`、`block(must)` 和可信的精确控制平面 mark 保留原动作。需要 DNS 控制器或原始 must 组的查询在 host skb mark 中携带路由/代际，不进入 `daens`；后续片也留在 host。内核 IPv4/IPv6 重组在优先级 `-400` 执行，早于队列 `-250` 与 conntrack `-200`。DNS 没有分片缓存；[非 DNS 分片记录](./datapath.md#重定向数据报的分片)由数据路径维护。
 
 Actor 在成功、饱和和拒绝路径均先区分完整 DNS 数据报与普通 token 流；验证 carrier、当前代际和准入 epoch，对原包确认 `NF_DROP` 后，才发布到透明 socket 共用的有界 DNS/原始 UDP 管线。回复沿用现有 redirect 元数据恢复原目的地址。分发前验证 UDP 校验和，允许 IPv4 零校验和并识别内核 checksum-partial 元数据；没有该元数据的 IPv6 零校验和被拒绝。
 
@@ -96,7 +96,9 @@ Proxy 不会创建第二条路由路径。它复用普通透明 UDP 使用的同
 
 ## 截止时间与 fatal 策略
 
-每个包只有一个绝对 3 秒截止时间，从 raw-netlink listener 收包时开始计算。Actor 延迟和每一次后端锁等待都消耗同一预算，包括 Direct Arm 与 Activate 之间的第二次取锁。队列、correlator 或 slow path 饱和，或截止时间到期时，均按 fail-closed 丢包，不延长所有权，也不继续增加内存占用。
+每个包只有一个从 raw-netlink listener 收包到 verdict 的绝对 3 秒截止时间。Actor 延迟、commit 队列等待和每一次后端锁等待都消耗同一预算，包括 Direct Arm 与 Activate 之间的第二次取锁。队列、correlator 或 slow path 饱和，或截止时间到期时，均按 fail-closed 丢包，不延长所有权，也不继续增加内存占用。
+
+`PendingUdpVerdicts` 持有 joined pump，每批最多处理 1,024 个终态请求，按后端写锁 → correlator cell 取锁，并在释放后端锁后交接 endpoint 给内核。同步后端工作在多线程 runtime 上用 `block_in_place`，在 current-thread runtime 上内联执行。Pump 在调用方取消后仍持有 direct/block lease；在出队、取得后端锁后、grace 后及每项执行前复验原始 deadline，过期请求不修改 conn。取消等待已 Arm Direct 在同一期限内完成。
 
 Watchdog 独立检查被持有的 cell，并强制执行硬持有上限。Token、endpoint generation 或后端状态不匹配时会丢包，且不会修改更新的 incarnation。Verdict 失败或 Direct 已 Arm 后的任何失败都会使进程 fatal，因为用户空间已无法安全判断内核接受了哪些原始包。
 
@@ -108,16 +110,16 @@ Reload 和 shutdown 共用同一 producer fence：
 
 1. 发布 `DATAPATH_FLAG_NFQ_READY=false`。现在需要暂存的新流会 fail closed。
 2. 完成同步 `RETIRE_GRACE_ROOT` barrier，再以有界、检查 incarnation 的 tuple-fence batch 移除残留 `Preparing`、`Pending`、`Aborted` 状态。延迟 queue delivery 随后因 token lookup 失败而终止；descriptor generation 发布仍对排队 DNS fragment 实施 fence。
-3. 关闭 correlator admission；在改变 runtime 所有权前 drain 或 cancel verdict guard、initializer lease、scheduled token cleanup、endpoint tombstone 和 retirement work。
+3. 关闭 correlator admission，在改变 runtime 所有权前 drain 或 cancel verdict guard、initializer lease、scheduled token cleanup、endpoint tombstone、retirement work 及已准入 commit。最终 shutdown 停止并 join pump；reload 保留它。已 Arm Direct 可使 reload 延迟到其原始三秒[收包至 verdict 截止时间](#截止时间与-fatal-策略)；取消既不提前中止，也不重新计时。
 4. 成功 reload 会发布 replacement runtime generation，最后再重开 correlator admission 和 readiness。Shutdown 会 detach producer、关闭 queue 所有权，并最后删除 `inet honk_nfqueue`。
 
 Listener、queue、watchdog、cleanup、verdict 或 retirement 生命周期中的失败或歧义均为 fatal；runtime 绝不会在所有权不确定时重新开放暂存。
 
 ### 精确 tuple 退役
 
-Retirement 先发布 `RETIRE_ACTIVE`，再用 `BPF_NOEXIST` 插入各 `RETIRE_FENCE[tuple]`，value 中独立保存唯一退役操作 owner 与 decision token。成功重装私有 `RETIRE_GRACE_ROOT` 的同一个 inner map 会同步排空 fence 前的 non-sleepable 读者。排他期间重新验证捕获的 incarnation、token、state、handoff 与 redirect 所有权后才删除。Batch 对 tuple fence 去重，但保留每个请求的结果。释放时逐一验证 owner；保留实际部分删除计数及操作/释放两类错误。无法解决的所有权禁止继续准入。暂存 commit 也使用同一 fence/grace 协议。
+Retirement 发布 `RETIRE_ACTIVE`，再用 `BPF_NOEXIST` 插入 `RETIRE_FENCE[tuple]`，分别保留操作 owner 与 decision token。成功重装 `RETIRE_GRACE_ROOT` 的同一 inner map 会排空 fence 前的 non-sleepable 读者；之后后端复验 incarnation、token、state 与辅助项所有权才删除。Batch 对 fence 去重，保留每个请求的结果、部分删除计数及操作/释放错误；释放时检查精确 owner，未解决的所有权禁止准入。初始 `ArmDirect`/`ActivateProxy`/`Block` commit 共用该协议，每批一次 grace。只有 `ActivateDirect` 在原生锁下原地更新不可变 `DirectArmed`（`BPF_EXIST | BPF_F_LOCK`），不取 fence/grace：后端写锁排除其他写者，内核从不续期 `Pending`/`DirectArmed` 时间戳。
 
-WAN 与 LAN 用户态 UDP 即使 token 为零也使用同一 fence：endpoint 保留准入时捕获的 incarnation，WAN ownership bit 区分带 mark 的 direct/must 与原生直连。事务内先回收匹配的辅助项，再回收 conn-state，过期 conn 清理也相同，使新 incarnation 能复用 tuple。遇到外来 token/incarnation 元数据时保留原项并拒绝操作；conn 所有权缺失或被替代，不授权删除其他 owner。
+WAN 与 LAN 用户态 UDP 即使 token 为零也共用 fence：endpoint 保留准入 incarnation，WAN ownership bit 区分带 mark 的 direct/must 与原生直连。先回收匹配辅助项再回收 conn，过期清理也相同；保留外来元数据，拒绝缺失/已被取代的所有权。用户态 [endpoint 退役](./control-plane.md#tcp-中继与-conn-state-所有权)要求实际删除 conn 的证据。
 
 内核 producer 在成功发布前失败时，记录捕获 incarnation 和实际已分配 token 的终态 `Aborted`（尚未分配则为零），不删除 tuple 项，也不把已完成的 Pending/native/proxy/block 改成 Aborted。Preparing 与 Aborted follower 都不能续期时间戳；Aborted 不得激活或转发，立即满足精确 fenced hint/janitor 清理条件。全部物理 tuple 回收仍共用后端协议。
 
@@ -139,6 +141,7 @@ WAN 与 LAN 用户态 UDP 即使 token 为零也使用同一 fence：endpoint �
 | 内核 NFQUEUE | `4096` 个排队数据包 |
 | 用户空间 ingest actor | `256` 项和 `8 MiB` 保留的排队 payload |
 | Verdict correlator | `4096` 个存活 flow cell |
+| Commit pump 队列 | `4096` 个排队请求，每个存活 flow cell 一个；槽位预留等待消耗[原始截止时间](#截止时间与-fatal-策略) |
 | 单个 flow cell | `64` 个被持有的 verdict guard，包括首包 |
 | UDP slow path | 启动时有效预算上限为 `256`；仅在 actor dequeue 时获取 permit |
 

@@ -78,6 +78,8 @@ Malformed non-`must` UDP53 payloads retain the generic UDP fallback rather than 
 
 LAN local-socket precedence applies only to non-53 destinations, independently per transport; wildcard ownership also requires full FIB `NOT_FWDED`, and the non-DNS TCP pure-SYN probe skip remains. Bound `:53` sockets cannot preempt the policy results above. See [DNS ownership](../design/dns.md#dns-ownership-state-machine) for transparent LAN versus native/loopback delivery.
 
+Admission and policy-size limits: [LAN per-source new-flow budget](../design/datapath.md#per-source-new-flow-limit) and [compiled-policy capacity](../design/routing.md#restricted-native-backend).
+
 ## Policy-routing marks
 
 `direct(mark: 512)` and `direct(mark: 0x200)` select the same direct mark.

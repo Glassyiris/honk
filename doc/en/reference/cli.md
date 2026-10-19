@@ -209,9 +209,19 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | Learned IP and active-policy domain-predicate bitmap indices, from DNS or sniffed evidence; known-zero entries remain visible. |
 | `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
 
-The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, TCP ownership publication failures (child proof storage and SYN-claim resource errors), the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.
+The commands read pins through raw `bpf(2)` without loading programs or attaching hooks; reads normally require root or suitable BPF capabilities. `stats` prints each counter below on its own labeled line, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counts. `BPF_STATS_MAP` must have nine slots: mixed tool/engine versions fail with `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` (reversed for an older tool), rather than mislabelling counters. Upgrade the tool with the engine/object.
 
-Each ordinary `BPF_STATS_MAP` counter is printed on its own line using its shared canonical label, for example `udp_conn_overflow: 0`; labels and units are unchanged. The map has seven slots, renumbered when the request-proof counter was removed, so `stats` refuses a map of any other size instead of mislabelling it: upgrade the tool with the engine/object.
+| Key | Canonical label | Counts |
+| --- | --- | --- |
+| `0` | `udp_conn_overflow` | UDP conn-state insertion failures with no existing tuple. |
+| `1` | `tcp_conn_overflow` | TCP conn-state insertion failures. |
+| `2` | `redirect_track_insert_failure` | Redirect-track publication failures: map insertion or unavailable preparation scratch. |
+| `3` | `routing_handoff_insert_failure` | Routing-handoff publication failures: map insertion or unavailable preparation scratch. |
+| `4` | `socket_identity_capture_failure` | Failures to capture or store a socket's process identity. |
+| `5` | `tcp_child_proof_storage_failure` | Failures to store an accepted TCP child's ownership proof. |
+| `6` | `tcp_publisher_claim_failure` | TCP SYN publisher-claim insertion failures, excluding ordinary same-tuple collisions (`EEXIST`). |
+| `7` | `new_flow_rate_limited` | LAN flow attempts dropped by the per-source, per-CPU new-flow limit. |
+| `8` | `udp_reverse_learning_suspended` | Reverse UDP learning attempts skipped under conn pressure after a conn-state lookup miss. |
 
 `routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries; upgrade the tool with the engine/object.
 

@@ -255,6 +255,8 @@ one GeoIP predicate can contain hundreds of thousands of prefixes. The emitter
 checks its 1,000,000-instruction budget before each instruction insertion and stops
 immediately on exhaustion, before further instruction or fixup expansion.
 
+Fact bits are a per-generation resource: 256 IDs per category (destination IP, source IP, MAC), counted per distinct list rather than per rule. Rules that name the same IP list (identified by its interned matcher) or the same MAC list (by value, order-sensitive) share one ID; negation stays on the rule condition. Domain predicates have a separate 256-ID limit and share IDs for equal normalized matcher keys. Branch distances must fit signed 16-bit instruction offsets; otherwise publication fails with `routing jump out of range`.
+
 Capacity and verifier limits are explicit errors. No rule chain is truncated and
 no missing outbound silently becomes direct. Generated source attribution records
 rule IDs and normalized rule descriptions. A raw loader uses the existing syscall

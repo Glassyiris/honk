@@ -199,6 +199,8 @@ IPv4/IPv6 仍分别构造 key、
 前缀数量与谓词数量独立：一个 GeoIP 谓词可以包含数十万个前缀。emitter 在每次插入指令前
 检查 1,000,000 条指令预算，耗尽时立即返回错误，不再继续展开指令或 fixup。
 
+事实位是每代资源：目的 IP、源 IP、MAC 各有 256 个 ID，按不同列表而非规则数量计数。引用同一个 IP 列表（按 interned matcher 身份识别）或同一个 MAC 列表（按值识别，顺序敏感）的规则共享 ID；取反保留在规则条件上。域名谓词另有 256 个 ID，规范化 matcher key 相等时共享 ID。分支距离必须能用有符号 16 位指令偏移表示，否则以 `routing jump out of range` 错误拒绝发布。
+
 容量和 verifier 限制是明确错误，不能截断规则链或把缺失 outbound 默认为 direct。
 生成源映射记录 RuleId 和规范化规则描述。raw loader 复用现有 syscall/BTF 基础，不
 增加运行时 clang/LLVM 或另一个 ELF writer。函数原型必须真实；raw `func_info` 与
