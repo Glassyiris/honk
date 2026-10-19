@@ -12,6 +12,7 @@ mod admission;
 mod cadence;
 mod cursor;
 mod redirect_retention;
+mod telemetry;
 
 const IPPROTO_TCP: u8 = 6;
 
@@ -551,7 +552,7 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         match map {
             "conn" => {
                 let (deleted, scanned) = janitor
-                    .cleanup_conn_state_at(now_ns, &mut gauge, ((0, 0), 0), tuning)
+                    .cleanup_conn_state_at(now_ns, &mut gauge, Some(((0, 0), 0)), tuning)
                     .await?;
                 assert_eq!((deleted, scanned), (1, order.len()));
                 assert_eq!(gauge.estimate(0, 0, 0), order.len() as u64);
@@ -686,7 +687,7 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         .cleanup_conn_state_at(
             UDP_CONN_STATE_TIMEOUT_NS + 1,
             &mut gauge,
-            ((10, 0), 0),
+            Some(((10, 0), 0)),
             scan_tuning(0.0),
         )
         .await

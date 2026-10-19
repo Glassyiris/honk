@@ -230,7 +230,7 @@ impl BpfJanitor {
         self.cleanup_conn_state_at(
             now_ns,
             &mut gauge,
-            ((0, 0), 0),
+            Some(((0, 0), 0)),
             ScanTuning {
                 candidates: JANITOR_MAX_CANDIDATES,
                 budget: Duration::from_secs(1),

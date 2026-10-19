@@ -87,6 +87,14 @@ struct MockRoutingGeneration {
     domain: HashMap<[u32; 4], DomainRouting>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct MockTelemetryFaults {
+    pub stats: bool,
+    pub conn_occupancy: bool,
+    pub aux_occupancy: bool,
+}
+
 /// In-memory transactional routing backend used by control-plane tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
@@ -137,6 +145,8 @@ pub struct MockEbpfBackend {
     pub outbound_alive: HashMap<u32, u32>,
     /// BPF statistics overflow counters
     pub bpf_stats: HashMap<u32, u64>,
+    #[cfg(test)]
+    pub telemetry_faults: std::sync::Arc<parking_lot::Mutex<MockTelemetryFaults>>,
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub admission_pressure: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1084,7 +1094,21 @@ impl EbpfBackend for MockEbpfBackend {
         None
     }
 
+    fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.telemetry_faults.lock().conn_occupancy,
+            "injected conn occupancy read failure"
+        );
+        Ok((0, 0))
+    }
+
     fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.telemetry_faults.lock().aux_occupancy,
+            "injected auxiliary occupancy read failure"
+        );
         Ok((
             self.redirect_tracks.len() as u64,
             self.routing_handoffs.lock().len() as u64,
@@ -1254,6 +1278,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.telemetry_faults.lock().stats,
+            "injected BPF stats read failure"
+        );
         Ok(self.bpf_stats.get(&key).copied())
     }
 

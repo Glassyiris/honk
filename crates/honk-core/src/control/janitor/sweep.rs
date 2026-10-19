@@ -206,7 +206,7 @@ impl BpfJanitor {
         &self,
         now_ns: u64,
         gauge: &mut OccupancyGauge,
-        occ_counters: ((u64, u64), u64),
+        occ_counters: Option<((u64, u64), u64)>,
         tuning: ScanTuning,
     ) -> anyhow::Result<(u64, usize)> {
         let (scan, retired) = self
@@ -228,8 +228,9 @@ impl BpfJanitor {
                 |counts| counts.conn,
             )
             .await;
-        if scan.complete {
-            let ((inserts, ebpf_deletes), userspace_deletes) = occ_counters;
+        if scan.complete
+            && let Some(((inserts, ebpf_deletes), userspace_deletes)) = occ_counters
+        {
             gauge.calibrate(
                 scan.scanned as u64,
                 inserts,

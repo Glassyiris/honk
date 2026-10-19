@@ -13,6 +13,20 @@ pub(super) fn admission_pressured(active: bool, utilization: f64) -> bool {
         }
 }
 
+pub(super) fn telemetry_sample<T>(signal: &'static str, result: anyhow::Result<T>) -> Option<T> {
+    match result {
+        Ok(sample) => Some(sample),
+        Err(error) => {
+            crate::logging::warn_throttled!(
+                signal,
+                error = %format_args!("{error:#}"),
+                "BPF janitor: telemetry read failed; retaining the previous sample"
+            );
+            None
+        }
+    }
+}
+
 pub(super) struct TickState {
     pub(super) pressure: PressureState,
     pub(super) gauge: OccupancyGauge,
@@ -21,6 +35,8 @@ pub(super) struct TickState {
     last_cleanup: Instant,
     last_health_check: Instant,
     admission_pressure: bool,
+    conn_occupancy: u64,
+    aux_occupancy: (u64, u64),
 }
 
 impl TickState {
@@ -36,6 +52,8 @@ impl TickState {
             last_cleanup: now,
             last_health_check: now,
             admission_pressure: false,
+            conn_occupancy: 0,
+            aux_occupancy: (0, 0),
         }
     }
 }
@@ -47,30 +65,46 @@ impl BpfJanitor {
         now: Instant,
         now_ns: Option<u64>,
     ) -> anyhow::Result<()> {
-        let (overflow_delta, conn_utilization, aux_utilization, occ_counters) = {
+        let (overflow_delta, overflow_read_ok, conn_utilization, aux_utilization, occ_counters) = {
             let ebpf = self.ebpf.read().await;
-            let udp = ebpf
-                .get_bpf_stats(BpfStatsKey::UdpConnOverflow as u32)?
-                .unwrap_or(0);
-            let tcp = ebpf
-                .get_bpf_stats(BpfStatsKey::TcpConnOverflow as u32)?
-                .unwrap_or(0);
+            let udp = telemetry_sample(
+                BpfStatsKey::UdpConnOverflow.label(),
+                ebpf.get_bpf_stats(BpfStatsKey::UdpConnOverflow as u32)
+                    .map(|value| value.unwrap_or(0)),
+            );
+            let tcp = telemetry_sample(
+                BpfStatsKey::TcpConnOverflow.label(),
+                ebpf.get_bpf_stats(BpfStatsKey::TcpConnOverflow as u32)
+                    .map(|value| value.unwrap_or(0)),
+            );
+            let overflow_read_ok = udp.is_some() && tcp.is_some();
+            let udp = udp.unwrap_or(state.pressure.last_udp_overflow);
+            let tcp = tcp.unwrap_or(state.pressure.last_tcp_overflow);
             let delta =
                 udp > state.pressure.last_udp_overflow || tcp > state.pressure.last_tcp_overflow;
             state.pressure.last_udp_overflow = udp;
             state.pressure.last_tcp_overflow = tcp;
-            let counters = ebpf.conn_state_occupancy()?;
-            let userspace_deletes = crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let occupancy = state
-                .gauge
-                .estimate(counters.0, counters.1, userspace_deletes);
-            let (redirect, handoff) = ebpf.aux_occupancy()?;
+            let occ_counters =
+                telemetry_sample("conn-state occupancy", ebpf.conn_state_occupancy()).map(
+                    |counters| {
+                        let userspace_deletes = crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        state.conn_occupancy =
+                            state
+                                .gauge
+                                .estimate(counters.0, counters.1, userspace_deletes);
+                        (counters, userspace_deletes)
+                    },
+                );
+            if let Some(occupancy) = telemetry_sample("auxiliary occupancy", ebpf.aux_occupancy()) {
+                state.aux_occupancy = occupancy;
+            }
             (
                 delta,
-                occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
-                redirect.max(handoff) as f64 / AUX_MAP_CAPACITY as f64,
-                (counters, userspace_deletes),
+                overflow_read_ok,
+                state.conn_occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
+                state.aux_occupancy.0.max(state.aux_occupancy.1) as f64 / AUX_MAP_CAPACITY as f64,
+                occ_counters,
             )
         };
         let admission_pressure = admission_pressured(state.admission_pressure, conn_utilization);
@@ -83,7 +117,10 @@ impl BpfJanitor {
             state.admission_pressure = admission_pressure;
         }
         let utilization = conn_utilization.max(aux_utilization);
-        update_pressure_state(&mut state.pressure, overflow_delta, utilization);
+        // A missed overflow sample cannot establish another quiet round.
+        if overflow_read_ok || overflow_delta || utilization >= CONN_STATE_PRESSURE_WATERMARK {
+            update_pressure_state(&mut state.pressure, overflow_delta, utilization);
+        }
         let backlog = state
             .aux_scan_results
             .iter()
