@@ -2,6 +2,7 @@ use super::*;
 
 use honk_ebpf_common::{ConnState, NFQUEUE_PENDING_MARK, RoutingMeta};
 
+mod kernel_reclamation;
 mod retirement;
 
 fn identity(token: u32, generation: u64) -> PendingUdpIdentity {

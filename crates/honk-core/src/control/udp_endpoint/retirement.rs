@@ -270,6 +270,32 @@ impl UdpEndpointPool {
         }
     }
 
+    /// Retire the endpoint that owns kernel flow incarnation `incarnation`
+    /// after backend retirement deleted its conn. An endpoint of another
+    /// incarnation, or of none, is left alone.
+    pub(in crate::control) fn retire_reclaimed(
+        &self,
+        flow: &honk_ebpf_common::TuplesKey,
+        incarnation: u64,
+    ) -> bool {
+        if flow.l4proto != libc::IPPROTO_UDP as u8 {
+            return false;
+        }
+        let key = EndpointKey {
+            client_ip: unsafe { flow.src_ip.u6_addr8 },
+            client_port: flow.src_port,
+            dst_ip: unsafe { flow.dst_ip.u6_addr8 },
+            dst_port: flow.dst_port,
+        };
+        let identity = self.endpoints.get(&key).and_then(|entry| {
+            let owner = entry.value().owner();
+            (owner.incarnation() == Some(incarnation)
+                && !matches!(entry.value(), EndpointEntry::Retiring { .. }))
+            .then(|| (owner.token, entry.value().generation()))
+        });
+        identity.is_some_and(|(token, generation)| self.retire_if_same(key, token, generation))
+    }
+
     #[cfg(any(feature = "ebpf", test))]
     pub(in crate::control) fn retire_staged_identity(
         &self,

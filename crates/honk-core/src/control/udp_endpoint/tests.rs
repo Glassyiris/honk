@@ -4,6 +4,7 @@ pub(super) mod closure;
 #[cfg(feature = "native-api")]
 mod native_flow_tests;
 
+mod reclamation;
 mod score;
 
 fn transport(

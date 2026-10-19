@@ -493,6 +493,7 @@ fn deletes_are_counted_for_success_and_partial_failure() {
 fn only_removed_absent_or_superseded_owners_are_settled() {
     use UdpDecisionCommitResult::*;
     assert!(!RetireOutcome::default().settled());
+    assert!(RetireOutcome::ConnRetired.settled());
     for (result, settled) in [
         (Applied, true),
         (Missing, true),

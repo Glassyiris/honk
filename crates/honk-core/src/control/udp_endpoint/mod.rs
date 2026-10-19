@@ -810,6 +810,11 @@ impl UdpEndpointPool {
     }
 
     #[cfg(test)]
+    pub(super) fn contains(&self, client: SocketAddr, dst: SocketAddr) -> bool {
+        self.endpoints.contains_key(&EndpointKey::new(client, dst))
+    }
+
+    #[cfg(test)]
     fn is_terminal(&self) -> bool {
         self.terminal.load(Ordering::Acquire)
     }

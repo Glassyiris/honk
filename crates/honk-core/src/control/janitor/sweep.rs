@@ -54,6 +54,7 @@ impl BpfJanitor {
     {
         let ebpf = Arc::clone(&self.ebpf);
         let pins = Arc::clone(&self.tcp_flow_pins);
+        let udp_pool = self.udp_pool.clone();
         #[cfg(test)]
         let before_delete_hook = self.before_delete_hook.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -77,7 +78,21 @@ impl BpfJanitor {
                 if requests.is_empty() {
                     continue;
                 }
-                match ebpf.retire_batch(&requests, &mut outcomes[..requests.len()]) {
+                let batch = ebpf.retire_batch(&requests, &mut outcomes[..requests.len()]);
+                drop(ebpf);
+                // Deletes before a failure are real, so their endpoints retire too.
+                if let Some(pool) = &udp_pool {
+                    for (request, outcome) in requests.iter().zip(&outcomes) {
+                        if let (
+                            RetireKind::ExpiredConn { expected, .. },
+                            RetireOutcome::ConnRetired,
+                        ) = (request.kind, outcome)
+                        {
+                            pool.retire_reclaimed(&request.key, expected.incarnation);
+                        }
+                    }
+                }
+                match batch {
                     Ok(progress) => counts += progress,
                     Err(error) => {
                         counts += error.counts;

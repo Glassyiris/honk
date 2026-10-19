@@ -417,14 +417,16 @@ impl ControlPlane {
                 Arc::clone(&self.retirement),
             ));
             epoch.janitor = Some(
-                BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone()).spawn_supervised(
-                    CriticalTaskExit {
-                        name: "bpf_janitor",
-                        fatal_tx: critical_tx,
-                        expected: false,
-                    },
-                    epoch.stop.subscribe(),
-                ),
+                BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone())
+                    .with_udp_pool(self.udp_pool.clone())
+                    .spawn_supervised(
+                        CriticalTaskExit {
+                            name: "bpf_janitor",
+                            fatal_tx: critical_tx,
+                            expected: false,
+                        },
+                        epoch.stop.subscribe(),
+                    ),
             );
             epoch.health_updates = Some(HealthUpdates::start(self));
             #[cfg(feature = "ebpf")]

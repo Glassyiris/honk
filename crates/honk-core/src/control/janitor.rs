@@ -22,6 +22,7 @@
 //!   the aggressive auxiliary cadence
 
 use super::connection::TcpFlowPins;
+use super::udp_endpoint::UdpEndpointPool;
 use crate::ebpf::{EbpfBackend, RETIRE_BATCH_CAPACITY};
 use health::{AuxMap, HealthLatches};
 use honk_ebpf_common::conn::{BpfStatsKey, MAX_CONN_STATE_NUM};
@@ -140,6 +141,7 @@ struct PressureState {
 pub struct BpfJanitor {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tcp_flow_pins: Arc<TcpFlowPins>,
+    udp_pool: Option<Arc<UdpEndpointPool>>,
     #[cfg(test)]
     blocking_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -155,11 +157,18 @@ impl BpfJanitor {
         Self {
             ebpf,
             tcp_flow_pins,
+            udp_pool: None,
             #[cfg(test)]
             blocking_read_hook: None,
             #[cfg(test)]
             before_delete_hook: None,
         }
+    }
+
+    /// Retire the endpoints of UDP flows whose conn this janitor deletes.
+    pub(super) fn with_udp_pool(mut self, pool: Arc<UdpEndpointPool>) -> Self {
+        self.udp_pool = Some(pool);
+        self
     }
 
     /// Spawn with a guard that reports unexpected task death to the control plane.

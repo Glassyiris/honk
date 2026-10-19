@@ -1567,14 +1567,19 @@ mod batch_retirement_tests {
         assert_eq!(counts, RetireCounts::default());
         assert_eq!(outcome, UdpDecisionCommitResult::Superseded);
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_some());
-        let (counts, outcome) = retire_fixture(
-            &mut backend,
-            key,
-            RetireKind::ExpiryHint {
-                incarnation: 1,
-                now_ns: 31_000_000_000,
-            },
-        );
+        let mut outcomes = [RetireOutcome::NotRun];
+        let counts = backend
+            .retire_batch(
+                &[RetireRequest {
+                    key,
+                    kind: RetireKind::ExpiryHint {
+                        incarnation: 1,
+                        now_ns: 31_000_000_000,
+                    },
+                }],
+                &mut outcomes,
+            )
+            .unwrap();
         assert_eq!(
             counts,
             RetireCounts {
@@ -1582,7 +1587,10 @@ mod batch_retirement_tests {
                 ..Default::default()
             }
         );
-        assert_eq!(outcome, UdpDecisionCommitResult::Applied);
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+        );
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
             backend
@@ -1620,16 +1628,20 @@ mod batch_retirement_tests {
                 .incarnation,
             1
         );
-        let (counts, outcome) = retire_fixture(
-            &mut backend,
-            key,
-            RetireKind::ExpiryHint {
-                incarnation: 1,
-                now_ns: 31_000_000_001 + honk_ebpf_common::conn::UDP_CONN_STATE_TIMEOUT_NS,
-            },
-        );
+        let counts = backend
+            .retire_batch(
+                &[RetireRequest {
+                    key,
+                    kind: RetireKind::ExpiryHint {
+                        incarnation: 1,
+                        now_ns: 31_000_000_001 + honk_ebpf_common::conn::UDP_CONN_STATE_TIMEOUT_NS,
+                    },
+                }],
+                &mut outcomes,
+            )
+            .unwrap();
         assert_eq!(counts.conn, 1);
-        assert_eq!(outcome, UdpDecisionCommitResult::Applied);
+        assert_eq!(outcomes, [RetireOutcome::ConnRetired]);
         assert!(backend.conn_state_lookup(&key).unwrap().is_none());
     }
 

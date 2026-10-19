@@ -140,7 +140,7 @@ impl std::ops::AddAssign for RetireCounts {
 /// Per-request result of `retire_batch`. `NotRun` is the pre-filled value and
 /// survives only where the batch failed first, so it is never settled.
 /// `ConnRetired` means this request physically deleted the flow's conn entry;
-/// `Done(Applied)` is an auxiliary-only deletion that left the conn in place.
+/// `Done(Applied)` acknowledges only auxiliary retirement, not a conn deletion.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RetireOutcome {
     #[default]

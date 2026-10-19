@@ -84,7 +84,13 @@ impl Retirement {
         (!pins.contains(&request.key)).then_some(request)
     }
 
-    fn settle(self, ok: bool, pool: &UdpEndpointPool, tracker: &ConnectionTracker) {
+    fn settle(
+        self,
+        ok: bool,
+        outcome: RetireOutcome,
+        pool: &UdpEndpointPool,
+        tracker: &ConnectionTracker,
+    ) {
         match self {
             Self::Udp(removal) => {
                 if ok && let Some(id) = removal.conn_id.as_deref() {
@@ -96,7 +102,13 @@ impl Retirement {
                 flow.finish_retirement(ok);
                 let _ = completion.send(ok);
             }
-            Self::Hint(_) => {}
+            // The endpoint's own removal already owns its tombstone, so only
+            // a kernel-side reclamation of the conn needs to reach the pool.
+            Self::Hint(hint) => {
+                if outcome == RetireOutcome::ConnRetired {
+                    pool.retire_reclaimed(&hint.key, hint.incarnation);
+                }
+            }
         }
     }
 }
@@ -105,6 +117,7 @@ struct Slot {
     job: Retirement,
     request: Option<RetireRequest<'static>>,
     ok: bool,
+    outcome: RetireOutcome,
 }
 
 impl From<Retirement> for Slot {
@@ -113,6 +126,7 @@ impl From<Retirement> for Slot {
             job,
             request: None,
             ok: true,
+            outcome: RetireOutcome::NotRun,
         }
     }
 }
@@ -296,6 +310,7 @@ pub(in crate::control) fn spawn_retirement_worker(
                 .filter(|slot| slot.request.is_some())
                 .zip(&outcomes)
             {
+                slot.outcome = outcome;
                 slot.ok = batch_ok && outcome.settled();
                 if batch_ok
                     && !slot.ok
@@ -308,7 +323,7 @@ pub(in crate::control) fn spawn_retirement_worker(
                 }
             }
             for slot in slots.drain(..) {
-                slot.job.settle(slot.ok, &udp_pool, &tracker);
+                slot.job.settle(slot.ok, slot.outcome, &udp_pool, &tracker);
             }
             requests.clear();
             udp_pool.flush_removal_dirty();
