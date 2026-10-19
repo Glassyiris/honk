@@ -1,6 +1,7 @@
 use super::*;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use udp_group::{UdpGroup, lookup_cookie};
 
 pub(super) struct NetworkFixture {
     pub(super) backend: RealEbpfBackend,
@@ -235,6 +236,19 @@ impl NetworkFixture {
             .unwrap();
         program.attach("hrtun0", TcAttachType::Ingress).unwrap();
         tun
+    }
+
+    /// Replaces the daens UDP listeners with distinct sockets per family.
+    pub(super) fn udp_group(&mut self) -> UdpGroup {
+        let (backend, listeners) = (&mut self.backend, &self.listeners);
+        in_netns(&self._daens_ns, || UdpGroup::publish(backend, listeners))
+    }
+
+    /// Cookie of the listener `tproxy_sk_lookup` would select for this flow.
+    pub(super) fn lookup_cookie(&self, source: SocketAddr, destination: SocketAddr) -> u64 {
+        in_netns(&self._daens_ns, || {
+            lookup_cookie(&self.backend, source, destination)
+        })
     }
 
     pub(super) fn assert_no_redirects(&self) {

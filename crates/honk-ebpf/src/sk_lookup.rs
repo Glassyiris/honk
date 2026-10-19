@@ -17,6 +17,7 @@ use crate::{
     transport::{IPPROTO_TCP, IPPROTO_UDP},
 };
 use aya_ebpf::{bindings::bpf_sk_lookup, programs::SkLookupContext};
+use honk_ebpf_common::redirect_need::TuplesKey;
 
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
@@ -31,13 +32,34 @@ pub(crate) const KEY_UDP4_BASE: u32 = 2;
 pub(crate) const UDP_LISTENER_COUNT: u32 = 4;
 pub(crate) const KEY_UDP6_BASE: u32 = KEY_UDP4_BASE + UDP_LISTENER_COUNT;
 
-/// Flow-consistent spread over the parallel UDP listeners.
+/// Marker bit in `cb[4]` that carries the listener index chosen at the
+/// redirect site to `dae0peer_ingress`; `cb[4]` is otherwise unused for UDP.
+pub(crate) const UDP_LISTENER_MARKER: u32 = 0x100;
+
+/// Flow-consistent spread over the parallel UDP listeners. The sole
+/// definition: the redirect sites, `dae0peer_ingress` and `sk_lookup` all
+/// derive the index from the flow tuple here, with addresses and ports in
+/// host byte order, so a flow lands on one socket whichever path delivers it.
 #[inline(always)]
-pub(crate) fn listener_hash(a: u32, b: u32, c: u32, d: u32) -> u32 {
-    (a.wrapping_add(b.rotate_left(8))
-        .wrapping_add(c.rotate_left(16))
-        ^ d)
+pub(crate) fn udp_listener_index(src: u32, dst: u32, src_port: u16, dst_port: u16) -> u32 {
+    let ports = ((src_port as u32) << 16) | dst_port as u32;
+    src.wrapping_add(dst.rotate_left(8))
+        .wrapping_add(ports.rotate_left(16))
         % UDP_LISTENER_COUNT
+}
+
+/// `cb[4]` value for a UDP flow. Both families hash the low address word: the
+/// IPv4-mapped tuple form keeps the IPv4 address there, like `remote_ip4`.
+#[inline(always)]
+pub(crate) fn udp_listener_marker(five: &TuplesKey) -> u32 {
+    let (src, dst) = unsafe { (five.src_ip.u6_addr32[3], five.dst_ip.u6_addr32[3]) };
+    UDP_LISTENER_MARKER
+        | udp_listener_index(
+            u32::from_be(src),
+            u32::from_be(dst),
+            five.src_port,
+            five.dst_port,
+        )
 }
 
 #[unsafe(no_mangle)]
@@ -86,11 +108,11 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
 #[inline(never)]
 fn udp_listener_key_v4(lookup: *const bpf_sk_lookup) -> u32 {
     let lookup = unsafe { &*lookup };
-    let h = listener_hash(
-        lookup.remote_ip4,
-        lookup.local_ip4,
-        (lookup.remote_port as u32) << 16,
-        lookup.local_port,
+    let h = udp_listener_index(
+        u32::from_be(lookup.remote_ip4),
+        u32::from_be(lookup.local_ip4),
+        u16::from_be(lookup.remote_port),
+        lookup.local_port as u16,
     );
     KEY_UDP4_BASE + h
 }
@@ -99,11 +121,11 @@ fn udp_listener_key_v4(lookup: *const bpf_sk_lookup) -> u32 {
 #[inline(never)]
 fn udp_listener_key_v6(lookup: *const bpf_sk_lookup) -> u32 {
     let lookup = unsafe { &*lookup };
-    let h = listener_hash(
-        lookup.remote_ip6[3],
-        lookup.local_ip6[3],
-        (lookup.remote_port as u32) << 16,
-        lookup.local_port,
+    let h = udp_listener_index(
+        u32::from_be(lookup.remote_ip6[3]),
+        u32::from_be(lookup.local_ip6[3]),
+        u16::from_be(lookup.remote_port),
+        lookup.local_port as u16,
     );
     KEY_UDP6_BASE + h
 }

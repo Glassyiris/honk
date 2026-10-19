@@ -37,11 +37,7 @@ use honk_ebpf_common::{
     pack_nfqueue_mark,
     redirect_need::TuplesKey,
 };
-use network_types::{
-    eth::EthHdr,
-    ip::{Ipv4Hdr, Ipv6Hdr},
-    udp::UdpHdr,
-};
+use network_types::eth::EthHdr;
 
 use crate::{
     auxiliary::{AuxPrep, redirect_needs_publish},
@@ -109,14 +105,17 @@ fn redirect_lan_packet_to_control_plane(
             (*ctx.skb.skb).cb[2] = dns_route_mark;
             let syn =
                 pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph);
-            (*ctx.skb.skb).cb[3] = if syn {
-                incarnation as u32
+            // Values first, then stores at fixed offsets: branch-local stores
+            // get merged into one store through a modified ctx pointer.
+            let (cb3, cb4) = if syn {
+                (incarnation as u32, (incarnation >> 32) as u32)
             } else if pkt.l4proto == IPPROTO_UDP {
-                trace_id
+                (trace_id, udp_listener_marker(&pkt.tuples.five))
             } else {
-                0
+                (0, 0)
             };
-            (*ctx.skb.skb).cb[4] = if syn { (incarnation >> 32) as u32 } else { 0 };
+            (*ctx.skb.skb).cb[3] = cb3;
+            (*ctx.skb.skb).cb[4] = cb4;
         }
     }
 
@@ -1034,72 +1033,41 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     // Redirected frames may still carry the original destination MAC.
     let _ = ctx.change_type(0);
     if listener_l4proto == IPPROTO_UDP {
-        let _ = assign_udp_listener(ctx);
+        // Without the redirect site's marker the packet reaches sk_lookup unassigned.
+        let marker = unsafe { (*ctx.skb.skb).cb[4] };
+        let key = udp_assign_key(ctx, marker);
+        // BPF_PROG_TEST_RUN never runs at TC ingress, so assignment cannot take
+        // effect there; fixtures read the chosen map key back from cb[4].
+        #[cfg(feature = "routing-test")]
+        unsafe {
+            (*ctx.skb.skb).cb[4] = key.unwrap_or(0)
+        };
+        if let Some(key) = key {
+            let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
+            let _ = sk::sk_assign_by_index(ctx, map_ptr, &key, 0);
+        }
     }
 
     Ok(TC_ACT_OK)
 }
 
-use crate::sk_lookup::{KEY_UDP4_BASE, KEY_UDP6_BASE, listener_hash};
+use crate::sk_lookup::{
+    KEY_UDP4_BASE, KEY_UDP6_BASE, UDP_LISTENER_COUNT, UDP_LISTENER_MARKER, udp_listener_marker,
+};
 
+/// Listener map key named by a redirect site's `cb[4]` marker.
 #[inline(always)]
-fn assign_udp_listener(ctx: &TcContext) -> Result<(), c_long> {
-    let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
-    let h = udp_listener_hash(ctx, is_v6);
-    let key = if is_v6 {
-        KEY_UDP6_BASE + h
-    } else {
-        KEY_UDP4_BASE + h
-    };
-
-    let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
-    sk::sk_assign_by_index(ctx, map_ptr, &key, 0)
-}
-
-/// Flow-consistent listener index for a UDP packet: the same 4-tuple always
-/// lands on the same socket while different flows spread over the group.
-/// Header-missing packets (short reads) hash with zeroed ports, which is
-/// still deterministic per flow.
-#[inline(always)]
-fn udp_listener_hash(ctx: &TcContext, is_v6: bool) -> u32 {
-    // Guarantee the headers are in the linear data area; bounds checks
-    // below still guard the actual reads.
-    let _ = ctx.pull_data(ETH_HLEN + 40 + 8);
-    let data = ctx.data() as *const u8;
-    let data_end = ctx.data_end() as *const u8;
-    if unsafe { data.add(mem::size_of::<EthHdr>()) } > data_end {
-        return 0;
+fn udp_assign_key(ctx: &TcContext, marker: u32) -> Option<u32> {
+    let index = marker.wrapping_sub(UDP_LISTENER_MARKER);
+    if index >= UDP_LISTENER_COUNT {
+        return None;
     }
-    let (src, dst, l4off) = if is_v6 {
-        if unsafe { data.add(ETH_HLEN as usize + mem::size_of::<Ipv6Hdr>()) } > data_end {
-            return 0;
-        }
-        let v6h = unsafe { &*(data.add(ETH_HLEN as usize) as *const Ipv6Hdr) };
-        let src = u32::from_be_bytes(v6h.src_addr[12..16].try_into().unwrap_or([0; 4]));
-        let dst = u32::from_be_bytes(v6h.dst_addr[12..16].try_into().unwrap_or([0; 4]));
-        (src, dst, ETH_HLEN as usize + mem::size_of::<Ipv6Hdr>())
+    let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
+    Some(if is_v6 {
+        KEY_UDP6_BASE + index
     } else {
-        if unsafe { data.add(ETH_HLEN as usize + mem::size_of::<Ipv4Hdr>()) } > data_end {
-            return 0;
-        }
-        let v4h = unsafe { &*(data.add(ETH_HLEN as usize) as *const Ipv4Hdr) };
-        let ihl = (v4h.vihl & 0x0f) as usize * 4;
-        if ihl < 20 {
-            return 0;
-        }
-        (
-            u32::from_be_bytes(v4h.src_addr),
-            u32::from_be_bytes(v4h.dst_addr),
-            ETH_HLEN as usize + ihl,
-        )
-    };
-    let (sport, dport) = if unsafe { data.add(l4off + 4) } > data_end {
-        (0u16, 0u16)
-    } else {
-        let udph = unsafe { &*(data.add(l4off) as *const UdpHdr) };
-        (u16::from_be_bytes(udph.src), u16::from_be_bytes(udph.dst))
-    };
-    listener_hash(src, dst, ((sport as u32) << 16) | dport as u32, 0)
+        KEY_UDP4_BASE + index
+    })
 }
 
 // #[inline(never)]: standalone program, no deep call chain.

@@ -557,7 +557,7 @@ fn fast_path_decision(
         (*ctx.skb.skb).cb[1] = IPPROTO_UDP as u32;
         (*ctx.skb.skb).cb[2] = dns_route_mark;
         (*ctx.skb.skb).cb[3] = trace_id;
-        (*ctx.skb.skb).cb[4] = 0;
+        (*ctx.skb.skb).cb[4] = crate::sk_lookup::udp_listener_marker(&tuples.five);
     }
 
     // Must UDP53 ownership (including the direct mark index) is entirely
