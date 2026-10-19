@@ -370,8 +370,9 @@ impl PendingUdpVerdicts {
     }
 
     pub(in crate::control) async fn shutdown_commit_pump(&self) -> anyhow::Result<()> {
-        self.commits.stop.send_replace(true);
+        // Under the task lock a pump spawn either sees stop or subscribes before it.
         let mut task = self.commits.task.lock().await;
+        self.commits.stop.send_replace(true);
         if let Some(handle) = task.handle.as_mut() {
             let result = handle.await;
             task.handle = None;
