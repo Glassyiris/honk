@@ -565,10 +565,31 @@ pub fn retire_pending(
     Ok(outcome[0])
 }
 
-fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
+fn retired_counts(result: &Result<RetireCounts, RetireError>) -> RetireCounts {
     match result {
-        Ok(counts) => counts.conn,
-        Err(error) => error.counts.conn,
+        Ok(counts) => *counts,
+        Err(error) => error.counts,
+    }
+}
+
+fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
+    retired_counts(result).conn
+}
+
+/// Redirect and handoff elements one backend's userspace removed. The datapath
+/// only inserts them, so this is what `aux_occupancy` subtracts from its counters.
+#[derive(Debug, Default)]
+pub(crate) struct AuxDeleteTally {
+    pub redirect: u64,
+    pub handoff: u64,
+}
+
+impl AuxDeleteTally {
+    /// Count a finished batch, including deletes made before a failure.
+    pub(crate) fn record(&mut self, result: &Result<RetireCounts, RetireError>) {
+        let counts = retired_counts(result);
+        self.redirect += counts.redirect;
+        self.handoff += counts.handoff;
     }
 }
 

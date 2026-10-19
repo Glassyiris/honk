@@ -204,6 +204,13 @@ pub const fn is_stateless_udp_ports(src_port: u16, dst_port: u16) -> bool {
 pub const OCCUPANCY_INSERTS: u32 = 0;
 pub const OCCUPANCY_EBPF_DELETES: u32 = 1;
 
+/// Slots of the `AUX_OCCUPANCY` per-CPU array: cumulative successful NOEXIST
+/// inserts into REDIRECT_TRACK / ROUTING_HANDOFF_MAP. The datapath never
+/// deletes these elements, so userspace derives live occupancy as
+/// `inserts - retirement deletes`, recalibrated on every complete scan.
+pub const AUX_OCCUPANCY_REDIRECT_INSERTS: u32 = 0;
+pub const AUX_OCCUPANCY_HANDOFF_INSERTS: u32 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum TcpState {

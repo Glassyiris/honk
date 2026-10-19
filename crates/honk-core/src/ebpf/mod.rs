@@ -820,6 +820,13 @@ pub trait EbpfBackend: Send + Sync {
         Ok((0, 0))
     }
 
+    /// Live `(redirect, handoff)` element estimates: the datapath's cumulative
+    /// inserts minus what userspace retirement removed. Backends without the
+    /// gauge return `(0, 0)`.
+    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+
     /// Stream REDIRECT_TRACK in bounded chunks. The callback can stop at a
     /// chunk boundary so callers can retain a wall-clock budget.
     fn redirect_track_for_each_chunk(

@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use super::TcpSocketOwnership;
+use super::retirement::AuxDeleteTally;
 use super::{
     EbpfBackend, FlowExpiryHint, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP, RetireCounts,
     RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
@@ -96,6 +97,7 @@ pub struct RealEbpfBackend {
     #[cfg(feature = "native-api")]
     receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
+    aux_deletes: AuxDeleteTally,
 }
 
 /// Find cgroup2 in the calling thread's mount namespace, not its thread-group leader's.
@@ -343,6 +345,35 @@ impl RealEbpfBackend {
             visit(&projected);
         }
         Ok(())
+    }
+
+    /// Sum each slot of a per-CPU `u64` array over all CPUs; a map the object
+    /// lacks reads as zero.
+    fn percpu_totals<const N: usize>(
+        &self,
+        name: &str,
+        slots: [u32; N],
+    ) -> anyhow::Result<[u64; N]> {
+        let mut totals = [0u64; N];
+        let Some(map) = self.bpf()?.map(name) else {
+            return Ok(totals);
+        };
+        let array = AyaPerCpuArray::<_, u64>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+        for (total, slot) in totals.iter_mut().zip(slots) {
+            match array.get(&slot, 0) {
+                Ok(values) => {
+                    *total = values
+                        .iter()
+                        .fold(0u64, |sum, value| sum.wrapping_add(*value));
+                }
+                Err(MapError::KeyNotFound) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!("map '{name}' get[{slot}]: {error}"));
+                }
+            }
+        }
+        Ok(totals)
     }
 
     fn hash_remove<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<()> {
@@ -839,35 +870,28 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
-        let bpf = self.bpf()?;
-        let Some(map) = bpf.map("CONN_STATE_OCCUPANCY") else {
-            return Ok((0, 0));
-        };
-        let array = AyaPerCpuArray::<_, u64>::try_from(map)
-            .map_err(|error| anyhow::anyhow!("map 'CONN_STATE_OCCUPANCY': {error}"))?;
-        let mut totals = [0u64; 2];
-        for (index, slot) in [
-            honk_ebpf_common::conn::OCCUPANCY_INSERTS,
-            honk_ebpf_common::conn::OCCUPANCY_EBPF_DELETES,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            match array.get(&slot, 0) {
-                Ok(values) => {
-                    totals[index] = values
-                        .iter()
-                        .fold(0u64, |total, value| total.wrapping_add(*value));
-                }
-                Err(MapError::KeyNotFound) => {}
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "map 'CONN_STATE_OCCUPANCY' get[{slot}]: {error}"
-                    ));
-                }
-            }
-        }
-        Ok((totals[0], totals[1]))
+        let [inserts, deletes] = self.percpu_totals(
+            "CONN_STATE_OCCUPANCY",
+            [
+                honk_ebpf_common::conn::OCCUPANCY_INSERTS,
+                honk_ebpf_common::conn::OCCUPANCY_EBPF_DELETES,
+            ],
+        )?;
+        Ok((inserts, deletes))
+    }
+
+    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        let [redirect, handoff] = self.percpu_totals(
+            "AUX_OCCUPANCY",
+            [
+                honk_ebpf_common::conn::AUX_OCCUPANCY_REDIRECT_INSERTS,
+                honk_ebpf_common::conn::AUX_OCCUPANCY_HANDOFF_INSERTS,
+            ],
+        )?;
+        Ok((
+            redirect.saturating_sub(self.aux_deletes.redirect),
+            handoff.saturating_sub(self.aux_deletes.handoff),
+        ))
     }
 
     fn set_outbound_alive(

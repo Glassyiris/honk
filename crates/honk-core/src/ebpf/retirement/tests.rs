@@ -490,6 +490,22 @@ fn deletes_are_counted_for_success_and_partial_failure() {
 }
 
 #[test]
+fn auxiliary_tally_counts_success_and_partial_failure() {
+    let counts = RetireCounts {
+        conn: 3,
+        redirect: 2,
+        handoff: 5,
+    };
+    let mut tally = AuxDeleteTally::default();
+    tally.record(&Ok(counts));
+    tally.record(&Err(RetireError {
+        counts,
+        source: anyhow::anyhow!("fault after partial progress"),
+    }));
+    assert_eq!((tally.redirect, tally.handoff), (4, 10));
+}
+
+#[test]
 fn only_removed_absent_or_superseded_owners_are_settled() {
     use UdpDecisionCommitResult::*;
     assert!(!RetireOutcome::default().settled());

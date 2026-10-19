@@ -209,6 +209,11 @@ pub static CONN_STATE_MAP: HashMap<
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
+/// Successful redirect/handoff insertions; only fenced userspace reclamation
+/// removes these elements, so userspace subtracts its own deletes.
+#[btf_map]
+pub static AUX_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
+
 /// Conn UDP/TCP, redirect/handoff insertion, socket identity capture, TCP child proof
 /// storage and non-collision SYN claim failures.
 #[btf_map]

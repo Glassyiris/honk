@@ -17,6 +17,7 @@ use std::os::fd::AsRawFd;
 use std::ptr;
 use std::time::Duration;
 
+mod aux_occupancy;
 mod datagram_fragments;
 mod direct_mode;
 mod failures;

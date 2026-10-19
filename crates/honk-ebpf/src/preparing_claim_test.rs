@@ -95,6 +95,8 @@ pub fn preparing_claim_interleaving_test(ctx: *mut __sk_buff) -> c_long {
         {
             return TC_ACT_SHOT;
         }
+        crate::auxiliary::aux_occupancy_add(honk_ebpf_common::conn::AUX_OCCUPANCY_HANDOFF_INSERTS);
+        crate::auxiliary::aux_occupancy_add(honk_ebpf_common::conn::AUX_OCCUPANCY_REDIRECT_INSERTS);
         if mode == 5 {
             scratch.state.incarnation = aux_incarnation;
             scratch.state.state = UdpDecisionState::Preparing as u8;

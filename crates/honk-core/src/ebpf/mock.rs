@@ -1053,6 +1053,13 @@ impl EbpfBackend for MockEbpfBackend {
         None
     }
 
+    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        Ok((
+            self.redirect_tracks.len() as u64,
+            self.routing_handoffs.lock().len() as u64,
+        ))
+    }
+
     fn retire_batch(
         &mut self,
         requests: &[RetireRequest<'_>],

@@ -259,6 +259,7 @@ impl RealEbpfBackend {
             Err(source) => Err(RetireError { counts, source }),
         };
         account_retirement(&result);
+        self.aux_deletes.record(&result);
         result
     }
 
@@ -509,13 +510,15 @@ impl RealEbpfBackend {
         };
         if plan.remove_handoff {
             self.hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", key)?;
+            self.aux_deletes.handoff += 1;
         }
         match plan.redirect {
             Some(RedirectEffect::Rewrite(track)) => {
                 self.flow_insert("REDIRECT_TRACK", &track_key, &track)?
             }
             Some(RedirectEffect::Remove) => {
-                self.hash_remove::<_, FlowMapValue<RedirectEntry>>("REDIRECT_TRACK", &track_key)?
+                self.hash_remove::<_, FlowMapValue<RedirectEntry>>("REDIRECT_TRACK", &track_key)?;
+                self.aux_deletes.redirect += 1;
             }
             None => {}
         }

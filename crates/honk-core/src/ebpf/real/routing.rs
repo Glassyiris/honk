@@ -648,6 +648,7 @@ impl RealEbpfBackend {
             #[cfg(feature = "native-api")]
             receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
+            aux_deletes: Default::default(),
         })
     }
 

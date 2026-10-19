@@ -16,7 +16,10 @@ use aya_ebpf_bindings::{
 use core::mem;
 use honk_ebpf_common::{
     FlowMapValue, RedirectEntry, RedirectTuple, RoutingHandoffEntry, Tuples, TuplesKey,
-    conn::{BpfStatsKey, REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS},
+    conn::{
+        AUX_OCCUPANCY_HANDOFF_INSERTS, AUX_OCCUPANCY_REDIRECT_INSERTS, BpfStatsKey,
+        REDIRECT_TRACK_TIMEOUT_NS, ROUTING_HANDOFF_TIMEOUT_NS,
+    },
 };
 use network_types::eth::EthHdr;
 
@@ -27,7 +30,7 @@ use crate::{
         AuxiliaryIdentity, copy_payload, handoff_identity, redirect_identity, redirect_snapshot,
     },
     maps::{
-        CLIENT_REPLY_TRACK, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, TCP_PUBLISHING,
+        AUX_OCCUPANCY, CLIENT_REPLY_TRACK, REDIRECT_TRACK, ROUTING_HANDOFF_MAP, TCP_PUBLISHING,
         UdpDecisionScratch, increment_bpf_stat, tuple_retiring,
     },
 };
@@ -60,6 +63,16 @@ pub fn auxiliary_expired(
         send_flow_expired(key, incarnation);
     }
     expired
+}
+
+/// Per-CPU, contention-free count of one successful NOEXIST element insertion.
+#[inline(always)]
+pub fn aux_occupancy_add(slot: u32) {
+    if let Some(counter) = AUX_OCCUPANCY.get_ptr_mut(slot) {
+        unsafe {
+            *counter += 1;
+        }
+    }
 }
 
 #[inline(always)]
@@ -336,6 +349,7 @@ pub fn publish_redirect(
             increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
             -1
         })?;
+    aux_occupancy_add(AUX_OCCUPANCY_REDIRECT_INSERTS);
     publish_client_reply(key, scratch);
     Ok(())
 }
@@ -402,7 +416,9 @@ pub fn publish_handoff(
         .map_err(|_| {
             increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
             -1
-        })
+        })?;
+    aux_occupancy_add(AUX_OCCUPANCY_HANDOFF_INSERTS);
+    Ok(())
 }
 
 /// How one packet may touch an auxiliary map element.
