@@ -815,7 +815,9 @@ fn wan_tcp_requires_fresh_policy_but_not_cached_outbound_health() {
             7,
         );
         assert_eq!(
-            fixture.run("wan_egress_l2", &packet, SkbInput::default()).return_value,
+            fixture
+                .run("wan_egress_l2", &packet, SkbInput::default())
+                .return_value,
             expected,
             "WAN TCP fresh={fresh} alive={alive}"
         );

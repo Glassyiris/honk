@@ -18,8 +18,14 @@ fn wan_tcp_dns_must_proxy_is_exempt_from_dead_outbound_health() {
             set_array(&mut backend, "OUTBOUND_CONNECTIVITY_MAP", key, 0u64);
         }
         for (src, dst) in [
-            ("192.0.2.83".parse().unwrap(), "198.51.100.83".parse().unwrap()),
-            ("2001:db8:1::83".parse().unwrap(), "2001:db8:2::83".parse().unwrap()),
+            (
+                "192.0.2.83".parse().unwrap(),
+                "198.51.100.83".parse().unwrap(),
+            ),
+            (
+                "2001:db8:1::83".parse().unwrap(),
+                "2001:db8:2::83".parse().unwrap(),
+            ),
         ] {
             let key = tuple(src, dst, 45900, 53, IPPROTO_TCP);
             let syn = packet(src, dst, IPPROTO_TCP, key.src_port, 53, 5, 0x02);
@@ -50,8 +56,14 @@ fn tcp_health_applies_to_fresh_admission_not_cached_packets_while_udp_stays_gate
             true,
         )]);
         for (src, dst) in [
-            ("192.0.2.84".parse().unwrap(), "198.51.100.84".parse().unwrap()),
-            ("2001:db8:1::84".parse().unwrap(), "2001:db8:2::84".parse().unwrap()),
+            (
+                "192.0.2.84".parse().unwrap(),
+                "198.51.100.84".parse().unwrap(),
+            ),
+            (
+                "2001:db8:1::84".parse().unwrap(),
+                "2001:db8:2::84".parse().unwrap(),
+            ),
         ] {
             for (index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
                 for key in 2 * 6..3 * 6 {
@@ -62,7 +74,10 @@ fn tcp_health_applies_to_fresh_admission_not_cached_packets_while_udp_stays_gate
                 let syn = packet(src, dst, IPPROTO_TCP, port, 443, 5, 0x02);
                 let udp = packet(src, dst, IPPROTO_UDP, port, 443, 5, 0);
                 for bytes in [&syn, &udp] {
-                    assert_eq!(run(&backend, side, bytes, SkbInput::default()).verdict, TC_ACT_REDIRECT);
+                    assert_eq!(
+                        run(&backend, side, bytes, SkbInput::default()).verdict,
+                        TC_ACT_REDIRECT
+                    );
                 }
                 let owner = handoff(&backend, &key).incarnation;
                 for key in 2 * 6..3 * 6 {
@@ -77,7 +92,10 @@ fn tcp_health_applies_to_fresh_admission_not_cached_packets_while_udp_stays_gate
                     );
                     assert_eq!(handoff(&backend, &key).incarnation, owner);
                 }
-                assert_eq!(run(&backend, side, &udp, SkbInput::default()).verdict, TC_ACT_SHOT);
+                assert_eq!(
+                    run(&backend, side, &udp, SkbInput::default()).verdict,
+                    TC_ACT_SHOT
+                );
                 let fresh_syn = packet(src, dst, IPPROTO_TCP, port + 1, 443, 5, 0x02);
                 let fresh_udp = packet(src, dst, IPPROTO_UDP, port + 1, 443, 5, 0);
                 for bytes in [&fresh_syn, &fresh_udp, &fresh_syn, &fresh_udp] {

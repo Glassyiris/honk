@@ -1066,9 +1066,8 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     }
     let mut canonical: TuplesKey = unsafe { mem::zeroed() };
     crate::contrack::copy_reversed_tuples(&pkt.tuples.five, &mut canonical);
-    if crate::contrack::tuple_unavailable(&canonical) {
-        return Err(TC_ACT_SHOT);
-    }
+    let lifecycle =
+        crate::contrack::available_tuple_lifecycle(&canonical).map_err(|_| TC_ACT_SHOT)?;
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five).reverse();
 
     let now = unsafe { bpf_ktime_get_ns() };
@@ -1077,6 +1076,12 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     {
         Some(entry) => {
             crate::stats::count_rx(ctx, entry.outbound);
+            if pkt.l4proto == IPPROTO_UDP
+                && !crate::contrack::is_short_lived_udp_traffic(&canonical)
+                && let Some(snapshot) = lifecycle.as_ref()
+            {
+                crate::contrack::udp::renew_udp_reply(&canonical, snapshot, &entry, now);
+            }
             entry
         }
         // No outbound owns this reply, so it is not counted against one.

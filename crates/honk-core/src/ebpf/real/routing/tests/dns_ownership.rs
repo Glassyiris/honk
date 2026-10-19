@@ -155,6 +155,7 @@ struct SkbInput {
 #[derive(Debug)]
 struct Run {
     verdict: u32,
+    duration: Duration,
     mark: u32,
     cb: [u32; 5],
     priority: u32,
@@ -291,6 +292,7 @@ fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) ->
     let returned: __sk_buff = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
     Run {
         verdict: result.return_value,
+        duration: result.duration,
         mark: returned.mark,
         cb: returned.cb,
         priority: returned.priority,

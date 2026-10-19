@@ -41,6 +41,26 @@ fn spoofed_reverse_syn_cannot_overwrite_a_proxied_tcp_flow() {
                 TC_ACT_REDIRECT,
                 "{src} ACK escaped the proxy"
             );
+            let absent = tuple(src, dst, key.src_port + 5, 443, IPPROTO_TCP);
+            let reverse_absent = tuple(dst, src, 443, absent.src_port, IPPROTO_TCP);
+            let unsolicited = packet(dst, src, IPPROTO_TCP, 443, absent.src_port, 19, 0x02);
+            for side in ["wan_ingress_l2", "lan_egress_l2"] {
+                assert_eq!(
+                    run(&backend, side, &unsolicited, SkbInput::default()).verdict,
+                    TC_ACT_PIPE
+                );
+                assert!(
+                    backend.conn_state_lookup(&absent).unwrap().is_none(),
+                    "{side} created canonical state for an unsolicited SYN"
+                );
+                assert!(
+                    backend
+                        .conn_state_lookup(&reverse_absent)
+                        .unwrap()
+                        .is_none(),
+                    "{side} created reverse state for an unsolicited SYN"
+                );
+            }
         }
     });
 }

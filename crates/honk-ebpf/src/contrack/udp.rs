@@ -220,6 +220,39 @@ pub fn lookup_udp_seen(key: &TuplesKey) -> Option<&'static mut ConnState> {
     lookup_udp_seen_at(key, unsafe { bpf_ktime_get_ns() })
 }
 
+/// Queued decisions keep a userspace-owned clock until their final state is published.
+#[inline(always)]
+pub fn renew_udp_reply(
+    key: &TuplesKey,
+    snapshot: &crate::flow::ConnLifecycle,
+    redirect: &honk_ebpf_common::RedirectEntry,
+    now: u64,
+) {
+    if redirect.incarnation == 0
+        || snapshot.incarnation != redirect.incarnation
+        || (snapshot.state != UdpDecisionState::None as u8
+            && snapshot.state != UdpDecisionState::Proxy as u8)
+        || now.saturating_sub(snapshot.last_seen_ns) < UDP_CONN_STATE_UPDATE_INTERVAL_NS
+        || tuple_retiring(key)
+    {
+        return;
+    }
+    let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
+        return;
+    };
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let current = unsafe { &mut (*ptr).value };
+    if current.incarnation == redirect.incarnation
+        && current.decision_token == redirect.decision_token
+        && current.state == snapshot.state
+        && !udp_conn_state_expired(current, now)
+        && now.saturating_sub(current.last_seen_ns) >= UDP_CONN_STATE_UPDATE_INTERVAL_NS
+    {
+        current.last_seen_ns = now;
+    }
+    unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
+}
+
 /// Returns an invocation-local snapshot after publication, never a map payload pointer.
 fn __mark_udp_seen(
     key: *const TuplesKey,
