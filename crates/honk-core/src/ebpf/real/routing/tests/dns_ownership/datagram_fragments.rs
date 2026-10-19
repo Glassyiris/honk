@@ -295,6 +295,97 @@ fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
     });
 }
 
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn an_accepted_first_fragment_clears_the_previous_datagrams_drop_record() {
+    isolated(|| {
+        for (family, (src, _, dst)) in families().into_iter().enumerate() {
+            for (side_index, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
+                let (mut backend, _, _listeners) = publish(&[
+                    rule(
+                        "proxy",
+                        RoutingCondition {
+                            port: vec!["443".into()],
+                            ..Default::default()
+                        },
+                        "proxy",
+                        USER_MARK,
+                        true,
+                    ),
+                    rule(
+                        "native",
+                        RoutingCondition {
+                            port: vec!["444".into()],
+                            ..Default::default()
+                        },
+                        "direct",
+                        0,
+                        true,
+                    ),
+                ]);
+                load_classifier(&mut backend, side);
+                let id = 0x6000;
+                let proxy = fragment(src, dst, 443, id, true);
+                let later = fragment(src, dst, 443, id, false);
+                let context = format!("{side} family {family}");
+                assert_eq!(
+                    verdict(&backend, side, &proxy),
+                    TC_ACT_REDIRECT,
+                    "{context}"
+                );
+
+                if side_index == 0 {
+                    // Pre-parse exits must not retire the preceding packet's record.
+                    let unrelated = fragment(src, dst, 444, id + 1, true);
+                    assert_eq!(
+                        run(
+                            &backend,
+                            side,
+                            &unrelated,
+                            SkbInput {
+                                mark: CLASSIFIED_MARK,
+                                ..Default::default()
+                            }
+                        )
+                        .verdict,
+                        TC_ACT_OK,
+                        "{context}: owned packet"
+                    );
+                    backend.set_datapath_ready(false).unwrap();
+                    assert_eq!(
+                        verdict(&backend, side, &unrelated),
+                        TC_ACT_UNSPEC,
+                        "{context}: closed admission"
+                    );
+                    backend.set_datapath_ready(true).unwrap();
+                }
+                assert_eq!(
+                    verdict(&backend, side, &later),
+                    TC_ACT_SHOT,
+                    "{context}: original datagram"
+                );
+                let direct = fragment(src, dst, 444, id, true);
+                let accepted = if side_index == 0 {
+                    TC_ACT_OK
+                } else {
+                    TC_ACT_UNSPEC
+                };
+                assert_eq!(verdict(&backend, side, &direct), TC_ACT_OK, "{context}");
+                assert_eq!(
+                    verdict(&backend, side, &fragment(src, dst, 444, id, false)),
+                    accepted,
+                    "{context}: an accepted datagram reusing the ID must keep its tails"
+                );
+                assert_eq!(
+                    hash_count::<FragmentKey, FragmentVerdict>(&backend, "FRAG_VERDICT"),
+                    0,
+                    "{context}: stale record removed"
+                );
+            }
+        }
+    });
+}
+
 fn monotonic_ns() -> u64 {
     let mut time: libc::timespec = unsafe { mem::zeroed() };
     assert_eq!(

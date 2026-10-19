@@ -32,22 +32,24 @@ pub fn condemned(pkt: &ParsedPacket) -> bool {
     })
 }
 
-/// Entry-wrapper hook: remember a first fragment's SHOT or REDIRECT. Staged,
-/// pending and DNS paths return OK and are never recorded, so their later
-/// fragments keep reaching NFQUEUE and the DNS fragment path.
+/// Entry-wrapper hook: remember a first fragment's SHOT or REDIRECT, or forget
+/// the old outcome when an accepted datagram reuses its identification.
 #[inline(never)]
 pub fn record(verdict: i32) -> i32 {
-    if verdict != TC_ACT_SHOT as i32 && verdict != TC_ACT_REDIRECT as i32 {
-        return verdict;
-    }
-    // Every verdict other than OK follows the parse, which rewrites is_fragmented.
+    // The caller clears fragmentation before any pre-parse early exit.
     let Some(pkt) = PKT_SCRATCH_KEY.get_ptr_mut(0) else {
         return verdict;
     };
     let pkt = unsafe { &*pkt };
-    if pkt.is_fragmented == 0
-        || (pkt.tuples.five.l4proto == IPPROTO_UDP
-            && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five))
+    if pkt.is_fragmented == 0 {
+        return verdict;
+    }
+    if verdict != TC_ACT_SHOT as i32 && verdict != TC_ACT_REDIRECT as i32 {
+        let _ = FRAG_VERDICT.remove(key(pkt));
+        return verdict;
+    }
+    if pkt.tuples.five.l4proto == IPPROTO_UDP
+        && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five)
     {
         return verdict;
     }

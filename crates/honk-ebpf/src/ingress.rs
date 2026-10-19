@@ -474,6 +474,14 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
 fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
+    let scratch_key: u32 = 0;
+    let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) {
+        Some(ptr) => unsafe { &mut *ptr },
+        None => return Err(TC_ACT_SHOT),
+    };
+    // Fragment verdict retirement must not observe a previous packet on early exits.
+    pkt.is_fragmented = 0;
+
     if !crate::maps::datapath_ready() {
         return Err(TC_ACT_UNSPEC);
     }
@@ -482,12 +490,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if unsafe { (*ctx.skb.skb).mark } & (CLASSIFIED_MARK | NFQUEUE_PENDING_MARK) != 0 {
         return Err(TC_ACT_OK);
     }
-
-    let scratch_key: u32 = 0;
-    let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => return Err(TC_ACT_SHOT),
-    };
 
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
