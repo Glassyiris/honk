@@ -722,7 +722,7 @@ fn do_tproxy_wan_egress_udp(
             routing_meta_flags,
         );
         if state.is_none() {
-            if crate::contrack::tuple_unavailable(&tuples.five)
+            if crate::maps::tuple_retiring(&tuples.five)
                 || crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
             {
                 return Err(TC_ACT_SHOT);
