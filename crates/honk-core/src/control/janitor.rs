@@ -217,7 +217,7 @@ impl BpfJanitor {
                 };
 
                 if let Err(error) = self.tick(&mut state, now, now_ns).await {
-                    error!(%error, "BPF janitor: tick failed");
+                    error!(error = %format_args!("{error:#}"), "BPF janitor: tick failed");
                     return;
                 }
             }
@@ -265,25 +265,27 @@ pub(super) fn monotonic_now_ns() -> anyhow::Result<u64> {
     Ok(ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64)
 }
 
-/// Update the pressure state from the conn-state overflow counters and the
-/// live occupancy watermark.
+/// Update pressure from conn-state overflow and separate conn/redirect/handoff
+/// utilization samples, so an auxiliary episode is not attributed to conn-state.
 ///
 /// Pressure mode latches on when either the kernel's UDP/TCP overflow
 /// counters grow (insert failures — the fail-closed last resort) or the
 /// estimated occupancy crosses `CONN_STATE_PRESSURE_WATERMARK`.  It switches
 /// off after `PRESSURE_EXIT_ROUNDS` consecutive ticks with neither signal.
-fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utilization: f64) {
-    let high_water = utilization >= CONN_STATE_PRESSURE_WATERMARK;
+fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utilizations: [f64; 3]) {
+    let [conn_utilization, redirect_utilization, handoff_utilization] = utilizations;
+    let high_water = utilizations
+        .into_iter()
+        .any(|utilization| utilization >= CONN_STATE_PRESSURE_WATERMARK);
     if overflow_delta || high_water {
         if !state.active {
-            if overflow_delta {
-                warn!("BPF janitor: entering pressure mode (conn state overflow)");
-            } else {
-                warn!(
-                    "BPF janitor: entering pressure mode (conn-state occupancy ~{:.1}%)",
-                    utilization * 100.0
-                );
-            }
+            warn!(
+                conn_overflow = overflow_delta,
+                conn_utilization_pct = conn_utilization * 100.0,
+                redirect_utilization_pct = redirect_utilization * 100.0,
+                handoff_utilization_pct = handoff_utilization * 100.0,
+                "BPF janitor: entering pressure mode"
+            );
         }
         state.active = true;
         state.quiet_rounds = 0;
@@ -297,8 +299,11 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utiliz
         state.active = false;
         state.quiet_rounds = 0;
         info!(
-            "BPF janitor: exiting pressure mode (quiet for {} rounds)",
-            PRESSURE_EXIT_ROUNDS
+            quiet_rounds = PRESSURE_EXIT_ROUNDS,
+            conn_utilization_pct = conn_utilization * 100.0,
+            redirect_utilization_pct = redirect_utilization * 100.0,
+            handoff_utilization_pct = handoff_utilization * 100.0,
+            "BPF janitor: exiting pressure mode"
         );
     }
 }

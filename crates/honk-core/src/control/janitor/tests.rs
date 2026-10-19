@@ -140,7 +140,7 @@ fn test_pressure_state_enter_on_overflow_delta() {
     let mut state = PressureState::default();
     assert!(!state.active);
 
-    update_pressure_state(&mut state, true, 0.0);
+    update_pressure_state(&mut state, true, [0.0; 3]);
     assert!(state.active);
     assert_eq!(state.quiet_rounds, 0);
 }
@@ -150,7 +150,11 @@ fn test_pressure_state_enter_on_high_watermark() {
     let mut state = PressureState::default();
     assert!(!state.active);
 
-    update_pressure_state(&mut state, false, CONN_STATE_PRESSURE_WATERMARK + 0.01);
+    update_pressure_state(
+        &mut state,
+        false,
+        [CONN_STATE_PRESSURE_WATERMARK + 0.01, 0.0, 0.0],
+    );
     assert!(state.active);
     assert_eq!(state.quiet_rounds, 0);
 }
@@ -159,7 +163,11 @@ fn test_pressure_state_enter_on_high_watermark() {
 fn test_pressure_state_stays_inactive_below_watermark() {
     let mut state = PressureState::default();
     for _ in 0..10 {
-        update_pressure_state(&mut state, false, CONN_STATE_PRESSURE_WATERMARK - 0.01);
+        update_pressure_state(
+            &mut state,
+            false,
+            [CONN_STATE_PRESSURE_WATERMARK - 0.01, 0.0, 0.0],
+        );
         assert!(!state.active);
     }
 }
@@ -177,7 +185,7 @@ fn test_pressure_state_exit_after_quiet_rounds() {
     // consecutive ticks → exit.
     for _ in 0..PRESSURE_EXIT_ROUNDS {
         assert!(state.active);
-        update_pressure_state(&mut state, false, 0.0);
+        update_pressure_state(&mut state, false, [0.0; 3]);
     }
     assert!(!state.active);
 }
@@ -192,16 +200,16 @@ fn test_pressure_state_overflow_resets_quiet_counter() {
     };
 
     // A new overflow restarts the quiet-period countdown.
-    update_pressure_state(&mut state, true, 0.0);
+    update_pressure_state(&mut state, true, [0.0; 3]);
     assert!(state.active);
     assert_eq!(state.quiet_rounds, 0);
 
     // And it still takes the full run of quiet ticks to exit.
     for _ in 0..PRESSURE_EXIT_ROUNDS - 1 {
-        update_pressure_state(&mut state, false, 0.0);
+        update_pressure_state(&mut state, false, [0.0; 3]);
         assert!(state.active);
     }
-    update_pressure_state(&mut state, false, 0.0);
+    update_pressure_state(&mut state, false, [0.0; 3]);
     assert!(!state.active);
 }
 
@@ -209,7 +217,7 @@ fn test_pressure_state_overflow_resets_quiet_counter() {
 fn test_pressure_state_inactive_stays_inactive_without_overflow() {
     let mut state = PressureState::default();
     for _ in 0..10 {
-        update_pressure_state(&mut state, false, 0.0);
+        update_pressure_state(&mut state, false, [0.0; 3]);
         assert!(!state.active);
     }
 }
@@ -314,7 +322,7 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
             scans
         };
         let mut health = HealthLatches::default();
-        for (utilization, pressure, scans, aux_expected, occupancy_expected) in [
+        for (episode, (utilization, pressure, scans, aux_expected, occupancy_expected)) in [
             (
                 CONN_STATE_PRESSURE_WATERMARK,
                 true,
@@ -332,12 +340,29 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
                 true,
                 true,
             ),
-        ] {
+            (0.1, true, scans(high, true), true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut utilizations = [utilization, 0.0, 0.0];
+            if pressure {
+                utilizations[1 + map as usize] = 0.9;
+            }
             janitor
-                .check_map_health(utilization, pressure, scans, &mut health)
+                .check_map_health(utilizations, scans, &mut health)
                 .await;
             assert_eq!(health.aux_pressure_warned[map as usize], aux_expected);
             assert_eq!(health.occupancy_warned, occupancy_expected);
+            assert_eq!(
+                (
+                    health.overflow_warned,
+                    health.udp_pressure_warned,
+                    health.tcp_pressure_warned
+                ),
+                (episode == 0, episode == 0, episode == 0),
+                "unchanged overflow history must not be promoted during an occupancy episode",
+            );
             for key in BpfStatsKey::ALL {
                 assert_eq!(health.last_failures[key as usize], 101 + key as u64);
             }

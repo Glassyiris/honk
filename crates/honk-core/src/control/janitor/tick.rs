@@ -65,7 +65,7 @@ impl BpfJanitor {
         now: Instant,
         now_ns: Option<u64>,
     ) -> anyhow::Result<()> {
-        let (overflow_delta, overflow_read_ok, conn_utilization, aux_utilization, occ_counters) = {
+        let (overflow_delta, overflow_read_ok, utilizations, occ_counters) = {
             let ebpf = self.ebpf.read().await;
             let udp = telemetry_sample(
                 BpfStatsKey::UdpConnOverflow.label(),
@@ -102,11 +102,15 @@ impl BpfJanitor {
             (
                 delta,
                 overflow_read_ok,
-                state.conn_occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
-                state.aux_occupancy.0.max(state.aux_occupancy.1) as f64 / AUX_MAP_CAPACITY as f64,
+                [
+                    state.conn_occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
+                    state.aux_occupancy.0 as f64 / AUX_MAP_CAPACITY as f64,
+                    state.aux_occupancy.1 as f64 / AUX_MAP_CAPACITY as f64,
+                ],
                 occ_counters,
             )
         };
+        let [conn_utilization, redirect_utilization, handoff_utilization] = utilizations;
         let admission_pressure = admission_pressured(state.admission_pressure, conn_utilization);
         if admission_pressure != state.admission_pressure {
             self.ebpf
@@ -116,10 +120,12 @@ impl BpfJanitor {
                 .context("publishing reverse UDP admission pressure")?;
             state.admission_pressure = admission_pressure;
         }
-        let utilization = conn_utilization.max(aux_utilization);
+        let utilization = conn_utilization
+            .max(redirect_utilization)
+            .max(handoff_utilization);
         // A missed overflow sample cannot establish another quiet round.
         if overflow_read_ok || overflow_delta || utilization >= CONN_STATE_PRESSURE_WATERMARK {
-            update_pressure_state(&mut state.pressure, overflow_delta, utilization);
+            update_pressure_state(&mut state.pressure, overflow_delta, utilizations);
         }
         let backlog = state
             .aux_scan_results
@@ -146,7 +152,14 @@ impl BpfJanitor {
                 .await
                 .context("conn-state retirement")?;
             if utilization >= CONN_STATE_ELEVATED_WATERMARK || deleted > 0 {
-                debug!(deleted, total, utilization, "BPF janitor: conn-state sweep");
+                debug!(
+                    deleted,
+                    total,
+                    conn_utilization_pct = conn_utilization * 100.0,
+                    redirect_utilization_pct = redirect_utilization * 100.0,
+                    handoff_utilization_pct = handoff_utilization * 100.0,
+                    "BPF janitor: conn-state sweep"
+                );
             }
             for map in AuxMap::ALL {
                 state.aux_scan_results[map as usize] = match map {
@@ -158,13 +171,8 @@ impl BpfJanitor {
             state.last_cleanup = now;
         }
         if state.last_health_check + Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS) <= now {
-            self.check_map_health(
-                conn_utilization,
-                state.pressure.active,
-                state.aux_scan_results,
-                &mut state.health,
-            )
-            .await;
+            self.check_map_health(utilizations, state.aux_scan_results, &mut state.health)
+                .await;
             state.last_health_check = now;
         }
         Ok(())
