@@ -139,10 +139,13 @@ impl std::ops::AddAssign for RetireCounts {
 
 /// Per-request result of `retire_batch`. `NotRun` is the pre-filled value and
 /// survives only where the batch failed first, so it is never settled.
+/// `ConnRetired` means this request physically deleted the flow's conn entry;
+/// `Done(Applied)` is an auxiliary-only deletion that left the conn in place.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RetireOutcome {
     #[default]
     NotRun,
+    ConnRetired,
     Done(UdpDecisionCommitResult),
 }
 
@@ -151,7 +154,10 @@ impl RetireOutcome {
     /// newer incarnation that retirement must not touch.
     pub fn settled(self) -> bool {
         use UdpDecisionCommitResult::*;
-        matches!(self, Self::Done(Applied | Missing | Superseded))
+        matches!(
+            self,
+            Self::ConnRetired | Self::Done(Applied | Missing | Superseded)
+        )
     }
 }
 
@@ -389,16 +395,13 @@ impl RetirePlan {
     }
 
     /// `removed` is what the executor just deleted for this request.
-    pub(crate) fn outcome(&self, removed: RetireCounts) -> UdpDecisionCommitResult {
-        let decided = if self.conn {
-            removed.conn
+    pub(crate) fn outcome(&self, removed: RetireCounts) -> RetireOutcome {
+        if self.conn && removed.conn != 0 {
+            RetireOutcome::ConnRetired
+        } else if !self.conn && removed.handoff + removed.redirect != 0 {
+            UdpDecisionCommitResult::Applied.into()
         } else {
-            removed.handoff + removed.redirect
-        };
-        if decided != 0 {
-            UdpDecisionCommitResult::Applied
-        } else {
-            self.unchanged
+            self.unchanged.into()
         }
     }
 }
@@ -580,8 +583,10 @@ pub(crate) fn retire_fixture(
     let counts = backend
         .retire_batch(&[RetireRequest { key, kind }], &mut outcomes)
         .unwrap();
-    let RetireOutcome::Done(result) = outcomes[0] else {
-        panic!("singleton retirement skipped a request");
+    let result = match outcomes[0] {
+        RetireOutcome::ConnRetired => UdpDecisionCommitResult::Applied,
+        RetireOutcome::Done(result) => result,
+        RetireOutcome::NotRun => panic!("singleton retirement skipped a request"),
     };
     (counts, result)
 }

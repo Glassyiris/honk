@@ -543,7 +543,7 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
             assert_eq!(
                 outcomes,
                 [
-                    RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+                    RetireOutcome::ConnRetired,
                     RetireOutcome::Done(UdpDecisionCommitResult::Superseded),
                     RetireOutcome::Done(UdpDecisionCommitResult::StateMismatch)
                 ]

@@ -249,7 +249,7 @@ impl RealEbpfBackend {
             }
             self.with_retirement_fences(&keys[..requests.len()], |backend| {
                 for (request, outcome) in requests.iter().zip(outcomes) {
-                    *outcome = backend.retire_one(request, &mut counts)?.into();
+                    *outcome = backend.retire_one(request, &mut counts)?;
                 }
                 Ok(())
             })
@@ -266,7 +266,7 @@ impl RealEbpfBackend {
         &mut self,
         request: &RetireRequest<'_>,
         counts: &mut RetireCounts,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
+    ) -> anyhow::Result<RetireOutcome> {
         let key = &request.key;
         let track_key = RedirectTuple::from_tuples(key);
         let reads = request.kind.owner_reads();
@@ -292,7 +292,7 @@ impl RealEbpfBackend {
         };
         let plan = match plan_retirement(request, &owners) {
             Ok(plan) => plan,
-            Err(result) => return Ok(result),
+            Err(result) => return Ok(result.into()),
         };
         // Native lifetimes are never zero; only explicit model fixtures use that identity.
         if plan.conn && matches!(request.kind, RetireKind::Udp { .. }) {

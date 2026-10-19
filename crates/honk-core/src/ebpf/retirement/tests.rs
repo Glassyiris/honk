@@ -523,10 +523,10 @@ fn flow_plan_removes_auxiliaries_with_conn_and_refuses_foreign_owners() {
         conn: 1,
         ..Default::default()
     };
-    assert_eq!(plan.outcome(removed), UdpDecisionCommitResult::Applied);
+    assert_eq!(plan.outcome(removed), RetireOutcome::ConnRetired);
     assert_eq!(
         plan.outcome(RetireCounts::default()),
-        UdpDecisionCommitResult::Missing,
+        RetireOutcome::Done(UdpDecisionCommitResult::Missing),
     );
 
     let plan = plan_retirement(&request, &owners(Some(&state), None, None)).unwrap();
@@ -573,7 +573,7 @@ fn auxiliary_plans_decide_from_their_own_snapshot() {
     assert!(plan.redirect && !plan.conn && !plan.handoff);
     assert_eq!(
         plan.outcome(RetireCounts::default()),
-        UdpDecisionCommitResult::Applied,
+        RetireOutcome::Done(UdpDecisionCommitResult::Applied),
     );
     let newer = RedirectEntry {
         incarnation: 2,

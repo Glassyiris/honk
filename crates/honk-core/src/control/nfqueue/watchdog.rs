@@ -19,6 +19,7 @@ impl PendingUdpVerdicts {
             } => (key.tuples(), decision_token, None),
         };
         match crate::ebpf::retire_pending(backend, key, token, incarnation) {
+            Ok(crate::ebpf::RetireOutcome::ConnRetired) => Ok(None),
             Ok(outcome) if outcome.settled() => Ok(None),
             Ok(crate::ebpf::RetireOutcome::Done(refusal)) => Ok(Some(refusal)),
             Ok(crate::ebpf::RetireOutcome::NotRun) => Err(self.fatal_error(

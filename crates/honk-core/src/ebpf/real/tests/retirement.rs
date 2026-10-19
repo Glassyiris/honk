@@ -24,10 +24,7 @@ fn retirement_release_failure_retains_applied_counts_and_releases_other_fences()
             handoff: 2,
         }
     );
-    assert_eq!(
-        outcomes,
-        [RetireOutcome::Done(UdpDecisionCommitResult::Applied); 2]
-    );
+    assert_eq!(outcomes, [RetireOutcome::ConnRetired; 2]);
     for (index, request) in requests.iter().enumerate() {
         assert!(backend.conn_state_lookup(&request.key).unwrap().is_none());
         assert!(
@@ -270,10 +267,7 @@ fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_f
                 handoff: 2,
             }
         );
-        assert_eq!(
-            outcomes,
-            [RetireOutcome::Done(UdpDecisionCommitResult::Applied); 2]
-        );
+        assert_eq!(outcomes, [RetireOutcome::ConnRetired; 2]);
     }
 }
 

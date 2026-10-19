@@ -401,10 +401,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
                 &mut outcomes,
             )
             .unwrap();
-        assert_eq!(
-            outcomes[0],
-            crate::ebpf::RetireOutcome::Done(crate::ebpf::UdpDecisionCommitResult::Applied)
-        );
+        assert_eq!(outcomes[0], crate::ebpf::RetireOutcome::ConnRetired);
         tracker.remove("acknowledged");
         assert!(pool.complete_removal(source, destination, removal.owner, generation));
         assert!(!pool.close_exact(source, destination, 101, generation));

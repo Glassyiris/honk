@@ -239,7 +239,7 @@ impl MockEbpfBackend {
         &mut self,
         request: &RetireRequest<'_>,
         counts: &mut RetireCounts,
-    ) -> UdpDecisionCommitResult {
+    ) -> RetireOutcome {
         let raw = Self::tuples_key_bytes(&request.key);
         let track_raw = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(&request.key));
         let reads = request.kind.owner_reads();
@@ -262,7 +262,7 @@ impl MockEbpfBackend {
         };
         let plan = match plan_retirement(request, &owners) {
             Ok(plan) => plan,
-            Err(result) => return result,
+            Err(result) => return result.into(),
         };
         let before = *counts;
         if plan.handoff {
@@ -303,7 +303,7 @@ impl MockEbpfBackend {
             }
             #[cfg(not(test))]
             let _ = index;
-            *outcome = self.retire_model_request(request, counts).into();
+            *outcome = self.retire_model_request(request, counts);
         }
         Ok(())
     }
@@ -1771,7 +1771,7 @@ mod batch_retirement_tests {
         assert_eq!(
             outcomes,
             [
-                RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+                RetireOutcome::ConnRetired,
                 RetireOutcome::Done(UdpDecisionCommitResult::Missing),
                 RetireOutcome::NotRun
             ]
