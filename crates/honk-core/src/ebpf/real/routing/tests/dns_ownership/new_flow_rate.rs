@@ -136,6 +136,92 @@ fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published()
     });
 }
 
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests() {
+    isolated(|| {
+        assert!(
+            std::process::Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        pin_to_current_cpu();
+        for (client, local, target) in [
+            (
+                "192.0.2.120".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+                "203.0.113.120".parse().unwrap(),
+            ),
+            (
+                "2001:db8:1::120".parse().unwrap(),
+                "::1".parse().unwrap(),
+                "2001:db8:2::120".parse().unwrap(),
+            ),
+        ] {
+            let (backend, _listeners) = fixture();
+            let service = UdpSocket::bind(SocketAddr::new(local, 0)).unwrap();
+            let port = service.local_addr().unwrap().port();
+            let limit = NEW_FLOW_LIMIT_PER_CPU_SECOND as u16;
+            let before_drops = limited(&backend);
+            align_to_second();
+            for index in 0..limit + EXCESS {
+                let request = packet(client, local, IPPROTO_UDP, 20000 + index, port, 0, 0);
+                assert_eq!(
+                    run(&backend, "lan_ingress_l2", &request, SkbInput::default()).verdict,
+                    TC_ACT_OK,
+                    "{client}: service request #{index} must stay native"
+                );
+            }
+            assert_eq!(
+                state_counts(&backend),
+                (usize::from(limit), 0),
+                "{client}: only budgeted requests may allocate reverse conn state"
+            );
+            assert_eq!(
+                limited(&backend),
+                before_drops,
+                "{client}: skipped learning must not count a packet drop"
+            );
+
+            let other = nth_host(client, 1);
+            let request = packet(other, local, IPPROTO_UDP, 20000, port, 0, 0);
+            assert_eq!(
+                run(&backend, "lan_ingress_l2", &request, SkbInput::default()).verdict,
+                TC_ACT_OK
+            );
+            assert!(
+                backend
+                    .conn_state_lookup(&tuple(local, other, port, 20000, IPPROTO_UDP))
+                    .unwrap()
+                    .is_some(),
+                "{client}: another source still learns"
+            );
+
+            // The local-service requests spent the same budget as ordinary routed flows.
+            let routed = packet(client, target, IPPROTO_UDP, 30000, 443, 0, 0);
+            assert_eq!(
+                run(&backend, "lan_ingress_l2", &routed, SkbInput::default()).verdict,
+                TC_ACT_SHOT,
+                "{client}: local and routed traffic must share one budget"
+            );
+            assert_eq!(limited(&backend), before_drops + 1);
+            assert_eq!(state_counts(&backend), (usize::from(limit) + 1, 0));
+            for index in 0..limit + EXCESS {
+                let state = backend
+                    .conn_state_lookup(&tuple(local, client, port, 20000 + index, IPPROTO_UDP))
+                    .unwrap();
+                assert_eq!(
+                    state.is_some(),
+                    index < limit,
+                    "{client}: learned reverse tuple #{index}"
+                );
+            }
+        }
+    });
+}
+
 fn nth_host(base: IpAddr, index: usize) -> IpAddr {
     match base {
         IpAddr::V4(ip) => {

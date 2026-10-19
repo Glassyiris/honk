@@ -412,6 +412,9 @@ pub fn local_udp_reply_seen(key: &TuplesKey) -> bool {
 
 #[inline(never)]
 pub fn observe_local_udp_reply(key: &TuplesKey, reversed: &mut TuplesKey) {
+    if super::is_short_lived_udp_traffic(key) || !crate::new_flow_limit::try_acquire(&key.src_ip) {
+        return;
+    }
     super::copy_reversed_tuples(key, reversed);
     observe_reverse_udp(reversed);
 }
