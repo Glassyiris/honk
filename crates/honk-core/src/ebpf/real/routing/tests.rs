@@ -5,6 +5,7 @@ mod native_trace;
 mod predicate_semantics;
 mod publication;
 mod readiness;
+mod shared_facts;
 mod verifier_budget;
 use crate::control::routing_matcher::RoutingPushPlan;
 use crate::routing::{ConnectionInfo, Router, golden};
