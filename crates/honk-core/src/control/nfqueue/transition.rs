@@ -39,13 +39,14 @@ impl PendingUdpVerdicts {
             if *cancelling {
                 return Err(PendingUdpDecisionError::StaleIdentity);
             }
-            let result = backend
-                .commit_udp_decision(
+            let result = blocking_section(|| {
+                backend.commit_udp_decision(
                     &identity.tuples(),
                     identity.owner.token,
                     UdpDecisionTransition::ArmDirect(direct_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("arm direct", format!("{error:#}")))?;
+            })
+            .map_err(|error| self.fatal_error("arm direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -104,13 +105,14 @@ impl PendingUdpVerdicts {
                 drop(backend);
                 continue;
             }
-            let result = backend
-                .commit_udp_decision(
+            let result = blocking_section(|| {
+                backend.commit_udp_decision(
                     &identity.tuples(),
                     identity.owner.token,
                     UdpDecisionTransition::ActivateDirect(direct_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("activate direct", format!("{error:#}")))?;
+            })
+            .map_err(|error| self.fatal_error("activate direct", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 let fatal = PendingUdpFatal::new(
@@ -167,13 +169,14 @@ impl PendingUdpVerdicts {
                 drop(backend);
                 return Err(self.expire_unarmed_pending(&cell, identity));
             }
-            let result = backend
-                .commit_udp_decision(
+            let result = blocking_section(|| {
+                backend.commit_udp_decision(
                     &identity.tuples(),
                     identity.owner.token,
                     UdpDecisionTransition::ActivateProxy(final_outbound, final_rule_mark),
                 )
-                .map_err(|error| self.fatal_error("activate proxy", format!("{error:#}")))?;
+            })
+            .map_err(|error| self.fatal_error("activate proxy", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);
@@ -217,13 +220,14 @@ impl PendingUdpVerdicts {
                 drop(backend);
                 return Err(self.expire_unarmed_pending(&cell, identity));
             }
-            let result = backend
-                .commit_udp_decision(
+            let result = blocking_section(|| {
+                backend.commit_udp_decision(
                     &identity.tuples(),
                     identity.owner.token,
                     UdpDecisionTransition::Block,
                 )
-                .map_err(|error| self.fatal_error("block", format!("{error:#}")))?;
+            })
+            .map_err(|error| self.fatal_error("block", format!("{error:#}")))?;
             if result != UdpDecisionCommitResult::Applied {
                 self.record_commit_mismatch(result);
                 return Err(PendingUdpDecisionError::StaleIdentity);

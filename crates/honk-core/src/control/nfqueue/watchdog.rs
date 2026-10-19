@@ -18,7 +18,7 @@ impl PendingUdpVerdicts {
                 decision_token,
             } => (key.tuples(), decision_token, None),
         };
-        match crate::ebpf::retire_pending(backend, key, token, incarnation) {
+        match blocking_section(|| crate::ebpf::retire_pending(backend, key, token, incarnation)) {
             Ok(crate::ebpf::RetireOutcome::ConnRetired) => Ok(None),
             Ok(outcome) if outcome.settled() => Ok(None),
             Ok(crate::ebpf::RetireOutcome::Done(refusal)) => Ok(Some(refusal)),

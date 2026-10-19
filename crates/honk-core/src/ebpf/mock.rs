@@ -84,6 +84,9 @@ pub struct MockEbpfBackend {
     pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
     /// Tuple fences retained by model fixtures for allocator conflict checks.
     retire_fences: HashMap<[u8; 40], RetirementFence>,
+    /// Blocking time `commit_udp_decision` spends before applying, modelling the kernel grace wait.
+    #[cfg(test)]
+    pub commit_delay: Option<std::time::Duration>,
     #[cfg(test)]
     pub retire_fault_after: Option<usize>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
@@ -861,6 +864,10 @@ impl EbpfBackend for MockEbpfBackend {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult> {
+        #[cfg(test)]
+        if let Some(delay) = self.commit_delay {
+            std::thread::sleep(delay);
+        }
         validate_udp_decision_transition(transition)?;
         if token == 0 {
             return Ok(UdpDecisionCommitResult::TokenMismatch);

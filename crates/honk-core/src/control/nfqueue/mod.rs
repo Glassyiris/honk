@@ -40,6 +40,17 @@ const MAX_CORRELATOR_FLOWS: usize = honk_nfqueue::QUEUE_MAXLEN as usize;
 const MAX_HELD_VERDICTS_PER_FLOW: usize = 64;
 const IPPROTO_UDP: u8 = 17;
 
+/// Run a backend mutation that waits for kernel grace periods. A multi-thread
+/// runtime hands the worker's queue to another thread meanwhile; a
+/// current-thread runtime (and any non-runtime caller) runs it inline because
+/// `block_in_place` panics there.
+fn blocking_section<R>(section: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(section),
+        _ => section(),
+    }
+}
+
 const _: () = {
     assert!(honk_nfqueue::NFQUEUE_PENDING_MARK == honk_ebpf_common::NFQUEUE_PENDING_MARK);
     assert!(honk_nfqueue::NFQUEUE_SIGNATURE_MARK == honk_ebpf_common::NFQUEUE_SIGNATURE_MARK);

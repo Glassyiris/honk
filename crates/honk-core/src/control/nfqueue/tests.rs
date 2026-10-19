@@ -2,6 +2,7 @@ use super::*;
 
 use honk_ebpf_common::{ConnState, NFQUEUE_PENDING_MARK, RoutingMeta};
 
+mod commit;
 mod kernel_reclamation;
 mod retirement;
 
@@ -172,8 +173,14 @@ struct DecisionFixture {
 }
 
 fn pending_fixture(token: u32) -> DecisionFixture {
+    pending_fixture_with(token, crate::ebpf::mock::MockEbpfBackend::new())
+}
+
+fn pending_fixture_with(
+    token: u32,
+    mut mock: crate::ebpf::mock::MockEbpfBackend,
+) -> DecisionFixture {
     let key = identity(token, 0).key;
-    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
     mock.seed_staged_udp_flow(
         &key.tuples(),
         ConnState {
