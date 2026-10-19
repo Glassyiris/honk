@@ -978,25 +978,20 @@ impl EbpfBackend for RealEbpfBackend {
             }
         }
 
-        // dae0_ingress runs on dae0 (host namespace) and rewrites reply traffic
-        // back to the original LAN interface.
-        match Self::attach_tc(self.bpf_mut()?, "dae0_ingress", "dae0") {
-            Ok(id) => {
-                let p: &mut aya::programs::SchedClassifier = self
-                    .bpf_mut()?
-                    .program_mut("dae0_ingress")
-                    .ok_or_else(|| anyhow::anyhow!("dae0_ingress program disappeared"))?
-                    .try_into()?;
-                self.dae0_ingress_link = Some(
-                    p.take_link(id)
-                        .map_err(|e| anyhow::anyhow!("failed to take dae0_ingress link: {}", e))?,
-                );
-                info!("dae0_ingress attached and link held");
-            }
-            Err(e) => {
-                warn!("dae0_ingress attach failed (non-fatal): {}", e);
-            }
-        }
+        // Both LAN and WAN-only deployments need this link to deliver proxied replies.
+        let id = Self::attach_tc(self.bpf_mut()?, "dae0_ingress", "dae0")
+            .map_err(|error| anyhow::anyhow!("attach dae0_ingress: {error}"))?;
+        let program: &mut aya::programs::SchedClassifier = self
+            .bpf_mut()?
+            .program_mut("dae0_ingress")
+            .ok_or_else(|| anyhow::anyhow!("dae0_ingress program disappeared"))?
+            .try_into()?;
+        self.dae0_ingress_link = Some(
+            program
+                .take_link(id)
+                .map_err(|error| anyhow::anyhow!("take dae0_ingress link: {error}"))?,
+        );
+        info!("dae0_ingress attached and link held");
 
         Ok(())
     }

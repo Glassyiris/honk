@@ -1,5 +1,6 @@
 use super::*;
 
+mod attachment;
 mod btf_source;
 mod mandatory_helpers;
 mod raw_bpf;
