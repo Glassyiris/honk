@@ -286,12 +286,6 @@ impl RealEbpfBackend {
                 ebpf_lan_ifname,
                 lan_ifname.unwrap_or_default()
             );
-            if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_lan_ifname) {
-                let msg = e.to_string();
-                if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                    debug!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
-                }
-            }
         }
         let (lan_ingress_prog, lan_egress_prog) = Self::lan_program_pair(&ebpf_lan_ifname);
         // Primary hooks share the watcher-owned table so an interface rebind
@@ -335,13 +329,6 @@ impl RealEbpfBackend {
         if ebpf_wan_ifname.is_empty() {
             warn!("WAN interface name is empty; skipping wan_egress attach");
         } else {
-            if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_wan_ifname) {
-                let msg = e.to_string();
-                if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                    debug!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
-                }
-            }
-
             let wan_egress_prog = Self::wan_program_pair(&ebpf_wan_ifname).1;
             interface_links.push(
                 Self::attach_tc_owned(
@@ -396,15 +383,6 @@ impl RealEbpfBackend {
             let ingress_dir = aya::programs::TcAttachType::Ingress;
             let egress_dir = aya::programs::TcAttachType::Egress;
             for slave in &br_slaves {
-                if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    let msg = e.to_string();
-                    if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                        debug!(
-                            "failed to add clsact qdisc to bridge slave {}: {}",
-                            slave, e
-                        );
-                    }
-                }
                 let slave_prog = Self::lan_program_pair(slave).0;
                 // A slave we cannot attach silently leaves that traffic
                 // outside the proxy — abort rather than run half-covered.
@@ -453,9 +431,6 @@ impl RealEbpfBackend {
             // same loaded program object and attach it to each slave.
             let slave_dir = aya::programs::TcAttachType::Ingress;
             for slave in &lan_slaves {
-                if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    debug!("failed to add clsact qdisc to slave {}: {}", slave, e);
-                }
                 let slave_prog = Self::lan_program_pair(slave).0;
                 interface_links.push(
                     Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
@@ -483,9 +458,6 @@ impl RealEbpfBackend {
             );
             let slave_dir = aya::programs::TcAttachType::Egress;
             for slave in &wan_egress_slaves {
-                if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
-                    debug!("failed to add clsact qdisc to slave {}: {}", slave, e);
-                }
                 // Bond slaves are ARPHRD_ETHER and see fully-framed skbs at
                 // their TC egress hook (the bond driver has already built
                 // the Ethernet header), so use the L2 program.
@@ -670,7 +642,7 @@ impl RealEbpfBackend {
     /// Ethernet interfaces, including bridge masters, use L2; others use L3.
     fn lan_program_pair(iface: &str) -> (&'static str, &'static str) {
         // NOTE: bridge masters are attached with L2 programs because the TC
-        // ingress qdisc on a Linux bridge sees the full Ethernet frame.
+        // ingress hook on a Linux bridge sees the full Ethernet frame.
         if Self::iface_is_ethernet(iface) {
             ("lan_ingress_l2", "lan_egress_l2")
         } else {
@@ -766,7 +738,6 @@ impl RealEbpfBackend {
     ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
         let ifname = Self::bridge_interface(ifname).unwrap_or_else(|| ifname.to_string());
         debug!("Attaching LAN programs to additional interface: {}", ifname);
-        let _ = aya::programs::tc::qdisc_add_clsact(&ifname);
         let ifindex = crate::netlink::ifindex_of(&ifname).unwrap_or(0);
         let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
         let mut hooks = crate::ebpf::DynamicHooks {
@@ -787,7 +758,6 @@ impl RealEbpfBackend {
     /// Attach WAN egress to an additional interface.
     pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
         debug!("Attaching WAN egress to additional interface: {}", ifname);
-        let _ = aya::programs::tc::qdisc_add_clsact(ifname);
         if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), true) {
             return Ok(());
         }
@@ -800,7 +770,6 @@ impl RealEbpfBackend {
     /// chosen by interface type, same as `attach_wan_egress`.
     pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
         debug!("Attaching WAN ingress to additional interface: {}", ifname);
-        let _ = aya::programs::tc::qdisc_add_clsact(ifname);
         if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), false) {
             return Ok(());
         }
@@ -821,7 +790,6 @@ impl RealEbpfBackend {
             "Attaching slave programs to additional interface: {}",
             ifname
         );
-        let _ = aya::programs::tc::qdisc_add_clsact(ifname);
         let ifindex = crate::netlink::ifindex_of(ifname).unwrap_or(0);
         let mut hooks = crate::ebpf::DynamicHooks {
             ingress: self.interface_hooked(ifindex, false),

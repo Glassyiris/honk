@@ -5085,6 +5085,8 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 let direct_stats = control.stats.udp_snapshot().nfqueue;
                 anyhow::ensure!(direct_stats.direct_accepted == 1);
                 anyhow::ensure!(direct_stats.proxy_copied == 0);
+                // This sentinel uses legacy TC filters; production attaches only TCX links.
+                aya::programs::tc::qdisc_add_clsact("honk-wan0")?;
                 let tc_status = std::process::Command::new("tc")
                     .args([
                         "filter",

@@ -968,16 +968,6 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
-        // Ensure clsact qdisc exists on dae0 and dae0peer before attaching the
-        // TC programs; otherwise netlink returns EINVAL.
-        for iface in &["dae0", "dae0peer"] {
-            if let Err(e) = aya::programs::tc::qdisc_add_clsact(iface)
-                && !e.to_string().contains("File exists")
-            {
-                debug!("failed to add clsact qdisc to {}: {}", iface, e);
-            }
-        }
-
         // Both LAN and WAN-only deployments need this link to deliver proxied replies.
         let id = Self::attach_tc(self.bpf_mut()?, "dae0_ingress", "dae0")
             .map_err(|error| anyhow::anyhow!("attach dae0_ingress: {error}"))?;
@@ -999,17 +989,10 @@ impl EbpfBackend for RealEbpfBackend {
     fn attach_dae0peer_ingress(&mut self) -> anyhow::Result<()> {
         // dae0peer lives in the daens namespace; enter it with a scoped
         // `with_daens_netns` switch for the attach (the process otherwise
-        // stays in the host netns).  The netlink sockets used by
-        // qdisc_add_clsact/attach_tc resolve interface names in the netns
-        // they are created in, so both must run inside daens.  The link
-        // handle persists after switching back to the host netns.
+        // stays in the host netns). Interface names for the TCX link resolve
+        // in the attaching thread's netns; the link handle persists after
+        // switching back to the host netns.
         crate::daens::with_daens_netns("attach dae0peer_ingress", move || {
-            if let Err(error) = aya::programs::tc::qdisc_add_clsact("dae0peer")
-                && !error.to_string().contains("File exists")
-            {
-                debug!("failed to add clsact qdisc to dae0peer: {}", error);
-            }
-
             let id = Self::attach_tc(self.bpf_mut()?, "dae0peer_ingress", "dae0peer")
                 .map_err(|error| anyhow::anyhow!("attach dae0peer_ingress: {error}"))?;
             let program: &mut aya::programs::SchedClassifier = self
