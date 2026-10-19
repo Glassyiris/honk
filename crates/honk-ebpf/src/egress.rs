@@ -59,15 +59,13 @@ fn skb_mark(ctx: &TcContext) -> u32 {
     unsafe { (*ctx.skb.skb).mark }
 }
 
-const DOMAIN_DNS: u32 = 1;
 const DOMAIN_UDP_OTHER: u32 = 2;
 const DOMAIN_DEFAULT: u32 = 0;
 
 /// Check whether the selected outbound is currently alive.
 ///
-/// DNS UDP (dport == 53) is always considered alive because user-space DNS
-/// routing is responsible for fallback/rejection.  For all other traffic the
-/// function consults `OUTBOUND_CONNECTIVITY_MAP`.
+/// DNS uses userspace fallback/rejection regardless of transport, so destination
+/// port 53 is exempt. Other traffic consults `OUTBOUND_CONNECTIVITY_MAP`.
 ///
 /// Map key layout (mirrors C):
 ///   key = outbound * 6 + domain_idx * 2 + ip_idx
@@ -75,13 +73,12 @@ const DOMAIN_DEFAULT: u32 = 0;
 ///   - ip_idx: 0 = IPv4, 1 = IPv6
 #[inline(always)]
 pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    if l4proto == IPPROTO_UDP && dport == 53u16 {
+    if dport == 53 {
         return true;
     }
 
-    let domain_idx: u32 = match (l4proto, dport) {
-        (IPPROTO_UDP, 53) => DOMAIN_DNS,
-        (IPPROTO_UDP, _) => DOMAIN_UDP_OTHER,
+    let domain_idx: u32 = match l4proto {
+        IPPROTO_UDP => DOMAIN_UDP_OTHER,
         _ => DOMAIN_DEFAULT,
     };
 

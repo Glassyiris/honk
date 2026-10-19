@@ -427,7 +427,7 @@ fn pass_through_classified(ctx: &TcContext) -> Verdict {
 
 #[inline(always)]
 fn lan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    dport == 53 || crate::egress::wan_outbound_is_alive(ctx, outbound, l4proto, dport)
+    crate::egress::wan_outbound_is_alive(ctx, outbound, l4proto, dport)
 }
 
 /// Confirm that a wildcard socket match names a host-local route. Socket

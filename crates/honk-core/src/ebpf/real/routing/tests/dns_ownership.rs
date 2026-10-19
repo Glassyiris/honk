@@ -21,6 +21,7 @@ mod aux_occupancy;
 mod datagram_fragments;
 mod direct_mode;
 mod failures;
+mod health;
 mod local_udp;
 mod network;
 mod new_flow_rate;
