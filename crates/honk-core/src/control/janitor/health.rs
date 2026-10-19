@@ -86,6 +86,9 @@ impl BpfJanitor {
                 | BpfStatsKey::TcpPublisherClaimFailure => {
                     "BPF janitor: TCP ownership publication failures increased; affected connections were refused"
                 }
+                BpfStatsKey::NewFlowRateLimited => {
+                    "BPF janitor: a LAN source exceeded its per-CPU new-flow limit; excess flow attempts were dropped"
+                }
             };
             let failures = stats[key as usize];
             if failures > latches.last_failures[key as usize] {

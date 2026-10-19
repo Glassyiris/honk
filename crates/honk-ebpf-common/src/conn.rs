@@ -116,10 +116,11 @@ pub enum BpfStatsKey {
     SocketIdentityCaptureFailure = 4,
     TcpChildProofStorageFailure = 5,
     TcpPublisherClaimFailure = 6,
+    NewFlowRateLimited = 7,
 }
 
 impl BpfStatsKey {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::UdpConnOverflow,
         Self::TcpConnOverflow,
         Self::RedirectTrackInsertFailure,
@@ -127,6 +128,7 @@ impl BpfStatsKey {
         Self::SocketIdentityCaptureFailure,
         Self::TcpChildProofStorageFailure,
         Self::TcpPublisherClaimFailure,
+        Self::NewFlowRateLimited,
     ];
     pub const COUNT: u32 = Self::ALL.len() as u32;
 
@@ -139,9 +141,14 @@ impl BpfStatsKey {
             Self::SocketIdentityCaptureFailure => "socket_identity_capture_failure",
             Self::TcpChildProofStorageFailure => "tcp_child_proof_storage_failure",
             Self::TcpPublisherClaimFailure => "tcp_publisher_claim_failure",
+            Self::NewFlowRateLimited => "new_flow_rate_limited",
         }
     }
 }
+
+/// New flows (pure SYN, first non-DNS UDP packet, every UDP/53 packet) one LAN
+/// source may start per second on each CPU before further attempts are dropped.
+pub const NEW_FLOW_LIMIT_PER_CPU_SECOND: u32 = 256;
 
 /// CONN_STATE_MAP capacity, shared by the eBPF map and userspace pressure gauge.
 pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;

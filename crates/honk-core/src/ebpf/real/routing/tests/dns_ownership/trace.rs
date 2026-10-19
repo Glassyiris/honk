@@ -367,11 +367,13 @@ fn exhausted_capture_ids_do_not_change_redirect_or_decision_tokens() {
 fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
-        let src = "192.0.2.23".parse().unwrap();
+        // A source may start only so many new flows per second, so spread them.
+        let source = |port: u16| IpAddr::V4(Ipv4Addr::new(192, 0, 3, ((port - 44000) / 128) as u8));
         let dst = "198.51.100.33".parse().unwrap();
         let mut references = Vec::new();
         for offset in 0..=ROUTE_TRACE_CAPACITY {
             let port = 44000 + offset as u16;
+            let src = source(port);
             let key = tuple(src, dst, port, 443, IPPROTO_UDP);
             let bytes = packet(src, dst, IPPROTO_UDP, port, 443, 0, 0);
             assert_eq!(
@@ -390,7 +392,15 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
         backend
             .hash_remove::<_, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP", key)
             .unwrap();
-        let bytes = packet(src, dst, IPPROTO_UDP, key.src_port, 443, 7, 0);
+        let bytes = packet(
+            source(key.src_port),
+            dst,
+            IPPROTO_UDP,
+            key.src_port,
+            443,
+            7,
+            0,
+        );
         assert_eq!(
             run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict,
             TC_ACT_REDIRECT

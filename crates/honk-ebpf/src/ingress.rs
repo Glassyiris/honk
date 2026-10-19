@@ -516,6 +516,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         crate::contrack::tcp::TcpSynRole::InterceptedForward,
     );
     if pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph) {
+        // Before any conn/aux element exists, so a rejected flood leaves no state behind.
+        if crate::new_flow_limit::exceeded(&pkt.tuples.five.src_ip) {
+            return Err(TC_ACT_SHOT);
+        }
         if !tcp_publisher.acquire(ctx, &pkt.tcph) {
             return Err(TC_ACT_SHOT);
         }
@@ -675,6 +679,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         {
             return pass_through_classified(ctx);
         }
+    }
+
+    // Counts the first packet of every UDP flow and each stateless UDP/53 packet.
+    if pkt.l4proto == IPPROTO_UDP && crate::new_flow_limit::exceeded(&pkt.tuples.five.src_ip) {
+        return Err(TC_ACT_SHOT);
     }
 
     let flags = crate::maps::datapath_flags();

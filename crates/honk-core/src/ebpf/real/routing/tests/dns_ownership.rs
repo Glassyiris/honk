@@ -20,6 +20,7 @@ use std::time::Duration;
 mod direct_mode;
 mod failures;
 mod network;
+mod new_flow_rate;
 mod refresh;
 mod retirement;
 mod trace;

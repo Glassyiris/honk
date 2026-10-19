@@ -1,12 +1,14 @@
 use aya_ebpf::Global;
 use aya_ebpf::btf_maps::{
-    Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SkStorage, SockMap,
+    Array, ArrayOfMaps, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf, SkStorage,
+    SockMap,
 };
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
     BpfStatsKey, ConnState, FlowIncarnationSequence, FlowMapValue, MAX_CONN_STATE_NUM,
     ParseTransportCtx, RetirementFence, UdpDecisionSequence,
 };
+use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
     RoutingHandoffEntry, SocketIdentity, TcpSocketBinding, TuplesKey,
@@ -122,6 +124,20 @@ pub static REDIRECT_TRACK: HashMap<RedirectTuple, FlowMapValue<RedirectEntry>, 6
 /// the map is full. That only restores the previous behaviour for that client,
 /// unlike the plain hashes above, so no userspace sweep owns it.
 pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
+
+/// Fixed one-second window of a source's new-flow budget on one CPU.
+#[repr(C)]
+pub struct NewFlowWindow {
+    pub second: u32,
+    pub count: u32,
+}
+
+/// New-flow budget per LAN source address. Per-CPU values let each CPU count
+/// without atomics, which LRU maps cannot back with a spin lock; the effective
+/// limit is the CPU count times `NEW_FLOW_LIMIT_PER_CPU_SECOND`. Eviction only
+/// forgets a source's recent count.
+#[btf_map]
+pub static NEW_FLOW_RATE: LruPerCpuHashMap<In6Addr, NewFlowWindow, 16384> = LruPerCpuHashMap::new();
 
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
