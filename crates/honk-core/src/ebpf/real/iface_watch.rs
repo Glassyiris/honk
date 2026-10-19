@@ -398,7 +398,7 @@ fn desired_interfaces(config: &honk_config::Config) -> (HashMap<String, IfaceRol
         desired.insert(l.clone(), role);
     }
     // Bridge/bond slaves of configured LAN masters need their own hooks
-    // (forwarded traffic bypasses the master's qdiscs); membership is
+    // (forwarded traffic bypasses the master's TC hooks); membership is
     // re-read on every reconcile so late-added containers are covered.
     for master in &lan {
         for slave in super::RealEbpfBackend::bridge_slaves(master) {

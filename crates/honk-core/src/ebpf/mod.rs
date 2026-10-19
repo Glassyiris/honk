@@ -292,11 +292,11 @@ pub enum IfaceRole {
     /// slave (mirrors the startup expansion).
     LanBridgeSlave,
     /// Slave of a configured LAN bond master: packets may arrive/leave on the
-    /// slave without touching the master's qdiscs, so it gets
+    /// slave without touching the master's TC hooks, so it gets
     /// lan_ingress + wan_egress (mirrors the startup expansion).
     LanBondSlave,
     /// Slave of a WAN bond master: locally-originated traffic can bypass the
-    /// master's egress qdisc, so only wan_egress belongs on this interface.
+    /// master's egress hook, so only wan_egress belongs on this interface.
     WanBondSlave,
 }
 
