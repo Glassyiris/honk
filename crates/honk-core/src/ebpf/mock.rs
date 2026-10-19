@@ -88,6 +88,8 @@ pub struct MockEbpfBackend {
     #[cfg(test)]
     pub commit_delay: Option<std::time::Duration>,
     #[cfg(test)]
+    pub commit_barrier_fault: bool,
+    #[cfg(test)]
     pub retire_fault_after: Option<usize>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
     pub outbound_alive: HashMap<u32, u32>,
@@ -878,6 +880,12 @@ impl EbpfBackend for MockEbpfBackend {
         };
         if state.decision_token != token {
             return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        #[cfg(test)]
+        if !matches!(transition, UdpDecisionTransition::ActivateDirect(_))
+            && std::mem::take(&mut self.commit_barrier_fault)
+        {
+            anyhow::bail!("injected UDP commit barrier failure");
         }
         let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
         // Explicit model fixtures may commit a zero-identity staged flow.
@@ -1907,6 +1915,7 @@ mod tests {
                 .unwrap(),
             UdpDecisionCommitResult::StateMismatch
         );
+        backend.commit_barrier_fault = true;
         assert_eq!(
             backend
                 .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x1234))
@@ -1918,6 +1927,12 @@ mod tests {
         assert_eq!(active.state, UdpDecisionState::None as u8);
         assert_eq!((active_raw >> 8) & 0xffff_ffff, 0x1234);
         assert_ne!(active_raw & ROUTING_META_FLAG_OFFLOAD, 0);
+        assert!(
+            backend.commit_barrier_fault,
+            "activation used a grace barrier"
+        );
+        assert_eq!(active.last_seen_ns, armed.last_seen_ns);
+        assert_eq!(active.incarnation, armed.incarnation);
         assert_eq!(
             backend
                 .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x1234))

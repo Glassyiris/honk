@@ -485,8 +485,8 @@ pub(crate) struct UdpCommitPlan {
     pub redirect: Option<RedirectEffect>,
 }
 
-/// Authorize a UDP decision transition from post-grace snapshots whose conn
-/// token and incarnation the caller already matched, or refuse.
+/// Authorize a UDP decision transition from coherent snapshots whose conn token
+/// and incarnation the caller already matched, or refuse.
 pub(crate) fn plan_udp_commit(
     mut state: ConnState,
     token: u32,
@@ -501,6 +501,11 @@ pub(crate) fn plan_udp_commit(
     let initial = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
     if initial && (handoff.is_none() || track.is_none()) {
         return Err(UdpDecisionCommitResult::Missing);
+    }
+    // ArmDirect removed both auxiliaries. Activation must never turn an
+    // unexpected publication into unfenced map reclamation.
+    if !initial && (handoff.is_some() || track.is_some()) {
+        return Err(UdpDecisionCommitResult::StateMismatch);
     }
     Ok(UdpCommitPlan {
         state,

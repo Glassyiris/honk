@@ -617,7 +617,11 @@ impl EbpfBackend for RealEbpfBackend {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult> {
-        self.commit_udp_fenced(key, token, transition)
+        if matches!(transition, UdpDecisionTransition::ActivateDirect(_)) {
+            self.activate_udp_direct(key, token, transition)
+        } else {
+            self.commit_udp_fenced(key, token, transition)
+        }
     }
 
     fn retire_batch(

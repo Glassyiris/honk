@@ -25,6 +25,7 @@ mod new_flow_rate;
 mod refresh;
 mod retirement;
 mod trace;
+mod udp_commit;
 mod udp_group;
 mod udp_listeners;
 

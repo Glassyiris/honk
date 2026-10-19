@@ -192,8 +192,12 @@ fn lookup_udp_seen_at(key: &TuplesKey, now: u64) -> Option<&'static mut ConnStat
     unsafe { bpf_spin_lock(&mut (*ptr).lock) };
     let state = unsafe { &mut (*ptr).value };
     let expired = udp_conn_state_expired(state, now);
+    // Staging lasts at most three seconds. Freezing these snapshots makes the
+    // backend the sole writer between its locked read and in-place activation.
     if !expired
         && state.state != UdpDecisionState::Preparing as u8
+        && state.state != UdpDecisionState::Pending as u8
+        && state.state != UdpDecisionState::DirectArmed as u8
         && now.saturating_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS
     {
         state.last_seen_ns = now;

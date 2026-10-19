@@ -352,6 +352,56 @@ impl RealEbpfBackend {
         Ok(())
     }
 
+    pub(super) fn activate_udp_direct(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+        transition: UdpDecisionTransition,
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
+        anyhow::ensure!(
+            !self.retirement_failed,
+            "retirement ownership is unresolved"
+        );
+        validate_udp_decision_transition(transition)?;
+        if token == 0 {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let Some(state) = self.flow_lookup::<_, ConnState>("CONN_STATE_MAP", key)? else {
+            return Ok(UdpDecisionCommitResult::Missing);
+        };
+        if state.decision_token != token {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        anyhow::ensure!(
+            state.incarnation != 0,
+            "UDP commit has no lifetime identity"
+        );
+        let handoff = self.flow_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
+        let track = self
+            .flow_lookup::<_, RedirectEntry>("REDIRECT_TRACK", &RedirectTuple::from_tuples(key))?;
+        let plan = match plan_udp_commit(state, token, transition, handoff.as_ref(), track.as_ref())
+        {
+            Ok(plan) => plan,
+            Err(result) => return Ok(result),
+        };
+        // DirectArmed is immutable to the kernel; backend W excludes all other
+        // writers and deleters. EXIST|LOCK copies into this same element, so no
+        // reader can retain an element freed by a replacement or deletion.
+        match self
+            .hash_map_mut::<TuplesKey, FlowMapValue<ConnState>>("CONN_STATE_MAP")?
+            .insert(
+                key,
+                FlowMapValue::new(plan.state),
+                (aya_obj::generated::BPF_EXIST | aya_obj::generated::BPF_F_LOCK) as u64,
+            ) {
+            Ok(()) => Ok(UdpDecisionCommitResult::Applied),
+            Err(error) if Self::map_error_is_missing(&error) => {
+                Ok(UdpDecisionCommitResult::Missing)
+            }
+            Err(error) => Err(anyhow::anyhow!("in-place UDP activation: {error}")),
+        }
+    }
+
     pub(super) fn commit_udp_fenced(
         &mut self,
         key: &TuplesKey,
