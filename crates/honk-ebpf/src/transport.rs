@@ -686,7 +686,7 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
     out.is_fragmented = 0;
     if let Err(e) = tctx.parse(ctx, link_h_len) {
         if e == PARSE_FRAGMENT as c_long {
-            // Later fragments are identified by address pair, protocol and ID.
+            // Later fragments match on address pair and ID, plus the protocol for IPv4.
             out.frag_id = tctx.frag_id;
             tctx.fill_tuples(&mut out.tuples);
         }

@@ -3,7 +3,8 @@ use aya::maps::HashMap as AyaHashMap;
 use honk_ebpf_common::conn::{FragmentKey, FragmentVerdict};
 
 const PORT_FIRST: u16 = 40000;
-/// The documented fragment record lifetime, not imported from production.
+/// The documented fragment record lifetime (doc/en/design/datapath.md),
+/// deliberately not imported from production so a drifting value fails these tests.
 const FRAGMENT_TTL_NS: u64 = 30_000_000_000;
 
 /// One fragment of a UDP datagram. The first fragment carries the UDP header and MF;
