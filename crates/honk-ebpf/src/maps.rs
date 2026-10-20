@@ -144,7 +144,7 @@ pub struct NewFlowWindow {
     pub count: u32,
 }
 
-/// New-flow budget per LAN source (IPv4 address; IPv6 /64 prefix). Per-CPU values let each CPU count
+/// New-flow budget per LAN source address. Per-CPU values let each CPU count
 /// without atomics, which LRU maps cannot back with a spin lock; the effective
 /// limit is the CPU count times `NEW_FLOW_LIMIT_PER_CPU_SECOND`. Eviction only
 /// forgets a source's recent count.

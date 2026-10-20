@@ -20,19 +20,8 @@ pub fn exceeded(src: &In6Addr) -> bool {
 
 /// Consumes one attempt without counting a packet drop: local-service requests
 /// keep passing when their optional reply-state learning cannot get a budget.
-/// An IPv6 host owns its whole /64 (SLAAC privacy addresses rotate within it),
-/// so the budget is keyed by the prefix, not the address. The key lives in this
-/// frame because its callers already sit near the BPF stack limit.
-#[inline(never)]
+#[inline(always)]
 pub fn try_acquire(src: &In6Addr) -> bool {
-    let mut key = *src;
-    if !key.is_v4_mapped() {
-        unsafe {
-            key.u6_addr32[2] = 0;
-            key.u6_addr32[3] = 0;
-        }
-    }
-    let src = &key;
     let second = (unsafe { bpf_ktime_get_ns() } / 1_000_000_000) as u32;
     let Some(window) = NEW_FLOW_RATE.get_ptr_mut(src) else {
         // A failed insert only leaves this attempt uncounted.

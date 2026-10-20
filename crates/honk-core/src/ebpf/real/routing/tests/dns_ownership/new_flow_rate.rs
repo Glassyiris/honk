@@ -3,7 +3,8 @@ use honk_ebpf_common::conn::BpfStatsKey;
 use nix::sched::{CpuSet, sched_setaffinity};
 use nix::unistd::Pid;
 
-/// The documented per-CPU budget, not imported from production.
+/// The documented per-CPU budget (doc/en/design/datapath.md), deliberately not
+/// imported from production so a drifting value fails these tests.
 const NEW_FLOW_LIMIT_PER_CPU_SECOND: u16 = 256;
 
 fn monotonic_ns() -> u64 {
@@ -72,7 +73,7 @@ fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published()
             ),
             (
                 "2001:db8:1::90".parse().unwrap(),
-                "2001:db8:3::91".parse().unwrap(),
+                "2001:db8:1::91".parse().unwrap(),
                 "2001:db8:2::90".parse().unwrap(),
             ),
         ];
@@ -122,14 +123,6 @@ fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published()
                 TC_ACT_REDIRECT,
                 "family {family}: another host's new flow"
             );
-            if family == 1 {
-                let sibling: IpAddr = "2001:db8:1::beef".parse().unwrap();
-                assert_eq!(
-                    attempt(sibling, 0, kinds[1]),
-                    TC_ACT_SHOT,
-                    "another address in the attacker's /64 shares its budget"
-                );
-            }
         }
     });
 }
