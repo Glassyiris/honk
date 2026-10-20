@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
-MAX_JSON_BYTES = 256 * 1024
+MAX_JSON_BYTES = 512 * 1024
 MAX_REPORTS = 64
 MAX_BODY_BYTES = 60_000
 MAX_FAILURE_LINES = 20
@@ -119,7 +119,7 @@ def require_integer(value: Any, field: str) -> int:
 
 def load_json(path: Path) -> Any:
     require(path.is_file(), f"missing {path.name}")
-    require(path.stat().st_size <= MAX_JSON_BYTES, f"{path.name} exceeds 256 KiB")
+    require(path.stat().st_size <= MAX_JSON_BYTES, f"{path.name} exceeds 512 KiB")
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError, RecursionError) as error:
@@ -795,6 +795,60 @@ def render(candidate_dir: Path, baseline_dir: Path, selection_path: Path, jobs_p
     return cap_body(lines)
 
 
+def self_test_json_size(root: Path) -> None:
+    import subprocess
+    import tempfile
+    import textwrap
+    import zipfile
+
+    report = load_json(root / "ordinary" / "candidate" / "test.json")
+    original_names = report["values"]["test_inventory"]["value"]["names"]
+    names = [
+        f"honk_core::native_api::tests::case_{index:04d}::{original_names[index % len(original_names)]}"
+        for index in range(4000)
+    ]
+    report["values"]["test_inventory"]["value"] = {"total": len(names), "names": names}
+    report["failure"] = {
+        "summary": "workspace nextest failed",
+        "detail_lines": [f"{names[-1]}: assertion failed"],
+    }
+    payload = (json.dumps(report, indent=2) + "\n").encode("utf-8")
+    assert 256 * 1024 < len(payload) < 512 * 1024
+    provenance = {(report["run_id"], report["run_attempt"], report["measured_sha"])}
+    workflow = (root.parents[2] / "workflows" / "report.yml").read_text(encoding="utf-8")
+    importer = textwrap.dedent(workflow.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+    with tempfile.TemporaryDirectory() as temporary:
+        for name, data, accepted in (
+            ("expanded-inventory", payload, True),
+            ("at-cap", payload.ljust(512 * 1024, b" "), True),
+            ("over-cap", payload.ljust(512 * 1024 + 1, b" "), False),
+        ):
+            case = Path(temporary) / name
+            direct = case / "direct"
+            imported = case / "imported"
+            direct.mkdir(parents=True)
+            imported.mkdir()
+            (direct / "test.json").write_bytes(data)
+            reports, errors = load_reports(direct, provenance)
+            archive = case / "report.zip"
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+                output.writestr("test.json", data)
+            subprocess.run(
+                [sys.executable, "-", str(archive), str(imported), "test.json"],
+                input=importer, text=True, check=True,
+            )
+            if accepted:
+                assert not errors, errors
+                assert reports == {"test": report}
+                assert (imported / "test.json").read_bytes() == data
+                assert load_reports(imported, provenance) == (reports, [])
+            else:
+                assert not reports and errors, (reports, errors)
+                assert not (imported / "test.json").exists()
+                marker = load_json(imported / "invalid-report.json")
+                assert "artifact_validation_error" in marker, marker
+
+
 def self_test() -> int:
     root = Path(__file__).resolve().parent / "fixtures"
     cases = (
@@ -816,11 +870,15 @@ def self_test() -> int:
             continue
         if actual != expected:
             failures.append(f"{case}: rendered output differs from {expected_path.name}")
+    try:
+        self_test_json_size(root)
+    except (AssertionError, InvalidInput, OSError, ValueError) as error:
+        failures.append(f"report JSON size boundary: {error}")
     if failures:
         for failure in failures:
             print(failure, file=sys.stderr)
         return 1
-    print("8 report fixtures passed")
+    print("8 report fixtures and report JSON size boundary passed")
     return 0
 
 

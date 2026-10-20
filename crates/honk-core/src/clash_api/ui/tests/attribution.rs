@@ -161,7 +161,7 @@ async fn completed_setup_header_stall_is_target_scoped_but_carrier_loss_is_node_
                     .unwrap()
                     .start(),
             );
-            let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+            let mut archive = ArchiveFile::create(dir.path()).unwrap();
             let error = {
                 let by = tokio::time::Instant::now() + Duration::from_secs(1);
                 let fetch = tokio::time::timeout_at(

@@ -1,3 +1,4 @@
+use super::handoff::RetireAck;
 use super::overall_dial_timeout;
 use super::routing::{build_connection_info, connection_chains};
 use crate::control::*;
@@ -193,6 +194,7 @@ impl ControlPlaneHandle {
     async fn pin_tcp_dns_route(
         &self,
         handoff: &super::handoff::HandoffResult,
+        #[cfg(feature = "native-api")] record_route: bool,
     ) -> anyhow::Result<TcpDnsRoute> {
         let config = self.config.read().await;
         let backend = self.ebpf.read().await;
@@ -220,7 +222,7 @@ impl ControlPlaneHandle {
             matched_rule: None,
             reroute_by_sniffed_domain: false,
             #[cfg(feature = "native-api")]
-            native_route: None,
+            native_route: record_route.then(super::observation::RouteObservation::kernel),
         };
         drop(backend);
         Ok(TcpDnsRoute {
@@ -288,7 +290,7 @@ impl ControlPlaneHandle {
         });
         #[cfg(feature = "native-api")]
         let mut terminal = None;
-        let close = self
+        let mut close = self
             .connection_tracker
             .is_enabled()
             .then(|| CloseCompletion(CloseSignal::new()));
@@ -319,7 +321,14 @@ impl ControlPlaneHandle {
                     if handoff.outbound == OutboundIndex::Block as u8 {
                         None
                     } else if handoff.must != 0 {
-                        Some(self.pin_tcp_dns_route(handoff).await?)
+                        Some(
+                            self.pin_tcp_dns_route(
+                                handoff,
+                                #[cfg(feature = "native-api")]
+                                observation.is_recording(),
+                            )
+                            .await?,
+                        )
                     } else {
                         self.dns_controller
                             .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
@@ -328,6 +337,14 @@ impl ControlPlaneHandle {
                         {
                             terminal = Some(TcpTerminal::DnsInterceptCompleted);
                         }
+                        anyhow::ensure!(
+                            flow.retire(RetireAck {
+                                close: close.take(),
+                                outbound: None
+                            })
+                            .await,
+                            "TCP DNS retirement failed"
+                        );
                         return Ok(());
                     }
                 } else {
@@ -519,10 +536,7 @@ impl ControlPlaneHandle {
                 if let Some((generation, catalog)) = &pinned_native {
                     observation.pin_selection(*generation, catalog, &generation_config);
                 }
-                #[cfg(feature = "native-api")]
-                let selection_observer = pinned_native.as_ref().and_then(|(generation, _)| {
-                    observation.observer(|| *generation, "dial_target")
-                });
+                let selection_observer = observation.selection_observer();
                 let (
                     mut candidates,
                     selection_mode,
@@ -541,15 +555,7 @@ impl ControlPlaneHandle {
                             mode_constraint,
                         )
                     };
-                    #[cfg(feature = "native-api")]
-                    let plan = match &selection_observer {
-                        Some(observer) => observer.sync_scope(select),
-                        None => select(),
-                    };
-                    #[cfg(not(feature = "native-api"))]
-                    let plan = select();
-                    #[cfg(feature = "native-api")]
-                    observation.selection_observed(plan.observation.as_ref(), plan.health_family);
+                    let plan = observation.observe_tcp_plan(selection_observer.as_ref(), select);
                     unpack_tcp_score_plan(plan)
                 };
                 // Only an unmeasured URLTest group is allowed to speculate. Its
@@ -680,16 +686,8 @@ impl ControlPlaneHandle {
                                     original.as_ref(),
                                 )
                             };
-                            #[cfg(feature = "native-api")]
-                            let mut plan = match &selection_observer {
-                                Some(observer) => observer.sync_scope(select),
-                                None => select(),
-                            };
-                            #[cfg(not(feature = "native-api"))]
-                            let mut plan = select();
-                            #[cfg(feature = "native-api")]
-                            observation
-                                .selection_observed(plan.observation.as_ref(), plan.health_family);
+                            let mut plan =
+                                observation.observe_tcp_plan(selection_observer.as_ref(), select);
                             // URLTest retains its existing fresh retry-round budget.
                             let mut retry_deadline =
                                 tokio::time::Instant::now() + overall_dial_timeout;
@@ -710,22 +708,8 @@ impl ControlPlaneHandle {
                                         original,
                                     )
                                 };
-                                #[cfg(feature = "native-api")]
-                                {
-                                    plan = match &selection_observer {
-                                        Some(observer) => observer.sync_scope(select),
-                                        None => select(),
-                                    };
-                                }
-                                #[cfg(not(feature = "native-api"))]
-                                {
-                                    plan = select();
-                                }
-                                #[cfg(feature = "native-api")]
-                                observation.selection_observed(
-                                    plan.observation.as_ref(),
-                                    plan.health_family,
-                                );
+                                plan = observation
+                                    .observe_tcp_plan(selection_observer.as_ref(), select);
                                 retry_deadline = dial_deadline;
                             }
                             let (
@@ -953,7 +937,6 @@ impl ControlPlaneHandle {
                             debug!("Failed to write sniffed bytes to proxy: {}", error);
                             self.stats.record_error(&outbound_name, outbound_kind);
                         }
-                        drop(outbound_guard);
                         if let Some(reporter) = &score_reporter {
                             reporter.finish(if intentionally_closed {
                                 crate::group::ScoreOutcome::Cancelled
@@ -962,7 +945,14 @@ impl ControlPlaneHandle {
                             });
                         }
                         drop(proxy_stream);
-                        anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                        anyhow::ensure!(
+                            flow.retire(RetireAck {
+                                close: close.take(),
+                                outbound: Some(outbound_guard)
+                            })
+                            .await,
+                            "TCP retirement failed"
+                        );
                         return Ok(());
                     }
                 };
@@ -1034,7 +1024,14 @@ impl ControlPlaneHandle {
                     {
                         terminal = Some(TcpTerminal::IntentionalRetirement);
                     }
-                    anyhow::ensure!(flow.retire().await, "TCP retirement failed");
+                    anyhow::ensure!(
+                        flow.retire(RetireAck {
+                            close: close.take(),
+                            outbound: Some(outbound_guard)
+                        })
+                        .await,
+                        "TCP retirement failed"
+                    );
                     return Ok(());
                 };
                 #[cfg(feature = "native-api")]
@@ -1075,8 +1072,14 @@ impl ControlPlaneHandle {
                         }
                     }
                 }
-                anyhow::ensure!(flow.retire().await, "TCP retirement failed");
-                drop(outbound_guard);
+                anyhow::ensure!(
+                    flow.retire(RetireAck {
+                        close: close.take(),
+                        outbound: Some(outbound_guard)
+                    })
+                    .await,
+                    "TCP retirement failed"
+                );
 
                 if relay_succeeded && outbound_name != "direct" && outbound_name != "block" {
                     self.replenish_tcp_pool(
@@ -1171,6 +1174,15 @@ mod score_tests {
                         test_dns_forwarder(),
                     )?;
                     let handle = plane.spawn_handle();
+                    let (fatal_tx, mut removal_errors) = mpsc::unbounded_channel();
+                    let removals = spawn_retirement_worker(
+                        Arc::clone(&plane.udp_pool),
+                        Arc::clone(&handle.ebpf),
+                        Arc::clone(&handle.connection_tracker),
+                        fatal_tx,
+                        Arc::clone(&handle.tcp_flow_pins),
+                        Arc::clone(&handle.retirement),
+                    );
                     let manager = handle.group_manager.read().clone();
                     let seed = manager
                         .feedback_for_node(
@@ -1254,6 +1266,10 @@ mod score_tests {
                     }
                     let runtime = handle.runtime_registry.read().clone();
                     runtime.shutdown().await;
+                    plane.udp_pool.shutdown().await;
+                    handle.retirement.sink.lock().take();
+                    removals.await?;
+                    assert_eq!(removal_errors.try_recv().is_ok(), retirement_fails);
                 }
             }
             Ok::<_, anyhow::Error>(())

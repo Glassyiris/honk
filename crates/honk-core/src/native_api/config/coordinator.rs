@@ -1,11 +1,12 @@
 mod completion;
 mod geodata;
+mod managed_entries;
 mod revisions;
 #[cfg(test)]
 mod tests;
 mod validation;
 
-use super::super::management::{self, Completion, Mutation};
+use super::super::management;
 use super::super::{
     config_write::WriteError,
     offline,
@@ -17,7 +18,7 @@ use crate::control::{ControlCommand, LogFiles};
 use crate::subscription::SubscriptionSupervisorHandle;
 use honk_config::parser::LoadedConfig;
 use tokio::sync::watch;
-use validation::{config_error, diagnostics_error, not_included, restart_diagnostics};
+use validation::{config_error, not_included};
 
 pub(crate) struct ConfigCoordinator {
     service: Arc<ConfigService>,
@@ -352,221 +353,6 @@ impl Worker {
         }
     }
 
-    async fn manage(
-        &mut self,
-        mutation: Mutation,
-        catalog: &crate::observe::catalog::Catalog,
-        group_manager: &honk_outbound::group::SharedGroupManager,
-        alive_set: &honk_outbound::alive::AliveDialerSet,
-    ) -> Result<Completion, ApiError> {
-        self.service.manage_admission()?;
-        let active = self.active.read().await.clone();
-        let accepted = self
-            .service
-            .sources
-            .accepted
-            .read()
-            .clone()
-            .ok_or_else(management::unsupported)?;
-        if let Some(reason) = self.service.source_refusal(&accepted, 0) {
-            return Err(management::unsupported().with_reason(reason));
-        }
-        let main = &accepted.update.sources[0];
-        use honk_config::parser::source_edit::{
-            append_node_source, append_subscription_source, remove_node_source,
-            remove_subscription_source,
-        };
-        let content = match &mutation {
-            Mutation::CreateNode(input) => {
-                if active.nodes.iter().any(|node| node.name == input.name) {
-                    return Err(management::conflict());
-                }
-                append_node_source(main, &input.name, &input.link).map_err(|_| {
-                    management::unsupported_value(
-                        "The main source cannot hold this node name and share link",
-                        json!({"resource":"/nodes","fields":["name","link"]}),
-                    )
-                })?
-            }
-            Mutation::CreateProvider(input) => {
-                if active
-                    .subscriptions
-                    .iter()
-                    .any(|subscription| subscription.name == input.name)
-                {
-                    return Err(management::conflict());
-                }
-                append_subscription_source(main, &input.name, &input.url, &input.options())
-                    .map_err(|_| {
-                        management::unsupported_value(
-                            "The main source cannot hold this provider name, URL or user agent",
-                            json!({"resource":"/providers","fields":["name","url","user_agent"]}),
-                        )
-                    })?
-            }
-            Mutation::DeleteNode(id) => {
-                let node = uuid::Uuid::parse_str(id)
-                    .ok()
-                    .and_then(|id| active.nodes.iter().find(|node| node.id == id));
-                let Some(node) = node else {
-                    return Ok(Completion::Deleted(0));
-                };
-                if node.subscription_id.is_some()
-                    || matches!(
-                        node.protocol(),
-                        honk_config::types::NodeProtocol::Direct
-                            | honk_config::types::NodeProtocol::Block
-                    )
-                {
-                    return Err(management::unsupported());
-                }
-                let identity = catalog.snapshot();
-                let groups: Vec<_> = active
-                    .groups
-                    .iter()
-                    .filter(|group| group.final_outbound.as_deref() == Some(node.name.as_str()))
-                    .filter_map(|group| identity.groups.get(&group.name))
-                    .collect();
-                if !groups.is_empty() {
-                    return Err(management::referenced(&groups));
-                }
-                remove_node_source(main, node.id)
-                    .map_err(|_| management::unsupported())?
-                    .ok_or_else(management::unsupported)?
-            }
-            Mutation::DeleteProvider(id) => {
-                if id == "inline" {
-                    return Err(management::unsupported());
-                }
-                let subscription = uuid::Uuid::parse_str(id).ok().and_then(|id| {
-                    active
-                        .subscriptions
-                        .iter()
-                        .find(|subscription| subscription.id == id)
-                });
-                let Some(subscription) = subscription else {
-                    return Ok(Completion::Deleted(0));
-                };
-                if active.subscriptions.iter().any(|other| {
-                    other.id != subscription.id
-                        && crate::subscription::same_subscription_fetch_identity(
-                            other,
-                            subscription,
-                        )
-                }) {
-                    return Err(management::unsupported());
-                }
-                if !(subscription.url.starts_with("http://")
-                    || subscription.url.starts_with("https://"))
-                {
-                    return Err(management::unsupported());
-                }
-                remove_subscription_source(main, subscription, &active.assets)
-                    .map_err(|_| management::unsupported())?
-                    .ok_or_else(management::unsupported)?
-            }
-        };
-        drop(active);
-        let (candidate, sources, diagnostics, committed) = self
-            .prepare_replace(
-                &accepted.ids[&main.path],
-                content,
-                Precondition::Internal {
-                    sha256: accepted.hashes[0].clone(),
-                    revision: accepted.revision.clone(),
-                },
-                match &mutation {
-                    Mutation::CreateProvider(input) => Some(input.name.clone()),
-                    _ => None,
-                },
-                self.service.principal(),
-            )
-            .await?;
-        let created = match &mutation {
-            Mutation::CreateNode(input) => candidate
-                .nodes
-                .iter()
-                .find(|node| node.name == input.name && node.subscription_id.is_none())
-                .map(|node| ("nodes", node.id)),
-            Mutation::CreateProvider(input) => candidate
-                .subscriptions
-                .iter()
-                .find(|subscription| subscription.name == input.name)
-                .map(|subscription| ("providers", subscription.id)),
-            _ => None,
-        };
-        let deferred = created
-            .filter(|(collection, _)| *collection == "providers")
-            .map(|(_, id)| id);
-        self.begin_record(&committed);
-        let completion = self
-            .activation
-            .activate(ActivationRequest {
-                candidate,
-                sources: Some(sources),
-                diagnostics,
-                expected_group_revision: Some(accepted.revision),
-                deferred_provider: deferred,
-            })
-            .await;
-        let stored = self
-            .record(committed, &completion)
-            .await
-            .map_err(|mut details| {
-                details["stage"] = json!(completion::record_failure(&completion).0);
-                unavailable().with_details(details)
-            })?;
-        completion
-            .map_err(|failure| failure.management_error(stored, &self.service.instance_id))?;
-        if mutation.deleting() {
-            return Ok(Completion::Deleted(1));
-        }
-        let (collection, id) = created.ok_or_else(|| {
-            management::activation_error(
-                "resource_unavailable",
-                Some(true),
-                Some(true),
-                Some(true),
-                None,
-            )
-        })?;
-        // Capture under the publication barrier before the queue can delete this resource.
-        let active = self.active.read().await;
-        let value = if collection == "nodes" {
-            let secrets = self.service.secrets_with(&active);
-            super::super::catalog::node_value(
-                &active,
-                &catalog.snapshot(),
-                &group_manager.read(),
-                alive_set,
-                id,
-                &secrets,
-            )
-        } else {
-            super::super::providers::provider_value(
-                &active,
-                Some(&self.subscriptions),
-                id,
-                Some(&self.service),
-                |name| super::super::geodata::group_id(catalog, name),
-            )
-        }
-        .ok_or_else(|| {
-            management::activation_error(
-                "resource_unavailable",
-                Some(true),
-                Some(true),
-                Some(true),
-                None,
-            )
-        })?;
-        Ok(Completion::Created {
-            collection,
-            id,
-            value,
-        })
-    }
-
     async fn tree_operation(&mut self, id: &str, prepared: Result<Prepared, ApiError>) {
         match prepared {
             Ok((candidate, sources, diagnostics, committed)) => {
@@ -609,12 +395,27 @@ impl Worker {
                     .first()
                     .and_then(|main| accepted.ids.get(&main.path))
                     .cloned();
-                (accepted.ids.clone(), main)
+                (
+                    accepted.ids.clone(),
+                    main,
+                    !accepted.update.dependencies.is_empty(),
+                )
             });
+        let capture = if accepted.as_ref().is_some_and(|(_, _, captured)| *captured) {
+            let active = self.active.read().await.clone();
+            let deferred = self
+                .subscriptions
+                .deferred_subscriptions()
+                .await
+                .map_err(|_| unavailable())?;
+            Some((active, self.data_dir.clone(), deferred))
+        } else {
+            None
+        };
         tokio::task::spawn_blocking(move || {
             let (ids, main) = accepted
                 .as_ref()
-                .map_or((None, None), |(ids, main)| (Some(ids), main.as_deref()));
+                .map_or((None, None), |(ids, main, _)| (Some(ids), main.as_deref()));
             let reject = |error, diagnostics: &[DetailedDiagnostic], sources: &[SourceSnapshot]| {
                 config_error(error, diagnostics, sources, main, ids)
             };
@@ -631,6 +432,24 @@ impl Worker {
             let loaded = store
                 .load(&HashMap::new(), &mut diagnostics)
                 .map_err(|error| reject(error, &diagnostics, &[]))?;
+            // Reload admission permits unavailable geo assets; failed fingerprint capture
+            // must not tighten that contract or retain a stale dependency baseline.
+            let dependencies = capture
+                .and_then(|(active, data_dir, deferred)| {
+                    offline::capture_for_coordinator(
+                        loaded.clone(),
+                        store.dependency_root(),
+                        &active,
+                        &data_dir,
+                        SourceLimits::DEFAULT,
+                        &mut Vec::new(),
+                        &deferred,
+                        None,
+                    )
+                    .ok()
+                    .map(|captured| captured.dependencies)
+                })
+                .unwrap_or_default();
             let mut config = crate::admit_operator_config(
                 loaded.config,
                 loaded.sources[0].source.clone(),
@@ -642,7 +461,7 @@ impl Worker {
                 config,
                 Some(SourceUpdate {
                     sources: loaded.sources,
-                    dependencies: Vec::new(),
+                    dependencies,
                     geo_sources: None,
                 }),
                 diagnostics,
@@ -928,188 +747,6 @@ impl Worker {
         .await
         .map_err(|_| unavailable())?
     }
-
-    async fn candidate_check(&self) -> Result<CandidateCheck, ApiError> {
-        let active = self.active.read().await.clone();
-        Ok(CandidateCheck {
-            store: self.store.clone(),
-            secrets: self.service.secrets_with(&active),
-            active,
-            log_files: self.log_files.clone(),
-            data_dir: self.data_dir.clone(),
-            deferred: self
-                .subscriptions
-                .deferred_subscriptions()
-                .await
-                .map_err(|_| unavailable())?,
-        })
-    }
-}
-
-/// What a candidate validates against, captured before blocking work.
-struct CandidateCheck {
-    store: SourceStore,
-    /// The set the source listing's `writable` uses, so a write it offers is not refused here.
-    secrets: ListenerSecrets,
-    active: Arc<Config>,
-    log_files: LogFiles,
-    data_dir: PathBuf,
-    deferred: Vec<honk_config::subscription::Subscription>,
-}
-
-impl CandidateCheck {
-    /// Full validation of a candidate, refusing anything the write or the following reload
-    /// must not admit. `write` is a source write of `content` at `target` over `accepted`;
-    /// `None` is a whole-tree candidate.
-    fn validate(
-        &self,
-        loaded: LoadedConfig,
-        diagnostics: &mut Vec<DetailedDiagnostic>,
-        write: Option<(&Accepted, &Path, &str)>,
-        fallback: Option<&str>,
-        ids: Option<&HashMap<PathBuf, String>>,
-    ) -> Result<offline::ValidatedConfig, ApiError> {
-        let active = &self.active;
-        let parsed_sources = loaded.sources.clone();
-        let validated = offline::validate_for_coordinator(
-            loaded,
-            self.store.dependency_root(),
-            active,
-            &self.data_dir,
-            SourceLimits::DEFAULT,
-            diagnostics,
-            &self.deferred,
-            None,
-            &[],
-        )
-        .map_err(|error| config_error(error, diagnostics, &parsed_sources, fallback, ids))?;
-        if diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == Severity::Error)
-        {
-            return Err(diagnostics_error(
-                diagnostics,
-                &validated.sources,
-                fallback,
-                ids,
-            ));
-        }
-        let mut written = &validated.sources[0];
-        let refusal = if let Some((accepted, target, content)) = write {
-            let old_credentials: Vec<_> = accepted
-                .update
-                .sources
-                .iter()
-                .filter(|source| source.contains_api_secret)
-                .map(|source| (&source.path, &source.content))
-                .collect();
-            let new_credentials: Vec<_> = validated
-                .sources
-                .iter()
-                .filter(|source| source.contains_api_secret)
-                .map(|source| (&source.path, &source.content))
-                .collect();
-            // The target's own declaration implies a changed credential set, so it goes first.
-            let refusal = if validated
-                .sources
-                .iter()
-                .any(|source| source.path == target && source.contains_api_secret)
-            {
-                Some(WriteRefusal::ListenerSecretSource)
-            } else if self.secrets.contains(content) {
-                Some(WriteRefusal::ListenerSecretInContent)
-            } else if old_credentials != new_credentials {
-                Some(WriteRefusal::CredentialSourcesChanged)
-            } else {
-                None
-            };
-            if let Some(source) = validated
-                .sources
-                .iter()
-                .find(|source| source.path == target)
-            {
-                written = source;
-            }
-            refusal
-        } else {
-            None
-        };
-        let refusal = refusal.or_else(|| {
-            (validated.config.experimental.native_api != active.experimental.native_api
-                || validated.config.experimental.clash_api.secret
-                    != active.experimental.clash_api.secret
-                || (matches!(self.store, SourceStore::Db(_))
-                    && validated.config.global.data_dir != active.global.data_dir))
-                .then_some(WriteRefusal::ListenerSettingsChanged)
-        });
-        if let Some(reason) = refusal {
-            return Err(denied().with_reason(reason));
-        }
-        // The reload would reject these, and a rejected reload leaves the written file
-        // ahead of the accepted hash; refuse before writing.
-        let restart = restart_diagnostics(
-            active,
-            &validated.config,
-            &self.log_files,
-            &written.source,
-            Severity::Error,
-        );
-        if !restart.is_empty() {
-            diagnostics.extend(restart);
-            return Err(diagnostics_error(
-                diagnostics,
-                &validated.sources,
-                fallback,
-                ids,
-            ));
-        }
-        Ok(validated)
-    }
-
-    fn recheck(
-        &self,
-        overlay: &HashMap<PathBuf, Arc<str>>,
-        validated: &offline::ValidatedConfig,
-    ) -> Result<(), WriteError> {
-        unchanged(
-            &self.store,
-            overlay,
-            validated,
-            &self.active,
-            &self.data_dir,
-            &self.deferred,
-        )
-    }
-}
-
-/// Fails with `Conflict` unless `store` still yields `validated`: the same documents, loading
-/// without errors, over the same dependencies.
-fn unchanged(
-    store: &SourceStore,
-    overlay: &HashMap<PathBuf, Arc<str>>,
-    validated: &offline::ValidatedConfig,
-    active: &Config,
-    data_dir: &Path,
-    deferred: &[honk_config::subscription::Subscription],
-) -> Result<(), WriteError> {
-    let mut notices = Vec::new();
-    let loaded = store
-        .load(overlay, &mut notices)
-        .map_err(|_| WriteError::Conflict)?;
-    if notices
-        .iter()
-        .any(|notice| notice.severity == Severity::Error)
-        || !same_source_documents(&validated.sources, &loaded.sources)
-    {
-        return Err(WriteError::Conflict);
-    }
-    let dependencies = validated
-        .recapture_dependencies(active, data_dir, SourceLimits::DEFAULT, deferred)
-        .map_err(|_| WriteError::Conflict)?;
-    if validated.dependencies != dependencies {
-        return Err(WriteError::Conflict);
-    }
-    Ok(())
 }
 
 fn prepared(

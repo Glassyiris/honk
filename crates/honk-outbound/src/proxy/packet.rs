@@ -57,6 +57,12 @@ impl<'a> QuicSendAttempt<'a> {
         }
     }
 
+    /// Whether this attempt tracks an ACK baseline; non-QUIC transports hand
+    /// out an inactive token that never outlives its send.
+    pub fn is_active(&self) -> bool {
+        self.token.is_active()
+    }
+
     pub fn success(mut self) {
         self.completed = true;
         self.transport.record_quic_send_success(self.token);
@@ -127,6 +133,82 @@ pub trait PacketTransport: Send + Sync + Debug {
         self.send_packet(data).await
     }
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+/// One logical UDP association that can address any destination, the unit a
+/// core source scope shares across a client's destinations. Replies must carry
+/// the real peer from [`PacketTransport::recv_packet`], never a captured target.
+///
+/// Implementors give `send_packet` and `send_to` one unboxed inherent helper so
+/// the ordinary path pays no second `async_trait` boxing.
+#[async_trait]
+pub trait MultiTargetTransport: PacketTransport {
+    /// `domain` is the name the flow was dialed by, when any. `confirmed`
+    /// requests the first-datagram admission of [`PacketTransport::send_packet_confirmed`];
+    /// `admitted` is set once the datagram reached the wire path.
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        confirmed: bool,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()>;
+    /// Server address reported when a shared association is reused.
+    fn carrier_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// Whether a cancelled frame write has torn this transport's reliable
+    /// stream, so every later send fails with [`super::FrameInterrupted`].
+    fn frame_stream_torn(&self) -> bool {
+        false
+    }
+}
+
+/// Poison flag of a reliable stream that carries every destination's frames.
+///
+/// A write cancelled or failed partway leaves a partial frame, so the flag
+/// stays set until the frame completes; dropping the guard never clears it.
+/// Callers already hold the stream's writer lock, so `begin` is not a CAS.
+#[derive(Debug, Default)]
+pub(crate) struct FramePoison(std::sync::atomic::AtomicBool);
+
+impl FramePoison {
+    /// Fails fast on a torn stream without marking a new write in flight.
+    pub(crate) fn check(&self) -> std::io::Result<()> {
+        if self.is_set() {
+            return Err(super::FrameInterrupted.into());
+        }
+        Ok(())
+    }
+
+    /// Marks a frame write in flight. From here the write can leave a partial
+    /// frame, so the datagram is `admitted`: a later deadline tears the stream
+    /// rather than staying packet-local congestion.
+    pub(crate) fn begin(
+        &self,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<FrameWrite<'_>> {
+        self.check()?;
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(admitted) = admitted {
+            admitted.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(FrameWrite(&self.0))
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[must_use]
+pub(crate) struct FrameWrite<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl FrameWrite<'_> {
+    pub(crate) fn complete(self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub(crate) trait MuxSession: crate::session::ManagedSession + Sized + 'static {
@@ -268,21 +350,25 @@ impl<T: ?Sized + Send + Sync + 'static> PreparedUdpTransport<T> {
         self.commit.await
     }
 }
-pub(super) async fn prepare_detached_quic_transport<T, F, Fut>(
+pub(super) async fn prepare_detached_quic_transport<T, P, F, Fut>(
     runtime: Arc<crate::runtime::NodeRuntime>,
     client: Arc<T>,
     prepare: F,
-) -> anyhow::Result<PreparedUdpTransport>
+) -> anyhow::Result<PreparedUdpTransport<P>>
 where
     T: crate::runtime::QuicRuntimeClient,
+    P: ?Sized + PacketTransport + 'static,
     F: FnOnce(Arc<T>) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Arc<dyn PacketTransport>>>,
+    Fut: Future<Output = anyhow::Result<Arc<P>>>,
 {
     if !matches!(runtime.runtime, crate::runtime::ProtocolRuntime::Quic(_)) {
         anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
     }
     let task_scope = runtime.task_scope();
-    let transport = runtime.scope_tasks(prepare(Arc::clone(&client))).await?;
+    let transport = {
+        let operation = std::pin::pin!(prepare(Arc::clone(&client)));
+        runtime.scope_tasks(operation).await?
+    };
     Ok(PreparedUdpTransport::new(task_scope.scope_owned(
         async move {
             let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {

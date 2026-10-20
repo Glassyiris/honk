@@ -33,7 +33,7 @@ pub(super) struct RuntimeEpoch {
     maintenance: OwnedTasks,
     dns: Option<dns_listener::DnsListener>,
     janitor: Option<tokio::task::JoinHandle<()>>,
-    removals: Option<tokio::task::JoinHandle<()>>,
+    removals: Option<retirement_worker::RetirementWorker>,
     removal_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     critical_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     health_updates: Option<HealthUpdates>,
@@ -143,9 +143,7 @@ impl ControlPlane {
                 Some(l)
             }
             Err(e) => {
-                // Same rule as the UDPv6 listeners: only a host without an
-                // IPv6 stack may continue with the slot empty (the published
-                // v4 fd fallback cannot accept v6 flows).
+                // Only a host without an IPv6 stack may leave this slot empty.
                 let no_ipv6 = e
                     .downcast_ref::<io::Error>()
                     .and_then(|error| error.raw_os_error())
@@ -238,7 +236,7 @@ impl ControlPlane {
                 c.global.tcp_check_http_method.clone()
             };
             if !check_url.is_empty() {
-                let prober = Arc::new(ProxyHttpProber::new(
+                let prober = Arc::new(super::probers::http::ProxyHttpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
@@ -315,7 +313,7 @@ impl ControlPlane {
     async fn prepare_epoch(&mut self, listeners: BoundListeners) -> anyhow::Result<RuntimeEpoch> {
         use std::os::fd::AsRawFd;
         let tcp4 = listeners.tcp4.as_raw_fd();
-        let tcp6 = listeners.tcp6.as_ref().map_or(tcp4, AsRawFd::as_raw_fd);
+        let tcp6 = listeners.tcp6.as_ref().map(AsRawFd::as_raw_fd);
         let udp4: Vec<_> = listeners
             .udp4
             .iter()
@@ -410,21 +408,25 @@ impl ControlPlane {
             }
             #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
             record_udp_trace(&self.degradations, trace_error.is_some());
-            epoch.removals = Some(spawn_udp_removal_worker(
+            epoch.removals = Some(spawn_retirement_worker(
                 self.udp_pool.clone(),
                 self.ebpf.clone(),
                 self.connection_tracker.clone(),
                 removal_tx,
+                self.tcp_flow_pins.clone(),
+                Arc::clone(&self.retirement),
             ));
             epoch.janitor = Some(
-                BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone()).spawn_supervised(
-                    CriticalTaskExit {
-                        name: "bpf_janitor",
-                        fatal_tx: critical_tx,
-                        expected: false,
-                    },
-                    epoch.stop.subscribe(),
-                ),
+                BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone())
+                    .with_udp_pool(self.udp_pool.clone())
+                    .spawn_supervised(
+                        CriticalTaskExit {
+                            name: "bpf_janitor",
+                            fatal_tx: critical_tx,
+                            expected: false,
+                        },
+                        epoch.stop.subscribe(),
+                    ),
             );
             epoch.health_updates = Some(HealthUpdates::start(self));
             #[cfg(feature = "ebpf")]
@@ -444,17 +446,6 @@ impl ControlPlane {
                             .await
                     }
                 }
-                if let Some(queue) = epoch.queue.as_mut()
-                    && let Err(error) = queue.check_startup_health().await
-                {
-                    self.cleanup_nfqueue_startup_failure(&mut epoch.queue).await;
-                    epoch.queue = None;
-                    self.degrade_nfqueue_startup(
-                        &mut epoch.listeners.nfqueue_enabled,
-                        error.into(),
-                    )
-                    .await;
-                }
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -462,7 +453,13 @@ impl ControlPlane {
         if let Err(error) = prepared {
             // Preparation has not opened admission. Cleanup must not borrow the
             // terminal process shutdown path or discard retained API owners.
-            if let Err(cleanup) = self.stop_network_epoch(Some(&mut epoch)).await {
+            let mut cleanup = None;
+            retain_error(&mut cleanup, self.quiesce_udp_epoch(Some(&mut epoch)).await);
+            retain_error(
+                &mut cleanup,
+                self.stop_network_epoch(Some(&mut epoch)).await,
+            );
+            if let Some(cleanup) = cleanup {
                 return Err(cleanup
                     .context("runtime candidate cleanup failed")
                     .context(error));
@@ -473,6 +470,15 @@ impl ControlPlane {
     }
 
     async fn open_epoch(&mut self, epoch: &mut RuntimeEpoch) -> anyhow::Result<()> {
+        #[cfg(feature = "ebpf")]
+        if let Some(queue) = epoch.queue.as_mut()
+            && let Err(error) = queue.check_startup_health().await
+        {
+            self.cleanup_nfqueue_startup_failure(&mut epoch.queue).await;
+            epoch.queue = None;
+            self.degrade_nfqueue_startup(&mut epoch.listeners.nfqueue_enabled, error.into())
+                .await;
+        }
         #[cfg(feature = "ebpf")]
         let queue_ready = epoch
             .queue
@@ -591,6 +597,27 @@ pub(super) async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> an
     result
 }
 
+async fn join_retirement_owner<T: Default>(
+    task: &mut Option<tokio::task::JoinHandle<T>>,
+    owner: &'static str,
+) -> anyhow::Result<T> {
+    let Some(handle) = task.as_mut() else {
+        return Ok(T::default());
+    };
+    let result = match tokio::time::timeout(STAGE_TIMEOUT, &mut *handle).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                owner,
+                "Retirement owner exceeded its stop deadline; waiting for admitted cleanup"
+            );
+            handle.await
+        }
+    };
+    task.take();
+    result.map_err(anyhow::Error::from)
+}
+
 async fn abort_and_join(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Result<()> {
     if let Some(handle) = task.as_ref() {
         handle.abort();
@@ -695,14 +722,14 @@ fn reap_tcp(result: Option<Result<(), tokio::task::JoinError>>) -> EpochEvent {
 impl ControlPlane {
     async fn fence_runtime(&self) -> anyhow::Result<()> {
         let mut error = None;
+        if let Some(flags) = self.datapath_flags.as_ref() {
+            retain_error(&mut error, flags.fence_nfqueue().await);
+        }
         retain_error(
             &mut error,
             self.ebpf.write().await.set_datapath_ready(false),
         );
         self.drain_tracker.start_rejecting();
-        if let Some(flags) = self.datapath_flags.as_ref() {
-            retain_error(&mut error, flags.fence_nfqueue().await);
-        }
         error.map_or(Ok(()), Err)
     }
 
@@ -819,5 +846,30 @@ mod reap_tests {
         let cancelled = tasks.join_next().await;
         assert!(matches!(&cancelled, Some(Err(error)) if error.is_cancelled()));
         assert!(matches!(reap_tcp(cancelled), EpochEvent::Reaped));
+    }
+}
+
+#[cfg(test)]
+mod retirement_join_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_join_outlives_warning_and_cancelled_waiter() -> anyhow::Result<()> {
+        for owner in ["flow retirement worker", "BPF janitor"] {
+            let (release, waiting) = tokio::sync::oneshot::channel();
+            let mut task = Some(tokio::spawn(async move { waiting.await.unwrap() }));
+            let mut joining = Box::pin(join_retirement_owner(&mut task, owner));
+            assert!(futures::poll!(&mut joining).is_pending());
+            tokio::time::advance(STAGE_TIMEOUT + Duration::from_secs(1)).await;
+            assert!(futures::poll!(&mut joining).is_pending());
+            drop(joining);
+            assert!(!task.as_ref().unwrap().is_finished());
+            let mut joining = Box::pin(join_retirement_owner(&mut task, owner));
+            assert!(futures::poll!(&mut joining).is_pending());
+            release.send(()).unwrap();
+            joining.await?;
+            assert!(task.is_none());
+        }
+        Ok(())
     }
 }

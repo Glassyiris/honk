@@ -7,6 +7,7 @@ use super::cursor::{BodySyntax, Document};
 use super::lexer::Source;
 use super::read::{self, Text};
 use super::sources::SourceSnapshot;
+use crate::diagnostic::Severity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupField {
@@ -33,9 +34,12 @@ impl GroupField {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Default, thiserror::Error)]
 #[error("source cannot represent the requested edit")]
-pub struct SourceEditError;
+pub struct SourceEditError {
+    /// Static parser/admission reason when the requested entry itself was rejected.
+    pub reason: Option<&'static str>,
+}
 
 fn group_source_indices(documents: &[Document<'_>]) -> HashMap<String, usize> {
     let mut result = HashMap::new();
@@ -65,7 +69,7 @@ pub fn edit_group_source(
         &mut Vec::new(),
         false,
     )
-    .map_err(|_| SourceEditError)?;
+    .map_err(|_| SourceEditError::default())?;
     let group = document
         .sections()
         .filter(|root| root.header() == "group")
@@ -73,7 +77,7 @@ pub fn edit_group_source(
         .flatten()
         .filter(|group| read::block_header(group).is_some_and(|header| header.raw() == name))
         .last()
-        .ok_or(SourceEditError)?;
+        .ok_or_else(SourceEditError::default)?;
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut additions = String::new();
     let newline = if source.content.contains("\r\n") {
@@ -98,7 +102,7 @@ pub fn edit_group_source(
             .iter()
             .any(|(previous, _)| previous == field)
         {
-            return Err(SourceEditError);
+            return Err(SourceEditError::default());
         }
         let fields: Vec<_> = group
             .body()
@@ -153,7 +157,7 @@ pub fn edit_group_source(
     }
     edits.sort_unstable_by_key(|(range, _)| range.start);
     if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     let mut output = source.content.to_string();
     for (range, text) in edits.into_iter().rev() {
@@ -164,7 +168,7 @@ pub fn edit_group_source(
 
 fn quote_scalar(value: &str, preferred: Option<char>) -> Result<String, SourceEditError> {
     if value.chars().any(char::is_control) {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     for quote in preferred.into_iter().chain(['\'', '"']) {
         let candidate = format!("{quote}{value}{quote}");
@@ -172,7 +176,7 @@ fn quote_scalar(value: &str, preferred: Option<char>) -> Result<String, SourceEd
             return Ok(candidate);
         }
     }
-    Err(SourceEditError)
+    Err(SourceEditError::default())
 }
 
 /// Append one validated, explicitly named node without expanding includes.
@@ -184,10 +188,10 @@ pub fn append_node_source(
 ) -> Result<String, SourceEditError> {
     let (entry, config) = managed_entry("node", name, link, &[])?;
     let [node] = config.nodes.as_slice() else {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     };
     if node.name != name {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     let document = managed_document(source)?;
     let sections = document
@@ -198,12 +202,12 @@ pub fn append_node_source(
     let mut diagnostics =
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
     let nodes = super::entries::parse_node_section(&sections, &mut diagnostics)
-        .map_err(|_| SourceEditError)?;
+        .map_err(|_| SourceEditError::default())?;
     if nodes
         .iter()
         .any(|existing| existing.name == name || existing.id == node.id)
     {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     Ok(append_entry(&document, "node", &entry))
 }
@@ -229,9 +233,9 @@ pub fn remove_node_source(
             duplicate |= target.replace(span.start..span.end).is_some();
         }
     })
-    .map_err(|_| SourceEditError)?;
+    .map_err(|_| SourceEditError::default())?;
     if duplicate {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     Ok(target.map(|range| {
         let mut output = source.content.to_string();
@@ -269,7 +273,7 @@ pub fn append_subscription_source(
     }
     let (entry, config) = managed_entry("subscription", name, url, &fields)?;
     let [subscription] = config.subscriptions.as_slice() else {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     };
     let defaults = crate::subscription::Subscription::default();
     if subscription.name != name
@@ -282,7 +286,7 @@ pub fn append_subscription_source(
             .ok()
             .is_none_or(|url| url.host_str().is_none())
     {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     let document = managed_document(source)?;
     let sections = document
@@ -298,9 +302,9 @@ pub fn append_subscription_source(
         &crate::assets::AssetsConfig::default(),
         &mut diagnostics,
     )
-    .map_err(|_| SourceEditError)?;
+    .map_err(|_| SourceEditError::default())?;
     if subscriptions.iter().any(|existing| existing.name == name) {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     Ok(append_entry(&document, "subscription", &entry))
 }
@@ -344,9 +348,9 @@ pub fn remove_subscription_source(
             }
         },
     )
-    .map_err(|_| SourceEditError)?;
+    .map_err(|_| SourceEditError::default())?;
     if ambiguous {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     Ok(target.map(|range| {
         let mut output = source.content.to_string();
@@ -393,7 +397,7 @@ fn managed_document(source: &SourceSnapshot) -> Result<Document<'_>, SourceEditE
         &mut Vec::new(),
         false,
     )
-    .map_err(|_| SourceEditError)
+    .map_err(|_| SourceEditError::default())
 }
 
 /// A scalar `name: value` entry, or with `fields` a block whose `url` is `value`.
@@ -404,15 +408,16 @@ fn managed_entry(
     fields: &[String],
 ) -> Result<(String, crate::Config), SourceEditError> {
     if name.trim().is_empty() {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     let value = quote_scalar(value, None)?;
-    let quoted = quote_scalar(name, None).map_err(|_| SourceEditError)?;
+    let quoted = quote_scalar(name, None).map_err(|_| SourceEditError::default())?;
     let bare = name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
         .then(|| name.to_owned());
     // A bare key that the section reads back differently (`mux`) keeps its quotes.
+    let mut reason = None;
     for key in bare.into_iter().chain([quoted]) {
         let entry = if fields.is_empty() {
             format!("{key}: {value}")
@@ -423,11 +428,16 @@ fn managed_entry(
             }
             entry + "\n    }"
         };
-        let Ok(config) = super::parse_dae_config_with_detailed_diagnostics(
+        let mut diagnostics = Vec::new();
+        let config = match super::parse_dae_config_with_detailed_diagnostics(
             &format!("{section} {{\n    {entry}\n}}"),
-            &mut Vec::new(),
-        ) else {
-            continue;
+            &mut diagnostics,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                reason = Some(error.diagnostic.message);
+                continue;
+            }
         };
         let names: Vec<&str> = match section {
             "node" => config.nodes.iter().map(|node| node.name.as_str()).collect(),
@@ -437,11 +447,22 @@ fn managed_entry(
                 .map(|subscription| subscription.name.as_str())
                 .collect(),
         };
-        if names == [name] && config.validate().is_ok() {
-            return Ok((entry, config));
+        if names != [name] {
+            // A section skips an unreadable entry and records why as its last warning.
+            reason = diagnostics
+                .iter()
+                .rev()
+                .find(|diagnostic| diagnostic.severity != Severity::Info)
+                .map(|diagnostic| diagnostic.message)
+                .or(reason);
+            continue;
+        }
+        match config.validate_detailed() {
+            Ok(()) => return Ok((entry, config)),
+            Err(error) => reason = Some(error.diagnostic.message),
         }
     }
-    Err(SourceEditError)
+    Err(SourceEditError { reason })
 }
 
 fn append_entry(document: &Document<'_>, section: &str, entry: &str) -> String {
@@ -476,16 +497,16 @@ fn quote_dae_scalar(value: &str) -> Result<String, SourceEditError> {
         return Ok(quoted);
     }
     if value.chars().any(char::is_control) {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     // dae preserves backslashes, so adding quote escapes would change the value.
     // Only use bare text when the canonical reader sees exactly one scalar.
     let candidate = format!("global {{\nvalue: {value}\n}}\n");
     let document = plain_document(&candidate)?;
     let mut roots = document.sections();
-    let root = roots.next().ok_or(SourceEditError)?;
-    let mut fields = root.body().ok_or(SourceEditError)?;
-    let field = fields.next().ok_or(SourceEditError)?;
+    let root = roots.next().ok_or_else(SourceEditError::default)?;
+    let mut fields = root.body().ok_or_else(SourceEditError::default)?;
+    let field = fields.next().ok_or_else(SourceEditError::default)?;
     if roots.next().is_some()
         || fields.next().is_some()
         || field.is_block()
@@ -494,7 +515,7 @@ fn quote_dae_scalar(value: &str) -> Result<String, SourceEditError> {
             .kv()
             .is_some_and(|(key, parsed)| key.raw() == "value" && parsed.unquote().raw() == value)
     {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     Ok(value.to_owned())
 }
@@ -517,9 +538,31 @@ pub fn strip_listener_secrets(content: &str) -> Result<String, SourceEditError> 
         output.replace_range(range, "");
     }
     if super::sources::contains_api_secret(&plain_document(&output)?) {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     Ok(output)
+}
+
+pub fn visit_listener_secret_values(
+    source: &SourceSnapshot,
+    mut visit: impl FnMut(&str),
+) -> Result<(), SourceEditError> {
+    let document = Document::parse_attempt(
+        Source::new(&source.content, source.source.clone()),
+        &mut Vec::new(),
+        true,
+    )
+    .map_err(|_| SourceEditError::default())?;
+    for (_, block) in listener_blocks(&document) {
+        for field in block.body().into_iter().flatten() {
+            if let Some((key, value)) = Text::segment(&field).kv()
+                && key.raw() == "secret"
+            {
+                visit(value.unquote().raw());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Put listener secrets back into content without any; an empty value is not
@@ -531,7 +574,7 @@ pub fn restore_listener_secrets(
 ) -> Result<String, SourceEditError> {
     let document = plain_document(content)?;
     if super::sources::contains_api_secret(&document) {
-        return Err(SourceEditError);
+        return Err(SourceEditError::default());
     }
     let newline = if content.contains("\r\n") {
         "\r\n"
@@ -547,7 +590,7 @@ pub fn restore_listener_secrets(
         let (_, block) = blocks
             .iter()
             .rfind(|(name, _)| *name == api)
-            .ok_or(SourceEditError)?;
+            .ok_or_else(SourceEditError::default)?;
         let entry = format!("secret: {}", quote_dae_scalar(value)?);
         let close = block.span().end - 1;
         let edit = match own_line_start(content, close) {
@@ -594,7 +637,7 @@ pub fn inline_sources(sources: &[SourceSnapshot]) -> Result<String, SourceEditEr
 fn plain_document(content: &str) -> Result<Document<'_>, SourceEditError> {
     let source = crate::diagnostic::DiagnosticSources::new(None).root();
     Document::parse_attempt(Source::new(content, source), &mut Vec::new(), false)
-        .map_err(|_| SourceEditError)
+        .map_err(|_| SourceEditError::default())
 }
 
 fn listener_blocks<'d, 'a>(
@@ -652,7 +695,7 @@ pub fn source_indices(
                 &mut notices,
                 false,
             )
-            .map_err(|_| SourceEditError)
+            .map_err(|_| SourceEditError::default())
         })
         .collect::<Result<Vec<_>, _>>()?;
     let groups = group_source_indices(&documents);
@@ -693,7 +736,7 @@ pub fn source_indices(
             }
         }
     })
-    .map_err(|_| SourceEditError)?;
+    .map_err(|_| SourceEditError::default())?;
     let dns = documents
         .iter()
         .flat_map(Document::sections)

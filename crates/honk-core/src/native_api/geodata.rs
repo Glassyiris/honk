@@ -173,7 +173,7 @@ fn route(settings: &NativeApiConfig, sources: Option<&Sources>) -> Route {
 
 /// A URL as `source_redacted` and `fetched_url_redacted` show it, listener
 /// secrets masked; None when it cannot be shown safely.
-pub(crate) fn redact(url: &str, secrets: &config::ListenerSecrets) -> Option<String> {
+pub(crate) fn redact(url: &str, secrets: &super::secrets::ListenerSecrets) -> Option<String> {
     display_url(url, |text| secrets.contains(text)).map(|url| secrets.mask(&url).0)
 }
 
@@ -647,7 +647,7 @@ async fn exchange(
     let (reply, group) = match routed {
         None => (download_route::fetch_direct(&request).await?, None),
         Some((outbounds, detour)) => outbounds
-            .fetch(detour, DETOUR_SETTING, PURPOSE, &request)
+            .fetch(detour, DETOUR_SETTING, PURPOSE, &request, &mut None)
             .await
             .map_err(|failed| match failed {
                 Failed::Route(_) => "group_unavailable",

@@ -1,7 +1,9 @@
 use std::io;
+use std::net::SocketAddr;
 
 use rand::RngExt;
 
+use crate::proxy::addr::SocksAddr;
 use crate::quic::recv_read_exact as read_exact;
 
 /// Auth request target: `POST https://hysteria/auth` (`protocol/http.go:8-10`).
@@ -108,15 +110,13 @@ pub(super) fn encode_tcp_request(addr: &str) -> Vec<u8> {
 }
 
 /// One inbound UDP message (datagram), see `protocol/proxy.go:162-169`.
-/// The address is informational; the relay keys sessions by target.
 #[derive(Debug)]
 pub(super) struct UdpInbound {
     pub(super) session_id: u32,
     pub(super) packet_id: u16,
     pub(super) frag_id: u8,
     pub(super) frag_total: u8,
-    #[cfg(test)]
-    pub(super) addr: String,
+    pub(super) addr: SocksAddr,
     pub(super) data: Vec<u8>,
 }
 
@@ -152,14 +152,24 @@ pub(super) fn decode_udp_message(data: &[u8]) -> Option<UdpInbound> {
     if data.len() <= end {
         return None;
     }
-    let _addr = std::str::from_utf8(&data[start..end]).ok()?;
+    let addr = std::str::from_utf8(&data[start..end]).ok()?;
+    let addr = match addr.parse::<SocketAddr>() {
+        Ok(SocketAddr::V4(addr)) => SocksAddr::V4(addr),
+        Ok(SocketAddr::V6(addr)) => SocksAddr::V6(addr),
+        Err(_) => {
+            let (host, port) = addr.rsplit_once(':')?;
+            if host.is_empty() || host.contains([':', '[', ']']) {
+                return None;
+            }
+            SocksAddr::Domain(host.to_owned(), port.parse().ok()?)
+        }
+    };
     Some(UdpInbound {
         session_id,
         packet_id,
         frag_id,
         frag_total,
-        #[cfg(test)]
-        addr: _addr.to_owned(),
+        addr,
         data: data[end..].to_vec(),
     })
 }

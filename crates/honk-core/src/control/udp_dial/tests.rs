@@ -386,3 +386,64 @@ async fn udp_disabled_capability_falls_back_but_explicit_policy_is_terminal() {
         }
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn unpolled_loser_is_cancelled_without_vetoing_ready_winner() {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let release = Arc::new(parking_lot::Mutex::new(Some(release)));
+    let released = Arc::new(parking_lot::Mutex::new(Some(released)));
+    let loser_polls = Arc::new(AtomicUsize::new(0));
+    let cancellations = Arc::new(AtomicUsize::new(0));
+    let prepare: UdpPrepare<()> = {
+        let loser_polls = Arc::clone(&loser_polls);
+        Arc::new(move |index, _| {
+            if index == 0 {
+                let released = released.lock().take().unwrap();
+                Box::pin(async move {
+                    released.await.unwrap();
+                    Ok(())
+                })
+            } else {
+                let loser_polls = Arc::clone(&loser_polls);
+                Box::pin(async move {
+                    loser_polls.fetch_add(1, Ordering::SeqCst);
+                    Err(honk_outbound::proxy::PacketRejection::Capacity.into())
+                })
+            }
+        })
+    };
+    let callbacks = UdpStaggerCallbacks {
+        // A wakes while the loser is admitted, before it is pushed.
+        allows_target: Arc::new(move |node| {
+            if node.name == "loser" {
+                let _ = release.lock().take().unwrap().send(());
+            }
+            true
+        }),
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: Arc::new(|_| panic!("cancellation is health-neutral")),
+        on_attempt: Arc::new(|| {}),
+        on_winner: Arc::new(|| {}),
+        on_cancellation: {
+            let cancellations = Arc::clone(&cancellations);
+            Arc::new(move || {
+                cancellations.fetch_add(1, Ordering::SeqCst);
+            })
+        },
+    };
+    let task = tokio::spawn(prepare_udp_plan(
+        SelectionPlanMode::ColdUrlTest,
+        vec![candidate("winner"), candidate("loser")],
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        prepare,
+        callbacks,
+    ));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    let winner = task.await.unwrap().unwrap().unwrap();
+
+    assert_eq!(winner.0.name, "winner");
+    assert_eq!(loser_polls.load(Ordering::SeqCst), 0);
+    assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+}

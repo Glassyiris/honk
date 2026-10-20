@@ -11,8 +11,9 @@ use tokio::net::TcpStream;
 
 use super::addr;
 use super::{
-    AsyncReadWrite, PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound,
-    WarmRequirement, WarmableOutbound,
+    AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement,
+    WarmableOutbound,
 };
 
 const CRLF: &[u8] = b"\r\n";
@@ -103,7 +104,42 @@ impl TrojanHandler {
         target: SocketAddr,
         domain: Option<&str>,
         timeout: std::time::Duration,
-    ) -> anyhow::Result<super::PreparedUdpTransport> {
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        let (transport, preparation) =
+            Self::open_udp_stream(node, runtime, target, domain, timeout).await?;
+        Ok(Self::commit_udp_stream(
+            transport as Arc<dyn PacketTransport>,
+            preparation,
+        ))
+    }
+
+    /// One association for a whole client source scope: `target` and
+    /// `domain` only name the UDP-associate request; every frame carries its
+    /// own destination.
+    pub(crate) async fn prepare_udp_source(
+        runtime: &Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let (transport, preparation) =
+            Self::open_udp_stream(&runtime.node, Some(runtime), target, domain, timeout).await?;
+        Ok(Self::commit_udp_stream(
+            transport as Arc<dyn MultiTargetTransport>,
+            preparation,
+        ))
+    }
+
+    async fn open_udp_stream(
+        node: &Node,
+        runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(
+        Arc<TrojanUdpTransport>,
+        super::transport::TransportPreparation,
+    )> {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!(
                 "Trojan UDP: node network {:?} does not include \"udp\"",
@@ -112,10 +148,17 @@ impl TrojanHandler {
         }
         let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
         let transport = Self::finish_udp_stream(node, target, domain, control).await?;
-        Ok(super::PreparedUdpTransport::new(async move {
+        Ok((transport, preparation))
+    }
+
+    fn commit_udp_stream<T: ?Sized + Send + Sync + 'static>(
+        transport: Arc<T>,
+        preparation: super::transport::TransportPreparation,
+    ) -> PreparedUdpTransport<T> {
+        PreparedUdpTransport::new(async move {
             preparation.commit()?;
             Ok(transport)
-        }))
+        })
     }
 
     async fn finish_udp_stream(
@@ -123,7 +166,7 @@ impl TrojanHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         mut control: Box<dyn AsyncReadWrite>,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+    ) -> anyhow::Result<Arc<TrojanUdpTransport>> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let addr_header = addr::encode_address(target, target_domain)?;
         let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
@@ -137,8 +180,10 @@ impl TrojanHandler {
         let (rd, wr) = tokio::io::split(control);
         Ok(Arc::new(TrojanUdpTransport {
             writer: tokio::sync::Mutex::new(wr),
+            poison: super::FramePoison::default(),
             reader: tokio::sync::Mutex::new(rd),
             addr_header,
+            domain: target_domain.map(Box::from),
             relay_addr: target,
         }))
     }
@@ -191,6 +236,21 @@ impl TcpOutbound for TrojanHandler {
             connect_timeout,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for TrojanHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        Self::prepare_udp_source(&runtime, target, target_domain, connect_timeout).await
     }
 }
 
@@ -426,11 +486,16 @@ mod tests {
 
 /// Framed UDP-associate transport over the Trojan control stream: packets
 /// are framed directly onto the associate stream
-/// (`addr | u16 len | CRLF | payload`).
+/// (`addr | u16 len | CRLF | payload`), each frame naming its own peer.
 struct TrojanUdpTransport {
     writer: tokio::sync::Mutex<WriteHalf<Box<dyn AsyncReadWrite>>>,
+    /// Poisoned by a write cancelled halfway, so no sibling destination can
+    /// append a frame to a torn one.
+    poison: super::FramePoison,
     reader: tokio::sync::Mutex<ReadHalf<Box<dyn AsyncReadWrite>>>,
+    /// Encoded `relay_addr`/`domain`: the destination of `send_packet`.
     addr_header: Vec<u8>,
+    domain: Option<Box<str>>,
     relay_addr: SocketAddr,
 }
 
@@ -442,13 +507,14 @@ impl std::fmt::Debug for TrojanUdpTransport {
     }
 }
 
-#[async_trait]
-impl PacketTransport for TrojanUdpTransport {
-    fn relay_addr(&self) -> SocketAddr {
-        self.relay_addr
-    }
-
-    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+impl TrojanUdpTransport {
+    async fn send_frame(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
         if data.len() > u16::MAX as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -463,71 +529,104 @@ impl PacketTransport for TrojanUdpTransport {
                 "trojan UDP writer is busy",
             ));
         };
-        let mut frame = Vec::with_capacity(self.addr_header.len() + 4 + data.len());
-        frame.extend_from_slice(&self.addr_header);
+        let mut frame;
+        if target == self.relay_addr && domain == self.domain.as_deref() {
+            frame = Vec::with_capacity(self.addr_header.len() + 4 + data.len());
+            frame.extend_from_slice(&self.addr_header);
+        } else {
+            let address = addr::SocksAddr::new(target, domain)?;
+            frame = Vec::with_capacity(address.encoded_len() + 4 + data.len());
+            address.encode(&mut frame);
+        }
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
+        let write = self.poison.begin(admitted)?;
         writer.write_all(&frame).await?;
-        writer.flush().await
+        writer.flush().await?;
+        write.complete();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PacketTransport for TrojanUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay_addr
+    }
+
+    fn allows_full_cone_replies(&self) -> bool {
+        true
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_frame(self.relay_addr, self.domain.as_deref(), data, None)
+            .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let mut rd = self.reader.lock().await;
-        // Source address is parsed (bounds-checked) but discarded: the flow's
-        // reply validation keys on relay_addr, not the packet's source field.
-        let _src = addr::SocksAddr::read_from_stream(&mut *rd).await?;
-        let mut len_buf = [0u8; 2];
-        rd.read_exact(&mut len_buf).await?;
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut crlf = [0u8; 2];
-        rd.read_exact(&mut crlf).await?;
-        if len > buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "trojan udp frame exceeds buffer",
-            ));
+        loop {
+            // An unknown ATYP has no derivable length, so the parser's error
+            // stays terminal for the whole stream.
+            let peer = match addr::SocksAddr::read_from_stream(&mut *rd).await? {
+                addr::SocksAddr::V4(peer) => Some(SocketAddr::V4(peer)),
+                addr::SocksAddr::V6(peer) => {
+                    Some(SocketAddr::new(peer.ip().to_canonical(), peer.port()))
+                }
+                // Only the dialed name projects back; no other name is resolved.
+                addr::SocksAddr::Domain(domain, port) => {
+                    addr::dialed_domain_peer(self.domain.as_deref(), self.relay_addr, domain, port)
+                }
+            };
+            let mut head = [0u8; 4];
+            rd.read_exact(&mut head).await?;
+            let len = u16::from_be_bytes([head[0], head[1]]) as usize;
+            if let Some(peer) = peer {
+                if len > buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "trojan udp frame exceeds buffer",
+                    ));
+                }
+                rd.read_exact(&mut buf[..len]).await?;
+                return Ok((len, peer));
+            }
+            // The dropped frame must be consumed so the next one decodes.
+            let mut left = len;
+            while left > 0 {
+                let chunk = left.min(buf.len());
+                if chunk == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "trojan udp frame exceeds buffer",
+                    ));
+                }
+                rd.read_exact(&mut buf[..chunk]).await?;
+                left -= chunk;
+            }
         }
-        rd.read_exact(&mut buf[..len]).await?;
-        Ok((len, self.relay_addr))
+    }
+}
+
+#[async_trait]
+impl MultiTargetTransport for TrojanUdpTransport {
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        _confirmed: bool,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.domain.as_deref(), domain);
+        self.send_frame(target, domain, data, admitted).await
+    }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
     }
 }
 
 #[cfg(test)]
-mod udp_transport_tests {
-    use super::*;
-
-    /// send_packet frames `addr|len|CRLF|payload`; recv_packet unframes the
-    /// same shape back. Round-tripped over a duplex pair.
-    #[tokio::test]
-    async fn trojan_udp_transport_frame_roundtrip() {
-        let (client, mut server) = tokio::io::duplex(8192);
-        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let (rd, wr) = tokio::io::split(Box::new(client) as Box<dyn AsyncReadWrite>);
-        let transport = TrojanUdpTransport {
-            writer: tokio::sync::Mutex::new(wr),
-            reader: tokio::sync::Mutex::new(rd),
-            addr_header: addr::encode_address(target, None).unwrap(),
-            relay_addr: target,
-        };
-
-        // client → server frame
-        transport.send_packet(b"hello-trojan-udp").await.unwrap();
-        let mut head = vec![0u8; addr::encode_address(target, None).unwrap().len() + 4];
-        server.read_exact(&mut head).await.unwrap();
-        let mut payload = [0u8; 16];
-        server.read_exact(&mut payload).await.unwrap();
-        assert_eq!(&payload, b"hello-trojan-udp");
-
-        // server → client frame
-        let mut frame = addr::encode_address(target, None).unwrap();
-        frame.extend_from_slice(&5u16.to_be_bytes());
-        frame.extend_from_slice(b"\r\n");
-        frame.extend_from_slice(b"pong!");
-        server.write_all(&frame).await.unwrap();
-        let mut buf = [0u8; 64];
-        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"pong!");
-        assert_eq!(src, target);
-    }
-}
+mod udp_transport_tests;

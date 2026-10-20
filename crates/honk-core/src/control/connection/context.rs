@@ -42,6 +42,7 @@ pub(in crate::control) struct ControlPlaneHandle {
     pub(in crate::control) connection_pool: Arc<ConnectionPool>,
     pub(in crate::control) connection_tracker: Arc<ConnectionTracker>,
     pub(in crate::control) tcp_flow_pins: Arc<TcpFlowPins>,
+    pub(in crate::control) retirement: Arc<crate::control::retirement_worker::RetirementPort>,
     /// Shared clash mode state (None when the clash API is disabled).
     pub(in crate::control) mode_state: Option<crate::mode::SharedModeState>,
 }

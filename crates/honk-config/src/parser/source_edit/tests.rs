@@ -175,6 +175,40 @@ fn managed_appends_reject_injection_parse_skips_and_duplicate_identities() {
 }
 
 #[test]
+fn managed_node_rejection_keeps_the_static_parser_reason() {
+    let loaded = managed_source("node {}\n");
+    let link = |extra: &str| {
+        format!(
+            "vless://00000000-0000-4000-8000-000000000001@example.test:443?type=xhttp&security=tls&extra={}",
+            url::form_urlencoded::byte_serialize(extra.as_bytes()).collect::<String>()
+        )
+    };
+    for (extra, reason) in [
+        (
+            r#"{"xPaddingBytes":"0-10","headers":{"X-Secret":"private-value"}}"#,
+            "XHTTP xPaddingBytes must stay within 1-8192",
+        ),
+        (
+            r#"{"scMaxEachPostBytes":0}"#,
+            "XHTTP scMaxEachPostBytes must stay within 1-16777216",
+        ),
+        (
+            r#"{"scMinPostsIntervalMs":"10-60001"}"#,
+            "XHTTP scMinPostsIntervalMs must stay within 0-60000",
+        ),
+        (
+            r#"{"headers":{"Host":"private-value"}}"#,
+            "invalid or protocol-managed XHTTP header",
+        ),
+    ] {
+        let error = append_node_source(&loaded.sources[0], "edge", &link(extra)).unwrap_err();
+        assert_eq!(error.reason, Some(reason), "{extra}");
+    }
+    let error = append_node_source(&loaded.sources[0], "", "socks5://127.0.0.1:1080").unwrap_err();
+    assert_eq!(error.reason, None);
+}
+
+#[test]
 fn managed_node_deletion_uses_normalized_identity_and_keeps_nested_siblings() {
     let declaration = "'display # name': 'vless://00000000-0000-0000-0000-000000000001@example.test:443?security=tls&flow=xtls-rprx-vision-udp443'";
     let text = format!(
@@ -711,6 +745,29 @@ fn restored_listener_secrets_preserve_quotes_and_backslashes() {
         assert!(restore_listener_secrets(content, secret, "").is_err());
         assert!(restore_listener_secrets(content, "", secret).is_err());
     }
+}
+
+#[test]
+fn listener_secret_values_are_visited_unquoted_and_unparsable_sources_fail() {
+    let content = "experimental {\n    native_api {\n        secret: 'first token'\n        secret: \"quoted\\\"token\" # comment\n        secret: bare-token\n    }\n    clash_api { secret: clash-token }\n}\nglobal { log_level: info }\n";
+    let loaded = managed_source(content);
+    let mut values = Vec::new();
+    visit_listener_secret_values(&loaded.sources[0], |value| values.push(value.to_owned()))
+        .unwrap();
+    assert_eq!(
+        values,
+        [
+            "first token",
+            "quoted\\\"token",
+            "bare-token",
+            "clash-token"
+        ]
+    );
+    let mut broken = loaded.sources[0].clone();
+    broken.content = Arc::from("experimental { native_api { secret: 'unfinished\n");
+    let mut visited = false;
+    assert!(visit_listener_secret_values(&broken, |_| visited = true).is_err());
+    assert!(!visited);
 }
 
 #[test]

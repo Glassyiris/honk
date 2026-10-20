@@ -10,6 +10,7 @@ use honk_config::node::Node;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// One candidate transport-preparation future. The candidate index preserves
@@ -64,6 +65,7 @@ where
     let mut next = 0;
     let mut tasks = FuturesUnordered::new();
     let mut rejection = None;
+    let finalized = Arc::new(AtomicBool::new(false));
 
     let winner = 'schedule: loop {
         if tokio::time::Instant::now() >= deadline {
@@ -97,10 +99,14 @@ where
                 (callbacks.on_attempt)();
             }
             let prepare = Arc::clone(&prepare);
+            let finalized = Arc::clone(&finalized);
             tasks.push(
                 std::panic::AssertUnwindSafe(async move {
+                    if finalized.load(Ordering::Relaxed) {
+                        return (node, None);
+                    }
                     let result = prepare(next - 1, node.clone()).await;
-                    (node, result)
+                    (node, Some(result))
                 })
                 .catch_unwind(),
             );
@@ -120,7 +126,7 @@ where
         let Some(joined) = joined else {
             continue;
         };
-        let Ok((node, result)) = joined else {
+        let Ok((node, Some(result))) = joined else {
             // A task panic/abort has no observed transport result and must not
             // affect health. Continue scheduling the remaining candidates.
             continue;
@@ -143,21 +149,25 @@ where
         }
     };
 
+    // Draining reports losers that already completed; a preparation first
+    // polled after this point is never started.
+    finalized.store(true, Ordering::Relaxed);
+    let mut cancelled = 0;
     while let Some(Some(joined)) = tasks.next().now_or_never() {
         match joined {
-            Ok((node, Err(error))) => {
+            Ok((node, Some(Err(error)))) => {
                 if honk_outbound::proxy::is_packet_rejection(&error) {
                     rejection.get_or_insert(error);
                 } else {
                     (callbacks.on_dial_error)(&node);
                 }
             }
-            Ok((_, Ok(_))) => {}
-            Err(_) => {}
+            Ok((_, None)) => cancelled += 1,
+            Ok((_, Some(Ok(_)))) | Err(_) => {}
         }
     }
     if records_stagger_metrics {
-        for _ in 0..tasks.len() {
+        for _ in 0..cancelled + tasks.len() {
             (callbacks.on_cancellation)();
         }
     }

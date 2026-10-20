@@ -114,6 +114,8 @@ impl RelayError {
                     | std::io::ErrorKind::NotConnected
                     | std::io::ErrorKind::UnexpectedEof
                     | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
             );
         Self { error, client }
     }

@@ -356,12 +356,13 @@ async fn socks5_udp_transport_frames_domain_request() {
 }
 
 #[tokio::test]
-async fn socks5_udp_transport_reports_reply_source_as_logical_relay_peer() {
+async fn socks5_udp_transport_reports_reply_source_from_wire() {
     let server =
         run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
             .await;
     let target: SocketAddr = "203.0.113.9:5353".parse().unwrap();
     let transport = dial_udp_test_transport(&server, target, None).await;
+    assert!(transport.allows_full_cone_replies());
     let client_addr = transport_client_addr(&server, &transport).await;
     server
         .relay
@@ -376,70 +377,79 @@ async fn socks5_udp_transport_reports_reply_source_as_logical_relay_peer() {
     let (n, source) = transport.recv_packet(&mut received).await.unwrap();
     assert_eq!(&received[..n], b"reply payload");
     assert_eq!(source, target);
-    assert_eq!(
-        source,
-        transport.relay_addr(),
-        "honk-core accepts the first reply only when its source matches relay_addr"
-    );
 }
 
 #[tokio::test]
-async fn socks5_udp_transport_maps_mismatched_ipv4_wire_source_to_logical_target() {
+async fn socks5_udp_transport_returns_the_real_numeric_wire_source() {
     let server =
         run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
             .await;
     let target: SocketAddr = "203.0.113.9:5353".parse().unwrap();
-    let wire_source: SocketAddr = "198.51.100.50:5353".parse().unwrap();
-    assert_ne!(wire_source, target);
     let transport = dial_udp_test_transport(&server, target, None).await;
     let client_addr = transport_client_addr(&server, &transport).await;
-    server
-        .relay
-        .send_to(
-            &expected_socks5_udp_datagram(wire_source, None, 0, b"mismatched-src"),
-            client_addr,
+
+    // A peer that was never contacted, an IPv6 one, and an IPv4-mapped one
+    // that must read back as plain IPv4.
+    let mapped: SocketAddr = "[::ffff:198.51.100.77]:7000".parse().unwrap();
+    let cases: [(SocketAddr, SocketAddr); 3] = [
+        (
+            "198.51.100.50:5353".parse().unwrap(),
+            "198.51.100.50:5353".parse().unwrap(),
+        ),
+        (
+            "[2001:db8::50]:5354".parse().unwrap(),
+            "[2001:db8::50]:5354".parse().unwrap(),
+        ),
+        (mapped, "198.51.100.77:7000".parse().unwrap()),
+    ];
+    for (wire, expected) in cases {
+        assert_ne!(wire, target);
+        server
+            .relay
+            .send_to(
+                &expected_socks5_udp_datagram(wire, None, 0, b"from-wire"),
+                client_addr,
+            )
+            .await
+            .unwrap();
+        let mut received = [0u8; 1024];
+        let (n, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            transport.recv_packet(&mut received),
         )
         .await
-        .unwrap();
-
-    let mut received = [0u8; 1024];
-    let (n, source) = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        transport.recv_packet(&mut received),
-    )
-    .await
-    .expect("recv_packet should complete without network I/O")
-    .expect("valid RFC1928 frame must be accepted");
-    assert_eq!(&received[..n], b"mismatched-src");
-    assert_eq!(
-        source, target,
-        "PacketTransport peer must be logical target_addr, not RFC1928 wire source"
-    );
-    assert_eq!(source, transport.relay_addr());
+        .expect("recv_packet should complete without network I/O")
+        .expect("valid RFC1928 frame must be accepted");
+        assert_eq!(&received[..n], b"from-wire");
+        assert_eq!(source, expected);
+    }
 }
 
 #[tokio::test]
-async fn socks5_udp_transport_maps_domain_wire_source_to_logical_target_without_dns() {
+async fn socks5_udp_transport_projects_only_the_dialed_domain_without_dns() {
     let server =
         run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
             .await;
     let target: SocketAddr = "203.0.113.11:5353".parse().unwrap();
-    let transport = dial_udp_test_transport(&server, target, None).await;
+    let transport = dial_udp_test_transport(&server, target, Some("Peer.Example.Test")).await;
     let client_addr = transport_client_addr(&server, &transport).await;
-    // Domain wire source must not trigger bootstrap/system DNS; peer is logical target.
-    server
-        .relay
-        .send_to(
-            &expected_socks5_udp_datagram(
-                target,
-                Some("reply-src.invalid.test"),
-                0,
-                b"domain-wire",
-            ),
-            client_addr,
-        )
-        .await
-        .unwrap();
+
+    // Other names, and the dialed name on another port, are dropped; the
+    // frame after them is still decoded. The dialed name matches
+    // case-insensitively and projects to the captured target.
+    let datagrams = [
+        expected_socks5_udp_datagram(target, Some("other.invalid.test"), 0, b"foreign-name"),
+        expected_socks5_udp_datagram(
+            "203.0.113.11:5354".parse().unwrap(),
+            Some("Peer.Example.Test"),
+            0,
+            b"wrong-port",
+        ),
+        expected_socks5_udp_datagram(target, Some("peer.example.test"), 0, b"projected"),
+    ];
+    for datagram in &datagrams {
+        server.relay.send_to(datagram, client_addr).await.unwrap();
+    }
 
     let mut received = [0u8; 1024];
     let (n, source) = tokio::time::timeout(
@@ -448,13 +458,85 @@ async fn socks5_udp_transport_maps_domain_wire_source_to_logical_target_without_
     )
     .await
     .expect("domain wire source must not block on DNS")
-    .expect("valid domain ATYP frame must be accepted without resolving");
-    assert_eq!(&received[..n], b"domain-wire");
+    .expect("a dropped domain frame must not fail the transport");
+    assert_eq!(&received[..n], b"projected");
+    assert_eq!(source, target);
+}
+
+#[tokio::test]
+async fn socks5_udp_transport_drops_a_domain_source_when_dialed_by_address() {
+    let server =
+        run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
+            .await;
+    let target: SocketAddr = "203.0.113.11:5353".parse().unwrap();
+    let transport = dial_udp_test_transport(&server, target, None).await;
+    let client_addr = transport_client_addr(&server, &transport).await;
+    for datagram in [
+        expected_socks5_udp_datagram(target, Some("peer.example.test"), 0, b"dropped"),
+        expected_socks5_udp_datagram(target, None, 0, b"numeric"),
+    ] {
+        server.relay.send_to(&datagram, client_addr).await.unwrap();
+    }
+
+    let mut received = [0u8; 1024];
+    let (n, _) = transport.recv_packet(&mut received).await.unwrap();
+    assert_eq!(&received[..n], b"numeric");
+}
+
+#[tokio::test]
+async fn socks5_udp_transport_carries_empty_and_maximum_payloads() {
+    let server =
+        run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
+            .await;
+    let target: SocketAddr = "203.0.113.12:5353".parse().unwrap();
+    let transport = dial_udp_test_transport(&server, target, None).await;
+    // IPv4 UDP payload limit 65507 minus the 10-byte SOCKS5 header.
+    let largest = vec![0x5a; 65_507 - 10];
+    let mut relay_buf = vec![0u8; 65_535];
+    let mut client_addr = None;
+    for payload in [&[][..], &largest[..]] {
+        transport.send_packet(payload).await.unwrap();
+        let (n, client) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.relay.recv_from(&mut relay_buf),
+        )
+        .await
+        .expect("relay should receive the request")
+        .unwrap();
+        assert_eq!(
+            &relay_buf[..n],
+            expected_socks5_udp_datagram(target, None, 0, payload)
+        );
+        client_addr = Some(client);
+    }
+    let client_addr = client_addr.unwrap();
+
+    let mut received = vec![0u8; 65_535];
+    for payload in [&[][..], &largest[..]] {
+        server
+            .relay
+            .send_to(
+                &expected_socks5_udp_datagram(target, None, 0, payload),
+                client_addr,
+            )
+            .await
+            .unwrap();
+        let (n, source) = transport.recv_packet(&mut received).await.unwrap();
+        assert_eq!(&received[..n], payload);
+        assert_eq!(source, target);
+    }
+
+    // One byte past the datagram limit is a local size refusal; the shared
+    // association must keep serving its other destinations.
+    let error = transport
+        .send_packet(&vec![0x5a; 65_507 - 10 + 1])
+        .await
+        .unwrap_err();
     assert_eq!(
-        source, target,
-        "domain wire source must map to logical target_addr without DNS"
+        crate::proxy::io_packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::InvalidSize)
     );
-    assert_eq!(source, transport.relay_addr());
+    transport.send_packet(b"alive").await.unwrap();
 }
 
 #[tokio::test]
@@ -837,3 +919,5 @@ async fn test_socks5_handshake_no_auth() {
         .await;
     assert!(result.is_ok());
 }
+
+mod shared_source;

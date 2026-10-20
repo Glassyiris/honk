@@ -919,3 +919,42 @@ async fn removed_destination_settings_survive_export_reload_and_sighup() {
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn unchanged_reload_keeps_the_revision_of_a_write_with_captured_dependencies() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    std::fs::write(fixture.path("hosts.rules"), "full:alias.test 192.0.2.1\n").unwrap();
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = format!(
+        "{}dns {{\n use_host: '{}'\n}}\n",
+        fixture.originals["main.dae"],
+        fixture.path("hosts.rules").display()
+    );
+    let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+    let written = fixture.get(CONFIG).await;
+    assert_ne!(written["revision"], before["revision"]);
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    assert_eq!(fixture.get(CONFIG).await["revision"], written["revision"]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn unchanged_reload_keeps_a_startup_revision_without_dependency_snapshots() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |root, files| {
+        let hosts = root.join("hosts.rules");
+        std::fs::write(&hosts, "full:alias.test 192.0.2.1\n").unwrap();
+        files
+            .get_mut("main.dae")
+            .unwrap()
+            .push_str(&format!("dns {{\n use_host: '{}'\n}}\n", hosts.display()));
+    })
+    .await;
+    let before = fixture.get(CONFIG).await;
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    assert_eq!(fixture.get(CONFIG).await["revision"], before["revision"]);
+    fixture.shutdown().await;
+}

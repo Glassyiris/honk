@@ -164,16 +164,20 @@ impl BootstrapResolver {
             qtype_name(qtype),
             LookupOrigin::Upstream(self.server, if self.use_tcp { "tcp" } else { "udp" }),
         );
+        let child = observation.as_ref().map(LookupObservation::child);
         let result = async {
-            let msg = tokio::time::timeout(QUERY_TIMEOUT, self.query_raw(host, qtype))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out")
-                })??;
+            let msg = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                self.query_raw(host, qtype, observation.as_mut()),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out")
+            })??;
             parse_answers(&msg, qtype)
         };
-        let result = match &observation {
-            Some(observation) => observation.child().scope(result).await,
+        let result = match child {
+            Some(child) => child.scope(result).await,
             None => result.await,
         };
         if let Some(observation) = &mut observation {
@@ -183,13 +187,22 @@ impl BootstrapResolver {
     }
 
     /// Send a single query and return the raw response that answers it.
-    async fn query_raw(&self, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+    async fn query_raw(
+        &self,
+        host: &str,
+        qtype: u16,
+        observation: Option<&mut LookupObservation>,
+    ) -> io::Result<Vec<u8>> {
         let query = build_query(host, qtype);
         if !self.use_tcp {
             let response = self.exchange_udp(&query).await?;
             // A truncated answer may omit records; libc's resolver retries it over TCP.
             if response[2] & 0x02 == 0 {
                 return Ok(response);
+            }
+            if let Some(observation) = observation {
+                observation.data.upstream_transport = Some("tcp");
+                observation.data.carrier_transport = Some("tcp");
             }
         }
         self.exchange_tcp(&query).await
@@ -307,9 +320,10 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
             if resolver.use_tcp { "tcp" } else { "udp" },
         ),
     );
-    let operation = resolver.query_raw(host, QTYPE_HTTPS);
-    let result = match &observation {
-        Some(observation) => observation.child().scope(operation).await,
+    let child = observation.as_ref().map(LookupObservation::child);
+    let operation = resolver.query_raw(host, QTYPE_HTTPS, observation.as_mut());
+    let result = match child {
+        Some(child) => child.scope(operation).await,
         None => operation.await,
     };
     if let Some(observation) = &mut observation {

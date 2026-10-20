@@ -52,6 +52,7 @@ Field-by-field configuration and API reference. / 逐字段的配置与 API 参�
 | Document | English | 中文 |
 | ---------- | --------- | ------ |
 | DNS canary and rollback runbook | [en/operations/dns-rollout.md](./en/operations/dns-rollout.md) | [zh/operations/dns-rollout.md](./zh/operations/dns-rollout.md) |
+| Long connections and keepalive / 长连接与保活 | [en/operations/long-connections.md](./en/operations/long-connections.md) | [zh/operations/long-connections.md](./zh/operations/long-connections.md) |
 
 ---
 

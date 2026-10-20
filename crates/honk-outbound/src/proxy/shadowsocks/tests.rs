@@ -48,6 +48,20 @@ fn test_is_2022_method() {
     assert!(!is_2022_method("chacha20-ietf-poly1305"));
 }
 
+fn legacy_transport(socket: tokio::net::UdpSocket, target: SocketAddr) -> SsUdpTransport {
+    SsUdpTransport {
+        server_addr: socket.peer_addr().unwrap(),
+        socket,
+        crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
+            LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
+        )),
+        recv_buf: tokio::sync::Mutex::new(None),
+        socks: addr::encode_address(target, None).unwrap(),
+        target,
+        target_domain: None,
+    }
+}
+
 #[test]
 fn test_legacy_udp_roundtrip() {
     let crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
@@ -61,7 +75,11 @@ fn test_legacy_udp_roundtrip() {
     // salt + tag minimum
     assert!(packet.len() > 16 + 16 + payload.len());
     let opened = crypto.open(&packet).unwrap();
-    assert_eq!(opened, payload);
+    assert_eq!(opened.payload(), payload);
+    assert_eq!(
+        opened.peer,
+        addr::SocksAddr::V4("8.8.8.8:53".parse().unwrap())
+    );
 }
 
 #[tokio::test]
@@ -70,15 +88,7 @@ async fn udp_send_waits_for_cipher_instead_of_reporting_a_drop_as_success() {
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client.connect(server.local_addr().unwrap()).await.unwrap();
     let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    let transport = Arc::new(SsUdpTransport {
-        socket: client,
-        crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
-            LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
-        )),
-        recv_buf: tokio::sync::Mutex::new(None),
-        socks: addr::encode_address(target, None).unwrap(),
-        target,
-    });
+    let transport = Arc::new(legacy_transport(client, target));
     let guard = transport.crypto.lock().await;
     let sender = {
         let transport = Arc::clone(&transport);
@@ -112,7 +122,8 @@ fn test_legacy_udp_roundtrip_chacha() {
     let payload = b"quic initial";
     let packet = crypto.seal(&socks, payload).unwrap();
     let opened = crypto.open(&packet).unwrap();
-    assert_eq!(opened, payload);
+    assert_eq!(opened.payload(), payload);
+    assert_eq!(opened.peer, addr::SocksAddr::Domain("one.one".into(), 443));
 }
 
 #[test]
@@ -318,15 +329,7 @@ async fn udp_receive_drops_an_unopenable_datagram_and_keeps_the_session() {
     client.connect(server.local_addr().unwrap()).await.unwrap();
     let client_addr = client.local_addr().unwrap();
     let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    let transport = SsUdpTransport {
-        socket: client,
-        crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
-            LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
-        )),
-        recv_buf: tokio::sync::Mutex::new(None),
-        socks: addr::encode_address(target, None).unwrap(),
-        target,
-    };
+    let transport = legacy_transport(client, target);
     let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
     let wrong_key = LegacyUdpCrypto::new("aes-128-gcm", "other-password").unwrap();
     let socks = addr::encode_address(target, None).unwrap();
@@ -367,7 +370,11 @@ async fn test_dial_udp_transport_legacy_end_to_end() {
         loop {
             let (n, src) = server.recv_from(&mut buf).await.unwrap();
             let payload = server_crypto.open(&buf[..n]).unwrap();
-            let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+            let reply: Vec<u8> = payload
+                .payload()
+                .iter()
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
             let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None).unwrap();
             let packet = server_crypto.seal(&socks, &reply).unwrap();
             server.send_to(&packet, src).await.unwrap();
@@ -406,4 +413,353 @@ async fn test_dial_udp_transport_legacy_end_to_end() {
     let (n, src) = received.unwrap();
     assert_eq!(src, target);
     assert_eq!(&buf[..n], &[b'A'; 1200]);
+}
+
+/// Independent legacy-AEAD wire peer for the shared-association tests:
+/// `salt | AEAD(HKDF-SHA1(key, salt, "ss-subkey"))(addr | payload)` with a
+/// zero nonce, framed without the production UDP codec.
+struct LegacyPeer {
+    method: &'static str,
+    key: Vec<u8>,
+}
+
+impl LegacyPeer {
+    fn new(method: &'static str, password: &str) -> Self {
+        use md5::{Digest, Md5};
+        let key_len = if method == "aes-128-gcm" { 16 } else { 32 };
+        let (mut key, mut prev) = (Vec::new(), Vec::new());
+        while key.len() < key_len {
+            prev.extend_from_slice(password.as_bytes());
+            prev = Md5::digest(&prev).to_vec();
+            key.extend_from_slice(&prev);
+        }
+        key.truncate(key_len);
+        Self { method, key }
+    }
+
+    fn salt_len(&self) -> usize {
+        self.key.len()
+    }
+
+    fn cipher(&self, salt: &[u8]) -> AeadCipher {
+        let mut subkey = vec![0u8; self.key.len()];
+        Hkdf::<Sha1>::new(Some(salt), &self.key)
+            .expand(b"ss-subkey", &mut subkey)
+            .unwrap();
+        AeadCipher::new(self.method, &subkey).unwrap()
+    }
+
+    fn seal(&self, plain: &[u8]) -> Vec<u8> {
+        let mut salt = vec![0u8; self.salt_len()];
+        rand::rng().fill_bytes(&mut salt);
+        let mut packet = salt.clone();
+        packet.extend_from_slice(&self.cipher(&salt).seal(&[0u8; 12], plain).unwrap());
+        packet
+    }
+
+    fn open(&self, packet: &[u8]) -> Vec<u8> {
+        let (salt, sealed) = packet.split_at(self.salt_len());
+        self.cipher(salt).open(&[0u8; 12], sealed).unwrap()
+    }
+}
+
+/// SOCKS5 address bytes for a socket address, written by hand.
+fn wire_addr(peer: SocketAddr) -> Vec<u8> {
+    let mut out = Vec::new();
+    match peer {
+        SocketAddr::V4(v4) => {
+            out.push(1);
+            out.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            out.push(4);
+            out.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    out.extend_from_slice(&peer.port().to_be_bytes());
+    out
+}
+
+fn wire_domain(domain: &str, port: u16) -> Vec<u8> {
+    let mut out = vec![3, domain.len() as u8];
+    out.extend_from_slice(domain.as_bytes());
+    out.extend_from_slice(&port.to_be_bytes());
+    out
+}
+
+const LEGACY_METHODS: [&str; 3] = ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"];
+const PASSWORD: &str = "shared-source-password";
+const STEP: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn legacy_node(server: SocketAddr, method: &str) -> Node {
+    let mut node = Node {
+        name: "test-ss-shared".into(),
+        address: server.ip().to_string(),
+        port: server.port(),
+        outbound: honk_config::node::OutboundConfig::Shadowsocks(
+            honk_config::node::ShadowsocksConfig {
+                encryption: Some(method.into()),
+                password: Some(PASSWORD.into()),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+struct Shared {
+    server: tokio::net::UdpSocket,
+    peer: LegacyPeer,
+    transport: Arc<dyn MultiTargetTransport>,
+}
+
+impl Shared {
+    async fn new(method: &'static str, target: SocketAddr, domain: Option<&str>) -> Self {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node = legacy_node(server.local_addr().unwrap(), method);
+        let transport = Arc::new(
+            ShadowsocksHandler::udp_transport(&node, target, domain, STEP)
+                .await
+                .unwrap(),
+        );
+        Self {
+            server,
+            peer: LegacyPeer::new(method, PASSWORD),
+            transport,
+        }
+    }
+
+    async fn send(&self, to: SocketAddr, domain: Option<&str>, payload: &[u8]) {
+        self.transport
+            .send_to(to, domain, payload, false, None)
+            .await
+            .unwrap();
+    }
+
+    /// The client's outer source and the decrypted `addr | payload`.
+    async fn server_recv(&self) -> (SocketAddr, Vec<u8>) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(STEP, self.server.recv_from(&mut buf))
+            .await
+            .expect("server datagram")
+            .unwrap();
+        (from, self.peer.open(&buf[..n]))
+    }
+
+    async fn reply(&self, client: SocketAddr, addr: &[u8], payload: &[u8]) {
+        let plain = [addr, payload].concat();
+        self.server
+            .send_to(&self.peer.seal(&plain), client)
+            .await
+            .unwrap();
+    }
+
+    async fn client_recv(&self) -> (Vec<u8>, SocketAddr) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(STEP, self.transport.recv_packet(&mut buf))
+            .await
+            .expect("client datagram")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+}
+
+/// Two destinations over one transport reach the server from one outer
+/// source (one server-side mapping); a reply from a never-contacted peer
+/// returns that peer, IPv4-mapped sources normalize, empty payloads survive.
+#[tokio::test]
+async fn legacy_udp_one_association_serves_every_destination() {
+    for method in LEGACY_METHODS {
+        let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let b: SocketAddr = "[2001:db8::2]:5353".parse().unwrap();
+        let c: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        let c6: SocketAddr = "[2001:db8::9]:9".parse().unwrap();
+        let shared = Shared::new(method, a, None).await;
+        assert_eq!(
+            shared.transport.carrier_addr(),
+            Some(shared.server.local_addr().unwrap())
+        );
+
+        shared.send(a, None, b"to-a").await;
+        shared.send(b, None, b"to-b").await;
+        shared.send(a, None, b"").await;
+        let (src_a, plain_a) = shared.server_recv().await;
+        let (src_b, plain_b) = shared.server_recv().await;
+        let (src_empty, plain_empty) = shared.server_recv().await;
+        assert_eq!(src_a, src_b, "{method}: one outer source for both targets");
+        assert_eq!(src_a, src_empty);
+        assert_eq!(plain_a, [wire_addr(a), b"to-a".to_vec()].concat());
+        assert_eq!(plain_b, [wire_addr(b), b"to-b".to_vec()].concat());
+        assert_eq!(plain_empty, wire_addr(a));
+
+        // Unsolicited peers, then the contacted ones.
+        shared.reply(src_a, &wire_addr(c), b"from-c").await;
+        assert_eq!(shared.client_recv().await, (b"from-c".to_vec(), c));
+        shared.reply(src_a, &wire_addr(c6), b"from-c6").await;
+        assert_eq!(shared.client_recv().await, (b"from-c6".to_vec(), c6));
+        shared.reply(src_a, &wire_addr(b), b"from-b").await;
+        assert_eq!(shared.client_recv().await, (b"from-b".to_vec(), b));
+        shared.reply(src_a, &wire_addr(a), b"").await;
+        assert_eq!(shared.client_recv().await, (Vec::new(), a));
+
+        let mapped = vec![
+            4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 7, 0x1f, 0x90,
+        ];
+        shared.reply(src_a, &mapped, b"mapped").await;
+        let expected: SocketAddr = "192.0.2.7:8080".parse().unwrap();
+        assert_eq!(shared.client_recv().await, (b"mapped".to_vec(), expected));
+    }
+}
+
+/// A domain source is accepted only as the dialed domain and port, and is
+/// projected to the dialed target; any other name is dropped without DNS.
+#[tokio::test]
+async fn legacy_udp_domain_source_projects_only_the_dialed_name() {
+    let a: SocketAddr = "198.51.100.1:443".parse().unwrap();
+    let c: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+    let shared = Shared::new("aes-256-gcm", a, Some("Example.COM")).await;
+
+    // Default target keeps its dialed name on the wire; the same IP without
+    // the name is a different destination.
+    shared.transport.send_packet(b"d").await.unwrap();
+    shared.send(a, None, b"ip").await;
+    shared.send(a, Some("other.example"), b"other").await;
+    let (src, first) = shared.server_recv().await;
+    assert_eq!(
+        first,
+        [wire_domain("Example.COM", 443), b"d".to_vec()].concat()
+    );
+    assert_eq!(
+        shared.server_recv().await.1,
+        [wire_addr(a), b"ip".to_vec()].concat()
+    );
+    assert_eq!(
+        shared.server_recv().await.1,
+        [wire_addr(a), b"other".to_vec()].concat(),
+        "a name other than the dialed one goes out numerically"
+    );
+
+    shared
+        .reply(src, &wire_domain("other.example", 443), b"x")
+        .await;
+    shared
+        .reply(src, &wire_domain("example.com", 444), b"x")
+        .await;
+    shared
+        .reply(src, &wire_domain("example.com", 443), b"named")
+        .await;
+    assert_eq!(shared.client_recv().await, (b"named".to_vec(), a));
+    shared
+        .reply(src, &wire_domain("other.example", 443), b"x")
+        .await;
+    shared.reply(src, &wire_addr(c), b"after").await;
+    assert_eq!(shared.client_recv().await, (b"after".to_vec(), c));
+
+    let overlong = "d".repeat(256);
+    shared.send(a, Some(&overlong), b"long").await;
+    assert_eq!(
+        shared.server_recv().await.1,
+        [wire_addr(a), b"long".to_vec()].concat()
+    );
+}
+
+/// Short, wrong-key, truncated, unknown-ATYP and bad-domain frames each
+/// drop only their own datagram.
+#[tokio::test]
+async fn legacy_udp_bad_frames_drop_only_the_datagram() {
+    let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
+    let shared = Shared::new("aes-128-gcm", a, None).await;
+    shared.send(a, None, b"hello").await;
+    let (client, _) = shared.server_recv().await;
+
+    let wrong_key = LegacyPeer::new("aes-128-gcm", "other-password");
+    let frames = [
+        vec![0u8; 8],
+        wrong_key.seal(&[wire_addr(a), b"x".to_vec()].concat()),
+        shared.peer.seal(&[1, 1, 2]),
+        shared.peer.seal(&[5, 1, 2, 3, 4, 5, 6, 7]),
+        shared.peer.seal(&[3, 0, 0, 53]),
+        shared.peer.seal(&[3, 2, 0xff, 0xfe, 0, 53, 1]),
+        shared.peer.seal(&[]),
+    ];
+    for frame in &frames {
+        shared.server.send_to(frame, client).await.unwrap();
+    }
+    shared.reply(client, &wire_addr(a), b"genuine").await;
+    assert_eq!(shared.client_recv().await, (b"genuine".to_vec(), a));
+}
+
+/// The largest datagram that fits one UDP packet crosses both ways; one byte
+/// more is refused without hurting the association.
+#[tokio::test]
+async fn legacy_udp_max_size_boundary() {
+    for method in LEGACY_METHODS {
+        let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let shared = Shared::new(method, a, None).await;
+        // 65507 UDP payload = salt + IPv4 address (7) + payload + tag (16).
+        let max = 65507 - shared.peer.salt_len() - 7 - 16;
+        let payload = vec![0x5a; max];
+
+        shared.send(a, None, &payload).await;
+        let (client, plain) = shared.server_recv().await;
+        assert_eq!(plain[7..], payload[..]);
+        shared.reply(client, &wire_addr(a), &payload).await;
+        assert_eq!(shared.client_recv().await, (payload.clone(), a));
+
+        let error = shared
+            .transport
+            .send_to(a, None, &vec![0; max + 1], false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::proxy::io_packet_rejection(&error),
+            Some(crate::proxy::PacketRejection::InvalidSize),
+            "a socket size refusal is local, not a dead tunnel"
+        );
+        shared.send(a, None, b"alive").await;
+        assert_eq!(shared.server_recv().await.1[7..], b"alive"[..]);
+    }
+}
+
+/// Dropping a transport closes its socket.
+#[tokio::test]
+async fn legacy_udp_drop_releases_the_socket() {
+    let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
+    let shared = Shared::new("aes-128-gcm", a, None).await;
+    shared.send(a, None, b"x").await;
+    let (client, _) = shared.server_recv().await;
+    assert!(
+        std::net::UdpSocket::bind(client).is_err(),
+        "the live transport owns its source port"
+    );
+    let Shared { transport, .. } = shared;
+    drop(transport);
+    drop(std::net::UdpSocket::bind(client).expect("drop closes the transport socket"));
+}
+
+/// The core reaches Shadowsocks only through the shared-source dispatch.
+#[tokio::test]
+async fn shared_source_dispatch_builds_a_shadowsocks_association() {
+    let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+    assert!(registry.has_shared_source(honk_config::types::NodeProtocol::SS));
+    let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let node = legacy_node(server.local_addr().unwrap(), "aes-128-gcm");
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+    let transport = registry
+        .prepare_shared_source(runtime, a, None, STEP, true)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    transport.send_to(a, None, b"hi", true, None).await.unwrap();
+    let mut buf = [0u8; 256];
+    let (n, _) = tokio::time::timeout(STEP, server.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n > b"hi".len());
 }

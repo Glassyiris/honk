@@ -20,6 +20,7 @@ use crate::ebpf::{EbpfBackend, UdpDecisionCommitResult, UdpDecisionTransition};
 use crate::stats::StatsManager;
 
 mod cell;
+mod commit;
 mod ingest;
 mod transition;
 pub(in crate::control) use cell::HeldVerdict;
@@ -39,6 +40,17 @@ const MAX_SCHEDULED_CLEANUPS: usize = honk_nfqueue::QUEUE_MAXLEN as usize;
 const MAX_CORRELATOR_FLOWS: usize = honk_nfqueue::QUEUE_MAXLEN as usize;
 const MAX_HELD_VERDICTS_PER_FLOW: usize = 64;
 const IPPROTO_UDP: u8 = 17;
+
+/// Run a backend mutation that waits for kernel grace periods. A multi-thread
+/// runtime hands the worker's queue to another thread meanwhile; a
+/// current-thread runtime (and any non-runtime caller) runs it inline because
+/// `block_in_place` panics there.
+fn blocking_section<R>(section: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(section),
+        _ => section(),
+    }
+}
 
 const _: () = {
     assert!(honk_nfqueue::NFQUEUE_PENDING_MARK == honk_ebpf_common::NFQUEUE_PENDING_MARK);
@@ -92,6 +104,7 @@ pub(super) struct PendingUdpVerdicts {
     cleanup_drainer: tokio::sync::Mutex<()>,
     admission: AdmissionGate,
     empty: Notify,
+    commits: commit::CommitPump,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     endpoints: Arc<UdpEndpointPool>,
     stats: Arc<StatsManager>,
@@ -113,6 +126,7 @@ impl PendingUdpVerdicts {
                 cleanup_drainer: tokio::sync::Mutex::new(()),
                 admission: AdmissionGate::new(),
                 empty: Notify::new(),
+                commits: commit::CommitPump::new(),
                 ebpf,
                 endpoints,
                 stats,
@@ -125,7 +139,7 @@ impl PendingUdpVerdicts {
     pub(super) fn identity_for_lease(lease: &UdpInitLease) -> PendingUdpIdentity {
         PendingUdpIdentity::new(
             FlowKey::new(lease.client_addr(), lease.original_dst()),
-            lease.decision_token(),
+            lease.owner(),
             lease.generation(),
         )
     }

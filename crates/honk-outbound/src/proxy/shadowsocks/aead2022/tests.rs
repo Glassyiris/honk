@@ -3,6 +3,7 @@ use crate::proxy::shadowsocks::ShadowsocksHandler;
 use crate::proxy::{PacketOutbound, TcpOutbound};
 use honk_config::node::Node;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 fn hex(s: &str) -> Vec<u8> {
@@ -169,6 +170,16 @@ fn test_sliding_window() {
     assert!(!w.check(SW_SIZE + 199));
 }
 
+/// Length of the leading SOCKS5 address, parsed independently of production.
+fn addr_len(buf: &[u8]) -> usize {
+    match buf[0] {
+        0x01 => 7,
+        0x03 => 2 + buf[1] as usize + 2,
+        0x04 => 19,
+        atyp => panic!("unexpected ATYP {atyp:#x}"),
+    }
+}
+
 fn udp_target() -> (Vec<u8>, SocketAddr) {
     let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
     (
@@ -194,7 +205,7 @@ fn server_open_aes(method: &Ss2022Method, packet: &[u8]) -> (u64, u64, Vec<u8>) 
     assert!(unix_timestamp().abs_diff(ts) <= 30);
     let padding_len = u16::from_be_bytes([body[9], body[10]]) as usize;
     let rest = &body[11 + padding_len..];
-    let skip = socks_addr_len(rest).unwrap();
+    let skip = addr_len(rest);
     (session_id, packet_id, rest[skip..].to_vec())
 }
 
@@ -278,7 +289,7 @@ fn test_udp_2022_aes_roundtrip() {
         b"dns response",
     );
     let opened = session.open_packet(&response).unwrap();
-    assert_eq!(opened, b"dns response");
+    assert_eq!(opened.payload(), b"dns response");
 
     // Replay of the same packet must be rejected.
     assert!(session.open_packet(&response).is_err());
@@ -342,7 +353,7 @@ fn test_udp_2022_chacha_roundtrip() {
     assert_eq!(body[16], HEADER_TYPE_CLIENT);
     let padding_len = u16::from_be_bytes([body[25], body[26]]) as usize;
     let rest = &body[27 + padding_len..];
-    let skip = socks_addr_len(rest).unwrap();
+    let skip = addr_len(rest);
     assert_eq!(&rest[skip..], payload);
 
     let response = server_seal_udp(
@@ -356,7 +367,7 @@ fn test_udp_2022_chacha_roundtrip() {
     );
 
     let opened = session.open_packet(&response).unwrap();
-    assert_eq!(opened, b"quic response");
+    assert_eq!(opened.payload(), b"quic response");
     assert!(session.open_packet(&response).is_err()); // replay
 }
 
@@ -393,17 +404,23 @@ fn test_udp_2022_server_session_replay_and_rotation() {
         };
 
         let a0 = packet(0xa, 0, now, b"a0");
-        assert_eq!(session.open_packet_at(&a0, now).unwrap(), b"a0");
+        assert_eq!(session.open_packet_at(&a0, now).unwrap().payload(), b"a0");
         let b0 = packet(0xb, 0, now, b"b0");
-        assert_eq!(session.open_packet_at(&b0, now).unwrap(), b"b0");
+        assert_eq!(session.open_packet_at(&b0, now).unwrap().payload(), b"b0");
         assert!(session.open_packet_at(&a0, now).is_err());
 
         let a1 = packet(0xa, 1, now + 10, b"a1");
-        assert_eq!(session.open_packet_at(&a1, now + 10).unwrap(), b"a1");
+        assert_eq!(
+            session.open_packet_at(&a1, now + 10).unwrap().payload(),
+            b"a1"
+        );
         let c0 = packet(0xc, 0, now + 69, b"c0");
         assert!(session.open_packet_at(&c0, now + 69).is_err());
         let c0 = packet(0xc, 0, now + 70, b"c0");
-        assert_eq!(session.open_packet_at(&c0, now + 70).unwrap(), b"c0");
+        assert_eq!(
+            session.open_packet_at(&c0, now + 70).unwrap().payload(),
+            b"c0"
+        );
     }
 }
 
@@ -441,7 +458,7 @@ fn test_udp_2022_failed_server_packet_does_not_mutate_replay_state() {
             };
 
             let a0 = packet(client_session_id, 0xa, 0, b"a0");
-            assert_eq!(session.open_packet_at(&a0, now).unwrap(), b"a0");
+            assert_eq!(session.open_packet_at(&a0, now).unwrap().payload(), b"a0");
 
             let failed_client_id = if corrupt_ciphertext {
                 client_session_id
@@ -455,10 +472,10 @@ fn test_udp_2022_failed_server_packet_does_not_mutate_replay_state() {
             assert!(session.open_packet_at(&failed_b0, now).is_err());
 
             let c0 = packet(client_session_id, 0xc, 0, b"c0");
-            assert_eq!(session.open_packet_at(&c0, now).unwrap(), b"c0");
+            assert_eq!(session.open_packet_at(&c0, now).unwrap().payload(), b"c0");
             assert!(session.open_packet_at(&a0, now).is_err());
             let a1 = packet(client_session_id, 0xa, 1, b"a1");
-            assert_eq!(session.open_packet_at(&a1, now).unwrap(), b"a1");
+            assert_eq!(session.open_packet_at(&a1, now).unwrap().payload(), b"a1");
         }
     }
 }
@@ -508,7 +525,7 @@ async fn mock_2022_server(
     rd.read_exact(&mut var).await.unwrap();
     let var = cipher.open(&nonce, &var).unwrap();
     increment_nonce(&mut nonce);
-    let addr_len = socks_addr_len(&var).unwrap();
+    let addr_len = addr_len(&var);
     let padding_len = u16::from_be_bytes([var[addr_len], var[addr_len + 1]]) as usize;
     assert!(padding_len > 0, "padding must be present without payload");
     assert_eq!(var.len(), addr_len + 2 + padding_len);
@@ -698,3 +715,5 @@ async fn test_dial_udp_2022_end_to_end() {
     let (n, _src) = transport.recv_packet(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"MORE DATA");
 }
+
+mod shared_source;

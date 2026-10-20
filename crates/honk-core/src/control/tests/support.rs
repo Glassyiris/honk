@@ -1,3 +1,4 @@
+use crate::control::retirement_worker::RetirementWorker;
 use crate::control::udp_endpoint::UdpEndpointPool;
 use crate::control::{ControlPlane, ControlPlaneHandle};
 use crate::dns::{self, DnsResolver};
@@ -14,6 +15,45 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(super) mod netns;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(super) mod wire;
+
+pub(in crate::control) struct TestRetirement {
+    pub(in crate::control) task: RetirementWorker,
+    pub(in crate::control) fatal: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
+}
+
+impl TestRetirement {
+    pub(in crate::control) fn start(handle: &ControlPlaneHandle) -> Self {
+        let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
+        let task = crate::control::spawn_retirement_worker(
+            Arc::clone(&handle.udp_pool),
+            Arc::clone(&handle.ebpf),
+            Arc::clone(&handle.connection_tracker),
+            fatal_tx,
+            Arc::clone(&handle.tcp_flow_pins),
+            Arc::clone(&handle.retirement),
+        );
+        Self { task, fatal }
+    }
+
+    pub(in crate::control) async fn join(
+        mut self,
+        handle: &ControlPlaneHandle,
+    ) -> anyhow::Result<()> {
+        let shutdown = handle.udp_pool.shutdown().await;
+        handle.retirement.sink.lock().take();
+        self.task.await?;
+        anyhow::ensure!(shutdown.joined, "test UDP retirement did not join");
+        if let Ok(error) = self.fatal.try_recv() {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
 
 /// A minimal DNS query payload for "a.com" (A record).
 pub(in crate::control) fn dns_query_payload() -> Vec<u8> {
@@ -734,3 +774,6 @@ impl NativeFlowApi {
         self.server.shutdown().await;
     }
 }
+
+mod quic;
+pub(in crate::control) use quic::{QuicStreamHold, QuicUdpMode, QuicUdpPacket, QuicUdpPeer};

@@ -23,6 +23,7 @@ mod pages;
 pub(crate) mod probes;
 pub(crate) mod providers;
 pub(crate) mod routing;
+pub(crate) mod secrets;
 mod security;
 mod server;
 mod settings;
@@ -120,11 +121,11 @@ impl NativeState {
             ("native_api", &settings.secret),
             ("clash_api", &clash_secret),
         ] {
-            if !secret.is_empty() && secret.len() < config::MIN_MASKED_SECRET {
+            if !secret.is_empty() && secret.len() < secrets::MIN_MASKED_SECRET {
                 tracing::warn!(
                     api,
                     "listener secret shorter than {} bytes is not masked in native API responses",
-                    config::MIN_MASKED_SECRET
+                    secrets::MIN_MASKED_SECRET
                 );
             }
         }

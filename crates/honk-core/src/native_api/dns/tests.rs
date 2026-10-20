@@ -489,3 +489,119 @@ async fn rules_lock_wait_past_deadline_is_retryable_snapshot_unavailable() {
     assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error.headers()["retry-after"], "1");
 }
+
+#[tokio::test]
+async fn query_cache_and_log_mask_listener_secrets_but_keep_identity() {
+    use crate::dns::cache::{CacheKey, OperationKind};
+    use crate::dns::forwarder::build_dns_query;
+    use crate::dns::outcome::{
+        DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance, ResponseClass,
+    };
+    use crate::dns::planner::RequestScope;
+    use crate::dns::query::QueryContext;
+    use crate::dns::response::build_dns_refused;
+
+    const SECRET: &str = "clash-listener-token";
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let mut wire = [0u8; 512];
+        let (length, peer) = socket.recv_from(&mut wire).await.unwrap();
+        let mut response = wire[..length].to_vec();
+        response[2..4].copy_from_slice(&[0x81, 0x80]);
+        socket.send_to(&response, peer).await.unwrap();
+    });
+    let mut config = honk_config::Config::default();
+    config.experimental.clash_api.secret = SECRET.into();
+    config.experimental.native_api.record_dns_log = true;
+    config.dns.routing.request.fallback =
+        honk_config::dns::DnsRequestAction::Upstream(SECRET.into());
+    config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+        name: SECRET.into(),
+        address: address.to_string(),
+        protocol: honk_config::types::DnsProtocol::Udp,
+        tls_server_name: None,
+        outbound: None,
+    }];
+    let state = dns_state(config).await;
+    let id = RequestId("secret-dns".into());
+
+    let request = query_request(
+        "",
+        json!({"domain": "unrelated.example", "type": ["A"], "cache_mode": "bypass"}),
+    );
+    let response = query(&state, request, &id).await.unwrap();
+    let body = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+        .await
+        .unwrap();
+    upstream.await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains(SECRET));
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["results"][0]["upstream"], "<redacted>");
+
+    let service = state.dns.cache().lock().await.service();
+    let mut response = build_dns_query(&format!("canary.{SECRET}.example"), 1);
+    let key = CacheKey::new(
+        &QueryContext::parse(&response).unwrap(),
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").unwrap()),
+        OperationKind::Resolve,
+    );
+    response[2..4].copy_from_slice(&[0x81, 0x80]);
+    service.put_exact(key.clone(), response, 300, None);
+    let entry_id = service.entry_id(&key).unwrap();
+    let (status, page) = cache_page(&state, &format!("?domain={SECRET}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.to_string().contains(SECRET));
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["entries"][0]["entry_id"], entry_id);
+    assert_eq!(page["entries"][0]["domain"], "canary.<redacted>.example.");
+
+    let query_wire = build_dns_query(&format!("canary.{SECRET}.example"), 1);
+    let outcome = DnsOutcome::new(OutcomeParts {
+        status: OutcomeStatus::Accepted,
+        response_class: ResponseClass::Servfail,
+        provenance: Provenance::Upstream,
+        domain: format!("canary.{SECRET}.example").into(),
+        qtype: 1,
+        answer_ips: Vec::new(),
+        expiry: EffectiveExpiry::do_not_cache(),
+        logical_upstream: None,
+        final_upstream: Some(SECRET.into()),
+        requery_history: Vec::new(),
+        reusable: Default::default(),
+        rendered: Vec::new(),
+        template: None,
+        policy_id: None,
+    });
+    state.observation.dns.set_log_limit(64);
+    state.observation.dns.set_recording(true);
+    state.observation.dns.recorder.history().capture(
+        &query_wire,
+        IngressProfile::Udp {
+            advertised_size: 512,
+        },
+        Some("192.0.2.7:5353".parse().unwrap()),
+        Some(&outcome),
+        &build_dns_refused(&query_wire),
+        Duration::from_millis(3),
+    );
+    let uri: Uri = "/api/v1/dns/log".parse().unwrap();
+    let response = log(&state, &uri, &id).await.unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains(SECRET));
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(page["total"], 1);
+    assert!(
+        page["records"][0]["id"]
+            .as_str()
+            .unwrap()
+            .ends_with(":dns:1")
+    );
+    assert_eq!(
+        page["records"][0]["question"]["name"],
+        "canary.<redacted>.example."
+    );
+    assert_eq!(page["records"][0]["upstream"], "<redacted>");
+    state.dns.provider().unwrap().shutdown().await;
+}

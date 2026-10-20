@@ -9,9 +9,9 @@ use core::ffi::c_long;
 /// Verdict carrier for TC program bodies.
 pub type Verdict = Result<c_long, c_long>;
 
+// TCX continues only on UNSPEC; OK terminates the chain for mark-bearing ownership.
 pub const TC_ACT_OK: c_long = 0;
 pub const TC_ACT_SHOT: c_long = 2;
-pub const TC_ACT_PIPE: c_long = 3;
 pub const TC_ACT_REDIRECT: c_long = 7;
 pub const TC_ACT_UNSPEC: c_long = -1;
 

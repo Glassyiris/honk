@@ -1,6 +1,8 @@
 use sha2::{Digest, Sha256};
 
-use super::{CompiledCondition, CompiledPredicate, CompiledRoute, DomainMatcherKey, RouteAction};
+use super::{
+    CompiledCondition, CompiledPredicate, CompiledRoute, RouteAction, domain::DomainMatcherKey,
+};
 
 /// Hash the policy's semantic inputs without depending on derived compiler state.
 pub(super) fn policy(
@@ -160,7 +162,10 @@ fn encode_domain_key(encoder: &mut Encoder<'_>, key: &DomainMatcherKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::{DomainMatcher, GeositeDomain, IpMatcher, PortRange};
+    use crate::routing::{
+        IpMatcher, PortRange,
+        domain::{DomainMatcher, GeositeDomain},
+    };
     use std::sync::Arc;
 
     fn route(condition: CompiledPredicate) -> CompiledRoute {

@@ -76,6 +76,8 @@ TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` 监听 socket 不
 
 畸形的非 `must` UDP53 payload 保留通用 UDP 回退，不进入 `DnsController`；控制器一行不表示所有端口 53 payload 都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)。LAN 本地 socket 优先接收仅适用于非 53 目的端口，按 transport 分别判断；通配监听仍需完整 FIB 返回 `NOT_FWDED`，非 DNS TCP 纯 SYN 仍跳过探测。透明 LAN 与原生/loopback 交付的区别见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
 
+准入与策略规模限制见 [LAN 单源新流预算](../design/datapath.md#单源新流限制)和[编译策略容量](../design/routing.md#受限原生后端)。
+
 ## 策略路由 mark
 
 `direct(mark: 512)` 与 `direct(mark: 0x200)` 选择相同的直连 mark。

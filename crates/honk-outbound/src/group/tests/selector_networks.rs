@@ -548,3 +548,50 @@ fn pinned_automatic_group_does_not_advance_unchosen_members() {
         assert_eq!(rotation, [Some(x.id), Some(y.id)], "{policy:?}");
     }
 }
+
+#[test]
+fn pinned_urltest_retry_never_reaches_an_unchosen_sibling() {
+    let a = make_node(nid("pin-retry-a"), "a");
+    let b = make_node(nid("pin-retry-b"), "b");
+    let nodes = [a.clone(), b.clone()];
+    let groups = [make_group("auto", GroupPolicy::URLTest, vec![a.id, b.id])];
+    let manager =
+        GroupManager::with_alive_set(&groups, &nodes, Some(Arc::new(AliveDialerSet::new())));
+    let tcp =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let retry = || {
+        manager
+            .urltest_retry_plan_for_target("auto", &tcp, None)
+            .entries
+            .into_iter()
+            .map(|entry| entry.node.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        retry(),
+        [a.id, b.id],
+        "unpinned URLTest keeps its alternatives"
+    );
+    manager
+        .publish_override("auto", &SelectorMember::Node(a.id), SelectorNetworks::Udp)
+        .unwrap()
+        .run_callbacks();
+    assert_eq!(
+        retry(),
+        [a.id, b.id],
+        "a UDP-only pin does not restrict TCP retries"
+    );
+    manager
+        .publish_override("auto", &SelectorMember::Node(a.id), SelectorNetworks::Tcp)
+        .unwrap()
+        .run_callbacks();
+    assert!(
+        retry().is_empty(),
+        "a TCP pin must not be escaped through retry"
+    );
+    manager
+        .clear_override("auto", SelectorNetworks::Tcp)
+        .unwrap()
+        .run_callbacks();
+    assert_eq!(retry(), [a.id, b.id]);
+}

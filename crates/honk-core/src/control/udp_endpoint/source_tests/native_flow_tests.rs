@@ -33,11 +33,12 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
         ids.push(flow.id().to_owned());
         let mut lease = reserve_source(&pool, &stats, client_addr, target, node.id);
         let attachment = pool
-            .prepare_vless_source(
+            .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,
-                VlessUdpPath::Xudp,
+                SourcePath::Vless(VlessUdpPath::Xudp),
                 None,
                 target,
                 None,
@@ -45,6 +46,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
                 Arc::clone(&alive),
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
+                false,
             )
             .await
             .unwrap()

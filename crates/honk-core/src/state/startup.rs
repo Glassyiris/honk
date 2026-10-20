@@ -110,6 +110,15 @@ pub(crate) struct ClaimedState {
     pub(crate) subscriptions: Option<subscription::SubscriptionStore>,
 }
 
+/// Whether the Clash API owns the persisted mode and GLOBAL rows.
+pub(crate) fn clash_owner_active(config: &Config) -> bool {
+    let experimental = &config.experimental;
+    experimental.cache_file.stores_mode()
+        && cfg!(feature = "clash-api")
+        && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
+        && !experimental.clash_api.external_controller.is_empty()
+}
+
 /// Startup changes to the state db, made with the instance lock held: the
 /// reset of a corrupt non-strict db, clearing disabled owners' tables, and the
 /// legacy `.sub` import and removal. The previous instance has exited, so a
@@ -132,10 +141,7 @@ pub(crate) fn claim_state(
         let owners = state::ActiveOwners {
             cache: experimental.cache_file.stores_selections(),
             dns: experimental.cache_file.stores_dns(),
-            clash: experimental.cache_file.stores_mode()
-                && cfg!(feature = "clash-api")
-                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
-                && !experimental.clash_api.external_controller.is_empty(),
+            clash: clash_owner_active(config),
             subscriptions: config.global.store_subscribe,
         };
         if let Err(error) = state::clear_inactive(state, owners) {
@@ -302,5 +308,70 @@ mod state_claim_tests {
         );
         assert!(claimed.subscriptions.is_some());
         assert!(state_dir.join("honk.db.corrupt").exists());
+    }
+
+    #[cfg(feature = "native-api")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_native_bind_failure_rolls_back_started_owners_before_returning() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock_path = directory.path().join("honk-core.lock");
+        crate::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = Some(lock_path.clone()));
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = directory.path().join("config.dae");
+        std::fs::write(
+            &config,
+            format!(
+                "global {{\n data_dir: '{}'\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n",
+                data_dir.display(),
+                occupied.local_addr().unwrap()
+            ),
+        )
+        .unwrap();
+        let cli =
+            crate::Cli::parse_from(["honk-core", "--mock-ebpf", "-c", config.to_str().unwrap()]);
+
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+
+        let error = crate::run(cli).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native API listener bind failed"),
+            "{error:#}"
+        );
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("Control plane stopped"),
+            "startup failure must finish joined rollback before returning: {logs}"
+        );
+        crate::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = None);
     }
 }

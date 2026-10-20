@@ -1,6 +1,37 @@
 use super::*;
 
 impl PendingUdpVerdicts {
+    /// `None` means the pending owner is settled; `Some` is the backend's refusal.
+    pub(super) fn retire_pending(
+        &self,
+        backend: &mut dyn EbpfBackend,
+        request: CleanupRequest,
+    ) -> Result<Option<UdpDecisionCommitResult>, PendingUdpDecisionError> {
+        let (key, token, incarnation) = match request {
+            CleanupRequest::Flow(identity) => (
+                identity.tuples(),
+                identity.owner.token,
+                identity.owner.incarnation(),
+            ),
+            CleanupRequest::Token {
+                key,
+                decision_token,
+            } => (key.tuples(), decision_token, None),
+        };
+        match blocking_section(|| crate::ebpf::retire_pending(backend, key, token, incarnation)) {
+            Ok(crate::ebpf::RetireOutcome::ConnRetired) => Ok(None),
+            Ok(outcome) if outcome.settled() => Ok(None),
+            Ok(crate::ebpf::RetireOutcome::Done(refusal)) => Ok(Some(refusal)),
+            Ok(crate::ebpf::RetireOutcome::NotRun) => Err(self.fatal_error(
+                "retire pending flow",
+                "backend omitted retirement outcome".into(),
+            )),
+            Err(error) => {
+                Err(self.fatal_error("retire pending flow", format!("{:#}", error.source)))
+            }
+        }
+    }
+
     pub(in crate::control) async fn run_watchdog(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
         let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -44,7 +75,7 @@ impl PendingUdpVerdicts {
             }
         }
         for identity in overdue {
-            let _ = self.cancel(identity).await;
+            let _ = self.cancel_unarmed(identity).await;
         }
         for (key, cell) in expired {
             self.remove_if_expired(key, &cell, now);
@@ -61,30 +92,21 @@ impl PendingUdpVerdicts {
                 return;
             };
             let retry = match request {
-                CleanupRequest::Flow(identity) => match self.cancel(identity).await {
+                CleanupRequest::Flow(identity) => match self.cancel_unarmed(identity).await {
                     Ok(()) | Err(PendingUdpDecisionError::StaleIdentity) => false,
                     Err(PendingUdpDecisionError::ArmedInProgress) => true,
                     Err(PendingUdpDecisionError::ReservedDirectMark) => unreachable!(),
                     Err(PendingUdpDecisionError::Fatal(_)) => false,
                 },
-                CleanupRequest::Token {
-                    key,
-                    decision_token,
-                } => {
+                CleanupRequest::Token { .. } => {
                     let result = {
                         let Ok(mut backend) = self.ebpf.try_write() else {
                             return;
                         };
-                        backend.abort_pending_udp_flow(&key.tuples(), decision_token)
+                        self.retire_pending(backend.as_mut(), request)
                     };
-                    match result {
-                        Ok(UdpDecisionCommitResult::Applied)
-                        | Ok(UdpDecisionCommitResult::Missing) => {}
-                        Ok(result) => self.record_commit_mismatch(result),
-                        Err(error) => self.signal_fatal(PendingUdpFatal::new(
-                            "scheduled abort",
-                            error.to_string(),
-                        )),
+                    if let Ok(Some(refusal)) = result {
+                        self.record_commit_mismatch(refusal);
                     }
                     false
                 }
@@ -129,7 +151,6 @@ impl PendingUdpVerdicts {
     pub(super) async fn backend_before_deadline<'a>(
         &'a self,
         cell: &Arc<FlowCell>,
-        identity: PendingUdpIdentity,
     ) -> Result<tokio::sync::RwLockWriteGuard<'a, Box<dyn EbpfBackend>>, PendingUdpDecisionError>
     {
         let deadline = {
@@ -143,7 +164,7 @@ impl PendingUdpVerdicts {
             .await
         {
             Ok(backend) => Ok(backend),
-            Err(_) => Err(self.expire_unarmed_pending(cell, identity)),
+            Err(_) => Err(self.expire_commit(cell)),
         }
     }
 
@@ -174,12 +195,12 @@ impl PendingUdpVerdicts {
         self.endpoints.retire_staged_identity(
             identity.client(),
             identity.destination(),
-            identity.decision_token,
+            identity.owner.token,
             identity.endpoint_generation,
         );
         self.schedule_cleanup(CleanupRequest::Token {
             key: identity.key,
-            decision_token: identity.decision_token,
+            decision_token: identity.owner.token,
         });
         PendingUdpDecisionError::StaleIdentity
     }
@@ -204,10 +225,10 @@ impl PendingUdpVerdicts {
         &self,
         vacant: dashmap::mapref::entry::VacantEntry<'_, FlowKey, Arc<FlowCell>>,
         key: FlowKey,
-        decision_token: u32,
+        owner: crate::ebpf::UdpFlowOwner,
         flow_slot: OwnedSemaphorePermit,
     ) {
-        let identity = PendingUdpIdentity::new(key, decision_token, 0);
+        let identity = PendingUdpIdentity::new(key, owner, 0);
         vacant.insert(Arc::new(FlowCell::terminal(
             identity,
             CellState::Dead {
@@ -264,7 +285,7 @@ impl PendingUdpVerdicts {
         };
         match entry {
             dashmap::mapref::entry::Entry::Occupied(occupied)
-                if occupied.get().identity.decision_token == decision_token =>
+                if occupied.get().identity.owner.token == decision_token =>
             {
                 let cell = Arc::clone(occupied.get());
                 drop(occupied);
@@ -412,7 +433,7 @@ impl PendingUdpVerdicts {
     }
 
     pub(in crate::control) fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.scheduled_cleanups.lock().is_empty()
+        self.cells.is_empty() && self.scheduled_cleanups.lock().is_empty() && self.commits.is_idle()
     }
 
     pub(in crate::control) async fn wait_empty(&self) {
@@ -453,15 +474,7 @@ impl PendingUdpVerdicts {
                 break;
             }
             for cell in armed {
-                let notified = cell.changed.notified();
-                if matches!(&*cell.state.lock(), CellState::Pending { armed: true, .. }) {
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = tokio::time::sleep(WATCHDOG_INTERVAL) => {
-                            self.fail_armed(&cell, cell.identity);
-                        }
-                    }
-                }
+                let _ = self.wait_armed(&cell, cell.identity).await;
             }
         }
         self.drain_scheduled_cleanups().await;

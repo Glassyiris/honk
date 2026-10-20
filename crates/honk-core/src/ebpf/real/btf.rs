@@ -1,8 +1,36 @@
 //! Raw BTF reader for the few kernel and object layouts aya does not expose.
 
+use anyhow::Context;
 use std::ops::Range;
 
 pub(super) const BTF_HEADER_LEN: usize = 24;
+
+// Only raw BTF parses here; an ELF debug vmlinux needs HONK_VMLINUX_BTF pointed at its extracted `.BTF`.
+const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
+// OpenWrt's vmlinux-btf package installs a detached raw BTF blob here for kernels built without BTF.
+const VMLINUX_BTF_FALLBACK_PATH: &str = "/usr/lib/debug/boot/vmlinux";
+const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
+
+pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
+    let data = if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
+        std::fs::read(&path).with_context(|| {
+            format!(
+                "reading kernel BTF from {VMLINUX_BTF_ENV}={}",
+                std::path::Path::new(&path).display()
+            )
+        })?
+    } else {
+        std::fs::read(VMLINUX_BTF_PATH)
+            .or_else(|_| std::fs::read(VMLINUX_BTF_FALLBACK_PATH))
+            .with_context(|| {
+                format!(
+                    "reading kernel BTF from {VMLINUX_BTF_PATH} or {VMLINUX_BTF_FALLBACK_PATH}; set {VMLINUX_BTF_ENV}"
+                )
+            })?
+    };
+    let btf = aya::Btf::parse(&data, Default::default()).context("parsing selected kernel BTF")?;
+    Ok((data, btf))
+}
 
 #[derive(Clone, Copy)]
 enum Endian {
@@ -105,12 +133,20 @@ impl<'a> Btf<'a> {
         None
     }
 
+    pub(super) fn unsigned_integer_width(&self, type_id: u32, width: u32) -> bool {
+        let Some(cursor) = self.resolve_modifiers(type_id) else {
+            return false;
+        };
+        self.kind(cursor) == Some(1)
+            && self.u32_at(cursor + 8) == Some(width)
+            && self.u32_at(cursor + 12) == width.checked_mul(8)
+    }
+
     pub(super) fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
         self.composite_member_offset(self.find_type(4, type_name)?, member_name, 0, None)
     }
 
     /// Offset of a complete, non-bitfield member of exactly `width` bytes.
-    #[cfg(any(feature = "native-api", test))]
     pub(super) fn sized_member_offset(
         &self,
         type_name: &str,
@@ -118,6 +154,27 @@ impl<'a> Btf<'a> {
         width: u32,
     ) -> Option<u32> {
         self.composite_member_offset(self.find_type(4, type_name)?, member_name, 0, Some(width))
+    }
+
+    /// Direct, non-bitfield member: its type id and byte offset.
+    pub(super) fn direct_member(&self, cursor: usize, name: &str) -> Option<(u32, u32)> {
+        let info = self.u32_at(cursor.checked_add(4)?)?;
+        if self.kind(cursor)? != 4 || info >> 31 != 0 {
+            return None;
+        }
+        for index in 0..(info & 0xffff) as usize {
+            let member = cursor
+                .checked_add(12)?
+                .checked_add(index.checked_mul(12)?)?;
+            if self.string(self.u32_at(member)?) == Some(name) {
+                let bits = self.u32_at(member.checked_add(8)?)?;
+                if bits % 8 != 0 {
+                    return None;
+                }
+                return Some((self.u32_at(member.checked_add(4)?)?, bits / 8));
+            }
+        }
+        None
     }
 
     fn composite_member_offset(
@@ -184,12 +241,18 @@ impl<'a> Btf<'a> {
     }
 
     fn type_size(&self, mut type_id: u32) -> Option<u32> {
+        let mut elements = 1u32;
         for _ in 0..8 {
             let cursor = self.type_by_id(type_id)?;
-            let info = read_u32(self.data, cursor.checked_add(4)?, self.endian)?;
-            let size = read_u32(self.data, cursor.checked_add(8)?, self.endian)?;
+            let info = self.u32_at(cursor.checked_add(4)?)?;
+            let size = self.u32_at(cursor.checked_add(8)?)?;
             match (info >> 24) & 0x1f {
-                1 | 4 | 5 | 6 | 16 | 19 => return Some(size),
+                1 | 4 | 5 | 6 | 16 | 19 => return size.checked_mul(elements),
+                2 => return 8u32.checked_mul(elements),
+                3 => {
+                    elements = elements.checked_mul(self.u32_at(cursor.checked_add(20)?)?)?;
+                    type_id = self.u32_at(cursor.checked_add(12)?)?;
+                }
                 8..=11 | 18 => type_id = size,
                 _ => return None,
             }
@@ -257,6 +320,62 @@ fn type_extra_len(kind: u32, vlen: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::Btf;
+
+    #[test]
+    fn array_members_require_exact_bounded_nonoverflowing_width() {
+        let strings = b"\0holder\0padding\0u8\0";
+        let make = |count: u32, element: u32| {
+            let types: Vec<u8> = [
+                1,
+                (4 << 24) | 1,
+                3,
+                8,
+                3,
+                0,
+                16,
+                1 << 24,
+                1,
+                8,
+                0,
+                3 << 24,
+                0,
+                element,
+                2,
+                count,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+            let mut data = Vec::from([0x9f, 0xeb, 1, 0]);
+            for value in [
+                24,
+                0,
+                types.len() as u32,
+                types.len() as u32,
+                strings.len() as u32,
+            ] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            data.extend_from_slice(&types);
+            data.extend_from_slice(strings);
+            data
+        };
+        let data = make(3, 2);
+        let btf = Btf::parse(&data).unwrap();
+        assert_eq!(btf.sized_member_offset("holder", "padding", 3), Some(0));
+        assert_eq!(btf.sized_member_offset("holder", "padding", 2), None);
+        let outside = make(4, 2);
+        assert_eq!(
+            Btf::parse(&outside)
+                .unwrap()
+                .sized_member_offset("holder", "padding", 3),
+            None
+        );
+        let recursive = make(2, 3);
+        assert_eq!(Btf::parse(&recursive).unwrap().type_size(3), None);
+        let overflow = make(u32::MAX, 1);
+        assert_eq!(Btf::parse(&overflow).unwrap().type_size(3), None);
+    }
 
     #[test]
     fn receive_fields_require_complete_sized_non_bitfield_members() {

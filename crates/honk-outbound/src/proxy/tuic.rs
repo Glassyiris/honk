@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -101,7 +101,6 @@ struct UdpInbound {
     packet_id: u16,
     frag_total: u8,
     frag_id: u8,
-    #[cfg(test)]
     addr: TuicAddr,
     data: Vec<u8>,
 }
@@ -120,7 +119,7 @@ fn decode_udp_message(data: &[u8]) -> io::Result<UdpInbound> {
     let frag_id = data[5];
     let size = u16::from_be_bytes(data[6..8].try_into().expect("len checked")) as usize;
     let mut cursor = &data[8..];
-    let _addr = TuicAddr::decode(&mut cursor)?;
+    let addr = TuicAddr::decode(&mut cursor)?;
     if cursor.len() != size {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -132,8 +131,7 @@ fn decode_udp_message(data: &[u8]) -> io::Result<UdpInbound> {
         packet_id,
         frag_total,
         frag_id,
-        #[cfg(test)]
-        addr: _addr,
+        addr,
         data: cursor.to_vec(),
     })
 }
@@ -147,7 +145,7 @@ async fn read_udp_message_stream(recv: &mut quinn::RecvStream) -> io::Result<Udp
     let frag_total = fixed[4];
     let frag_id = fixed[5];
     let size = u16::from_be_bytes(fixed[6..8].try_into().expect("array length")) as usize;
-    let _addr = TuicAddr::read_from_stream(recv).await?;
+    let addr = TuicAddr::read_from_stream(recv).await?;
     let mut data = vec![0u8; size];
     read_exact(recv, &mut data).await?;
     Ok(UdpInbound {
@@ -155,8 +153,7 @@ async fn read_udp_message_stream(recv: &mut quinn::RecvStream) -> io::Result<Udp
         packet_id,
         frag_total,
         frag_id,
-        #[cfg(test)]
-        addr: _addr,
+        addr,
         data,
     })
 }
@@ -214,17 +211,13 @@ fn fragment_udp_packets(
     for frag_id in 0..frag_total {
         let cap = if frag_id == 0 { first_cap } else { cont_cap };
         let end = (offset + cap).min(data.len());
-        let frag_addr = if frag_id == 0 {
-            addr.clone()
-        } else {
-            TuicAddr::None
-        };
+        let frag_addr = if frag_id == 0 { addr } else { &TuicAddr::None };
         out.push(encode_udp_packet(
             session_id,
             packet_id,
             frag_total as u8,
             frag_id as u8,
-            &frag_addr,
+            frag_addr,
             &data[offset..end],
         ));
         offset = end;
@@ -562,7 +555,7 @@ impl TuicHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+    ) -> anyhow::Result<Arc<TuicUdpTransport>> {
         let target_addr = TuicAddr::new(target, target_domain)?;
         loop {
             let (conn, state) = client.connection(connect_timeout).await?;
@@ -592,22 +585,60 @@ impl TuicHandler {
         }
     }
 
+    pub async fn prepare_udp_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<super::PreparedUdpTransport<TuicUdpTransport>> {
+        if !speculative {
+            let client = self.client_for_runtime(&runtime).await?;
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?;
+            *transport.request_observer.lock() = None;
+            return Ok(super::PreparedUdpTransport::ready(transport));
+        }
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?;
+            *transport.request_observer.lock() = None;
+            Ok(transport)
+        })
+        .await
+    }
+
     async fn send_udp(
         state: &TuicConnState,
         session_id: u16,
         packet_id: u16,
         addr: &TuicAddr,
         data: &[u8],
+        admitted: Option<&AtomicBool>,
     ) -> anyhow::Result<()> {
-        if data.len() > u16::MAX as usize {
-            anyhow::bail!("UDP payload too large: {} bytes", data.len());
-        }
         state.touch();
         if state.udp_over_stream {
             // One uni stream per packet (sing `writePacket` udpStream branch).
             let pkt = encode_udp_packet(session_id, packet_id, 1, 0, addr, data);
             let mut stream = state.conn.open_uni().await?;
-            stream.write_all(&pkt).await?;
+            let mut remaining = pkt.as_slice();
+            while !remaining.is_empty() {
+                let written = stream.write(remaining).await?;
+                if written == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WriteZero).into());
+                }
+                if let Some(admitted) = admitted {
+                    admitted.store(true, Ordering::Release);
+                }
+                remaining = &remaining[written..];
+            }
             stream.finish()?;
             return Ok(());
         }
@@ -618,6 +649,9 @@ impl TuicHandler {
                 .send_datagram_wait(bytes::Bytes::from(pkt))
                 .await
                 .map_err(io::Error::other)?;
+            if let Some(admitted) = admitted {
+                admitted.store(true, Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -700,8 +734,9 @@ impl PacketOutbound for TuicHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.build_client(node, None).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await?)
     }
 
     async fn dial_udp_transport_runtime(
@@ -712,8 +747,9 @@ impl PacketOutbound for TuicHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.client_for_runtime(&runtime).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await?)
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -728,8 +764,9 @@ impl PacketOutbound for TuicHandler {
             .build_client(runtime.node.as_ref(), Some(profiles))
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
-            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-                .await
+            Ok(self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await? as Arc<dyn PacketTransport>)
         })
         .await
     }
@@ -755,7 +792,7 @@ impl ProbeableOutbound for TuicHandler {
 /// the shared QUIC connection (datagrams, or uni streams when datagrams were
 /// not negotiated) and inbound frames arrive through the connection's
 /// session demux queue.
-struct TuicUdpTransport {
+pub struct TuicUdpTransport {
     state: Arc<TuicConnState>,
     session_id: u16,
     packet_id: AtomicU16,
@@ -792,6 +829,9 @@ impl PacketTransport for TuicUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
     }
+    fn allows_full_cone_replies(&self) -> bool {
+        true
+    }
     fn send_timeout(&self) -> Duration {
         self.state.path_health.send_timeout()
     }
@@ -824,24 +864,8 @@ impl PacketTransport for TuicUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        let packet_id = self
-            .packet_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        TuicHandler::send_udp(
-            &self.state,
-            self.session_id,
-            packet_id,
-            &self.target_addr,
-            data,
-        )
-        .await
-        .map_err(|error| io::Error::other(crate::SharedError::new(error)))
-        .map_err(super::quic_carrier_io_error)?;
-        if let Some(observer) = self.request_observer.lock().take() {
-            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
-        }
-        Ok(())
+        self.send_to(self.target, self.target_domain(), data, None)
+            .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -858,12 +882,31 @@ impl PacketTransport for TuicUdpTransport {
                     ),
                 )
             })?;
-            let complete =
-                self.defrag
-                    .lock()
-                    .await
-                    .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
-            if let Some(data) = complete {
+            let peer = match &msg.addr {
+                TuicAddr::Addr(SocksAddr::V4(peer)) => Some((*peer).into()),
+                TuicAddr::Addr(SocksAddr::V6(peer)) => Some((*peer).into()),
+                TuicAddr::Addr(SocksAddr::Domain(domain, port)) => {
+                    let Some(peer) = super::addr::dialed_domain_peer(
+                        self.target_domain(),
+                        self.target,
+                        domain,
+                        *port,
+                    ) else {
+                        continue;
+                    };
+                    Some(peer)
+                }
+                TuicAddr::None if msg.frag_id != 0 => None,
+                _ => continue,
+            };
+            let complete = self.defrag.lock().await.feed(
+                msg.packet_id,
+                msg.frag_id,
+                msg.frag_total,
+                peer,
+                msg.data,
+            );
+            if let Some((data, peer)) = complete {
                 if data.len() > buf.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -871,9 +914,62 @@ impl PacketTransport for TuicUdpTransport {
                     ));
                 }
                 buf[..data.len()].copy_from_slice(&data);
-                return Ok((data.len(), self.target));
+                return Ok((data.len(), peer));
             }
         }
+    }
+}
+
+impl TuicUdpTransport {
+    pub fn server_addr(&self) -> SocketAddr {
+        self.state.conn.remote_address()
+    }
+
+    fn target_domain(&self) -> Option<&str> {
+        match &self.target_addr {
+            TuicAddr::Addr(SocksAddr::Domain(domain, _)) => Some(domain),
+            _ => None,
+        }
+    }
+
+    pub async fn send_to(
+        &self,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        if data.len() > u16::MAX as usize {
+            return Err(super::PacketRejection::InvalidSize.into());
+        }
+        let stored_domain = self.target_domain();
+        let address;
+        let addr = if target == self.target && target_domain == stored_domain {
+            &self.target_addr
+        } else {
+            address = TuicAddr::new(target, target_domain)?;
+            &address
+        };
+        let packet_id = self
+            .packet_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        TuicHandler::send_udp(
+            &self.state,
+            self.session_id,
+            packet_id,
+            addr,
+            data,
+            admitted,
+        )
+        .await
+        .map_err(|error| io::Error::other(crate::SharedError::new(error)))
+        .map_err(super::quic_carrier_io_error)?;
+        let captured = self.request_observer.lock().take();
+        if let Some(observer) = crate::runtime::flow_observation::current().or(captured) {
+            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+        }
+        Ok(())
     }
 }
 

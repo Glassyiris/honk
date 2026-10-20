@@ -568,13 +568,28 @@ impl XhttpOptions {
 
     /// Validate canonical options for immutable node admission.
     pub fn validate(&self) -> Result<(), &'static str> {
-        for (range, min, max) in [
-            (self.x_padding_bytes, 1, 8192),
-            (self.sc_max_each_post_bytes, 1, 16 * 1024 * 1024),
-            (self.sc_min_posts_interval_ms, 0, 60_000),
+        for (range, min, max, error) in [
+            (
+                self.x_padding_bytes,
+                1,
+                8192,
+                "XHTTP xPaddingBytes must stay within 1-8192",
+            ),
+            (
+                self.sc_max_each_post_bytes,
+                1,
+                16 * 1024 * 1024,
+                "XHTTP scMaxEachPostBytes must stay within 1-16777216",
+            ),
+            (
+                self.sc_min_posts_interval_ms,
+                0,
+                60_000,
+                "XHTTP scMinPostsIntervalMs must stay within 0-60000",
+            ),
         ] {
             if range.min < min || range.min > range.max || range.max > max {
-                return Err("XHTTP range exceeds supported bounds");
+                return Err(error);
             }
         }
         let path = self

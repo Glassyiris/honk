@@ -4,10 +4,6 @@ use aya::programs::{CgroupSock, CgroupSockAddr};
 use honk_ebpf_common::DaeParam;
 use std::convert::TryInto;
 
-pub(super) const VMLINUX_BTF_PATHS: [&str; 2] =
-    ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
-pub(super) const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PnameCaptureMode {
     Argv0,
@@ -19,11 +15,13 @@ pub(super) enum PnameCaptureMode {
 /// cgroup programs during verification.
 pub(super) fn select_capture_mode(
     obj: &[u8],
+    kernel_btf: &aya::Btf,
     offsets: Option<ProcessNameOffsets>,
 ) -> PnameCaptureMode {
     if offsets.is_some()
         && probe_pair(
             obj,
+            kernel_btf,
             offsets,
             "tproxy_wan_cg_sock_create",
             "tproxy_wan_cg_connect4",
@@ -36,6 +34,7 @@ pub(super) fn select_capture_mode(
 
 fn probe_pair(
     obj: &[u8],
+    kernel_btf: &aya::Btf,
     offsets: Option<ProcessNameOffsets>,
     sock_name: &str,
     sock_addr_name: &str,
@@ -48,6 +47,7 @@ fn probe_pair(
     let mm_arg_start_offset = offsets.map(|value| value.mm_arg_start).unwrap_or_default();
     let mut loader = EbpfLoader::new();
     loader
+        .btf(Some(kernel_btf))
         .override_global("PARAM", &param, true)
         .override_global("TASK_MM_OFFSET", &task_mm_offset, true)
         .override_global("MM_ARG_START_OFFSET", &mm_arg_start_offset, true);
@@ -79,17 +79,7 @@ pub(super) struct ProcessNameOffsets {
     pub mm_arg_start: u32,
 }
 
-pub(super) fn detect() -> Option<ProcessNameOffsets> {
-    if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
-        return find_offsets(&std::fs::read(path).ok()?);
-    }
-    VMLINUX_BTF_PATHS.iter().find_map(|path| {
-        let data = std::fs::read(path).ok()?;
-        find_offsets(&data)
-    })
-}
-
-fn find_offsets(data: &[u8]) -> Option<ProcessNameOffsets> {
+pub(super) fn detect(data: &[u8]) -> Option<ProcessNameOffsets> {
     let btf = Btf::parse(data)?;
     Some(ProcessNameOffsets {
         task_mm: btf.member_offset("task_struct", "mm")?,
@@ -143,7 +133,7 @@ mod tests {
         data.extend_from_slice(&strings);
 
         assert_eq!(
-            find_offsets(&data),
+            detect(&data),
             Some(ProcessNameOffsets {
                 task_mm: 24,
                 mm_arg_start: 80,

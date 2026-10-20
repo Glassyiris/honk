@@ -50,6 +50,26 @@ fn answer(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn pause_wins_over_query_completion_but_not_completed_reply() {
+    for reply in [false, true] {
+        let (current, _) = runtime(1, 0);
+        let provider = DnsServiceProvider::new(current);
+        let lease = provider.try_acquire().unwrap();
+        let operation = async {
+            provider.begin_pause();
+        };
+        let result = if reply {
+            lease.run_reply(operation).await
+        } else {
+            lease.run(std::pin::pin!(operation)).await
+        };
+        assert_eq!(result.is_err(), !reply, "reply={reply}");
+        drop(lease);
+        provider.finish_pause().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn pause_closes_wire_query_but_waits_for_its_lease() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

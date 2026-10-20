@@ -9,37 +9,29 @@ use std::{
 use super::flows::{FlowStore, record::StepData};
 use crate::dns::{outcome::DnsOutcome, query::IngressProfile};
 
-pub(crate) trait DnsLog: Send + Sync {
-    fn recording(&self) -> bool;
-    #[allow(clippy::too_many_arguments)]
-    fn capture(
-        &self,
-        query: &[u8],
-        ingress: IngressProfile,
-        source: Option<SocketAddr>,
-        outcome: Option<&DnsOutcome>,
-        response: &[u8],
-        elapsed: Duration,
-    );
-}
+pub(crate) mod history;
+
+use history::DnsHistory;
 
 pub(crate) struct DnsRecorder {
-    instance: String,
     flows: Weak<FlowStore>,
-    log: Arc<dyn DnsLog>,
+    history: DnsHistory,
 }
 
 impl DnsRecorder {
-    pub(crate) fn new(instance: String, flows: Weak<FlowStore>, log: Arc<dyn DnsLog>) -> Self {
+    pub(crate) fn new(instance: String, flows: Weak<FlowStore>, recording: bool) -> Self {
         Self {
-            instance,
             flows,
-            log,
+            history: DnsHistory::new(instance, recording),
         }
     }
 
     pub(crate) fn instance(&self) -> &str {
-        &self.instance
+        self.history.instance()
+    }
+
+    pub(crate) fn history(&self) -> &DnsHistory {
+        &self.history
     }
 
     pub(crate) fn record_flow(
@@ -58,7 +50,7 @@ impl DnsRecorder {
     }
 
     pub(crate) fn recording(&self) -> bool {
-        self.log.recording()
+        self.history.recording()
     }
 }
 
@@ -90,7 +82,7 @@ impl DnsObserver {
         let recorder = self.0.read().upgrade();
         if let Some(recorder) = recorder {
             recorder
-                .log
+                .history
                 .capture(query, ingress, source, outcome, response, elapsed);
         }
     }

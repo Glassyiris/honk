@@ -578,7 +578,11 @@ fn apply_tls(
     apply_reality(mapping, node, protocol, tls_explicit)
 }
 
-fn apply_quic(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str> {
+fn apply_quic(
+    mapping: &Mapping,
+    node: &mut Node,
+    tuic_default_alpn: Option<&str>,
+) -> Result<(), &'static str> {
     let protocol = node.protocol();
     if matches!(protocol, NodeProtocol::Hysteria2 | NodeProtocol::Juicity)
         && yaml_value(mapping, "alpn").is_some_and(yaml_active)
@@ -643,7 +647,8 @@ fn apply_quic(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str> {
                     "congestion",
                 ],
             )?;
-            config.alpn = yaml_list_alias(mapping, &["alpn"])?;
+            config.alpn = yaml_list_alias(mapping, &["alpn"])?
+                .or_else(|| tuic_default_alpn.map(str::to_owned));
             config.init_stream_recv_window = yaml_u64_alias(mapping, STREAM_WINDOW_KEYS)?;
             config.init_conn_recv_window = yaml_u64_alias(mapping, CONN_WINDOW_KEYS)?;
         }
@@ -694,6 +699,7 @@ fn validate_imported_node(node: &Node) -> Result<(), &'static str> {
 pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
+    tuic_default_alpn: Option<&str>,
 ) -> Result<Node, &'static str> {
     let ProxySource {
         protocol,
@@ -717,7 +723,7 @@ pub(super) fn parse_clash_proxy(
     apply_protocol(mapping, &mut node)?;
     apply_stream(mapping, &mut node, udp)?;
     apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
-    apply_quic(mapping, &mut node)?;
+    apply_quic(mapping, &mut node, tuic_default_alpn)?;
     node.normalize_stream_transport()?;
     if let Some(config) = node.vless_mut() {
         config.normalize();

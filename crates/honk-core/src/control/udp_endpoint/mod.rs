@@ -9,11 +9,13 @@
 
 #[cfg(test)]
 use self::driver::TRANSPORT_SEND_TIMEOUT;
+use crate::ebpf::UdpFlowOwner;
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
 use honk_outbound::group::{ScoreOutcome, ScoreReporter};
 use parking_lot::Mutex;
+pub(in crate::control) use source::UplinkStall;
 use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
@@ -115,15 +117,16 @@ mod admission;
 #[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
 mod observation;
 mod retirement;
-#[cfg(feature = "rprx")]
 mod source;
+#[cfg(test)]
+mod source_quic_tests;
+#[cfg(test)]
+mod source_shared_tests;
 #[cfg(all(test, feature = "rprx"))]
 mod source_tests;
 use retirement::{EndpointIoGuard, RetirementIo};
 pub(crate) use retirement::{EndpointRemoval, RemovalReason};
-#[cfg(feature = "rprx")]
-pub(in crate::control) use source::{SourceAttachment, VlessSourcePreparation};
-#[cfg(feature = "rprx")]
+pub(in crate::control) use source::{SourceAttachment, SourcePath, SourcePreparation};
 use source::{SourceEndpoint, SourceOwner, SourceRetirement, SourceScope};
 #[doc(hidden)]
 pub mod bench_support;
@@ -146,7 +149,6 @@ pub(crate) const MAX_ENDPOINTS: usize = 8192;
 pub(in crate::control) const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 enum EndpointTransport {
     Flow(Arc<dyn honk_outbound::proxy::PacketTransport>),
-    #[cfg(feature = "rprx")]
     Source(SourceEndpoint),
 }
 
@@ -185,7 +187,7 @@ pub struct UdpEndpoint {
     download: Arc<AtomicU64>,
     score_reporter: Option<ScoreReporter>,
     health_family: honk_outbound::alive::IpVersion,
-    #[cfg(all(test, feature = "rprx"))]
+    #[cfg(test)]
     source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<String>>,
     pub(in crate::control) native: observation::EndpointObservation,
@@ -226,7 +228,6 @@ impl UdpEndpoint {
         )
     }
 
-    #[cfg(feature = "rprx")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn new_source_scored(
         attachment: SourceAttachment,
@@ -287,7 +288,7 @@ impl UdpEndpoint {
             pending_reply_next: AtomicU64::new(0),
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
-            #[cfg(all(test, feature = "rprx"))]
+            #[cfg(test)]
             source_reply_hook: Mutex::new(None),
             tracker_id: Mutex::new(None),
             score_reporter,
@@ -297,7 +298,7 @@ impl UdpEndpoint {
         }
     }
 
-    #[cfg(all(feature = "native-api", feature = "rprx"))]
+    #[cfg(feature = "native-api")]
     fn finish_native_source(&self, retirement: SourceRetirement) {
         let outcome = match retirement {
             SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.has_reply() => {
@@ -348,7 +349,6 @@ impl UdpEndpoint {
         let Some(reporter) = &self.score_reporter else {
             return;
         };
-        #[cfg(feature = "rprx")]
         let outcome = match &self.transport {
             EndpointTransport::Source(source) if outcome != ScoreOutcome::Shutdown => {
                 match source.score_retirement() {
@@ -431,7 +431,6 @@ impl UdpEndpoint {
         }
         match &self.transport {
             EndpointTransport::Flow(_) => self.dead.store(true, Ordering::Release),
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.retire(&self.dead),
         }
     }
@@ -450,7 +449,6 @@ impl UdpEndpoint {
     fn flow_transport(&self) -> Option<&dyn honk_outbound::proxy::PacketTransport> {
         match &self.transport {
             EndpointTransport::Flow(transport) => Some(transport.as_ref()),
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(_) => None,
         }
     }
@@ -458,7 +456,6 @@ impl UdpEndpoint {
     fn is_source(&self) -> bool {
         match &self.transport {
             EndpointTransport::Flow(_) => false,
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(_) => true,
         }
     }
@@ -466,36 +463,39 @@ impl UdpEndpoint {
     fn send_timeout(&self) -> Duration {
         match &self.transport {
             EndpointTransport::Flow(transport) => transport.send_timeout(),
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.send_timeout(),
         }
     }
 
     fn send_timeout_is_congestion(&self) -> bool {
-        self.flow_transport()
-            .is_some_and(|transport| transport.send_timeout_is_congestion())
+        self.packet_transport().send_timeout_is_congestion()
     }
 
     fn quic_path_stalled(&self) -> bool {
-        self.flow_transport()
-            .is_some_and(|transport| transport.quic_path_stalled())
+        self.packet_transport().quic_path_stalled()
     }
 
-    #[cfg(all(test, feature = "rprx"))]
+    fn packet_transport(&self) -> &dyn honk_outbound::proxy::PacketTransport {
+        match &self.transport {
+            EndpointTransport::Flow(transport) => transport.as_ref(),
+            EndpointTransport::Source(source) => source.packet_transport(),
+        }
+    }
+
+    #[cfg(test)]
     async fn send_packet(&self, data: &[u8], confirmed: bool) -> io::Result<()> {
-        self.send_packet_with_admission(data, confirmed, None)
+        self.send_packet_with_admission(data, confirmed, None, &mut None)
             .await
             .map(|_| ())
     }
 
-    async fn send_packet_with_admission(
-        &self,
+    async fn send_packet_with_admission<'a>(
+        &'a self,
         data: &[u8],
         confirmed: bool,
         admitted: Option<&AtomicBool>,
+        attempt: &mut Option<honk_outbound::proxy::QuicSendAttempt<'a>>,
     ) -> io::Result<Option<Instant>> {
-        #[cfg(not(feature = "rprx"))]
-        let _ = admitted;
         let operation = async {
             match &self.transport {
                 EndpointTransport::Flow(transport) if confirmed => {
@@ -504,12 +504,13 @@ impl UdpEndpoint {
                 EndpointTransport::Flow(transport) => {
                     transport.send_packet(data).await.map(|()| None)
                 }
-                #[cfg(feature = "rprx")]
                 EndpointTransport::Source(source) => {
                     let record_start = self.score_reporter.is_some()
                         && !data.is_empty()
                         && self.upload.load(Ordering::Relaxed) == 0;
-                    source.send(data, admitted, record_start).await
+                    source
+                        .send(data, confirmed, admitted, record_start, attempt)
+                        .await
                 }
             }
         };
@@ -520,25 +521,27 @@ impl UdpEndpoint {
     }
 
     fn fail_source(&self, outcome: ScoreOutcome) {
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.fail(outcome);
         }
-        #[cfg(not(feature = "rprx"))]
-        let _ = outcome;
+    }
+
+    fn source_uplink_stall(&self) -> Option<&UplinkStall> {
+        match &self.transport {
+            EndpointTransport::Flow(_) => None,
+            EndpointTransport::Source(source) => Some(source.uplink_stall()),
+        }
     }
 
     fn source_flow_idle_expired(&self) {
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.flow_idle_expired();
         }
     }
 
-    #[cfg(feature = "rprx")]
+    #[cfg(all(test, feature = "native-api"))]
     fn source_owner_id(&self) -> Option<u64> {
         match &self.transport {
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => Some(source.owner_id()),
             EndpointTransport::Flow(_) => None,
         }
@@ -546,7 +549,6 @@ impl UdpEndpoint {
 
     fn commit_source_binding(&self, endpoint_permit: OwnedSemaphorePermit) -> bool {
         match &self.transport {
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.commit_binding(endpoint_permit),
             EndpointTransport::Flow(_) => {
                 drop(endpoint_permit);
@@ -555,7 +557,6 @@ impl UdpEndpoint {
         }
     }
 
-    #[cfg(feature = "rprx")]
     fn begin_source_reply(&self, owner_id: u64) -> bool {
         match &self.transport {
             EndpointTransport::Source(source) => source.reply_admitted(owner_id),
@@ -563,20 +564,16 @@ impl UdpEndpoint {
         }
     }
 
-    #[cfg(feature = "rprx")]
     fn source_reply_socket(&self) -> &Arc<ReplySocket> {
         match &self.transport {
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.reply_socket(),
             EndpointTransport::Flow(_) => panic!("ordinary UDP endpoint has no source reply lease"),
         }
     }
 
-    #[cfg(feature = "rprx")]
     fn record_source_reply(&self, len: u64) {
         self.tracker_download(len);
         self.score_reply(len);
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.record_reply(len);
         }
@@ -701,15 +698,10 @@ pub struct UdpEndpointPool {
     /// Lifetime-held across active and retiring ordinary/source reply sockets.
     /// The fixed 8× endpoint budget prevents teardown overlap from doubling FDs.
     reply_socket_slots: Arc<Semaphore>,
-    #[cfg(feature = "rprx")]
     sources: DashMap<SourceScope, Arc<SourceOwner>>,
-    #[cfg(feature = "rprx")]
     source_slots: Arc<Semaphore>,
-    #[cfg(feature = "rprx")]
     next_source_owner: AtomicU64,
-    #[cfg(feature = "rprx")]
     source_tasks: Mutex<TaskRegistry>,
-    #[cfg(feature = "rprx")]
     source_changed: Notify,
     /// Linearizes finalized-node binding against node-death scans. Without
     /// this gate a scan can observe an unbound initializer, then binding can
@@ -773,15 +765,10 @@ impl UdpEndpointPool {
             reply_socket_slots: Arc::new(Semaphore::new(
                 capacity_limit.saturating_mul(MAX_REPLY_SOCKETS_PER_ENDPOINT),
             )),
-            #[cfg(feature = "rprx")]
             sources: DashMap::new(),
-            #[cfg(feature = "rprx")]
             source_slots: Arc::new(Semaphore::new(capacity_limit)),
-            #[cfg(feature = "rprx")]
             next_source_owner: AtomicU64::new(1),
-            #[cfg(feature = "rprx")]
             source_tasks: Mutex::new(TaskRegistry::default()),
-            #[cfg(feature = "rprx")]
             source_changed: Notify::new(),
             node_binding_gate: Mutex::new(()),
             next_generation: AtomicU64::new(1),
@@ -820,6 +807,11 @@ impl UdpEndpointPool {
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.endpoints.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, client: SocketAddr, dst: SocketAddr) -> bool {
+        self.endpoints.contains_key(&EndpointKey::new(client, dst))
     }
 
     #[cfg(test)]

@@ -322,12 +322,12 @@ async fn ebpf_bytes_sum_memlock_of_own_bpf_fds_only() {
         (
             "3",
             "anon_inode:bpf-map",
-            Some("pos:\t0\nmap_type:\t1\nmemlock:\t4096\n"),
+            Some("pos:\t0\nmap_type:\t1\nmap_id:\t17\nmemlock:\t4096\n"),
         ),
         (
             "4",
             "anon_inode:bpf-prog",
-            Some("prog_type:\t3\nmemlock:\t8192\n"),
+            Some("prog_type:\t3\nprog_id:\t5\nmemlock:\t8192\n"),
         ),
         (
             "5",
@@ -340,6 +340,22 @@ async fn ebpf_bytes_sum_memlock_of_own_bpf_fds_only() {
             Some("pos:\t0\nmemlock:\t1000000\n"),
         ),
         ("7", "anon_inode:bpf-map", None),
+        // Duplicate handles of objects 3 and 4, and a program sharing a map's numeric id.
+        (
+            "8",
+            "anon_inode:bpf-map",
+            Some("pos:\t0\nmap_type:\t1\nmap_id:\t17\nmemlock:\t4096\n"),
+        ),
+        (
+            "9",
+            "anon_inode:bpf-prog",
+            Some("prog_type:\t3\nprog_id:\t5\nmemlock:\t8192\n"),
+        ),
+        (
+            "10",
+            "anon_inode:bpf-prog",
+            Some("prog_type:\t3\nprog_id:\t17\nmemlock:\t16384\n"),
+        ),
     ];
     for (name, target, info) in entries {
         symlink(target, fd.join(name)).unwrap();
@@ -347,15 +363,15 @@ async fn ebpf_bytes_sum_memlock_of_own_bpf_fds_only() {
             std::fs::write(fdinfo.join(name), info).unwrap();
         }
     }
-    assert_eq!(ebpf_bytes(proc_self), Some(4096 + 8192));
+    assert_eq!(ebpf_bytes(proc_self), Some(4096 + 8192 + 16384));
     let reading = read_memory(proc_self).await;
-    assert_eq!(reading.ebpf.map(|(bytes, _)| bytes), Some(12288));
+    assert_eq!(reading.ebpf.map(|(bytes, _)| bytes), Some(28672));
     assert!(
         reading
             .metrics()
             .any(|metric| metric == "kernel.ebpf_bytes")
     );
-    for name in ["3", "4"] {
+    for name in ["3", "4", "8", "9", "10"] {
         std::fs::remove_file(fdinfo.join(name)).unwrap();
     }
     assert_eq!(ebpf_bytes(proc_self), None);

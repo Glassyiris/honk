@@ -49,6 +49,7 @@ fn scope() -> ImportScope {
     ImportScope {
         selector_groups: ["proxy".to_owned()].into(),
         nodes: ["fresh".to_owned(), "stale".to_owned()].into(),
+        clash: true,
     }
 }
 
@@ -252,9 +253,40 @@ fn rows_for_groups_and_nodes_outside_the_configuration_are_not_imported() {
             path,
             cache_id: "gw".into(),
         },
-        &ImportScope::default(),
+        &ImportScope {
+            clash: true,
+            ..Default::default()
+        },
     );
     assert_eq!(all_rows(&state), ["global=proxy", "mode=Global"]);
+    drop(legacy);
+}
+
+#[test]
+fn clash_mode_and_global_are_not_imported_for_a_disabled_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.db");
+    let legacy = seed(&path);
+    let state = StateDb::open(directory.path()).unwrap();
+    import_cache_db(
+        &state,
+        &LegacyCache {
+            path,
+            cache_id: "gw".into(),
+        },
+        &ImportScope {
+            clash: false,
+            ..scope()
+        },
+    );
+    assert!(rows(&state, "SELECT key FROM clash_state").is_empty());
+    assert_eq!(
+        rows(
+            &state,
+            "SELECT grp || '/' || network FROM selector ORDER BY 1"
+        ),
+        ["proxy/tcp", "proxy/udp"]
+    );
     drop(legacy);
 }
 

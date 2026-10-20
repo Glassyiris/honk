@@ -9,7 +9,7 @@ use anyhow::{Context, ensure};
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Redirect, Response},
 };
 use tower_http::services::{ServeDir, ServeFile};
@@ -138,6 +138,7 @@ impl Ui {
             return StatusCode::NOT_FOUND.into_response();
         };
         *request.uri_mut() = uri;
+        expand_wildcard(request.headers_mut());
         let result = if navigation {
             files
                 .clone()
@@ -170,6 +171,48 @@ impl Ui {
                 _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             },
         }
+    }
+}
+
+/// tower-http's filesystem negotiation drops `*`, so a client that accepts gzip only through
+/// it would be served the identity file it may have refused. Spell out the codings `*` stands
+/// for, with its q-value, beside the ones the client named.
+fn expand_wildcard(headers: &mut HeaderMap) {
+    let items: Vec<&str> = headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .collect();
+    let coding = |item: &str| item.split(';').next().unwrap_or_default().trim().to_owned();
+    let Some(wildcard) = items.iter().rev().find(|item| coding(item) == "*") else {
+        return;
+    };
+    let parameters = wildcard
+        .split_once(';')
+        .map_or("", |(_, parameters)| parameters);
+    let mut expanded: Vec<String> = items
+        .iter()
+        .filter(|item| coding(item) != "*")
+        .map(|item| (*item).to_owned())
+        .collect();
+    for name in ["br", "gzip", "identity"] {
+        let named = items.iter().any(|item| {
+            let coding = coding(item);
+            coding.eq_ignore_ascii_case(name)
+                || (name == "gzip" && coding.eq_ignore_ascii_case("x-gzip"))
+        });
+        if !named {
+            expanded.push(if parameters.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name};{parameters}")
+            });
+        }
+    }
+    if let Ok(value) = HeaderValue::from_str(&expanded.join(", ")) {
+        headers.insert(header::ACCEPT_ENCODING, value);
     }
 }
 

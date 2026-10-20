@@ -236,36 +236,28 @@ pub(crate) fn encode_address(
     Ok(SocksAddr::new(target, target_domain)?.to_vec())
 }
 
-/// Length in bytes of the SOCKS5-ATYP address at the start of `buf`.
-pub(crate) fn socks_addr_len(buf: &[u8]) -> anyhow::Result<usize> {
-    match buf.first() {
-        Some(&ATYP_IPV4) => {
-            if buf.len() < 7 {
-                anyhow::bail!("truncated IPv4 socks address");
-            }
-            Ok(7)
-        }
-        Some(&ATYP_DOMAIN) => {
-            if buf.len() < 2 {
-                anyhow::bail!("truncated domain socks address");
-            }
-            let len = buf[1] as usize;
-            if len == 0 {
-                anyhow::bail!("empty domain socks address");
-            }
-            if buf.len() < 2 + len + 2 {
-                anyhow::bail!("truncated domain socks address");
-            }
-            Ok(2 + len + 2)
-        }
-        Some(&ATYP_IPV6) => {
-            if buf.len() < 19 {
-                anyhow::bail!("truncated IPv6 socks address");
-            }
-            Ok(19)
-        }
-        other => anyhow::bail!("invalid socks address type {:?}", other),
-    }
+/// The name a shared association may put on the wire for one datagram: only
+/// the one it was dialed by. sing-box 1.12.4 fixes its outbound's form by the
+/// first destination, and a different name later tears the association down
+/// (or black-holes it, for Shadowsocks), so any other name goes out as the
+/// numeric `target`.
+pub(crate) fn dialed_name<'a>(dialed: Option<&str>, domain: Option<&'a str>) -> Option<&'a str> {
+    domain.filter(|name| dialed == Some(*name))
+}
+
+/// The real peer a reply naming `domain:port` stands for: `target` when that
+/// is the name the association was dialed by, otherwise `None` and the caller
+/// drops the frame, since any other name would need DNS. The match is
+/// ASCII-case-insensitive, unlike the exact [`dialed_name`] on the send side,
+/// because servers may fold the case of a name they echo.
+pub(crate) fn dialed_domain_peer(
+    dialed: Option<&str>,
+    target: SocketAddr,
+    domain: impl AsRef<[u8]>,
+    port: u16,
+) -> Option<SocketAddr> {
+    (port == target.port() && dialed?.as_bytes().eq_ignore_ascii_case(domain.as_ref()))
+        .then_some(target)
 }
 
 #[cfg(test)]
@@ -410,13 +402,19 @@ mod tests {
     }
 
     #[test]
-    fn test_socks_addr_len() {
-        let v4 = encode_address("1.2.3.4:53".parse().unwrap(), None).unwrap();
-        assert_eq!(socks_addr_len(&v4).unwrap(), 7);
-        let domain = encode_address("127.0.0.1:443".parse().unwrap(), Some("example.com")).unwrap();
-        assert_eq!(socks_addr_len(&domain).unwrap(), 15);
-        assert!(socks_addr_len(&[0x05, 1, 2]).is_err());
-        assert!(socks_addr_len(&[0x01, 1]).is_err());
-        assert!(socks_addr_len(&[0x03, 0, 0, 0]).is_err());
+    fn dialed_domain_peer_projects_only_the_dialed_name_and_port() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let project = |dialed, domain: &str, port| dialed_domain_peer(dialed, target, domain, port);
+        assert_eq!(
+            project(Some("Example.COM"), "example.com", 443),
+            Some(target)
+        );
+        assert_eq!(project(Some("example.com"), "other.example", 443), None);
+        assert_eq!(project(Some("example.com"), "example.com", 80), None);
+        assert_eq!(project(None, "example.com", 443), None);
+        assert_eq!(
+            dialed_domain_peer(Some("example.com"), target, b"EXAMPLE.com", 443),
+            Some(target)
+        );
     }
 }

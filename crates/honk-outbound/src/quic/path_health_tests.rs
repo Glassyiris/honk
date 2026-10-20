@@ -351,6 +351,35 @@ fn sampling_during_state_mutation_keeps_the_no_ack_clock() {
     h.ack_state
         .store(path_state(0, true) | PATH_MUTATING, Ordering::Release);
     h.unacked_since_ms.store(1, Ordering::Release);
-    h.refresh_unacked_since(path_now_millis());
+    h.refresh_unacked_since();
     assert_eq!(h.unacked_since_ms.load(Ordering::Acquire), 1);
+}
+
+/// A sampler that read the idle state before a completion armed the clock
+/// must not erase that clock once it resumes.
+#[test]
+fn stale_idle_sample_cannot_erase_an_armed_clock() {
+    let h = health(0, 0, false);
+    let stale = h.ack_state.load(Ordering::Acquire);
+    h.sampled_sent_ack_eliciting_packets
+        .store(5, Ordering::Release);
+    assert!(h.complete_send(QuicSendToken::new(0, 0, 0), 0));
+    let armed = h.unacked_since_ms.load(Ordering::Acquire);
+    assert_ne!(armed, 0);
+    h.refresh_unacked_since_from(stale);
+    assert_eq!(h.unacked_since_ms.load(Ordering::Acquire), armed);
+}
+
+/// A stale sampler from before an ACK cannot write the clock after the next
+/// wait has started, even when that completion has not set its clock yet.
+#[test]
+fn stale_wait_sample_cannot_arm_the_next_ack_epoch() {
+    let h = health(0, 0, true);
+    let stale = h.ack_state.load(Ordering::Acquire);
+    assert!(h.note_ack_progress(3));
+    h.sampled_sent_ack_eliciting_packets
+        .store(6, Ordering::Release);
+    h.ack_state.store(path_state(1, true), Ordering::Release);
+    h.refresh_unacked_since_from(stale);
+    assert_eq!(h.unacked_since_ms.load(Ordering::Acquire), 0);
 }

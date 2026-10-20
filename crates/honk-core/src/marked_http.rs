@@ -331,6 +331,7 @@ pub(crate) struct Reply {
     pub(crate) status: http::StatusCode,
     /// Unchecked, so a caller that follows it can reject one that is not text.
     pub(crate) location: Option<http::HeaderValue>,
+    pub(crate) subscription_userinfo: Option<http::HeaderValue>,
     pub(crate) body: Arc<[u8]>,
 }
 
@@ -367,10 +368,12 @@ pub(crate) async fn read(
     let result = async {
         let status = parts.status;
         let location = parts.headers.get(LOCATION).cloned();
+        let subscription_userinfo = parts.headers.get("subscription-userinfo").cloned();
         if !wants_body(status, &parts.headers) {
             return Ok(Reply {
                 status,
                 location,
+                subscription_userinfo,
                 body: Arc::from([]),
             });
         }
@@ -420,12 +423,14 @@ pub(crate) async fn read(
             Some(buffer) if buffer.len() == received => Ok(Reply {
                 status,
                 location,
+                subscription_userinfo,
                 body: buffer,
             }),
             Some(_) => Err("http_failed".into()),
             None => Ok(Reply {
                 status,
                 location,
+                subscription_userinfo,
                 body: grown.into(),
             }),
         }

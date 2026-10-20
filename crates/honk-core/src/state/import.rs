@@ -44,13 +44,15 @@ impl LegacyCache {
     }
 }
 
-/// The Selector groups and nodes of the running configuration; rows for any
-/// other group or node are not imported, so the import stays within what the
+/// The Selector groups and nodes of the running configuration, and whether
+/// the Clash API owns mode and GLOBAL; rows for any other group or node, or
+/// for a disabled owner, are not imported, so the import stays within what the
 /// maintenance tick would keep.
 #[derive(Debug, Clone, Default)]
 pub struct ImportScope {
     pub selector_groups: std::collections::HashSet<String>,
     pub nodes: std::collections::HashSet<String>,
+    pub clash: bool,
 }
 
 fn now_unix() -> u64 {
@@ -293,6 +295,9 @@ fn import_row(
     scope: &ImportScope,
 ) -> rusqlite::Result<()> {
     if key == "clash_mode" || key == "selector:GLOBAL" {
+        if !scope.clash {
+            return Ok(());
+        }
         let target = if key == "clash_mode" {
             "mode"
         } else {

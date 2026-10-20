@@ -1,9 +1,13 @@
+use std::hash::BuildHasher as _;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use ipnet::IpNet;
 
-use super::{BinaryLpmTrie, GeositeDomain, GeositeMatcher};
+use super::{
+    BinaryLpmTrie,
+    domain::{GeositeDomain, GeositeMatcher},
+};
 
 /// One canonical condition in a compiled routing rule.
 #[derive(Debug, Clone)]
@@ -57,7 +61,9 @@ impl IpMatcher {
 /// identical tries, so any holder's matcher is interchangeable.
 #[derive(Default)]
 pub(crate) struct SharedMatchers {
-    ip: Vec<Arc<IpMatcher>>,
+    hasher: std::hash::RandomState,
+    /// Buckets by list hash: the interned lists stay in their matchers.
+    ip: std::collections::HashMap<u64, Vec<Arc<IpMatcher>>>,
     /// Keyed by selector name, which pins content only within one build's
     /// assets, so these are never offered across builds.
     geosite: std::collections::HashMap<String, Arc<GeositeMatcher>>,
@@ -65,11 +71,15 @@ pub(crate) struct SharedMatchers {
 
 impl SharedMatchers {
     pub(crate) fn ip(&mut self, nets: Vec<IpNet>) -> Arc<IpMatcher> {
-        if let Some(matcher) = self.ip.iter().find(|matcher| matcher.nets() == nets) {
+        let known = self
+            .ip
+            .entry(self.hasher.hash_one(nets.as_slice()))
+            .or_default();
+        if let Some(matcher) = known.iter().find(|matcher| matcher.nets() == nets) {
             return Arc::clone(matcher);
         }
         let matcher = Arc::new(IpMatcher::new(nets));
-        self.ip.push(Arc::clone(&matcher));
+        known.push(Arc::clone(&matcher));
         matcher
     }
 
@@ -87,8 +97,12 @@ impl SharedMatchers {
     /// Offers live matchers so a rebuild keeps them for unchanged network lists.
     pub(crate) fn offer<'a>(&mut self, matchers: impl IntoIterator<Item = &'a Arc<IpMatcher>>) {
         for matcher in matchers {
-            if !self.ip.iter().any(|known| known.nets() == matcher.nets()) {
-                self.ip.push(Arc::clone(matcher));
+            let known = self
+                .ip
+                .entry(self.hasher.hash_one(matcher.nets()))
+                .or_default();
+            if !known.iter().any(|known| known.nets() == matcher.nets()) {
+                known.push(Arc::clone(matcher));
             }
         }
     }

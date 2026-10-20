@@ -32,7 +32,7 @@ async fn native_log_records_one_client_completion_not_internal_resolution() {
     assert_eq!(response[3] & 15, 0);
     drop(client);
     task.await.unwrap();
-    let response = api.log_for_test().page_for_test();
+    let response = api.log_page_for_test();
     let body = axum::body::to_bytes(response.into_body(), 262144)
         .await
         .unwrap();
@@ -86,7 +86,7 @@ async fn native_log_keeps_admission_refusal_and_forward_failure() {
     assert_eq!(read_tcp_response(&mut client).await[3] & 15, 2);
     drop(client);
     task.await.unwrap();
-    let response = api.log_for_test().page_for_test();
+    let response = api.log_page_for_test();
     let body = axum::body::to_bytes(response.into_body(), 262144)
         .await
         .unwrap();

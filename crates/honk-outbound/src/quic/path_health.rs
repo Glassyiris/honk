@@ -96,19 +96,37 @@ impl QuicPathHealth {
         sent.saturating_sub(acked)
     }
 
-    /// The mutation-bit holder owns the clock; a sampler racing it must not
-    /// zero the watchdog's only no-ACK clock.
-    pub(super) fn refresh_unacked_since(&self, now: u64) {
-        let state = self.ack_state.load(Ordering::Acquire);
-        if state & PATH_MUTATING != 0 {
+    /// Only the mutation-bit holder writes the no-ACK clock, so a sampler
+    /// that read an older state cannot erase or backdate a newer wait.
+    pub(super) fn refresh_unacked_since(&self) {
+        self.refresh_unacked_since_from(self.ack_state.load(Ordering::Acquire));
+    }
+
+    pub(super) fn refresh_unacked_since_from(&self, state: u64) {
+        if state & (PATH_WAITING | PATH_MUTATING) != PATH_WAITING
+            || self
+                .ack_state
+                .compare_exchange(
+                    state,
+                    state | PATH_MUTATING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
             return;
         }
-        if state & PATH_WAITING == 0 || self.unacked_sends_since_wait() == 0 {
+        self.update_unacked_since();
+        self.ack_state.store(state, Ordering::Release);
+    }
+
+    /// Caller holds `PATH_MUTATING` for a waiting state.
+    fn update_unacked_since(&self) {
+        if self.unacked_sends_since_wait() == 0 {
             self.unacked_since_ms.store(0, Ordering::Release);
-        } else {
-            let _ =
-                self.unacked_since_ms
-                    .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        } else if self.unacked_since_ms.load(Ordering::Acquire) == 0 {
+            self.unacked_since_ms
+                .store(path_now_millis(), Ordering::Release);
         }
     }
 
@@ -176,7 +194,7 @@ impl QuicPathHealth {
             .fetch_max(stats.path.sent_ack_eliciting_packets, Ordering::Release);
         let current = self.sampled_acked_packets.load(Ordering::Acquire);
         self.note_ack_progress(current);
-        self.refresh_unacked_since(now);
+        self.refresh_unacked_since();
         current
     }
     /// Refresh Quinn statistics at most once per second on packet send paths.
@@ -278,9 +296,9 @@ impl QuicPathHealth {
                 self.waiting_sent_baseline
                     .fetch_min(token.sent_baseline, Ordering::AcqRel);
             }
+            self.update_unacked_since();
             self.ack_state
                 .store(path_state(epoch, true), Ordering::Release);
-            self.refresh_unacked_since(path_now_millis());
             return true;
         }
     }

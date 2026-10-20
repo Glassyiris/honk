@@ -341,6 +341,18 @@ fn collect_subscription_fields<'d, 'a>(
             text.span.end = opener.end;
         }
         let text = text.trim();
+        if !legacy
+            && entry_block_header(&child).is_some()
+            && let Some((key, _)) = text.kv()
+        {
+            key.notice(
+                diagnostics,
+                Severity::Warning,
+                "unknown-key",
+                "nested subscription entry ignored",
+            );
+            continue;
+        }
         if let Some((key, value)) = text.kv() {
             diagnostics.register_field(key.raw(), value);
             let value = value.unquote();

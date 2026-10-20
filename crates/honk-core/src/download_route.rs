@@ -15,8 +15,8 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::{
-    ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
-    SharedGroupManager,
+    ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreSelectionContext,
+    ScoreTarget, SelectionNetwork, SharedGroupManager,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry, TcpOutbound};
 use honk_outbound::runtime::{
@@ -72,25 +72,11 @@ pub(crate) struct NoUsableNode {
 /// Where the download goes.
 pub(crate) enum Route {
     Direct {
-        #[cfg_attr(
-            not(feature = "clash-api"),
-            allow(
-                dead_code,
-                reason = "only the Clash UI download reports Score feedback"
-            )
-        )]
         feedback: Option<ScoreAttempt>,
     },
     Block,
     Proxy {
         node: Box<Node>,
-        #[cfg_attr(
-            not(feature = "clash-api"),
-            allow(
-                dead_code,
-                reason = "only the Clash UI download reports Score feedback"
-            )
-        )]
         feedback: Option<ScoreAttempt>,
     },
 }
@@ -133,6 +119,8 @@ impl Outbounds<'_> {
     /// is `None`: `Router::route_action` for the outbound name, then the
     /// authoritative group/leaf resolution for the node to dial. `setting`
     /// names the detour's setting in the log, and `purpose` the download in errors.
+    /// `strict_resolver`, when set, is the only resolver the host is looked up
+    /// with, without the system fallback; unusable, it leaves the address unknown.
     pub(crate) async fn decide(
         &self,
         detour: Option<&str>,
@@ -140,15 +128,22 @@ impl Outbounds<'_> {
         purpose: &str,
         (host, port): (&str, u16),
         original: Option<&ScoreContinuation>,
+        strict_resolver: Option<&str>,
     ) -> anyhow::Result<Decision> {
         let host_ip = parse_host_ip(host);
-        let resolved_ip = match host_ip {
-            Some(ip) => Some(ip),
-            None => honk_outbound::bootstrap::resolve(host)
-                .await
-                .ok()
-                .and_then(|addresses| addresses.into_iter().next()),
+        let resolved = match (host_ip, strict_resolver) {
+            (Some(ip), _) => Ok(vec![ip]),
+            (None, Some(resolver)) => {
+                match honk_outbound::bootstrap::BootstrapResolver::parse(resolver) {
+                    Some(resolver) => resolver.query(host).await,
+                    None => Err(std::io::ErrorKind::NotFound.into()),
+                }
+            }
+            (None, None) => honk_outbound::bootstrap::resolve(host).await,
         };
+        let resolved_ip = resolved
+            .ok()
+            .and_then(|addresses| addresses.into_iter().next());
         let dst_ip = resolved_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let domain = host_ip.is_none().then(|| host.to_string());
         let info = ConnectionInfo {
@@ -359,18 +354,21 @@ impl Outbounds<'_> {
     /// node the detour or the routing rules choose, whose tunnel is closed
     /// after. Also returns the group the route went through. `setting` and
     /// `purpose` are as in [`Self::decide`]. Setup has to finish by the
-    /// deadline's `headers`.
+    /// deadline's `headers`. `original` is the first admitted Score business of
+    /// a redirect chain; later hops of the chain continue it instead of
+    /// starting new business.
     pub(crate) async fn fetch(
         &self,
         detour: Detour<'_>,
         setting: &str,
         purpose: &str,
         request: &Request<'_>,
+        original: &mut Option<ScoreContinuation>,
     ) -> Result<(Reply, Option<String>), Failed> {
-        let detour = match detour {
+        let (detour, strict_resolver) = match detour {
             Detour::Direct => return Ok((fetch_direct(request).await?, None)),
-            Detour::Routing => None,
-            Detour::Group(group) => Some(group),
+            Detour::Routing => (None, None),
+            Detour::Group(group) => (Some(group), request.bootstrap),
         };
         let host = request.url.host_str().ok_or("invalid_source")?;
         let port = request
@@ -380,38 +378,107 @@ impl Outbounds<'_> {
         let by = request.deadline.headers;
         let decision = timeout_at(
             by,
-            self.decide(detour, setting, purpose, (host, port), None),
+            self.decide(
+                detour,
+                setting,
+                purpose,
+                (host, port),
+                original.as_ref(),
+                strict_resolver,
+            ),
         )
         .await
         .map_err(|_| "download_timeout")?
         .map_err(Failed::Route)?;
-        let reply = match decision.route {
+        let (node, feedback) = match decision.route {
             Route::Block => return Err("route_blocked".into()),
-            Route::Direct { .. } => fetch_direct(request).await?,
-            Route::Proxy { node, .. } => {
-                let tunnel = match timeout_at(by, self.tunnel(&node, (host, port))).await {
-                    Err(_) => return Err("download_timeout".into()),
-                    Ok(Err(error)) => {
-                        debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
-                        return Err("connection_failed".into());
-                    }
-                    Ok(Ok(tunnel)) => tunnel,
-                };
-                let reply = match timeout_at(by, tunnel.dial()).await {
-                    Err(_) => Err("download_timeout"),
-                    Ok(Err(error)) => {
-                        debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
-                        Err("connection_failed")
-                    }
-                    Ok(Ok(stream)) => get(stream, request).await,
-                };
-                if let Err(error) = tunnel.close().await {
-                    debug!(%error, "{purpose} tunnel did not close cleanly");
-                }
-                reply?
-            }
+            Route::Direct { feedback } => (None, feedback),
+            Route::Proxy { node, feedback } => (Some(node), feedback),
         };
+        let business = admit(
+            feedback.as_ref(),
+            original,
+            decision.group.as_deref(),
+            purpose,
+        )?;
+        let reply = match node {
+            None => fetch_direct(request).await,
+            Some(node) => self.fetch_through(&node, purpose, request).await,
+        };
+        if let Some(business) = business {
+            business.finish(settlement(&reply));
+        }
+        let reply = reply?;
         Ok((reply, decision.group))
+    }
+
+    async fn fetch_through(
+        &self,
+        node: &Node,
+        purpose: &str,
+        request: &Request<'_>,
+    ) -> Result<Reply, &'static str> {
+        let host = request.url.host_str().ok_or("invalid_source")?;
+        let port = request
+            .url
+            .port_or_known_default()
+            .ok_or("invalid_source")?;
+        let by = request.deadline.headers;
+        let tunnel = match timeout_at(by, self.tunnel(node, (host, port))).await {
+            Err(_) => return Err("download_timeout"),
+            Ok(Err(error)) => {
+                debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
+                return Err("connection_failed");
+            }
+            Ok(Ok(tunnel)) => tunnel,
+        };
+        let reply = match timeout_at(by, tunnel.dial()).await {
+            Err(_) => Err("download_timeout"),
+            Ok(Err(error)) => {
+                debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
+                Err("connection_failed")
+            }
+            Ok(Ok(stream)) => get(stream, request).await,
+        };
+        if let Err(error) = tunnel.close().await {
+            debug!(%error, "{purpose} tunnel did not close cleanly");
+        }
+        reply
+    }
+}
+
+/// Admits the planned Score business before the download runs. Admission is
+/// refused when the selected node left its pool since the plan, so the route
+/// has no usable node. The first admitted business of a chain becomes its
+/// `original`.
+pub(crate) fn admit(
+    feedback: Option<&ScoreAttempt>,
+    original: &mut Option<ScoreContinuation>,
+    group: Option<&str>,
+    purpose: &str,
+) -> Result<Option<ScoreBusinessGuard>, Failed> {
+    let business = feedback.map(ScoreAttempt::begin).transpose().map_err(|_| {
+        Failed::Route(
+            anyhow::Error::new(NoUsableNode {
+                outbound: group.unwrap_or_default().to_owned(),
+            })
+            .context(purpose.to_owned()),
+        )
+    })?;
+    if let Some(business) = &business {
+        original.get_or_insert_with(|| business.continuation());
+    }
+    Ok(business)
+}
+
+/// The Score settlement of a finished download. A download has no client side
+/// to disconnect, so every failure is the carrier's or target's, never a
+/// cancellation, as for the external UI download.
+pub(crate) fn settlement(reply: &Result<Reply, &'static str>) -> ScoreOutcome {
+    match reply {
+        Ok(_) => ScoreOutcome::Success,
+        Err("download_timeout") => ScoreOutcome::Timeout,
+        Err(_) => ScoreOutcome::Other,
     }
 }
 
@@ -444,22 +511,34 @@ pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'stati
                 .map_err(|_| "resolution_failed")?
         }
     };
-    for ip in addresses {
-        let connected = timeout_at(
-            by,
-            honk_outbound::util::connect_marked_addr(
-                SocketAddr::new(ip, port),
-                Some(honk_outbound::util::bypass_mark()),
-                by.saturating_duration_since(Instant::now()),
-            ),
-        )
-        .await
-        .map_err(|_| "download_timeout")?;
-        if let Ok(stream) = connected {
-            return get(Box::new(stream), request).await;
-        }
-    }
-    Err("connection_failed")
+    let addresses: Vec<_> = addresses
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    let stream = connect_direct(&addresses, by).await?;
+    get(Box::new(stream), request).await
+}
+
+/// A connection to the first of `addresses` that accepts, racing them like a
+/// proxy server's, so a blackholed address does not use up the deadline.
+async fn connect_direct(
+    addresses: &[SocketAddr],
+    by: Instant,
+) -> Result<tokio::net::TcpStream, &'static str> {
+    timeout_at(
+        by,
+        honk_outbound::util::connect_marked_resolved(
+            addresses,
+            Some(honk_outbound::util::bypass_mark()),
+            by.saturating_duration_since(Instant::now()),
+        ),
+    )
+    .await
+    .map_err(|_| "download_timeout")?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::TimedOut => "download_timeout",
+        _ => "connection_failed",
+    })
 }
 
 async fn get(
@@ -502,4 +581,51 @@ async fn get(
     )
     .await
     .map_err(|error| error.stage)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
+    /// A listener whose accept queue is full, so further connects hang.
+    fn blackhole() -> (socket2::Socket, Vec<std::net::TcpStream>) {
+        let listener =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        listener
+            .bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+            .unwrap();
+        listener.listen(0).unwrap();
+        let address = listener.local_addr().unwrap().as_socket().unwrap();
+        let fillers = (0..4)
+            .map(|_| {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                socket.set_nonblocking(true).unwrap();
+                let _ = socket.connect(&address.into());
+                socket.into()
+            })
+            .collect();
+        (listener, fillers)
+    }
+
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_use_up_the_deadline() {
+        let (blackhole, _fillers) = blackhole();
+        let first = blackhole.local_addr().unwrap().as_socket().unwrap();
+        let healthy = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), first.port()))
+            .await
+            .unwrap();
+        let second = healthy.local_addr().unwrap();
+
+        let stream =
+            super::connect_direct(&[first, second], Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), second);
+    }
 }

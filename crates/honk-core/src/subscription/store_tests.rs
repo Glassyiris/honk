@@ -57,6 +57,21 @@ async fn a_subscription_with_cache_off_is_neither_stored_nor_restored_nor_kept()
     );
 }
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn the_offline_lookup_skips_a_subscription_with_cache_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut sub = subscription("a");
+    SubscriptionStore::in_dir(temp.path())
+        .store_content(&sub, "socks5://127.0.0.1:1080#stored".into())
+        .await
+        .unwrap();
+    let bodies = StoredBodies::open(temp.path()).unwrap().unwrap();
+    assert!(bodies.find(&sub).unwrap().is_some());
+    sub.cache = false;
+    assert!(bodies.find(&sub).unwrap().is_none());
+}
+
 #[tokio::test]
 async fn a_replacement_url_frees_the_old_bodies() {
     let temp = tempfile::tempdir().unwrap();

@@ -40,7 +40,7 @@ pub(crate) struct Provider {
     node_count: usize,
     updated_at: Option<String>,
     expires_at: Option<String>,
-    traffic: Option<()>,
+    traffic: Option<ProviderTraffic>,
     status: &'static str,
     last_error: Option<ProviderError>,
     download: Option<Value>,
@@ -56,6 +56,13 @@ impl std::fmt::Debug for Provider {
             .field("status", &self.status)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Clone, Serialize)]
+struct ProviderTraffic {
+    upload_bytes: Option<String>,
+    download_bytes: Option<String>,
+    total_bytes: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,8 +112,19 @@ impl Provider {
             url_redacted: Some(subscription.url.clone()),
             node_count,
             updated_at: load.updated_at.map(timestamp),
-            expires_at: None,
-            traffic: None,
+            expires_at: load
+                .userinfo
+                .expire
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds.try_into().ok()?, 0))
+                .map(|expires| timestamp(expires.into())),
+            traffic: (load.userinfo.upload.is_some()
+                || load.userinfo.download.is_some()
+                || load.userinfo.total.is_some())
+            .then(|| ProviderTraffic {
+                upload_bytes: load.userinfo.upload.map(|bytes| bytes.to_string()),
+                download_bytes: load.userinfo.download.map(|bytes| bytes.to_string()),
+                total_bytes: load.userinfo.total.map(|bytes| bytes.to_string()),
+            }),
             status: if load.error.is_some() && node_count == 0 {
                 "error"
             } else if load.updated_at.is_none()
@@ -151,7 +169,7 @@ impl Provider {
     ) -> Self {
         let secrets = match sources {
             Some(sources) => sources.secrets_with(config),
-            None => super::config::ListenerSecrets::from_config(config),
+            None => super::secrets::ListenerSecrets::from_config(config),
         };
         for value in std::iter::once(&mut self.name).chain(self.url_redacted.iter_mut()) {
             *value = secrets.mask(value).0;
@@ -165,6 +183,37 @@ impl Provider {
             + self.name.capacity()
             + self.url_redacted.as_ref().map_or(0, String::capacity)
             + self.updated_at.as_ref().map_or(0, String::capacity)
+            + self.expires_at.as_ref().map_or(0, String::capacity)
+            + self.traffic.as_ref().map_or(0, |traffic| {
+                traffic.upload_bytes.as_ref().map_or(0, String::capacity)
+                    + traffic.download_bytes.as_ref().map_or(0, String::capacity)
+                    + traffic.total_bytes.as_ref().map_or(0, String::capacity)
+            })
+            + self.download.as_ref().map_or(0, json_heap)
+            + self
+                .last_error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .map_or(0, json_heap)
+    }
+}
+
+/// Heap `value` owns beyond its inline slot. A map is charged whole 11-entry nodes, the
+/// `BTreeMap` layout; an ordered map would differ by a small constant.
+fn json_heap(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(items) => {
+            items.capacity() * size_of::<Value>() + items.iter().map(json_heap).sum::<usize>()
+        }
+        Value::Object(map) => {
+            map.len().div_ceil(11) * 11 * size_of::<(String, Value)>()
+                + map
+                    .iter()
+                    .map(|(key, value)| key.capacity() + json_heap(value))
+                    .sum::<usize>()
+        }
+        _ => 0,
     }
 }
 

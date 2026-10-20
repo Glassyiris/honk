@@ -43,11 +43,11 @@
 //! accepts both forms).
 
 use std::collections::HashMap;
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSliceMut, Write as _};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -79,7 +79,10 @@ mod h3;
 mod salamander;
 #[cfg(test)]
 mod tests;
+mod udp;
 mod wire;
+
+pub use udp::Hy2UdpTransport;
 
 use h3::*;
 use salamander::*;
@@ -719,7 +722,7 @@ impl Hysteria2Handler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+    ) -> anyhow::Result<Arc<Hy2UdpTransport>> {
         let (conn, state) = client.connection(connect_timeout).await?;
         if state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
@@ -743,10 +746,41 @@ impl Hysteria2Handler {
             rx: tokio::sync::Mutex::new(rx),
             defrag: tokio::sync::Mutex::new(Defragmenter::new(MAX_UDP_SIZE)),
             addr,
+            target_domain_len: target_domain.map(str::len),
             max_datagram,
             target,
             request_observer: parking_lot::Mutex::new(crate::runtime::flow_observation::current()),
         }))
+    }
+
+    pub async fn prepare_udp_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<super::PreparedUdpTransport<Hy2UdpTransport>> {
+        if !speculative {
+            let client = self.client_for_runtime(&runtime).await?;
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?;
+            *transport.request_observer.lock() = None;
+            return Ok(super::PreparedUdpTransport::ready(transport));
+        }
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?;
+            *transport.request_observer.lock() = None;
+            Ok(transport)
+        })
+        .await
     }
 }
 
@@ -798,8 +832,9 @@ impl PacketOutbound for Hysteria2Handler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.build_client(node, None).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await?)
     }
 
     async fn dial_udp_transport_runtime(
@@ -810,8 +845,9 @@ impl PacketOutbound for Hysteria2Handler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.client_for_runtime(&runtime).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await?)
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -826,8 +862,9 @@ impl PacketOutbound for Hysteria2Handler {
             .build_client(runtime.node.as_ref(), Some(profiles))
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
-            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-                .await
+            Ok(self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await? as Arc<dyn PacketTransport>)
         })
         .await
     }
@@ -844,137 +881,6 @@ impl ProbeableOutbound for Hysteria2Handler {
                     node.name, e
                 );
                 false
-            }
-        }
-    }
-}
-
-/// Framed UDP transport over the shared Hysteria2 QUIC connection: UDP
-/// message datagrams go straight onto the connection and inbound datagrams
-/// arrive through the session demux queue.
-struct Hy2UdpTransport {
-    state: Arc<Hy2ConnState>,
-    session_id: u32,
-    packet_id: AtomicU16,
-    rx: tokio::sync::Mutex<mpsc::Receiver<UdpInbound>>,
-    defrag: tokio::sync::Mutex<Defragmenter>,
-    addr: String,
-    max_datagram: usize,
-    target: SocketAddr,
-    request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
-}
-
-impl std::fmt::Debug for Hy2UdpTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Hy2UdpTransport")
-            .field("session_id", &self.session_id)
-            .field("target", &self.target)
-            .finish()
-    }
-}
-
-impl Drop for Hy2UdpTransport {
-    fn drop(&mut self) {
-        self.state.sessions.lock().remove(&self.session_id);
-        self.state.open.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-#[async_trait]
-impl PacketTransport for Hy2UdpTransport {
-    fn relay_addr(&self) -> SocketAddr {
-        self.target
-    }
-    fn send_timeout(&self) -> Duration {
-        self.state.path_health.send_timeout()
-    }
-    fn record_quic_send_started(&self) -> QuicSendToken {
-        self.state.path_health.record_send_started(&self.state.conn)
-    }
-    fn record_quic_send_success(&self, token: QuicSendToken) {
-        self.state
-            .path_health
-            .record_send_success(token, &self.state.conn);
-    }
-    fn record_quic_send_timeout(&self, token: QuicSendToken) {
-        if self
-            .state
-            .path_health
-            .record_send_timeout(token, &self.state.conn)
-        {
-            crate::quic::record_quic_send_timeout();
-        }
-    }
-    fn record_quic_send_failure(&self, token: QuicSendToken) {
-        self.state.path_health.record_send_failure(token);
-    }
-
-    fn quic_path_stalled(&self) -> bool {
-        self.state.path_health.is_stalled()
-    }
-    fn send_timeout_is_congestion(&self) -> bool {
-        true
-    }
-
-    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        if data.len() > MAX_UDP_SIZE {
-            return Err(super::PacketRejection::InvalidSize.into());
-        }
-        self.state.touch();
-        let packet_id = self
-            .packet_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let packets = fragment_udp_message(
-            self.session_id,
-            packet_id,
-            &self.addr,
-            data,
-            self.max_datagram,
-        )
-        .map_err(io::Error::other)?;
-        for packet in packets {
-            self.state
-                .conn
-                .send_datagram_wait(bytes::Bytes::from(packet))
-                .await
-                .map_err(io::Error::other)
-                .map_err(super::quic_carrier_io_error)?;
-        }
-        if let Some(observer) = self.request_observer.lock().take() {
-            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
-        }
-        Ok(())
-    }
-
-    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        loop {
-            let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    super::NodeFailure(
-                        self.state
-                            .conn
-                            .close_reason()
-                            .map(anyhow::Error::new)
-                            .unwrap_or_else(|| anyhow::anyhow!("hysteria2 connection closed")),
-                    ),
-                )
-            })?;
-            let complete =
-                self.defrag
-                    .lock()
-                    .await
-                    .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
-            if let Some(data) = complete {
-                if data.len() > buf.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "hysteria2 packet exceeds buffer",
-                    ));
-                }
-                buf[..data.len()].copy_from_slice(&data);
-                return Ok((data.len(), self.target));
             }
         }
     }

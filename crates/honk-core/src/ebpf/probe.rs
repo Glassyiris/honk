@@ -1,16 +1,14 @@
 //! Runtime capability probing for batched `bpf()` map commands.
 //!
-//! aya 0.14 does not expose `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+) or
-//! `BPF_MAP_LOOKUP_AND_DELETE_ELEM` (Linux 4.20+), so `ebpf::real` issues
-//! them as raw syscalls. Availability is detected at runtime instead of
-//! relying on kernel version parsing. A capability failure sends subsequent
-//! calls to the per-element fallback; an already-in-flight successful call
-//! can still record support afterwards.
+//! aya 0.14 does not expose `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+), so
+//! `ebpf::map_snapshot` issues it as a raw syscall. Availability is detected at runtime instead of
+//! relying on kernel version parsing. On capability failure the storage adapter
+//! either selects its proven-safe fallback or returns an explicit unsupported
+//! error. An already-in-flight successful call can still record support later.
 //!
-//! The observation is per command, not per (command, map): every map the batch
-//! paths touch belongs to the htab family (`REDIRECT_TRACK`,
-//! `ROUTING_HANDOFF_MAP`, `CONN_STATE_MAP` and `COOKIE_PID_MAP` are plain
-//! hash), so a single verdict per command is valid for all of them.
+//! Keep separate observations for plain and BPF_F_LOCK batch copies: support
+//! for ordinary hashes does not prove support for locked flow values. Request
+//! enumeration requires plain batch support rather than an unsafe fallback.
 
 use std::ffi::c_long;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Errno values that mean "this bpf() command (for this map type) is not
 /// available on the running kernel":
 /// - `EINVAL`: the command number is unknown (pre-5.6 kernels have no
-///   batch commands; pre-4.20 kernels have no LOOKUP_AND_DELETE_ELEM);
+///   batch commands);
 /// - `EOPNOTSUPP` (== `ENOTSUP` on Linux): the map type provides no
 ///   implementation for the command;
 /// - `EPERM`: bpf() is restricted (e.g. `kernel.unprivileged_bpf_disabled`

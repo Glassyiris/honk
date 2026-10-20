@@ -38,13 +38,16 @@ mod stream;
 
 #[cfg(test)]
 use crate::proxy::RuntimeOwnedIo;
-use packet::VlessConnectedTransport;
+#[cfg(test)]
+use packet::{VlessConnectedTransport, VlessUotTransport};
 
 use super::cool::VlessXudpTransport;
 #[cfg(test)]
 use super::{cool, mux};
 #[cfg(test)]
-use crate::proxy::{PacketRejection, ProxyRegistry, WarmOutcome, is_packet_rejection, uot};
+use crate::proxy::{
+    MultiTargetTransport, PacketRejection, ProxyRegistry, WarmOutcome, is_packet_rejection, uot,
+};
 pub use stream::VisionSplice;
 #[cfg(test)]
 use stream::{
@@ -62,7 +65,7 @@ use tokio::net::TcpStream;
 
 use crate::proxy::{
     MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
 use crate::session::{OpenError, SpeculativeCheckout};
 
@@ -75,6 +78,17 @@ const MAX_NATIVE_PACKET_SIZE: usize = 8190;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
+
+/// Nothing a preparation retained is published before the caller's commit.
+fn publish_on_commit<T: ?Sized + Send + Sync + 'static>(
+    transport: Arc<T>,
+    preparation: crate::proxy::transport::TransportPreparation,
+) -> PreparedUdpTransport<T> {
+    PreparedUdpTransport::new(async move {
+        preparation.commit()?;
+        Ok(transport)
+    })
+}
 
 #[derive(Debug, Default)]
 pub struct VLessHandler {
@@ -228,58 +242,20 @@ impl VLessHandler {
             VlessUdpPath::CoolSeparate => {
                 Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout).await
             }
-            VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::Xudp => {
+            VlessUdpPath::UotV2 => {
+                let (transport, preparation) = self
+                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout)
+                    .await?;
+                preparation.commit()?;
+                Ok(transport)
+            }
+            VlessUdpPath::Native | VlessUdpPath::Xudp => {
                 self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
                     .await?
                     .commit()
                     .await
             }
         }
-    }
-
-    async fn prepare_protocol_udp(
-        &self,
-        runtime: Arc<crate::runtime::NodeRuntime>,
-        path: VlessUdpPath,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: std::time::Duration,
-    ) -> anyhow::Result<PreparedUdpTransport> {
-        let vless = runtime.node.vless().unwrap();
-        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
-        let (command, header_target, header_domain, setup) = match path {
-            VlessUdpPath::Native => (CMD_UDP, Some(target), domain, None),
-            VlessUdpPath::UotV2 => (
-                CMD_TCP,
-                Some(SocketAddr::from(([0, 0, 0, 0], 0))),
-                Some(crate::proxy::uot::MAGIC_ADDRESS),
-                Some(crate::proxy::uot::connect_request(target, domain)?),
-            ),
-            VlessUdpPath::Xudp => (super::cool::VLESS_MUX_COMMAND, None, None, None),
-            _ => unreachable!("protocol UDP preparation excludes pooled mux paths"),
-        };
-        let header = Self::build_request_header(
-            &uuid,
-            command,
-            header_target,
-            header_domain,
-            vless.wire_flow(),
-        )?;
-        let operation = self.prepare_retained_carrier(&runtime, uuid, header, timeout);
-        let (stream, preparation) = if path == VlessUdpPath::Native {
-            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?
-        } else {
-            operation.await?
-        };
-        let transport: Arc<dyn PacketTransport> = if path == VlessUdpPath::Xudp {
-            super::cool::connect_single_xudp(stream, target, domain, [0; 8]).await?
-        } else {
-            Arc::new(VlessConnectedTransport::new(stream, target, setup))
-        };
-        Ok(PreparedUdpTransport::new(async move {
-            preparation.commit()?;
-            Ok(transport)
-        }))
     }
 
     fn cool_limit(node: &Node, separate: bool) -> anyhow::Result<usize> {
@@ -463,121 +439,6 @@ impl VLessHandler {
         Ok(transport)
     }
 
-    async fn prepare_mux_udp<S, T, Dial, DialFuture, Open, OpenFuture>(
-        pool: Arc<crate::session::SessionPool<S>>,
-        dial: Dial,
-        open: Open,
-        retired_error: &'static str,
-    ) -> anyhow::Result<PreparedUdpTransport<T>>
-    where
-        S: MuxSession,
-        T: PacketTransport + ?Sized + 'static,
-        Dial: FnOnce() -> DialFuture + Send,
-        DialFuture: Future<Output = anyhow::Result<(Arc<S>, crate::proxy::transport::TransportPreparation)>>
-            + Send,
-        Open: Fn(Arc<S>, crate::session::SessionPermit<S>) -> OpenFuture + Send,
-        OpenFuture: Future<Output = Result<Arc<T>, OpenError>> + Send,
-    {
-        let mut dial = Some(dial);
-        let mut last_error = None;
-        for _ in 0..2 {
-            match pool.checkout_speculative().await? {
-                SpeculativeCheckout::Shared { session, permit } => {
-                    let observation = crate::session::ObservedSessionOpen::start();
-                    let result = open(Arc::clone(&session), permit).await;
-                    observation.finish_open(&result);
-                    match result {
-                        Ok(transport) => return Ok(PreparedUdpTransport::ready(transport)),
-                        Err(OpenError::Refused(error)) => return Err(error),
-                        Err(OpenError::Draining(error)) => {
-                            crate::session::ManagedSession::begin_drain(session.as_ref());
-                            last_error = Some(error);
-                        }
-                        Err(OpenError::Session(error)) => {
-                            pool.invalidate(&session);
-                            last_error = Some(error);
-                        }
-                    }
-                }
-                SpeculativeCheckout::Detached(mut reservation) => {
-                    let dial = dial.take().expect("speculative dial runs at most once");
-                    let (session, preparation) = tokio::select! {
-                        result = dial() => result?,
-                        _ = reservation.cancelled() => anyhow::bail!(retired_error),
-                    };
-                    let permit = reservation.attach(&session)?;
-                    let observation = crate::session::ObservedSessionOpen::start();
-                    let result = open(session, permit).await;
-                    observation.finish_open(&result);
-                    let transport = result.map_err(Self::open_error)?;
-                    return Ok(PreparedUdpTransport::new(async move {
-                        preparation.commit()?;
-                        // Mux rejection may leave valid warm carriers in the capped XHTTP pool.
-                        reservation.commit()?;
-                        Ok(transport)
-                    }));
-                }
-            }
-        }
-        Err(last_error.expect("shared mux open attempts record an error"))
-    }
-
-    /// Prepare a concrete source-scoped XUDP child without sending NEW; commit
-    /// promotes only a detached physical carrier after the caller wins admission.
-    pub async fn prepare_source_udp(
-        runtime: Arc<crate::runtime::NodeRuntime>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: std::time::Duration,
-        global_id: [u8; 8],
-    ) -> anyhow::Result<PreparedUdpTransport<VlessXudpTransport>> {
-        // This large cold handshake must not inflate each task-scope poll frame.
-        runtime
-            .scope_tasks(Box::pin(async {
-                match Self::udp_path(&runtime.node, target.port())? {
-                    VlessUdpPath::Xudp => {
-                        let (stream, preparation) = Self::new()
-                            .prepare_retained_mux_carrier(&runtime, timeout)
-                            .await?;
-                        let transport =
-                            super::cool::connect_single_xudp(stream, target, domain, global_id)
-                                .await?;
-                        Ok(PreparedUdpTransport::new(async move {
-                            preparation.commit()?;
-                            Ok(transport)
-                        }))
-                    }
-                    path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
-                        let separate = path == VlessUdpPath::CoolSeparate;
-                        let pool = if separate {
-                            runtime.vless_separate_cool_pool()?
-                        } else {
-                            runtime.vless_shared_cool_pool()?
-                        };
-                        let active_limit = Self::cool_limit(&runtime.node, separate)?;
-                        let dial_runtime = Arc::clone(&runtime);
-                        Self::prepare_mux_udp(
-                            pool,
-                            move || Self::prepare_cool_session(dial_runtime, active_limit, timeout),
-                            move |session, permit| {
-                                super::cool::open_xudp(session, permit, target, domain, global_id)
-                            },
-                            if separate {
-                                "VLESS separate Cool pool retired during source preparation"
-                            } else {
-                                "VLESS shared Cool pool retired during source preparation"
-                            },
-                        )
-                        .await
-                    }
-                    VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::H2 => {
-                        Err(crate::proxy::PacketRejection::Policy.into())
-                    }
-                }
-            }))
-            .await
-    }
-
     async fn warm_mux_pool<S, Dial, DialFuture>(
         pool: Arc<crate::session::SessionPool<S>>,
         dial: Dial,
@@ -710,98 +571,6 @@ impl TcpOutbound for VLessHandler {
             }
             VlessTcpPath::Cool => {
                 Self::open_cool_tcp(runtime, target, target_domain, connect_timeout).await
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl PacketOutbound for VLessHandler {
-    async fn dial_udp_transport(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let path = Self::udp_path(node, target.port())?;
-        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
-        let transport = self
-            .open_udp(
-                owner.runtime(),
-                path,
-                target,
-                target_domain,
-                connect_timeout,
-            )
-            .await?;
-        Ok(crate::proxy::packet_transport_with_owner(transport, owner))
-    }
-
-    async fn dial_udp_transport_runtime(
-        &self,
-        runtime: Arc<crate::runtime::NodeRuntime>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let path = Self::udp_path(&runtime.node, target.port())?;
-        self.open_udp(runtime, path, target, target_domain, connect_timeout)
-            .await
-    }
-
-    async fn dial_udp_transport_speculative_runtime(
-        &self,
-        runtime: Arc<crate::runtime::NodeRuntime>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<PreparedUdpTransport> {
-        let path = Self::udp_path(&runtime.node, target.port())?;
-        match path {
-            VlessUdpPath::H2 => {
-                let pool = runtime.vless_h2_pool()?;
-                let dial_runtime = Arc::clone(&runtime);
-                Self::prepare_mux_udp(
-                    pool,
-                    move || Self::prepare_h2_session(dial_runtime, connect_timeout),
-                    move |session, permit| async move {
-                        let transport: Arc<dyn PacketTransport> =
-                            session.open_packet(permit, target, target_domain).await?;
-                        Ok(transport)
-                    },
-                    "VLESS H2 pool retired during speculative dial",
-                )
-                .await
-            }
-            path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
-                let separate = path == VlessUdpPath::CoolSeparate;
-                let pool = if separate {
-                    runtime.vless_separate_cool_pool()?
-                } else {
-                    runtime.vless_shared_cool_pool()?
-                };
-                let active_limit = Self::cool_limit(&runtime.node, separate)?;
-                let dial_runtime = Arc::clone(&runtime);
-                Self::prepare_mux_udp(
-                    pool,
-                    move || Self::prepare_cool_session(dial_runtime, active_limit, connect_timeout),
-                    move |session, permit| async move {
-                        let transport: Arc<dyn PacketTransport> =
-                            session.open_packet(permit, target, target_domain).await?;
-                        Ok(transport)
-                    },
-                    if separate {
-                        "VLESS separate Cool pool retired during speculative dial"
-                    } else {
-                        "VLESS shared Cool pool retired during speculative dial"
-                    },
-                )
-                .await
-            }
-            VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2 => {
-                self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
-                    .await
             }
         }
     }

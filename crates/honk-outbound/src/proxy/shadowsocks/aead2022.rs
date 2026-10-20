@@ -28,8 +28,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::{AeadCipher, increment_nonce};
-use crate::proxy::addr::socks_addr_len;
+use super::{AeadCipher, UdpDatagram, increment_nonce};
 
 const HEADER_TYPE_CLIENT: u8 = 0;
 pub(crate) const HEADER_TYPE_SERVER: u8 = 1;
@@ -375,9 +374,9 @@ enum ServerSessionSlot {
 
 /// Client-side Shadowsocks 2022 UDP session.
 ///
-/// One session per `dial_udp_transport` call: random session id, monotonically
-/// increasing packet id for outgoing packets, and current/previous server
-/// session replay windows on the receive path.
+/// One session per UDP transport, whatever destinations it carries: random
+/// session id, monotonically increasing packet id for outgoing packets, and
+/// current/previous server session replay windows on the receive path.
 pub(crate) struct Ss2022UdpSession {
     method: Ss2022Method,
     session_id: u64,
@@ -508,12 +507,12 @@ impl Ss2022UdpSession {
         Ok(out)
     }
 
-    /// Decapsulate one datagram from the server, returning the payload.
-    pub(crate) fn open_packet(&mut self, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+    /// Decapsulate one datagram from the server.
+    pub(crate) fn open_packet(&mut self, packet: &[u8]) -> anyhow::Result<UdpDatagram> {
         self.open_packet_at(packet, unix_timestamp())
     }
 
-    fn open_packet_at(&mut self, packet: &[u8], now: u64) -> anyhow::Result<Vec<u8>> {
+    fn open_packet_at(&mut self, packet: &[u8], now: u64) -> anyhow::Result<UdpDatagram> {
         if let Some(xchacha) = &self.xchacha_cipher {
             if packet.len() < UDP_XNONCE_SIZE + UDP_MINIMAL_PACKET_SIZE {
                 anyhow::bail!("UDP packet too short");
@@ -528,9 +527,10 @@ impl Ss2022UdpSession {
             let server_session_id = u64::from_be_bytes(body[..8].try_into().unwrap());
             let server_packet_id = u64::from_be_bytes(body[8..16].try_into().unwrap());
             let slot = self.server_packet_slot(server_session_id, server_packet_id, now)?;
-            let payload = self.parse_server_body(&body[16..], now)?;
+            let address_at = 16 + self.server_address_offset(&body[16..], now)?;
+            let datagram = UdpDatagram::new(body, address_at)?;
             self.commit_server_packet(slot, server_session_id, server_packet_id, None, now);
-            return Ok(payload);
+            return Ok(datagram);
         }
 
         if packet.len() < UDP_MINIMAL_PACKET_SIZE {
@@ -563,9 +563,10 @@ impl Ss2022UdpSession {
         let body = cipher
             .open(&plain_header[4..16], &packet[16..])
             .map_err(|e| anyhow::anyhow!("open UDP packet failed: {:?}", e))?;
-        let payload = self.parse_server_body(&body, now)?;
+        let address_at = self.server_address_offset(&body, now)?;
+        let datagram = UdpDatagram::new(body, address_at)?;
         self.commit_server_packet(slot, server_session_id, server_packet_id, new_cipher, now);
-        Ok(payload)
+        Ok(datagram)
     }
 
     fn server_packet_slot(
@@ -641,9 +642,9 @@ impl Ss2022UdpSession {
         }
     }
 
-    /// Validate and strip the server-to-client main header; returns payload.
-    /// `body` starts at the header type byte.
-    fn parse_server_body(&self, body: &[u8], now: u64) -> anyhow::Result<Vec<u8>> {
+    /// Validate the server-to-client main header; returns the offset of the
+    /// address that follows it. `body` starts at the header type byte.
+    fn server_address_offset(&self, body: &[u8], now: u64) -> anyhow::Result<usize> {
         if body.len() < 1 + 8 + 8 + 2 {
             anyhow::bail!("UDP body too short");
         }
@@ -663,9 +664,7 @@ impl Ss2022UdpSession {
         if body.len() < 19 + padding_len {
             anyhow::bail!("truncated UDP padding");
         }
-        let rest = &body[19 + padding_len..];
-        let skip = socks_addr_len(rest)?;
-        Ok(rest[skip..].to_vec())
+        Ok(19 + padding_len)
     }
 }
 

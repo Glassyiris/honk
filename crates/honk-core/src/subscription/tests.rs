@@ -19,6 +19,46 @@ fn parse_clash_subscription(
 }
 
 #[test]
+fn subscription_userinfo_parses_known_unsigned_fields() {
+    let cases = [
+        ("", [None, None, None, None]),
+        (
+            "upload=422986054; download=5198408536; total=214748364800; expire=1796712849",
+            [
+                Some(422986054),
+                Some(5198408536),
+                Some(214748364800),
+                Some(1796712849),
+            ],
+        ),
+        (
+            " upload = 0 ; download = 0 ; total = 0 ; expire = 0 ",
+            [Some(0), Some(0), None, None],
+        ),
+        (
+            "download=12; ignored=34; upload=7",
+            [Some(7), Some(12), None, None],
+        ),
+        (
+            "upload=-1; download=no; total=18446744073709551616; expire=1=2; broken",
+            [None, None, None, None],
+        ),
+        (
+            "upload=18446744073709551615; total=1; expire=2",
+            [Some(u64::MAX), None, Some(1), Some(2)],
+        ),
+    ];
+    for (header, expected) in cases {
+        let parsed = parse_subscription_userinfo(header);
+        assert_eq!(
+            [parsed.upload, parsed.download, parsed.total, parsed.expire],
+            expected,
+            "{header}"
+        );
+    }
+}
+
+#[test]
 fn private_literal_hosts_are_recognized_by_address_not_name() {
     for url in [
         "http://127.0.0.1/sub",

@@ -178,7 +178,7 @@ enum PacketAdmissionError {
     GlobalPayloadFull,
 }
 pub(super) struct InitializingEndpoint {
-    pub(super) decision_token: u32,
+    pub(super) owner: UdpFlowOwner,
     pub(super) generation: u64,
     pub(super) epoch: u64,
     pub(super) raw_dns_route: Option<RawDnsRoute>,
@@ -235,7 +235,7 @@ impl InitializingEndpoint {
 }
 
 pub(super) struct ReadyEndpoint {
-    pub(super) decision_token: u32,
+    pub(super) owner: UdpFlowOwner,
     pub(super) generation: u64,
     pub(super) raw_dns_route: Option<RawDnsRoute>,
     pub(super) endpoint: Arc<UdpEndpoint>,
@@ -251,7 +251,7 @@ pub(super) enum EndpointEntry {
     Ready(Arc<ReadyEndpoint>),
     Retiring {
         generation: u64,
-        token: u32,
+        owner: UdpFlowOwner,
         io: Option<Arc<RetirementIo>>,
         #[cfg(feature = "native-api")]
         native_terminal: Option<observation::SharedTerminal>,
@@ -267,16 +267,16 @@ impl EndpointEntry {
         }
     }
 
-    pub(super) fn decision_token(&self) -> u32 {
+    pub(super) fn owner(&self) -> UdpFlowOwner {
         match self {
-            Self::Initializing(entry) => entry.decision_token,
-            Self::Ready(entry) => entry.decision_token,
-            Self::Retiring { token, .. } => *token,
+            Self::Initializing(entry) => entry.owner,
+            Self::Ready(entry) => entry.owner,
+            Self::Retiring { owner, .. } => *owner,
         }
     }
 
     pub(super) fn matches_identity(&self, generation: u64, token: u32) -> bool {
-        self.generation() == generation && self.decision_token() == token
+        self.generation() == generation && self.owner().token == token
     }
 
     pub(super) fn retire(&self) -> Option<String> {
@@ -322,7 +322,7 @@ pub(in crate::control) struct UdpInitLease {
     pool: Arc<UdpEndpointPool>,
     pub(super) key: EndpointKey,
     generation: u64,
-    decision_token: u32,
+    owner: UdpFlowOwner,
     first: Option<QueuedDatagram>,
     _slow_permit: OwnedSemaphorePermit,
     cancellation: watch::Receiver<u64>,
@@ -377,12 +377,12 @@ impl UdpInitLease {
         if let Some(mut entry) = self.pool.endpoints.get_mut(&self.key) {
             if let EndpointEntry::Retiring {
                 generation,
-                token,
+                owner,
                 native_terminal,
                 ..
             } = entry.value_mut()
                 && *generation == self.generation
-                && *token == self.decision_token
+                && *owner == self.owner
             {
                 *native_terminal = Some(Arc::clone(&terminal));
             }
@@ -421,7 +421,11 @@ impl UdpInitLease {
     }
 
     pub(in crate::control) fn decision_token(&self) -> u32 {
-        self.decision_token
+        self.owner.token
+    }
+
+    pub(in crate::control) fn owner(&self) -> UdpFlowOwner {
+        self.owner
     }
 
     pub(in crate::control) fn raw_dns_route(&self) -> Option<RawDnsRoute> {
@@ -431,6 +435,11 @@ impl UdpInitLease {
     #[cfg(test)]
     pub(in crate::control) fn cancellation(&self) -> watch::Receiver<u64> {
         self.cancellation.clone()
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(in crate::control) fn initialization_cancelled(&self) -> bool {
+        !self.pool.initialization_epoch_is(self.initializer.epoch)
     }
 
     pub(in crate::control) fn wait_cancellation(
@@ -463,7 +472,7 @@ impl UdpInitLease {
         match entry.value() {
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token =>
+                    && initializing.owner == self.owner =>
             {
                 initializing.bind_selected_node(node_id);
                 true
@@ -480,7 +489,7 @@ impl UdpInitLease {
         };
         if let EndpointEntry::Initializing(initializing) = entry.value()
             && initializing.generation == self.generation
-            && initializing.decision_token == self.decision_token
+            && initializing.owner == self.owner
         {
             initializing.clear_selected_node();
         }
@@ -497,7 +506,7 @@ impl UdpInitLease {
             entry.value(),
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token
+                    && initializing.owner == self.owner
         )
     }
 
@@ -506,7 +515,7 @@ impl UdpInitLease {
         match entry.value() {
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token =>
+                    && initializing.owner == self.owner =>
             {
                 initializing.take_receiver()
             }
@@ -544,7 +553,7 @@ impl UdpInitLease {
         let initializing = match occupied.get() {
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token =>
+                    && initializing.owner == self.owner =>
             {
                 Arc::clone(initializing)
             }
@@ -563,7 +572,7 @@ impl UdpInitLease {
         };
         occupied.insert(EndpointEntry::Ready(Arc::new(ReadyEndpoint {
             generation: self.generation,
-            decision_token: self.decision_token,
+            owner: self.owner,
             endpoint,
             queue_tx: initializing.queue_tx.clone(),
             flow_slots: initializing.flow_slots.clone(),
@@ -578,7 +587,9 @@ impl UdpInitLease {
 
     /// Retire a direct or blocked staged flow after its terminal conn_state is
     /// published. The exact tombstone prevents this tuple from being reused
-    /// until the removal worker acknowledges the kernel handoff.
+    /// until the removal worker acknowledges the kernel handoff. A reload that
+    /// cancelled initialization after the backend committed still hands off:
+    /// the userspace retirement path cannot reclaim a finished kernel state.
     #[cfg(any(feature = "ebpf", test))]
     pub(in crate::control) fn commit_kernel_handoff(&mut self) -> bool {
         let mut occupied = match self.pool.endpoints.entry(self.key) {
@@ -586,21 +597,21 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
-        if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) {
             return false;
         }
         if !matches!(
             occupied.get(),
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token
+                    && initializing.owner == self.owner
         ) {
             return false;
         }
         self.pool.active_retirements.fetch_add(1, Ordering::AcqRel);
         let entry = occupied.insert(EndpointEntry::Retiring {
             generation: self.generation,
-            token: self.decision_token,
+            owner: self.owner,
             io: None,
             #[cfg(feature = "native-api")]
             native_terminal: self.initializer.native_terminal.get().cloned(),
@@ -610,14 +621,14 @@ impl UdpInitLease {
         drop(entry);
         drop(self.first.take());
         drop(self.connection_guard.take());
-        self.pool.notify_removed(
-            SocketAddr::new(self.key.client_ip(), self.key.client_port),
-            SocketAddr::new(self.key.dst_ip(), self.key.dst_port),
+        self.pool.notify_removed(EndpointRemoval {
+            client: SocketAddr::new(self.key.client_ip(), self.key.client_port),
+            dst: SocketAddr::new(self.key.dst_ip(), self.key.dst_port),
             conn_id,
-            RemovalReason::KernelHandoff,
-            self.decision_token,
-            self.generation,
-        );
+            reason: RemovalReason::KernelHandoff,
+            owner: self.owner,
+            generation: self.generation,
+        });
         self.committed = true;
         true
     }
@@ -629,7 +640,7 @@ impl Drop for UdpInitLease {
             drop(self.first.take());
             drop(self.connection_guard.take());
             self.pool
-                .retire_if_same(self.key, self.decision_token, self.generation);
+                .retire_if_same(self.key, self.owner.token, self.generation);
         }
     }
 }
@@ -796,13 +807,19 @@ impl UdpEndpointPool {
         self: &Arc<Self>,
         vacant: dashmap::mapref::entry::VacantEntry<'_, EndpointKey, EndpointEntry>,
         data: DatagramPayload<'_>,
-        decision_token: u32,
+        owner: UdpFlowOwner,
         raw_dns_route: Option<RawDnsRoute<&str>>,
         expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
         stats: &StatsManager,
     ) -> EndpointReservation {
+        if (raw_dns_route.is_some()
+            || owner.is_stateless(vacant.key().client_port, vacant.key().dst_port))
+            && owner.incarnation.is_some()
+        {
+            return EndpointReservation::IdentityMismatch;
+        }
         let reservation_epoch = expected_epoch;
         #[cfg(test)]
         self.pause_before_reservation_gate();
@@ -843,7 +860,7 @@ impl UdpEndpointPool {
         }
         let epoch = *epoch_gate;
         let initializer = Arc::new(InitializingEndpoint {
-            decision_token,
+            owner,
             generation,
             epoch,
             raw_dns_route,
@@ -866,7 +883,7 @@ impl UdpEndpointPool {
             pool: Arc::clone(self),
             key,
             generation,
-            decision_token,
+            owner,
             first: Some(first),
             _slow_permit: slow_permit,
             cancellation,
@@ -898,6 +915,7 @@ impl UdpEndpointPool {
             dst,
             data,
             None,
+            UdpFlowOwner::new(0, None).expect("model UDP owner"),
             expected_epoch,
             slow_permit,
             queue_now(),
@@ -912,6 +930,7 @@ impl UdpEndpointPool {
         dst: SocketAddr,
         data: &[u8],
         raw_dns_route: Option<RawDnsRoute<&str>>,
+        owner: UdpFlowOwner,
         expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
@@ -922,6 +941,7 @@ impl UdpEndpointPool {
             dst,
             DatagramPayload::Borrowed(data),
             raw_dns_route,
+            owner,
             expected_epoch,
             slow_permit,
             enqueued_at,
@@ -936,6 +956,7 @@ impl UdpEndpointPool {
         dst: SocketAddr,
         data: DatagramPayload<'_>,
         raw_dns_route: Option<RawDnsRoute<&str>>,
+        owner: UdpFlowOwner,
         expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
@@ -951,8 +972,9 @@ impl UdpEndpointPool {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
                     let (stale_token, stale_generation) = match occupied.get() {
                         EndpointEntry::Initializing(initializing) => {
-                            if initializing.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
-                                != raw_dns_route
+                            if initializing.owner != owner
+                                || initializing.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
+                                    != raw_dns_route
                             {
                                 return EndpointReservation::IdentityMismatch;
                             }
@@ -973,7 +995,7 @@ impl UdpEndpointPool {
                                 initializing.native_terminal.get(),
                             ) {
                                 EndpointReservation::QueueClosed => {
-                                    (initializing.decision_token, initializing.generation)
+                                    (initializing.owner.token, initializing.generation)
                                 }
                                 other => return other,
                             }
@@ -982,8 +1004,9 @@ impl UdpEndpointPool {
                             if ready.alive.load(Ordering::Acquire)
                                 && !ready.endpoint.dead.load(Ordering::Acquire) =>
                         {
-                            if ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
-                                != raw_dns_route
+                            if ready.owner != owner
+                                || ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref)
+                                    != raw_dns_route
                             {
                                 return EndpointReservation::IdentityMismatch;
                             }
@@ -997,12 +1020,12 @@ impl UdpEndpointPool {
                                 ready.endpoint.native.terminal(),
                             ) {
                                 EndpointReservation::QueueClosed => {
-                                    (ready.decision_token, ready.generation)
+                                    (ready.owner.token, ready.generation)
                                 }
                                 other => return other,
                             }
                         }
-                        EndpointEntry::Ready(ready) => (ready.decision_token, ready.generation),
+                        EndpointEntry::Ready(ready) => (ready.owner.token, ready.generation),
                         EndpointEntry::Retiring { .. } => {
                             stats.record_udp_queue_closed();
                             return EndpointReservation::QueueClosed;
@@ -1015,7 +1038,7 @@ impl UdpEndpointPool {
                     return self.reserve_new_at(
                         vacant,
                         data,
-                        0,
+                        owner,
                         raw_dns_route,
                         expected_epoch,
                         slow_permit,
@@ -1045,7 +1068,7 @@ impl UdpEndpointPool {
             client,
             dst,
             data,
-            decision_token,
+            UdpFlowOwner::new(decision_token, None).expect("model UDP owner"),
             expected_generation,
             slow_permit,
             std::time::Instant::now(),
@@ -1060,7 +1083,7 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: Bytes,
-        decision_token: u32,
+        owner: UdpFlowOwner,
         expected_generation: Option<u64>,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: std::time::Instant,
@@ -1071,7 +1094,7 @@ impl UdpEndpointPool {
             stats.record_udp_queue_closed();
             return EndpointReservation::QueueClosed;
         }
-        if decision_token == 0 {
+        if owner.token == 0 {
             return EndpointReservation::IdentityMismatch;
         }
 
@@ -1085,7 +1108,7 @@ impl UdpEndpointPool {
                         EndpointReservation::IdentityMismatch
                     };
                 };
-                if !occupied.get().matches_identity(generation, decision_token) {
+                if occupied.get().generation() != generation || occupied.get().owner() != owner {
                     return EndpointReservation::IdentityMismatch;
                 }
                 match occupied.get() {
@@ -1125,7 +1148,7 @@ impl UdpEndpointPool {
                 self.reserve_new_at(
                     vacant,
                     DatagramPayload::Owned(data),
-                    decision_token,
+                    owner,
                     None,
                     self.initialization_epoch(),
                     slow_permit,
@@ -1151,7 +1174,7 @@ impl UdpEndpointPool {
             client,
             dst,
             data,
-            decision_token,
+            UdpFlowOwner::new(decision_token, None).expect("model UDP owner"),
             std::time::Instant::now(),
             stats,
         )
@@ -1164,12 +1187,12 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: Bytes,
-        decision_token: u32,
+        owner: UdpFlowOwner,
         enqueued_at: std::time::Instant,
         stats: &StatsManager,
     ) -> Result<u64, OwnedEnqueueError> {
         let enqueued_at = queue_timestamp(enqueued_at);
-        if decision_token == 0 {
+        if owner.token == 0 {
             return Err(OwnedEnqueueError::IdentityMismatch);
         }
         if self.terminal.load(Ordering::Acquire) {
@@ -1179,25 +1202,24 @@ impl UdpEndpointPool {
         let Some(entry) = self.endpoints.get(&EndpointKey::new(client, dst)) else {
             return Err(OwnedEnqueueError::IdentityMismatch);
         };
+        if entry.owner() != owner {
+            return Err(OwnedEnqueueError::IdentityMismatch);
+        }
         let (generation, result) = match entry.value() {
-            EndpointEntry::Initializing(initializing)
-                if initializing.decision_token == decision_token =>
-            {
-                (
-                    initializing.generation,
-                    self.enqueue_at(
-                        &initializing.queue_tx,
-                        &initializing.flow_slots,
-                        DatagramPayload::Owned(data),
-                        enqueued_at,
-                        stats,
-                        #[cfg(feature = "native-api")]
-                        initializing.native_terminal.get(),
-                    ),
-                )
-            }
+            EndpointEntry::Initializing(initializing) if initializing.owner == owner => (
+                initializing.generation,
+                self.enqueue_at(
+                    &initializing.queue_tx,
+                    &initializing.flow_slots,
+                    DatagramPayload::Owned(data),
+                    enqueued_at,
+                    stats,
+                    #[cfg(feature = "native-api")]
+                    initializing.native_terminal.get(),
+                ),
+            ),
             EndpointEntry::Ready(ready)
-                if ready.decision_token == decision_token
+                if ready.owner == owner
                     && ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
@@ -1214,7 +1236,7 @@ impl UdpEndpointPool {
                     ),
                 )
             }
-            EndpointEntry::Retiring { token, .. } if *token == decision_token => {
+            EndpointEntry::Retiring { owner: current, .. } if *current == owner => {
                 stats.record_udp_queue_closed();
                 return Err(OwnedEnqueueError::QueueClosed);
             }
@@ -1284,12 +1306,12 @@ impl UdpEndpointPool {
                         #[cfg(feature = "native-api")]
                         ready.endpoint.native.terminal(),
                     ),
-                    (ready.decision_token, ready.generation),
+                    (ready.owner.token, ready.generation),
                 )
             }
             EndpointEntry::Ready(ready) => (
                 EndpointReservation::QueueClosed,
-                (ready.decision_token, ready.generation),
+                (ready.owner.token, ready.generation),
             ),
             EndpointEntry::Retiring { .. } => {
                 stats.record_udp_queue_closed();

@@ -95,6 +95,14 @@ impl UiDownloadTask {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_handle(handle: JoinHandle<()>) -> Self {
+        Self {
+            stop: watch::channel(false).0,
+            handle: Some(handle),
+        }
+    }
 }
 
 impl Drop for UiDownloadTask {
@@ -214,6 +222,7 @@ async fn decide_route(
             "external UI download",
             (host, port),
             original,
+            None,
         )
         .await
         .map(|decision| decision.route)
@@ -479,9 +488,9 @@ async fn receive(
     Ok(ProxiedFetch::Body)
 }
 
-/// The archive being downloaded: an unlinked private file beside the target
-/// directory, so the download is not held in memory, stays on the target's
-/// filesystem and leaves nothing behind on any path.
+/// The archive being downloaded: an unlinked private file inside the output
+/// directory, so the download is not held in memory, stays on its filesystem
+/// and leaves nothing behind on any path.
 struct ArchiveFile {
     file: tokio::fs::File,
     len: usize,
@@ -489,13 +498,9 @@ struct ArchiveFile {
 }
 
 impl ArchiveFile {
-    fn create(target: &Path) -> std::io::Result<Self> {
-        let parent = match target.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
+    fn create(directory: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            file: tokio::fs::File::from_std(unlinked_file(parent)?),
+            file: tokio::fs::File::from_std(unlinked_file(directory)?),
             len: 0,
             limit: MAX_ARCHIVE_BYTES,
         })
@@ -1118,10 +1123,9 @@ mod tests {
 
         let addr = spawn_zip_server(vec![7; 64]).await;
         let dir = tempfile::tempdir().unwrap();
-        let ui = dir.path().join("ui");
         let fetch = |limit| {
             let url = format!("http://{addr}/ui.zip");
-            let mut archive = ArchiveFile::create(&ui).unwrap();
+            let mut archive = ArchiveFile::create(dir.path()).unwrap();
             archive.limit = limit;
             async move {
                 let direct = fetch_direct(&url, None, &mut archive, &mut None).await;
@@ -1147,6 +1151,20 @@ mod tests {
         let metadata = file.metadata().unwrap();
         assert_eq!((metadata.nlink(), metadata.mode() & 0o777), (0, 0o600));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A writable output directory under an unwritable parent must be enough.
+    #[tokio::test]
+    async fn the_archive_is_opened_inside_the_output_directory_not_beside_it() {
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ui = dir.path().join("ui");
+        std::fs::create_dir(&ui).unwrap();
+        let archive = ArchiveFile::create(&ui).unwrap();
+        let opened =
+            std::fs::read_link(format!("/proc/self/fd/{}", archive.file.as_raw_fd())).unwrap();
+        assert!(opened.starts_with(&ui), "{}", opened.display());
     }
 
     #[tokio::test]
@@ -1200,7 +1218,7 @@ mod tests {
         let error = fetch_routed(
             &test_ctx(dir.path(), &rules),
             &format!("http://{addr}/redirect"),
-            &mut ArchiveFile::create(&dir.path().join("ui")).unwrap(),
+            &mut ArchiveFile::create(dir.path()).unwrap(),
             &mut None,
         )
         .await
@@ -1353,7 +1371,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ui-parent", "ui-child"]
         );
-        let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+        let mut archive = ArchiveFile::create(dir.path()).unwrap();
         let url = reqwest::Url::parse(&format!("http://{addr}/ui.zip")).unwrap();
         let fetched = fetch_proxied(
             &ctx,
@@ -1445,7 +1463,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ui-direct"]
         );
-        let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+        let mut archive = ArchiveFile::create(dir.path()).unwrap();
         let fetched = fetch_direct(
             &format!("http://{addr}/ui.zip"),
             feedback,
@@ -1518,7 +1536,7 @@ mod tests {
                 });
                 let url = format!("http://{address}/ui.zip");
                 let dir = tempfile::tempdir().unwrap();
-                let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+                let mut archive = ArchiveFile::create(dir.path()).unwrap();
                 let healthy = fetch_direct(&url, None, &mut archive, &mut None)
                     .await
                     .unwrap();
@@ -1530,7 +1548,7 @@ mod tests {
                 }
                 .install_default()
                 .unwrap();
-                let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+                let mut archive = ArchiveFile::create(dir.path()).unwrap();
                 let error = fetch_direct(&url, None, &mut archive, &mut None)
                     .await
                     .err()
@@ -1624,7 +1642,7 @@ mod tests {
             config.experimental.clash_api.external_ui_download_detour = "ui-score".into();
         }
         *ctx.group_manager.write() = Arc::clone(&manager);
-        let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+        let mut archive = ArchiveFile::create(dir.path()).unwrap();
         assert!(
             fetch_routed(
                 &ctx,

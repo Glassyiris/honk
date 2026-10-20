@@ -521,6 +521,7 @@ impl ControlPlane {
             connection_pool: self.connection_pool.clone(),
             connection_tracker: self.connection_tracker.clone(),
             tcp_flow_pins: self.tcp_flow_pins.clone(),
+            retirement: Arc::clone(&self.retirement),
             mode_state: self.mode_state.clone(),
         }
     }

@@ -24,7 +24,13 @@ impl SupervisorState {
                 Ok(Some(nodes)) => {
                     honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
                     let count = nodes.len();
-                    if !self.add_startup_nodes(&mut config.nodes, subscription, nodes, true) {
+                    if !self.add_startup_nodes(
+                        &mut config.nodes,
+                        subscription,
+                        nodes,
+                        true,
+                        SubscriptionUserinfo::default(),
+                    ) {
                         continue;
                     }
                     crate::config_diagnostics::declare_provider_diagnostics(
@@ -100,9 +106,9 @@ impl SupervisorState {
                         } = completion;
                         let subscription = authorized.subscription;
                         match result {
-                            Some(Ok(nodes)) => {
+                            Some(Ok((nodes, userinfo))) => {
                                 let count = nodes.len();
-                                if self.add_startup_nodes(&mut config.nodes, &subscription, nodes, false) {
+                                if self.add_startup_nodes(&mut config.nodes, &subscription, nodes, false, userinfo) {
                                     startup_diagnostics
                                         .replace_provider(subscription.id, diagnostics);
                                     info!(
@@ -159,6 +165,7 @@ impl SupervisorState {
         subscription: &Subscription,
         nodes: Vec<Node>,
         cached: bool,
+        userinfo: SubscriptionUserinfo,
     ) -> bool {
         let mut ids: HashSet<_> = current
             .iter()
@@ -180,6 +187,7 @@ impl SupervisorState {
         current.extend(nodes);
         *load = ProviderLoad {
             updated_at: Some(SystemTime::now()),
+            userinfo,
             cached,
             error: None,
             rejection: None,

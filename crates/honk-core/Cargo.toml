@@ -127,6 +127,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
 dns-bench = []
+udp-bench = []
 reload-bench = []
 reload-alloc-bench = ["reload-bench"]
 reload-bench-counters = ["reload-bench"]
@@ -138,6 +139,9 @@ flate2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 aya-ebpf-bindings.workspace = true
+# Independent Shadowsocks AEAD key schedule in the full-cone fixtures.
+md-5.workspace = true
+sha1.workspace = true
 nix = { workspace = true, features = ["signal"] }
 # Test utilities
 tokio = { workspace = true, features = ["test-util"] }
@@ -162,6 +166,11 @@ required-features = ["dns-bench"]
 [[bench]]
 name = "udp"
 harness = false
+
+[[bench]]
+name = "udp_io"
+harness = false
+required-features = ["udp-bench"]
 
 [[bench]]
 name = "reload"

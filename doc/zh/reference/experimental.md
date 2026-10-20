@@ -14,7 +14,7 @@
 
 ## `native_api`
 
-需要显式编译 Cargo feature `native-api`（以 `--features native-api` 或 `native-ui` 构建；发布产物包含），不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有生效字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
+需要显式编译 Cargo feature `native-api`（以 `--features native-api` 或 `native-ui` 构建；full 与 `-native-api` 发布产物包含），不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有生效字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ experimental {
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api)。
 
-单文件部署可使用发布产物，或执行 `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`，并设置 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。静态资源不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
+单文件部署可使用 full 发布产物，或执行 `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`，并设置 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。静态资源不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
 
 配置文件中的 geodata 来源由管理员配置、需重启，不能通过源写入修改。启用状态数据库时，下载还可使用已认证的 URL 覆盖或内置来源；拒绝 userinfo、fragment、redirect 与 content encoding。直连的域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS。`assets.geodata.route` 或已存储的路由可改为遵循路由规则或经过组下载；路由无法承载请求时不会回退到直连。更新使用适用的配置文件、已存储或内置来源。[主文件条目与 geodata 契约](./api.md#主文件条目与-geodata-管理)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
 
@@ -103,7 +103,7 @@ Dashboard 下载 URL 与出口见 [`assets.ui`](./assets.md)。
 
 绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `assets.ui.url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
-`assets.ui.route` 优先于 `assets.route`，适用于初始请求及每次重定向。`direct` 直接下载，路由规则选中 `block` 时中止下载，组则为每次请求解析其权威叶节点。未配置出口时，每个 URL 遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。压缩包写入目标父目录中一个无文件名的私有文件，不保存在内存中；解压结束或下载失败后不留下任何文件。解压超过 10,000 个条目或 128 MiB 内容（与压缩包本身的上限相同）时拒绝继续，已写入的目录被清空，下次启动时重新下载。
+`assets.ui.route` 优先于 `assets.route`，适用于初始请求及每次重定向。`direct` 直接下载，路由规则选中 `block` 时中止下载，组则为每次请求解析其权威叶节点。未配置出口时，每个 URL 遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。压缩包写入目标目录中一个无文件名的私有文件，不保存在内存中；解压结束或下载失败后不留下任何文件。解压超过 10,000 个条目或 128 MiB 内容（与压缩包本身的上限相同）时拒绝继续，已写入的目录被清空，下次启动时重新下载。
 
 ### 启动模式
 

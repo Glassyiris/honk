@@ -593,17 +593,24 @@ impl RealEbpfBackend {
     /// Load the production object without attaching any network or cgroup hook.
     /// The resulting backend can publish a real generated policy and exercise
     /// the optional `routing_test` classifier with `BPF_PROG_TEST_RUN`.
-    pub(crate) fn load_routing_test_fixture(obj: &[u8], param: DaeParam) -> anyhow::Result<Self> {
+    pub(crate) fn load_routing_test_fixture(
+        obj: &[u8],
+        mut param: DaeParam,
+    ) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
         anyhow::ensure!(
             version >= (6, 12, 0),
             "routing tests require Linux 6.12 or newer"
         );
+        layout::validate_object(obj)?;
+        param.tcp_daens_netns_id = crate::daens::daens_netns_id()?;
         let mut loader = EbpfLoader::new();
         loader.override_global("PARAM", &param, true);
-        let bpf = loader.load(obj)?;
-        validate_routing_handoff_layout(&bpf)?;
+        let mut bpf = loader.load(obj)?;
+        layout::validate_loaded_maps(&bpf)?;
+        let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
+        let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
         Ok(Self {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),
@@ -618,8 +625,15 @@ impl RealEbpfBackend {
             listeners_published: false,
             log_flush_handle: None,
             event_flush_handle: None,
-            cap_lookup_and_delete: BatchCapability::new(),
+            expiry_hints: None,
+            retirement_grace_inner,
+            retirement_owner: 0,
+            retirement_failed: false,
+            retirement_faults: Default::default(),
+            tcp_proof_link: None,
             cap_lookup_batch: BatchCapability::new(),
+            cap_flow_lookup_batch: BatchCapability::new(),
+            tcp_live_pins,
             routing_generation: None,
             routing_slot: 0,
             routing_generation_counter: 0,
@@ -634,6 +648,7 @@ impl RealEbpfBackend {
             #[cfg(feature = "native-api")]
             receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
+            aux_deletes: Default::default(),
         })
     }
 

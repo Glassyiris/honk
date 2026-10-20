@@ -2,13 +2,17 @@ use super::*;
 
 use honk_ebpf_common::{ConnState, NFQUEUE_PENDING_MARK, RoutingMeta};
 
+mod batching;
+mod kernel_reclamation;
+mod retirement;
+
 fn identity(token: u32, generation: u64) -> PendingUdpIdentity {
     PendingUdpIdentity::new(
         FlowKey::new(
             "192.0.2.10:40000".parse().unwrap(),
             "198.51.100.20:443".parse().unwrap(),
         ),
-        token,
+        crate::ebpf::UdpFlowOwner::new(token, None).unwrap(),
         generation,
     )
 }
@@ -158,43 +162,8 @@ fn held_guards_preserve_fifo_without_retaining_payloads() {
     );
 }
 
-#[tokio::test]
-async fn cancel_token_mismatch_drops_local_guards_and_marks_cell_dead() {
-    let identity = identity(11, 3);
-    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
-    backend
-        .udp_conn_state_store(
-            &identity.tuples(),
-            &ConnState {
-                state: UdpDecisionState::Pending as u8,
-                decision_token: 12,
-                ..ConnState::default()
-            },
-        )
-        .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-    let endpoints = Arc::new(UdpEndpointPool::new());
-    let stats = Arc::new(StatsManager::new());
-    let (pending, _fatal) = PendingUdpVerdicts::new(backend, endpoints, stats);
-    let sink = Arc::new(Mutex::new(Vec::new()));
-    let cell = Arc::new(FlowCell::pending(
-        identity,
-        Instant::now(),
-        HeldVerdict::test(1, Instant::now(), Arc::clone(&sink)),
-        test_flow_slot(),
-    ));
-    pending.cells.insert(identity.key, Arc::clone(&cell));
-
-    assert!(matches!(
-        pending.cancel(identity).await,
-        Err(PendingUdpDecisionError::StaleIdentity)
-    ));
-    assert!(matches!(&*cell.state.lock(), CellState::Dead { .. }));
-    assert_eq!(*sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
-}
-
 struct DecisionFixture {
-    pending: PendingUdpVerdicts,
+    pending: Arc<PendingUdpVerdicts>,
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
     lease: UdpInitLease,
     identity: PendingUdpIdentity,
@@ -204,8 +173,14 @@ struct DecisionFixture {
 }
 
 fn pending_fixture(token: u32) -> DecisionFixture {
+    pending_fixture_with(token, crate::ebpf::mock::MockEbpfBackend::new())
+}
+
+fn pending_fixture_with(
+    token: u32,
+    mut mock: crate::ebpf::mock::MockEbpfBackend,
+) -> DecisionFixture {
     let key = identity(token, 0).key;
-    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
     mock.seed_staged_udp_flow(
         &key.tuples(),
         ConnState {
@@ -253,7 +228,7 @@ fn pending_fixture(token: u32) -> DecisionFixture {
     );
     stats.increment_udp_nfqueue_active_flows();
     DecisionFixture {
-        pending,
+        pending: Arc::new(pending),
         backend,
         lease,
         identity,
@@ -284,7 +259,7 @@ fn armed_direct_follower_queues_without_slow_or_endpoint_admission() {
 
     let result = fixture.pending.ingest_existing(
         Arc::clone(&cell),
-        fixture.identity.decision_token,
+        fixture.identity.owner.token,
         bytes::Bytes::from_static(b"discarded armed payload"),
         HeldVerdict::test(2, Instant::now(), Arc::clone(&fixture.sink)),
         None,
@@ -330,7 +305,7 @@ fn armed_direct_verdicts_are_bounded_per_flow() {
 
     let result = fixture.pending.ingest_existing(
         Arc::clone(&cell),
-        fixture.identity.decision_token,
+        fixture.identity.owner.token,
         bytes::Bytes::from_static(b"bounded armed payload"),
         HeldVerdict::test(
             MAX_HELD_VERDICTS_PER_FLOW as u64 + 1,
@@ -419,18 +394,17 @@ async fn armed_direct_backend_wait_is_bounded_by_hold_deadline() {
     let DecisionFixture {
         pending,
         backend,
-        mut lease,
+        lease,
         identity,
         sink,
         mut fatal,
         ..
     } = pending_fixture(26);
-    let pending = Arc::new(pending);
     let initial_reader = backend.read().await;
     let activation_pending = Arc::clone(&pending);
     let activation = tokio::spawn(async move {
         activation_pending
-            .activate_direct(identity, &mut lease, 0x1200)
+            .activate_direct(identity, lease, 0x1200)
             .await
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -460,7 +434,7 @@ async fn armed_direct_backend_wait_is_bounded_by_hold_deadline() {
     assert!(matches!(
         pending.ingest_existing(
             cell,
-            identity.decision_token,
+            identity.owner.token,
             bytes::Bytes::from_static(b"armed follower"),
             HeldVerdict::test(2, Instant::now(), Arc::clone(&sink)),
             None,
@@ -507,7 +481,7 @@ async fn wait_empty_includes_cleanup_blocked_on_backend() {
     let pending = Arc::new(pending);
     pending.schedule_cleanup(CleanupRequest::Token {
         key: identity.key,
-        decision_token: identity.decision_token,
+        decision_token: identity.owner.token,
     });
 
     let backend_guard = backend.write().await;
@@ -532,7 +506,7 @@ async fn wait_empty_includes_cleanup_blocked_on_backend() {
         backend
             .read()
             .await
-            .udp_conn_state_lookup(&identity.tuples())
+            .conn_state_lookup(&identity.tuples())
             .unwrap()
             .is_none()
     );
@@ -580,7 +554,7 @@ async fn direct_arms_accepts_fifo_then_activates_without_copying_payload() {
 
     fixture
         .pending
-        .activate_direct(fixture.identity, &mut fixture.lease, 0x1200)
+        .activate_direct(fixture.identity, fixture.lease, 0x1200)
         .await
         .unwrap();
 
@@ -601,12 +575,12 @@ async fn direct_arms_accepts_fifo_then_activates_without_copying_payload() {
         .backend
         .read()
         .await
-        .udp_conn_state_lookup(&fixture.identity.tuples())
+        .conn_state_lookup(&fixture.identity.tuples())
         .unwrap()
         .unwrap();
     let raw = unsafe { state.meta.raw };
     assert_eq!(state.state, UdpDecisionState::None as u8);
-    assert_eq!(state.decision_token, fixture.identity.decision_token);
+    assert_eq!(state.decision_token, fixture.identity.owner.token);
     assert_eq!(raw & 0xff, OutboundIndex::Direct as u64);
     assert_eq!(((raw >> 8) & u32::MAX as u64) as u32, 0x1200);
     assert_ne!(raw & ROUTING_META_FLAG_OFFLOAD, 0);
@@ -635,12 +609,12 @@ async fn proxy_commits_before_dropping_original_and_retains_copied_payload() {
         .backend
         .read()
         .await
-        .udp_conn_state_lookup(&fixture.identity.tuples())
+        .conn_state_lookup(&fixture.identity.tuples())
         .unwrap()
         .unwrap();
     let raw = unsafe { state.meta.raw };
     assert_eq!(state.state, UdpDecisionState::Proxy as u8);
-    assert_eq!(state.decision_token, fixture.identity.decision_token);
+    assert_eq!(state.decision_token, fixture.identity.owner.token);
     assert_eq!(raw & 0xff, 4);
     assert_eq!(((raw >> 8) & u32::MAX as u64) as u32, 0x3400);
     assert_eq!(raw & ROUTING_META_FLAG_OFFLOAD, 0);
@@ -658,7 +632,7 @@ async fn block_commits_then_drops_original_and_retires_initializer() {
     let mut fixture = pending_fixture(23);
     fixture
         .pending
-        .block(fixture.identity, &mut fixture.lease)
+        .block(fixture.identity, fixture.lease)
         .await
         .unwrap();
 
@@ -667,40 +641,14 @@ async fn block_commits_then_drops_original_and_retires_initializer() {
         .backend
         .read()
         .await
-        .udp_conn_state_lookup(&fixture.identity.tuples())
+        .conn_state_lookup(&fixture.identity.tuples())
         .unwrap()
         .unwrap();
     let raw = unsafe { state.meta.raw };
     assert_eq!(state.state, UdpDecisionState::Block as u8);
-    assert_eq!(state.decision_token, fixture.identity.decision_token);
+    assert_eq!(state.decision_token, fixture.identity.owner.token);
     assert_eq!(raw & 0xff, OutboundIndex::Block as u64);
     assert_eq!(fixture.stats.udp_snapshot().nfqueue.block, 1);
-    assert!(matches!(
-        fixture.fatal.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
-}
-
-#[tokio::test]
-async fn cancel_drops_original_and_removes_exact_pending_state() {
-    let mut fixture = pending_fixture(24);
-    let cancellation = fixture.lease.wait_cancellation();
-    fixture.pending.cancel(fixture.identity).await.unwrap();
-    tokio::time::timeout(Duration::from_millis(100), cancellation)
-        .await
-        .expect("pending cancellation must wake the exact initializer");
-
-    assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
-    assert!(
-        fixture
-            .backend
-            .read()
-            .await
-            .udp_conn_state_lookup(&fixture.identity.tuples())
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(fixture.stats.udp_snapshot().nfqueue.cancel, 1);
     assert!(matches!(
         fixture.fatal.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -806,7 +754,7 @@ async fn active_direct_follower_does_not_wait_for_backend() {
             destination: fixture.identity.destination(),
         },
         payload: bytes::Bytes::from_static(b"direct follower"),
-        mark: honk_ebpf_common::pack_nfqueue_mark(fixture.identity.decision_token).unwrap(),
+        mark: honk_ebpf_common::pack_nfqueue_mark(fixture.identity.owner.token).unwrap(),
         priority: None,
         received_at,
     };
@@ -874,7 +822,7 @@ async fn rejected_dns_carrier_never_aborts_an_ordinary_token_incarnation() {
     let backend = backend.read().await;
     assert_eq!(
         backend
-            .udp_conn_state_lookup(&dns.tuples())
+            .conn_state_lookup(&dns.tuples())
             .unwrap()
             .unwrap()
             .decision_token,
@@ -883,7 +831,7 @@ async fn rejected_dns_carrier_never_aborts_an_ordinary_token_incarnation() {
     );
     assert!(
         backend
-            .udp_conn_state_lookup(&ordinary.tuples())
+            .conn_state_lookup(&ordinary.tuples())
             .unwrap()
             .is_none(),
         "known rejected ordinary packets still retire their exact pending token"

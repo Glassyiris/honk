@@ -180,13 +180,15 @@ impl super::GroupManager {
                     observation: None,
                 };
             };
-            if group.policy != honk_config::group::GroupPolicy::URLTest {
+            let pinned = group.policy == honk_config::group::GroupPolicy::URLTest
+                && self.selector_member(group, context.network).is_some();
+            if group.policy != honk_config::group::GroupPolicy::URLTest || pinned {
                 return observation::decision(
                     group,
                     context.health_family,
                     super::SelectionEffects::Peek,
                     || {
-                        observation::reason("not_urltest");
+                        observation::reason(if pinned { "pinned" } else { "not_urltest" });
                         self.score_selection_plan(
                             Vec::new(),
                             super::SelectionPlanMode::Authoritative,
@@ -275,7 +277,7 @@ impl super::GroupManager {
         })
     }
 
-    fn score_selection_plan<'a>(
+    pub(super) fn score_selection_plan<'a>(
         &'a self,
         candidates: Vec<super::Candidate<'a>>,
         mode: super::SelectionPlanMode,
@@ -986,91 +988,5 @@ impl super::GroupManager {
             ScoreSelectionRules::default(),
         )
         .map(|candidate| candidate.tag().to_owned())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use honk_config::group::{Group, GroupPolicy};
-    use honk_config::node::Node;
-
-    #[test]
-    fn publication_between_ranking_and_plan_construction_refuses_node_work() {
-        let nodes = ["a", "b"].map(|name| Node {
-            id: Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
-            name: name.into(),
-            ..Default::default()
-        });
-        let group = Group {
-            id: Uuid::new_v4(),
-            name: "score".into(),
-            policy: GroupPolicy::Score,
-            nodes: nodes.iter().map(|node| node.id).collect(),
-            ..Default::default()
-        };
-        let manager = GroupManager::new(std::slice::from_ref(&group), &nodes);
-        // Trials only serve challengers with fewer completions than the ordinary selection.
-        manager.score_state().inner.lock().aggregate.put(
-            AggregateKey {
-                group: "score".into(),
-                network: SelectionNetwork::Tcp,
-                family: None,
-                node_id: nodes[0].id,
-            },
-            Stats {
-                setup_success: 1.0,
-                updated_at: Some(Instant::now()),
-                ..Default::default()
-            },
-        );
-        let context = ScoreSelectionContext {
-            network: SelectionNetwork::Tcp,
-            probe_domain: ProbeDomain::Tcp,
-            target_family: Some(IpVersion::V4),
-            health_family: IpVersion::V4,
-            target: Some(ScoreTarget::domain("reload.example", 443)),
-        };
-        let (mode, candidates) = manager.selection_candidates_for_target(
-            &group,
-            &context,
-            &mut Vec::new(),
-            0,
-            SelectionEffects::Apply,
-            ScoreSelectionRules {
-                cold_urltest: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            manager
-                .score_budget_counters("score", SelectionNetwork::Tcp)
-                .reserved,
-            1
-        );
-        let replacement = GroupManager::with_alive_set_and_score_state(
-            std::slice::from_ref(&group),
-            &nodes,
-            None,
-            manager.score_state(),
-        );
-        replacement.publish_score_membership();
-        let published = replacement.score_budget_counters("score", SelectionNetwork::Tcp);
-        let plan = manager.score_selection_plan(candidates, mode, &context, None);
-        assert!(
-            !plan.entries[0]
-                .feedback
-                .as_ref()
-                .is_none_or(|attempt| attempt.begin().is_ok())
-        );
-        assert_eq!(
-            replacement.score_budget_counters("score", SelectionNetwork::Tcp),
-            published
-        );
-        assert_eq!(replacement.score_state().root_business_starts(), 0);
-        assert_eq!(
-            (published.reserved, published.spent, published.refunded),
-            (0, 0, 1)
-        );
     }
 }

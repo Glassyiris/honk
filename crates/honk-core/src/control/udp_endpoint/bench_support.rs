@@ -3,10 +3,16 @@
 //! These helpers exercise the production reservation and Ready fast-path
 //! state machines without duplicating them. They create no socket, runtime,
 //! or task; all resources are dropped and checked before a batch returns.
+//! `real_io` (feature `udp-bench`) is the exception: it owns loopback sockets
+//! and spawns the production driver for the real-I/O benchmark.
+
+#[cfg(feature = "udp-bench")]
+pub mod real_io;
 
 use super::{
     EndpointReservation, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY, UdpEndpoint, UdpEndpointPool,
 };
+use crate::ebpf::UdpFlowOwner;
 use crate::stats::StatsManager;
 use std::io;
 use std::net::SocketAddr;
@@ -100,6 +106,7 @@ impl QueuedBatch {
             destination,
             first,
             None,
+            UdpFlowOwner::new(0, None).expect("benchmark UDP owner"),
             pool.initialization_epoch(),
             acquire_slow_permit(&slow_slots),
             enqueued_at,
@@ -130,6 +137,7 @@ impl QueuedBatch {
             self.destination,
             payload,
             None,
+            UdpFlowOwner::new(0, None).expect("benchmark UDP owner"),
             self.pool.initialization_epoch(),
             acquire_slow_permit(&self.slow_slots),
             self.enqueued_at,
@@ -218,7 +226,7 @@ impl ReadyBatch {
         assert!(self.pool.complete_removal(
             removal.client,
             removal.dst,
-            removal.decision_token,
+            removal.owner,
             removal.generation,
         ));
         let pool = Arc::clone(&self.pool);
@@ -264,6 +272,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
             destination,
             b"rollback",
             None,
+            UdpFlowOwner::new(0, None).expect("benchmark UDP owner"),
             pool.initialization_epoch(),
             acquire_slow_permit(&slow_slots),
             enqueued_at,
@@ -279,7 +288,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
         assert!(pool.complete_removal(
             removal.client,
             removal.dst,
-            removal.decision_token,
+            removal.owner,
             removal.generation,
         ));
         assert_released(&pool, &slow_slots, iterations);

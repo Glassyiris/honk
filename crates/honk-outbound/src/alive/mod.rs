@@ -5,6 +5,7 @@ mod health;
 pub mod latencies;
 mod observations;
 mod probe;
+mod runner;
 mod urltest;
 
 #[cfg(test)]
@@ -18,7 +19,7 @@ pub use observations::{
     ProbeTicket, UrlProbeMember,
 };
 use parking_lot::{Mutex, RwLock};
-pub use probe::{HealthCheckError, HealthProbePermit, ProbeCancellation};
+pub use runner::{HealthCheckError, HealthProbePermit, ProbeCancellation};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -357,8 +358,8 @@ pub struct AliveDialerSet {
     trigger_tx: tokio::sync::mpsc::Sender<Uuid>,
     trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Uuid>>>,
     trigger_pending: Mutex<HashSet<Uuid>>,
-    health_control: Mutex<probe::HealthControl>,
-    health_mode: tokio::sync::watch::Sender<probe::HealthMode>,
+    health_control: Mutex<runner::HealthControl>,
+    health_mode: tokio::sync::watch::Sender<runner::HealthMode>,
     health_changed: tokio::sync::Notify,
     external_probes: Mutex<tokio::task::JoinSet<()>>,
     #[cfg(feature = "owned-tasks")]
@@ -435,7 +436,7 @@ impl AliveDialerSet {
     pub fn new() -> Self {
         const TRIGGER_QUEUE_CAPACITY: usize = 256;
         let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
-        let (health_mode, _) = tokio::sync::watch::channel(probe::HealthMode::Running);
+        let (health_mode, _) = tokio::sync::watch::channel(runner::HealthMode::Running);
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
@@ -449,7 +450,7 @@ impl AliveDialerSet {
             trigger_tx: tx,
             trigger_rx: Mutex::new(Some(rx)),
             trigger_pending: Mutex::new(HashSet::new()),
-            health_control: Mutex::new(probe::HealthControl::default()),
+            health_control: Mutex::new(runner::HealthControl::default()),
             health_mode,
             health_changed: tokio::sync::Notify::new(),
             external_probes: Mutex::new(tokio::task::JoinSet::new()),
@@ -750,7 +751,7 @@ impl AliveDialerSet {
 
     pub fn trigger_probe(&self, node_id: Uuid) {
         let _control = self.health_control.lock();
-        if *self.health_mode.borrow() != probe::HealthMode::Running {
+        if *self.health_mode.borrow() != runner::HealthMode::Running {
             return;
         }
         let mut pending = self.trigger_pending.lock();

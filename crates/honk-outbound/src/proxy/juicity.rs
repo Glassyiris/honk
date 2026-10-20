@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
-use bytes::Bytes;
 use honk_config::node::Node;
 use tracing::debug;
 
@@ -16,8 +15,10 @@ use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_e
 use crate::transport_quality::TransportQuality;
 
 use super::addr::SocksAddr as JuiceAddr;
+use super::uot::{AddrFraming, MAX_PACKET_SIZE};
 use super::{
-    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+    MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
+    ProxyStream, SharedSourceOutbound, TcpOutbound, WarmableOutbound,
 };
 
 const JUICITY_VERSION: u8 = 0x00;
@@ -218,11 +219,14 @@ impl JuicityHandler {
     }
 
     /// Open a bi stream and write the juicity request header
-    /// (`[network][metadata]`, `stream_conn.go:29-36`).
+    /// (`[network][metadata]`, `stream_conn.go:29-36`). `observe` publishes
+    /// the opener's request milestone; a shared UDP stream's header names only
+    /// its first destination, so its flows publish per datagram instead.
     async fn open_stream(
         conn: &quinn::Connection,
         network: u8,
         addr: &JuiceAddr,
+        observe: bool,
     ) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
         let (mut send, recv) = conn
             .open_bi()
@@ -236,8 +240,8 @@ impl JuicityHandler {
             .await
             .context("Juicity: send request header")
             .map_err(super::quic_carrier_error)?;
-        if let Some(observer) = crate::runtime::flow_observation::current() {
-            observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
+        if observe {
+            publish_request_sent();
         }
         Ok((send, recv))
     }
@@ -268,7 +272,7 @@ impl JuicityHandler {
             connect_timeout,
             move |conn| {
                 let addr = addr.clone();
-                async move { Self::open_stream(&conn, NETWORK_TCP, &addr).await }
+                async move { Self::open_stream(&conn, NETWORK_TCP, &addr, true).await }
             },
             |_| true,
             "Juicity",
@@ -287,14 +291,15 @@ impl JuicityHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        observe_open: bool,
+    ) -> anyhow::Result<Arc<JuicityUdpTransport>> {
         let stream_addr = JuiceAddr::new(target, target_domain)?;
         let mut last_error = None;
         for _ in 0..2 {
             let (conn, state) = client.connection(connect_timeout).await?;
             state.touch();
             let observation = crate::session::ObservedSessionOpen::start();
-            match Self::open_stream(&conn, NETWORK_UDP, &stream_addr).await {
+            match Self::open_stream(&conn, NETWORK_UDP, &stream_addr, observe_open).await {
                 Ok((send, recv)) => {
                     observation
                         .finish(crate::runtime::flow_observation::SessionEvent::OpenSucceeded);
@@ -310,10 +315,11 @@ impl JuicityHandler {
                     return Ok(Arc::new(JuicityUdpTransport {
                         state,
                         send: tokio::sync::Mutex::new(send),
+                        poison: super::FramePoison::default(),
                         recv: tokio::sync::Mutex::new(recv),
                         _guard: guard,
-                        target_addr: stream_addr,
                         target,
+                        target_domain: target_domain.map(Box::from),
                     }));
                 }
                 Err(error) => {
@@ -324,6 +330,43 @@ impl JuicityHandler {
             }
         }
         Err(last_error.expect("Juicity UDP stream attempts are non-empty"))
+    }
+
+    /// One UDP stream carrying every destination of a client source.
+    pub async fn prepare_udp_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        if !speculative {
+            let client = self.client_for_runtime(&runtime).await?;
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout, false)
+                .await?;
+            return Ok(PreparedUdpTransport::ready(
+                transport as Arc<dyn MultiTargetTransport>,
+            ));
+        }
+        let profiles = runtime.quic_flow_control_profiles()?;
+        let client = self
+            .build_client(runtime.node.as_ref(), Some(profiles))
+            .await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout, false)
+                .await?;
+            Ok(transport as Arc<dyn MultiTargetTransport>)
+        })
+        .await
+    }
+}
+
+fn publish_request_sent() {
+    if let Some(observer) = crate::runtime::flow_observation::current() {
+        observer.milestone_once(crate::runtime::flow_observation::Milestone::TargetRequestSent);
     }
 }
 
@@ -384,6 +427,21 @@ impl TcpOutbound for JuicityHandler {
 }
 
 #[async_trait]
+impl SharedSourceOutbound for JuicityHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        self.prepare_udp_source(runtime, target, target_domain, connect_timeout, speculative)
+            .await
+    }
+}
+
+#[async_trait]
 impl PacketOutbound for JuicityHandler {
     async fn dial_udp_transport(
         &self,
@@ -393,8 +451,9 @@ impl PacketOutbound for JuicityHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.build_client(node, None).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+            .await?)
     }
 
     async fn dial_udp_transport_runtime(
@@ -405,8 +464,9 @@ impl PacketOutbound for JuicityHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.client_for_runtime(&runtime).await?;
-        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+            .await?)
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -421,8 +481,10 @@ impl PacketOutbound for JuicityHandler {
             .build_client(runtime.node.as_ref(), Some(profiles))
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
-            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
-                .await
+            let transport = self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+                .await?;
+            Ok(transport as Arc<dyn PacketTransport>)
         })
         .await
     }
@@ -445,16 +507,23 @@ impl ProbeableOutbound for JuicityHandler {
 }
 
 /// Framed UDP transport over a Juicity UDP bi stream: datagrams are framed
-/// as `[metadata][len u16][payload]` directly on the QUIC stream.
+/// as `[metadata][len u16][payload]` directly on the QUIC stream, in both
+/// directions and for any destination.
 struct JuicityUdpTransport {
     state: Arc<JuicityConnState>,
     send: tokio::sync::Mutex<quinn::SendStream>,
+    /// Set while a frame is being written, cleared once it is accepted:
+    /// `write_chunk` is not cancellation safe, so a write cancelled halfway
+    /// leaves it set and no sibling destination may extend the torn frame.
+    poison: super::FramePoison,
     recv: tokio::sync::Mutex<quinn::RecvStream>,
     /// Keeps the connection's open-stream accounting alive for the
     /// transport's lifetime (see `QuicBiStream::into_parts`).
     _guard: crate::quic::StreamDropGuard,
-    target_addr: JuiceAddr,
+    /// The destination and name the stream was opened for: ordinary sends go
+    /// there, and a domain reply from it projects back to `target`.
     target: SocketAddr,
+    target_domain: Option<Box<str>>,
 }
 
 impl std::fmt::Debug for JuicityUdpTransport {
@@ -469,6 +538,9 @@ impl std::fmt::Debug for JuicityUdpTransport {
 impl PacketTransport for JuicityUdpTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
+    }
+    fn allows_full_cone_replies(&self) -> bool {
+        true
     }
     fn send_timeout(&self) -> Duration {
         self.state.path_health.send_timeout()
@@ -511,33 +583,79 @@ impl PacketTransport for JuicityUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        if data.len() > u16::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "juicity datagram too large",
-            ));
-        }
-        self.state.touch();
-        // SealUDP: `[metadata][len u16][payload]`
-        // (`stream_packet_conn.go:83-90`).
-        let mut frame = Vec::with_capacity(self.target_addr.encoded_len() + 2 + data.len());
-        self.target_addr.encode(&mut frame);
-        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        frame.extend_from_slice(data);
-        self.send
-            .lock()
+        self.send_datagram(self.target, self.target_domain.as_deref(), data, None)
             .await
-            .write_chunk(Bytes::from(frame))
-            .await
-            .map_err(io::Error::other)
-            .map_err(super::quic_carrier_io_error)
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (_addr, payload_len) = read_udp_frame(&mut *self.recv.lock().await, buf)
+        let mut recv = self.recv.lock().await;
+        loop {
+            let (addr, payload_len) = read_udp_frame(&mut recv, buf)
+                .await
+                .map_err(super::quic_carrier_io_error)?;
+            let peer = match addr {
+                JuiceAddr::V4(peer) => peer.into(),
+                JuiceAddr::V6(peer) => SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+                // The frame is already consumed; an unprojectable name is
+                // not resolved and does not end the stream.
+                JuiceAddr::Domain(domain, port) => match super::addr::dialed_domain_peer(
+                    self.target_domain.as_deref(),
+                    self.target,
+                    domain,
+                    port,
+                ) {
+                    Some(peer) => peer,
+                    None => continue,
+                },
+            };
+            return Ok((payload_len, peer));
+        }
+    }
+}
+
+#[async_trait]
+impl MultiTargetTransport for JuicityUdpTransport {
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        _confirmed: bool,
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> io::Result<()> {
+        self.send_datagram(target, domain, data, admitted).await?;
+        publish_request_sent();
+        Ok(())
+    }
+
+    fn carrier_addr(&self) -> Option<SocketAddr> {
+        Some(self.state._conn.remote_address())
+    }
+
+    fn frame_stream_torn(&self) -> bool {
+        self.poison.is_set()
+    }
+}
+
+impl JuicityUdpTransport {
+    /// SealUDP: `[metadata][len u16][payload]` (`stream_packet_conn.go:83-90`).
+    async fn send_datagram(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+    ) -> io::Result<()> {
+        let frame = AddrFraming::SOCKS5.encode(&[], target, domain, data, MAX_PACKET_SIZE)?;
+        self.state.touch();
+        let mut send = self.send.lock().await;
+        let write = self.poison.begin(admitted)?;
+        send.write_chunk(frame)
             .await
+            .map_err(io::Error::other)
             .map_err(super::quic_carrier_io_error)?;
-        Ok((payload_len, self.target))
+        write.complete();
+        Ok(())
     }
 }
 

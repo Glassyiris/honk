@@ -1,26 +1,19 @@
 //! Raw extensions for BPF map commands that Aya 0.14 does not expose.
 //!
 //! Ordinary map reads, writes, deletes, iteration, and per-CPU access use
-//! Aya's typed map APIs in `real::mod`. This module owns the atomic and batch
-//! commands plus locked access to the persistent UDP token allocator.
+//! Aya's typed map APIs in `real::mod`. This module owns the atomic commands,
+//! typed batch adapter and locked access to the persistent UDP token allocator.
 
 use super::*;
 
+use crate::ebpf::map_snapshot::{self, BatchError, BatchSpec};
 use aya::Pod;
 use aya_obj::generated::bpf_cmd::*;
 use aya_obj::generated::{BPF_ANY, BPF_F_LOCK, bpf_attr, bpf_map_info, bpf_map_type};
 use std::ffi::c_long;
-use std::mem::MaybeUninit;
 use std::path::Path;
 
-const ENOENT: c_long = libc::ENOENT as c_long;
 pub const BPF_BATCH_CHUNK: usize = 128;
-
-pub enum LookupAndDelete<V> {
-    Unsupported,
-    Missing,
-    Value(V),
-}
 
 pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
@@ -40,6 +33,45 @@ pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(),
     } else {
         Ok(())
     }
+}
+
+pub(super) fn next_flow_key(
+    fd: RawFd,
+    previous: Option<&[u8; 40]>,
+) -> anyhow::Result<Option<[u8; 40]>> {
+    let mut next = [0u8; 40];
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = previous.map_or(0, |key| key.as_ptr() as u64);
+    attr.__bindgen_anon_2.__bindgen_anon_1.next_key = next.as_mut_ptr() as u64;
+    match unsafe { bpf_syscall(BPF_MAP_GET_NEXT_KEY as c_long, &mut attr) } {
+        Ok(()) => Ok(Some(next)),
+        Err(errno) if errno == libc::ENOENT as c_long => Ok(None),
+        Err(errno) => anyhow::bail!("bpf get_next_key errno={errno}"),
+    }
+}
+
+pub(super) fn insert_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow::Result<()> {
+    let value = 1u8;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = map.fd().as_fd().as_raw_fd() as u32;
+    attr.__bindgen_anon_2.key = (&incarnation as *const u64) as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = (&value as *const u8) as u64;
+    attr.__bindgen_anon_2.flags = aya_obj::generated::BPF_NOEXIST as u64;
+    unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
+            .context("TCP_LIVE_PINS no-exist insert")
+    })
+}
+
+pub(super) fn remove_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow::Result<()> {
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = map.fd().as_fd().as_raw_fd() as u32;
+    attr.__bindgen_anon_2.key = (&incarnation as *const u64) as u64;
+    unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
+            .context(format!("TCP_LIVE_PINS release {incarnation}"))
+    })
 }
 
 fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
@@ -79,7 +111,7 @@ fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
     data.fd().as_fd().as_raw_fd()
 }
 
-fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
+pub(super) fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
     bpf.map(name)
         .map(map_raw_fd)
         .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))
@@ -227,133 +259,30 @@ pub(super) fn write_udp_decision_sequence_locked(
     )
 }
 
-pub fn bpf_lookup_and_delete<K: Pod, V: Pod>(
+pub(super) fn validate_map_layout(
     bpf: &Ebpf,
-    cap: &BatchCapability,
-    map: &str,
-    key: &K,
-) -> anyhow::Result<LookupAndDelete<V>> {
-    if cap.is_unsupported() {
-        return Ok(LookupAndDelete::Unsupported);
-    }
-    let fd = map_fd(bpf, map)?;
-    let mut value = MaybeUninit::<V>::uninit();
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key as *const K as u64;
-    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_mut_ptr() as u64;
-    let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_AND_DELETE_ELEM as c_long, &mut attr) };
-    if !cap.observe(result) {
-        debug!(
-            "bpf lookup_and_delete({}) unsupported, using lookup+delete",
-            map
-        );
-        return Ok(LookupAndDelete::Unsupported);
-    }
-    match result {
-        Ok(()) => Ok(LookupAndDelete::Value(unsafe { value.assume_init() })),
-        Err(ENOENT) => Ok(LookupAndDelete::Missing),
-        Err(error) => Err(anyhow::anyhow!(
-            "bpf lookup_and_delete({map}) errno={error}"
-        )),
-    }
-}
-
-/// Delete through a shared Aya map handle. This is only used by the legacy
-/// fallback for `routing_handoff_take`, whose public contract deliberately
-/// takes `&self` so hot-path callers can retain a backend read lock.
-pub fn bpf_delete_shared<K: Pod>(bpf: &Ebpf, map: &str, key: &K) -> anyhow::Result<()> {
-    let fd = map_fd(bpf, map)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key as *const K as u64;
-    match unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) } {
-        Ok(()) | Err(ENOENT) => Ok(()),
-        Err(error) => Err(anyhow::anyhow!("bpf delete({map}) errno={error}")),
-    }
-}
-
-fn lookup_batch_result(result: Result<(), c_long>, count: u32) -> Result<(usize, bool), c_long> {
-    match result {
-        Ok(()) => Ok(((count as usize).min(BPF_BATCH_CHUNK), false)),
-        Err(ENOENT) => Ok(((count as usize).min(BPF_BATCH_CHUNK), true)),
-        Err(error) => Err(error),
-    }
-}
-
-fn uninitialized<T>(len: usize) -> Vec<MaybeUninit<T>> {
-    std::iter::repeat_with(MaybeUninit::uninit)
-        .take(len)
-        .collect()
-}
-
-fn append_initialized<K: Pod, V: Pod>(
-    keys: &[MaybeUninit<K>],
-    values: &[MaybeUninit<V>],
-    count: usize,
-    out: &mut Vec<(K, V)>,
-) {
-    for index in 0..count {
-        out.push((unsafe { keys[index].assume_init() }, unsafe {
-            values[index].assume_init()
-        }));
-    }
-}
-
-/// Scan a hash-family map with `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+).
-/// Returns `false` without changing `out` when the command is unsupported.
-pub fn bpf_lookup_batch_scan<K: Pod, V: Pod>(
-    bpf: &Ebpf,
-    cap: &BatchCapability,
-    map: &str,
-    out: &mut Vec<(K, V)>,
-) -> anyhow::Result<bool> {
-    if cap.is_unsupported() {
-        return Ok(false);
-    }
-    let fd = map_fd(bpf, map)?;
-    let initial_len = out.len();
-    let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
-    let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
-    let mut next_key = MaybeUninit::<K>::uninit();
-    let mut previous_key: Option<K> = None;
-    loop {
-        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-        attr.batch.map_fd = fd as u32;
-        attr.batch.in_batch = previous_key
-            .as_ref()
-            .map_or(0, |key| key as *const K as u64);
-        attr.batch.out_batch = next_key.as_mut_ptr() as u64;
-        attr.batch.keys = keys.as_mut_ptr() as u64;
-        attr.batch.values = values.as_mut_ptr() as u64;
-        attr.batch.count = BPF_BATCH_CHUNK as u32;
-        let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
-        if !cap.observe(result) {
-            out.truncate(initial_len);
-            debug!(
-                "bpf lookup_batch({}) unsupported, using Aya map iteration",
-                map
-            );
-            return Ok(false);
-        }
-        let (count, terminal) = match lookup_batch_result(result, unsafe { attr.batch.count }) {
-            Ok(result) => result,
-            Err(error) => {
-                out.truncate(initial_len);
-                return Err(anyhow::anyhow!("bpf lookup_batch({map}) errno={error}"));
-            }
-        };
-        append_initialized(&keys, &values, count, out);
-        // A successful batch may be short; only ENOENT marks the final batch.
-        if terminal {
-            return Ok(true);
-        }
-        if count == 0 {
-            out.truncate(initial_len);
-            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
-        }
-        previous_key = Some(unsafe { next_key.assume_init() });
-    }
+    name: &str,
+    type_: bpf_map_type,
+    key: u32,
+    value: u32,
+    entries: u32,
+    flags: u32,
+) -> anyhow::Result<()> {
+    let info = raw_map_info(map_fd(bpf, name)?)?;
+    anyhow::ensure!(
+        info.type_ == type_ as u32
+            && info.key_size == key
+            && info.value_size == value
+            && info.max_entries == entries
+            && info.map_flags == flags,
+        "map '{name}' has incompatible lifetime layout: type={} key={} value={} entries={} flags={}",
+        info.type_,
+        info.key_size,
+        info.value_size,
+        info.max_entries,
+        info.map_flags
+    );
+    Ok(())
 }
 
 /// Streaming lookup-batch variant that keeps memory bounded to one chunk.
@@ -363,49 +292,97 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     map: &str,
     visit: &mut BatchVisitor<'_, K, V>,
 ) -> anyhow::Result<bool> {
+    bpf_lookup_batch_scan_cb_flags(bpf, cap, map, 0, &mut None, visit)
+}
+
+pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
+    bpf: &Ebpf,
+    cap: &BatchCapability,
+    map: &str,
+    elem_flags: u64,
+    cursor: &mut Option<[u8; 4]>,
+    visit: &mut BatchVisitor<'_, K, V>,
+) -> anyhow::Result<bool> {
     if cap.is_unsupported() {
         return Ok(false);
     }
-    let fd = map_fd(bpf, map)?;
-    let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
-    let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
-    let mut next_key = MaybeUninit::<K>::uninit();
-    let mut previous_key: Option<K> = None;
+    scan_lookup_batch(map_fd(bpf, map)?, map, elem_flags, Some(cap), cursor, visit)
+}
+
+/// Drive one `BPF_MAP_LOOKUP_BATCH` traversal of `fd`, holding each hash bucket
+/// stable while it copies, with memory bounded to one chunk. The caller owns the
+/// fallback policy: given `cap`, an unsupported command returns `Ok(false)` so a
+/// caller with a proven-safe fallback can take it; without `cap` every failure
+/// is an error, so request maps and external pinned reads never get a singleton
+/// fallback. `Ok(true)` means the scan finished or `visit` stopped it.
+pub(crate) fn scan_lookup_batch<K: Pod, V: Pod>(
+    fd: RawFd,
+    map: &str,
+    elem_flags: u64,
+    cap: Option<&BatchCapability>,
+    cursor: &mut Option<[u8; 4]>,
+    visit: &mut BatchVisitor<'_, K, V>,
+) -> anyhow::Result<bool> {
+    let (key_len, value_len) = (core::mem::size_of::<K>(), core::mem::size_of::<V>());
     let mut chunk = Vec::with_capacity(BPF_BATCH_CHUNK);
-    loop {
-        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-        attr.batch.map_fd = fd as u32;
-        attr.batch.in_batch = previous_key
-            .as_ref()
-            .map_or(0, |key| key as *const K as u64);
-        attr.batch.out_batch = next_key.as_mut_ptr() as u64;
-        attr.batch.keys = keys.as_mut_ptr() as u64;
-        attr.batch.values = values.as_mut_ptr() as u64;
-        attr.batch.count = BPF_BATCH_CHUNK as u32;
-        let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
-        if !cap.observe(result) {
-            debug!(
-                "bpf lookup_batch({}) unsupported, using Aya map iteration",
-                map
-            );
-            return Ok(false);
-        }
-        let (count, terminal) = lookup_batch_result(result, unsafe { attr.batch.count })
-            .map_err(|error| anyhow::anyhow!("bpf lookup_batch({map}) errno={error}"))?;
+    let project = |keys: &[u8], values: &[u8]| {
         chunk.clear();
-        append_initialized(&keys, &values, count, &mut chunk);
-        if !chunk.is_empty() && !visit(&chunk) {
-            return Ok(true);
-        }
-        // A successful batch may be short; only ENOENT marks the final batch.
-        if terminal {
-            return Ok(true);
-        }
-        if count == 0 {
-            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
-        }
-        previous_key = Some(unsafe { next_key.assume_init() });
+        chunk.extend(
+            keys.chunks_exact(key_len)
+                .zip(values.chunks_exact(value_len))
+                .map(|(key, value)| unsafe {
+                    (
+                        core::ptr::read_unaligned(key.as_ptr() as *const K),
+                        core::ptr::read_unaligned(value.as_ptr() as *const V),
+                    )
+                }),
+        );
+        visit(&chunk)
+    };
+    let completed = unsafe {
+        map_snapshot::scan(
+            BatchSpec {
+                fd,
+                key_len,
+                value_len,
+                chunk: BPF_BATCH_CHUNK,
+                elem_flags,
+            },
+            cursor,
+            |result, count| {
+                clamp_batch_count(count);
+                cap.is_none_or(|cap| cap.observe(result.map_err(c_long::from)))
+            },
+            project,
+        )
     }
+    .map_err(|error| match error {
+        BatchError::Errno {
+            errno,
+            after_progress: true,
+        } => anyhow::anyhow!("bpf lookup_batch({map}) failed after a partial scan: errno={errno}"),
+        BatchError::Errno { errno, .. } => {
+            anyhow::anyhow!("bpf lookup_batch({map}) errno={errno}")
+        }
+        BatchError::InvalidCount {
+            count: 0,
+            terminal: false,
+        } => anyhow::anyhow!("bpf lookup_batch({map}) returned an empty nonterminal batch"),
+        BatchError::InvalidCount { count, terminal } => anyhow::anyhow!(
+            "bpf lookup_batch({map}) returned invalid count {count} (terminal={terminal})"
+        ),
+    })?;
+    if !completed {
+        debug!(
+            "bpf lookup_batch({}) unsupported; caller must select a safe fallback",
+            map
+        );
+    }
+    Ok(completed)
+}
+
+fn clamp_batch_count(count: &mut u32) {
+    *count = (*count).min(BPF_BATCH_CHUNK as u32);
 }
 
 #[cfg(test)]
@@ -459,24 +436,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn successful_short_batch_is_not_terminal() {
-        for count in [1, BPF_BATCH_CHUNK as u32 - 1] {
-            let (returned, terminal) = lookup_batch_result(Ok(()), count).unwrap();
-            assert!(!terminal);
-            assert_eq!(returned, count as usize);
-        }
-    }
-
-    #[test]
-    fn terminal_enoent_preserves_partial_count() {
-        for count in [0, 1, 127, 128, 129, 255] {
-            let (returned, terminal) = lookup_batch_result(Err(ENOENT), count).unwrap();
-            assert!(terminal);
-            assert_eq!(returned, (count as usize).min(BPF_BATCH_CHUNK));
-        }
-    }
-
     fn compatible_sequence_info() -> bpf_map_info {
         let mut info: bpf_map_info = unsafe { core::mem::zeroed() };
         info.type_ = bpf_map_type::BPF_MAP_TYPE_ARRAY as u32;
@@ -505,5 +464,14 @@ mod tests {
         let mut wrong = info;
         wrong.btf_value_type_id = 0;
         assert!(validate_udp_decision_sequence_info(&wrong).is_err());
+    }
+
+    #[test]
+    fn engine_clamps_oversized_batch_counts() {
+        for count in [0, 1, 127, 128, 129, 255] {
+            let mut clamped = count;
+            clamp_batch_count(&mut clamped);
+            assert_eq!(clamped as usize, (count as usize).min(BPF_BATCH_CHUNK));
+        }
     }
 }

@@ -16,7 +16,7 @@ UDP 对象。
 - `ProxyStream`：已经建立、绑定目标的 TCP 字节流；或
 - `Arc<dyn PacketTransport>`：已经建立、面向一个 UDP 目标的分帧报文路径。
 
-推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享的 VLESS 路径把类型化 `VlessXudpTransport` 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用 receiver。
+推测式 UDP 拨号先返回 `PreparedUdpTransport<T>`；其 commit 可能失败，且只返回已选中值的 `Arc<T>`，未选中的 preparation 在 drop 时回滚。来源共享协议（具体的 VLESS XUDP/Mux.Cool、Hysteria2、TUIC，以及所有 `MultiTargetTransport`）把 transport 提交给 core 所有的 source attachment，使同一 source scope 下的多个五元组共用唯一 receiver。
 
 `direct` 不使用代理协议，直接连接目标。`block` 终止请求。其他每个 handler 都根据
 选定节点生成代理服务器能够理解的协议字节。
@@ -91,8 +91,7 @@ downcast 不变量；`proxy/vless/handler/stream.rs` 的 `ProxyStream::into_visi
 `PacketTransport` 暴露 relay 目标、`send_packet`、
 `send_packet_confirmed` 与 `recv_packet`。对于带队列的 tunnel，
 `send_packet_confirmed` 是更强的首包准入点。full-cone 协议还可以声明
-服务端 metadata 能够权威指定回包源地址。来源共享的 VLESS 在内部使用同一
-framing transport，但由 core 串行化各 endpoint view 的发送并持有唯一 receive loop。
+服务端 metadata 能够权威指定回包源地址。对于来源共享协议，由 core 串行化各 endpoint view 的发送并持有 transport 的唯一 receive loop。
 
 生产 UDP handler 不返回裸 socket 或 loopback bridge。Direct 与 SOCKS5
 把 native socket 包装在 `PacketTransport` 后面；tunnel 协议在其真实
@@ -152,15 +151,26 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | --- | --- | --- |
 | `direct` | Native 带 mark 目标连接 | `PacketTransport` 后的 native 带 mark UDP |
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association；协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
-| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
-| `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。发送时只写入拨号域名，其他名字以数值目标发出。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
+| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每个客户端 source 一个已连接的服务端 socket 与加密状态，可发往任意目的地（见下文） |
+| `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing；每个客户端 source 一条 associate 流，每个 frame 自带对端地址 |
 | `vmess` | VMess stream | 未实现 |
 | `vless` | 由独立 multiplex policy 选择 direct、H2 或 Mux.Cool | `network` 允许 UDP 时可用；encoding 与可选 UDP multiplex 决定路径 |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagram |
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
-| `juicity` | Juicity QUIC stream | 一条长度分帧 QUIC bi stream |
+| `juicity` | Juicity QUIC stream | 每个客户端源一条长度分帧 QUIC bi stream，承载所有目的地 |
+
+Shadowsocks（传统 AEAD 与 2022）用一个 `MultiTargetTransport` 承载同一客户端
+source 的所有目的地：一个连接到服务端的带标记 socket、一份加密状态；2022 还
+包含一个客户端 session ID、一个单调递增的包计数器和一对服务端 session 重放
+窗口，且不会随目的地重置。默认目标的地址头预先编码，其他目的地编码到栈缓冲。
+`recv_packet` 返回经认证的内层地址作为对端，因此未联系过的主机的回包会以该主机
+的身份到达核心（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名与
+端口（ASCII 不区分大小写）时被接受并映射到拨号目标，其他域名一律丢弃且不做
+DNS。发送时每个 datagram 只写入拨号域名，其他名字以数值目标发出。过短、密钥错误、重放、地址错误或无法映射的数据报只丢弃自身；2022 的重放
+状态只在地址解码成功后提交。外层 socket 仍连接服务端，因此未经请求的对端能否
+到达客户端取决于服务端自身的 NAT 行为。
 
 VMess 与 VLESS entry 只在 `rprx` feature 下编译。`honk-core` 与 `honk-tool`
 默认 feature 集启用它。不带 `rprx` 时，这些节点形式仍能解析，但 registry
@@ -275,6 +285,15 @@ REALITY 参数时，它使用[有界认证建立过程](#服务端认证与指�
 XHTTP 建立过程。
 
 Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
+
+Trojan UDP 让一个客户端 source 的所有目的地共用一条 UDP-associate 流：请求头
+指名首个目的地，随后每个 frame（`address | u16 length | CRLF | payload`）在两个方向上
+各自携带对端地址。`recv_packet` 返回 frame 中的真实对端（IPv4-mapped IPv6 规范化为 IPv4），
+因此核心可以接纳来自从未联系过的对端的首个回复。域名 frame 仅在与捕获的拨号域名及端口一致时
+才投影为捕获的目标；其他域名 frame 会被整帧（length、CRLF、payload）消费并丢弃，不做 DNS。
+发送时每个 frame 只写入拨号域名，其他名字以数值目标发出。
+未知 ATYP 无法推导长度，会终止该流。各 frame 共用该流的 writer：写到一半停滞的 frame 对整个
+source 是终止性的，绝不按拥塞处理，各目的地共享队头阻塞与失败命运。域名目标 scope 仍按原始目的地区分。
 TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
 错误，不会把该错误转换成 EOF。
 
@@ -494,6 +513,20 @@ Xray TCP concurrency 为零表示 8，负值关闭 TCP mux。XUDP concurrency �
 或 setup preamble。发送范围为 1–8190 字节；收到的零长度 frame 是 datagram，不是
 EOF。writer 会确认 flush，不重放取消后结果不明确的写入。
 
+显式 `uot-v2` 使用 non-connect UoT v2：request 为模式字节 `0` 加第一个目的地，
+此后双向每个 datagram 都是 `[ATYP 0/1/2][地址][端口][u16 长度][payload]`（UoT v1
+编号），payload 最多 65535 字节。因此一条 stream 服务一个客户端 source 的全部
+目的地（core `Shared` source），每个回复保留真实 peer：数字 peer 直接返回（IPv4-mapped
+IPv6 规范化为 IPv4），捕获的拨号域名与端口投影回逻辑目标，其他域名不经 DNS 直接丢弃并整帧消费，
+未知 ATYP 终止该 stream。与 XUDP 不同，这里没有 empty-first 或 poisoned-child 规则。
+request 与第一个 datagram 在一次写入中发送；被中断的写入使 stream 失效且不重放。
+按域名拨号的 flow 在 request 和每个 datagram 中发送该域名；其他任何名字（以及按数值拨号的 flow）
+都以数值目标发出。真实 sing-box 1.12.4 的 direct outbound 由首个目的地决定其形态：域名 request
+之后，同名的逐包 FQDN 会被映射；数值 request 之后，逐包 FQDN 报
+`invalid AddrPort: missing address` 并终止整个 association。H2MUX PacketAddr、AnyTLS、Trojan、
+SOCKS5 与 Shadowsocks 适用同一规则（`addr::dialed_name`）；Juicity 未改动且无法验证，
+因为没有 juicity-server 可用。
+
 类型化 policy、size 与 carrier-capacity 拒绝都是 terminal local result，与拥塞
 或 transport failure 分开；它们不降低健康状态或 Score。候选准入在提交协议状态前
 检查 policy；DNS、health 与 CLI 调用方保留该拒绝，不选择 fallback，也不将路径报
@@ -503,8 +536,11 @@ EOF。writer 会确认 flush，不重放取消后结果不明确的写入。
 
 `src/proxy/uot.rs` 与 `src/proxy/vless/mux.rs` 实现共享 UoT v2 framing 和
 sing-box H2MUX。H2MUX 把物理 VLESS 请求发往 `sp.mux.sing-box.arpa:444`，
-选择 backend `2`，然后在 carrier 上运行 HTTP/2。逻辑 stream 承载 TCP 或
-native connected UDP；UDP 使用共享 UoT 长度 codec，而不是 loopback bridge。
+选择 backend `2`，然后在 carrier 上运行 HTTP/2。逻辑 stream 承载 TCP 或 UDP。
+UDP stream 设置 sing-mux flags `UDP|Addr`（`3`），在命名第一个目的地的 request 之后，
+双向都携带 `[SOCKS5 地址][端口][u16 长度][payload]`（SOCKS5 ATYP，不同于 UoT v1 编号）。
+一条 stream 即客户端的共享 source，并在与 UoT 相同的投影/丢弃规则下返回真实 peer；
+被丢弃的帧同样归还其 HTTP/2 credit。不存在 loopback bridge。
 
 可选 H2 padding 为每个方向最初 16 条 record 增加 sing-mux v1 随机 preface
 与 record framing。每节点最多有两条可复用或拨号中的 H2 carrier，每条最多
@@ -515,7 +551,8 @@ HTTP/2 flow control 驱动 backpressure。GOAWAY 使 carrier 进入 draining 并
 把新工作滚动到 replacement。driver failure 向 child 扩散；half-close、reset、
 receive-window 释放与 lazy response error 仍按 stream 隔离。接收 credit 保持
 每 stream 2 MiB；connection credit 仍可为每条已准入 stream 容纳一个最大
-UoT response frame。
+response frame：状态字节、最宽地址（259 字节）、长度与 65535 字节 payload。
+credit 按每帧完整消费的 wire 长度归还，无论该帧被交付还是被丢弃。
 
 ### Mux.Cool 与 XUDP
 
@@ -531,12 +568,51 @@ packet 保持 8 KiB 上限；Single XUDP 保持 7,526 字节上限。
 
 ### Source/session ownership and capacity
 
-对于 Single XUDP 与 shared/separate Mux.Cool，`honk-core` 按 reused
-`NodeRuntime` identity、规范化 client 地址、所选 UDP path 与 reply projection
-（`ActualPeer` 或 `RewriteTo(original destination)`）索引 source owner。一个
-owner 持有一条 XUDP session 与一条 receiver，多个规范五元组 endpoint entry
-提供串行 send view。Single XUDP 每 scope 使用一个 private、未池化的
+对于来源共享协议（Single XUDP、shared/separate Mux.Cool、Hysteria2、TUIC 与各 `MultiTargetTransport`），`honk-core`
+按 reused `NodeRuntime` identity、规范化 client 地址、所选协议/UDP path 与
+reply projection（`ActualPeer` 或 `RewriteTo(original destination)`）索引
+source owner。一个 owner 持有一条协议 association 与一条 receiver，多个规范
+五元组 endpoint entry 提供串行 send view。Single XUDP 每 scope 使用一个 private、未池化的
 SID 0；Mux.Cool 为各 scope 分配不同 child SID，而这些 SID 可以共享物理 pool。
+
+Hysteria2 在 scope 的不同目的地间复用一个 Session ID，TUIC 复用一个 association
+ID。不同 scope 可以共用物理 QUIC connection，但不共用逻辑 association。
+关闭 `rprx` 时，这些 QUIC source 路径及其 shutdown join 仍可用；只有 VLESS
+分支依赖该 feature。
+
+Hysteria2 与 TUIC 的两种接收模式通过既有有界重组器保留实际回包来源。Hysteria2
+各分片的来源必须一致；TUIC 后续片可以省略地址，并等待第零片提供来源，包括
+第零片最后到达的情况。来源元数据随所属 packet entry 过期。已知请求域名与端口
+可使用捕获的目标投影，域名按 ASCII 大小写不敏感比较；未知域名不触发 DNS，
+也不伪造 foreign IP。TUIC 零长度 payload 仍是 datagram；Hysteria2 保留既有的
+空入站 payload 拒绝。来源保留不保证远端 NAT 的映射或过滤行为。
+
+`MultiTargetTransport` 是 Shadowsocks、Juicity、SOCKS5、Trojan、AnyTLS 与 VLESS
+UoT v2/H2MUX 共用的通用 source transport（Hysteria2、TUIC 与 VLESS XUDP/Mux.Cool
+保留具体分支，使其发送路径不被装箱）。每个客户端 source 为其所有目的地持有
+一条逻辑 association：一个 Shadowsocks socket 与加密会话（SS2022 不会因目的地
+变化重置 session ID、包计数器或重放窗口）、一条 Juicity 双向流、一条 SOCKS5
+控制连接加一个中继 socket、一条 Trojan associate 流、一条 non-connect UoT v2
+流或一条 H2MUX PacketAddr 流。`recv_packet` 返回服务端报告的真实 peer：IPv4 映射
+的 peer 规范化为 IPv4；域名来源仅在等于捕获的域名与端口时接受，其他域名不经
+DNS 直接丢弃，流式协议会整帧消费被丢弃的帧后再读下一帧；未知地址类型仍是终止性
+错误。`send_packet` 与 `send_to` 共用一个未装箱 helper；`confirmed` 只在各 view 的
+首个 datagram 上传给 transport，`admitted` 在 datagram 进入线路或 writer 队列时
+设置。可靠流 carrier（Trojan、Juicity、AnyTLS、UoT、H2MUX）的部分帧超时对整个
+source 保持终止性，因此共用一条流的各目的地也共享其队头阻塞与失败命运。H2MUX
+只在第一个分块交给 h2 时才 admit 该 datagram 并开始中毒标记，因此任何字节入队前
+的流控等待超时属于包局部拥塞，流仍可继续使用。包局部拥塞只在 source 仍能 admit
+datagram 时成立：一串未 admit 的超时若没有被任何 admit 的 datagram 打断，无论彼此
+间隔多远，持续满 30 秒后都会像其他传输失败一样使 source 失败，因此回包无法让卡死的
+上行一直存活，而什么都不发的空闲 source 不会被误判。写到一半
+被取消的帧会使该流带着类型化的 `FrameInterrupted` 中毒：下一次发送失败并退役该
+source 的所有目的地，而不会接在残帧后面。若该写入是被其 view 自身的退役所取消，
+这次退役是中性取消，不向节点记入健康或 Score；因超时造成的撕裂仍是传输失败。
+原生 UDP 的大小拒绝（`EMSGSIZE`）是类型化的本地
+`InvalidSize` 拒绝，不终止任何东西。最后一个 view 的 endpoint permit 保留到
+source receiver 退出或另一个 view 绑定，使退役中的 source 不超出描述符分区；这
+意味着饱和的 pool 在短时间内可能拒绝新 endpoint。core 的 send gate 是唯一的外层
+锁：后端只在其下持有自己的叶子锁，且不回调 core。
 
 完整 `(client, destination)` endpoint map 继续权威持有 route、decision token
 与逐 flow Score。Ready entry 的 reply 仅在 endpoint 属于该 source owner 时
@@ -545,7 +621,7 @@ SID 0；Mux.Cool 为各 scope 分配不同 child SID，而这些 SID 可以共�
 reply；它更新 source transport accounting，但没有 flow Score owner。domain
 route 使用 `RewriteTo(original)`，永远不会变成 foreign reply。
 
-runtime 从该 scope lazy 生成 private keyed source-ID hash。复用 runtime 时替换
+VLESS runtime 从该 scope lazy 生成 private keyed source-ID hash。复用 runtime 时替换
 carrier 保持 ID；替换 runtime 或重启进程会生成新 key。这刻意保留 honk 的
 per-source 行为，不等同于 Xray 的 source-only global identity，也不保证 NAT
 无碰撞。迟到 callback 在动作前重新检查 source owner 与 endpoint token/generation；
@@ -568,12 +644,17 @@ source 关闭前已经退役的 view，保留自己的局部结果；shutdown �
 已绑定 view 只在 pending attachment 也全部释放后才退役 source；sibling view 退役
 时，已有 attachment 仍可完成 commit。
 
-endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
+对于 VLESS，endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
 也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
 避免兄弟 flow 的发送将其重新解释为 carrier 故障。
 发送开始、完成与退役意图共用 source-state 临界区；先记录匹配 sender 的意图，
 再在同一临界区发布 endpoint 和 source-view 退役标志，之后发送或接收端才能分类
 取消原因。
+
+QUIC source 仅在通过 source gate、开始 I/O 后创建 send token，但 token 由
+endpoint driver 保留到 success/timeout/failure 分类完成。等待 gate 消耗既有
+发送 deadline，不创建 QUIC attempt。Datagram 拥塞与 TUIC stream failure
+保留各自语义；取消或部分接受都不授权重放 packet。
 
 Selector 与 UDP warm retention 独立解析：TCP 所选 pool 响应
 `WarmRequirement::Session`，UDP 所选 pool 响应 `WarmRequirement::Udp`。因此
@@ -713,13 +794,23 @@ client 槽，因此 warm 释放、重建与 speculative client 会复用同一�
 | 协议 | 认证与 TCP | UDP | Transport 策略 |
 | --- | --- | --- | --- |
 | TUIC v5（`src/proxy/tuic.rs`） | uni stream 上的 TLS-exporter 认证；每个 flow 一条 TCP bi stream | QUIC datagram、分片，以及没有 datagram 时的 uni-stream fallback | 10 秒 heartbeat；默认 8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB，可由节点覆盖 |
-| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record（`[metadata][len u16][payload]`）的 bi stream | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB |
+| Juicity（`src/proxy/juicity.rs`，已验证与 juicity-rs 服务端互通） | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 每个客户端源一条 bi stream；打开时写一次 `[network=3][metadata]`，之后双向均为 `[metadata][u16 length][payload]` record，每条各自标明目的地或来源 | 上游 juicity/juicity-rs 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口，后者自动调整至最多 32 MiB |
 | Hysteria2（`src/proxy/hysteria2/`、`mod.rs`） | ALPN `h3`；最小 `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 正值 `hy2_up_mbps` 选择 `quic::BrutalConfig`（窗口 = max(速率×RTT, 10×MTU)，忽略丢包），否则 BBR；`hy2_down_mbps` 按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口，connection 窗口同样自动调整 |
 
 Go `juicity-server` v0.4.3 有实现层面的 UDP relay 限制：它申请的 1,500 字节
 buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包。互操作实测
 8,192 字节 payload 只返回 2,048 字节，而 2,048 字节回显正常。这不是 Juicity
 线协议限制，因此 honk 不会对其他服务端任意施加 2,048 字节上限。
+
+Juicity UDP 使用已部署的 trojanc ATYP 编号（IPv4 为 1、域名为 3、IPv6 为 4），而非
+Juicity 规范示意的不同编号，也不增加会话字节。同一客户端源的所有目的地共用一条
+UDP stream，合作的服务端因此可以用同一个 socket 转发；`recv_packet` 返回每个回复帧
+所标明的对端（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅当与 stream 打开时使用的
+名称相等（ASCII 不区分大小写）且端口相同才被接受，并投影为该 stream 的目标；其余
+域名帧被整帧消费并丢弃，不做 DNS。未知 ATYP 为终止性错误。以改写域名拨出的目的地
+仍按原始目的地分别建立 scope。所有目的地共享该 stream 的队头阻塞与失败命运；写入
+超时可能留下半个帧，因此会退役整个源，而不是按拥塞处理。QUIC send-attempt hook 保留
+在该源路径上。
 
 Hysteria2 HTTP/3 层刻意保持本地且最小：control/QPACK uni stream、静态表
 QPACK，以及认证所需的 HEADERS 处理。它不得宣告
@@ -766,6 +857,8 @@ least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每�
 则只重置该 stream。窗口内完全静默不表示 carrier 已失效：突发丢包会让所有 stream
 同时静默，之后 TCP 仍会送达。此时只重置该 open，并让 session 退出轮转。
 仅当再静默十秒才连同其 stream 一起退役，pool 会重新拨号，而不继续复用已失效的 carrier。
+同一静默窗口内超时的所有 open 及其最终退役共用一个 Score 节点故障 episode，
+不会按受影响的 stream 数量重复累加故障次数。
 
 Session 在 30 分钟时按每 session jitter 进入 age-based drain。配置的
 `min_idle` floor（`anytls_min_idle_session`）与 `anytls_idle_session_timeout` 输入同一个节点局部 janitor。Selector 或
@@ -843,11 +936,23 @@ UoT delivery 使用非阻塞 `try_send`。UoT sink 满时会移除该 sink 并�
 
 ### Lazy UoT 创建
 
-通过 `open_uot_stream` 打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT connect request。
-connect request 与第一条编码后 datagram 作为一个有序 PSH 一起发送。payload
+通过 `open_uot_stream` 打开 AnyTLS UDP transport 会预留 stream，但延后其 UoT request。
+AnyTLS 使用 non-connect UoT v2：request 为 `0x00` 加第一个目的地的 SOCKS5 地址，
+仅用于服务端路由与地址族选择；request 与第一条编码后 datagram 作为一个有序 PSH
+一起发送。此后双向每个 datagram 都用 UoT v1 布局
+`[ATYP][address][port][u16 length][payload]` 携带自己的地址，packet ATYP 为
+IPv4 `0`、IPv6 `1`、域名 `2`（不同于 request 地址的 SOCKS5 编号）。payload
 上限为 16 KiB，与 anytls-go 0.0.13 及 sing v0.5.1 的 relay buffer 一致；
 更大的输入会在消耗 lazy setup 或破坏逻辑 stream 之前失败。这样既避免原本
 空的 setup round trip，也不允许首包重放。
+
+因此一条 stream 服务一个客户端 source 的全部目的地（`Shared` source transport），
+服务端可用同一个未 connect 的 socket 承载它们。`recv_packet` 在消耗 frame 之前先解码地址：
+数值源地址直接返回（IPv4-mapped IPv6 归一为 IPv4），打开时捕获的域名加端口投影回捕获的 target，
+其他任何域名 frame 都被整体丢弃（释放其头部与 payload 的全部 credit，不做域名解析）；
+未知 ATYP 是终止错误。发送时每个 datagram 只写入拨号域名，其他名字以数值目标发出。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
+`admitted` 在 frame 入 session writer 队列时设置。队列与 credit 上限仍是单个 transport 的上限，
+因此队列饱和或 EOF 会退役共享该 SID 的所有目的地。域名目标流（`RewriteTo`）仍按原始目的地各自成 scope。
 
 ## 冷 URLTest speculative preparation
 

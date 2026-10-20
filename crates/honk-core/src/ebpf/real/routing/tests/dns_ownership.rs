@@ -17,11 +17,24 @@ use std::os::fd::AsRawFd;
 use std::ptr;
 use std::time::Duration;
 
+mod aux_occupancy;
+mod datagram_fragments;
 mod direct_mode;
 mod failures;
+mod health;
+mod local_udp;
 mod network;
+mod new_flow_rate;
+mod refresh;
+mod retirement;
+mod tcx;
 mod trace;
+mod udp_commit;
+mod udp_group;
+mod udp_listeners;
+mod udp_reverse;
 
+const TC_ACT_UNSPEC: u32 = u32::MAX;
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
 const TC_ACT_REDIRECT: u32 = 7;
@@ -124,7 +137,12 @@ impl TproxyListeners {
     fn publish(&self, backend: &mut RealEbpfBackend) -> anyhow::Result<()> {
         let udp4 = [self.udp4.as_raw_fd(); 4];
         let udp6 = [self.udp6.as_raw_fd(); 4];
-        backend.publish_listener_sockets(self.tcp4.as_raw_fd(), self.tcp6.as_raw_fd(), &udp4, &udp6)
+        backend.publish_listener_socket_maps(
+            self.tcp4.as_raw_fd(),
+            Some(self.tcp6.as_raw_fd()),
+            &udp4,
+            &udp6,
+        )
     }
 }
 
@@ -142,6 +160,7 @@ struct Run {
     mark: u32,
     cb: [u32; 5],
     priority: u32,
+    data: Vec<u8>,
 }
 
 fn isolated(f: impl FnOnce() + Send + 'static) {
@@ -202,6 +221,17 @@ fn set_array<V: Pod>(backend: &mut RealEbpfBackend, name: &str, index: u32, valu
         .unwrap();
 }
 
+fn flow_count<K: Pod, V: Pod>(backend: &RealEbpfBackend, name: &str) -> usize {
+    let mut count = 0;
+    backend
+        .flow_for_each_chunk::<K, V>(name, 256, &mut |chunk| {
+            count += chunk.len();
+            true
+        })
+        .unwrap();
+    count
+}
+
 fn hash_count<K: Pod, V: Pod>(backend: &RealEbpfBackend, name: &str) -> usize {
     let map = backend.bpf().unwrap().map(name).unwrap();
     HashMap::<_, K, V>::try_from(map)
@@ -212,11 +242,7 @@ fn hash_count<K: Pod, V: Pod>(backend: &RealEbpfBackend, name: &str) -> usize {
 }
 
 fn handoff(backend: &RealEbpfBackend, key: &TuplesKey) -> RoutingHandoffEntry {
-    let map = backend.bpf().unwrap().map("ROUTING_HANDOFF_MAP").unwrap();
-    HashMap::<_, TuplesKey, RoutingHandoffEntry>::try_from(map)
-        .unwrap()
-        .get(key, 0)
-        .unwrap()
+    backend.routing_handoff_lookup(key).unwrap().unwrap()
 }
 
 fn load_classifier(backend: &mut RealEbpfBackend, name: &str) {
@@ -263,13 +289,14 @@ fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) ->
             repeat: 1,
             ..Default::default()
         })
-        .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {name}: {error}"));
+        .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {name}: {error:?}"));
     let returned: __sk_buff = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
     Run {
         verdict: result.return_value,
         mark: returned.mark,
         cb: returned.cb,
         priority: returned.priority,
+        data: output,
     }
 }
 
@@ -377,6 +404,18 @@ fn packet(
     bytes
 }
 
+/// Same-tuple replays with the same ISN are retransmissions; replacement needs a new ISN.
+fn with_isn(mut packet: Vec<u8>, isn: u32) -> Vec<u8> {
+    let tcp = 14
+        + if packet[12..14] == [0x08, 0x00] {
+            20
+        } else {
+            40
+        };
+    packet[tcp + 4..tcp + 8].copy_from_slice(&isn.to_be_bytes());
+    packet
+}
+
 fn tuple(
     src: IpAddr,
     dst: IpAddr,
@@ -471,9 +510,9 @@ fn dns_direct_must_marks_keep_lan_native_and_reroute_wan_v4_v6_tcp_udp() {
                     TC_ACT_OK
                 };
                 let expected_mark = if wan { 0 } else { mark | CLASSIFIED_MARK };
-                let before_conn = hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
+                let before_conn = flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
                 let before_handoff =
-                    hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
+                    flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
                 let before_sequence = backend.udp_decision_sequence_status().unwrap();
                 let udp = packet(
                     source,
@@ -491,12 +530,12 @@ fn dns_direct_must_marks_keep_lan_native_and_reroute_wan_v4_v6_tcp_udp() {
                 );
                 assert_eq!(udp_run.mark, expected_mark, "{side} UDP {destination}");
                 assert_eq!(
-                    hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
+                    flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                     before_conn,
                     "native DNS UDP must not allocate conn state"
                 );
                 assert_eq!(
-                    hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
+                    flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
                     before_handoff,
                     "must DNS UDP ownership is per-packet, never a tuple handoff"
                 );
@@ -565,8 +604,8 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                     ),
                 ] {
                     let before_conn =
-                        hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
-                    let before_handoff = hash_count::<TuplesKey, RoutingHandoffEntry>(
+                        flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
+                    let before_handoff = flow_count::<TuplesKey, RoutingHandoffEntry>(
                         &backend,
                         "ROUTING_HANDOFF_MAP",
                     );
@@ -577,7 +616,7 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                     if must {
                         assert_eq!(udp_run.verdict, TC_ACT_SHOT, "{side} {family} UDP");
                         assert_eq!(
-                            hash_count::<TuplesKey, RoutingHandoffEntry>(
+                            flow_count::<TuplesKey, RoutingHandoffEntry>(
                                 &backend,
                                 "ROUTING_HANDOFF_MAP"
                             ),
@@ -606,7 +645,7 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                         assert_eq!(entry.result.decision_token, 0);
                     }
                     assert_eq!(
-                        hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
+                        flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                         before_conn,
                         "DNS UDP must not allocate conn state"
                     );
@@ -623,13 +662,13 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                     let source_port = 42100 + wan as u16;
                     let tcp_tuple = tuple(source, destination, source_port, 53, IPPROTO_TCP);
                     let before_tcp_conn =
-                        hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
+                        flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
                     let syn = packet(source, destination, IPPROTO_TCP, source_port, 53, 0, 0x02);
                     let syn_run = run(&backend, side, &syn, SkbInput::default());
                     let expected = if must { TC_ACT_SHOT } else { TC_ACT_REDIRECT };
                     assert_eq!(syn_run.verdict, expected, "{side} {family} TCP SYN");
                     assert_eq!(
-                        hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
+                        flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                         before_tcp_conn + 1,
                         "TCP SYN allocates one cached state before its terminal outcome"
                     );
@@ -652,12 +691,12 @@ fn dns_block_redirects_nonmust_and_drops_must() {
                         "{side} {family} TCP following"
                     );
                     assert_eq!(
-                        hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
+                        flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                         before_tcp_conn + 1,
                         "TCP following packet reuses cached state"
                     );
                     assert_eq!(
-                        hash_count::<TuplesKey, RoutingHandoffEntry>(
+                        flow_count::<TuplesKey, RoutingHandoffEntry>(
                             &backend,
                             "ROUTING_HANDOFF_MAP"
                         ),
@@ -695,9 +734,9 @@ fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
         .enumerate()
         {
             backend.set_datapath_flags(flags).unwrap();
-            let before = hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
+            let before = flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP");
             let before_handoff =
-                hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
+                flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP");
             let initial_sequence = backend.udp_decision_sequence_status().unwrap();
             let source_port = 43000 + index as u16;
             let udp_tuple = tuple(source, destination, source_port, 53, IPPROTO_UDP);
@@ -711,7 +750,7 @@ fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
             assert_eq!(raw_run.verdict, TC_ACT_REDIRECT);
             assert_eq!(raw_run.cb[2], raw_route.to_mark(), "raw {destination}");
             assert_eq!(
-                hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
+                flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
                 before_handoff,
                 "raw UDP DNS must not publish an unused handoff"
             );
@@ -725,7 +764,7 @@ fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
             );
             assert_ne!(raw_run.cb[2], nonmust_run.cb[2]);
             assert_eq!(
-                hash_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
+                flow_count::<TuplesKey, RoutingHandoffEntry>(&backend, "ROUTING_HANDOFF_MAP"),
                 before_handoff + 1,
                 "nonmust UDP DNS publishes its own handoff"
             );
@@ -761,7 +800,7 @@ fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
                 assert_eq!(peer.mark, expected, "peer {label} {destination}");
             }
             assert_eq!(
-                hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
+                flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                 before,
                 "UDP DNS must not allocate conn state"
             );
@@ -840,7 +879,7 @@ fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
                 "5353 is not a DNS carrier"
             );
             assert_eq!(
-                hash_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
+                flow_count::<TuplesKey, ConnState>(&backend, "CONN_STATE_MAP"),
                 before + 2,
                 "5353 follows ordinary TCP/UDP state accounting"
             );

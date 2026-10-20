@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ApiError, ErrorCode, NativeState, error, full_detail, invalid_query, timestamp,
-    types::RequestId,
+    ApiError, ErrorCode, NativeState, error, full_detail, invalid_query, secrets::ListenerSecrets,
+    timestamp, types::RequestId,
 };
 use crate::dns::{
     DiagnosticError, DiagnosticFailure,
@@ -46,26 +46,23 @@ const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 pub(crate) struct DnsApi {
     rate: super::security::RequestRate,
     snapshots: tokio::sync::Mutex<VecDeque<cache::Snapshot>>,
-    log: Arc<log::DnsHistory>,
     pub(crate) recorder: Arc<DnsRecorder>,
 }
 
 impl DnsApi {
     pub(crate) fn new(instance_id: String, recording: bool, flows: Weak<FlowStore>) -> Self {
-        let log = Arc::new(log::DnsHistory::new(instance_id.clone(), recording));
         Self {
-            recorder: Arc::new(DnsRecorder::new(instance_id, flows, log.clone())),
-            log,
+            recorder: Arc::new(DnsRecorder::new(instance_id, flows, recording)),
             rate: super::security::RequestRate::new(),
             snapshots: tokio::sync::Mutex::new(VecDeque::new()),
         }
     }
 
     pub(crate) fn set_log_limit(&self, limit: usize) {
-        self.log.set_limit(limit);
+        self.recorder.history().set_limit(limit);
     }
     pub(crate) fn set_recording(&self, recording: bool) {
-        self.log.set_recording(recording);
+        self.recorder.history().set_recording(recording);
     }
     pub(crate) fn query_capability(&self) -> Value {
         json!({"available":true,"record_types":TYPES.iter().map(|&value| records::record_type(value)).collect::<Vec<_>>(),
@@ -76,11 +73,11 @@ impl DnsApi {
         json!({"available":true,"read":true,"delete_entry":true,"delete_name":true,"flush":true,"entry_kinds":["positive","negative"]})
     }
     pub(crate) fn log_capability(&self) -> Value {
-        self.log.capability()
+        log::capability(self.recorder.history())
     }
     #[cfg(test)]
-    pub(crate) fn log_for_test(&self) -> &log::DnsHistory {
-        &self.log
+    pub(crate) fn log_page_for_test(&self) -> Response {
+        log::page_for_test(self.recorder.history())
     }
 }
 
@@ -285,6 +282,7 @@ pub(super) async fn query(
         rows.push(row);
     }
     bounded_response(
+        state,
         &json!({"domain": domain, "cache_mode": cache_mode, "query_time": query_time, "results": rows}),
         id,
     )
@@ -322,12 +320,24 @@ impl Write for BoundedJson {
         Ok(())
     }
 }
-fn bounded_response(value: &impl Serialize, id: &RequestId) -> Result<Response, ApiError> {
-    json_response(value, MAX_RESPONSE_BYTES, id)
+fn bounded_response(
+    state: &NativeState,
+    value: &impl Serialize,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let secrets = state.observation.configuration.current_secrets();
+    json_response(value, MAX_RESPONSE_BYTES, &secrets, id)
 }
-fn json_response(value: &impl Serialize, cap: usize, id: &RequestId) -> Result<Response, ApiError> {
+fn json_response(
+    value: &impl Serialize,
+    cap: usize,
+    secrets: &ListenerSecrets,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let mut value = serde_json::to_value(value).map_err(|_| unavailable(id))?;
+    secrets.mask_value(&mut value);
     let mut writer = BoundedJson(Vec::new(), cap);
-    serde_json::to_writer(&mut writer, value).map_err(|_| unavailable(id))?;
+    serde_json::to_writer(&mut writer, &value).map_err(|_| unavailable(id))?;
     Ok((
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(writer.0),
@@ -377,6 +387,7 @@ pub(super) async fn delete_name(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
+        state,
         &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )
@@ -397,7 +408,7 @@ pub(super) async fn delete_entry(
         ))
         .await
         .map_err(|_| unavailable(id))?;
-    bounded_response(&json!({"deleted":result.deleted}), id)
+    bounded_response(state, &json!({"deleted":result.deleted}), id)
 }
 
 pub(super) async fn flush(
@@ -413,6 +424,7 @@ pub(super) async fn flush(
         .await
         .map_err(|_| unavailable(id))?;
     bounded_response(
+        state,
         &json!({"matched":result.deleted,"deleted":result.deleted}),
         id,
     )

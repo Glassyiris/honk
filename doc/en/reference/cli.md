@@ -80,7 +80,7 @@ An exhausted [compiled-routing publication counter](../design/routing.md#synchro
 | `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |
 | `MIMALLOC_PURGE_DELAY` | `honk-core` with `mimalloc` | mimalloc's own purge delay in milliseconds: how long freed pages stay committed before they are returned to the OS. honk starts with `100` (mimalloc v3's default is `1000`), which lowers RSS under connection, probe and DNS churn without a measurable bulk-relay throughput or CPU change; any value set in the environment takes precedence, including an unparsable one, which leaves mimalloc's `1000`. `0` purges immediately (lowest RSS, slightly more CPU) and `-1` never purges. |
 | `TOKIO_WORKER_THREADS` | `honk-core` | Tokio's own worker count. `honk-core` builds a default multi-thread runtime, so it follows the core count. It must be a positive integer: `0` or a non-number makes Tokio panic at startup. Every worker keeps its own allocator heap, so a lower value reduces RSS on many-core gateways (lab, 120 connections plus DNS on a 4-core host: about 85 MiB with 16 workers, 66 MiB with 8 and 60 MiB with 4, CPU within noise). The relay path runs on these workers; size the value to the traffic. |
-| `HONK_VMLINUX_BTF` | `honk-core` with `ebpf` | Overrides the raw kernel BTF file used to resolve process-name offsets. Without it, honk checks `/sys/kernel/btf/vmlinux` and then `/usr/lib/debug/boot/vmlinux`; if runtime BTF offsets or verifier-safe kernel argv access are unavailable, pname synchronously falls back to the calling thread's `comm`. |
+| `HONK_VMLINUX_BTF` | `honk-core` with `ebpf` | Overrides the raw kernel BTF shared by process-name routing and native UDP receive tracing. The file must match the running kernel. An explicit unreadable or invalid override refuses real-backend startup rather than falling back to another file. TCP ownership proof reads no kernel structures and does not depend on it. |
 | `DAE_LOCATION_ASSET` | Geo loading in both binaries | Directory checked first for `geoip.dat` and `geosite.dat`. |
 
 UDP NFQUEUE has no environment-variable switch. It is enabled by default through `global.nfqueue_enable`; set that key to `false` to disable it. See the [global configuration reference](./global.md) and [NFQUEUE design](../design/nfqueue.md).
@@ -90,7 +90,7 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 | Item | Control | Current invariant |
 | --- | --- | --- |
 | eBPF object | Embedded object or `--bpf-object PATH` | With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`; the option replaces those bytes at runtime. Builds without `ebpf` use the mock backend. |
-| Kernel BTF | `HONK_VMLINUX_BTF` or common-path search | Used only to resolve `pname` kernel-field offsets. Without an override, honk tries `/sys/kernel/btf/vmlinux` followed by `/usr/lib/debug/boot/vmlinux`. |
+| Kernel BTF | `HONK_VMLINUX_BTF`, `/sys/kernel/btf/vmlinux` or `/usr/lib/debug/boot/vmlinux` | Without an override, reads `/sys/kernel/btf/vmlinux`, then `/usr/lib/debug/boot/vmlinux` (OpenWrt's `vmlinux-btf` package) if the former is unreadable. Only raw BTF is accepted; for an ELF debug vmlinux, extract its `.BTF` section and point the override at it. The selected BTF supplies kernel-field offsets, the Aya loader target and receive-trace function signatures. Missing or invalid BTF refuses startup. Unavailable kernel argv capture can still fall back to thread `comm`. Native UDP receive tracing additionally needs the in-kernel BTF and ftrace, and degrades without them; an external file does not replace them. |
 | Pin root | `--bpf-pin-root PATH` | Defaults to `/sys/fs/bpf` and is passed to the real backend for pinned maps. |
 | Bypass mark | `global.so_mark_from_dae` | Exact socket mark for dials, probes, DNS and downloads; zero selects the default `0x100`. Changes require restart. See [socket marks](./global.md#socket-marks). |
 | TPROXY mark | Compiled constant plus validated config | `TPROXY_MARK = 0x08000000`; `global.tproxy_mark` must equal this value. |
@@ -209,7 +209,19 @@ honk-tool bpf stats [--pin-root PATH]
 | `domain-routing` | Learned IP and active-policy domain-predicate bitmap indices, from DNS or sniffed evidence; known-zero entries remain visible. |
 | `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
 
-The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.
+The commands read pins through raw `bpf(2)` without loading programs or attaching hooks; reads normally require root or suitable BPF capabilities. `stats` prints each counter below on its own labeled line, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counts. `BPF_STATS_MAP` must have nine slots: mixed tool/engine versions fail with `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` (reversed for an older tool), rather than mislabelling counters. Upgrade the tool with the engine/object.
+
+| Key | Canonical label | Counts |
+| --- | --- | --- |
+| `0` | `udp_conn_overflow` | UDP conn-state insertion failures with no existing tuple. |
+| `1` | `tcp_conn_overflow` | TCP conn-state insertion failures. |
+| `2` | `redirect_track_insert_failure` | Redirect-track publication failures: map insertion or unavailable preparation scratch. |
+| `3` | `routing_handoff_insert_failure` | Routing-handoff publication failures: map insertion or unavailable preparation scratch. |
+| `4` | `socket_identity_capture_failure` | Failures to capture or store a socket's process identity. |
+| `5` | `tcp_child_proof_storage_failure` | Failures to store an accepted TCP child's ownership proof. |
+| `6` | `tcp_publisher_claim_failure` | TCP SYN publisher-claim insertion failures, excluding ordinary same-tuple collisions (`EEXIST`). |
+| `7` | `new_flow_rate_limited` | LAN flow attempts dropped by the per-source, per-CPU new-flow limit. |
+| `8` | `udp_reverse_learning_suspended` | Reverse UDP learning attempts skipped under conn pressure after a conn-state lookup miss. |
 
 `routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries; upgrade the tool with the engine/object.
 

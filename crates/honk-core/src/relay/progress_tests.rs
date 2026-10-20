@@ -198,6 +198,18 @@ async fn copy_errors_preserve_endpoint_origin_original_error_and_accepted_bytes(
                 true,
             ),
             (
+                Read,
+                ErrorKind::HostUnreachable,
+                Some(libc::EHOSTUNREACH),
+                true,
+            ),
+            (
+                Write,
+                ErrorKind::NetworkUnreachable,
+                Some(libc::ENETUNREACH),
+                true,
+            ),
+            (
                 EofFlush,
                 ErrorKind::ConnectionAborted,
                 Some(libc::ECONNABORTED),

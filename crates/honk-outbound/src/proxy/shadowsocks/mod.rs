@@ -18,7 +18,9 @@
 //! UDP is supported for both cipher families through `dial_udp_transport`:
 //! datagrams are sealed/opened in place and exchanged over a connected
 //! server-facing socket (legacy: per-packet salt + AEAD; 2022: session-based
-//! separate-header construction).
+//! separate-header construction). One transport serves every destination of a
+//! client source ([`MultiTargetTransport`]) and returns the authenticated
+//! address the server reports as the reply's source.
 //!
 //! References: <https://shadowsocks.org/doc/aead.html>,
 //! <https://shadowsocks.org/doc/sip022.html>
@@ -34,12 +36,16 @@ use sha1::Sha1;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
 use super::addr;
-use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound};
+use super::{
+    MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
+    ProxyStream, SharedSourceOutbound, TcpOutbound,
+};
 use aead2022::{Ss2022Method, Ss2022UdpSession};
 
 pub(crate) const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
@@ -433,6 +439,25 @@ impl TcpOutbound for ShadowsocksHandler {
 }
 
 #[async_trait]
+impl SharedSourceOutbound for ShadowsocksHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let _ = speculative;
+        // Nothing outside the transport owns its socket, so a losing
+        // preparation closes it by dropping.
+        let transport =
+            Self::udp_transport(&runtime.node, target, target_domain, connect_timeout).await?;
+        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
+    }
+}
+
+#[async_trait]
 impl PacketOutbound for ShadowsocksHandler {
     async fn dial_udp_transport(
         &self,
@@ -441,15 +466,9 @@ impl PacketOutbound for ShadowsocksHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let (crypto, outbound, socks) =
-            Self::udp_server_session(node, target, target_domain, connect_timeout).await?;
-        Ok(Arc::new(SsUdpTransport {
-            socket: outbound,
-            crypto: tokio::sync::Mutex::new(crypto),
-            recv_buf: tokio::sync::Mutex::new(None),
-            socks,
-            target,
-        }))
+        Ok(Arc::new(
+            Self::udp_transport(node, target, target_domain, connect_timeout).await?,
+        ))
     }
 }
 
@@ -457,14 +476,12 @@ impl PacketOutbound for ShadowsocksHandler {
 impl ProbeableOutbound for ShadowsocksHandler {}
 
 impl ShadowsocksHandler {
-    /// Set up a UDP relay session towards the server: cipher state plus a
-    /// connected, bypass-marked server-facing socket.
-    async fn udp_server_session(
+    async fn udp_transport(
         node: &Node,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<(SsUdpCrypto, tokio::net::UdpSocket, Vec<u8>)> {
+    ) -> anyhow::Result<SsUdpTransport> {
         let config = node.shadowsocks().unwrap();
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = config.password.as_deref().unwrap_or("");
@@ -511,18 +528,33 @@ impl ShadowsocksHandler {
             "Shadowsocks UDP: session to {} for target {}",
             server_addr, target
         );
-        Ok((crypto, outbound, socks))
+        Ok(SsUdpTransport {
+            socket: outbound,
+            crypto: tokio::sync::Mutex::new(crypto),
+            recv_buf: tokio::sync::Mutex::new(None),
+            socks,
+            target,
+            target_domain: target_domain.map(Box::from),
+            server_addr,
+        })
     }
 }
 
 /// Framed Shadowsocks UDP transport: datagrams are sealed/opened in place
-/// and go straight over the connected server-facing socket.
+/// and go straight over the connected server-facing socket. One transport
+/// carries every destination of a client source: the crypto state (legacy
+/// salts, SS2022 session id, packet counter and server replay windows) is
+/// shared, and the outer socket stays pinned to the server while the
+/// authenticated inner address names the real remote peer.
 struct SsUdpTransport {
     socket: tokio::net::UdpSocket,
     crypto: tokio::sync::Mutex<SsUdpCrypto>,
     recv_buf: tokio::sync::Mutex<Option<Vec<u8>>>,
+    /// Pre-encoded address of the default `target`.
     socks: Vec<u8>,
     target: SocketAddr,
+    target_domain: Option<Box<str>>,
+    server_addr: SocketAddr,
 }
 
 impl fmt::Debug for SsUdpTransport {
@@ -533,33 +565,113 @@ impl fmt::Debug for SsUdpTransport {
     }
 }
 
-#[async_trait]
-impl PacketTransport for SsUdpTransport {
-    fn relay_addr(&self) -> SocketAddr {
-        self.target
-    }
-    fn send_timeout_is_congestion(&self) -> bool {
-        true
-    }
+/// Longest SOCKS address: ATYP, length, 255-byte domain, port.
+const MAX_SOCKS_ADDR_LEN: usize = 1 + 1 + u8::MAX as usize + 2;
 
-    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+/// Encode `target` (or its dialed `domain`) into `out`, returning the length.
+fn encode_socks_addr(
+    target: SocketAddr,
+    domain: Option<&str>,
+    out: &mut [u8; MAX_SOCKS_ADDR_LEN],
+) -> std::io::Result<usize> {
+    let port = target.port().to_be_bytes();
+    let len = match (domain, target) {
+        (Some(domain), _) => {
+            if domain.is_empty() || domain.len() > u8::MAX as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "proxy target domain must contain 1..=255 bytes",
+                ));
+            }
+            out[0] = addr::ATYP_DOMAIN;
+            out[1] = domain.len() as u8;
+            out[2..2 + domain.len()].copy_from_slice(domain.as_bytes());
+            out[2 + domain.len()..4 + domain.len()].copy_from_slice(&port);
+            4 + domain.len()
+        }
+        (None, SocketAddr::V4(v4)) => {
+            out[0] = addr::ATYP_IPV4;
+            out[1..5].copy_from_slice(&v4.ip().octets());
+            out[5..7].copy_from_slice(&port);
+            7
+        }
+        (None, SocketAddr::V6(v6)) => {
+            out[0] = addr::ATYP_IPV6;
+            out[1..17].copy_from_slice(&v6.ip().octets());
+            out[17..19].copy_from_slice(&port);
+            19
+        }
+    };
+    Ok(len)
+}
+
+impl SsUdpTransport {
+    /// The one send path of both trait entry points: seal under the shared
+    /// crypto state, release it, then send.
+    async fn send_sealed(
+        &self,
+        socks: &[u8],
+        target_port: u16,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
         // The endpoint driver already serializes this flow's sends. Receive
         // holds the shared cipher only for one decrypt, so awaiting that
         // short critical section preserves datagrams without an unobservable
         // overload drop or a per-packet task.
         let mut crypto = self.crypto.lock().await;
         let packet = crypto
-            .seal(&self.socks, self.target.port(), data)
+            .seal(socks, target_port, data)
             .map_err(std::io::Error::other)?;
         drop(crypto);
-        let sent = self.socket.send(&packet).await?;
+        let sent = self
+            .socket
+            .send(&packet)
+            .await
+            .map_err(crate::proxy::send_size_refusal)?;
         if sent != packet.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "partial Shadowsocks UDP datagram send",
             ));
         }
+        if let Some(admitted) = admitted {
+            admitted.store(true, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// The reply source a decoded inner address stands for, or `None` for a
+    /// domain other than the dialed one (never resolved: it names no IP).
+    fn reply_peer(&self, peer: &addr::SocksAddr) -> Option<SocketAddr> {
+        match peer {
+            addr::SocksAddr::V4(peer) => Some(SocketAddr::V4(*peer)),
+            addr::SocksAddr::V6(peer) => Some(match peer.ip().to_ipv4_mapped() {
+                Some(ip) => SocketAddr::new(ip.into(), peer.port()),
+                None => SocketAddr::V6(*peer),
+            }),
+            addr::SocksAddr::Domain(domain, port) => {
+                addr::dialed_domain_peer(self.target_domain.as_deref(), self.target, domain, *port)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl PacketTransport for SsUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+    fn allows_full_cone_replies(&self) -> bool {
+        true
+    }
+    fn send_timeout_is_congestion(&self) -> bool {
+        true
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_sealed(&self.socks, self.target.port(), data, None)
+            .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -572,17 +684,18 @@ impl PacketTransport for SsUdpTransport {
             Some(recv_buf.get_or_insert_with(|| vec![0u8; UDP_PACKET_BUFFER_SIZE]))
         };
         // A datagram that fails to open (short, wrong key, replayed, bad
-        // address) is that datagram's problem: the session and the endpoint
-        // stay valid, so drop it and keep receiving. Only the socket ends the
-        // transport.
+        // address) or names an unprojectable source is that datagram's
+        // problem: the session and the endpoint stay valid, so drop it and
+        // keep receiving. Only the socket ends the transport.
         loop {
             let wire = match scratch.as_deref_mut() {
                 Some(scratch) => scratch.as_mut_slice(),
                 None => &mut *buf,
             };
             let n = self.socket.recv(wire).await?;
-            let payload = match self.crypto.lock().await.open(&wire[..n]) {
-                Ok(payload) => payload,
+            let opened = self.crypto.lock().await.open(&wire[..n]);
+            let datagram = match opened {
+                Ok(datagram) => datagram,
                 Err(error) => {
                     debug!(
                         "Shadowsocks UDP: dropping {} byte datagram for {}: {}",
@@ -591,6 +704,14 @@ impl PacketTransport for SsUdpTransport {
                     continue;
                 }
             };
+            let Some(peer) = self.reply_peer(&datagram.peer) else {
+                debug!(
+                    "Shadowsocks UDP: dropping datagram from unmapped source {:?} for {}",
+                    datagram.peer, self.target
+                );
+                continue;
+            };
+            let payload = datagram.payload();
             if payload.len() > buf.len() {
                 debug!(
                     "Shadowsocks UDP: dropping {} byte payload for {} that exceeds the {} byte buffer",
@@ -600,9 +721,36 @@ impl PacketTransport for SsUdpTransport {
                 );
                 continue;
             }
-            buf[..payload.len()].copy_from_slice(&payload);
-            return Ok((payload.len(), self.target));
+            buf[..payload.len()].copy_from_slice(payload);
+            return Ok((payload.len(), peer));
         }
+    }
+}
+
+#[async_trait]
+impl MultiTargetTransport for SsUdpTransport {
+    async fn send_to(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        _confirmed: bool,
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.target_domain.as_deref(), domain);
+        if target == self.target && domain == self.target_domain.as_deref() {
+            return self
+                .send_sealed(&self.socks, target.port(), data, admitted)
+                .await;
+        }
+        let mut socks = [0u8; MAX_SOCKS_ADDR_LEN];
+        let len = encode_socks_addr(target, domain, &mut socks)?;
+        self.send_sealed(&socks[..len], target.port(), data, admitted)
+            .await
+    }
+
+    fn carrier_addr(&self) -> Option<SocketAddr> {
+        Some(self.server_addr)
     }
 }
 
@@ -754,7 +902,7 @@ impl LegacyUdpCrypto {
         Ok(out)
     }
 
-    pub(crate) fn open(&self, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn open(&self, packet: &[u8]) -> anyhow::Result<UdpDatagram> {
         if packet.len() < self.conf.salt_len + self.conf.tag_len {
             anyhow::bail!("UDP packet too short");
         }
@@ -766,8 +914,34 @@ impl LegacyUdpCrypto {
         let body = cipher
             .open(&nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("open UDP packet failed: {:?}", e))?;
-        let skip = addr::socks_addr_len(&body)?;
-        Ok(body[skip..].to_vec())
+        UdpDatagram::new(body, 0)
+    }
+}
+
+/// One authenticated datagram: the remote peer the server names and the
+/// payload behind that address.
+pub(crate) struct UdpDatagram {
+    pub(crate) peer: addr::SocksAddr,
+    body: Vec<u8>,
+    payload_at: usize,
+}
+
+impl UdpDatagram {
+    /// Decode the address at `body[address_at..]`. Callers that commit state
+    /// on success must build this first, so a bad address changes nothing.
+    pub(crate) fn new(body: Vec<u8>, address_at: usize) -> anyhow::Result<Self> {
+        let mut rest = &body[address_at..];
+        let peer = addr::SocksAddr::decode_with(&mut rest, addr::ATYP_SOCKS5)?;
+        let payload_at = body.len() - rest.len();
+        Ok(Self {
+            peer,
+            body,
+            payload_at,
+        })
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.body[self.payload_at..]
     }
 }
 
@@ -785,7 +959,7 @@ impl SsUdpCrypto {
         }
     }
 
-    fn open(&mut self, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn open(&mut self, packet: &[u8]) -> anyhow::Result<UdpDatagram> {
         match self {
             SsUdpCrypto::Legacy(c) => c.open(packet),
             SsUdpCrypto::V2022(s) => s.open_packet(packet),

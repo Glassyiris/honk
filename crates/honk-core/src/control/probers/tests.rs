@@ -1,3 +1,4 @@
+use super::http::ProxyHttpProber;
 use super::*;
 use crate::control::tests::support::{UdpTestHandler, UdpTestMode, udp_test_node};
 use honk_outbound::alive::{HttpProbeResult, HttpProber, UdpProber};

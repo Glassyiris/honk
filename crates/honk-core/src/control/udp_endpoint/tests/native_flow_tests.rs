@@ -550,7 +550,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
             assert!(pool.complete_removal(
                 removal.client,
                 removal.dst,
-                removal.decision_token,
+                removal.owner,
                 removal.generation
             ));
         }

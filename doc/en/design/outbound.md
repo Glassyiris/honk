@@ -18,7 +18,7 @@ An ordinary caller receives one of:
 - `ProxyStream`, an established target-bound TCP byte stream; or
 - `Arc<dyn PacketTransport>`, an established framed packet path for one UDP target.
 
-Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. The source-shared VLESS path commits the typed `VlessXudpTransport` into a core-owned source attachment so several five-tuple endpoints can share its receiver.
+Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is fallible and returns the selected `Arc<T>`; dropping an unselected preparation rolls it back. Source-shared protocols (concrete VLESS XUDP/Mux.Cool, Hysteria2 and TUIC, and every `MultiTargetTransport`) commit their transports into core-owned source attachments so several five-tuple endpoints can share one receiver.
 
 `direct` reaches the target without a proxy protocol. `block` terminates the
 request. Every other handler turns the selected node into bytes understood by
@@ -93,8 +93,8 @@ UDP-only Xray pool therefore does not make Selector warming open that pool.
 `send_packet_confirmed`, and `recv_packet`. `send_packet_confirmed` is the
 stronger first-packet admission point for queue-backed tunnels. Full-cone
 protocols can additionally declare that server metadata authoritatively names
-the reply source. Source-shared VLESS uses the same framing transport internally,
-but core serializes sends from endpoint views and owns its single receive loop.
+the reply source. For source-shared protocols, core serializes
+sends from endpoint views and owns the transport's single receive loop.
 
 No production UDP handler returns a raw socket or a loopback bridge. Direct and
 SOCKS5 wrap native sockets behind `PacketTransport`; tunnel protocols implement
@@ -160,15 +160,32 @@ refusal; it is not interchangeable with missing UDP support.
 | --- | --- | --- |
 | `direct` | Native marked target connect | Native marked UDP behind `PacketTransport` |
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association; greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
-| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing |
-| `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. On send, only the dialed name is written; any other name goes out as the numeric target. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
+| `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing; one connected server socket and crypto state per client source, usable for every destination (see below) |
+| `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP; one associate stream per client source, each frame names its peer |
 | `vmess` | VMess stream | Unimplemented |
 | `vless` | Direct, H2, or Mux.Cool from the independent multiplex policy | Available when `network` allows UDP; encoding and optional UDP multiplexing select the path |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagrams |
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
-| `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream |
+| `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
+
+Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
+from one `MultiTargetTransport`: one marked socket connected to the server, one
+set of crypto state, and, for 2022, one client session ID, one monotonically
+increasing packet counter and one pair of server-session replay windows that
+never reset per destination. The default target's address header is
+pre-encoded; other destinations are encoded into a stack buffer. `recv_packet`
+returns the authenticated inner address as the peer, so a reply from a
+never-contacted host reaches the core as that host (IPv4-mapped IPv6 is
+normalized to IPv4). A domain source is accepted only as the dialed domain and
+port (ASCII case-insensitive) and is projected to the dialed target; any other
+domain is dropped without DNS. On send only the dialed name is written per
+datagram; any other name goes out as the numeric target. Short, wrong-key, replayed, bad-address or
+unprojectable datagrams drop only themselves; 2022 replay state is committed
+only after the address decodes. The outer socket stays connected to the
+server, so whether an unsolicited peer can reach the client depends on the
+server's own NAT behavior.
 
 VMess and VLESS entries are compiled only with the `rprx` feature. The default
 `honk-core` and `honk-tool` feature sets enable it. Without `rprx`, these node
@@ -299,6 +316,20 @@ consistent TLS, REALITY, WS, gRPC and XHTTP setup.
 Cold and pooled-bare Trojan streams use that same complete transport stack.
 TLS batching returns bytes already read before surfacing a later I/O error on
 the next non-empty read; it never converts that error into EOF.
+
+Trojan UDP carries every destination of a client source on one UDP-associate
+stream: the request header names the first destination, and each frame
+(`address | u16 length | CRLF | payload`) then names its own peer, in both
+directions. `recv_packet` returns the frame's real peer (IPv4-mapped IPv6
+canonicalized), so the core can admit a first reply from a never-contacted
+peer. A domain-named frame is accepted only when it equals the captured dial
+domain and port, then projects to the captured target; any other domain frame is
+consumed whole (length, CRLF, payload) and dropped without DNS. On send only the
+dialed name is written per frame; any other name goes out as the numeric target.
+An unknown ATYP has no derivable length and ends the stream. Frames share the stream's writer:
+a stalled partial frame is terminal for the whole source, never congestion, and
+destinations share head-of-line blocking and failure fate. Domain-target scopes
+stay per original destination.
 
 
 `transport_quality` owns advisory per-runtime carrier pressure. Common TCP/TLS/REALITY and AnyTLS use a physical-I/O adapter; Shadowsocks borrows its existing socket half. Linux `TCP_INFO` is read at most once per active second, checking each field against the returned ABI length; missing fields/errors remain unknown and never alter I/O. Vision Direct and ready-pool descriptor probing retain the socket path. Hy2/TUIC/Juicity reuse their existing one-second physical QUIC monitor, excluding pre-confirmation/pre-publication history and reseeding on peer changes. Logical mux children do not each report the same carrier event. No extra descriptor or per-TCP sampling task is retained; quiescent TCP has no new event-driven observation. See [Score pressure semantics](./groups.md#score-scoring-and-lifecycle).
@@ -548,6 +579,25 @@ command-UDP without the UoT magic destination or setup preamble. Sends accept
 1–8190 bytes; received zero-length frames are datagrams, not EOF. The writer is
 flush-confirmed and a cancelled ambiguous write is not replayed.
 
+Explicit `uot-v2` uses non-connect UoT v2: the request carries mode byte `0` and
+the first destination, then every datagram in both directions is
+`[ATYP 0/1/2][address][port][u16 length][payload]` (UoT v1 numbering) with up to
+65535 payload bytes. One stream therefore serves every destination of a client
+source (the core `Shared` source) and each reply keeps its real peer: numeric
+peers are returned with IPv4-mapped IPv6 canonicalized, the captured dial domain
+and port are projected back to the logical target, any other domain is dropped
+without DNS and consumed whole, and an unknown ATYP ends the stream. Unlike XUDP
+there is no empty-first or poisoned-child rule. The request and first datagram
+share one write; an interrupted write poisons the stream and is never replayed.
+A flow dialed by name sends that name in the request and per datagram; any other
+name (and a numeric flow) goes out as the numeric target. Real sing-box 1.12.4
+fixes its direct outbound's form by the first destination: after a domain request
+it maps the same name per datagram, but after a numeric request a per-packet FQDN
+fails with `invalid AddrPort: missing address` and ends the whole association.
+The same rule applies to H2MUX PacketAddr, AnyTLS, Trojan, SOCKS5 and Shadowsocks
+(`addr::dialed_name`); Juicity is unchanged and unverified, as no
+juicity-server is available.
+
 Typed policy, size, and carrier-capacity refusals are terminal local results,
 distinct from congestion or transport failure. They do not demote health or
 Score. Candidate admission checks policy before committing protocol state;
@@ -559,8 +609,12 @@ fallback or reporting the path as not applicable.
 `src/proxy/uot.rs` and `src/proxy/vless/mux.rs` implement shared UoT v2 framing
 and sing-box H2MUX. H2MUX sends the physical VLESS request to
 `sp.mux.sing-box.arpa:444`, selects backend `2`, then runs HTTP/2 over that
-carrier. Logical streams carry TCP or native connected UDP. UDP uses the shared
-UoT length codec rather than a loopback bridge.
+carrier. Logical streams carry TCP or UDP. UDP streams set sing-mux flags
+`UDP|Addr` (`3`) and, after the request naming the first destination, carry
+`[SOCKS5 address][port][u16 length][payload]` in both directions (SOCKS5 ATYPs,
+unlike UoT v1 numbering). One stream is the shared source of a client and
+returns real peers under the same projection and drop rules as UoT; a dropped
+frame still releases its HTTP/2 credit. There is no loopback bridge.
 
 Optional H2 padding adds the sing-mux v1 randomized preface and record framing
 for the first 16 records in each direction. A node has at most two reusable or
@@ -572,7 +626,9 @@ HTTP/2 flow control drives backpressure. GOAWAY makes the carrier draining and
 rolls new work to a replacement. Driver failure fans out to its children;
 half-close, reset, receive-window release, and lazy response errors remain
 per-stream. Receive credit stays 2 MiB per stream and connection credit remains
-large enough for one maximum UoT response frame for each admitted stream.
+large enough for one maximum response frame for each admitted stream: status
+byte, the widest address (259 bytes), the length and 65535 payload bytes. Credit
+is released by the full consumed wire length of each frame, delivered or dropped.
 
 ### Mux.Cool and XUDP
 
@@ -590,13 +646,64 @@ Single XUDP retains its 7,526-byte cap.
 
 ### Source/session ownership and capacity
 
-For Single XUDP and shared/separate Mux.Cool, `honk-core` indexes a source owner
-by reused `NodeRuntime` identity, normalized client address, selected UDP path,
-and reply projection (`ActualPeer` or `RewriteTo(original destination)`). One
-owner holds one XUDP session and one receiver while multiple canonical
-five-tuple endpoint entries expose serialized send views. Single XUDP uses one
+For source-shared protocols (Single XUDP, shared/separate Mux.Cool, Hysteria2, TUIC and every `MultiTargetTransport`), `honk-core` indexes
+a source owner by reused `NodeRuntime` identity, normalized client address,
+selected protocol/UDP path, and reply projection (`ActualPeer` or
+`RewriteTo(original destination)`). One owner holds one protocol association
+and one receiver; canonical five-tuple endpoints expose serialized send views. Single XUDP uses one
 private unpooled SID 0 per scope; Mux.Cool gives scopes separate child SIDs that
 may share physical pools.
+
+Hysteria2 shares one Session ID and TUIC one association ID across the scope's
+destinations. Different scopes can share a physical QUIC connection without
+sharing their logical association. These QUIC source paths and their shutdown
+joins remain available without `rprx`; only VLESS alternatives require it.
+
+Hysteria2 and both TUIC receive modes retain concrete reply peers through the
+existing bounded reassembler. Hysteria2 fragment addresses must agree; TUIC
+continuations may omit the address and wait for fragment zero, even if it arrives
+last. Peer metadata expires with its packet entry. A known requested domain and
+port may use the captured target projection, with ASCII case-insensitive name
+comparison; an unknown domain never triggers DNS or fabricates a foreign IP.
+TUIC zero-length payloads remain datagrams; Hysteria2 keeps its existing rejection
+of empty inbound payloads. Source preservation does not guarantee remote NAT
+mapping or filtering behavior.
+
+`MultiTargetTransport` is the one generic source transport for Shadowsocks,
+Juicity, SOCKS5, Trojan, AnyTLS and VLESS UoT v2/H2MUX (Hysteria2, TUIC and VLESS
+XUDP/Mux.Cool keep their concrete arms so their send path is not boxed). Each
+client source owns one logical association for all destinations: one Shadowsocks
+socket and crypto session (SS2022 never resets its session ID, packet counter or
+replay windows per destination), one Juicity bidirectional stream, one SOCKS5
+control connection with one relay socket, one Trojan associate stream, one
+non-connect UoT v2 stream or one H2MUX PacketAddr stream. `recv_packet` returns
+the real peer the server reports: an IPv4-mapped peer is IPv4, a domain source is
+accepted only as the captured domain and port, any other domain is dropped
+without DNS, and stream protocols consume a dropped frame whole before reading
+the next; an unknown address type stays terminal. `send_packet` and `send_to`
+share one unboxed helper; `confirmed` reaches the transport only on each view's
+first datagram, and `admitted` is set when the datagram reached the wire path or
+the writer queue. Reliable-stream carriers (Trojan, Juicity, AnyTLS, UoT, H2MUX)
+keep a partial-frame timeout terminal for the whole source, so destinations
+sharing a stream also share its head-of-line blocking and failure fate. H2MUX
+admits a datagram and starts its poison only when the first chunk is queued to
+h2, so a flow-control wait before any byte is queued times out as packet-local
+congestion and leaves the stream usable. Packet-local congestion lasts only while
+the source still admits datagrams: a run of unadmitted deadlines that no admitted
+datagram interrupts fails the source like any transport failure once it has
+lasted 30 s, however far apart they fall, so replies cannot keep a wedged uplink
+alive while an idle source, which sends nothing, is not blamed. A frame
+write cancelled halfway poisons the stream with a typed `FrameInterrupted`: the
+next send fails and the source retires every destination instead of appending to
+a torn frame. When a view's own retirement cancelled that write, the retirement
+is a neutral cancellation that charges no health or Score to the node; a
+timeout-caused tear stays a transport failure. A native UDP size refusal (`EMSGSIZE`) is a typed
+local `InvalidSize` rejection and ends nothing. The last view's endpoint permit
+stays held until the source receiver exits or another view binds, which keeps
+retiring sources inside the descriptor partition; for a short window a
+saturated pool can therefore refuse a new endpoint. Core's send gate is the
+only outer lock: backends hold their own leaf locks beneath it and never call
+back into core.
 
 The full `(client, destination)` endpoint map remains authoritative for route,
 decision token, and per-flow Score. A reply for a Ready entry is delivered only
@@ -606,7 +713,7 @@ an absent key in an `ActualPeer` scope is eligible for a foreign full-cone reply
 which updates source transport accounting but has no flow Score owner. Domain
 routes use `RewriteTo(original)` and never become foreign replies.
 
-The runtime lazily creates a private keyed source-ID hash from this scope.
+The VLESS runtime lazily creates a private keyed source-ID hash from this scope.
 Carrier replacement under a reused runtime preserves the ID; runtime
 replacement or process restart creates a new key. This intentionally preserves
 honk's per-source behavior, not Xray's source-only global identity and not a
@@ -633,10 +740,16 @@ result; shutdown remains neutral.
 The last bound view retires its source only after pending attachments are also
 gone; an attachment can still commit while a sibling view retires.
 
-Intentional endpoint retirement after queue admission ends the ambiguous source
+For VLESS, intentional endpoint retirement after queue admission ends the ambiguous source
 without replay or negative transport health. Later senders and the receiver
 retain the same cancellation cause, so a sibling send cannot reinterpret it as
 a carrier failure.
+
+QUIC source send tokens begin only after the source gate admits I/O, but remain
+owned by the endpoint driver through success/timeout/failure classification.
+Waiting for that gate consumes the existing send deadline without creating a
+QUIC attempt. Datagram congestion and TUIC stream failures retain their distinct
+semantics; cancellation or partial acceptance never authorizes packet replay.
 Send start/completion and retirement intent share the source-state critical
 section. It publishes both endpoint and source-view retirement flags after the
 matching sender's intent, before either send or receive can classify cancellation.
@@ -818,7 +931,7 @@ protocol heartbeat datagrams are unavailable.
 | Protocol | Authentication and TCP | UDP | Transport policy |
 | --- | --- | --- | --- |
 | TUIC v5 (`src/proxy/tuic.rs`) | TLS-exporter authentication on a uni stream; one TCP bi stream per flow | QUIC datagrams, fragmentation, and uni-stream fallback when datagrams are unavailable | 10 s heartbeat; default 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB, with node overrides |
-| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB |
+| Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream per client source; opened once with `[network=3][metadata]`, then `[metadata][u16 length][payload]` records in both directions, each naming its own destination or source | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows, the latter auto-tuned up to 32 MiB |
 | Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | A positive `hy2_up_mbps` selects `quic::BrutalConfig` (window = max(rate×RTT, 10×MTU), ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows with the same connection auto-tuning |
 
 The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
@@ -826,6 +939,20 @@ its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed
 packets are truncated by the server. Interop observed 8,192-byte payloads returning
 2,048 bytes; 2,048-byte echoes passed. This is not a Juicity wire limit, so honk
 does not impose an arbitrary 2,048-byte cap on other servers.
+
+Juicity UDP uses the deployed trojanc ATYP numbering (IPv4 1, domain 3, IPv6 4),
+not the differing numbers illustrated in the Juicity specification, and adds no
+session bytes. A client source shares one UDP stream across all destinations, so a
+cooperating server can relay them through one socket, and `recv_packet` returns the
+peer named by each reply frame (IPv4-mapped IPv6 normalized to IPv4). A domain
+source is accepted only when it equals, ASCII case-insensitively, the name the
+stream was opened with and carries the same port; it projects to that stream's
+target. Any other domain frame is consumed and dropped without DNS. An unknown
+ATYP is terminal. Destinations dialed by a rewritten domain scope per original
+destination. Every destination shares the stream's head-of-line blocking and
+failure fate; a write that times out may leave a partial frame, so it retires the
+whole source rather than counting as congestion. The QUIC send-attempt hooks stay
+on the source path.
 
 Hysteria2's HTTP/3 layer is deliberately local and minimal: control/QPACK
 unidirectional streams, static-table QPACK, and enough HEADERS handling for
@@ -887,6 +1014,8 @@ is dead: a loss burst silences every stream at once, and TCP delivers afterwards
 In that case, only the pending open is reset and the session leaves rotation.
 The session and its streams retire only after another ten seconds of silence,
 so the pool redials instead of reusing a dead carrier.
+All opens that time out in one silent window and its eventual retirement share
+one node-failure episode in Score, rather than one strike per affected stream.
 
 Sessions enter age-based drain at 30 minutes with per-session jitter. The
 configured `min_idle` floor (`anytls_min_idle_session`) and `anytls_idle_session_timeout` feed one node-local janitor.
@@ -974,12 +1103,28 @@ chunk and continuing a corrupted length-delimited byte stream.
 
 ### Lazy UoT creation
 
-Opening an AnyTLS UDP transport through `open_uot_stream` reserves a stream but defers its UoT connect
-request. The connect request and first encoded datagram are emitted together as
-one ordered PSH. Payloads are limited to 16 KiB, matching anytls-go 0.0.13's
-sing v0.5.1 relay buffer; larger inputs fail before consuming the lazy setup or
-poisoning the logical stream. This avoids an otherwise empty setup round trip
-without permitting first-packet replay.
+Opening an AnyTLS UDP transport through `open_uot_stream` reserves a stream but defers its UoT
+request. AnyTLS uses non-connect UoT v2: the request is `0x00` followed by the SOCKS5 address of
+the first destination, which only informs server routing and address-family selection. The
+request and the first encoded datagram are emitted together as one ordered PSH. Every datagram in
+both directions then carries its own address in the UoT v1 layout
+`[ATYP][address][port][u16 length][payload]`, with packet ATYP IPv4 `0`, IPv6 `1` and domain `2`
+(not the SOCKS5 numbering of the request address). Payloads are limited to 16 KiB, matching
+anytls-go 0.0.13's sing v0.5.1 relay buffer; larger inputs fail before consuming the lazy setup or
+poisoning the logical stream. This avoids an otherwise empty setup round trip without permitting
+first-packet replay.
+
+One stream therefore serves every destination of a client source (the `Shared` source transport),
+and the server can use one unconnected socket for all of them. `recv_packet` decodes the address
+before consuming the frame: numeric sources are returned (IPv4-mapped IPv6 as IPv4), the captured
+open-time domain and port project to the captured target, and any other domain frame is dropped
+whole, with its header and payload credit released and no name resolution. An unknown ATYP is
+terminal. On send, only the dialed name is written per datagram; any other name goes out as the
+numeric target. The first send of each flow waits for the physical flush (`confirmed`); steady sends only
+enqueue, and `admitted` is set when the frame is queued to the session writer. The queue and
+credit limits are those of a single transport, so queue saturation or EOF retires every
+destination sharing the SID. Domain-target flows (`RewriteTo`) keep one scope per original
+destination.
 
 ## Cold URLTest speculative preparation
 

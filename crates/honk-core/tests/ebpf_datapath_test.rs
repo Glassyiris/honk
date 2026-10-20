@@ -21,7 +21,7 @@ use std::ptr;
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
 const TC_ACT_REDIRECT: u32 = 7;
-const TC_ACT_PIPE: u32 = 3;
+const TC_ACT_UNSPEC: u32 = u32::MAX;
 const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -92,6 +92,8 @@ impl Fixture {
             wan_ifindex: 1,
             dae0peer_mac: [0x02, 0, 0, 0, 0, 2],
             dae_socket_mark: DAE_BYPASS_MARK,
+            // Cached non-SYN rows never perform a native socket lookup.
+            tcp_daens_netns_id: 0,
             ..Default::default()
         };
         let wan_ifindex = 1u32;
@@ -186,21 +188,21 @@ fn set_array<V: Pod>(bpf: &mut Ebpf, name: &str, index: u32, value: V) -> Result
 
 fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError> {
     let map = bpf.map_mut(name).expect("hash map present");
-    let mut hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
-    hash.insert(key, value, 0)
+    let mut hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
+    hash.insert(key, FlowMapValue::new(value), 4)
 }
 
 fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize {
     let map = bpf.map(name).expect("hash map present");
-    let hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
+    let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     hash.keys().map(Result::unwrap).count()
 }
 
 fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V> {
     let map = bpf.map(name).expect("hash map present");
-    let hash = HashMap::<_, K, V>::try_from(map).expect("hash map type/layout");
-    match hash.get(&key, 0) {
-        Ok(value) => Some(value),
+    let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
+    match hash.get(&key, 4) {
+        Ok(value) => Some(value.value),
         Err(MapError::KeyNotFound) => None,
         Err(error) => panic!("read {name}: {error}"),
     }
@@ -245,14 +247,15 @@ fn routing_meta(outbound: u8, mark: u32, must: bool, offload: bool) -> RoutingMe
     RoutingMeta { raw }
 }
 
+fn monotonic_now_ns() -> u64 {
+    let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .expect("read monotonic clock");
+    now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64
+}
+
 fn cached_state(outbound: u8, state: u8, token: u32, must: bool, offload: bool) -> ConnState {
     let mut value: ConnState = unsafe { mem::zeroed() };
-    let mut now: libc::timespec = unsafe { mem::zeroed() };
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
-        0
-    );
-    value.last_seen_ns = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+    value.last_seen_ns = monotonic_now_ns();
     value.state = state;
     value.decision_token = token;
     value.meta = routing_meta(outbound, 0, must, offload);
@@ -409,7 +412,7 @@ fn ndp_redirect_l2_contract() {
         fixture
             .run("lan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
             .return_value,
-        TC_ACT_OK,
+        TC_ACT_UNSPEC,
         "forwarded ICMPv6 Redirect passes"
     );
     assert_eq!(
@@ -420,7 +423,7 @@ fn ndp_redirect_l2_contract() {
                 SkbInput::default()
             )
             .return_value,
-        TC_ACT_OK,
+        TC_ACT_UNSPEC,
         "other ICMPv6 remains untouched"
     );
     assert_eq!(
@@ -464,7 +467,7 @@ fn ndp_redirect_l2_contract() {
                 SkbInput::default()
             )
             .return_value,
-        TC_ACT_OK,
+        TC_ACT_UNSPEC,
         "non-initial IPv6 fragment passes for kernel reassembly"
     );
     let truncated = ipv6_packet(src6, dst6, IPPROTO_ICMPV6, &[]);
@@ -516,6 +519,8 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
             smac: [0x02, 0, 0, 0, 0, 2],
             outbound: TEST_OUTBOUND,
             ifindex: 1,
+            last_seen_ns: monotonic_now_ns(),
+            incarnation: 1,
             ..Default::default()
         },
     )
@@ -536,7 +541,7 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
     ] {
         let before = outbound_stats(&fixture.bpf, TEST_OUTBOUND);
         let run = fixture.run("dae0_ingress", &wrong_reply, SkbInput::default());
-        assert_eq!(run.return_value, TC_ACT_OK);
+        assert_eq!(run.return_value, TC_ACT_UNSPEC);
         let after = outbound_stats(&fixture.bpf, TEST_OUTBOUND);
         assert_eq!(after.rx_packets, before.rx_packets);
         assert_eq!(after.rx_bytes, before.rx_bytes);
@@ -559,7 +564,7 @@ fn proxy_replies_do_not_create_reverse_udp_state() {
         };
         assert_eq!(
             fixture.run("lan_egress_l2", &reply, input).return_value,
-            TC_ACT_PIPE
+            TC_ACT_UNSPEC
         );
         let state: Option<ConnState> = get_hash(
             &fixture.bpf,
@@ -606,7 +611,7 @@ fn replies_from_uncontacted_peers_reach_the_client() {
         udp_packet([198, 51, 100, 9], client, 3478, 41001, 19),
     ] {
         let run = fixture.run("dae0_ingress", &packet, SkbInput::default());
-        assert_eq!(run.return_value, TC_ACT_OK);
+        assert_eq!(run.return_value, TC_ACT_UNSPEC);
     }
 
     // The contacted peer's reply keeps its exact record and attribution.
@@ -656,7 +661,7 @@ fn cached_route_health_and_pending_marks() {
             cached_state(TEST_OUTBOUND, 0, 0, false, false),
             false,
             0,
-            TC_ACT_SHOT,
+            TC_ACT_REDIRECT,
         ),
         (
             IPPROTO_TCP,
@@ -771,6 +776,29 @@ fn cached_route_health_and_pending_marks() {
             assert_eq!(run.mark, expected_mark, "cached route row {index}");
         }
     }
+}
+
+#[test]
+#[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
+fn cached_wan_tcp_survives_a_dead_outbound() {
+    let mut fixture = Fixture::load();
+    let key = tuple([10, 0, 0, 3], [198, 51, 100, 3], 42000, 443, IPPROTO_TCP);
+    put_hash(
+        &mut fixture.bpf,
+        "CONN_STATE_MAP",
+        key,
+        cached_state(TEST_OUTBOUND, 0, 0, false, false),
+    )
+    .unwrap();
+    set_health(&mut fixture.bpf, TEST_OUTBOUND, IPPROTO_TCP, 443, false);
+    let packet = tcp_packet([10, 0, 0, 3], [198, 51, 100, 3], 42000, 443, 0x10, 7);
+    assert_eq!(
+        fixture
+            .run("wan_egress_l2", &packet, SkbInput::default())
+            .return_value,
+        TC_ACT_REDIRECT,
+        "health gates fresh SYN publication, not an established flow"
+    );
 }
 
 #[test]

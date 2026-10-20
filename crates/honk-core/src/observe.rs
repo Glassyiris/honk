@@ -2,12 +2,12 @@
 //! records, independent of the native HTTP surface that serves them.
 
 pub(crate) mod catalog;
-mod dns;
+pub(crate) mod dns;
 pub(crate) mod flows;
 pub(crate) mod rules;
 pub(crate) mod vocab;
 
-pub(crate) use dns::{DnsLog, DnsObserver, DnsOperation, DnsRecorder};
+pub(crate) use dns::{DnsObserver, DnsOperation, DnsRecorder};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

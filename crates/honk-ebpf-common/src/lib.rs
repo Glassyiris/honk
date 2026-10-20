@@ -10,10 +10,13 @@ pub mod redirect_need;
 pub mod routing_policy;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
-pub use crate::conn::{ConnState, UdpDecisionSequence, UdpDecisionState};
+pub use crate::conn::{
+    ConnState, FlowIncarnationSequence, FlowMapValue, RetirementFence, UdpDecisionSequence,
+    UdpDecisionState,
+};
 pub use crate::redirect_need::{
-    DomainRouting, PIDName, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult, Tuples,
-    TuplesKey,
+    DomainRouting, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult, SocketIdentity,
+    TCP_BINDING_CHILD, TcpSocketBinding, Tuples, TuplesKey,
 };
 pub use routing_policy::{
     KernelRouteOutput, KernelRouteWitness, ROUTE_FACT_DESTINATION, ROUTE_FACT_DOMAIN,
@@ -232,7 +235,12 @@ pub struct DaeParam {
     pub padding2: u16,
     pub dae_socket_mark: u32,
     pub local_ip: u32,
+    /// Host-relative ID of the FD-owned daens; negative means unconfigured.
+    pub tcp_daens_netns_id: i32,
 }
+
+const _: () = assert!(core::mem::offset_of!(DaeParam, tcp_daens_netns_id) == 40);
+const _: () = assert!(core::mem::size_of::<DaeParam>() == 44);
 
 impl DaeParam {
     pub const DEFAULT: Self = Self {
@@ -249,6 +257,7 @@ impl DaeParam {
         padding2: 0,
         dae_socket_mark: 0,
         local_ip: 0,
+        tcp_daens_netns_id: -1,
     };
 }
 
@@ -486,9 +495,10 @@ pub struct RedirectEntry {
     pub padding: [u8; 2],
     pub ifindex: u32,
     pub decision_token: u32,
+    pub incarnation: u64,
 }
 
-const _REDIRECT_ENTRY_SIZE: () = assert!(core::mem::size_of::<RedirectEntry>() == 32);
+const _REDIRECT_ENTRY_SIZE: () = assert!(core::mem::size_of::<RedirectEntry>() == 40);
 const _REDIRECT_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RedirectEntry>() == 8);
 const _REDIRECT_ENTRY_LAST_SEEN_OFFSET: () =
     assert!(core::mem::offset_of!(RedirectEntry, last_seen_ns) == 0);
@@ -504,6 +514,7 @@ const _REDIRECT_ENTRY_IFINDEX_OFFSET: () =
     assert!(core::mem::offset_of!(RedirectEntry, ifindex) == 24);
 const _REDIRECT_ENTRY_TOKEN_OFFSET: () =
     assert!(core::mem::offset_of!(RedirectEntry, decision_token) == 28);
+const _: () = assert!(core::mem::offset_of!(RedirectEntry, incarnation) == 32);
 
 /// Bits of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
 /// at runtime (unlike `DaeParam`, which is fixed at load time). Mode/offload

@@ -40,11 +40,13 @@ CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
 CONFIG_BPF_JIT=y
 CONFIG_CGROUP_BPF=y
-CONFIG_NET_CLS_BPF=y|m
-CONFIG_NET_SCH_INGRESS=y|m
+CONFIG_NET_SCHED=y
 CONFIG_NET_CLS_ACT=y
+CONFIG_NET_XGRESS=y
 CONFIG_NET_NS=y
 ```
+
+TCX 后端需要由 `CONFIG_NET_CLS_ACT` 选中的隐藏选项 `CONFIG_NET_XGRESS`，不要求旧式 `CONFIG_NET_CLS_BPF` 或 `CONFIG_NET_SCH_INGRESS`。参见[挂钩与 qdisc 所有权](./design/datapath.md#接口挂钩集合)。
 
 默认启用的 held-first-packet UDP 还需要：
 
@@ -56,7 +58,15 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-`pname(...)` 路由需要 cgroup v2。缺少 cgroup v2 时，其余功能仍可启动，但进程名路由会被禁用。
+必须启用 cgroup v2 与 `CONFIG_CGROUP_BPF`。真实 datapath 会在根 cgroup 上挂载 socket 身份 hook 与 TCP `sock_ops` 程序 `honk_tcp_passive`，缺少时直接拒绝启动。若根 cgroup 的 `sock_ops` 槽位已被旧式（flags=0）程序占用，例如用 `bpftool cgroup attach` 挂载的程序，启动同样失败。`honk_tcp_passive` 会被主机上每一次 TCP `sock_ops` 回调调用（每条连接若干次），对不属于 honk 命名空间的 socket 立即返回。TCP 归属证明不需要内核自带 BTF、不需要 ftrace，也不要求内置 IPv6，因此只有外部原始 BTF 文件的内核也能运行。启动时总会加载原始 BTF（eBPF 加载器的目标 BTF，以及进程名与接收追踪的偏移），来源依次为 `HONK_VMLINUX_BTF` 指定的文件、`/sys/kernel/btf/vmlinux`、`/usr/lib/debug/boot/vmlinux`（OpenWrt `vmlinux-btf` 包的安装位置）。
+
+只有可选的 `native-api` UDP 接收追踪回退（UDP 接收优先级辅助元数据不可用时使用）会挂载 fentry/fexit 程序。它需要内核自带 BTF（`HONK_VMLINUX_BTF` 不能替代）与 ftrace，缺少时降级运行：
+
+```text
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+```
 
 ### bpffs
 
@@ -78,16 +88,22 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 ### 预编译二进制
 
-从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包：
+从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。无后缀名为 full 构建：
 
-- `x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl`
+| 变体 | 包后缀 | 内容 |
+|---|---|---|
+| full | 无 | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
+| clash-api | `-clash-api` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
+| native-api | `-native-api` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
 
 musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备。
 
+精简变体按 fail-closed 处理：在 `-clash-api` 上启用 `experimental.native_api`，或没有 `native-ui` 却设置 `ui: embedded`，都会启动失败。`--store db` 与原生配置管理需要 `native-api`。
+
 ```shell
-tar -xzf honk-core-<version>-<target>.tar.gz
-sudo install -m 0755 honk-core-<version>-<target>/honk-core /usr/local/bin/honk-core
+pkg=honk-core-<version>-<target>   # 按下载的包追加 -stock、-clash-api 或 -native-api
+tar -xzf "$pkg.tar.gz"
+sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
 ```
 

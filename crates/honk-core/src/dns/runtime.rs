@@ -406,7 +406,14 @@ impl RuntimeLease {
         tokio::select! {
             biased;
             error = self.cancelled() => Err(error),
-            result = operation => Ok(result),
+            result = operation => {
+                // Cancellation can be published after select polls its first branch.
+                if self.runtime.cancellation_requested.load(Ordering::Acquire) {
+                    Err(self.cancelled().await)
+                } else {
+                    Ok(result)
+                }
+            },
         }
     }
 

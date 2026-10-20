@@ -148,6 +148,7 @@ impl DnsForwarder {
             response_class,
             provenance,
             domain,
+            qtype: query.qtype().map_or(0, crate::dns::query::QType::get),
             answer_ips,
             expiry,
             logical_upstream,

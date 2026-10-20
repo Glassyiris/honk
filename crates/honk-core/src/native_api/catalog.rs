@@ -32,11 +32,10 @@ use crate::observe::{
 };
 
 use super::{
-    ApiError, ErrorCode, NativeState,
-    config::ListenerSecrets,
-    error, invalid_query,
+    ApiError, ErrorCode, NativeState, error, invalid_query,
     pages::{self, MAX_SNAPSHOT_BYTES, Pages, Snapshot},
     parse_query,
+    secrets::ListenerSecrets,
     types::RequestId,
 };
 

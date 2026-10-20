@@ -1,5 +1,6 @@
 use super::*;
 use crate::connection_tracker::{CloseOutcome, ConnectionEntry, ConnectionTracker};
+use crate::control::retirement_worker::{RetirementPort, spawn_retirement_worker};
 use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
 use honk_ebpf_common::{
     RedirectEntry, RedirectTuple,
@@ -46,11 +47,15 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
                 Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
             let (fatal, mut failures) = mpsc::unbounded_channel();
-            let worker = crate::control::udp_removal::spawn_udp_removal_worker(
+            let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
+            let port = Arc::new(RetirementPort::default());
+            let worker = spawn_retirement_worker(
                 Arc::clone(&pool),
                 Arc::clone(&backend),
                 Arc::clone(&tracker),
                 fatal,
+                Arc::clone(&pins),
+                Arc::clone(&port),
             );
             let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let destination = upstream.local_addr().unwrap();
@@ -164,7 +169,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             drop(socket_released);
             let mut pending = Box::pin(pending.wait());
             assert!(futures::poll!(&mut pending).is_pending());
-            assert!(locked.udp_conn_state_lookup(&key).unwrap().is_some());
+            assert!(locked.conn_state_lookup(&key).unwrap().is_some());
             drop(locked);
             if mismatch {
                 assert_eq!(pending.await, CloseOutcome::Failed);
@@ -183,7 +188,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     backend
                         .read()
                         .await
-                        .udp_conn_state_lookup(&key)
+                        .conn_state_lookup(&key)
                         .unwrap()
                         .unwrap()
                         .decision_token,
@@ -198,7 +203,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     backend
                         .read()
                         .await
-                        .udp_conn_state_lookup(&key)
+                        .conn_state_lookup(&key)
                         .unwrap()
                         .is_none()
                 );
@@ -221,6 +226,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 assert!(failures.try_recv().is_err());
             }
             pool.remove_sink.lock().take();
+            port.sink.lock().take();
             worker.await.unwrap();
         }
     })
@@ -381,12 +387,23 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
         let removal = removed.recv().await.unwrap();
         assert!(pool.wait_removal_io(&removal).await);
         drop(UdpSocket::bind(local_transport).await.unwrap());
-        assert_eq!(
-            backend.remove_udp_flow(&key, 101).unwrap(),
-            crate::ebpf::UdpDecisionCommitResult::Applied
-        );
+        let mut outcomes = [crate::ebpf::RetireOutcome::NotRun];
+        backend
+            .retire_batch(
+                &[crate::ebpf::RetireRequest {
+                    key,
+                    kind: crate::ebpf::RetireKind::Udp {
+                        token: 101,
+                        incarnation: removal.owner.incarnation(),
+                        pending_only: false,
+                    },
+                }],
+                &mut outcomes,
+            )
+            .unwrap();
+        assert_eq!(outcomes[0], crate::ebpf::RetireOutcome::ConnRetired);
         tracker.remove("acknowledged");
-        assert!(pool.complete_removal(source, destination, 101, generation));
+        assert!(pool.complete_removal(source, destination, removal.owner, generation));
         assert!(!pool.close_exact(source, destination, 101, generation));
         assert_eq!(pending.wait().await, CloseOutcome::Closed);
         signal.finish(false);
@@ -400,4 +417,97 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
+    for raw_dns in [false, true] {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let tracker = Arc::new(ConnectionTracker::new());
+        let source: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+        let destination: SocketAddr = if raw_dns {
+            "203.0.113.53:53"
+        } else {
+            "203.0.113.10:443"
+        }
+        .parse()
+        .unwrap();
+        let key = crate::control::connection::build_tuples_key(
+            destination.ip(),
+            destination.port(),
+            source.ip(),
+            source.port(),
+            17,
+        );
+        // Published, userspace-owned routing makes token-zero retirement
+        // eligible, so only the captured incarnation preserves the replacement.
+        let published = honk_ebpf_common::RoutingMeta {
+            raw: honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED | 2,
+        };
+        let mut mock = MockEbpfBackend::new();
+        mock.udp_conn_state_store(
+            &key,
+            &ConnState {
+                incarnation: if raw_dns { 22 } else { 11 },
+                meta: published,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
+        let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
+        let (fatal, mut failures) = mpsc::unbounded_channel();
+        let port = Arc::new(RetirementPort::default());
+        let worker = spawn_retirement_worker(
+            Arc::clone(&pool),
+            Arc::clone(&backend),
+            tracker,
+            fatal,
+            Arc::clone(&pins),
+            Arc::clone(&port),
+        );
+        let lease = match pool.reserve_or_enqueue_at(
+            source,
+            destination,
+            b"old",
+            None,
+            UdpFlowOwner::new(0, (!raw_dns).then_some(11)).unwrap(),
+            pool.initialization_epoch(),
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            queue_now(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("original endpoint must reserve"),
+        };
+        backend
+            .write()
+            .await
+            .udp_conn_state_store(
+                &key,
+                &ConnState {
+                    incarnation: 22,
+                    meta: published,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(lease);
+        assert!(pool.shutdown().await.joined);
+        assert_eq!(
+            backend
+                .read()
+                .await
+                .conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .incarnation,
+            22
+        );
+        assert!(failures.try_recv().is_err());
+        port.sink.lock().take();
+        worker.await.unwrap();
+    }
 }

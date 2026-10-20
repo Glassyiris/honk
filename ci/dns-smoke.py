@@ -369,6 +369,7 @@ def _udp_exchange(port: int, query: bytes) -> bytes:
 def _write_config(path: Path, dns_port: int, tproxy_port: int, upstream_port: int) -> None:
     path.write_text(
         f"""global {{
+    data_dir: '{path.parent / "state"}'
     tproxy_port: {tproxy_port}
     tproxy_port_protect: false
     log_level: info

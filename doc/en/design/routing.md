@@ -76,8 +76,9 @@ predicate ID within one policy.
 ### Source organization
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  userspace `Router`, priority-ordered compiled routes, `route_action`,
-  `GeositeMatcher`, and the `BinaryLpmTrie`/geo-asset helpers. `geo.rs` parses
+  userspace `Router`, priority-ordered compiled routes, `route_action`, and the
+  `BinaryLpmTrie`/geo-asset helpers. `domain.rs` owns the domain matchers,
+  `GeositeMatcher`, and the build-local interner. `geo.rs` parses
   `geoip.dat`/`geosite.dat` once per `Router` build and decodes only referenced
   codes; `category@attr` splits at the first `@` and filters attribute keys
   case-insensitively.
@@ -254,6 +255,8 @@ one GeoIP predicate can contain hundreds of thousands of prefixes. The emitter
 checks its 1,000,000-instruction budget before each instruction insertion and stops
 immediately on exhaustion, before further instruction or fixup expansion.
 
+Fact bits are a per-generation resource: 256 IDs per category (destination IP, source IP, MAC), counted per distinct list rather than per rule. Rules that name the same IP list (identified by its interned matcher) or the same MAC list (by value, order-sensitive) share one ID; negation stays on the rule condition. Domain predicates have a separate 256-ID limit and share IDs for equal normalized matcher keys. Branch distances must fit signed 16-bit instruction offsets; otherwise publication fails with `routing jump out of range`.
+
 Capacity and verifier limits are explicit errors. No rule chain is truncated and
 no missing outbound silently becomes direct. Generated source attribution records
 rule IDs and normalized rule descriptions. A raw loader uses the existing syscall
@@ -340,10 +343,12 @@ Implementation is accepted only with all existing matchers supported and with:
 The current CI real-kernel baseline is the pinned Ubuntu Linux
 `6.12.0-061200-generic` VM. CI builds the test executables on the hosted runner
 and runs those exact artifacts in the VM; it does not compile again in the guest.
-The VM runs the root-only routing and integration gates, while `just test-routing`
-also exercises the generated policy through the root/slot path, including
-precedence, complete decision metadata, capacity failures, and failed-publication
-preservation. `just test-netns` includes that routing gate.
+`just test-routing` and dependent `just test-netns` share that complete
+pre-provisioned disposable-VM gate. It exercises the real root/slot path,
+including precedence, complete decision metadata, capacity failures and
+failed-publication preservation, followed by the ownership/netns suites.
+Toolchain, both objects and VM environment prerequisites are documented in
+the `honk-real-ebpf-tests` skill; protected fixtures never run on a shared host.
 
 Performance measurements and historical prototype/lab records are intentionally
 not kept on this design page. The reload benchmark definition lives in

@@ -119,11 +119,11 @@ jobs:
                   if len(members) != 1:
                       raise ValueError("report artifact must contain exactly one file")
                   member = members[0]
-                  if PurePosixPath(member.filename).name != expected or member.file_size > 256 * 1024:
+                  if PurePosixPath(member.filename).name != expected or member.file_size > 512 * 1024:
                       raise ValueError("report artifact has an invalid member")
                   payload = source.read(member)
-                  if len(payload) > 256 * 1024:
-                      raise ValueError("report JSON expands beyond 256 KiB")
+                  if len(payload) > 512 * 1024:
+                      raise ValueError("report JSON expands beyond 512 KiB")
                   with (destination / expected).open("xb") as output:
                       output.write(payload)
           except (FileExistsError, OSError, ValueError, zipfile.BadZipFile) as error:

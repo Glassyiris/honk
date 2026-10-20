@@ -1015,7 +1015,7 @@ mod tests {
         assert_eq!(length, 12);
         assert_eq!(bytes[3] & 15, 5);
         stop_listener(&mut listener, &drain).await;
-        let page = api.log_for_test().page_for_test();
+        let page = api.log_page_for_test();
         let body = axum::body::to_bytes(page.into_body(), 262144)
             .await
             .unwrap();

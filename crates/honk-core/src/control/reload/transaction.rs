@@ -344,6 +344,33 @@ impl ControlPlane {
                 if declaring_sources_replaced(current_config.as_ref(), &new_config) {
                     *config = Arc::new(new_config);
                 }
+                let group_manager = self.group_manager.read().clone();
+                let cleared: Vec<_> = config
+                    .groups
+                    .iter()
+                    // An unpinned group needs no write lock or update; this keeps the
+                    // identical reload allocation-free.
+                    .filter(|group| {
+                        [
+                            honk_outbound::group::SelectionNetwork::Tcp,
+                            honk_outbound::group::SelectionNetwork::Udp,
+                        ]
+                        .into_iter()
+                        .any(|network| group_manager.has_override(&group.name, network))
+                    })
+                    .filter_map(|group| {
+                        group_manager
+                            .clear_override(
+                                &group.name,
+                                honk_outbound::group::SelectorNetworks::Both,
+                            )
+                            .ok()
+                    })
+                    .collect();
+                drop(config);
+                for update in cleared {
+                    update.run_callbacks_without_interrupt();
+                }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(ReloadOutcome::Noop { generation });
             }
@@ -381,25 +408,11 @@ impl ControlPlane {
         let geo_sources = &crate::routing::GeoSourceSet::load(&geo_requirements);
         let traffic_geo_fingerprint = geo_sources.fingerprint_for(&traffic_geo);
         let dns_geo_fingerprint = geo_sources.fingerprint_for(&dns_geo);
-        let hosts_sources = match crate::dns::forwarder::HostsSourceSet::load(&new_config.dns) {
-            Ok(sources) => sources,
-            Err(error) => {
-                warn!(%error, "Failed to load DNS hosts snapshot");
-                self.stop_reload_rejection_if_healthy(drain);
-                return Ok(ReloadOutcome::Rejected);
-            }
-        };
-        let candidate_dns_policy = match crate::dns::policy::PolicyId::from_config_with_artifacts(
-            &new_config.dns,
-            &hosts_sources.fingerprint(),
-            &dns_geo_fingerprint,
-        ) {
-            Ok(policy) => policy,
-            Err(error) => {
-                warn!(%error, "Failed to derive DNS policy identity");
-                self.stop_reload_rejection_if_healthy(drain);
-                return Ok(ReloadOutcome::Rejected);
-            }
+        let Some((hosts_sources, candidate_dns_policy)) =
+            super::dns::load_hosts_and_policy(&new_config, &dns_geo_fingerprint)
+        else {
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
         };
         let old_plan = self.active_routing_plan.read().clone();
         let old_has_direct_marks = current_router.has_direct_marks();
@@ -458,37 +471,22 @@ impl ControlPlane {
                 }
             };
         new_group_manager.bind_transport_quality(&new_runtime_registry);
-        let reuse_dns_router = dns_routing_state_reusable(&current_config, &new_config)
-            && current_dns_router.geo_fingerprint() == dns_geo_fingerprint;
-        let dns_router = if reuse_dns_router {
-            current_dns_router
-        } else {
-            match crate::dns::routing::DnsRouter::new_sharing(
-                &new_config.dns,
-                geo_sources,
-                &mut shared,
-            ) {
-                Ok(router) => Arc::new(router),
-                Err(error) => {
-                    warn!(%error, "Failed to build DNS router");
-                    self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(ReloadOutcome::Rejected);
-                }
-            }
+        let Some(dns_router) = super::dns::reuse_or_build_dns_router(
+            &current_config,
+            &new_config,
+            current_dns_router,
+            dns_geo_fingerprint,
+            geo_sources,
+            &mut shared,
+        ) else {
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
         };
-        let current_hosts = current_dns_forwarder.hosts_snapshot();
-        let hosts_changed = hosts_sources.fingerprint() != current_hosts.fingerprint();
-        let hosts_snapshot = if !hosts_changed {
-            current_hosts
-        } else {
-            match hosts_sources.parse() {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    warn!(%error, "Failed to parse DNS hosts snapshot");
-                    self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(ReloadOutcome::Rejected);
-                }
-            }
+        let Some(hosts_snapshot) =
+            super::dns::reuse_or_parse_hosts(hosts_sources, current_dns_forwarder.hosts_snapshot())
+        else {
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
         };
         let (new_dns_forwarder, new_upstream_pool) = match self
             .build_dns_forwarder(
@@ -953,67 +951,6 @@ impl ControlPlane {
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
         }
-    }
-
-    /// Build a DNS forwarder from an explicit config (used by the reload
-    /// pipeline's build phase — must not read live state, so the caller can
-    /// abort before commit without having mutated anything).
-    #[allow(clippy::too_many_arguments)]
-    async fn build_dns_forwarder(
-        &self,
-        config: &Config,
-        router: Arc<Router>,
-        group_manager: Arc<GroupManager>,
-        runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-        dns_policy: crate::dns::policy::PolicyId,
-        dns_router: Arc<crate::dns::routing::DnsRouter>,
-        hosts_snapshot: crate::dns::forwarder::HostsSnapshot,
-    ) -> anyhow::Result<(
-        Arc<crate::dns::forwarder::DnsForwarder>,
-        Arc<crate::dns::upstream_pool::UpstreamPool>,
-    )> {
-        let dns_upstream_pool = Arc::new(
-            crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
-                &config.dns.upstream,
-                dns_router.clone(),
-                Some(self.proxy_registry.clone()),
-                config.nodes.clone(),
-                config.groups.clone(),
-                honk_outbound::bootstrap::BootstrapResolver::parse(
-                    &config.global.bootstrap_resolver,
-                ),
-                config.dns.strategy,
-            )?
-            .with_client_subnet(config.dns.effective_client_subnet()?)
-            .with_timeouts(
-                std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
-                std::time::Duration::from_millis(config.global.connect_timeout_ms),
-            )
-            // Same SharedGroupManager + traffic Router cells as the data path
-            // (dae: Route DNS server IP; explicit `-> tag` still forces a group).
-            .with_group_manager_snapshot(group_manager)
-            .with_traffic_router_snapshot(router),
-        );
-        dns_upstream_pool.set_runtime_generation(runtime_generation)?;
-        let forwarder = Arc::new(
-            crate::dns::forwarder::DnsForwarder::new(
-                Arc::clone(&dns_upstream_pool) as Arc<dyn crate::dns::forwarder::DnsUpstreamPool>,
-                self.dns_controller.cache().await,
-                dns_router,
-            )
-            .with_configured_upstreams(&config.dns)
-            .with_timeouts(
-                std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
-                std::time::Duration::from_millis(config.global.connect_timeout_ms),
-            )
-            .with_strategy(config.dns.strategy)
-            .with_cache_enabled(config.dns.cache.enabled)
-            .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
-            .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
-            .with_policy_id(dns_policy)
-            .with_hosts_snapshot(hosts_snapshot),
-        );
-        Ok((forwarder, dns_upstream_pool))
     }
 }
 

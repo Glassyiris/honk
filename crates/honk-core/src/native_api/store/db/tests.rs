@@ -221,6 +221,19 @@ fn cli_export_restores_secrets_into_a_new_private_file() {
 }
 
 #[test]
+fn export_syncs_the_current_directory_for_a_bare_filename() {
+    assert_eq!(publication_dir(Path::new("exported.dae")), Path::new("."));
+    assert_eq!(
+        publication_dir(Path::new("out/exported.dae")),
+        Path::new("out")
+    );
+    assert_eq!(
+        publication_dir(Path::new("/tmp/exported.dae")),
+        Path::new("/tmp")
+    );
+}
+
+#[test]
 fn head_cache_and_existence_follow_promote() {
     let fixture = fixture();
     let store = initialized(&fixture);

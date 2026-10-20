@@ -669,7 +669,10 @@ fn test_udp_message_codec_roundtrip() {
     assert_eq!(msg.packet_id, 42);
     assert_eq!(msg.frag_total, 1);
     assert_eq!(msg.frag_id, 0);
-    assert_eq!(msg.addr, "8.8.8.8:53");
+    assert_eq!(
+        msg.addr,
+        super::super::addr::SocksAddr::new("8.8.8.8:53".parse().unwrap(), None).unwrap()
+    );
     assert_eq!(msg.data, b"payload");
 }
 
@@ -684,12 +687,25 @@ fn test_fragmentation_and_defrag() {
     let mut out = None;
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(pkt).unwrap();
-        assert_eq!(msg.addr, "8.8.8.8:53");
+        let peer = "8.8.8.8:53".parse().unwrap();
+        assert_eq!(
+            msg.addr,
+            super::super::addr::SocksAddr::new(peer, None).unwrap()
+        );
         out = defrag
-            .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data)
+            .feed(
+                msg.packet_id,
+                msg.frag_id,
+                msg.frag_total,
+                Some(peer),
+                msg.data,
+            )
             .or(out);
     }
-    assert_eq!(out.expect("reassembled payload"), data);
+    assert_eq!(
+        out.expect("reassembled payload"),
+        (data, "8.8.8.8:53".parse().unwrap())
+    );
 }
 
 #[test]
@@ -1001,8 +1017,7 @@ async fn udp_carrier_close_is_node_failure() {
         .await
         .unwrap();
     let endpoint =
-        crate::quic::packet_transport_endpoint(Arc::clone(&transport), transport.relay_addr())
-            .unwrap();
+        crate::quic::packet_transport_endpoint(transport.clone(), transport.relay_addr()).unwrap();
     let (conn, _) = client.connection(timeout).await.unwrap();
     conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
     let error = transport.send_packet(b"query").await.unwrap_err();
@@ -1539,3 +1554,5 @@ fn test_hop_state_rotation() {
     }
     assert!(seen.len() > 1, "hops should visit multiple ports: {seen:?}");
 }
+
+mod source_udp;

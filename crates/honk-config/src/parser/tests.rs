@@ -3098,6 +3098,35 @@ mod subscription_entry_options {
     }
 
     #[test]
+    fn entry_shaped_children_never_replace_the_enclosing_entry_options() {
+        let (subscriptions, diagnostics) = parse(
+            "subscription {\n outer: 'https://example.test/outer' {\n  route: direct\n  child: 'https://example.test/child' {\n   route: routing\n   cache: false\n   ua: 'child'\n  }\n }\n}",
+        );
+        assert_eq!(
+            subscriptions.iter().map(fetch).collect::<Vec<_>>(),
+            [(
+                "outer",
+                "https://example.test/outer",
+                None,
+                Subscription::default().update_interval,
+                true,
+                "direct"
+            )]
+        );
+        let unknown = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "unknown-key")
+            .map(|diagnostic| (diagnostic.severity, diagnostic.line))
+            .collect::<Vec<_>>();
+        assert_eq!(unknown, [(Severity::Warning, Some(4))]);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "legacy-wrapper")
+        );
+    }
+
+    #[test]
     fn a_header_that_is_not_a_quoted_link_stays_a_legacy_wrapper() {
         let (subscriptions, diagnostics) =
             parse("subscription {\n a: b: {\n  url: 'http://example.test/sub'\n }\n}");

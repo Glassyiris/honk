@@ -1,4 +1,5 @@
 use super::*;
+use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
 /// Format a `DaeEvent` IP field — four u32 chunks of a 16-byte address in
@@ -20,9 +21,42 @@ pub fn event_ip(chunks: &[u32; 4]) -> std::net::IpAddr {
 /// so a conntrack overflow burst cannot storm the log.
 pub const EVENT_LOG_MAX_PER_SEC: u32 = 32;
 
-/// Drain `EVENT_RINGBUF` into rate-limited structured logs.
+fn dispatch_expiry_event(
+    event: &DaeEvent,
+    expiry_hints: &tokio::sync::mpsc::Sender<FlowExpiryHint>,
+) -> bool {
+    if event.type_ != DaeEventType::FlowExpired as u32 {
+        return false;
+    }
+    if matches!(event.l4proto, 6 | 17)
+        && event.incarnation != 0
+        && event.incarnation <= honk_ebpf_common::conn::FLOW_INCARNATION_MAX
+    {
+        let hint = FlowExpiryHint {
+            key: TuplesKey {
+                src_ip: In6Addr {
+                    u6_addr32: event.sip,
+                },
+                dst_ip: In6Addr {
+                    u6_addr32: event.dip,
+                },
+                src_port: event.sport,
+                dst_port: event.dport,
+                l4proto: event.l4proto,
+                padding: [0; 3],
+            },
+            incarnation: event.incarnation,
+        };
+        // Advisory only: the ordinary janitor backs up a full hint queue.
+        let _ = expiry_hints.try_send(hint);
+    }
+    true
+}
+
+/// Drain functional expiry hints before rate-limiting diagnostic events.
 pub async fn consume_dae_events(
     mut async_fd: tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>,
+    expiry_hints: tokio::sync::mpsc::Sender<FlowExpiryHint>,
 ) {
     let mut window = std::time::Instant::now();
     let mut emitted: u32 = 0;
@@ -44,6 +78,9 @@ pub async fn consume_dae_events(
                 }
                 let ev: DaeEvent =
                     unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DaeEvent) };
+                if dispatch_expiry_event(&ev, &expiry_hints) {
+                    continue;
+                }
                 if window.elapsed() >= std::time::Duration::from_secs(1) {
                     if suppressed > 0 {
                         warn!(
@@ -91,5 +128,62 @@ pub async fn consume_dae_events(
             }
         }
         guard.clear_ready();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_dispatch_preserves_tuple_and_drops_only_advisory_overflow() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut event: DaeEvent = unsafe { core::mem::zeroed() };
+        event.type_ = DaeEventType::FlowExpired as u32;
+        event.l4proto = 6;
+        event.incarnation = 42;
+        event.sip = unsafe { In6Addr::from_ipv4_bytes([192, 0, 2, 1]).u6_addr32 };
+        event.dip = unsafe { In6Addr::from_ipv4_bytes([198, 51, 100, 2]).u6_addr32 };
+        event.sport = 49152;
+        event.dport = 443;
+
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.incarnation = 43;
+        assert!(dispatch_expiry_event(&event, &tx));
+        let hint = rx.try_recv().unwrap();
+        assert_eq!(hint.incarnation, 42);
+        assert_eq!(unsafe { hint.key.src_ip.u6_addr32 }, event.sip);
+        assert_eq!(unsafe { hint.key.dst_ip.u6_addr32 }, event.dip);
+        assert_eq!(hint.key.src_port, 49152);
+        assert_eq!(hint.key.dst_port, 443);
+        assert_eq!(hint.key.l4proto, 6);
+        assert_eq!(hint.key.padding, [0; 3]);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        event.l4proto = 17;
+        assert!(dispatch_expiry_event(&event, &tx));
+        assert_eq!(rx.try_recv().unwrap().key.l4proto, 17);
+        event.incarnation = 0;
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.incarnation = honk_ebpf_common::conn::FLOW_INCARNATION_MAX + 1;
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.incarnation = 44;
+        event.l4proto = 1;
+        assert!(dispatch_expiry_event(&event, &tx));
+        event.type_ = DaeEventType::Blocked as u32;
+        assert!(!dispatch_expiry_event(&event, &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 }

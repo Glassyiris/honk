@@ -50,7 +50,15 @@ async fn provider_get_is_safe_pure_and_counts_accepted_provenance_not_display_na
         assert!(detail["updated_at"].is_string());
         assert_eq!(detail["url_redacted"], subscription.url);
         assert_eq!(detail["name"], subscription.name);
-        assert!(detail["traffic"].is_null() && detail["expires_at"].is_null());
+        assert_eq!(
+            detail["traffic"],
+            json!({
+                "upload_bytes": "422986054",
+                "download_bytes": "5198408536",
+                "total_bytes": "214748364800",
+            })
+        );
+        assert_eq!(detail["expires_at"], "2026-12-08T06:54:09.000Z");
         assert_eq!(
             list["providers"]
                 .as_array()
@@ -824,4 +832,17 @@ async fn refresh_publishes_configured_xhttp_transport_in_node_catalog() {
     assert!(!row.to_string().contains("private-path"));
     fixture.stop().await;
     origin.stop().await;
+}
+
+#[test]
+fn retained_bytes_charge_the_owned_route_and_error_json() {
+    let bare = Provider::inline(0);
+    let mut owned = bare.clone();
+    owned.download = Some(json!({"route": "group", "group_id": "g".repeat(64)}));
+    owned.last_error = Some(ProviderError {
+        code: "rejected",
+        message: "rejected",
+        details: Some(json!({"diagnostic_code": "d".repeat(100)})),
+    });
+    assert!(owned.retained_bytes() >= bare.retained_bytes() + 64 + 100);
 }

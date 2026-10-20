@@ -1609,7 +1609,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-01"
-source = { file = "doc/en/how-to-start.md", lines = "158-169" }
+source = { file = "doc/en/how-to-start.md", lines = "174-185" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1620,7 +1620,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-02"
-source = { file = "doc/en/how-to-start.md", lines = "190-203" }
+source = { file = "doc/en/how-to-start.md", lines = "206-219" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1631,7 +1631,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-03"
-source = { file = "doc/en/how-to-start.md", lines = "209-209" }
+source = { file = "doc/en/how-to-start.md", lines = "225-225" }
 wrap = "global"
 layer = "structure"
 honk = "accept"
@@ -1642,7 +1642,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-04"
-source = { file = "doc/en/how-to-start.md", lines = "311-320" }
+source = { file = "doc/en/how-to-start.md", lines = "327-336" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1766,7 +1766,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-nodes-02"
-source = { file = "doc/en/reference/nodes.md", lines = "181-184" }
+source = { file = "doc/en/reference/nodes.md", lines = "207-210" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1777,7 +1777,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-03"
-source = { file = "doc/en/reference/nodes.md", lines = "271-273" }
+source = { file = "doc/en/reference/nodes.md", lines = "297-299" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1788,7 +1788,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-04"
-source = { file = "doc/en/reference/nodes.md", lines = "324-329" }
+source = { file = "doc/en/reference/nodes.md", lines = "355-360" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1799,7 +1799,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-05"
-source = { file = "doc/en/reference/nodes.md", lines = "204-206" }
+source = { file = "doc/en/reference/nodes.md", lines = "230-232" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1821,7 +1821,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-02"
-source = { file = "doc/en/reference/routing.md", lines = "163-163" }
+source = { file = "doc/en/reference/routing.md", lines = "165-165" }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -1833,7 +1833,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-03"
-source = { file = "doc/en/reference/routing.md", lines = "194-215" }
+source = { file = "doc/en/reference/routing.md", lines = "196-217" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1845,7 +1845,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-marks"
-source = { file = "doc/en/reference/routing.md", lines = "109-115" }
+source = { file = "doc/en/reference/routing.md", lines = "111-117" }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
@@ -1926,7 +1926,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-01"
-source = { file = "doc/zh/how-to-start.md", lines = "158-169" }
+source = { file = "doc/zh/how-to-start.md", lines = "174-185" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1937,7 +1937,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-02"
-source = { file = "doc/zh/how-to-start.md", lines = "190-203" }
+source = { file = "doc/zh/how-to-start.md", lines = "206-219" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1948,7 +1948,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-03"
-source = { file = "doc/zh/how-to-start.md", lines = "209-209" }
+source = { file = "doc/zh/how-to-start.md", lines = "225-225" }
 wrap = "global"
 layer = "structure"
 honk = "accept"
@@ -1959,7 +1959,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-04"
-source = { file = "doc/zh/how-to-start.md", lines = "311-320" }
+source = { file = "doc/zh/how-to-start.md", lines = "327-336" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2083,7 +2083,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-02"
-source = { file = "doc/zh/reference/nodes.md", lines = "180-183" }
+source = { file = "doc/zh/reference/nodes.md", lines = "203-206" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2094,7 +2094,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-03"
-source = { file = "doc/zh/reference/nodes.md", lines = "270-272" }
+source = { file = "doc/zh/reference/nodes.md", lines = "293-295" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2105,7 +2105,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-04"
-source = { file = "doc/zh/reference/nodes.md", lines = "323-328" }
+source = { file = "doc/zh/reference/nodes.md", lines = "351-356" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2116,7 +2116,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-05"
-source = { file = "doc/zh/reference/nodes.md", lines = "203-205" }
+source = { file = "doc/zh/reference/nodes.md", lines = "226-228" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2138,7 +2138,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-02"
-source = { file = "doc/zh/reference/routing.md", lines = "157-157" }
+source = { file = "doc/zh/reference/routing.md", lines = "159-159" }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -2150,7 +2150,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-03"
-source = { file = "doc/zh/reference/routing.md", lines = "186-207" }
+source = { file = "doc/zh/reference/routing.md", lines = "188-209" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2162,7 +2162,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-marks"
-source = { file = "doc/zh/reference/routing.md", lines = "105-111" }
+source = { file = "doc/zh/reference/routing.md", lines = "107-113" }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"

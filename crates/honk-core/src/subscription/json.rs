@@ -94,7 +94,7 @@ fn parse_entries(
         let ordinal = index + 1;
         let outcome = match normalize(entry) {
             Ok(NormalizedEntry::Node(proxy)) => {
-                match super::clash::parse_clash_proxy(&proxy, subscription_id) {
+                match super::clash::parse_clash_proxy(&proxy, subscription_id, None) {
                     Ok(node) => IndexedOutcome::node(ordinal, path, node),
                     Err(reason) if reason.contains("unsupported") => {
                         IndexedOutcome::unsupported(ordinal, path, reason)

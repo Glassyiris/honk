@@ -106,6 +106,78 @@ async fn reused_v2_session_requires_synack_within_deadline() {
     drop((first, second));
 }
 
+#[tokio::test(start_paused = true)]
+async fn silent_window_reports_one_node_failure_episode() {
+    use crate::group::ScoreOutcome;
+
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    write_frame(&mut server, CMD_SERVER_SETTINGS, 0, b"v=2\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    let mut active = session
+        .open_stream_direct(
+            vec![0x01, 1, 1, 1, 1, 0, 80],
+            session.try_reserve().unwrap(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        read_frame(&mut server).await.unwrap();
+    }
+    write_frame(&mut server, CMD_SYNACK, active.sid, &[])
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let mut pending = Vec::new();
+    for address in 2..=4 {
+        pending.push(
+            session
+                .open_stream_direct(
+                    vec![0x01, address, address, address, address, 0, 80],
+                    session.try_reserve().unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        for _ in 0..2 {
+            read_frame(&mut server).await.unwrap();
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    let mut outcomes = Vec::new();
+    for mut stream in pending {
+        outcomes.push(ScoreOutcome::from_io_error(
+            &stream.read_u8().await.unwrap_err(),
+        ));
+    }
+    let ScoreOutcome::SharedNodeFailure(episode) = outcomes[0] else {
+        panic!("silent opens must share one node failure episode: {outcomes:?}");
+    };
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| *outcome == ScoreOutcome::SharedNodeFailure(episode))
+    );
+    assert!(!session.is_closed());
+
+    tokio::time::advance(SILENT_SESSION_GRACE).await;
+    tokio::task::yield_now().await;
+    assert!(session.is_closed());
+    assert_eq!(
+        ScoreOutcome::from_io_error(&active.read_u8().await.unwrap_err()),
+        ScoreOutcome::SharedNodeFailure(episode),
+        "grace retirement must reuse the silent opens' episode"
+    );
+}
+
 /// Regression for the PR review repro: a SYNACK for one stream must not
 /// cancel the deadline of a concurrent, still-unacknowledged open.
 #[tokio::test(start_paused = true)]

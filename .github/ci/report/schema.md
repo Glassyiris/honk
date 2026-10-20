@@ -1,6 +1,6 @@
 # Per-lane CI report schema
 
-Each producer writes one UTF-8 JSON object to `<lane>.json`. The reporter accepts schema version 1 and rejects files larger than 256 KiB, duplicate lanes, lane/file-name mismatches, unknown metrics, and invalid field types.
+Each producer writes one UTF-8 JSON object to `<lane>.json`. The reporter accepts schema version 1 and rejects files larger than 512 KiB, duplicate lanes, lane/file-name mismatches, unknown metrics, and invalid field types. The archive importer enforces the same 512 KiB uncompressed JSON limit; its 1 MiB archive limit is unchanged.
 
 | Field | Type | Required | Contract |
 |---|---|---:|---|
@@ -30,6 +30,6 @@ Stage 1 accepts these value names and canonical units: `test_inventory` (`test-n
 
 ## Parser lane
 
-`ci-report-parser` contains `parser.json`, with lane `parser`. The lane writes and uploads the report even after failure, with 30-day retention and the same 256 KiB limit. `failure.summary` names the first failing conformance case; `failure.detail_lines` starts with its first differing path. Replay failures name the saved input. Setup or build failures point to the job steps rather than inventing a case.
+`ci-report-parser` contains `parser.json`, with lane `parser`. The lane writes and uploads the report even after failure, with 30-day retention and the same 512 KiB limit. `failure.summary` names the first failing conformance case; `failure.detail_lines` starts with its first differing path. Replay failures name the saved input. Setup or build failures point to the job steps rather than inventing a case.
 
 `conformance_cases.value` is an object with nonnegative integer fields `total`, `equal`, `bounded`, and `rejected_as_expected`. The three outcome counts cannot exceed the total; failed cases may be unclassified. `fuzz_replay_inputs.value` is the nonnegative number of inputs attempted, including the failing input when replay stops early. Missing results are unavailable observations, not zeros. The renderer shows one row per metric; neither count has a performance limit.

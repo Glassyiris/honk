@@ -64,8 +64,9 @@ LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，
 ### 源码组织
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  用户态 `Router`、按优先级排序的编译规则、`route_action`、`GeositeMatcher`
-  以及 `BinaryLpmTrie`/Geo 资源辅助代码。`geo.rs` 在每次构建 `Router` 时只解析
+  用户态 `Router`、按优先级排序的编译规则、`route_action` 以及
+  `BinaryLpmTrie`/Geo 资源辅助代码。`domain.rs` 负责域名 matcher、
+  `GeositeMatcher` 与构建期内部去重表。`geo.rs` 在每次构建 `Router` 时只解析
   一次 `geoip.dat`/`geosite.dat`，且只解码被引用的类别。`category@attr` 在首个
   `@` 处分隔，并以不区分大小写的方式筛选属性键。
   启动时，流量路由与 DNS 路由共用同一份 Geo 资源快照；两者完成编译后即释放
@@ -198,6 +199,8 @@ IPv4/IPv6 仍分别构造 key、
 前缀数量与谓词数量独立：一个 GeoIP 谓词可以包含数十万个前缀。emitter 在每次插入指令前
 检查 1,000,000 条指令预算，耗尽时立即返回错误，不再继续展开指令或 fixup。
 
+事实位是每代资源：目的 IP、源 IP、MAC 各有 256 个 ID，按不同列表而非规则数量计数。引用同一个 IP 列表（按 interned matcher 身份识别）或同一个 MAC 列表（按值识别，顺序敏感）的规则共享 ID；取反保留在规则条件上。域名谓词另有 256 个 ID，规范化 matcher key 相等时共享 ID。分支距离必须能用有符号 16 位指令偏移表示，否则以 `routing jump out of range` 错误拒绝发布。
+
 容量和 verifier 限制是明确错误，不能截断规则链或把缺失 outbound 默认为 direct。
 生成源映射记录 RuleId 和规范化规则描述。raw loader 复用现有 syscall/BTF 基础，不
 增加运行时 clang/LLVM 或另一个 ELF writer。函数原型必须真实；raw `func_info` 与
@@ -267,10 +270,11 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 
 当前 CI 的真实内核基线是固定的 Ubuntu Linux
 `6.12.0-061200-generic` VM。CI 在 hosted runner 上构建测试 executable，
-再在该 VM 中运行完全相同的产物，不会在 guest 内重新编译。VM 执行 root-only
-路由与集成 gate；`just test-routing` 还会沿真实 root/slot 路径检查生成 policy，
-包括优先级、完整 decision 元数据、容量失败和发布失败保留旧状态。
-`just test-netns` 包含该路由 gate。
+再在该 VM 中运行完全相同的产物，不会在 guest 内重新编译。`just test-routing`
+与依赖它的 `just test-netns` 共用完整、已准备前置条件的一次性 VM gate，
+沿真实 root/slot 路径检查优先级、完整 decision 元数据、容量失败和发布失败保留，
+随后执行所有权/netns 套件。工具链、两个对象及 VM 环境前置条件见
+`honk-real-ebpf-tests` skill；受保护的夹具不在共享宿主机运行。
 
 性能测量及历史原型/实验室记录有意不保留在本设计页。reload 基准定义见
 [`crates/honk-core/benches/reload.rs`](../../../crates/honk-core/benches/reload.rs)；

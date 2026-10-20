@@ -13,7 +13,9 @@ explicitly authorized Linux host with root access.
   a maintenance window. Do not use a shared production gateway as the first
   canary.
 - For the privileged canary only: root or passwordless `sudo`, a supported
-  Linux kernel with BTF, and the target interfaces, routes, and DNS clients.
+  Linux kernel with cgroup v2 and raw BTF (in-kernel, OpenWrt's
+  `/usr/lib/debug/boot/vmlinux`, or an external file via `HONK_VMLINUX_BTF`),
+  and the target interfaces, routes, and DNS clients.
 - Rust stable plus the project nightly toolchain, `rust-src`, `bpf-linker`,
   CMake, C/C++ compiler, libclang/bindgen dependencies, and `readelf`.
 - Exact paths for the active binary, config, BPF object, and persisted state
@@ -40,8 +42,13 @@ explicitly authorized Linux host with root access.
 3. Quiesce the installed service using its normal service manager. Copy the
    current binary and config to timestamped, read-only rollback paths.
 4. Back up the persisted state (`<data_dir>/state/`, or `cache.db`) while the
-   service is quiesced, preserving ownership and mode. Record checksums for all three rollback artifacts. Do not delete,
-   rewrite, compact, or migrate the database.
+   service is quiesced, preserving ownership and mode. With
+   `global.store_subscribe`, also back up the legacy subscription store, the
+   first private `.sub` directory found among `<data_dir>/.sub`,
+   `/var/share/honk/.sub` and `./.sub`: a candidate with the state db imports
+   and deletes its `*.sub` bodies on first start. Record checksums for the
+   binary, config, state and `.sub` backups. Do not delete, rewrite, compact, or
+   migrate the database.
 5. Restart the previous version and verify its UDP/TCP DNS smoke before
    proceeding. This verifies that the rollback bundle works.
 
@@ -85,8 +92,9 @@ explicitly authorized Linux host with root access.
 2. Restore the prior binary and config from the verified rollback copies.
    Restore the database backup only if the canary corrupted or replaced the
    database; normally keep the live database. A candidate with the state db
-   imports and deletes `cache.db` on its first start, so rolling back to a
-   binary without it means restoring the `cache.db` backup.
+   imports and deletes `cache.db` and, with `global.store_subscribe`, the
+   legacy `.sub` subscription bodies on its first start, so rolling back to a
+   binary without it means restoring the `cache.db` and `.sub` backups.
 3. Start the prior binary with the prior config and BPF object. Trigger its
    normal config reload once so it re-pushes the prior routing generation;
    verify the generation commit in logs before reopening traffic.

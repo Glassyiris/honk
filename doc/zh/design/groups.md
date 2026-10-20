@@ -78,7 +78,7 @@ Carrier 来源由实际拥有代理连接的边界标记，不能从通用 QUIC 
 
 Score 权限切换前捕获的普通待开始尝试，只有不持有可选 token 时，才可继续转发但不评分。Guard 保留原始业务身份，不发布当前证据或额度。失效的可选工作仍被拒绝，不能降级为免费的挑战者拨号。物理 runtime 准入、路由和类型化拒绝语义保持不变。
 
-TCP relay 在 copy 和 splice 路径中区分客户端断开与上游失败。客户端侧的 reset、abort、broken pipe、未连接 socket、异常 EOF 或 socket 超时，对 Score 按中性取消结算，不撤回已接受的 RX，也不清除既有失败／退避；relay 仍返回原始 I/O 错误，连接错误统计保持不变。同类上游错误、协议错误及未明确归因的本地失败保留既有失败处理。日志级别较低本身不代表错误中性。
+TCP relay 在 copy 和 splice 路径中区分客户端断开与上游失败。客户端侧的 reset、abort、broken pipe、未连接 socket、异常 EOF、socket 超时或主机／网络不可达错误，对 Score 按中性取消结算，不撤回已接受的 RX，也不清除既有失败／退避；relay 仍返回原始 I/O 错误，连接错误统计保持不变。同类上游错误、协议错误及未明确归因的本地失败保留既有失败处理。日志级别较低本身不代表错误中性。
 
 业务 RX 上报独立于吞吐窗口：首次合格非零 RX 立即发布，随后每个 reporter 每秒至多一次。普通单向 TX 回调不补发被限频的接收事件，也没有定时器把静默变成进展。共享源首次确认成功的非零发送可补认其串行发送开始后已交付的回包，使用实际 RX 时间而非确认时间；排队、失败或已退役的发送不能授予证据。限频中的失败后 RX 仍可能等待下一次可发布 RX 或终态，不保证一个自然秒内恢复。活跃发布更新可用性及作用域内恢复门槛，不增加 Beta 终态。
 
@@ -98,7 +98,7 @@ Traffic reporter 覆盖透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载�
 
 Reload 后，已开始的试用仍结算历史结果与成本计数。只有 `(group, node)` 仍是当前配置成员时，其结果才影响当前试用收益；已移除成员不能暂停或加速替补成员的额度赚取。保留成员仍可跨 authority 变化贡献结果。
 
-预留只在节点专属工作开始时支出；释放最后一个未开始引用或使未开始预留失效会退款，开始后取消不退款。Reload 保留已开始工作的在途记录，直到结算或既有到期边界。UI 重定向、DNS 重试和 TCP 替代尝试保留原始业务身份，不能产生试用额度或把已有试用重标为免费恢复。可选工作只有一条路径：已授权的定向 rank 按派发顺序遍历已评估挑战者，为账本首个接受的成员预留一份额度；预算拒绝结束遍历，在途拒绝则尝试下一个成员。每个成员针对其未决问题在同一目标上至多有一个尚未得到回答的试用，资格问题跨目标计算。缺少流量时仍无结论。真实失败保留 5 分钟至 6 小时退避，除非真正的作用域内 RX 打开恢复；试用不取得已提交现任保护。
+预留只在节点专属工作开始时支出；释放最后一个未开始引用或使未开始预留失效会退款，开始后取消不退款。Reload 保留已开始工作的在途记录，直到结算或既有到期边界。UI 与订阅重定向、DNS 重试和 TCP 替代尝试保留原始业务身份，不能产生试用额度或把已有试用重标为免费恢复。可选工作只有一条路径：已授权的定向 rank 按派发顺序遍历已评估挑战者，为账本首个接受的成员预留一份额度；预算拒绝结束遍历，在途拒绝则尝试下一个成员。每个成员针对其未决问题在同一目标上至多有一个尚未得到回答的试用，资格问题跨目标计算。缺少流量时仍无结论。真实失败保留 5 分钟至 6 小时退避，除非真正的作用域内 RX 打开恢复；试用不取得已提交现任保护。
 
 成员的未决问题依次为：连败后的恢复；缺少近期可用性时的可用性；普通选择能比较该成员、但所选成员与它的原始比较对缺少本作用域（精确目标，聚合读取时为共同目标）新鲜、非部分且晚于所选成员最近退化的业务响应时的成对问题；否则为资格。配置探测不能解决成对问题。派发顺序先放未训练成员，再按未决问题的进展（成对问题为已与参考成员共享有效时间块的挑战者 reporter 数）从多到少，然后按最久未被选中；从未被选中的成员以配置探测提示打破平局。近期顺序只在归属工作于 begin 时获准后推进，未开始、被拒绝或未计分的预案不改变顺序。除恢复外，只有完成数加上未完成工作仍少于所选成员完成数的成员才会被派发：首次选择跟随证据，先训练挑战者会挤掉探测优先的所选成员，因此冷启动探索在所选成员取得一次完成后开始。只读 question、action 与 wait 取自同一顺序的首个成员；wait 只附加账本当前的预算或在途拒绝。节点来源明确区分失败时间与失效边界，借用的 cell stamp 统一当前父节点及有效 fence 检查，不增加缓存。
 
@@ -231,13 +231,13 @@ Go dae 的 TCP=1 会使短暂的探测丢包在 URLTest 选择前将当前节点
 | Score QUIC 质量 | 每次周期性 UDP 探测都通过每个 Score 叶节点独立执行 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个配置的 `global.tcp_check_url`，且必须是有效的 HTTPS URL。测得时长提供独立 `DataUdp` 探测质量，不增加业务成功或虚构吞吐；DNS 探测失败而握手成功时仍可恢复 `DataUdp` 活性。缺少 URL 或 URL 不是 HTTPS 时禁用此探测；非 Score 叶节点既不创建此握手，也不创建 Score cell。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
-`has_udp_state(node)` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享 VLESS，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
+`has_udp_state(node)` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享协议，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
 
 类型化 policy、size 与 `PacketRejection::Capacity` refusal 对候选是 terminal，但不影响 health 或 Score；CLI 调用方收到 capacity error，而不是 `NotApplicable`。单包拥塞、已有 reply 后的 idle expiry、主动退役、节点死亡取消和进程关闭也不影响健康。alive→dead 转换调用带 `(NodeId, name)` 的控制面回调，清除 pool connection 与 UDP endpoint。若 sibling UDP domain 明确存活，则跳过该 UDP domain 的死亡清理，避免被阻断的 `:53` 探测清除正常 flow。
 
 每个节点最近一次真实 TCP 延迟样本每 60 秒写入状态数据库；启动时只恢复不超过 24 小时的样本。存活性从不由缓存恢复。合成 10 秒占位样本带有标记，不显示在历史中，不进入移动平均，也不会作为最近真实样本持久化；选择降级由失败 strike 计数承担，与占位样本无关。
 
-- `src/alive/` API 包括 `register_node`、`notify_check_*`、`report_*_traffic` 与 `record_dial_failure`。组表及 `(member tag, check_url)` 状态仍以名称为键：组没有 NodeId，成员可能是子组（sing-box RealTag）。`mod.rs` 负责状态、阈值、registry、eBPF 连通性推送回调；`probe.rs` 负责 HTTP/raw-connect `probe_node`、经 `dial_udp_transport` 的 DNS `probe_node_udp` 与并发探测周期；`collection.rs` 负责 `DialerCollection` 延迟、移动平均与拨号失败跟踪；`latencies.rs` 使用操作复杂度为 O(1)、容量为 10 的环形缓冲区，测量的 `SystemTime` 给出真实的 Clash 历史记录时间。`last_real_sample()` 排除合成条目，避免仪表盘显示虚构的 10000 ms。
+- `src/alive/` API 包括 `register_node`、`notify_check_*`、`report_*_traffic` 与 `record_dial_failure`。组表及 `(member tag, check_url)` 状态仍以名称为键：组没有 NodeId，成员可能是子组（sing-box RealTag）。`mod.rs` 负责状态、阈值、registry、eBPF 连通性推送回调；`probe.rs` 负责 HTTP/raw-connect `probe_node` 与经 `dial_udp_transport` 的 DNS `probe_node_udp` 测量；`runner.rs` 负责健康检查的准入/取消/排空、并发探测周期以及周期/恢复/紧急探测循环；`collection.rs` 负责 `DialerCollection` 延迟、移动平均与拨号失败跟踪；`latencies.rs` 使用操作复杂度为 O(1)、容量为 10 的环形缓冲区，测量的 `SystemTime` 给出真实的 Clash 历史记录时间。`last_real_sample()` 排除合成条目，避免仪表盘显示虚构的 10000 ms。
 
 `honk-outbound/src/urltest.rs` 统一负责 HTTP 请求构造和测量，URL 解释委托给 `honk-config::check` 的规范解码器。core 与 generation URLTest 还共享显式冷 session 预热，并在创建资源或反馈之前保留可失败的节点准入；独立工具调用保留 handler 内部的 setup 和 CLI 外层 deadline。请求使用不含凭据的 authority，仅保留非默认端口，移除 fragment，并保留原始路径、查询串及点段；仅有查询串的 URL 使用 `/?query`。HTTPS 验证证书并协商 `h2,http/1.1`，禁用 server push。第一轮使用 HEAD，第二轮使用配置方法（delay 测试为 HEAD）；两轮最终响应的解码状态都必须为有效的 200–499。HTTP/1 会在同一轮内消费临时响应头后再读取最终响应，但不支持协议切换；每轮响应头累计上限为 16 KiB。HTTP/2 响应头列表使用相同大小上限。
 HTTP/2 探测连接在首个本地检测到的协议错误时终止，避免后续远端 reset 覆盖已经拒绝的响应头错误并触发首轮样本回退。

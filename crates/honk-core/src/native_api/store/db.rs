@@ -21,8 +21,8 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::super::ApiError;
-use super::super::config::ListenerSecrets;
 use super::super::config_write::WriteError;
+use super::super::secrets::ListenerSecrets;
 use crate::configuration::{MAX_SOURCE_BYTES, MAX_SOURCES, digest};
 use crate::state::{StateDb, StateError, log_sql};
 
@@ -684,10 +684,15 @@ pub(crate) fn export_to(data_dir: &Path, out: &Path, with_secrets: bool) -> anyh
         .and_then(|()| std::fs::hard_link(&staged, out));
     let _ = std::fs::remove_file(&staged);
     published.map_err(|error| anyhow::anyhow!("write {}: {error}", out.display()))?;
-    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
-    }
+    File::open(publication_dir(out))?.sync_all()?;
     Ok(())
+}
+
+/// A bare relative `out` has an empty parent, which names the current directory.
+fn publication_dir(out: &Path) -> &Path {
+    out.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn head_and_parent(connection: &Connection) -> Result<Option<(i64, Option<i64>)>, StoreError> {
