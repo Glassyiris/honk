@@ -441,9 +441,8 @@ impl RealEbpfBackend {
             !self.retirement_failed,
             "retirement ownership is unresolved"
         );
-        let mut captured = [None; RETIRE_BATCH_CAPACITY];
-        let mut keys = [(TuplesKey::default(), 0); RETIRE_BATCH_CAPACITY];
-        let mut count = 0;
+        let mut captured = vec![None; requests.len()];
+        let mut keys = Vec::with_capacity(requests.len());
         for (index, request) in requests.iter().enumerate() {
             validate_udp_decision_transition(request.transition)?;
             anyhow::ensure!(
@@ -459,8 +458,7 @@ impl RealEbpfBackend {
                     .flow_lookup::<_, ConnState>("CONN_STATE_MAP", &request.key)?
                     .map(|state| state.incarnation);
                 if captured[index].is_some() {
-                    keys[count] = (request.key, request.token);
-                    count += 1;
+                    keys.push((request.key, request.token));
                 }
             }
         }
@@ -479,10 +477,10 @@ impl RealEbpfBackend {
             }
             Ok(())
         };
-        if count == 0 {
+        if keys.is_empty() {
             operation(self)
         } else {
-            self.with_retirement_fences(&keys[..count], operation)
+            self.with_retirement_fences(&keys, operation)
         }
     }
 
