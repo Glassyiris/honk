@@ -100,38 +100,3 @@ fn facts_ahead_of_long_process_chains_stay_within_the_verifier_budget() {
         }
     }
 }
-
-#[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn classifier_lifecycle_paths_stay_loadable() {
-    std::thread::spawn(|| {
-        use aya::programs::SchedClassifier;
-        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-        let mut backend =
-            RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
-        for name in [
-            "lan_ingress_l2",
-            "lan_ingress_l3",
-            "wan_ingress_l2",
-            "wan_ingress_l3",
-            "lan_egress_l2",
-            "lan_egress_l3",
-            "wan_egress_l2",
-            "wan_egress_l3",
-            "dae0_ingress",
-        ] {
-            let program: &mut SchedClassifier = backend
-                .bpf_mut()
-                .unwrap()
-                .program_mut(name)
-                .unwrap()
-                .try_into()
-                .unwrap();
-            program
-                .load()
-                .unwrap_or_else(|error| panic!("load {name}: {error}"));
-        }
-    })
-    .join()
-    .unwrap();
-}

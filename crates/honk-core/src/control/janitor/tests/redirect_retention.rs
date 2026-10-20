@@ -1,8 +1,12 @@
 use super::*;
 
+/// The documented reclaim age of unpinned redirects, deliberately not imported:
+/// a drifting production value must fail these tests.
+const UNPINNED_REDIRECT_RECLAIM_NS: u64 = 30_000_000_000;
+
 #[tokio::test]
 async fn short_auxiliary_deadline_preserves_conn_and_other_udp_redirects() -> anyhow::Result<()> {
-    let deadline = super::super::sweep::UNPINNED_REDIRECT_TIMEOUT_NS;
+    let deadline = UNPINNED_REDIRECT_RECLAIM_NS;
     let mut model = MockEbpfBackend::new();
     let pins = Arc::new(TcpFlowPins::default());
     let mut cases = Vec::new();
@@ -69,7 +73,7 @@ async fn short_auxiliary_deadline_preserves_conn_and_other_udp_redirects() -> an
 #[tokio::test]
 async fn redirect_refresh_after_scan_supersedes_short_deadline_candidate() -> anyhow::Result<()> {
     let key = test_tuple(31000, IPPROTO_TCP);
-    let now_ns = super::super::sweep::UNPINNED_REDIRECT_TIMEOUT_NS + 1;
+    let now_ns = UNPINNED_REDIRECT_RECLAIM_NS + 1;
     let mut model = MockEbpfBackend::new();
     model.redirect_track_store(&RedirectTuple::from_tuples(&key), &RedirectEntry::default())?;
     let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));

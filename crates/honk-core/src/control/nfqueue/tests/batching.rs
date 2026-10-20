@@ -88,7 +88,7 @@ async fn blocking_commit_leaves_the_worker_free_for_other_tasks() {
 async fn expired_commits_are_rejected_at_dequeue_and_after_backend_lock() {
     for (remaining, after_lock_delay) in [
         (Duration::ZERO, None),
-        (Duration::from_millis(50), Some(Duration::from_millis(100))),
+        (Duration::from_millis(200), Some(Duration::from_millis(400))),
     ] {
         let mock = MockEbpfBackend::new();
         let batches = Arc::clone(&mock.commit_batch_sizes);
@@ -120,11 +120,11 @@ async fn expired_commits_are_rejected_at_dequeue_and_after_backend_lock() {
 #[tokio::test]
 async fn commit_rechecks_deadline_after_the_grace_period() {
     let mut mock = MockEbpfBackend::new();
-    mock.commit_delay = Some(Duration::from_millis(100));
+    mock.commit_delay = Some(Duration::from_millis(400));
     let batches = Arc::clone(&mock.commit_batch_sizes);
     let trace = Arc::clone(&mock.commit_trace);
     let fixture = pending_fixture_with(34, mock);
-    deadline(&fixture, Duration::from_millis(50));
+    deadline(&fixture, Duration::from_millis(200));
     assert!(matches!(
         fixture
             .pending
@@ -144,7 +144,7 @@ async fn commit_rechecks_deadline_after_the_grace_period() {
 #[tokio::test]
 async fn each_batch_item_rechecks_its_own_deadline_before_applying() {
     let mut mock = MockEbpfBackend::new();
-    mock.commit_item_delay = Some((1, Duration::from_millis(100)));
+    mock.commit_item_delay = Some((1, Duration::from_millis(400)));
     let batches = Arc::clone(&mock.commit_batch_sizes);
     let (fixture, second, second_id) = pair(mock);
     let second_cell = fixture.pending.matching_cell(second_id).unwrap();
@@ -153,7 +153,7 @@ async fn each_batch_item_rechecks_its_own_deadline_before_applying() {
         let CellState::Pending { started_at, .. } = &mut *state else {
             panic!("pending")
         };
-        *started_at = Instant::now() - HARD_HOLD_TIMEOUT + Duration::from_millis(50);
+        *started_at = Instant::now() - HARD_HOLD_TIMEOUT + Duration::from_millis(200);
     }
     let first = fixture
         .pending

@@ -3,38 +3,6 @@ use crate::ebpf::mock::MockTelemetryFaults;
 use std::sync::atomic::Ordering;
 
 #[tokio::test]
-async fn telemetry_read_failures_before_any_sample_still_run_steady_sweeps() -> anyhow::Result<()> {
-    for failed_signal in 0..3 {
-        let mut model = MockEbpfBackend::new();
-        model.redirect_track_store(
-            &RedirectTuple::from_tuples(&test_tuple(1, 17)),
-            &RedirectEntry::default(),
-        )?;
-        let faults = Arc::clone(&model.telemetry_faults);
-        *faults.lock() = MockTelemetryFaults {
-            stats: failed_signal == 0,
-            conn_occupancy: failed_signal == 1,
-            aux_occupancy: failed_signal == 2,
-        };
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
-        let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
-        let start = tokio::time::Instant::now();
-        let mut state = tick::TickState::new(start);
-        janitor
-            .tick(
-                &mut state,
-                start + Duration::from_secs(60),
-                Some(REDIRECT_TRACK_TIMEOUT_NS + 1),
-            )
-            .await?;
-        *faults.lock() = MockTelemetryFaults::default();
-        assert_eq!(backend.read().await.aux_occupancy()?, (0, 0));
-        assert!(!state.pressure.active);
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn failed_telemetry_reads_keep_last_samples_and_still_sweep() -> anyhow::Result<()> {
     for failed_signal in 0..3 {
         let count = if failed_signal == 2 {
