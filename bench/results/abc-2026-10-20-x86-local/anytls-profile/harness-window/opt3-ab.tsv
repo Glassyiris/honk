@@ -1,0 +1,11 @@
+label	direction	mbps	user_cores	sys_cores	total_cores
+opt-base-1	down	20229.3	0.3592	0.4674	0.8266
+opt-base-2	down	20941.4	0.3579	0.4809	0.8387
+opt-base-3	down	21066.7	0.3592	0.4996	0.8588
+opt-base-up-1	up	18349.8	0.3592	0.4823	0.8415
+opt-base-up-2	up	18466.4	0.3542	0.4823	0.8365
+opt3-1	down	20992.3	0.3517	0.4822	0.8339
+opt3-2	down	21537.7	0.3591	0.4909	0.85
+opt3-3	down	21121.4	0.348	0.4984	0.8465
+opt3-up-1	up	18103.5	0.3542	0.4772	0.8314
+opt3-up-2	up	18238.2	0.3467	0.4884	0.8351

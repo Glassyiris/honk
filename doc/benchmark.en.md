@@ -260,7 +260,15 @@ the correction applies only to the two dae AnyTLS CPU cells, not to throughput
 or RSS. The same teardown affected the `.70` dae AnyTLS cells, so that
 campaign's “honk CPU higher than dae” statement is not supported. The harness
 fix is to use the iperf-reported transfer seconds or a transfer-window CPU
-sample, not the full command wall time; it is not applied here.
+sample, not the full command wall time; it is not applied here. A temporary
+harness copy using the transfer seconds reproduced the correction in a
+targeted A/B/C (Trojan plus both AnyTLS): dae AnyTLS-SB/Go **0.97/0.95 cores**,
+honk **0.86/0.87**, sing-box **1.35/1.42**; dae Trojan stays 0.67. The dae
+AnyTLS UDP cells also correct from 0.23/0.26 to 0.53/0.60. A temporary
+`opt-level=3` twin was within noise (download +0.9% throughput/+0.9% CPU;
+upload −1.3%/−0.7%), so no codegen change is warranted. The temporary patch and
+rows are in
+[`anytls-profile/harness-window`](../bench/results/abc-2026-10-20-x86-local/anytls-profile/harness-window/).
 
 #### AnyTLS hot path
 

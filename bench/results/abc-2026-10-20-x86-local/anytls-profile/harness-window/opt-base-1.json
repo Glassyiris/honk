@@ -1,0 +1,54 @@
+{
+  "label": "opt-base-1",
+  "engine": "honk",
+  "pid": 2989910,
+  "port": 5205,
+  "direction": "down",
+  "mbps": 20229.3,
+  "elapsed_s": 8.13,
+  "user_cores": 0.3592,
+  "sys_cores": 0.4674,
+  "total_cores": 0.8266,
+  "all_thread_cores": 0.8241,
+  "io": {
+    "rchar_MB": 0.0,
+    "wchar_MB": 0.06,
+    "syscr": 33,
+    "syscw": 8103
+  },
+  "rss_kb": 66888,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2989913",
+      "comm": "(tokio-rt-worker)",
+      "user": 1.15,
+      "sys": 1.48,
+      "total": 2.63
+    },
+    {
+      "tid": "2989912",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.71,
+      "sys": 0.92,
+      "total": 1.63
+    },
+    {
+      "tid": "2989915",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.65,
+      "sys": 0.88,
+      "total": 1.53
+    },
+    {
+      "tid": "2989914",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.4,
+      "sys": 0.51,
+      "total": 0.91
+    }
+  ],
+  "perfstat": null,
+  "perfrecord": null
+}

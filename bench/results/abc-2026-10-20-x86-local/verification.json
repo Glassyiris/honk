@@ -102,6 +102,32 @@
     "raw_perf_data": "left on 10.10.10.49 /root/bench-20261020/prof/ (76-81 MB each), not committed",
     "not_run": [
       "production code changes; this was verification only"
-    ]
+    ],
+    "harness_window_validation": {
+      "result": "passed",
+      "dae_anytls_sb": 0.97,
+      "dae_anytls_go": 0.95,
+      "honk_anytls_sb": 0.86,
+      "honk_anytls_go": 0.87,
+      "sing_box_anytls_sb": 1.35,
+      "sing_box_anytls_go": 1.42,
+      "dae_trojan": 0.67,
+      "dae_udp_anytls_sb": 0.53,
+      "dae_udp_anytls_go": 0.6,
+      "honk_udp_anytls_sb": 0.47,
+      "honk_udp_anytls_go": 0.54,
+      "evidence": "anytls-profile/harness-window/"
+    },
+    "opt3_ab": {
+      "result": "rejected",
+      "download": {
+        "throughput_delta_pct": 0.86,
+        "cpu_delta_pct": 0.93
+      },
+      "upload": {
+        "throughput_delta_pct": -1.29,
+        "cpu_delta_pct": -0.68
+      }
+    }
   }
 }

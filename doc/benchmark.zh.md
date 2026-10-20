@@ -225,7 +225,13 @@ window 采样得到：
 原始 TSV 保留 harness 值；修正只适用于 dae 两个 AnyTLS CPU 单元格，不影响
 吞吐或 RSS。`.70` 轮的 dae AnyTLS 也受同一 teardown 影响，因此旧结论
 “honk CPU 高于 dae”不成立。harness 应使用 iperf 报告的 transfer seconds 或
-transfer-window CPU 采样，而不是整条命令 wall time；本轮没有修改 harness。
+transfer-window CPU 采样，而不是整条命令 wall time；本轮没有修改正式
+harness。临时 harness 副本用 transfer seconds 复测量化了修正：dae
+AnyTLS-SB/Go **0.97/0.95 core**、honk **0.86/0.87**、sing-box
+**1.35/1.42**；dae Trojan 保持 0.67。dae AnyTLS UDP 也从 0.23/0.26 修正为
+0.53/0.60。临时 `opt-level=3` twin 在噪声内（download +0.9% 吞吐/+0.9% CPU；
+upload −1.3%/−0.7%），不支持改 codegen。临时 patch 与数据在
+[`anytls-profile/harness-window`](../bench/results/abc-2026-10-20-x86-local/anytls-profile/harness-window/)。
 
 #### AnyTLS 热点
 

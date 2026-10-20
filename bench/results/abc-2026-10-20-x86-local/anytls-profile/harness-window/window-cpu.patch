@@ -1,0 +1,48 @@
+--- bench/lab-bench.sh	2026-10-20 23:43:21.571595710 +0800
++++ /tmp/lab-local/lab-bench-window.sh	2026-10-21 01:00:11.347339043 +0800
+@@ -288,15 +288,17 @@
+     for i in $(seq 1 $BW_RUNS); do
+         ticks0=$(cpu_ticks "$pid")
+         ns0=$(now_ns)
+-        bw=$(ip netns exec $N iperf3 -c $T -p "$port" -t $BW_TIME -R -J 2>/dev/null |
++        bw_secs=$(ip netns exec $N iperf3 -c $T -p "$port" -t $BW_TIME -R -J 2>/dev/null |
+             tee "$STABILITY_DIR/$engine-$port.tcp-$i.json" |
+             python3 -c 'import json,sys
+ try:
+-    d=json.load(sys.stdin); print(int(d["end"]["sum_received"]["bits_per_second"]/1e6))
+-except Exception: print(0)')
++    d=json.load(sys.stdin); e=d["end"]["sum_received"]
++    print(int(e["bits_per_second"]/1e6), e["seconds"])
++except Exception: print("0 0")')
++        read -r bw secs <<<"$bw_secs"
+         ns1=$(now_ns)
+         ticks1=$(cpu_ticks "$pid")
+-        cores=$(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ns1-$ns0)/1e9):.2f}')")
++        cores=$(python3 -c "s=float('$secs') or (($ns1-$ns0)/1e9); print(f'{($ticks1-$ticks0)/100/s:.2f}')")
+         results="$results$bw:$cores\n"
+     done
+     # median by bandwidth; report that run's cpu alongside
+@@ -434,18 +436,19 @@
+     local ticks0 ticks1 ns0 ns1 res
+     ticks0=$(cpu_ticks "$pid")
+     ns0=$(now_ns)
+-    res=$(ip netns exec $N iperf3 -c $T -p "$port" -u -b 10G -l 1200 -t $BW_TIME -R -J 2>/dev/null |
++    res_secs=$(ip netns exec $N iperf3 -c $T -p "$port" -u -b 10G -l 1200 -t $BW_TIME -R -J 2>/dev/null |
+         tee "$STABILITY_DIR/$engine-$port.udp.json" |
+         python3 -c 'import json,sys
+ try:
+     d=json.load(sys.stdin); e=d["end"]
+     mbps = int(e["sum_received"]["bits_per_second"]/1e6)
+     loss = e["sum"]["lost_percent"]
+-    print("%d(%.1f%%)" % (mbps, loss))
+-except Exception: print("0(-)")')
++    print("%d(%.1f%%) %.6f" % (mbps, loss, e["sum_received"]["seconds"]))
++except Exception: print("0(-) 0")')
++    read -r res secs <<<"$res_secs"
+     ns1=$(now_ns)
+     ticks1=$(cpu_ticks "$pid")
+-    echo "$res $(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ns1-$ns0)/1e9):.2f}')")"
++    echo "$res $(python3 -c "s=float('$secs') or (($ns1-$ns0)/1e9); print(f'{($ticks1-$ticks0)/100/s:.2f}')")"
+ }
+ 
+ if [ "$LATENCY_STABILITY" = 1 ] && [ ! -r "$STABILITY_COLLECTOR" ]; then
