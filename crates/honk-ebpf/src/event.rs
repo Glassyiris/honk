@@ -49,27 +49,18 @@ pub fn send_dae_event(
 
 /// At most one advisory hint per tuple owner per second on each CPU while
 /// cached. Physical reclamation always belongs to fenced userspace retirement.
+/// Suppression is recorded only once the ring accepted the hint, so a full ring
+/// never silences the tuple for the next second.
 #[inline(never)]
 pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incarnation: u64) {
     let now = unsafe { bpf_ktime_get_ns() };
-    if let Some(previous) = FLOW_EXPIRY_HINT.get_ptr_mut(key) {
-        let previous = unsafe { &mut *previous };
+    if let Some(previous) = FLOW_EXPIRY_HINT.get_ptr(key) {
+        let previous = unsafe { &*previous };
         if previous.incarnation == incarnation
             && now.saturating_sub(previous.last_hint_ns) < 1_000_000_000
         {
             return;
         }
-        previous.incarnation = incarnation;
-        previous.last_hint_ns = now;
-    } else {
-        let _ = FLOW_EXPIRY_HINT.insert(
-            key,
-            FlowExpiryHint {
-                incarnation,
-                last_hint_ns: now,
-            },
-            0,
-        );
     }
     let Some(mut reservation) = EVENT_RINGBUF.reserve(0) else {
         return;
@@ -87,4 +78,18 @@ pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incar
     event.sport = key.src_port;
     event.dport = key.dst_port;
     reservation.submit(0);
+    if let Some(previous) = FLOW_EXPIRY_HINT.get_ptr_mut(key) {
+        let previous = unsafe { &mut *previous };
+        previous.incarnation = incarnation;
+        previous.last_hint_ns = now;
+    } else {
+        let _ = FLOW_EXPIRY_HINT.insert(
+            key,
+            FlowExpiryHint {
+                incarnation,
+                last_hint_ns: now,
+            },
+            0,
+        );
+    }
 }
