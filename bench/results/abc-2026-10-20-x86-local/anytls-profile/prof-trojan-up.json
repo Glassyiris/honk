@@ -1,0 +1,54 @@
+{
+  "label": "prof-trojan-up",
+  "engine": "honk",
+  "pid": 2863407,
+  "port": 5204,
+  "direction": "up",
+  "mbps": 18679.8,
+  "elapsed_s": 8.046,
+  "user_cores": 0.2075,
+  "sys_cores": 0.3828,
+  "total_cores": 0.5903,
+  "all_thread_cores": 0.5903,
+  "io": {
+    "rchar_MB": 0.0,
+    "wchar_MB": 0.04,
+    "syscr": 26,
+    "syscw": 4545
+  },
+  "rss_kb": 63600,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2863410",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.45,
+      "sys": 0.83,
+      "total": 1.28
+    },
+    {
+      "tid": "2863412",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.42,
+      "sys": 0.78,
+      "total": 1.2
+    },
+    {
+      "tid": "2863411",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.43,
+      "sys": 0.72,
+      "total": 1.15
+    },
+    {
+      "tid": "2863409",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.37,
+      "sys": 0.75,
+      "total": 1.12
+    }
+  ],
+  "perfstat": null,
+  "perfrecord": "/root/bench-20261020/prof/prof-trojan-up.perf.data"
+}

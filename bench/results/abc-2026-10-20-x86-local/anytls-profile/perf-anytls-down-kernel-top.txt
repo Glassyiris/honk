@@ -1,0 +1,198 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 17K of event 'cpu-clock'
+# Event count (approx.): 35901803320
+#
+# Overhead  Symbol                                         IPC   [IPC Coverage]
+# ........  .............................................  ....................
+#
+     1.55%  [k] _copy_to_iter                              -      -            
+            |
+            ---__skb_datagram_iter
+               skb_copy_datagram_iter
+               tcp_recvmsg_locked
+               tcp_recvmsg
+               sock_recvmsg
+               __sys_recvfrom
+               __x64_sys_recvfrom
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.12%  [k] _raw_spin_unlock_irqrestore                -      -            
+            |          
+             --0.89%--sock_def_readable
+                       |          
+                        --0.88%--tcp_data_queue
+                                  tcp_rcv_established
+                                  tcp_v4_do_rcv
+                                  |          
+                                  |--0.59%--tcp_v4_rcv
+                                  |          ip_protocol_deliver_rcu
+                                  |          ip_local_deliver_finish
+                                  |          __netif_receive_skb_one_core
+                                  |          process_backlog
+                                  |          __napi_poll
+                                  |          net_rx_action
+                                  |          handle_softirqs
+                                  |          do_softirq.part.0
+                                  |          __local_bh_enable_ip
+                                  |          __dev_queue_xmit
+                                  |          ip_finish_output2
+                                  |          ip_output
+                                  |          __ip_queue_xmit
+                                  |          __tcp_transmit_skb
+                                  |          tcp_write_xmit
+                                  |          |          
+                                  |           --0.55%--tcp_sendmsg_locked
+                                  |                     tcp_sendmsg
+                                  |                     __sys_sendto
+                                  |                     __x64_sys_sendto
+                                  |                     do_syscall_64
+                                  |                     entry_SYSCALL_64_after_hwframe
+                                  |          
+                                   --0.28%--__release_sock
+                                             release_sock
+                                             tcp_recvmsg
+                                             sock_recvmsg
+                                             __sys_recvfrom
+                                             __x64_sys_recvfrom
+                                             do_syscall_64
+                                             entry_SYSCALL_64_after_hwframe
+
+     0.96%  [k] _copy_from_iter                            -      -            
+            |
+            ---tcp_sendmsg_locked
+               tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.78%  [k] clear_highpages_kasan_tagged               -      -            
+            |
+            ---get_page_from_freelist
+               __alloc_frozen_pages_noprof
+               alloc_pages_mpol
+               |          
+                --0.76%--alloc_pages_noprof
+                          skb_page_frag_refill
+                          sk_page_frag_refill
+                          tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     0.42%  [k] pvclock_clocksource_read_nowd              -      -            
+            |          
+            |--0.31%--kvm_clock_get_cycles
+            |          |          
+            |           --0.17%--ktime_get
+            |          
+             --0.11%--kvm_sched_clock_read
+                       |          
+                        --0.10%--sched_clock
+
+     0.31%  [k] finish_task_switch.isra.0                  -      -            
+            |
+            ---__schedule
+               |          
+                --0.21%--schedule
+                          |          
+                           --0.18%--schedule_hrtimeout_range_clock
+                                     do_epoll_wait
+                                     do_epoll_pwait.part.0
+                                     __x64_sys_epoll_pwait
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+
+     0.29%  [k] do_syscall_64                              -      -            
+            |
+            ---entry_SYSCALL_64_after_hwframe
+
+     0.19%  [k] tcp_sendmsg_locked                         -      -            
+            |
+            ---tcp_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.18%  [k] fdget                                      -      -            
+            |          
+             --0.13%--__sys_recvfrom
+                       __x64_sys_recvfrom
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+
+     0.15%  [k] _raw_spin_unlock_irq                       -      -            
+     0.14%  [k] __raw_callee_save___pv_queued_spin_unlock  -      -            
+     0.14%  [k] tcp_rcv_established                        -      -            
+            |
+            ---tcp_v4_do_rcv
+
+     0.12%  [k] nft_do_chain                               -      -            
+     0.12%  [k] __dev_queue_xmit                           -      -            
+     0.12%  [k] __pv_queued_spin_lock_slowpath             -      -            
+            |
+            ---_raw_spin_lock_bh
+               lock_sock_nested
+               |          
+                --0.10%--tcp_recvmsg
+                          sock_recvmsg
+                          __sys_recvfrom
+                          __x64_sys_recvfrom
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     0.11%  [k] __check_object_size                        -      -            
+            |          
+             --0.11%--simple_copy_to_iter
+                       __skb_datagram_iter
+                       skb_copy_datagram_iter
+                       tcp_recvmsg_locked
+                       tcp_recvmsg
+                       sock_recvmsg
+                       __sys_recvfrom
+                       __x64_sys_recvfrom
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+
+     0.11%  [k] __skb_datagram_iter                        -      -            
+            |
+            ---skb_copy_datagram_iter
+               tcp_recvmsg_locked
+               tcp_recvmsg
+               sock_recvmsg
+               __sys_recvfrom
+               __x64_sys_recvfrom
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.11%  [k] _raw_spin_trylock                          -      -            
+            |          
+             --0.11%--__free_frozen_pages
+                       skb_release_data
+
+     0.11%  [k] enqueue_to_backlog                         -      -            
+            |
+            ---netif_rx_internal
+               __netif_rx
+
+     0.11%  [k] skb_release_data                           -      -            
+     0.10%  [k] __tcp_transmit_skb                         -      -            
+     0.10%  [k] _raw_spin_lock                             -      -            
+     0.10%  [k] do_user_addr_fault                         -      -            
+            |
+            ---exc_page_fault
+               asm_exc_page_fault
+
+
+
+#
+# (Tip: Show individual samples with: perf script)
+#

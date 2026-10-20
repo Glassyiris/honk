@@ -1,0 +1,67 @@
+{
+  "label": "dae-anytls-sb-down",
+  "engine": "dae",
+  "pid": 2862681,
+  "port": 5205,
+  "direction": "down",
+  "mbps": 19678.7,
+  "elapsed_s": 18.017,
+  "user_cores": 0.1981,
+  "sys_cores": 0.2492,
+  "total_cores": 0.4474,
+  "all_thread_cores": 0.4462,
+  "io": {
+    "rchar_MB": 19720.21,
+    "wchar_MB": 19684.65,
+    "syscr": 877992,
+    "syscw": 602750
+  },
+  "rss_kb": 62272,
+  "voluntary_ctxt": 125952,
+  "nonvoluntary_ctxt": 56289,
+  "threads": [
+    {
+      "tid": "2862687",
+      "comm": "(dae)",
+      "user": 0.75,
+      "sys": 0.95,
+      "total": 1.7
+    },
+    {
+      "tid": "2862681",
+      "comm": "(dae)",
+      "user": 0.66,
+      "sys": 0.94,
+      "total": 1.6
+    },
+    {
+      "tid": "2862709",
+      "comm": "(dae)",
+      "user": 0.7,
+      "sys": 0.85,
+      "total": 1.55
+    },
+    {
+      "tid": "2862707",
+      "comm": "(dae)",
+      "user": 0.7,
+      "sys": 0.83,
+      "total": 1.53
+    },
+    {
+      "tid": "2862708",
+      "comm": "(dae)",
+      "user": 0.29,
+      "sys": 0.37,
+      "total": 0.66
+    },
+    {
+      "tid": "2862683",
+      "comm": "(dae)",
+      "user": 0.01,
+      "sys": 0.01,
+      "total": 0.02
+    }
+  ],
+  "perfstat": null
+}

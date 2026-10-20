@@ -1,0 +1,26 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 17K of event 'cpu-clock'
+# Event count (approx.): 35210420560
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                       IPC   [IPC Coverage]
+# ........  ...........................................................................................................................................................................................................................................................................................................................................  ....................
+#
+     3.84%  [.] memcpy                                                                                                                                                                                                                                                                                                                                   -      -            
+     3.80%  [.] aes_gcm_enc_update_vaes_avx2                                                                                                                                                                                                                                                                                                             -      -            
+     0.27%  [.] memcmp                                                                                                                                                                                                                                                                                                                                   -      -            
+     0.15%  [.] sccp                                                                                                                                                                                                                                                                                                                                     -      -            
+     0.10%  [.] aes_hw_encrypt                                                                                                                                                                                                                                                                                                                           -      -            
+     0.09%  [.] gcm_gmult_vpclmulqdq_avx2                                                                                                                                                                                                                                                                                                                -      -            
+     0.07%  [.] get_meta                                                                                                                                                                                                                                                                                                                                 -      -            
+     0.06%  [.] EVP_AEAD_CTX_sealv                                                                                                                                                                                                                                                                                                                       -      -            
+     0.06%  [.] bssl::CRYPTO_gcm128_encrypt(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned char*, unsigned long)                                                                                                                                                                                                      -      -            
+     0.05%  [.] bssl::tls_write_app_data(ssl_st*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)                                                                                                                                                                                                                        -      -            
+
+
+#
+# (Tip: To see callchains in a more compact form: perf report -g folded)
+#

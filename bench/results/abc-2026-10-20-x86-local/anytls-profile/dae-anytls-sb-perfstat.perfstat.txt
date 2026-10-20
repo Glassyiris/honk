@@ -1,0 +1,118 @@
+# started on Tue Oct 20 16:46:04 2026
+
+
+ Performance counter stats for process id '2862958':
+
+             dae-2862958      <not counted> msec task-clock                                                            
+             dae-2862960              34.15 msec task-clock                                                            
+             dae-2862961            1871.96 msec task-clock                                                            
+             dae-2862962      <not counted> msec task-clock                                                            
+             dae-2862963      <not counted> msec task-clock                                                            
+             dae-2862966            1751.27 msec task-clock                                                            
+             dae-2862967      <not counted> msec task-clock                                                            
+             dae-2862974      <not counted> msec task-clock                                                            
+             dae-2862984            1927.33 msec task-clock                                                            
+             dae-2862985            1966.47 msec task-clock                                                            
+             dae-2862986            1954.11 msec task-clock                                                            
+             dae-2862958    <not supported>      cycles                                                                
+             dae-2862960    <not supported>      cycles                                                                
+             dae-2862961    <not supported>      cycles                                                                
+             dae-2862962    <not supported>      cycles                                                                
+             dae-2862963    <not supported>      cycles                                                                
+             dae-2862966    <not supported>      cycles                                                                
+             dae-2862967    <not supported>      cycles                                                                
+             dae-2862974    <not supported>      cycles                                                                
+             dae-2862984    <not supported>      cycles                                                                
+             dae-2862985    <not supported>      cycles                                                                
+             dae-2862986    <not supported>      cycles                                                                
+             dae-2862958    <not supported>      instructions                                                          
+             dae-2862960    <not supported>      instructions                                                          
+             dae-2862961    <not supported>      instructions                                                          
+             dae-2862962    <not supported>      instructions                                                          
+             dae-2862963    <not supported>      instructions                                                          
+             dae-2862966    <not supported>      instructions                                                          
+             dae-2862967    <not supported>      instructions                                                          
+             dae-2862974    <not supported>      instructions                                                          
+             dae-2862984    <not supported>      instructions                                                          
+             dae-2862985    <not supported>      instructions                                                          
+             dae-2862986    <not supported>      instructions                                                          
+             dae-2862958    <not supported>      branches                                                              
+             dae-2862960    <not supported>      branches                                                              
+             dae-2862961    <not supported>      branches                                                              
+             dae-2862962    <not supported>      branches                                                              
+             dae-2862963    <not supported>      branches                                                              
+             dae-2862966    <not supported>      branches                                                              
+             dae-2862967    <not supported>      branches                                                              
+             dae-2862974    <not supported>      branches                                                              
+             dae-2862984    <not supported>      branches                                                              
+             dae-2862985    <not supported>      branches                                                              
+             dae-2862986    <not supported>      branches                                                              
+             dae-2862958    <not supported>      branch-misses                                                         
+             dae-2862960    <not supported>      branch-misses                                                         
+             dae-2862961    <not supported>      branch-misses                                                         
+             dae-2862962    <not supported>      branch-misses                                                         
+             dae-2862963    <not supported>      branch-misses                                                         
+             dae-2862966    <not supported>      branch-misses                                                         
+             dae-2862967    <not supported>      branch-misses                                                         
+             dae-2862974    <not supported>      branch-misses                                                         
+             dae-2862984    <not supported>      branch-misses                                                         
+             dae-2862985    <not supported>      branch-misses                                                         
+             dae-2862986    <not supported>      branch-misses                                                         
+             dae-2862958    <not supported>      cache-references                                                      
+             dae-2862960    <not supported>      cache-references                                                      
+             dae-2862961    <not supported>      cache-references                                                      
+             dae-2862962    <not supported>      cache-references                                                      
+             dae-2862963    <not supported>      cache-references                                                      
+             dae-2862966    <not supported>      cache-references                                                      
+             dae-2862967    <not supported>      cache-references                                                      
+             dae-2862974    <not supported>      cache-references                                                      
+             dae-2862984    <not supported>      cache-references                                                      
+             dae-2862985    <not supported>      cache-references                                                      
+             dae-2862986    <not supported>      cache-references                                                      
+             dae-2862958    <not supported>      cache-misses                                                          
+             dae-2862960    <not supported>      cache-misses                                                          
+             dae-2862961    <not supported>      cache-misses                                                          
+             dae-2862962    <not supported>      cache-misses                                                          
+             dae-2862963    <not supported>      cache-misses                                                          
+             dae-2862966    <not supported>      cache-misses                                                          
+             dae-2862967    <not supported>      cache-misses                                                          
+             dae-2862974    <not supported>      cache-misses                                                          
+             dae-2862984    <not supported>      cache-misses                                                          
+             dae-2862985    <not supported>      cache-misses                                                          
+             dae-2862986    <not supported>      cache-misses                                                          
+             dae-2862958      <not counted>      context-switches                                                      
+             dae-2862960              15969      context-switches                                                      
+             dae-2862961             157257      context-switches                                                      
+             dae-2862962      <not counted>      context-switches                                                      
+             dae-2862963      <not counted>      context-switches                                                      
+             dae-2862966             150438      context-switches                                                      
+             dae-2862967      <not counted>      context-switches                                                      
+             dae-2862974      <not counted>      context-switches                                                      
+             dae-2862984             170123      context-switches                                                      
+             dae-2862985             174148      context-switches                                                      
+             dae-2862986             171867      context-switches                                                      
+             dae-2862958      <not counted>      cpu-migrations                                                        
+             dae-2862960                119      cpu-migrations                                                        
+             dae-2862961                216      cpu-migrations                                                        
+             dae-2862962      <not counted>      cpu-migrations                                                        
+             dae-2862963      <not counted>      cpu-migrations                                                        
+             dae-2862966                185      cpu-migrations                                                        
+             dae-2862967      <not counted>      cpu-migrations                                                        
+             dae-2862974      <not counted>      cpu-migrations                                                        
+             dae-2862984                212      cpu-migrations                                                        
+             dae-2862985                224      cpu-migrations                                                        
+             dae-2862986                192      cpu-migrations                                                        
+             dae-2862958      <not counted>      page-faults                                                           
+             dae-2862960                  0      page-faults                                                           
+             dae-2862961                156      page-faults                                                           
+             dae-2862962      <not counted>      page-faults                                                           
+             dae-2862963      <not counted>      page-faults                                                           
+             dae-2862966                236      page-faults                                                           
+             dae-2862967      <not counted>      page-faults                                                           
+             dae-2862974      <not counted>      page-faults                                                           
+             dae-2862984                242      page-faults                                                           
+             dae-2862985                203      page-faults                                                           
+             dae-2862986                142      page-faults                                                           
+
+       9.001098175 seconds time elapsed
+

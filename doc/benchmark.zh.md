@@ -199,13 +199,57 @@ eBPF 行因此为 `0.00`，sing-box 的 TUN client 是用户态路径，为 `1.0
 
 在这个 CPU 受限的 fixture 中，honk 赢得所有代理 TCP 行。相对 dae：
 HY2 +23.8%、TUIC +51.7%、SS2022 +24.2%、Trojan +44.7%、AnyTLS-SB +4.3%、
-AnyTLS-Go +11.5%。进程 CPU 在 HY2/TUIC/SS2022 更低，Trojan 高 16%，
-两个 AnyTLS 约高一倍。按 Mbps per process core 归一化，honk 相对 dae 在
-HY2/TUIC/SS2022/Trojan 为 +86.7%/+85.0%/+24.2%/+24.3%，但在
-**AnyTLS-SB/AnyTLS-Go 为 −47.3%/−46.8%**。相对 sing-box，honk 每行效率高
-+62.9% 到 +143.8%。AnyTLS 的 CPU 方向与 `.70` 轮一致（honk 0.40/0.44 对
-dae 0.22/0.24 core），不是本地 fixture 造成的假象。direct 比 dae 低 6.9%，
-那是 eBPF direct 路径，不是代理结果。
+AnyTLS-Go +11.5%。进程 CPU 在 HY2/TUIC/SS2022 更低，Trojan 高 16%；
+两个 AnyTLS 在修正 dae 的 teardown 分母后也更低。按 Mbps per process core
+归一化，honk 相对 dae 在 HY2/TUIC/SS2022/Trojan 为
++86.7%/+85.0%/+24.2%/+24.3%，在 **AnyTLS-SB/AnyTLS-Go 为
++24.0%/+27.3%**（使用 8 秒 transfer window）。相对 sing-box，honk 每行效率高
++62.9% 到 +143.8%。direct 比 dae 低 6.9%，那是 eBPF direct 路径，不是代理结果。
+
+#### AnyTLS CPU 分母修正
+
+dae 的 AnyTLS `iperf3` 命令在 8 秒传输结束后还会保持约 10 秒才退出；honk
+在 8.0 秒返回。harness 用整条命令的 wall time 除 CPU tick，所以 dae
+AnyTLS-SB/AnyTLS-Go 单元格（0.44/0.42 core）的分母约 18 秒。按 transfer
+window 采样得到：
+
+| Case | command wall | transfer | user cores | sys cores | total cores |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dae AnyTLS-SB | 18.017 s | 8.000 s | 0.446 | 0.561 | 1.008 |
+| dae AnyTLS-Go | 18.010 s | 8.000 s | 0.437 | 0.526 | 0.964 |
+| honk AnyTLS-SB | 8.044 s | 8.001 s | 0.367 | 0.480 | 0.847 |
+| honk AnyTLS-Go | 8.045 s | 8.000 s | 0.369 | 0.475 | 0.844 |
+
+9 秒 `perf stat` task-clock 窗口独立读到 dae 9.505 CPU-s（1.06 core）、honk
+8.316 CPU-s（0.92 core）。两种方法都说明 honk 的 AnyTLS engine CPU 更低。
+原始 TSV 保留 harness 值；修正只适用于 dae 两个 AnyTLS CPU 单元格，不影响
+吞吐或 RSS。`.70` 轮的 dae AnyTLS 也受同一 teardown 影响，因此旧结论
+“honk CPU 高于 dae”不成立。harness 应使用 iperf 报告的 transfer seconds 或
+transfer-window CPU 采样，而不是整条命令 wall time；本轮没有修改 harness。
+
+#### AnyTLS 热点
+
+用与测量 binary 相同的 `just build-musl` 参数加 debug info 构建 twin
+（`.text` 布局不同，只用于相对归因），在 8 秒 iperf3 运行期间用
+`perf record -a -e cpu-clock -g` 采样。
+
+| Profile | Mbps | AES-GCM | `memcpy` | AnyTLS demux | malloc | mpsc push |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AnyTLS-SB download | 20464 | 3.97% | 2.52% | 0.13% | 0.11% | 0.04% |
+| Trojan download | 22149 | 4.44% | 1.12% | — | — | — |
+| AnyTLS-SB upload | 17514 | 3.80% | 3.84% | — | — | — |
+| Trojan upload | 18680 | 4.14% | <0.1% | — | — | — |
+
+百分比是同一 system-wide profile 中所有 CPU-clock self samples 的份额；
+只在表内横向比较。AES-GCM 两侧接近；AnyTLS 的差异是 `memcpy`：download
+为 Trojan 的 2.25×，upload 中占主导。demux、mpsc push 和每帧分配都很小。
+两侧 kernel 栈都以通用的 `tcp_recvmsg`/`_copy_to_iter` 与
+`tcp_sendmsg`/`_copy_from_iter` 为主，因此 download 的 ~0.48 core system
+time 不是 AnyTLS 特有成本。候选位置是 inbound
+`read_frame_body` 分配加 `AnyTlsStream::poll_read` copy
+（`crates/honk-outbound/src/proxy/anytls/mod.rs:1837`、`.../inbound.rs:672`），
+以及 upload 的 `poll_write` copy 加 writer `encode_into` copy
+（`.../mod.rs:1612`）。这是 profile 支持的候选，不是已实施的修复。
 
 HY2/TUIC 的吞吐排序与 `.70` 相反（`.70` 为 honk 3135/3561 对 dae 3762/3306
 Mbps）。本地去掉了 LAN 上限，CPU 成为瓶颈；这些行不能证明 WAN 改善。
@@ -292,23 +336,27 @@ sing-box（p95 12.578/8.546 对 4.783/5.332 ms）。AnyTLS writer/stream 路径
 
 | 发现 | 证据 | 候选成本与下一步实验 |
 | --- | --- | --- |
-| AnyTLS 引擎 CPU | 0.87/0.88 core，对 dae 0.44/0.42；吞吐仅 +4.3%/+11.5%；Mbps/core −47%。`.70` 轮复现。 | 每帧 inbound 分配在 `read_frame_body`（`crates/honk-outbound/src/proxy/anytls/mod.rs:1837`），`AnyTlsStream::poll_read` 的 relay copy（`.../inbound.rs:672`），以及 upload 的两份 copy（`.../mod.rs:1612` 加 writer batching）。先做带符号 profile，再用 buffer pool/owned-`Bytes` 交接，并以 CPU 与 p95 为准，不只看吞吐。 |
-| AnyTLS loaded tail | p95 12.578/8.546 ms，load 19,343/17,782 Mbps；sing-box 4.783/5.332 ms 为相近负载；dae 14.149/11.657 ms 且有 8 次失败。 | 同一 AnyTLS 路径。等负载复测；修复必须降低 p95 且不牺牲中位数/CPU。 |
+| AnyTLS 每字节 copy | 差分 profile：`memcpy` 2.52% 对 Trojan 1.12%（download），3.84% 对 <0.1%（upload）；AES-GCM 接近；demux/mpsc/malloc <0.2%。Transfer-window CPU：honk 0.85 对 dae 1.01 core。 | 多出的用户态 copy 在 `read_frame_body` + `poll_read`（download）与 `poll_write` + writer `encode_into`（upload）。profile 支持的候选，未实施修复。下一步：owned-`Bytes`/vectored-write 实验，以 CPU 与 p95 为门槛。 |
+| AnyTLS loaded tail | p95 12.578/8.546 ms，load 19,343/17,782 Mbps；sing-box 4.783/5.332 ms 为相近负载；dae 14.149/11.657 ms 且有 8 次失败。 | tail 可能共用 streaming/copy 路径。等负载复测；修复必须降低 p95 且不牺牲中位数/CPU。 |
 | TUIC loaded tail | 9,960 Mbps 下 p95 6.860 ms；dae 6,728 Mbps 下 1.949 ms。 | collector 固定启动不限速 reverse stream。增加可选 `LOAD_BPS`，在 dae 压力下复测；只有 tail 仍存在才查 QUIC stream 调度。 |
 | UDP 饱和 | 本 fixture 与 `.70` 轮均落后 dae 的 HY2/TUIC/SS2022/Trojan。 | 先用受控 1% loss / 65ms RTT lab 验证，再改 shared-source UDP；不要在 80–90% 饱和 loss 上直接调参，优先 profile 每包 lookup/permit 路径。 |
 | size-oriented codegen | 测量 binary 使用 `Cargo.toml:151` 的 `opt-level = "s"`。 | 构建 `opt-level = 3` 候选，在 HY2/AnyTLS 上按既有门槛 A/B（≥3% 吞吐或 ≥10% CPU）。BoringSSL C++ 单独构建，只影响 Rust framing/relay/dispatch；先编译验证。 |
 
-AnyTLS 是 honk 唯一“吞吐更高但效率更差”的行：比 dae 快，但 engine CPU
-约高一倍。upload 的两份 copy 本身不在 reverse-download 的测量方向上，真正
-在测量路径上的是 inbound 分配/copy；这些是候选成本，不是已证实的根因。
+修正 teardown 分母后，AnyTLS 不再是 honk 相对 dae 的 CPU 效率劣势：honk
+用更少 CPU、吞吐略高。剩余 AnyTLS 特有成本是相对 honk Trojan 路径的每字节
+额外 `memcpy`；loaded tail 在相近压力下差于 sing-box。这些 copy 是 profile
+支持的候选，不是已实施的修复。
 
 ### 原始证据与验证边界
 
 [完整 campaign evidence](../bench/results/abc-2026-10-20-x86-local/) 保留
 stdout/stderr、两个 TSV、63 个 TCP 与 18 个 UDP JSON、全部 4,200 次 loaded
 尝试、每路由 summary 与 engine log、冻结的 client/server 配置与 fixture
-脚本、binary hash、主机遥测、路由归因和清理 receipt。运行结束后 fixture 已
-移除；`.49` 无 benchmark 引擎、`labsrv`、`dae0` 或 `daens`，lab netns 已重建。
+脚本、binary hash、主机遥测、路由归因和清理 receipt。
+[AnyTLS profile](../bench/results/abc-2026-10-20-x86-local/anytls-profile/)
+另外保存 transfer-window CPU 修正、差分 `perf` 报告和诊断 driver；原始
+76–81 MB `perf.data` 留在 `.49`，未提交。运行结束后 fixture 已移除；`.49`
+无 benchmark 引擎、`labsrv`、`dae0` 或 `daens`，lab netns 已重建。
 构建（`just build-musl 'ebpf,native-api,clash-api,mimalloc,rprx'`）、
 `bash -n bench/lab-bench.sh`、五个 collector test 和 18 条路由归因均通过。
 本轮没有运行完整 workspace、`test-routing`、`test-netns`、ARM benchmark 或
@@ -367,6 +415,11 @@ SS2022、Trojan 与两个 AnyTLS TCP 路由达到 native direct 路径上限。�
 比 dae 低 16.7%、比 sing-box 高 9.6%，TUIC 分别高 7.7%/9.1%。honk 的代理行 RSS
 均更低；进程 CPU 各行均低于 sing-box，QUIC/SS2022/Trojan 也低于 dae，但**两个
 AnyTLS server 的进程 CPU 都高于 dae**。
+
+**勘误（2026-10-20）：** dae 的 AnyTLS iperf 命令在 8 秒传输结束后还会保持
+约 10 秒，所以上表 dae AnyTLS CPU 单元格使用约 18 秒分母。按 transfer window
+采样，dae AnyTLS 约为 0.5 core，不是 0.22/0.24；“高于 dae”的结论不成立。
+见 2026-10-20 的 AnyTLS 修正与 profile。
 
 ### 首个请求与空载 hot 延迟
 

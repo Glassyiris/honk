@@ -76,5 +76,32 @@
     "just test-netns",
     "ARM benchmark",
     "active native API/UI"
-  ]
+  ],
+  "anytls_profile": {
+    "result": "passed",
+    "evidence": "anytls-profile/",
+    "engine_cpu_correction": {
+      "dae_anytls_sb_transfer_cores": 1.008,
+      "dae_anytls_go_transfer_cores": 0.964,
+      "honk_anytls_sb_transfer_cores": 0.847,
+      "honk_anytls_go_transfer_cores": 0.844,
+      "cause": "dae AnyTLS iperf command stays open ~10s after the 8s transfer; harness CPU denominator used command wall time"
+    },
+    "perf": {
+      "event": "cpu-clock",
+      "debug_twin": "same just build-musl flags plus debug info; .text layout differs",
+      "anytls_down_memcpy_pct": 2.52,
+      "trojan_down_memcpy_pct": 1.12,
+      "anytls_up_memcpy_pct": 3.84,
+      "trojan_up_memcpy_pct": "<0.1",
+      "anytls_down_aes_pct": 3.97,
+      "trojan_down_aes_pct": 4.44,
+      "anytls_up_aes_pct": 3.8,
+      "trojan_up_aes_pct": 4.14
+    },
+    "raw_perf_data": "left on 10.10.10.49 /root/bench-20261020/prof/ (76-81 MB each), not committed",
+    "not_run": [
+      "production code changes; this was verification only"
+    ]
+  }
 }

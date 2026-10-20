@@ -1,0 +1,67 @@
+{
+  "label": "dae-trojan-down",
+  "engine": "dae",
+  "pid": 2862810,
+  "port": 5204,
+  "direction": "down",
+  "mbps": 15962.6,
+  "elapsed_s": 8.006,
+  "user_cores": 0.2561,
+  "sys_cores": 0.4197,
+  "total_cores": 0.6757,
+  "all_thread_cores": 0.672,
+  "io": {
+    "rchar_MB": 15985.94,
+    "wchar_MB": 15964.47,
+    "syscr": 496321,
+    "syscw": 974681
+  },
+  "rss_kb": 60980,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2862813",
+      "comm": "(dae)",
+      "user": 0.63,
+      "sys": 0.98,
+      "total": 1.61
+    },
+    {
+      "tid": "2862836",
+      "comm": "(dae)",
+      "user": 0.51,
+      "sys": 0.88,
+      "total": 1.39
+    },
+    {
+      "tid": "2862818",
+      "comm": "(dae)",
+      "user": 0.45,
+      "sys": 0.76,
+      "total": 1.21
+    },
+    {
+      "tid": "2862837",
+      "comm": "(dae)",
+      "user": 0.28,
+      "sys": 0.45,
+      "total": 0.73
+    },
+    {
+      "tid": "2862838",
+      "comm": "(dae)",
+      "user": 0.15,
+      "sys": 0.26,
+      "total": 0.41
+    },
+    {
+      "tid": "2862812",
+      "comm": "(dae)",
+      "user": 0.0,
+      "sys": 0.03,
+      "total": 0.03
+    }
+  ],
+  "perfstat": null
+}

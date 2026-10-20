@@ -1,0 +1,54 @@
+{
+  "label": "prof-anytls-sb-down",
+  "engine": "honk",
+  "pid": 2863095,
+  "port": 5205,
+  "direction": "down",
+  "mbps": 20463.7,
+  "elapsed_s": 8.051,
+  "user_cores": 0.359,
+  "sys_cores": 0.4882,
+  "total_cores": 0.8471,
+  "all_thread_cores": 0.8471,
+  "io": {
+    "rchar_MB": 0.0,
+    "wchar_MB": 0.07,
+    "syscr": 28,
+    "syscw": 9157
+  },
+  "rss_kb": 68296,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2863099",
+      "comm": "(tokio-rt-worker)",
+      "user": 1.09,
+      "sys": 1.41,
+      "total": 2.5
+    },
+    {
+      "tid": "2863100",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.76,
+      "sys": 1.12,
+      "total": 1.88
+    },
+    {
+      "tid": "2863098",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.56,
+      "sys": 0.75,
+      "total": 1.31
+    },
+    {
+      "tid": "2863097",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.47,
+      "sys": 0.66,
+      "total": 1.13
+    }
+  ],
+  "perfstat": null,
+  "perfrecord": "/root/bench-20261020/prof/prof-anytls-sb-down.perf.data"
+}

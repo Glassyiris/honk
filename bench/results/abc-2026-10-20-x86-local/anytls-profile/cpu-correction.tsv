@@ -1,0 +1,13 @@
+label	engine	port	direction	mbps	command_s	transfer_s	harness_cpu	corrected_total	corrected_user	corrected_sys
+honk-anytls-sb-down	honk	5205	down	20056.1	8.044	8.0	0.8466	0.847	0.367	0.48
+honk-anytls-sb-up	honk	5205	up	17835.4	8.051	8.0	0.8397	0.84	0.354	0.486
+honk-anytls-go-down	honk	5206	down	17784.6	8.045	8.0	0.844	0.844	0.369	0.475
+honk-trojan-down	honk	5204	down	24219.2	8.047	8.0	0.7829	0.783	0.287	0.496
+honk-trojan-up	honk	5204	up	18800.9	8.048	8.0	0.5766	0.577	0.214	0.363
+dae-anytls-sb-down	dae	5205	down	19678.7	18.017	8.0	0.4474	1.008	0.446	0.561
+dae-anytls-go-down	dae	5206	down	18098.0	18.01	8.0	0.4281	0.964	0.437	0.526
+dae-trojan-down	dae	5204	down	15962.6	8.006	8.0	0.6757	0.676	0.256	0.42
+prof-anytls-sb-down	honk	5205	down	20463.7	8.051	8.0	0.8471	0.847	0.359	0.488
+prof-anytls-sb-up	honk	5205	up	17514.4	8.047	8.0	0.8376	0.838	0.36	0.477
+prof-trojan-down	honk	5204	down	22149.0	8.056	8.0	0.7857	0.786	0.297	0.489
+prof-trojan-up	honk	5204	up	18679.8	8.046	8.0	0.5903	0.59	0.207	0.383

@@ -117,5 +117,20 @@
   "notes": [
     "lab-bench.sh includes a stale-daens cleanup guard added after a crashed dae left stacked nsfs mounts; measurement code is otherwise unchanged.",
     "No native listener was configured, so this does not measure active native observation/UI overhead."
-  ]
+  ],
+  "corrections": [
+    {
+      "date": "2026-10-20",
+      "scope": "dae AnyTLS CPU cells",
+      "reason": "iperf command remains open ~10s after the 8s transfer; CPU denominator is command wall time",
+      "transfer_window_cores": {
+        "honk_anytls_sb": 0.847,
+        "honk_anytls_go": 0.844,
+        "dae_anytls_sb": 1.008,
+        "dae_anytls_go": 0.964
+      },
+      "evidence": "anytls-profile/cpu-correction.tsv"
+    }
+  ],
+  "anytls_profile": "anytls-profile/"
 }

@@ -1,0 +1,54 @@
+{
+  "label": "prof-trojan-down",
+  "engine": "honk",
+  "pid": 2863241,
+  "port": 5204,
+  "direction": "down",
+  "mbps": 22149.0,
+  "elapsed_s": 8.056,
+  "user_cores": 0.2967,
+  "sys_cores": 0.4891,
+  "total_cores": 0.7857,
+  "all_thread_cores": 0.7857,
+  "io": {
+    "rchar_MB": 0.0,
+    "wchar_MB": 0.15,
+    "syscr": 28,
+    "syscw": 19243
+  },
+  "rss_kb": 60976,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2863246",
+      "comm": "(tokio-rt-worker)",
+      "user": 1.05,
+      "sys": 1.75,
+      "total": 2.8
+    },
+    {
+      "tid": "2863244",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.99,
+      "sys": 1.57,
+      "total": 2.56
+    },
+    {
+      "tid": "2863245",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.33,
+      "sys": 0.56,
+      "total": 0.89
+    },
+    {
+      "tid": "2863243",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.03,
+      "sys": 0.05,
+      "total": 0.08
+    }
+  ],
+  "perfstat": null,
+  "perfrecord": "/root/bench-20261020/prof/prof-trojan-down.perf.data"
+}

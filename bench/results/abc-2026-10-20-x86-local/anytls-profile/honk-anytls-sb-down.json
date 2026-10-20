@@ -1,0 +1,53 @@
+{
+  "label": "honk-anytls-sb-down",
+  "engine": "honk",
+  "pid": 2862307,
+  "port": 5205,
+  "direction": "down",
+  "mbps": 20056.1,
+  "elapsed_s": 8.044,
+  "user_cores": 0.3667,
+  "sys_cores": 0.4798,
+  "total_cores": 0.8466,
+  "all_thread_cores": 0.8441,
+  "io": {
+    "rchar_MB": 0.0,
+    "wchar_MB": 0.07,
+    "syscr": 30,
+    "syscw": 8185
+  },
+  "rss_kb": 58900,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2862311",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.85,
+      "sys": 1.16,
+      "total": 2.01
+    },
+    {
+      "tid": "2862312",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.84,
+      "sys": 1.1,
+      "total": 1.94
+    },
+    {
+      "tid": "2862310",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.7,
+      "sys": 0.88,
+      "total": 1.58
+    },
+    {
+      "tid": "2862309",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.56,
+      "sys": 0.7,
+      "total": 1.26
+    }
+  ],
+  "perfstat": null
+}

@@ -1,0 +1,98 @@
+# started on Tue Oct 20 16:45:36 2026
+
+
+ Performance counter stats for process id '2862885':
+
+  honk-candidate-2862885      <not counted> msec task-clock                                                            
+ tokio-rt-worker-2862887            1498.55 msec task-clock                                                            
+ tokio-rt-worker-2862888            2621.10 msec task-clock                                                            
+ tokio-rt-worker-2862889            2590.51 msec task-clock                                                            
+ tokio-rt-worker-2862890            1604.37 msec task-clock                                                            
+ honk-cache-db-w-2862899      <not counted> msec task-clock                                                            
+ tokio-rt-worker-2862900               0.15 msec task-clock                                                            
+    honk-nfqueue-2862901               0.70 msec task-clock                                                            
+ tokio-rt-worker-2862912               0.13 msec task-clock                                                            
+  honk-candidate-2862885    <not supported>      cycles                                                                
+ tokio-rt-worker-2862887    <not supported>      cycles                                                                
+ tokio-rt-worker-2862888    <not supported>      cycles                                                                
+ tokio-rt-worker-2862889    <not supported>      cycles                                                                
+ tokio-rt-worker-2862890    <not supported>      cycles                                                                
+ honk-cache-db-w-2862899    <not supported>      cycles                                                                
+ tokio-rt-worker-2862900    <not supported>      cycles                                                                
+    honk-nfqueue-2862901    <not supported>      cycles                                                                
+ tokio-rt-worker-2862912    <not supported>      cycles                                                                
+  honk-candidate-2862885    <not supported>      instructions                                                          
+ tokio-rt-worker-2862887    <not supported>      instructions                                                          
+ tokio-rt-worker-2862888    <not supported>      instructions                                                          
+ tokio-rt-worker-2862889    <not supported>      instructions                                                          
+ tokio-rt-worker-2862890    <not supported>      instructions                                                          
+ honk-cache-db-w-2862899    <not supported>      instructions                                                          
+ tokio-rt-worker-2862900    <not supported>      instructions                                                          
+    honk-nfqueue-2862901    <not supported>      instructions                                                          
+ tokio-rt-worker-2862912    <not supported>      instructions                                                          
+  honk-candidate-2862885    <not supported>      branches                                                              
+ tokio-rt-worker-2862887    <not supported>      branches                                                              
+ tokio-rt-worker-2862888    <not supported>      branches                                                              
+ tokio-rt-worker-2862889    <not supported>      branches                                                              
+ tokio-rt-worker-2862890    <not supported>      branches                                                              
+ honk-cache-db-w-2862899    <not supported>      branches                                                              
+ tokio-rt-worker-2862900    <not supported>      branches                                                              
+    honk-nfqueue-2862901    <not supported>      branches                                                              
+ tokio-rt-worker-2862912    <not supported>      branches                                                              
+  honk-candidate-2862885    <not supported>      branch-misses                                                         
+ tokio-rt-worker-2862887    <not supported>      branch-misses                                                         
+ tokio-rt-worker-2862888    <not supported>      branch-misses                                                         
+ tokio-rt-worker-2862889    <not supported>      branch-misses                                                         
+ tokio-rt-worker-2862890    <not supported>      branch-misses                                                         
+ honk-cache-db-w-2862899    <not supported>      branch-misses                                                         
+ tokio-rt-worker-2862900    <not supported>      branch-misses                                                         
+    honk-nfqueue-2862901    <not supported>      branch-misses                                                         
+ tokio-rt-worker-2862912    <not supported>      branch-misses                                                         
+  honk-candidate-2862885    <not supported>      cache-references                                                      
+ tokio-rt-worker-2862887    <not supported>      cache-references                                                      
+ tokio-rt-worker-2862888    <not supported>      cache-references                                                      
+ tokio-rt-worker-2862889    <not supported>      cache-references                                                      
+ tokio-rt-worker-2862890    <not supported>      cache-references                                                      
+ honk-cache-db-w-2862899    <not supported>      cache-references                                                      
+ tokio-rt-worker-2862900    <not supported>      cache-references                                                      
+    honk-nfqueue-2862901    <not supported>      cache-references                                                      
+ tokio-rt-worker-2862912    <not supported>      cache-references                                                      
+  honk-candidate-2862885    <not supported>      cache-misses                                                          
+ tokio-rt-worker-2862887    <not supported>      cache-misses                                                          
+ tokio-rt-worker-2862888    <not supported>      cache-misses                                                          
+ tokio-rt-worker-2862889    <not supported>      cache-misses                                                          
+ tokio-rt-worker-2862890    <not supported>      cache-misses                                                          
+ honk-cache-db-w-2862899    <not supported>      cache-misses                                                          
+ tokio-rt-worker-2862900    <not supported>      cache-misses                                                          
+    honk-nfqueue-2862901    <not supported>      cache-misses                                                          
+ tokio-rt-worker-2862912    <not supported>      cache-misses                                                          
+  honk-candidate-2862885      <not counted>      context-switches                                                      
+ tokio-rt-worker-2862887              57360      context-switches                                                      
+ tokio-rt-worker-2862888              81376      context-switches                                                      
+ tokio-rt-worker-2862889              81733      context-switches                                                      
+ tokio-rt-worker-2862890              54724      context-switches                                                      
+ honk-cache-db-w-2862899      <not counted>      context-switches                                                      
+ tokio-rt-worker-2862900                 17      context-switches                                                      
+    honk-nfqueue-2862901                 92      context-switches                                                      
+ tokio-rt-worker-2862912                 13      context-switches                                                      
+  honk-candidate-2862885      <not counted>      cpu-migrations                                                        
+ tokio-rt-worker-2862887                 36      cpu-migrations                                                        
+ tokio-rt-worker-2862888                 48      cpu-migrations                                                        
+ tokio-rt-worker-2862889                 47      cpu-migrations                                                        
+ tokio-rt-worker-2862890                 35      cpu-migrations                                                        
+ honk-cache-db-w-2862899      <not counted>      cpu-migrations                                                        
+ tokio-rt-worker-2862900                  2      cpu-migrations                                                        
+    honk-nfqueue-2862901                  9      cpu-migrations                                                        
+ tokio-rt-worker-2862912                  2      cpu-migrations                                                        
+  honk-candidate-2862885      <not counted>      page-faults                                                           
+ tokio-rt-worker-2862887              28598      page-faults                                                           
+ tokio-rt-worker-2862888              56559      page-faults                                                           
+ tokio-rt-worker-2862889              58988      page-faults                                                           
+ tokio-rt-worker-2862890              38613      page-faults                                                           
+ honk-cache-db-w-2862899      <not counted>      page-faults                                                           
+ tokio-rt-worker-2862900                  0      page-faults                                                           
+    honk-nfqueue-2862901                  0      page-faults                                                           
+ tokio-rt-worker-2862912                  3      page-faults                                                           
+
+       9.001973810 seconds time elapsed
+

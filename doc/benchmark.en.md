@@ -229,14 +229,64 @@ sing-box's TUN client is a userspace path and reads `1.06`.
 
 honk wins every proxy TCP row in this CPU-bound fixture. Against dae it is
 +23.8% HY2, +51.7% TUIC, +24.2% SS2022, +44.7% Trojan, +4.3% AnyTLS-SB and
-+11.5% AnyTLS-Go. Its process CPU is lower on HY2/TUIC/SS2022, 16% higher on Trojan,
-and roughly twice as high on both AnyTLS routes. Normalised to
-Mbps per process core, honk is +86.7%/+85.0%/+24.2%/+24.3% versus dae on
-HY2/TUIC/SS2022/Trojan, but **−47.3%/−46.8% on AnyTLS-SB/AnyTLS-Go**. Against
-sing-box, honk is +62.9% to +143.8% more efficient on every row. The AnyTLS CPU
-direction reproduces the `.70` campaign (honk 0.40/0.44 vs dae 0.22/0.24
-cores), so it is not a local-fixture artifact. Direct is 6.9% below dae; that
-is the eBPF direct path, not a proxy result.
++11.5% AnyTLS-Go. Its process CPU is lower on HY2/TUIC/SS2022, 16% higher on
+Trojan, and lower on both AnyTLS routes once dae's teardown-inflated CPU
+denominator is corrected. Normalised to Mbps per process core, honk is
++86.7%/+85.0%/+24.2%/+24.3% versus dae on HY2/TUIC/SS2022/Trojan, and
+**+24.0%/+27.3% on AnyTLS-SB/AnyTLS-Go** after using the 8-second transfer
+window. Against sing-box, honk is +62.9% to +143.8% more efficient on every
+row. Direct is 6.9% below dae; that is the eBPF direct path, not a proxy
+result.
+
+#### AnyTLS CPU denominator correction
+
+dae's AnyTLS `iperf3` command stays open for about 10 seconds after its
+8-second transfer; honk's returns at 8.0 seconds. The harness divides CPU
+ticks by the command's wall time, so the dae AnyTLS-SB/AnyTLS-Go cells
+(0.44/0.42 cores) use an ~18-second denominator. Sampling the transfer window
+gives:
+
+| Case | command wall | transfer | user cores | sys cores | total cores |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dae AnyTLS-SB | 18.017 s | 8.000 s | 0.446 | 0.561 | 1.008 |
+| dae AnyTLS-Go | 18.010 s | 8.000 s | 0.437 | 0.526 | 0.964 |
+| honk AnyTLS-SB | 8.044 s | 8.001 s | 0.367 | 0.480 | 0.847 |
+| honk AnyTLS-Go | 8.045 s | 8.000 s | 0.369 | 0.475 | 0.844 |
+
+A 9-second `perf stat` task-clock window independently reads dae 9.505 CPU-s
+(1.06 cores) and honk 8.316 CPU-s (0.92 cores). Both methods agree that honk,
+not dae, uses less engine CPU for AnyTLS. The raw TSV keeps the harness values;
+the correction applies only to the two dae AnyTLS CPU cells, not to throughput
+or RSS. The same teardown affected the `.70` dae AnyTLS cells, so that
+campaign's “honk CPU higher than dae” statement is not supported. The harness
+fix is to use the iperf-reported transfer seconds or a transfer-window CPU
+sample, not the full command wall time; it is not applied here.
+
+#### AnyTLS hot path
+
+A debug-info twin of the measured binary (same `just build-musl` flags plus
+debug info; `.text` layout differs, used only for relative attribution) was
+profiled with `perf record -a -e cpu-clock -g` during an 8-second iperf3 run.
+
+| Profile | Mbps | AES-GCM | `memcpy` | AnyTLS demux | malloc | mpsc push |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AnyTLS-SB download | 20464 | 3.97% | 2.52% | 0.13% | 0.11% | 0.04% |
+| Trojan download | 22149 | 4.44% | 1.12% | — | — | — |
+| AnyTLS-SB upload | 17514 | 3.80% | 3.84% | — | — | — |
+| Trojan upload | 18680 | 4.14% | <0.1% | — | — | — |
+
+The percentages are self-sample shares of all CPU-clock samples in the same
+system-wide profile; compare rows within the table, not as absolute CPU.
+AES-GCM is similar on both protocols. The AnyTLS-specific delta is `memcpy`:
+2.25× Trojan on download and dominant on upload. The demux, mpsc push and
+per-frame allocation are small. Kernel stacks are dominated by generic
+`tcp_recvmsg`/`_copy_to_iter` and `tcp_sendmsg`/`_copy_from_iter` for both
+protocols, so system time (~0.48 cores on download) is not the AnyTLS delta.
+The candidate sites are the inbound `read_frame_body` allocation plus
+`AnyTlsStream::poll_read` copy (`crates/honk-outbound/src/proxy/anytls/mod.rs:1837`,
+`.../inbound.rs:672`) and the upload `poll_write` copy plus writer
+`encode_into` copy (`.../mod.rs:1612`, writer batching). This is a
+profile-backed candidate, not an implemented fix.
 
 The HY2/TUIC throughput order is the reverse of the `.70` campaign
 (honk 3135/3561 vs dae 3762/3306 Mbps there). Removing the LAN ceiling makes
@@ -332,17 +382,17 @@ before calling the TUIC tail a protocol defect.
 
 | Finding | Evidence | Candidate cost and next experiment |
 | --- | --- | --- |
-| AnyTLS engine CPU | 0.87/0.88 cores vs dae 0.44/0.42 at +4.3%/+11.5% throughput; −47% Mbps/core. Reproduced at `.70`. | Per-frame inbound allocation in `read_frame_body` (`crates/honk-outbound/src/proxy/anytls/mod.rs:1837`), the relay copy in `AnyTlsStream::poll_read` (`.../inbound.rs:672`), and the two-copy upload path (`.../mod.rs:1612` plus writer batching). Profile with symbols, then gate a buffer-pool/owned-`Bytes` handoff on CPU and p95, not throughput alone. |
-| AnyTLS loaded tail | p95 12.578/8.546 ms at 19,343/17,782 Mbps vs sing-box 4.783/5.332 ms at similar load; dae 14.149/11.657 ms with 8 failures. | Same AnyTLS path. Re-run at equal load; accept a fix only if it lowers p95 without moving the median or CPU in the wrong direction. |
+| AnyTLS per-byte copies | Differential profile: `memcpy` 2.52% vs Trojan 1.12% (download), 3.84% vs <0.1% (upload); AES-GCM similar; demux/mpsc/malloc <0.2%. Transfer-window CPU: honk 0.85 vs dae 1.01 cores. | Extra userspace copy in `read_frame_body` + `poll_read` (download) and `poll_write` + writer `encode_into` (upload). Profile-backed; no fix applied. Next: owned-`Bytes`/vectored-write experiment gated on CPU and p95. |
+| AnyTLS loaded tail | p95 12.578/8.546 ms at 19,343/17,782 Mbps vs sing-box 4.783/5.332 ms at similar load; dae 14.149/11.657 ms with 8 failures. | The tail may share the streaming/copy path. Re-run at equal load; accept a fix only if it lowers p95 without moving the median or CPU in the wrong direction. |
 | TUIC loaded tail | p95 6.860 ms at 9,960 Mbps vs dae 1.949 ms at 6,728 Mbps. | The collector always starts an uncapped reverse stream. Add an optional `LOAD_BPS` cap and compare at dae's pressure; then investigate QUIC stream scheduling only if the tail persists. |
 | UDP saturation | Trails dae on HY2/TUIC/SS2022/Trojan at this fixture and in the `.70` campaign. | Use the controlled 1% loss / 65 ms RTT lab before changing shared-source UDP; profile the per-packet lookup/permit path rather than tuning on the 80–90% saturation-loss numbers. |
 | Size-oriented codegen | `opt-level = "s"` in `Cargo.toml:151` applies to the measured release binary. | Build an `opt-level = 3` candidate and A/B it on HY2/AnyTLS with the existing gates (≥3% throughput or ≥10% CPU). BoringSSL's C++ is built separately, so only Rust framing/relay/dispatch is in scope. Compile for correctness. |
 
-The AnyTLS rows are the one place where honk's extra throughput does not buy
-efficiency: it is faster than dae but spends roughly twice the engine CPU to
-get there. The two-copy upload path is not on the reverse-download measurement
-by itself; the inbound allocation/copy is. Treat these as profiled candidates,
-not an established root cause.
+After the teardown correction, AnyTLS is no longer a CPU-efficiency deficit
+against dae: honk uses less CPU for slightly higher throughput. The remaining
+AnyTLS-specific cost is an extra `memcpy` per byte relative to honk's Trojan
+path, and the loaded tail is worse than sing-box's at similar pressure. Treat
+the copies as profiled candidates, not an implemented fix.
 
 ### Evidence and verification scope
 
@@ -350,7 +400,11 @@ not an established root cause.
 retains stdout/stderr, both TSVs, 63 TCP and 18 UDP JSON files, all 4,200
 loaded attempts, per-route summaries and engine logs, the frozen client/server
 configs and fixture scripts, binary hashes, host telemetry, route attribution
-and cleanup receipts. The fixture was removed after the run; `.49` has no
+and cleanup receipts. The
+[AnyTLS profile](../bench/results/abc-2026-10-20-x86-local/anytls-profile/)
+adds the transfer-window CPU correction, differential `perf` reports and the
+diagnostic driver; raw 76–81 MB `perf.data` files remain on `.49` and are not
+committed. The fixture was removed after the run; `.49` has no
 benchmark engine, `labsrv`, `dae0` or `daens` left, and the lab netns was
 rebuilt. Build (`just build-musl 'ebpf,native-api,clash-api,mimalloc,rprx'`),
 `bash -n bench/lab-bench.sh`, the five collector tests and all 18 route
@@ -419,6 +473,12 @@ honk's HY2 is 16.7% below dae and 9.6% above sing-box; TUIC is 7.7%/9.1%
 above them in this campaign. honk uses less proxy-row RSS throughout. Its
 process CPU is lower than sing-box throughout and lower than dae for QUIC,
 SS2022 and Trojan, but **higher than dae for both AnyTLS servers**.
+
+**Erratum (2026-10-20):** dae's AnyTLS iperf command stays open for about
+10 seconds after the 8-second transfer, so the dae AnyTLS CPU cells above use
+an ~18-second denominator. Transfer-window sampling puts dae AnyTLS at
+about 0.5 core, not 0.22/0.24; the “higher than dae” comparison is not supported.
+See the 2026-10-20 AnyTLS correction and profile.
 
 ### First request and unloaded hot latency
 

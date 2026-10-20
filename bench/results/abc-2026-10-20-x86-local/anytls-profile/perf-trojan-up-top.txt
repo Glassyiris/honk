@@ -1,0 +1,24 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 17K of event 'cpu-clock'
+# Event count (approx.): 35639278272
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                       IPC   [IPC Coverage]
+# ........  ...........................................................................................................................................................................................................................................................................................................................................  ....................
+#
+     4.14%  [.] aes_gcm_enc_update_vaes_avx2                                                                                                                                                                                                                                                                                                             -      -            
+     0.11%  [.] sccp                                                                                                                                                                                                                                                                                                                                     -      -            
+     0.10%  [.] aes_hw_encrypt                                                                                                                                                                                                                                                                                                                           -      -            
+     0.07%  [.] gcm_gmult_vpclmulqdq_avx2                                                                                                                                                                                                                                                                                                                -      -            
+     0.06%  [.] bssl::do_seal_record(ssl_st*, unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned char const*, unsigned long)                                                                                                                                                                                                        -      -            
+     0.06%  [.] get_meta                                                                                                                                                                                                                                                                                                                                 -      -            
+     0.05%  [.] <tokio::runtime::task::raw::RawTask>::drop_reference                                                                                                                                                                                                                                                                                     -      -            
+     0.05%  [.] __libc_malloc_impl                                                                                                                                                                                                                                                                                                                       -      -            
+
+
+#
+# (Tip: Show individual samples with: perf script)
+#

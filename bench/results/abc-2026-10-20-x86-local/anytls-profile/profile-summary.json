@@ -1,0 +1,194 @@
+{
+  "engine": "honk debug-info twin of 5d29dba6 (same just build-musl flags + debug_info; .text layout differs, used only for relative attribution)",
+  "fixture": "labsrv on 10.10.10.49, same as abc-2026-10-20-x86-local",
+  "cases": {
+    "honk-anytls-sb-down": {
+      "label": "honk-anytls-sb-down",
+      "engine": "honk",
+      "port": 5205,
+      "direction": "down",
+      "mbps": 20056.1,
+      "command_s": 8.044,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.8466,
+      "corrected_total": 0.847,
+      "corrected_user": 0.367,
+      "corrected_sys": 0.48
+    },
+    "honk-anytls-sb-up": {
+      "label": "honk-anytls-sb-up",
+      "engine": "honk",
+      "port": 5205,
+      "direction": "up",
+      "mbps": 17835.4,
+      "command_s": 8.051,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.8397,
+      "corrected_total": 0.84,
+      "corrected_user": 0.354,
+      "corrected_sys": 0.486
+    },
+    "honk-anytls-go-down": {
+      "label": "honk-anytls-go-down",
+      "engine": "honk",
+      "port": 5206,
+      "direction": "down",
+      "mbps": 17784.6,
+      "command_s": 8.045,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.844,
+      "corrected_total": 0.844,
+      "corrected_user": 0.369,
+      "corrected_sys": 0.475
+    },
+    "honk-trojan-down": {
+      "label": "honk-trojan-down",
+      "engine": "honk",
+      "port": 5204,
+      "direction": "down",
+      "mbps": 24219.2,
+      "command_s": 8.047,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.7829,
+      "corrected_total": 0.783,
+      "corrected_user": 0.287,
+      "corrected_sys": 0.496
+    },
+    "honk-trojan-up": {
+      "label": "honk-trojan-up",
+      "engine": "honk",
+      "port": 5204,
+      "direction": "up",
+      "mbps": 18800.9,
+      "command_s": 8.048,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.5766,
+      "corrected_total": 0.577,
+      "corrected_user": 0.214,
+      "corrected_sys": 0.363
+    },
+    "dae-anytls-sb-down": {
+      "label": "dae-anytls-sb-down",
+      "engine": "dae",
+      "port": 5205,
+      "direction": "down",
+      "mbps": 19678.7,
+      "command_s": 18.017,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.4474,
+      "corrected_total": 1.008,
+      "corrected_user": 0.446,
+      "corrected_sys": 0.561
+    },
+    "dae-anytls-go-down": {
+      "label": "dae-anytls-go-down",
+      "engine": "dae",
+      "port": 5206,
+      "direction": "down",
+      "mbps": 18098.0,
+      "command_s": 18.01,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.4281,
+      "corrected_total": 0.964,
+      "corrected_user": 0.437,
+      "corrected_sys": 0.526
+    },
+    "dae-trojan-down": {
+      "label": "dae-trojan-down",
+      "engine": "dae",
+      "port": 5204,
+      "direction": "down",
+      "mbps": 15962.6,
+      "command_s": 8.006,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.6757,
+      "corrected_total": 0.676,
+      "corrected_user": 0.256,
+      "corrected_sys": 0.42
+    },
+    "prof-anytls-sb-down": {
+      "label": "prof-anytls-sb-down",
+      "engine": "honk",
+      "port": 5205,
+      "direction": "down",
+      "mbps": 20463.7,
+      "command_s": 8.051,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.8471,
+      "corrected_total": 0.847,
+      "corrected_user": 0.359,
+      "corrected_sys": 0.488
+    },
+    "prof-anytls-sb-up": {
+      "label": "prof-anytls-sb-up",
+      "engine": "honk",
+      "port": 5205,
+      "direction": "up",
+      "mbps": 17514.4,
+      "command_s": 8.047,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.8376,
+      "corrected_total": 0.838,
+      "corrected_user": 0.36,
+      "corrected_sys": 0.477
+    },
+    "prof-trojan-down": {
+      "label": "prof-trojan-down",
+      "engine": "honk",
+      "port": 5204,
+      "direction": "down",
+      "mbps": 22149.0,
+      "command_s": 8.056,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.7857,
+      "corrected_total": 0.786,
+      "corrected_user": 0.297,
+      "corrected_sys": 0.489
+    },
+    "prof-trojan-up": {
+      "label": "prof-trojan-up",
+      "engine": "honk",
+      "port": 5204,
+      "direction": "up",
+      "mbps": 18679.8,
+      "command_s": 8.046,
+      "transfer_s": 8.0,
+      "harness_cpu": 0.5903,
+      "corrected_total": 0.59,
+      "corrected_user": 0.207,
+      "corrected_sys": 0.383
+    }
+  },
+  "perf_task_clock_9s": {
+    "honk_anytls_sb_ms": 8315.51,
+    "dae_anytls_sb_ms": 9505.29,
+    "honk_cores": 0.924,
+    "dae_cores": 1.056
+  },
+  "top_self_samples_system_wide": {
+    "anytls_down": {
+      "aes_gcm_dec": 3.97,
+      "memcpy": 2.52,
+      "session_demux": 0.13,
+      "malloc": 0.11,
+      "mpsc_push": 0.04
+    },
+    "trojan_down": {
+      "aes_gcm_dec": 4.44,
+      "memcpy": 1.12
+    },
+    "anytls_up": {
+      "aes_gcm_enc": 3.8,
+      "memcpy": 3.84
+    },
+    "trojan_up": {
+      "aes_gcm_enc": 4.14,
+      "memcpy": "<0.1"
+    }
+  },
+  "notes": [
+    "Percentages are self-sample shares of all CPU-clock samples in the system-wide profile; compare rows within the same profile.",
+    "Kernel stacks for both AnyTLS and Trojan are dominated by tcp_recvmsg/_copy_to_iter and tcp_sendmsg/_copy_from_iter; system time is generic TLS/TCP, not AnyTLS-specific.",
+    "Raw perf.data (76-81 MB per case) remains on 10.10.10.49 at /root/bench-20261020/prof/."
+  ]
+}

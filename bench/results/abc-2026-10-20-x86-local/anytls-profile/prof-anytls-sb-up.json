@@ -1,0 +1,54 @@
+{
+  "label": "prof-anytls-sb-up",
+  "engine": "honk",
+  "pid": 2863170,
+  "port": 5205,
+  "direction": "up",
+  "mbps": 17514.4,
+  "elapsed_s": 8.047,
+  "user_cores": 0.3604,
+  "sys_cores": 0.4772,
+  "total_cores": 0.8376,
+  "all_thread_cores": 0.8389,
+  "io": {
+    "rchar_MB": 0.0,
+    "wchar_MB": 0.04,
+    "syscr": 28,
+    "syscw": 4748
+  },
+  "rss_kb": 73420,
+  "voluntary_ctxt": 0,
+  "nonvoluntary_ctxt": 0,
+  "threads": [
+    {
+      "tid": "2863175",
+      "comm": "(tokio-rt-worker)",
+      "user": 1.13,
+      "sys": 1.5,
+      "total": 2.63
+    },
+    {
+      "tid": "2863173",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.75,
+      "sys": 0.98,
+      "total": 1.73
+    },
+    {
+      "tid": "2863172",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.65,
+      "sys": 0.86,
+      "total": 1.51
+    },
+    {
+      "tid": "2863174",
+      "comm": "(tokio-rt-worker)",
+      "user": 0.37,
+      "sys": 0.51,
+      "total": 0.88
+    }
+  ],
+  "perfstat": null,
+  "perfrecord": "/root/bench-20261020/prof/prof-anytls-sb-up.perf.data"
+}
