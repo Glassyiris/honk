@@ -160,6 +160,13 @@ stop_engines() {
     if [ -z "$(process_pids honk)" ] && [ -z "$(process_pids dae)" ]; then
         ip link del dae0 2>/dev/null
         ip netns del daens 2>/dev/null
+        # A hard-killed dae can leave stacked nsfs mounts; `ip netns del`
+        # removes at most one layer and the next start then fails with EEXIST.
+        for _ in $(seq 1 256); do
+            findmnt -T /run/netns/daens >/dev/null 2>&1 || break
+            umount -l /run/netns/daens 2>/dev/null || break
+        done
+        rm -f /run/netns/daens 2>/dev/null
     fi
     # sing-box's TUN auto_route rewrites the lab netns routing table.
     [ -n "$sb_running" ] && bash /root/setup-netns.sh >/dev/null 2>&1
