@@ -1,8 +1,10 @@
 use super::*;
 use aya::maps::HashMap as AyaHashMap;
-use honk_ebpf_common::conn::{FRAGMENT_VERDICT_TTL_NS, FragmentKey, FragmentVerdict};
+use honk_ebpf_common::conn::{FragmentKey, FragmentVerdict};
 
 const PORT_FIRST: u16 = 40000;
+/// The documented fragment record lifetime, not imported from production.
+const FRAGMENT_TTL_NS: u64 = 30_000_000_000;
 
 /// One fragment of a UDP datagram. The first fragment carries the UDP header and MF;
 /// a later fragment is the bare second 8-byte block.
@@ -195,13 +197,60 @@ fn later_fragments_of_a_redirected_or_dropped_datagram_are_dropped() {
     });
 }
 
+/// IPv6 Fragment -> Destination Options -> UDP: only the first fragment reaches
+/// UDP, so its parsed protocol differs from the later fragments' (Destination
+/// Options). Reassembly keys on source, destination and identification alone.
+fn fragment_behind_destination_options(src: IpAddr, dst: IpAddr, id: u32, first: bool) -> Vec<u8> {
+    const FRAGMENT_NEXT_HEADER: usize = 14 + 40;
+    const FRAGMENT_END: usize = FRAGMENT_NEXT_HEADER + 8;
+    const DESTINATION_OPTIONS: u8 = 60;
+    let mut frame = fragment(src, dst, 443, id, first);
+    frame[FRAGMENT_NEXT_HEADER] = DESTINATION_OPTIONS;
+    if first {
+        frame.splice(
+            FRAGMENT_END..FRAGMENT_END,
+            [IPPROTO_UDP, 0, 1, 4, 0, 0, 0, 0],
+        );
+        let payload_len = (frame.len() - 54) as u16;
+        frame[18..20].copy_from_slice(&payload_len.to_be_bytes());
+    }
+    frame
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn later_fragments_behind_ipv6_extension_headers_inherit_the_first_fragments_fate() {
+    isolated(|| {
+        let (src, _, dst) = families()[1];
+        let side = "lan_ingress_l2";
+        let (backend, _listeners) = fixture("block", side);
+        assert_eq!(
+            verdict(
+                &backend,
+                side,
+                &fragment_behind_destination_options(src, dst, 0x5000, true)
+            ),
+            TC_ACT_SHOT
+        );
+        assert_eq!(
+            verdict(
+                &backend,
+                side,
+                &fragment_behind_destination_options(src, dst, 0x5000, false)
+            ),
+            TC_ACT_SHOT,
+            "the tail must be dropped with its first fragment"
+        );
+    });
+}
+
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
     isolated(|| {
         // A fresh VM may have less uptime than the record TTL. Wait once for a
         // genuine old monotonic timestamp, rather than wrapping the backdated age.
-        let wait_ns = (FRAGMENT_VERDICT_TTL_NS + 2_000_000_000).saturating_sub(monotonic_ns());
+        let wait_ns = (FRAGMENT_TTL_NS + 2_000_000_000).saturating_sub(monotonic_ns());
         if wait_ns != 0 {
             std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
         }
@@ -223,7 +272,7 @@ fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
         let keys: Vec<_> = map.keys().map(Result::unwrap).collect();
         assert_eq!(keys.len(), 1);
         let mut aged = map.get(&keys[0], 0).unwrap();
-        aged.ktime_ns = monotonic_ns() - FRAGMENT_VERDICT_TTL_NS - 1_000_000_000;
+        aged.ktime_ns = monotonic_ns() - FRAGMENT_TTL_NS - 1_000_000_000;
         map.insert(keys[0], aged, 0).unwrap();
         assert_eq!(verdict(&backend, "lan_ingress_l2", &later), TC_ACT_OK);
     });

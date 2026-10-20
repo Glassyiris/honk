@@ -16,7 +16,12 @@ fn key(pkt: &ParsedPacket) -> FragmentKey {
     key.src_ip = pkt.tuples.five.src_ip;
     key.dst_ip = pkt.tuples.five.dst_ip;
     key.id = pkt.frag_id;
-    key.l4proto = pkt.tuples.five.l4proto;
+    // RFC 8200 reassembles on source, destination and identification alone. A
+    // later fragment stops at the Fragment header, so after extension headers
+    // its parsed protocol differs from the first fragment's.
+    if key.src_ip.is_v4_mapped() {
+        key.l4proto = pkt.tuples.five.l4proto;
+    }
     key
 }
 
