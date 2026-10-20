@@ -173,7 +173,192 @@ Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
 
-## Results (2026-10-11, current honk / upstream dae / sing-box A/B/C)
+## Results (2026-10-20, x86 local-fixture A/B/C)
+
+The canonical `.70` server host was unavailable for this campaign: its SSH
+endpoint refused the lab key and every protocol and target port was closed.
+To measure the merged `bench` tree rather than reuse an older binary, the
+server fixture was moved into a `labsrv` netns on the engine host using the
+documented fallback. **This is a different topology**: client, engine and
+server share one 4-vCPU / 2-GiB host. The direct control is a host memory path
+(75–80 Gbps for the eBPF engines), not the `.70` 9.4 Gbps LAN ceiling, and
+every proxy row is CPU/scheduler-bound. Absolute Mbps, CPU and tails are not
+comparable with the 2026-10-11 section; use same-host cross-engine deltas and
+the older `.70` section for WAN behaviour. The fixture scripts, configs and
+raw evidence are under
+[`abc-2026-10-20-x86-local`](../bench/results/abc-2026-10-20-x86-local/) and
+the local setup is described in [`bench/README.md`](../bench/README.md).
+
+| Engine | Measured revision / build | Executable SHA-256 prefix |
+| --- | --- | --- |
+| honk | `5d29dba6` (merge of `e936d022`), release/opt-s, static musl | `02453300bc55a4f3` |
+| dae | [v2.1.1](https://github.com/daeuniverse/dae/releases/tag/v2.1.1), `dbae2e82`, official generic x86-64 | `a217bf5edf5a5cac` |
+| sing-box | [v1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3), `7054cac5`, official amd64 | `768d31fa7f68debc` |
+
+honk includes `ebpf,native-api,clash-api,mimalloc,rprx`; the native listener is
+unconfigured, so this is not an active native-observation/UI overhead test.
+The server fixture is sing-box 1.14.3 (HY2, TUIC/cubic, SS2022, Trojan,
+AnyTLS), official anytls-go 0.0.13, iperf3 3.21, a 1,024-byte HTTP body and
+the same six-port routing contract as the 2026-10-11 campaign. SS2022
+timestamp validation was not weakened; client and server share the host clock.
+The harness's stale `daens` cleanup guard was the only driver change; benchmark
+and collector logic are otherwise the hash-pinned versions in
+[metadata](../bench/results/abc-2026-10-20-x86-local/metadata.json).
+All 18 proxy routes were observed on the server-side wire while the matching
+HTTP request ran (HY2/TUIC over UDP/QUIC, the other four over TCP); see
+[attribution.txt](../bench/results/abc-2026-10-20-x86-local/attribution.txt).
+The sing-box server log retains client-cancellation and cold-TLS-handshake
+errors; those are rejected/killed fixture connections, not arm failures.
+
+### TCP throughput, process CPU and RSS
+
+Three 8-second reverse runs per route; median receiver Mbps and that run's
+process CPU, followed by integer RSS MiB. Process CPU excludes kernel/eBPF,
+softirq and target costs; the direct eBPF rows therefore read `0.00`, while
+sing-box's TUN client is a userspace path and reads `1.06`.
+
+| Protocol | honk Mbps / process cores / MiB | dae Mbps / process cores / MiB | sing-box Mbps / process cores / MiB |
+| --- | --- | --- | --- |
+| direct | 74819 / 0.00 / 57 | 80356 / 0.00 / 49 | 29515 / 1.06 / 88 |
+| hy2 | 8394 / 0.67 / 62 | 6778 / 1.01 / 71 | 5705 / 1.11 / 92 |
+| tuic | 10122 / 0.82 / 59 | 6671 / 1.00 / 65 | 6705 / 1.25 / 92 |
+| ss2022 | 27411 / 0.76 / 61 | 22068 / 0.76 / 60 | 23579 / 1.22 / 91 |
+| trojan | 23551 / 0.78 / 61 | 16281 / 0.67 / 63 | 18036 / 1.40 / 96 |
+| anytls-sb | 20050 / 0.87 / 68 | 19232 / 0.44 / 65 | 19236 / 1.36 / 96 |
+| anytls-go | 19593 / 0.88 / 62 | 17567 / 0.42 / 61 | 17669 / 1.44 / 95 |
+
+honk wins every proxy TCP row in this CPU-bound fixture. Against dae it is
++23.8% HY2, +51.7% TUIC, +24.2% SS2022, +44.7% Trojan, +4.3% AnyTLS-SB and
++11.5% AnyTLS-Go. Its process CPU is lower on HY2/TUIC/SS2022, 16% higher on Trojan,
+and roughly twice as high on both AnyTLS routes. Normalised to
+Mbps per process core, honk is +86.7%/+85.0%/+24.2%/+24.3% versus dae on
+HY2/TUIC/SS2022/Trojan, but **−47.3%/−46.8% on AnyTLS-SB/AnyTLS-Go**. Against
+sing-box, honk is +62.9% to +143.8% more efficient on every row. The AnyTLS CPU
+direction reproduces the `.70` campaign (honk 0.40/0.44 vs dae 0.22/0.24
+cores), so it is not a local-fixture artifact. Direct is 6.9% below dae; that
+is the eBPF direct path, not a proxy result.
+
+The HY2/TUIC throughput order is the reverse of the `.70` campaign
+(honk 3135/3561 vs dae 3762/3306 Mbps there). Removing the LAN ceiling makes
+CPU the bottleneck here; these rows do not establish a WAN improvement.
+
+### First request and unloaded hot latency
+
+Cold means the first request after daemon readiness, not a guaranteed cold
+physical carrier. Hot p50/p95 use 15 successful requests and include the full
+HTTP body.
+
+| Protocol | honk cold / hot p50 / hot p95 (ms) | dae cold / hot p50 / hot p95 (ms) | sing-box cold / hot p50 / hot p95 (ms) |
+| --- | --- | --- | --- |
+| direct | 0.604 / - / - | 0.431 / - / - | 0.658 / - / - |
+| hy2 | 1.397 / 0.641 / 1.731 | 4.342 / 0.538 / 0.715 | 3.557 / 0.576 / 0.676 |
+| tuic | 1.279 / 0.722 / 1.399 | 4.269 / 0.580 / 0.696 | 6.142 / 0.581 / 0.960 |
+| ss2022 | 1.001 / 0.492 / 1.121 | 0.988 / 0.569 / 0.766 | 2.579 / 0.524 / 0.664 |
+| trojan | 2.097 / 0.349 / 1.590 | 2.978 / 1.526 / 1.791 | 3.381 / 1.596 / 2.124 |
+| anytls-sb | 0.945 / 0.536 / 0.850 | 2.527 / 0.485 / 0.581 | 2.357 / 0.523 / 0.646 |
+| anytls-go | 3.136 / 0.547 / 0.737 | 2.119 / 0.539 / 0.616 | 2.955 / 0.557 / 0.696 |
+
+honk's cold medians are lower than dae's on four routes and lower than
+sing-box's on five. Its hot p95 is nevertheless higher than dae's on HY2,
+TUIC, SS2022, AnyTLS-SB and AnyTLS-Go; Trojan is the exception. The hot-open
+path, not daemon startup, is the latency weak spot in this fixture. There is
+no universal latency win: AnyTLS-Go cold is worse than dae, and dae's HY2/TUIC
+hot p95 is below one millisecond.
+
+### UDP saturation
+
+RTT is the median of 15 echo attempts. Bandwidth is one 8-second reverse run
+with a 10 Gbps offer and 1,200-byte datagrams. Loss is iperf's receiver report,
+not a normal-load reliability claim; the sender rate can be below the offer
+and remains in the raw JSON.
+
+| Protocol | honk RTT ms / Mbps (loss) / process cores | dae RTT ms / Mbps (loss) / process cores | sing-box RTT ms / Mbps (loss) / process cores |
+| --- | --- | --- | --- |
+| hy2 | 0.060 / 950(90.3%) / 0.67 | 0.068 / 1038(89.6%) / 0.73 | 0.077 / 818(80.3%) / 1.08 |
+| tuic | 0.070 / 885(90.8%) / 0.64 | 0.074 / 1119(88.5%) / 0.76 | 0.074 / 803(91.9%) / 1.22 |
+| ss2022 | 0.038 / 1610(80.9%) / 0.67 | 0.053 / 1774(79.4%) / 0.88 | 0.046 / 1411(83.6%) / 0.72 |
+| trojan | 0.036 / 1733(82.0%) / 0.71 | 0.040 / 2378(72.6%) / 0.96 | 0.050 / 2409(74.7%) / 1.22 |
+| anytls-sb | 0.046 / 975(90.0%) / 0.45 | 0.058 / 948(89.9%) / 0.23 | 0.060 / 887(91.0%) / 0.78 |
+| anytls-go | 0.044 / 1235(87.2%) / 0.55 | 0.101 / 1225(86.9%) / 0.26 | 0.064 / 1053(89.4%) / 0.91 |
+
+honk's UDP RTT is lower than dae's on every route. At saturation it trails
+dae on HY2/TUIC/SS2022/Trojan (by 8.5%/20.9%/9.2%/27.1%) and slightly leads on
+both AnyTLS routes; loss is high everywhere because the offer exceeds what
+this shared host can carry. The same direction appeared in the `.70` campaign
+for TUIC/SS2022/Trojan, so it is not only a local-fixture effect, but neither
+run is a normal-traffic packet-loss or statistical superiority claim.
+
+### Loaded latency and retained failures
+
+200 absolute 250 ms deadlines per route while one same-route reverse stream
+loads it; 5 s HTTP timeout. Percentiles and maxima are success-only; failures
+stay in the 200-attempt denominator. Compare tails with achieved pressure.
+honk recorded 0/200 failures on all seven routes; dae recorded 9/4200
+(8 AnyTLS-SB, 1 SS2022); sing-box recorded 0/4200.
+
+| Engine | Protocol | Load Mbps | p50 ms | p95 ms | p99 ms | Max ms | Failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 75098 | 0.651 | 1.144 | 1.908 | 3.427 | 0/200 |
+| honk | hy2 | 6971 | 1.162 | 2.022 | 2.574 | 3.566 | 0/200 |
+| honk | tuic | 9960 | 2.354 | 6.860 | 11.876 | 13.510 | 0/200 |
+| honk | ss2022 | 27344 | 2.235 | 5.097 | 12.185 | 16.800 | 0/200 |
+| honk | trojan | 21857 | 1.274 | 3.758 | 8.835 | 11.826 | 0/200 |
+| honk | anytls-sb | 19343 | 1.648 | 12.578 | 16.618 | 17.100 | 0/200 |
+| honk | anytls-go | 17782 | 1.575 | 8.546 | 15.335 | 17.373 | 0/200 |
+| dae | direct | 79643 | 0.638 | 0.862 | 1.531 | 2.284 | 0/200 |
+| dae | hy2 | 6309 | 1.371 | 2.137 | 2.624 | 3.114 | 0/200 |
+| dae | tuic | 6728 | 1.389 | 1.949 | 2.364 | 2.947 | 0/200 |
+| dae | ss2022 | 22580 | 1.834 | 11.303 | 24.670 | 25.002 | 1/200 |
+| dae | trojan | 16233 | 3.498 | 15.834 | 25.935 | 32.078 | 0/200 |
+| dae | anytls-sb | 19344 | 1.355 | 14.149 | 19.546 | 25.147 | 8/200 |
+| dae | anytls-go | 17934 | 1.180 | 11.657 | 17.900 | 19.101 | 0/200 |
+| sing-box | direct | 26707 | 2.153 | 4.057 | 4.967 | 6.716 | 0/200 |
+| sing-box | hy2 | 5863 | 1.438 | 2.386 | 6.554 | 9.165 | 0/200 |
+| sing-box | tuic | 6631 | 1.586 | 2.782 | 3.516 | 3.759 | 0/200 |
+| sing-box | ss2022 | 22757 | 3.368 | 7.392 | 10.090 | 14.190 | 0/200 |
+| sing-box | trojan | 17679 | 5.389 | 11.604 | 17.933 | 21.745 | 0/200 |
+| sing-box | anytls-sb | 18791 | 1.841 | 4.783 | 10.199 | 15.555 | 0/200 |
+| sing-box | anytls-go | 17314 | 1.832 | 5.332 | 8.357 | 18.252 | 0/200 |
+
+honk's TUIC row carries 48% more pressure than dae's (9,960 vs 6,728 Mbps),
+so its 6.860 ms p95 is a capacity-edge result, not an equal-load comparison.
+Its HY2/SS2022/Trojan tails are better than dae's; its AnyTLS tails are far
+better than dae's AnyTLS-SB failure arm but worse than sing-box's at similar
+load (12.578/8.546 vs 4.783/5.332 ms p95). The AnyTLS writer/stream path is
+therefore the clearest tail weak spot, and a rate-limited rerun is needed
+before calling the TUIC tail a protocol defect.
+
+### Weak spots and follow-ups
+
+| Finding | Evidence | Candidate cost and next experiment |
+| --- | --- | --- |
+| AnyTLS engine CPU | 0.87/0.88 cores vs dae 0.44/0.42 at +4.3%/+11.5% throughput; −47% Mbps/core. Reproduced at `.70`. | Per-frame inbound allocation in `read_frame_body` (`crates/honk-outbound/src/proxy/anytls/mod.rs:1837`), the relay copy in `AnyTlsStream::poll_read` (`.../inbound.rs:672`), and the two-copy upload path (`.../mod.rs:1612` plus writer batching). Profile with symbols, then gate a buffer-pool/owned-`Bytes` handoff on CPU and p95, not throughput alone. |
+| AnyTLS loaded tail | p95 12.578/8.546 ms at 19,343/17,782 Mbps vs sing-box 4.783/5.332 ms at similar load; dae 14.149/11.657 ms with 8 failures. | Same AnyTLS path. Re-run at equal load; accept a fix only if it lowers p95 without moving the median or CPU in the wrong direction. |
+| TUIC loaded tail | p95 6.860 ms at 9,960 Mbps vs dae 1.949 ms at 6,728 Mbps. | The collector always starts an uncapped reverse stream. Add an optional `LOAD_BPS` cap and compare at dae's pressure; then investigate QUIC stream scheduling only if the tail persists. |
+| UDP saturation | Trails dae on HY2/TUIC/SS2022/Trojan at this fixture and in the `.70` campaign. | Use the controlled 1% loss / 65 ms RTT lab before changing shared-source UDP; profile the per-packet lookup/permit path rather than tuning on the 80–90% saturation-loss numbers. |
+| Size-oriented codegen | `opt-level = "s"` in `Cargo.toml:151` applies to the measured release binary. | Build an `opt-level = 3` candidate and A/B it on HY2/AnyTLS with the existing gates (≥3% throughput or ≥10% CPU). BoringSSL's C++ is built separately, so only Rust framing/relay/dispatch is in scope. Compile for correctness. |
+
+The AnyTLS rows are the one place where honk's extra throughput does not buy
+efficiency: it is faster than dae but spends roughly twice the engine CPU to
+get there. The two-copy upload path is not on the reverse-download measurement
+by itself; the inbound allocation/copy is. Treat these as profiled candidates,
+not an established root cause.
+
+### Evidence and verification scope
+
+[Complete campaign evidence](../bench/results/abc-2026-10-20-x86-local/)
+retains stdout/stderr, both TSVs, 63 TCP and 18 UDP JSON files, all 4,200
+loaded attempts, per-route summaries and engine logs, the frozen client/server
+configs and fixture scripts, binary hashes, host telemetry, route attribution
+and cleanup receipts. The fixture was removed after the run; `.49` has no
+benchmark engine, `labsrv`, `dae0` or `daens` left, and the lab netns was
+rebuilt. Build (`just build-musl 'ebpf,native-api,clash-api,mimalloc,rprx'`),
+`bash -n bench/lab-bench.sh`, the five collector tests and all 18 route
+attributions passed. Full workspace tests, `test-routing`, `test-netns`, the
+ARM benchmark and an active native API/UI were not run for this campaign. No
+production-gateway changes.
+
+## Results (2026-10-11, honk / upstream dae / sing-box A/B/C)
 
 One sequential x86 campaign on `.49`, **2026-10-10 19:54:28–20:34:38 UTC**
 (2026-10-11 03:54–04:34 UTC+8). This is the full six-protocol matrix plus

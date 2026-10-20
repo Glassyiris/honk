@@ -97,6 +97,31 @@ three binary SHA-256 identities on stderr.
 - `latency_stability.py` must be beside the driver unless
   `STABILITY_COLLECTOR` names another path.
 
+## Local fixture fallback (`10.10.10.70` unavailable)
+
+When the canonical `.70` server host is down, the same harness can run against
+a server fixture in a `labsrv` netns on the engine host. The frozen setup,
+server config, target fixture and client configs for the 2026-10-20 campaign
+are under
+[`results/abc-2026-10-20-x86-local/`](results/abc-2026-10-20-x86-local/);
+`fixture/setup-local-lab.sh` creates `veth-srv`/`labsrv`, starts sing-box
+1.14.3, anytls-go 0.0.13, the HTTP/UDP/DNS targets and the iperf3 servers.
+Point the driver at the fixture with `T=192.168.223.2` and the archived
+`honk-local.dae`, `dae-local.dae` and `sb-client-local.json`.
+
+This is a different topology: client, engine and server share the engine host,
+so the direct control is a host memory path (about 75–80 Gbps for the eBPF
+engines) and proxy rows are CPU/scheduler-bound. Do not compare its absolute
+Mbps, CPU or tails with `.70` campaigns; publish it as a separate campaign and
+keep the `.70` section as the WAN reference. SS2022 needs no clock preflight
+because both ends share the host clock, but timestamp validation must stay on.
+
+A hard-killed dae can leave stacked `nsfs` mounts at `/run/netns/daens`;
+`ip netns del` removes at most one layer, and the next dae start fails with
+`EEXIST`. The harness now unmounts the stack and removes the placeholder before
+declaring cleanup complete. This guard is the reason the 2026-10-20 driver hash
+differs from the 2026-10-11 hash; measurement code is unchanged.
+
 ## Paired runtime-memory measurements
 
 `runtime-memory.sh` compares two honk binaries on the engine host. It alternates

@@ -1,0 +1,80 @@
+{
+  "campaign": {
+    "result": "passed",
+    "exit_status": 0,
+    "started_at": "2026-10-20T15:45:57Z",
+    "ended_at": "2026-10-20T16:26:35Z",
+    "stdout": "campaign.stdout",
+    "stderr": "campaign.stderr",
+    "raw_tcp_json": 63,
+    "raw_udp_json": 18,
+    "loaded_routes": 21,
+    "loaded_attempts": 4200,
+    "loaded_failures": 9,
+    "loaded_failure_detail": {
+      "honk": 0,
+      "dae": 9,
+      "sing-box": 0
+    }
+  },
+  "build": {
+    "command": "just build-musl 'ebpf,native-api,clash-api,mimalloc,rprx'",
+    "result": "passed",
+    "binary_sha256": "02453300bc55a4f3280500f3d1b8694013b4759f9384925a4634a98abe512924",
+    "target": "x86_64-unknown-linux-musl",
+    "notes": [
+      "static musl binary",
+      "eBPF object embedded",
+      "two boring-sys library-directory warnings"
+    ]
+  },
+  "harness": {
+    "syntax": "bash -n bench/lab-bench.sh",
+    "result": "passed",
+    "change": "stale daens nsfs stack cleanup before dae start",
+    "hash": "dbce07cfa8e9f26bf8a92b43b27567cfea86304826c8eb5904e26f0cc0e341fa"
+  },
+  "collector": {
+    "command": "python3 bench/tests/latency_stability_test.py",
+    "result": "passed",
+    "tests": 5
+  },
+  "route_attribution": {
+    "result": "passed",
+    "routes": 18,
+    "udp_carried": [
+      "hy2",
+      "tuic"
+    ],
+    "tcp_carried": [
+      "ss2022",
+      "trojan",
+      "anytls-sb",
+      "anytls-go"
+    ],
+    "evidence": "attribution.txt"
+  },
+  "fixture_cleanup": {
+    "result": "passed",
+    "evidence": "cleanup.txt",
+    "checks": [
+      "no benchmark engine",
+      "no labsrv netns",
+      "no dae0",
+      "no daens",
+      "no fixture ports",
+      "lab netns rebuilt"
+    ]
+  },
+  "server_log_noise": {
+    "result": "retained, not arm failures",
+    "detail": "sing-box server log contains client-cancellation and cold-TLS-handshake errors from rejected/killed fixture connections"
+  },
+  "not_run": [
+    "full workspace suite",
+    "just test-routing",
+    "just test-netns",
+    "ARM benchmark",
+    "active native API/UI"
+  ]
+}

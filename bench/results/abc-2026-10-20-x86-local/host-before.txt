@@ -1,0 +1,18 @@
+campaign=abc-2026-10-20-x86-local
+Tue Oct 20 15:45:57 UTC 2026
+Linux archlinux 7.2.3-arch1-3 #1 SMP PREEMPT_DYNAMIC Sun, 06 Sep 2026 13:01:04 +0000 x86_64 GNU/Linux
+ 15:45:57 up 42 days, 22:48,  3 users,  load average: 0.74, 0.83, 0.59
+               total        used        free      shared  buff/cache   available
+Mem:            1952         881         660           0         679        1070
+Swap:           2039         858        1181
+4
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens3             UP             10.10.10.49/24 192.0.2.55/32 240e:3b6:32b0:b5d0:2a0:98ff:fe04:2a4b/64 fd00:abab::2a0:98ff:fe04:2a4b/64 fe80::2a0:98ff:fe04:2a4b/64 
+tailscale0       UNKNOWN        100.116.246.19/32 fd7a:115c:a1e0::bb32:f614/128 fe80::ede:7220:ecaa:d2d7/64 
+gre0@NONE        DOWN           
+gretap0@NONE     DOWN           
+erspan0@NONE     DOWN           
+veth-srv@if1458  UP             192.168.223.1/24 fe80::2064:d8ff:feb2:defa/64 
+veth-lab@if1510  UP             192.168.222.1/24 fe80::ecb6:8aff:fe84:88f8/64 
+lab (id: 26)
+labsrv (id: 25)

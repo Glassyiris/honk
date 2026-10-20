@@ -1,0 +1,123 @@
+[31mERROR[0m[0140] [[38;5;184m3665688232[0m 2.0s] connection: connection download closed: stream 20 canceled by remote with error code 0
+[31mERROR[0m[0140] [[38;5;167m3247121815[0m 2.0s] connection: connection download closed: stream 16 canceled by remote with error code 0
+[31mERROR[0m[0179] [[38;5;45m2880431389[0m 38.79s] connection: connection download closed: stream 24 canceled by remote with error code 0
+[31mERROR[0m[0193] [[38;5;37m2839459861[0m 2.0s] connection: connection download closed: stream 12 canceled by remote with error code 0
+[31mERROR[0m[0193] [[38;5;118m3047452774[0m 2.0s] connection: connection download closed: stream 16 canceled by remote with error code 0
+[31mERROR[0m[0195] [[38;5;131m3189807219[0m 2.0s] connection: connection download closed: stream 20 canceled by remote with error code 0
+[31mERROR[0m[0389] [[38;5;194m3708081148[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:36208: TLS handshake: EOF
+[31mERROR[0m[0389] [[38;5;43m157924891[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:36200: TLS handshake: EOF
+[31mERROR[0m[0396] [[38;5;193m4168871974[0m 3.11s] inbound/trojan[trojan]: process connection from 192.168.223.1:36224: TLS handshake: EOF
+[31mERROR[0m[0402] [[38;5;191m1442049023[0m 2.4s] connection: connection download closed: stream 20 canceled by remote with error code 0
+[31mERROR[0m[0404] [[38;5;195m1947662372[0m 5.30s] inbound/trojan[trojan]: process connection from 192.168.223.1:58770: TLS handshake: EOF
+[31mERROR[0m[0404] [[38;5;135m1446961271[0m 5.30s] inbound/trojan[trojan]: process connection from 192.168.223.1:58762: TLS handshake: EOF
+[31mERROR[0m[0411] [[38;5;188m989593516[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:48698: TLS handshake: EOF
+[31mERROR[0m[0417] [[38;5;123m3794179947[0m 2.4s] connection: connection download closed: stream 16 canceled by remote with error code 0
+[31mERROR[0m[0419] [[38;5;230m3176439297[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:48730: TLS handshake: EOF
+[31mERROR[0m[0419] [[38;5;220m444867788[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:48760: TLS handshake: EOF
+[31mERROR[0m[0426] [[38;5;119m255931239[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:40380: TLS handshake: EOF
+[31mERROR[0m[0426] [[38;5;202m247258298[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:40356: TLS handshake: EOF
+[31mERROR[0m[0435] [[38;5;154m1567277194[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:35074: TLS handshake: EOF
+[31mERROR[0m[0435] [[38;5;195m951893796[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:35088: TLS handshake: EOF
+[31mERROR[0m[0441] [[38;5;108m2406964060[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:40284: TLS handshake: EOF
+[31mERROR[0m[0456] [[38;5;99m2549859667[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:54352: TLS handshake: EOF
+[31mERROR[0m[0456] [[38;5;84m3885739411[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:54340: TLS handshake: EOF
+[31mERROR[0m[0465] [[38;5;228m3728289236[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:59036: TLS handshake: EOF
+[31mERROR[0m[0465] [[38;5;231m1908274944[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:59060: TLS handshake: EOF
+[31mERROR[0m[0471] [[38;5;215m1736070855[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:39588: TLS handshake: EOF
+[31mERROR[0m[0471] [[38;5;115m2642834019[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:39606: TLS handshake: EOF
+[31mERROR[0m[0480] [[38;5;229m4179282901[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:39652: TLS handshake: EOF
+[31mERROR[0m[0480] [[38;5;192m2338450942[0m 5.31s] inbound/trojan[trojan]: process connection from 192.168.223.1:39628: TLS handshake: EOF
+[31mERROR[0m[0654] [[38;5;153m184528265[0m 2.0s] connection: connection download closed: stream 20 canceled by remote with error code 0
+[31mERROR[0m[0670] [[38;5;188m1332565291[0m 2.0s] connection: connection download closed: stream 16 canceled by remote with error code 0
+[31mERROR[0m[0809] [[38;5;64m766516272[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:52100: TLS handshake: context deadline exceeded
+[31mERROR[0m[0809] [[38;5;97m882473041[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:52104: TLS handshake: context deadline exceeded
+[31mERROR[0m[0829] [[38;5;123m3136819052[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:42346: TLS handshake: context deadline exceeded
+[31mERROR[0m[0849] [[38;5;204m3189915324[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:58170: TLS handshake: context deadline exceeded
+[31mERROR[0m[0869] [[38;5;220m2672476939[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:55894: TLS handshake: context deadline exceeded
+[31mERROR[0m[0876] [[38;5;107m3371811931[0m 2.21s] inbound/trojan[trojan]: process connection from 192.168.223.1:50342: TLS handshake: EOF
+[31mERROR[0m[0883] [[38;5;150m1498656390[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:49766: TLS handshake: EOF
+[31mERROR[0m[0883] [[38;5;165m3079875221[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:49772: TLS handshake: EOF
+[31mERROR[0m[0889] [[38;5;187m1218392108[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:42794: TLS handshake: EOF
+[31mERROR[0m[0889] [[38;5;100m285939540[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:42806: TLS handshake: EOF
+[31mERROR[0m[0896] [[38;5;41m1712600816[0m 3.20s] inbound/trojan[trojan]: process connection from 192.168.223.1:42858: TLS handshake: EOF
+[31mERROR[0m[0896] [[38;5;144m344140160[0m 3.20s] inbound/trojan[trojan]: process connection from 192.168.223.1:42854: TLS handshake: EOF
+[31mERROR[0m[0908] [[38;5;35m1586522131[0m 8.4s] connection: connection download closed: stream 76 canceled by remote with error code 0
+[31mERROR[0m[0914] [[38;5;191m71653119[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:34934: TLS handshake: context deadline exceeded
+[31mERROR[0m[0916] [[38;5;186m3605329322[0m 8.4s] connection: connection download closed: stream 88 canceled by remote with error code 0
+[31mERROR[0m[0924] [[38;5;153m516389966[0m 8.4s] connection: connection download closed: stream 96 canceled by remote with error code 0
+[31mERROR[0m[0934] [[38;5;36m2671303403[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:49582: TLS handshake: context deadline exceeded
+[31mERROR[0m[0954] [[38;5;228m1103657475[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:35042: TLS handshake: context deadline exceeded
+[31mERROR[0m[0974] [[38;5;68m200157492[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:46852: TLS handshake: context deadline exceeded
+[31mERROR[0m[0981] [[38;5;44m3913866780[0m 57.4s] connection: connection download closed: stream 104 canceled by remote with error code 0
+[31mERROR[0m[0990] [[38;5;168m3748849304[0m 10.48s] inbound/trojan[trojan]: process connection from 192.168.223.1:42028: TLS handshake: EOF
+[31mERROR[0m[0996] [[38;5;139m3260776315[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:33262: TLS handshake: EOF
+[31mERROR[0m[1003] [[38;5;154m3352594253[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:60880: TLS handshake: EOF
+[31mERROR[0m[1009] [[38;5;226m1580512476[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:41440: TLS handshake: EOF
+[31mERROR[0m[1009] [[38;5;78m1557347646[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:41462: TLS handshake: EOF
+[31mERROR[0m[1022] [[38;5;227m2596586715[0m 8.4s] connection: connection download closed: stream 68 canceled by remote with error code 0
+[31mERROR[0m[1028] [[38;5;78m3951980350[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:41478: TLS handshake: context deadline exceeded
+[31mERROR[0m[1028] [[38;5;170m3787804826[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:41490: TLS handshake: context deadline exceeded
+[31mERROR[0m[1030] [[38;5;185m2846347177[0m 8.4s] connection: connection download closed: stream 80 canceled by remote with error code 0
+[31mERROR[0m[1038] [[38;5;117m535481957[0m 8.4s] connection: connection download closed: stream 88 canceled by remote with error code 0
+[31mERROR[0m[1048] [[38;5;199m2962983863[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:36138: TLS handshake: context deadline exceeded
+[31mERROR[0m[1068] [[38;5;150m3758707334[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:45622: TLS handshake: context deadline exceeded
+[31mERROR[0m[1088] [[38;5;134m2153368438[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:54308: TLS handshake: context deadline exceeded
+[31mERROR[0m[1095] [[38;5;200m2089995704[0m 57.4s] connection: connection download closed: stream 96 canceled by remote with error code 0
+[31mERROR[0m[1103] [[38;5;158m2779910217[0m 10.51s] inbound/trojan[trojan]: process connection from 192.168.223.1:43786: TLS handshake: EOF
+[31mERROR[0m[1110] [[38;5;74m1335734074[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:46412: TLS handshake: EOF
+[31mERROR[0m[1116] [[38;5;43m1905199346[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:46428: TLS handshake: EOF
+[31mERROR[0m[1123] [[38;5;220m1030223564[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:48246: TLS handshake: EOF
+[31mERROR[0m[1123] [[38;5;139m844033147[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:48274: TLS handshake: EOF
+[31mERROR[0m[1141] [[38;5;192m68048048[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:35560: TLS handshake: context deadline exceeded
+[31mERROR[0m[1141] [[38;5;148m1812666244[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:35552: TLS handshake: context deadline exceeded
+[31mERROR[0m[1161] [[38;5;189m2770612653[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:47052: TLS handshake: context deadline exceeded
+[31mERROR[0m[1181] [[38;5;167m3409532311[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:38362: TLS handshake: context deadline exceeded
+[31mERROR[0m[1201] [[38;5;228m287076820[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:51978: TLS handshake: context deadline exceeded
+[31mERROR[0m[1217] [[38;5;41m2641874457[0m 10.62s] inbound/trojan[trojan]: process connection from 192.168.223.1:53910: TLS handshake: EOF
+[31mERROR[0m[1285] [[38;5;33m2463912936[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:46226: TLS handshake: context deadline exceeded
+[31mERROR[0m[1330] [[38;5;158m322148681[0m 534ms] inbound/trojan[trojan]: process connection from 192.168.223.1:57458: TLS handshake: EOF
+[31mERROR[0m[1337] [[38;5;50m1580153890[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:57486: TLS handshake: EOF
+[31mERROR[0m[1337] [[38;5;222m4127071200[0m 3.11s] inbound/trojan[trojan]: process connection from 192.168.223.1:57472: TLS handshake: EOF
+[31mERROR[0m[1343] [[38;5;150m3035142278[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:41606: TLS handshake: EOF
+[31mERROR[0m[1350] [[38;5;156m2300369995[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:59912: TLS handshake: EOF
+[31mERROR[0m[1368] [[38;5;155m3569878092[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:59954: TLS handshake: context deadline exceeded
+[31mERROR[0m[1388] [[38;5;109m4276831581[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:60612: TLS handshake: context deadline exceeded
+[31mERROR[0m[1408] [[38;5;223m133326287[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:39184: TLS handshake: context deadline exceeded
+[31mERROR[0m[1428] [[38;5;176m4185630624[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:37148: TLS handshake: context deadline exceeded
+[31mERROR[0m[1443] [[38;5;71m757854519[0m 10.52s] inbound/trojan[trojan]: process connection from 192.168.223.1:53264: TLS handshake: EOF
+[31mERROR[0m[1450] [[38;5;221m3083431434[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:32838: TLS handshake: EOF
+[31mERROR[0m[1456] [[38;5;155m1938291595[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:32904: TLS handshake: EOF
+[31mERROR[0m[1456] [[38;5;148m753729412[0m 3.10s] inbound/trojan[trojan]: process connection from 192.168.223.1:32884: TLS handshake: EOF
+[31mERROR[0m[1463] [[38;5;139m2677452411[0m 3.11s] inbound/trojan[trojan]: process connection from 192.168.223.1:53154: TLS handshake: EOF
+[31mERROR[0m[1481] [[38;5;219m3755800267[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:44356: TLS handshake: context deadline exceeded
+[31mERROR[0m[1481] [[38;5;131m1147768947[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:44348: TLS handshake: context deadline exceeded
+[31mERROR[0m[1501] [[38;5;230m3005260246[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:37658: TLS handshake: context deadline exceeded
+[31mERROR[0m[1521] [[38;5;204m2352284860[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:56460: TLS handshake: context deadline exceeded
+[31mERROR[0m[1541] [[38;5;165m1868366485[0m 15.0s] inbound/trojan[trojan]: process connection from 192.168.223.1:51130: TLS handshake: context deadline exceeded
+[31mERROR[0m[1557] [[38;5;227m1615133907[0m 10.53s] inbound/trojan[trojan]: process connection from 192.168.223.1:49704: TLS handshake: EOF
+[31mERROR[0m[1682] [[38;5;155m1237927819[0m 8.0s] connection: connection download closed: stream 72 canceled by remote with error code 0
+[31mERROR[0m[1691] [[38;5;225m1799092945[0m 8.0s] connection: connection download closed: stream 80 canceled by remote with error code 0
+[31mERROR[0m[1699] [[38;5;121m1425934958[0m 8.0s] connection: connection download closed: stream 88 canceled by remote with error code 0
+[31mERROR[0m[1756] [[38;5;172m723096476[0m 57.0s] connection: connection download closed: stream 96 canceled by remote with error code 0
+[31mERROR[0m[1797] [[38;5;31m1131085071[0m 8.0s] connection: connection download closed: stream 68 canceled by remote with error code 0
+[31mERROR[0m[1805] [[38;5;227m1766545627[0m 8.0s] connection: connection download closed: stream 76 canceled by remote with error code 0
+[31mERROR[0m[1813] [[38;5;104m2341109848[0m 8.0s] connection: connection download closed: stream 84 canceled by remote with error code 0
+[31mERROR[0m[1870] [[38;5;210m1784111554[0m 57.0s] connection: connection download closed: stream 92 canceled by remote with error code 0
+[31mERROR[0m[2566] [[38;5;199m3215558071[0m 8.1s] connection: connection download closed: stream 72 canceled by remote with error code 0
+[31mERROR[0m[2566] [[38;5;114m1841814882[0m 8.1s] connection: connection download closed: stream 68 canceled by remote with error code 0
+[31mERROR[0m[2574] [[38;5;40m3365893912[0m 8.0s] connection: connection download closed: stream 80 canceled by remote with error code 0
+[31mERROR[0m[2574] [[38;5;195m4152263460[0m 8.0s] connection: connection download closed: stream 76 canceled by remote with error code 0
+[31mERROR[0m[2582] [[38;5;198m2348000694[0m 8.0s] connection: connection download closed: stream 88 canceled by remote with error code 0
+[31mERROR[0m[2582] [[38;5;138m565741178[0m 8.0s] connection: connection download closed: stream 84 canceled by remote with error code 0
+[31mERROR[0m[2639] [[38;5;65m3197495345[0m 57.0s] connection: connection download closed: stream 96 canceled by remote with error code 0
+[31mERROR[0m[2639] [[38;5;50m1295387385[0m 57.0s] connection: connection download closed: stream 92 canceled by remote with error code 0
+[31mERROR[0m[2648] [[38;5;165m1331671445[0m 9.14s] connection: connection download closed: stream 900 canceled by remote with error code 0
+[31mERROR[0m[2683] [[38;5;143m2551396223[0m 8.0s] connection: connection download closed: stream 64 canceled by remote with error code 0
+[31mERROR[0m[2683] [[38;5;222m2118806240[0m 8.0s] connection: connection download closed: stream 68 canceled by remote with error code 0
+[31mERROR[0m[2691] [[38;5;215m391303111[0m 8.0s] connection: connection download closed: stream 76 canceled by remote with error code 0
+[31mERROR[0m[2691] [[38;5;159m4160613704[0m 8.0s] connection: connection download closed: stream 72 canceled by remote with error code 0
+[31mERROR[0m[2699] [[38;5;28m735583244[0m 8.0s] connection: connection download closed: stream 84 canceled by remote with error code 0
+[31mERROR[0m[2699] [[38;5;97m2171803729[0m 8.0s] connection: connection download closed: stream 80 canceled by remote with error code 0
+[31mERROR[0m[2756] [[38;5;39m466198510[0m 57.0s] connection: connection download closed: stream 88 canceled by remote with error code 0
+[31mERROR[0m[2756] [[38;5;168m1086617752[0m 57.0s] connection: connection download closed: stream 92 canceled by remote with error code 0
+[31mERROR[0m[2764] [[38;5;150m1730456198[0m 8.0s] connection: connection download closed: stream 896 canceled by remote with error code 0

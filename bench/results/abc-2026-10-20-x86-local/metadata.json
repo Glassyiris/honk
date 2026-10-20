@@ -1,0 +1,121 @@
+{
+  "campaign": "abc-2026-10-20-x86-local",
+  "started_at": "2026-10-20T15:45:57Z",
+  "ended_at": "2026-10-20T16:26:35Z",
+  "host": {
+    "name": "archlinux",
+    "arch": "x86_64",
+    "kernel": "7.2.3-arch1-3",
+    "vcpus": 4,
+    "memory_mib": 1952,
+    "cpu": "13th Gen Intel(R) Core(TM) i5-13600K (host passthrough, 4 vCPU)",
+    "load_before": [
+      0.74,
+      0.83,
+      0.59
+    ],
+    "load_after": [
+      4.47,
+      3.57,
+      2.88
+    ]
+  },
+  "fixture": {
+    "location": "labsrv netns on 10.10.10.49 (same 4-vCPU host as the engine and client)",
+    "reason": "10.10.10.70 SSH refused the lab key and every protocol/target port was closed; the documented labsrv fallback was used",
+    "server_sing_box": {
+      "version": "1.14.3",
+      "binary_sha256": "768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93"
+    },
+    "anytls_go": {
+      "version": "0.0.13",
+      "binary_sha256": "c1a3a52cf3246a51b2cbf427283cde2482fe99b6868588a57786c24324ac44fa"
+    },
+    "targets": {
+      "http": "8080, 8001-8006 (fixed 1024-byte body)",
+      "iperf3": "5300, 5201-5206",
+      "udp_echo": "53531-53536",
+      "probe_dns": "53539"
+    },
+    "topology_caveat": "Client, engine and server share one 4-vCPU/2-GiB host. The direct control is a host memory path (75-80 Gbps for the eBPF engines), not the .70 9.4 Gbps LAN ceiling. Absolute throughput, CPU and tails are not comparable with the 2026-10-11 campaign; only same-host cross-engine deltas are.",
+    "direct_control_mbps": {
+      "honk": 74819,
+      "dae": 80356,
+      "sing-box": 29515
+    }
+  },
+  "engines": {
+    "honk": {
+      "source_revision": "5d29dba6",
+      "main_parent": "e936d022",
+      "version": "honk-core 5d29dba6",
+      "binary_sha256": "02453300bc55a4f3280500f3d1b8694013b4759f9384925a4634a98abe512924",
+      "target": "x86_64-unknown-linux-musl",
+      "profile": "release",
+      "opt_level": "s",
+      "lto": true,
+      "codegen_units": 1,
+      "features": [
+        "ebpf",
+        "native-api",
+        "clash-api",
+        "mimalloc",
+        "rprx"
+      ],
+      "native_listener": "unconfigured"
+    },
+    "dae": {
+      "tag": "v2.1.1",
+      "revision": "dbae2e82d3ed5324e1648548720f8bbc8cde3882",
+      "binary_sha256": "a217bf5edf5a5cac371e086af952b5c676e6ecaf8d7b07ba491916b656b66122",
+      "source": "official generic x86-64 release"
+    },
+    "sing-box": {
+      "tag": "v1.14.3",
+      "revision": "7054cac5124465ffdb145870d7c01885566711b1",
+      "binary_sha256": "768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93",
+      "source": "official amd64 release"
+    }
+  },
+  "sampling": {
+    "engines": [
+      "honk",
+      "dae",
+      "sing-box"
+    ],
+    "protocols": [
+      "hy2",
+      "tuic",
+      "ss2022",
+      "trojan",
+      "anytls-sb",
+      "anytls-go"
+    ],
+    "cold_restarts": 3,
+    "hot_requests": 15,
+    "tcp_runs": 3,
+    "tcp_seconds": 8,
+    "udp_seconds": 8,
+    "udp_offered_bps": 10000000000,
+    "udp_datagram_bytes": 1200,
+    "loaded_samples": 200,
+    "loaded_interval_ms": 250,
+    "loaded_timeout_seconds": 5,
+    "loaded_retries": 2,
+    "http_body_bytes": 1024
+  },
+  "configuration_sha256": {
+    "honk-local.dae": "1ac11a42ac797842f9902c73fbacd978d4ee218a15806aa5d917be457298a067",
+    "dae-local.dae": "05b70ba88e23fd7bd7a3de0149756cfe1d2da88088d8b42829d748e90f629af5",
+    "sb-client-local.json": "4b1f5f468c0dd16a7a51db29770c8ae0022a453a28a2519dea71b324f8a4c6ba",
+    "fixture/singbox-server.json": "2ad7dfc93eb21506e2886342e38be0f43cb9593eaff8ba4c200aed234bd3bd12",
+    "fixture/target-fixture.py": "11f9306e961cc05eb8bca8f25f0cfe9d9450730ed59814034b87b9fc1faa3639",
+    "fixture/setup-local-lab.sh": "b9081b7b8e520fcc07d501265f2431ece6a76691a2781b7f87131333a8225dc3",
+    "lab-bench.sh": "dbce07cfa8e9f26bf8a92b43b27567cfea86304826c8eb5904e26f0cc0e341fa",
+    "latency_stability.py": "aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575"
+  },
+  "notes": [
+    "lab-bench.sh includes a stale-daens cleanup guard added after a crashed dae left stacked nsfs mounts; measurement code is otherwise unchanged.",
+    "No native listener was configured, so this does not measure active native observation/UI overhead."
+  ]
+}

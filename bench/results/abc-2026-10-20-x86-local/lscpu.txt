@@ -1,0 +1,7 @@
+CPU(s):                                  4
+Model name:                              13th Gen Intel(R) Core(TM) i5-13600K
+Thread(s) per core:                      1
+Core(s) per socket:                      1
+Socket(s):                               4
+Virtualization:                          VT-x
+Virtualization type:                     full
