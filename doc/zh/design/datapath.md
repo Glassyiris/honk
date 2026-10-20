@@ -112,8 +112,8 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 插入/内核删除计数，结合实际用户态删除计数估算占用。此路径不再由内核删除 tuple，故内核删除计数保持零。 |
 | `AUX_OCCUPANCY` | 两槽 per-CPU redirect/handoff 插入计数器；用户态减去实际删除数。 |
 | `ADMISSION_PRESSURE` | Janitor 写入的 conn-state 压力锁存；辅助 map 压力不会将其置位。 |
-| `NEW_FLOW_RATE` | 16,384 项 per-CPU LRU hash，以 LAN 源地址为键。每个 CPU 为单源新流限制保存一个一秒 `(second, count)` 窗口。 |
-| `FRAG_VERDICT` | 4,096 项 LRU，以源、目的、协议与 IP identification 为键；见[分片处置记录](#重定向数据报的分片)。 |
+| `NEW_FLOW_RATE` | 16,384 项 per-CPU LRU hash，以 LAN 源（IPv4 地址；IPv6 /64 前缀）为键。每个 CPU 为单源新流限制保存一个一秒 `(second, count)` 窗口。 |
+| `FRAG_VERDICT` | 4,096 项 LRU，以源、目的与 IP identification 为键（IPv4 另含协议）；见[分片处置记录](#重定向数据报的分片)。 |
 | `BPF_STATS_MAP` | 由 [`honk-tool bpf stats`](../reference/cli.md#bpf) 公开的计数器；标签与布局不匹配说明见该参考页。 |
 | `EVENT_RINGBUF` | 262,144 字节 ring，记录为 80 字节，包含功能性的 tuple/incarnation 过期提示。Producer 直接预留并初始化 ring 存储，不再经有界 TC 栈复制事件。 |
 | `FLOW_EXPIRY_HINT` | 私有的 4,096 项 per-CPU LRU hash，以 tuple 为键，保存最近一次提示的 incarnation 与时间戳。仅尽力抑制重复 `FlowExpired` 提示，从不持有流或提供回收授权。 |
@@ -198,11 +198,11 @@ UDP53 不创建普通 UDP conn-state 或 decision token。LAN 查询分片需要
 
 ### 单源新流限制
 
-每个 LAN 源地址有始终开启、不可配置的 **256 次新流尝试/秒/CPU** 预算，使用固定一秒窗口：纯 TCP SYN（含重传）、未缓存流的首个普通 UDP 包，以及任一端口为 53 的每个被路由 UDP 包。direct 与代理流共用预算；同一个 NAT 路由器/接入点源地址后的所有客户端也共用预算。超额尝试在状态分配前丢弃，增加 `honk-tool bpf stats` 中的 `new_flow_rate_limited`，计数增长时 janitor 记录 WARN。本地服务回复学习共用预算，但不丢弃请求（见[反向学习](#反向-udp-学习与-conn-压力)）。LRU 淘汰会忘记近期计数；限制不覆盖主机发起的 WAN 流量、已缓存流的辅助项重建，以及大量伪造源地址。
+每个 LAN 源有始终开启、不可配置的 **256 次新流尝试/秒/CPU** 预算，使用固定一秒窗口：纯 TCP SYN（含重传）、未缓存流的首个普通 UDP 包，以及任一端口为 53 的每个被路由 UDP 包。IPv4 源即一个地址，IPv6 源按其 /64 前缀计，因此在前缀内轮换隐私地址不会刷新预算。direct 与代理流共用预算；同一个 NAT 路由器/接入点源地址后的所有客户端也共用预算。超额尝试在状态分配前丢弃，增加 `honk-tool bpf stats` 中的 `new_flow_rate_limited`，计数增长时 janitor 记录 WARN。本地服务回复学习共用预算，但不丢弃请求（见[反向学习](#反向-udp-学习与-conn-压力)）。LRU 淘汰会忘记近期计数；限制不覆盖主机发起的 WAN 流量、已缓存流的辅助项重建，以及大量伪造源地址。
 
 ### 重定向数据报的分片
 
-在 `lan_ingress`/`wan_egress`，首个分片（more-fragments 置位、偏移 0）的 verdict 为 `TC_ACT_SHOT` 或 `TC_ACT_REDIRECT` 时，进入 `FRAG_VERDICT` 保留 30 秒；匹配的后续分片丢弃，不为代理重组。其他首片 verdict 清除旧记录，保留 direct/staged/pending 流量。任一端口为 53 的 UDP 被排除；LAN DNS 保留[原生重组](./nfqueue.md#lan-dns-分片)。无法解析的微小首片放行。后续片先到达、记录过期/被淘汰/无法插入，或 IPv6 链为 Fragment → Destination Options → UDP（首片与后续片协议键不同）时，后续片可能放行。
+在 `lan_ingress`/`wan_egress`，首个分片（more-fragments 置位、偏移 0）的 verdict 为 `TC_ACT_SHOT` 或 `TC_ACT_REDIRECT` 时，进入 `FRAG_VERDICT` 保留 30 秒；匹配的后续分片丢弃，不为代理重组。其他首片 verdict 清除旧记录，保留 direct/staged/pending 流量。任一端口为 53 的 UDP 被排除；LAN DNS 保留[原生重组](./nfqueue.md#lan-dns-分片)。无法解析的微小首片放行。后续片先到达，或记录过期/被淘汰/无法插入时，后续片可能放行。IPv6 仅按源、目的与 identification 匹配，因此 UDP 之前的扩展头不会把同一数据报的分片分开。
 
 ### 反向 UDP 学习与 conn 压力
 
@@ -260,7 +260,7 @@ conn/redirect/handoff 的最高占用率决定每张 map 的清理节奏与候�
 
 Overflow、conn/辅助占用或健康统计读取失败时，保留上次样本（初始为零），至多每 10 秒记录一次 WARN 并指明失败信号，不停止清扫。漏读 overflow 不计为退出压力所需的安静轮次；校准要求新鲜计数。日志区分 conn/redirect/handoff 占用，overflow WARN 要求计数确实增长。退役或准入压力发布失败仍为 fatal，并记录完整原因链。
 
-内核过期会拒绝报文并发出 advisory hint，不删除状态。UDP handoff 若仍匹配存活 conn 的 token/incarnation，则即使超过其名义的 30 秒，也在加锁检查身份后原地续期，每秒至多一次；不匹配仍拒绝。`FLOW_EXPIRY_HINT` 将缓存中的 tuple/incarnation 合并为每 CPU 每秒一个提示；新 incarnation 重置抑制，淘汰/插入失败可丢失记录，ring 预留失败也消耗已记录的间隔。Hint 独立于诊断日志限速，不授予回收权；ring/queue 丢失由 janitor 清扫兜底，过载下不保证及时恢复。
+内核过期会拒绝报文并发出 advisory hint，不删除状态。UDP handoff 若仍匹配存活 conn 的 token/incarnation，则即使超过其名义的 30 秒，也在加锁检查身份后原地续期，每秒至多一次；不匹配仍拒绝。`FLOW_EXPIRY_HINT` 将缓存中的 tuple/incarnation 合并为每 CPU 每秒一个提示，仅在 ring 接受该提示后才记录；新 incarnation 重置抑制，淘汰/插入失败可丢失记录。因此 ring 满不会让某个 tuple 静默一秒。Hint 独立于诊断日志限速，不授予回收权；ring/queue 丢失由 janitor 清扫兜底，过载下不保证及时恢复。
 
 Removal worker 每批最多处理 1,024 项 TCP/UDP/过期请求，使用 [NFQUEUE fence/grace 协议](./nfqueue.md#精确-tuple-退役)，对规范 tuple 去重并保留首个 token 及获取/释放顺序。TCP pin 在后端写锁内复验，已准入的清理在关闭告警后继续 join。实际 UDP conn 删除触发[精确 endpoint 退役](./control-plane.md#tcp-中继与-conn-state-所有权)。
 
