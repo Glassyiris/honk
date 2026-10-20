@@ -200,6 +200,8 @@ UDP53 不创建普通 UDP conn-state 或 decision token。LAN 查询分片需要
 
 每个 LAN 源有始终开启、不可配置的 **256 次新流尝试/秒/CPU** 预算，使用固定一秒窗口：纯 TCP SYN（含重传）、未缓存流的首个普通 UDP 包，以及任一端口为 53 的每个被路由 UDP 包。IPv4 源即一个地址，IPv6 源按其 /64 前缀计，因此在前缀内轮换隐私地址不会刷新预算。direct 与代理流共用预算；同一个 NAT 路由器/接入点源地址后的所有客户端也共用预算。超额尝试在状态分配前丢弃，增加 `honk-tool bpf stats` 中的 `new_flow_rate_limited`，计数增长时 janitor 记录 WARN。本地服务回复学习共用预算，但不丢弃请求（见[反向学习](#反向-udp-学习与-conn-压力)）。LRU 淘汰会忘记近期计数；限制不覆盖主机发起的 WAN 流量、已缓存流的辅助项重建，以及大量伪造源地址。
 
+由于窗口按 CPU 计，有效上限是 CPU 数 × 256/s。该预算只减缓、并不限制单个源对共享辅助 map 的占用：3 个及以上 CPU 时，单个主机可用普通 UDP 流占满 `REDIRECT_TRACK`（65,536 项，空闲 120 秒过期）；9 个及以上 CPU 时，可用 TCP 占满 `ROUTING_HANDOFF`（30 秒过期）。janitor 的压力节奏与回收是兜底，map 写满由 `redirect_track_insert_failure` / `routing_handoff_insert_failure` 计数。
+
 ### 重定向数据报的分片
 
 在 `lan_ingress`/`wan_egress`，首个分片（more-fragments 置位、偏移 0）的 verdict 为 `TC_ACT_SHOT` 或 `TC_ACT_REDIRECT` 时，进入 `FRAG_VERDICT` 保留 30 秒；匹配的后续分片丢弃，不为代理重组。其他首片 verdict 清除旧记录，保留 direct/staged/pending 流量。任一端口为 53 的 UDP 被排除；LAN DNS 保留[原生重组](./nfqueue.md#lan-dns-分片)。无法解析的微小首片放行。后续片先到达，或记录过期/被淘汰/无法插入时，后续片可能放行。IPv6 仅按源、目的与 identification 匹配，因此 UDP 之前的扩展头不会把同一数据报的分片分开。
