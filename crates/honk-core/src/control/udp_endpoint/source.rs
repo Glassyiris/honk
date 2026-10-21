@@ -515,9 +515,18 @@ impl SourceEndpoint {
                 let peer = normalize_socket_addr(self.target);
                 if state.retired_reply_peers.len() < MAX_RETIRED_REPLY_PEERS {
                     state.retired_reply_peers.insert(peer);
-                } else if !state.retired_reply_peers.contains(&peer) {
+                } else if !state.foreign_replies_disabled
+                    && !state.retired_reply_peers.contains(&peer)
+                {
                     // ponytail: after 64 retired peers, disable only unbound foreign replies for this source lifetime.
                     state.foreign_replies_disabled = true;
+                    tracing::warn!(
+                        client = %self.owner.scope.client,
+                        outbound = %self.owner._runtime.node.name,
+                        protocol = ?self.owner._runtime.node.protocol(),
+                        retired_peers = state.retired_reply_peers.len(),
+                        "UDP source retired-peer limit reached; unbound replies are disabled for this source's lifetime"
+                    );
                 }
             }
             if binding.endpoint_permit.is_some() {

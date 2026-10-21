@@ -50,8 +50,9 @@ impl TransportQuality {
 
     /// Bind physical construction, not a logical stream's later I/O polls.
     /// Spawned factories must enter this scope using their captured runtime.
-    pub async fn scope<F: Future>(self: Arc<Self>, future: F) -> F::Output {
-        CURRENT_QUALITY.scope(self, future).await
+    /// Keep the task-local future direct: carrier setup already nests this scope.
+    pub fn scope<F: Future>(self: Arc<Self>, future: F) -> impl Future<Output = F::Output> {
+        CURRENT_QUALITY.scope(self, future)
     }
 
     pub(crate) fn current() -> Option<Arc<Self>> {

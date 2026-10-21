@@ -51,6 +51,8 @@ experimental {
 
 Nonempty native secrets must be visible ASCII without whitespace or commas, matching the HTTP bearer parser; unsupported bytes fail shared configuration admission rather than creating an unusable listener.
 
+Use an unpredictable token of at least 16 bytes. In token mode, an enabled non-loopback listener (including a wildcard bind) with a secret shorter than 16 bytes emits one WARN at startup activation and each accepted configuration reactivation. It records only structured `listen` and `secret_length` fields, never the secret, and does not reject the configuration. Loopback-only listeners and password mode do not emit this advisory. This is separate from the under-eight-byte masking warning described above.
+
 Authentication mode is restart-required. A nonempty `secret` selects the existing static-token mode. An empty `secret` with `password_auth: true` selects password mode. An empty `secret` with explicit anonymous loopback and an actual loopback bind selects the existing development mode. An enabled listener with none of these fails validation. Password mode requires an empty `secret` and is rejected with `allow_anonymous_loopback`; `config_write: true` likewise requires token or password mode.
 
 Replace the example secret. For local credential-free development, omit `secret` and explicitly set `allow_anonymous_loopback: true`; never publish that anonymous listener through a reverse proxy. Plain HTTP with a token on a non-loopback network is not a secure deployment. Terminate TLS at a trusted proxy.

@@ -230,12 +230,15 @@ impl QuicRuntime {
     }
 
     /// Drop reusable ownership without making this runtime terminal.
-    /// Established flows retain their own connection clones.
+    /// Established flows retain their own connection clones. The slot lock
+    /// stays held through the client release so a terminal close cannot
+    /// observe the slot empty while that release is still in flight.
     async fn release_warm(&self) {
-        let client = self.state.lock().await.client.take();
-        if let Some(client) = client {
+        let mut state = self.state.lock().await;
+        if let Some(client) = state.client.as_ref() {
             client.release_warm().await;
         }
+        state.client = None;
     }
 
     /// Occupancy (zero or one), or `None` while the slot lock is held.

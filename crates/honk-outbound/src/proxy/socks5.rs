@@ -437,22 +437,30 @@ impl Socks5UdpTransport {
     }
 
     /// Strict RFC 1928 UDP header validation; returns the wire source and the
-    /// payload offset, or `None` for a fragment (never reassembled).
+    /// payload offset. A truncated, non-zero-RSV, fragmented (never
+    /// reassembled) or badly named datagram is its own UDP packet, so it is
+    /// dropped (`None`) without ending the association; an unknown ATYP stays
+    /// terminal.
     fn parse_packet(packet: &[u8]) -> io::Result<Option<(WireSource<'_>, usize)>> {
+        fn drop_packet<T>(reason: &'static str) -> io::Result<Option<T>> {
+            debug!("SOCKS5 UDP: dropped relay datagram: {reason}");
+            Ok(None)
+        }
+
         if packet.len() < 4 {
-            return Err(Self::invalid_packet("SOCKS5 UDP: truncated header"));
+            return drop_packet("truncated header");
         }
         if packet[..2] != [0x00, 0x00] {
-            return Err(Self::invalid_packet("SOCKS5 UDP: non-zero RSV"));
+            return drop_packet("non-zero RSV");
         }
         if packet[2] != 0 {
-            return Ok(None);
+            return drop_packet("fragment");
         }
 
         let (source, payload_start) = match packet[3] {
             ATYP_IPV4 => {
                 if packet.len() < 10 {
-                    return Err(Self::invalid_packet("SOCKS5 UDP: truncated IPv4 frame"));
+                    return drop_packet("truncated IPv4 frame");
                 }
                 let ip = std::net::Ipv4Addr::new(packet[4], packet[5], packet[6], packet[7]);
                 let port = u16::from_be_bytes([packet[8], packet[9]]);
@@ -460,7 +468,7 @@ impl Socks5UdpTransport {
             }
             ATYP_IPV6 => {
                 if packet.len() < 22 {
-                    return Err(Self::invalid_packet("SOCKS5 UDP: truncated IPv6 frame"));
+                    return drop_packet("truncated IPv6 frame");
                 }
                 let ip = std::net::Ipv6Addr::from(
                     <[u8; 16]>::try_from(&packet[4..20]).expect("slice length"),
@@ -470,15 +478,16 @@ impl Socks5UdpTransport {
             }
             ATYP_DOMAIN => {
                 if packet.len() < 5 {
-                    return Err(Self::invalid_packet("SOCKS5 UDP: truncated domain frame"));
+                    return drop_packet("truncated domain frame");
                 }
                 let domain_len = packet[4] as usize;
                 let domain_end = 5 + domain_len;
                 if packet.len() < domain_end + 2 {
-                    return Err(Self::invalid_packet("SOCKS5 UDP: truncated domain frame"));
+                    return drop_packet("truncated domain frame");
                 }
-                let domain = std::str::from_utf8(&packet[5..domain_end])
-                    .map_err(|_| Self::invalid_packet("SOCKS5 UDP: invalid domain encoding"))?;
+                let Ok(domain) = std::str::from_utf8(&packet[5..domain_end]) else {
+                    return drop_packet("invalid domain encoding");
+                };
                 let port = u16::from_be_bytes([packet[domain_end], packet[domain_end + 1]]);
                 (WireSource::Domain(domain, port), domain_end + 2)
             }

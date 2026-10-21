@@ -56,7 +56,8 @@ struct Case {
 struct Source {
     file: Option<PathBuf>,
     dae: Option<PathBuf>,
-    lines: String,
+    lines: Option<String>,
+    fence: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,74 +73,83 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn input(case: &Case, upstream: &Upstream) -> Option<String> {
-    assert_ne!(
-        case.input.is_some(),
-        case.source.is_some(),
-        "{}: one input source required",
-        case.id
-    );
-    let mut text = if let Some(path) = &case.input {
-        std::fs::read_to_string(root().join(path))
-            .unwrap_or_else(|e| panic!("{}: cannot read input {}: {e}", case.id, path.display()))
-    } else {
-        let source = case.source.as_ref().unwrap();
-        assert_ne!(source.file.is_some(), source.dae.is_some());
-        let path = if let Some(file) = &source.dae {
-            assert!(
-                upstream.sources.iter().any(|s| &s.file == file),
-                "{}: uncited source",
-                case.id
-            );
+fn dae_range<'a, 'b>(lines: &'a [&'b str], range: &str) -> Result<&'a [&'b str], String> {
+    let (start, end) = range.split_once('-').unwrap_or((range, range));
+    let bad = || format!("input: bad line range {range}");
+    let start: usize = start.parse().map_err(|_| bad())?;
+    let end: usize = end.parse().map_err(|_| bad())?;
+    if start == 0 || end < start || end > lines.len() {
+        return Err(format!(
+            "input: line range {range} is outside {} lines",
+            lines.len()
+        ));
+    }
+    Ok(&lines[start - 1..end])
+}
+
+fn fence_body<'a, 'b>(lines: &'a [&'b str], fence: usize) -> Result<&'a [&'b str], String> {
+    let start = fence
+        .checked_sub(1)
+        .and_then(|n| {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.trim() == "```dae")
+                .nth(n)
+        })
+        .map(|(i, _)| i)
+        .ok_or_else(|| format!("input: no ```dae fence number {fence}"))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim() == "```")
+        .ok_or_else(|| format!("input: ```dae fence number {fence} is not closed"))?;
+    Ok(&lines[start + 1..start + 1 + end])
+}
+
+fn source_text(source: &Source, upstream: &Upstream) -> Result<Option<String>, String> {
+    let path = match (&source.file, &source.dae) {
+        (Some(file), None) => root().join(file),
+        (None, Some(file)) => {
+            if !upstream.sources.iter().any(|s| &s.file == file) {
+                return Err(format!("input: uncited source {}", file.display()));
+            }
             match std::env::var_os("CONFORMANCE_SRC") {
                 Some(dir) => PathBuf::from(dir).join(file),
                 None => {
-                    assert!(
-                        std::env::var_os("DAE_PARSE_BIN").is_none(),
-                        "CONFORMANCE_SRC required with oracle"
-                    );
-                    return None;
+                    if std::env::var_os("DAE_PARSE_BIN").is_some() {
+                        return Err("input: CONFORMANCE_SRC required with oracle".to_owned());
+                    }
+                    return Ok(None);
                 }
             }
-        } else {
-            root().join(source.file.as_ref().unwrap())
-        };
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{}: {}: {e}", case.id, path.display()));
-        let (start, end) = source
-            .lines
-            .split_once('-')
-            .unwrap_or((&source.lines, &source.lines));
-        let start: usize = start
-            .parse()
-            .unwrap_or_else(|_| panic!("{}: bad line range {}", case.id, source.lines));
-        let end: usize = end
-            .parse()
-            .unwrap_or_else(|_| panic!("{}: bad line range {}", case.id, source.lines));
-        let lines: Vec<_> = text.lines().collect();
-        assert!(
-            start > 0 && end >= start && end <= lines.len(),
-            "{}: line range {} is outside {} lines",
-            case.id,
-            source.lines,
-            lines.len()
-        );
-        if source.file.is_some() {
-            assert!(start >= 2 && end < lines.len());
-            assert_eq!(
-                lines[start - 2].trim(),
-                "```dae",
-                "{}: stale fence start",
-                case.id
-            );
-            assert_eq!(lines[end].trim(), "```", "{}: stale fence end", case.id);
         }
-        format!("{}\n", lines[start - 1..end].join("\n"))
+        _ => return Err("input: source needs exactly one of file/dae".to_owned()),
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("input: cannot read {}: {e}", path.display()))?;
+    let lines: Vec<_> = text.lines().collect();
+    let body = match (&source.file, source.fence, &source.lines) {
+        (Some(_), Some(fence), None) => fence_body(&lines, fence)?,
+        (None, None, Some(range)) => dae_range(&lines, range)?,
+        _ => return Err("input: file sources take fence, dae sources take lines".to_owned()),
+    };
+    Ok(Some(format!("{}\n", body.join("\n"))))
+}
+
+fn input(case: &Case, upstream: &Upstream) -> Result<Option<String>, String> {
+    let mut text = match (&case.input, &case.source) {
+        (Some(path), None) => std::fs::read_to_string(root().join(path))
+            .map_err(|e| format!("input: cannot read {}: {e}", path.display()))?,
+        (None, Some(source)) => match source_text(source, upstream)? {
+            Some(text) => text,
+            None => return Ok(None),
+        },
+        _ => return Err("input: exactly one of input/source required".to_owned()),
     };
     for section in case.wrap.split('.').rev().filter(|s| !s.is_empty()) {
         text = format!("{section} {{\n{text}\n}}\n");
     }
-    Some(text)
+    Ok(Some(text))
 }
 
 fn oracle(binary: &Path, case_id: &str, input: &str) -> Value {
@@ -317,9 +327,17 @@ fn manifest_cases() {
             assert!(["typed", "loading"].contains(&layer));
             assert!(names.contains(test), "{}: missing test {test}", case.id);
         }
-        let Some(input) = input(&case, &manifest.upstream) else {
-            skipped += 1;
-            continue;
+        let input = match input(&case, &manifest.upstream) {
+            Ok(Some(input)) => input,
+            Ok(None) => {
+                skipped += 1;
+                continue;
+            }
+            Err(error) => {
+                total += 1;
+                failures.push((case.id, error));
+                continue;
+            }
         };
         total += 1;
         let projection = project(&input);
@@ -386,4 +404,86 @@ fn manifest_cases() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[test]
+fn doc_fences_ignore_prose_and_other_languages() {
+    let document = "```rust\nexample\n```\n```dae\nfirst\n```\nprose\n```dae\n  second\n\n```\n";
+    for prefix in ["", "unrelated prose\n\nmore prose\n"] {
+        let text = format!("{prefix}{document}");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(fence_body(&lines, 2).unwrap(), &["  second", ""]);
+        assert!(fence_body(&lines, 0).is_err());
+        assert!(fence_body(&lines, 3).is_err());
+    }
+}
+
+#[test]
+fn source_failures_write_results_before_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let document = dir.path().join("document.md");
+    let unclosed = dir.path().join("unclosed.md");
+    std::fs::write(&document, "```dae\nglobal {}\n```\n").unwrap();
+    std::fs::write(&unclosed, "```dae\nglobal {}\n").unwrap();
+    std::fs::write(dir.path().join("upstream.dae"), "global {}\n").unwrap();
+    let document = serde_json::to_string(&document).unwrap();
+    let unclosed = serde_json::to_string(&unclosed).unwrap();
+    let missing = serde_json::to_string(&dir.path().join("missing.dae")).unwrap();
+    let cases = [
+        ("missing-input", format!("input = {missing}")),
+        (
+            "missing-ordinal",
+            format!("source = {{ file = {document} }}"),
+        ),
+        (
+            "missing-fence",
+            format!("source = {{ file = {document}, fence = 2 }}"),
+        ),
+        (
+            "unclosed-fence",
+            format!("source = {{ file = {unclosed}, fence = 1 }}"),
+        ),
+        (
+            "invalid-range",
+            "source = { dae = \"upstream.dae\", lines = \"0-99\" }".to_owned(),
+        ),
+    ];
+    let mut manifest = format!(
+        "note = \"source failure regression\"\n[upstream]\ncommit = \"test\"\n\
+         sources = [{{ file = \"upstream.dae\", \
+         url = \"https://raw.githubusercontent.com/daeuniverse/dae/test/upstream.dae\", \
+         sha256 = \"{}\" }}]\n",
+        "0".repeat(64)
+    );
+    for (id, source) in &cases {
+        manifest.push_str(&format!(
+            "\n[[case]]\nid = \"{id}\"\n{source}\nlayer = \"structure\"\n\
+             honk = \"accept\"\ndae = \"accept\"\nhonk_diagnostics = []\ncompare = \"equal\"\n"
+        ));
+    }
+    let manifest_path = dir.path().join("manifest.toml");
+    let result_path = dir.path().join("result.json");
+    std::fs::write(&manifest_path, manifest).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "manifest_cases", "--nocapture"])
+        .env_remove("DAE_PARSE_BIN")
+        .env_remove("CONFORMANCE_CASE")
+        .env("CONFORMANCE_MANIFEST", manifest_path)
+        .env("CONFORMANCE_RESULT", &result_path)
+        .env("CONFORMANCE_SRC", dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(result["total"], cases.len());
+    assert_eq!(result["failure"]["case"], "missing-input");
+    assert_eq!(result["failure"]["path"], "input");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for (id, _) in cases {
+        assert!(
+            stdout.contains(id) || stderr.contains(id),
+            "{id} was not reported"
+        );
+    }
 }

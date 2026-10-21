@@ -45,9 +45,13 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
+对象准入会在进程名 probe 或任何 Aya loader 运行前拒绝隐式 `ByName` map pinning。外部对象必须声明未 pin 的 map；包括持久分配器在内，所有 pin 路径均由 core 显式提供，避免 loader 创建的别名逃出启动回滚。
+
+真实 backend 在 pin map 后启动失败时，启动 guard 只删除本次成功创建的临时 pin。未能替换的已有 pin 与无关的已有 pin 不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理后都会保留；启动成功时，临时 pin 的所有权转交 backend 清理。
+
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
-UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`。即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
+UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。每个地址族都必须具备完整的 enter/exit 对：失败时卸载该对，不会禁用另一个地址族。两个地址族都依赖 `__skb_recv_udp` 上共享的 hook；它失败时两者都不可用。注册会检查 socket 地址族，因此缺少对应 hook 对的 listener 会报告不可用，而不是无证据地静默注册。每个 backend 只尝试一次 fallback，失败或部分成功也不例外。Listener 重载会重新检查原生辅助元数据支持和注册结果，但不会重试挂载；修改内核/BTF 支持后需重启。追踪缺失只影响已记录的内核路由证据，不改变路由或 UDP 交付。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
 
 ## 透明代理入口
 
@@ -240,6 +244,8 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 2. 拒绝新的透明代理准入。
 3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 及已准入的 commit-pump 工作变空，并排空精确 endpoint retirement。
 4. 编译 generation 的 `RoutingPushPlan`；在下述发布 guard 内，只有 compiled plan、learned facts 变化或数据路径健康需要恢复时才调用 `EbpfBackend::publish_routing_plan(&plan, learned_domains)`。后端选择 inactive slot，暂存由该 generation 持有的 IP/source/MAC/domain 事实 map（使用完整的 256 位谓词值），把生成函数附着到每个相关 target，最后切换 `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活使用已经持有的 backend 重置 mode，用户态再于同一串行边界内发布替代出站 registry、DNS runtime pointer、Router、配置、组与 projection snapshot；root 已提交后 mode reset 失败会提交新代为 degraded，并保持准入 fence。
+   发布后，退役旧 generation，替换其 UDP 与 Selector warm coordinator，并同步健康检查节点、URLTest 组及自定义组检查 URL。已提交但 degraded 的 generation 仍完成这些步骤，仅准入继续保持 fence。
+   停止 warm coordinator 会取消可能依赖另一 coordinator 的 retention-reconciliation 等待；coordinator 退出前仍会 abort 并 join 自己派发的子任务。QUIC warm 释放与终止关闭在 client 槽位上串行化，即使未启用原生任务所有权也一样；取消释放不会提前清空槽位，终止关闭仍能取得 client。
 5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
 `control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`；provider 的 DNS publication guard 在这些 guard 内准备。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。

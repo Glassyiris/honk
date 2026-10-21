@@ -151,7 +151,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | --- | --- | --- |
 | `direct` | Native 带 mark 目标连接 | `PacketTransport` 后的 native 带 mark UDP |
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。发送时只写入拨号域名，其他名字以数值目标发出。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。发送时只写入拨号域名，其他名字以数值目标发出。被截断、RSV 非零、分片（`FRAG != 0`）或域名不是 UTF-8 的中继 datagram 只丢弃该包并记 DEBUG；未知 ATYP 或控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每个客户端 source 一个已连接的服务端 socket 与加密状态，可发往任意目的地（见下文） |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing；每个客户端 source 一条 associate 流，每个 frame 自带对端地址 |
 | `vmess` | VMess stream | 未实现 |
@@ -594,7 +594,7 @@ UoT v2/H2MUX 共用的通用 source transport（Hysteria2、TUIC 与 VLESS XUDP/
 变化重置 session ID、包计数器或重放窗口）、一条 Juicity 双向流、一条 SOCKS5
 控制连接加一个中继 socket、一条 Trojan associate 流、一条 non-connect UoT v2
 流或一条 H2MUX PacketAddr 流。`recv_packet` 返回服务端报告的真实 peer：IPv4 映射
-的 peer 规范化为 IPv4；域名来源仅在等于捕获的域名与端口时接受，其他域名不经
+的 peer 规范化为 IPv4；域名来源仅在等于捕获的域名与端口时接受，其他域名（包括空名或非 UTF-8 名字）不经
 DNS 直接丢弃，流式协议会整帧消费被丢弃的帧后再读下一帧；未知地址类型仍是终止性
 错误。`send_packet` 与 `send_to` 共用一个未装箱 helper；`confirmed` 只在各 view 的
 首个 datagram 上传给 transport，`admitted` 在 datagram 进入线路或 writer 队列时
@@ -763,8 +763,8 @@ number 视为四字节，就会破坏短 packet number 后面的 payload；与�
 互测时，错误会相互抵消。
 
 进程级、有界 `SESSION_TICKETS` cache 按 ticket key 保存 BoringSSL TLS 1.3
-session（代理 key 包含 host、port、SNI 与有序 ALPN）。BoringSSL 没有隐式客户端缓存；会话恢复要求显式 `SSL_set_session`。`pinSHA256`
-节点绝不 resume，因为 PSK 握手会绕过证书 pin。被拒绝的缓存 session 会
+session（代理 key 包含 host、port、SNI 与有序 ALPN，且所有 key 都按 `skip_cert_verify` 分区，开启与跳过证书验证的连接绝不共享 ticket）。BoringSSL 没有隐式客户端缓存；会话恢复要求显式 `SSL_set_session`。`pinSHA256`
+节点既不 resume 也不保存 ticket，因为 PSK 握手会绕过证书 pin。被拒绝的缓存 session 会
 被淘汰，同时不会删除并发连接写入的更新 ticket。
 
 该 backend 可以为 hy2/juicity/tuic/DoQ/DoH3 承载真实 ECH 与 Chrome QUIC ClientHello。代理出站不向
@@ -844,6 +844,9 @@ pool 还负责有界重试分类、退避、退役与幂等的强制关闭。
 初始化 waiter 接收同一个 `SharedError`；它通过 `Arc` clone 原始
 `anyhow::Error` 并保留 source chain。pool 在广播 builder failure 前绝不会
 把它压平成 display 文本。
+runtime owner 已终止而拒绝拨号任务时，pool 清除该任务自己的 in-flight 注册、唤醒
+waiter，并按一次建立失败计入既有重拨 backoff。janitor 被拒绝时不保留运行标志，drain
+worker 被拒绝时强制关闭保留的 session；Mux.Cool 的 owner 拒绝 END 发送时使 carrier 失败。
 
 AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spread：
 第一条 session 变忙后，pool 会先建立第二条，再增加复用负载，随后按

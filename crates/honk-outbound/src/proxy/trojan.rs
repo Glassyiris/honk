@@ -567,18 +567,10 @@ impl PacketTransport for TrojanUdpTransport {
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let mut rd = self.reader.lock().await;
         loop {
-            // An unknown ATYP has no derivable length, so the parser's error
-            // stays terminal for the whole stream.
-            let peer = match addr::SocksAddr::read_from_stream(&mut *rd).await? {
-                addr::SocksAddr::V4(peer) => Some(SocketAddr::V4(peer)),
-                addr::SocksAddr::V6(peer) => {
-                    Some(SocketAddr::new(peer.ip().to_canonical(), peer.port()))
-                }
-                // Only the dialed name projects back; no other name is resolved.
-                addr::SocksAddr::Domain(domain, port) => {
-                    addr::dialed_domain_peer(self.domain.as_deref(), self.relay_addr, domain, port)
-                }
-            };
+            // Only the dialed name projects back and no other is resolved; an
+            // unknown ATYP has no derivable length, so it stays terminal.
+            let peer =
+                addr::read_reply_source(&mut *rd, self.domain.as_deref(), self.relay_addr).await?;
             let mut head = [0u8; 4];
             rd.read_exact(&mut head).await?;
             let len = u16::from_be_bytes([head[0], head[1]]) as usize;
@@ -594,15 +586,10 @@ impl PacketTransport for TrojanUdpTransport {
             }
             // The dropped frame must be consumed so the next one decodes.
             let mut left = len;
+            let mut discard = [0u8; 512];
             while left > 0 {
-                let chunk = left.min(buf.len());
-                if chunk == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "trojan udp frame exceeds buffer",
-                    ));
-                }
-                rd.read_exact(&mut buf[..chunk]).await?;
+                let chunk = left.min(discard.len());
+                rd.read_exact(&mut discard[..chunk]).await?;
                 left -= chunk;
             }
         }

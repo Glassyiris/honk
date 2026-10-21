@@ -68,6 +68,8 @@ CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
 ```
 
+`udp_recvmsg` 或 `udpv6_recvmsg` hook 缺失或不兼容时，只禁用对应 socket 地址族的 fallback；两个地址族都依赖共享的 `__skb_recv_udp` hook。Fallback 部分成功或失败后不会在 listener 重载时重试；修改内核/BTF 支持后需重启。见[接收追踪所有权](./design/control-plane.md#启动与关闭)。
+
 ### bpffs
 
 eBPF map 必须 pin 在 bpffs，不能使用普通目录：

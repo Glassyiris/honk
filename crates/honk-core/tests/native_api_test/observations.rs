@@ -809,10 +809,19 @@ async fn native_rejected_flow_streams_cannot_activate_capture() {
         assert_eq!(settings["recording"]["flows"]["active"], false);
         assert_eq!(settings["recording"]["events"]["active"], false);
     }
+    let stream_client = contract::ContractClient(
+        Client::builder()
+            .no_proxy()
+            .local_address("127.0.0.2".parse::<std::net::IpAddr>().unwrap())
+            .timeout(IO_TIMEOUT)
+            .build()
+            .unwrap(),
+    );
     let mut streams = Vec::new();
     for _ in 0..16 {
-        let mut stream = app
-            .get("/api/v1/events?kinds=runtime.updated")
+        let mut stream = stream_client
+            .get(app.url("/api/v1/events?kinds=runtime.updated"))
+            .bearer_auth(SECRET)
             .header("accept", "text/event-stream")
             .send()
             .await
@@ -833,6 +842,7 @@ async fn native_rejected_flow_streams_cannot_activate_capture() {
     assert_eq!(settings["recording"]["flows"]["active"], false);
     assert_eq!(settings["recording"]["events"]["active"], true);
     drop(streams);
+    drop(stream_client);
     app.shutdown().await;
 }
 

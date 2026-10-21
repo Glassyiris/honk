@@ -160,7 +160,7 @@ refusal; it is not interchangeable with missing UDP support.
 | --- | --- | --- |
 | `direct` | Native marked target connect | Native marked UDP behind `PacketTransport` |
 | `block` | Rejects | Explicit reject-path exemption; carries no UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. On send, only the dialed name is written; any other name goes out as the numeric target. `FRAG != 0` drops the datagram, control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association, one control stream and one relay-connected socket per client source for all its destinations; each request header names its destination, each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. On send, only the dialed name is written; any other name goes out as the numeric target. A truncated, nonzero-RSV, fragmented (`FRAG != 0`) or non-UTF-8-domain relay datagram is dropped on its own at DEBUG; an unknown ATYP or control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply (including relay DNS resolution) each have a five-second timeout |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing; one connected server socket and crypto state per client source, usable for every destination (see below) |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP; one associate stream per client source, each frame names its peer |
 | `vmess` | VMess stream | Unimplemented |
@@ -678,7 +678,8 @@ replay windows per destination), one Juicity bidirectional stream, one SOCKS5
 control connection with one relay socket, one Trojan associate stream, one
 non-connect UoT v2 stream or one H2MUX PacketAddr stream. `recv_packet` returns
 the real peer the server reports: an IPv4-mapped peer is IPv4, a domain source is
-accepted only as the captured domain and port, any other domain is dropped
+accepted only as the captured domain and port, any other domain (including an
+empty or non-UTF-8 name) is dropped
 without DNS, and stream protocols consume a dropped frame whole before reading
 the next; an unknown address type stays terminal. `send_packet` and `send_to`
 share one unboxed helper; `confirmed` reaches the transport only on each view's
@@ -879,8 +880,9 @@ that many bytes are masked or unmasked. Treating every number as four bytes
 corrupts the following payload for short packet numbers and self-cancels against same-bug peers.
 
 A process-wide, bounded `SESSION_TICKETS` cache stores BoringSSL TLS 1.3
-sessions by ticket key (proxy keys include host, port, SNI, and ordered ALPN). BoringSSL has no implicit client cache and requires
-explicit `SSL_set_session` for resumption. `pinSHA256` nodes never resume because a PSK handshake would bypass
+sessions by ticket key (proxy keys include host, port, SNI, and ordered ALPN, and every key is
+partitioned by `skip_cert_verify`, so verified and unverified connections never share a ticket). BoringSSL has no implicit client cache and requires
+explicit `SSL_set_session` for resumption. `pinSHA256` nodes neither resume nor store tickets because a PSK handshake would bypass
 the certificate pin. Rejected cached sessions are evicted without deleting a
 newer concurrent ticket.
 
@@ -996,6 +998,11 @@ classification, backoff, retirement, and idempotent force shutdown.
 Initialization waiters receive one `SharedError`, which clones the original
 `anyhow::Error` through an `Arc` and preserves its source chain. The pool never
 flattens a builder failure to display text before broadcasting it.
+A dial task refused by its terminal runtime owner clears its own in-flight
+registration, wakes waiters and counts one establishment failure under the
+existing redial backoff. A refused janitor leaves no running flag, a refused
+drain worker force-closes the retained sessions, and Mux.Cool fails the carrier
+when its owner refuses END delivery.
 
 AnyTLS configures two reusable physical sessions and 128 streams per session.
 It spreads work: after the first session becomes busy, the pool establishes the

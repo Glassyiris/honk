@@ -51,6 +51,8 @@ experimental {
 
 非空原生 secret 必须为不含空白或逗号的可见 ASCII，与 HTTP bearer parser 一致。不支持的字节在共用配置准入处报错，不会启动无法认证的 listener。
 
+请使用至少 16 字节、不可预测的 token。Token 模式下，已启用的非 loopback 监听（含通配地址）若 secret 短于 16 字节，会在启动激活及每次已接受的配置重新激活时各记录一次 WARN。日志只包含结构化的 `listen` 与 `secret_length` 字段，绝不记录 secret，且不会拒绝配置。仅监听 loopback 或使用密码模式时，不产生此提示。此提示与上文短于 8 字节值无法遮蔽的警告相互独立。
+
 认证模式变更需要重启。非空 `secret` 选择现有静态 token 模式；空 `secret` 与 `password_auth: true` 选择密码模式；空 `secret`、显式匿名 loopback 及实际 loopback 监听选择现有开发模式。启用 listener 却不满足任一模式时，配置校验失败。密码模式要求 `secret` 为空，且不能与 `allow_anonymous_loopback` 组合；`config_write: true` 同样要求 token 或密码模式。
 
 替换示例 secret。本地无凭据开发需省略 `secret` 并显式设置 `allow_anonymous_loopback: true`；不能通过反向代理公开该匿名 listener。非 loopback 网络上的明文 HTTP 加 token 不是安全部署，应由可信代理终止 TLS。

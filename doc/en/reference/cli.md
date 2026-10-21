@@ -89,7 +89,7 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 
 | Item | Control | Current invariant |
 | --- | --- | --- |
-| eBPF object | Embedded object or `--bpf-object PATH` | With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`; the option replaces those bytes at runtime. Builds without `ebpf` use the mock backend. |
+| eBPF object | Embedded object or `--bpf-object PATH` | With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`; the option replaces those bytes at runtime. Object-declared `ByName` pinning is refused before probe/loading: rebuild with unpinned maps, leaving pin paths to core. Builds without `ebpf` use the mock backend. |
 | Kernel BTF | `HONK_VMLINUX_BTF`, `/sys/kernel/btf/vmlinux` or `/usr/lib/debug/boot/vmlinux` | Without an override, reads `/sys/kernel/btf/vmlinux`, then `/usr/lib/debug/boot/vmlinux` (OpenWrt's `vmlinux-btf` package) if the former is unreadable. Only raw BTF is accepted; for an ELF debug vmlinux, extract its `.BTF` section and point the override at it. The selected BTF supplies kernel-field offsets, the Aya loader target and receive-trace function signatures. Missing or invalid BTF refuses startup. Unavailable kernel argv capture can still fall back to thread `comm`. Native UDP receive tracing additionally needs the in-kernel BTF and ftrace, and degrades without them; an external file does not replace them. |
 | Pin root | `--bpf-pin-root PATH` | Defaults to `/sys/fs/bpf` and is passed to the real backend for pinned maps. |
 | Bypass mark | `global.so_mark_from_dae` | Exact socket mark for dials, probes, DNS and downloads; zero selects the default `0x100`. Changes require restart. See [socket marks](./global.md#socket-marks). |

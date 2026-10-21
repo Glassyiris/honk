@@ -16,6 +16,9 @@ printf 'global {\n  log_file: honk.log\n}\n' | /tmp/dae-parse
 commit, and verifies each against the manifest's SHA-256; a mismatch fails with
 the file name. Nothing from dae is committed to this repository.
 
+See [conformance cases](../../crates/honk-config/conformance/README.md) for
+source selectors and failure reporting.
+
 ## Licence
 
 This tool links dae, which is licensed under AGPL-3.0-only. honk's own code,

@@ -297,9 +297,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
         let pool = Arc::clone(self);
         let shutdown_rx = self.shutdown_tx.subscribe();
-        let _ = self
+        if self
             .task_scope
-            .spawn(pool.run_janitor(idle_timeout, prewarm, shutdown_rx));
+            .spawn(pool.run_janitor(idle_timeout, prewarm, shutdown_rx))
+            .is_none()
+        {
+            self.pool.lock().janitor_running = false;
+        }
     }
 
     /// Retire the pool without cutting live streams. New offers, inserts,
@@ -343,7 +347,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
 
         let pool = Arc::clone(&self.pool);
         let state = Arc::clone(&self.state);
-        let _ = self.task_scope.spawn(async move {
+        let spawned = self.task_scope.spawn(async move {
             loop {
                 let (to_close, empty) = {
                     let mut pool = pool.lock();
@@ -378,6 +382,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
+        if spawned.is_none() {
+            // Refusal means the runtime owner is terminal; there is no
+            // remaining worker that can finish draining these sessions.
+            self.shutdown();
+        }
     }
 
     /// Shut the pool down: reject offers/inserts/prewarms, abort the

@@ -30,9 +30,15 @@ mkdir -p "$log_dir"
 for real_test in \
   ebpf::real::tests::bare_load_holds_no_tracing_links \
   ebpf::real::tests::mandatory_helpers::mandatory_programs_call_no_probe_read_helper \
-  ebpf::real::tests::socket_identity::occupied_sock_ops_slot_refuses_startup_without_leaving_links; do
+  ebpf::real::tests::socket_identity::occupied_sock_ops_slot_refuses_startup_without_leaving_links \
+  ebpf::real::receive_trace::tests::receive_trace_family_failure_is_isolated \
+  ebpf::real::receive_trace::tests::receive_trace_registration_loss_and_successful_zero_byte \
+  ebpf::real::receive_trace::tests::receive_trace_stays_armed_between_receives \
+  ebpf::real::receive_trace::tests::receive_trace_ignores_other_processes; do
   test "$("$HONK_CORE_TEST_BIN" "$real_test" --exact --ignored --list --format terse)" = "$real_test: test"
 done
+"$HONK_CORE_TEST_BIN" ebpf::real::receive_trace::tests --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-receive-trace.log"
 "$HONK_CORE_TEST_BIN" \
   ebpf::real::routing::tests \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"

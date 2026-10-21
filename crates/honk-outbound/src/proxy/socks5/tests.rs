@@ -336,6 +336,37 @@ async fn assert_udp_transport_invalid_data(datagram: &[u8]) {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
+/// A malformed relay datagram is its own UDP packet: it is dropped and the
+/// next valid one is still delivered.
+async fn assert_udp_transport_drops_only_malformed(datagram: &[u8]) {
+    let server =
+        run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
+            .await;
+    let target: SocketAddr = "198.51.100.9:53".parse().unwrap();
+    let transport = dial_udp_test_transport(&server, target, None).await;
+    let client_addr = transport_client_addr(&server, &transport).await;
+    server.relay.send_to(datagram, client_addr).await.unwrap();
+    server
+        .relay
+        .send_to(
+            &expected_socks5_udp_datagram(target, None, 0, b"valid"),
+            client_addr,
+        )
+        .await
+        .unwrap();
+
+    let mut received = [0u8; 1024];
+    let (n, source) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        transport.recv_packet(&mut received),
+    )
+    .await
+    .expect("a dropped malformed frame must not stall the transport")
+    .expect("a malformed frame must not fail the transport");
+    assert_eq!(&received[..n], b"valid");
+    assert_eq!(source, target);
+}
+
 #[tokio::test]
 async fn socks5_udp_transport_frames_ipv4_request() {
     assert_udp_transport_request_frame("198.51.100.7:53".parse().unwrap(), None).await;
@@ -540,8 +571,8 @@ async fn socks5_udp_transport_carries_empty_and_maximum_payloads() {
 }
 
 #[tokio::test]
-async fn socks5_udp_transport_rejects_invalid_domain_encoding() {
-    assert_udp_transport_invalid_data(&[
+async fn socks5_udp_transport_drops_invalid_domain_encoding() {
+    assert_udp_transport_drops_only_malformed(&[
         0x00,
         0x00,
         0x00,
@@ -621,8 +652,9 @@ async fn socks5_udp_transport_skips_fragmented_datagrams() {
 }
 
 #[tokio::test]
-async fn socks5_udp_transport_rejects_nonzero_rsv() {
-    assert_udp_transport_invalid_data(&[0x01, 0x00, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0, 53]).await;
+async fn socks5_udp_transport_drops_nonzero_rsv() {
+    assert_udp_transport_drops_only_malformed(&[0x01, 0x00, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0, 53])
+        .await;
 }
 
 #[tokio::test]
@@ -631,8 +663,17 @@ async fn socks5_udp_transport_rejects_unknown_atyp() {
 }
 
 #[tokio::test]
-async fn socks5_udp_transport_rejects_truncated_frame() {
-    assert_udp_transport_invalid_data(&[0x00, 0x00, 0x00, ATYP_IPV4, 127, 0]).await;
+async fn socks5_udp_transport_drops_truncated_frame() {
+    for datagram in [
+        &[][..],
+        &[0x00, 0x00, 0x00][..],
+        &[0x00, 0x00, 0x00, ATYP_IPV4, 127, 0][..],
+        &[0x00, 0x00, 0x00, ATYP_IPV6, 0, 0][..],
+        &[0x00, 0x00, 0x00, ATYP_DOMAIN][..],
+        &[0x00, 0x00, 0x00, ATYP_DOMAIN, 3, b'a', b'b'][..],
+    ] {
+        assert_udp_transport_drops_only_malformed(datagram).await;
+    }
 }
 
 #[tokio::test]

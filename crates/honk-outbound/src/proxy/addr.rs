@@ -173,13 +173,6 @@ impl SocksAddr {
         }
     }
 
-    /// Read one SOCKS5-ATYP address from a stream.
-    pub(crate) async fn read_from_stream<R: AsyncReadExt + Unpin>(rd: &mut R) -> io::Result<Self> {
-        let mut atyp = [0u8; 1];
-        rd.read_exact(&mut atyp).await?;
-        Self::read_body(atyp[0], rd, ATYP_SOCKS5).await
-    }
-
     /// Read the body of an address whose ATYP byte was already consumed,
     /// under the given ATYP numbering.
     pub(crate) async fn read_body<R: AsyncReadExt + Unpin>(
@@ -258,6 +251,44 @@ pub(crate) fn dialed_domain_peer(
 ) -> Option<SocketAddr> {
     (port == target.port() && dialed?.as_bytes().eq_ignore_ascii_case(domain.as_ref()))
         .then_some(target)
+}
+
+/// Read a SOCKS5 reply address without validating a domain before its frame
+/// can be drained. Only the captured domain/port projects to `target`; an
+/// unknown ATYP stays terminal.
+pub(crate) async fn read_reply_source<R: AsyncReadExt + Unpin>(
+    rd: &mut R,
+    dialed: Option<&str>,
+    target: SocketAddr,
+) -> io::Result<Option<SocketAddr>> {
+    match rd.read_u8().await? {
+        ATYP_IPV4 => {
+            let mut ip = [0u8; 4];
+            rd.read_exact(&mut ip).await?;
+            let port = rd.read_u16().await?;
+            Ok(Some(SocketAddr::new(Ipv4Addr::from(ip).into(), port)))
+        }
+        ATYP_IPV6 => {
+            let mut ip = [0u8; 16];
+            rd.read_exact(&mut ip).await?;
+            let port = rd.read_u16().await?;
+            Ok(Some(SocketAddr::new(
+                Ipv6Addr::from(ip).to_canonical(),
+                port,
+            )))
+        }
+        ATYP_DOMAIN => {
+            let len = usize::from(rd.read_u8().await?);
+            let mut name = [0u8; u8::MAX as usize];
+            rd.read_exact(&mut name[..len]).await?;
+            let port = rd.read_u16().await?;
+            Ok(dialed_domain_peer(dialed, target, &name[..len], port))
+        }
+        atyp => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown address type {atyp:#x}"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -385,20 +416,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_from_stream() {
+    async fn test_read_body() {
         let addr = SocksAddr::Domain("example.com".to_string(), 443);
         let mut buf = Vec::new();
         addr.encode(&mut buf);
-        let mut slice = &buf[..];
-        let read = SocksAddr::read_from_stream(&mut slice).await.unwrap();
+        let mut slice = &buf[1..];
+        let read = SocksAddr::read_body(buf[0], &mut slice, ATYP_SOCKS5)
+            .await
+            .unwrap();
         assert_eq!(read, addr);
 
         // Truncated stream body fails.
-        let mut short = &buf[..buf.len() - 1];
-        assert!(SocksAddr::read_from_stream(&mut short).await.is_err());
+        let mut short = &buf[1..buf.len() - 1];
+        assert!(
+            SocksAddr::read_body(buf[0], &mut short, ATYP_SOCKS5)
+                .await
+                .is_err()
+        );
         // Unknown ATYP fails.
-        let mut bad = &[0x05u8, 1, 2][..];
-        assert!(SocksAddr::read_from_stream(&mut bad).await.is_err());
+        let mut bad = &[1u8, 2][..];
+        assert!(
+            SocksAddr::read_body(0x05, &mut bad, ATYP_SOCKS5)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

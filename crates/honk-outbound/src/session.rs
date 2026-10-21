@@ -508,6 +508,16 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         backoff
     }
 
+    /// Clear our unsignalled in-flight dial (dropping the sender wakes waiters
+    /// to re-elect) and count it as a dial failure so the breaker paces redials.
+    fn abandon_dial(&self, id: u64) -> Duration {
+        let mut pool = self.pool.lock();
+        if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
+            pool.dial_done = None;
+        }
+        Self::record_dial_failure(&mut pool, &self.config)
+    }
+
     fn occupied_slots(pool: &KeyPool<S>) -> usize {
         pool.sessions
             .iter()
@@ -681,13 +691,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         // signal: clear it (dropping the sender wakes waiters
                         // to re-elect) and count the dead session as a dial
                         // failure so the breaker paces redials.
-                        let backoff = {
-                            let mut pool = self.pool.lock();
-                            if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
-                                pool.dial_done = None;
-                            }
-                            Self::record_dial_failure(&mut pool, &self.config)
-                        };
+                        let backoff = self.abandon_dial(id);
                         return Err(anyhow!(
                             "session established but immediately unusable (backoff {backoff:?})"
                         ));
@@ -700,8 +704,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let dial_scope = self
                         .task_scope
                         .sync_scope(crate::runtime::capture_dial_scope);
-                    tracing::debug!(id, "pool dial task spawned");
-                    let _ = self.task_scope.spawn(dial_scope.scope(async move {
+                    let spawned = self.task_scope.spawn(dial_scope.scope(async move {
                         let mut guard = DialGuard {
                             pool: Arc::clone(&task_pool),
                             inflight_id: id,
@@ -789,6 +792,15 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         let _ = done.send(signal);
                         capacity_notify.notify_waiters();
                     }));
+                    if spawned.is_none() {
+                        // A refused task is dropped unpolled, so its DialGuard
+                        // never exists to clear the registration.
+                        let backoff = self.abandon_dial(id);
+                        return Err(anyhow!(
+                            "session dial task refused by runtime owner (backoff {backoff:?})"
+                        ));
+                    }
+                    tracing::debug!(id, "pool dial task spawned");
                     rx
                 }
             };

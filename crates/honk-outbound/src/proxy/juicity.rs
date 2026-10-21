@@ -36,17 +36,20 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const AUTH_GRACE: Duration = Duration::ZERO;
 
 /// Read one inbound UDP frame (`[metadata][len u16][payload]`) into the
-/// caller's buffer. Oversized payloads are consumed before returning the
-/// same buffer-size error as the previous allocating path.
+/// caller's buffer. An unprojectable source is consumed whole and returned
+/// as `None`; an oversized deliverable payload is consumed before returning
+/// a buffer-size error.
 async fn read_udp_frame(
     recv: &mut quinn::RecvStream,
     payload: &mut [u8],
-) -> io::Result<(JuiceAddr, usize)> {
-    let addr = JuiceAddr::read_from_stream(recv).await?;
+    target: SocketAddr,
+    target_domain: Option<&str>,
+) -> io::Result<Option<(SocketAddr, usize)>> {
+    let peer = super::addr::read_reply_source(recv, target_domain, target).await?;
     let mut len = [0u8; 2];
     read_exact(recv, &mut len).await?;
     let payload_len = u16::from_be_bytes(len) as usize;
-    if payload_len > payload.len() {
+    let Some(peer) = peer.filter(|_| payload_len <= payload.len()) else {
         let mut discard = [0u8; 512];
         let mut remaining = payload_len;
         while remaining != 0 {
@@ -54,13 +57,17 @@ async fn read_udp_frame(
             read_exact(recv, &mut discard[..chunk]).await?;
             remaining -= chunk;
         }
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "juicity datagram exceeds buffer",
-        ));
-    }
+        return if peer.is_some() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "juicity datagram exceeds buffer",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
     read_exact(recv, &mut payload[..payload_len]).await?;
-    Ok((addr, payload_len))
+    Ok(Some((peer, payload_len)))
 }
 
 /// Per-QUIC-connection protocol state.
@@ -590,23 +597,12 @@ impl PacketTransport for JuicityUdpTransport {
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut recv = self.recv.lock().await;
         loop {
-            let (addr, payload_len) = read_udp_frame(&mut recv, buf)
-                .await
-                .map_err(super::quic_carrier_io_error)?;
-            let peer = match addr {
-                JuiceAddr::V4(peer) => peer.into(),
-                JuiceAddr::V6(peer) => SocketAddr::new(peer.ip().to_canonical(), peer.port()),
-                // The frame is already consumed; an unprojectable name is
-                // not resolved and does not end the stream.
-                JuiceAddr::Domain(domain, port) => match super::addr::dialed_domain_peer(
-                    self.target_domain.as_deref(),
-                    self.target,
-                    domain,
-                    port,
-                ) {
-                    Some(peer) => peer,
-                    None => continue,
-                },
+            let Some((peer, payload_len)) =
+                read_udp_frame(&mut recv, buf, self.target, self.target_domain.as_deref())
+                    .await
+                    .map_err(super::quic_carrier_io_error)?
+            else {
+                continue;
             };
             return Ok((payload_len, peer));
         }

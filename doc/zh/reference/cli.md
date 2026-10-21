@@ -89,7 +89,7 @@ UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启�
 
 | 项 | 控制方式 | 当前不变量 |
 | --- | --- | --- |
-| eBPF 目标文件 | 内嵌目标文件或 `--bpf-object PATH` | 启用 `ebpf` feature 时，`build.rs` 提供由 `include_bytes!` 内嵌的目标文件；该参数在运行时替换这些字节。未启用 `ebpf` 的构建使用 mock 后端。 |
+| eBPF 目标文件 | 内嵌目标文件或 `--bpf-object PATH` | 启用 `ebpf` feature 时，`build.rs` 提供由 `include_bytes!` 内嵌的目标文件；该参数在运行时替换这些字节。对象声明的 `ByName` pinning 会在 probe/loading 前被拒绝：需使用未 pin 的 map 重新构建，将 pin 路径交由 core 管理。未启用 `ebpf` 的构建使用 mock 后端。 |
 | 内核 BTF | `HONK_VMLINUX_BTF`、`/sys/kernel/btf/vmlinux` 或 `/usr/lib/debug/boot/vmlinux` | 未覆盖时读取 `/sys/kernel/btf/vmlinux`，不可读时再读取 `/usr/lib/debug/boot/vmlinux`（OpenWrt `vmlinux-btf` 包）。只接受原始 BTF；若只有 ELF 格式的 debug vmlinux，需先提取其 `.BTF` 段，再用该变量指向提取结果。所选 BTF 统一提供内核字段偏移、Aya loader 的目标 BTF 和接收追踪的函数签名。BTF 缺失或无效时拒绝启动。内核 argv 捕获不可用时仍可回退到线程 `comm`。原生 UDP 接收追踪另需内核自带 BTF 与 ftrace，缺少时降级运行；外部文件不能替代它们。 |
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
 | Bypass mark | `global.so_mark_from_dae` | 拨号、探测、DNS 与下载使用的精确 socket mark；零值选择默认 `0x100`。修改需重启，见[套接字 mark](./global.md#套接字-mark)。 |

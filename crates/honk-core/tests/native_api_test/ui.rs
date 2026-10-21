@@ -419,9 +419,10 @@ async fn slow_public_file_readers_release_capacity_at_the_connection_deadline() 
     })
     .await;
     let mut peers = Vec::new();
-    for _ in 0..64 {
+    for i in 0..64 {
         let socket = TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(1024).unwrap();
+        socket.bind(([127, 0, 0, 2 + i / 16], 0).into()).unwrap();
         let mut stream = socket.connect(app.addr).await.unwrap();
         stream
             .write_all(
@@ -446,6 +447,19 @@ async fn slow_public_file_readers_release_capacity_at_the_connection_deadline() 
         assert!(header.starts_with("http/1.1 200 "));
         assert!(header.contains(&format!("content-length: {file_size}")));
         peers.push(stream);
+        if i == 15 {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.bind(([127, 0, 0, 2], 0).into()).unwrap();
+            let mut rejected = socket.connect(app.addr).await.unwrap();
+            assert_eq!(
+                timeout(IO_TIMEOUT, rejected.read(&mut [0]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "the seventeenth connection from one IP closes without an HTTP response"
+            );
+        }
     }
     let mut waiting = TcpStream::connect(app.addr).await.unwrap();
     waiting.write_all(format!("GET /api HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {SECRET}\r\nConnection: close\r\n\r\n", app.addr).as_bytes()).await.unwrap();

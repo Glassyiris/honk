@@ -583,6 +583,66 @@ async fn shared_source_foreign_reply_requires_vacant_live_owner() {
 }
 
 #[tokio::test]
+async fn shared_source_retired_peer_limit_warns_once_and_keeps_bound_replies() {
+    use super::source::SourceEndpoint;
+    use tracing_subscriber::prelude::*;
+
+    struct Warnings(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                for field in ["client", "outbound", "protocol", "retired_peers"] {
+                    assert!(event.metadata().fields().field(field).is_some());
+                }
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings))),
+    );
+    let f = Fixture::new(false, 16).await;
+    let (client, bound, foreign) = (f.client(), f.target(0), f.target(1));
+    let endpoint = f.flow(0, b"bound").await;
+    let transport = f.transport();
+    transport.reply(foreign, b"before-limit");
+    assert_eq!(
+        received(&f.client).await,
+        (b"before-limit".to_vec(), foreign)
+    );
+    let reply_socket = Arc::new(f.pool.create_reply_socket(bound).unwrap());
+    for index in 0..66 {
+        let target = SocketAddr::from(([192, 0, 2, 1], 10000 + index));
+        let view = SourceEndpoint::new(
+            f.attach(client, target, None).await,
+            target,
+            None,
+            Arc::clone(&reply_socket),
+            f.stats
+                .outbound_tracker(&f.node.name, crate::stats::OutboundKind::Node),
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            view.retire(&AtomicBool::new(false));
+            view.retire(&AtomicBool::new(false));
+        });
+        assert_eq!(warnings.load(Ordering::SeqCst), usize::from(index >= 64));
+    }
+    transport.reply(foreign, b"after-limit");
+    no_reply(&f.client).await;
+    transport.reply(bound, b"still-bound");
+    assert_eq!(received(&f.client).await, (b"still-bound".to_vec(), bound));
+    drop((endpoint, transport, reply_socket));
+    f.shutdown().await;
+}
+
+#[tokio::test]
 async fn shared_source_terminal_error_retires_every_view() {
     for fail_send in [false, true] {
         let f = Fixture::new(false, 16).await;

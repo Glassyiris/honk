@@ -1,6 +1,23 @@
 use super::*;
 use anyhow::Context as _;
 
+struct StartupPins<'a> {
+    root: &'a Path,
+    names: Vec<String>,
+}
+
+impl Drop for StartupPins<'_> {
+    fn drop(&mut self) {
+        for name in &self.names {
+            if let Err(error) = std::fs::remove_file(self.root.join(name))
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                debug!(map = name, %error, "remove failed-start eBPF map pin");
+            }
+        }
+    }
+}
+
 impl RealEbpfBackend {
     pub async fn load(
         obj: &[u8],
@@ -163,7 +180,10 @@ impl RealEbpfBackend {
             }
         }
         let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
-        let mut pinned_maps = Vec::new();
+        let mut pinned_maps = StartupPins {
+            root: pin_root,
+            names: Vec::new(),
+        };
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
             // These cannot be pinned to bpffs; skip them to avoid noisy warnings.
@@ -171,13 +191,11 @@ impl RealEbpfBackend {
                 debug!("skipping internal map '{}'", name);
                 continue;
             }
-            if name == UDP_DECISION_SEQUENCE_MAP {
+            if name == UDP_DECISION_SEQUENCE_MAP || name == routing::ROUTING_GENERATION_SEQUENCE_MAP
+            {
                 continue;
             }
             let pin_path = pin_root.join(name);
-            // Recorded before the attempt, not after it: a stale pin whose unlink and re-pin both
-            // fail still belongs to us, and cleanup is the next chance to remove it.
-            pinned_maps.push(name.to_owned());
             if let Err(error) = std::fs::remove_file(&pin_path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -186,6 +204,9 @@ impl RealEbpfBackend {
             if let Err(e) = map.pin(&pin_path) {
                 warn!("pin '{}': {}", name, e);
             } else {
+                // Only successful new pins belong to this attempt; failed replacement leaves
+                // a pre-existing pin owned by someone else.
+                pinned_maps.names.push(name.to_owned());
                 debug!("pinned '{}'", name);
             }
         }
@@ -194,11 +215,8 @@ impl RealEbpfBackend {
             .ok_or_else(|| anyhow::anyhow!("required EVENT_RINGBUF map not found"))?;
         let event_ring = aya::maps::RingBuf::try_from(event_map)
             .map_err(|error| anyhow::anyhow!("required EVENT_RINGBUF open: {error}"))?;
-        let event_fd =
-            tokio::io::unix::AsyncFd::with_interest(event_ring, tokio::io::Interest::READABLE)
-                .map_err(|error| {
-                    anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}")
-                })?;
+        let event_fd = crate::async_fd::with_interest(event_ring, tokio::io::Interest::READABLE)
+            .map_err(|error| anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}"))?;
         match pname_mode {
             process_name::PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")
@@ -482,8 +500,7 @@ impl RealEbpfBackend {
         let log_flush_handle = match aya_log::EbpfLogger::init(&mut bpf) {
             Ok(logger) => {
                 debug!("eBPF logger initialized");
-                match tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)
-                {
+                match crate::async_fd::with_interest(logger, tokio::io::Interest::READABLE) {
                     Ok(async_logger) => Some(tokio::spawn(async move {
                         let mut async_logger = async_logger;
                         loop {
@@ -523,7 +540,7 @@ impl RealEbpfBackend {
         Ok(Self {
             bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
-            pinned_maps,
+            pinned_maps: std::mem::take(&mut pinned_maps.names),
             interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,

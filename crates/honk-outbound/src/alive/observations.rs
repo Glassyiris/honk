@@ -1,6 +1,6 @@
 use super::{AliveDialerSet, IpVersion, ProbeDomain, RegisteredNode};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -134,11 +134,71 @@ pub(super) struct RetainedHealth {
     averages: LatencyAverages,
 }
 
+const GROUP_SAMPLES: usize = 4096;
+
 #[derive(Default)]
 pub(super) struct HealthHistory {
-    pub nodes: HashMap<Uuid, Vec<RetainedHealth>>,
-    pub groups: VecDeque<GroupHealthObservation>,
+    nodes: HashMap<Uuid, Vec<RetainedHealth>>,
+    groups: Vec<GroupHealthObservation>,
+    /// Second-chance marks parallel to `groups`: an accepted update marks its key,
+    /// and a full table replaces the first unmarked key from `group_hand`, clearing
+    /// marks as it passes. A hit stays as cheap as a lookup and eviction is
+    /// amortized O(1); keeping the marks apart leaves each row at its natural size.
+    group_recent: Vec<bool>,
+    group_hand: usize,
     epoch: Option<Uuid>,
+}
+
+/// An earlier wall time is a stale completion, unless the retained sample is
+/// itself in the future: the clock stepped back since it was taken.
+fn stale(observation: &HealthObservation, retained: &HealthObservation) -> bool {
+    observation.observed_at < retained.observed_at && retained.observed_at <= SystemTime::now()
+}
+
+impl HealthHistory {
+    // ponytail: at most 4096 fixed-size group tuples; add an index only if probe cost warrants it.
+    fn record_group(&mut self, sample: GroupHealthObservation) -> bool {
+        let hit = self.groups.iter().position(|old| {
+            old.group_id == sample.group_id
+                && old.member_id == sample.member_id
+                && old.observation.same_key(&sample.observation)
+        });
+        match hit {
+            Some(index) => {
+                if stale(&sample.observation, &self.groups[index].observation) {
+                    return false;
+                }
+                self.groups[index] = sample;
+                self.group_recent[index] = true;
+            }
+            None if self.groups.len() < GROUP_SAMPLES => {
+                self.groups.push(sample);
+                self.group_recent.push(false);
+            }
+            None => {
+                let mut at = self.group_hand % GROUP_SAMPLES;
+                while std::mem::take(&mut self.group_recent[at]) {
+                    at = (at + 1) % GROUP_SAMPLES;
+                }
+                self.groups[at] = sample;
+                self.group_hand = at + 1;
+            }
+        }
+        true
+    }
+
+    fn clear_groups(&mut self) {
+        self.groups.clear();
+        self.group_recent.clear();
+    }
+
+    /// Dropping rows shifts indices, so the marks restart; they only bias replacement.
+    pub(super) fn remove_node(&mut self, node: Uuid) {
+        self.nodes.remove(&node);
+        self.groups.retain(|sample| sample.node_id != node);
+        self.group_recent.clear();
+        self.group_recent.resize(self.groups.len(), false);
+    }
 }
 
 impl HealthObservation {
@@ -178,6 +238,9 @@ impl HealthObservation {
         }
     }
 
+    /// Out of line so the group scan keeps its two ids in registers; inlined, the
+    /// key bytes spill them and the 4096-row scan slows by about a quarter.
+    #[inline(never)]
     fn same_key(&self, other: &Self) -> bool {
         self.transport == other.transport
             && self.purpose == other.purpose
@@ -299,11 +362,11 @@ impl AliveDialerSet {
             .iter_mut()
             .find(|old| old.observation.same_key(&observation))
         {
-            if observation.observed_at < previous.observation.observed_at {
+            if stale(&observation, &previous.observation) {
                 return false;
             }
             // A replay at the same instant must not weigh twice.
-            if observation.observed_at > previous.observation.observed_at
+            if observation.observed_at != previous.observation.observed_at
                 && let Some(latency) = observation.latency
             {
                 previous.averages.fold(latency);
@@ -349,14 +412,14 @@ impl AliveDialerSet {
     pub fn invalidate_group_health_observations(&self) {
         if let Some(retained) = self.health_observations.write().as_mut() {
             retained.epoch = None;
-            retained.groups.clear();
+            retained.clear_groups();
         }
     }
 
     pub(super) fn reset_group_health_observations(&self) {
         if let Some(retained) = self.health_observations.write().as_mut() {
             retained.epoch = Some(Uuid::new_v4());
-            retained.groups.clear();
+            retained.clear_groups();
         }
     }
 
@@ -395,23 +458,7 @@ impl AliveDialerSet {
             node_id: node,
             observation,
         };
-        // ponytail: at most 4096 fixed-size group tuples; add an index only if probe cost warrants it.
-        if let Some(old) = retained.groups.iter_mut().find(|old| {
-            old.group_id == context.group_id
-                && old.member_id == context.member_id
-                && old.observation.same_key(&observation)
-        }) {
-            if observation.observed_at < old.observation.observed_at {
-                return false;
-            }
-            *old = sample;
-        } else {
-            if retained.groups.len() == 4096 {
-                retained.groups.pop_front();
-            }
-            retained.groups.push_back(sample);
-        }
-        true
+        retained.record_group(sample)
     }
 }
 
@@ -545,6 +592,38 @@ mod tests {
             set.group_health_observations(context.group_id)[0].observation,
             sample()
         );
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_freeze_retention() {
+        let set = AliveDialerSet::new();
+        let node = Uuid::from_u128(1);
+        set.enable_health_history();
+        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        let context = GroupProbeContext {
+            group_id: Uuid::from_u128(2),
+            member_id: node,
+        };
+        let at = |observed_at, latency| HealthObservation {
+            observed_at,
+            latency: Some(Duration::from_millis(latency)),
+            ..sample()
+        };
+        let before_step = at(SystemTime::now() + Duration::from_secs(3600), 100);
+        let ticket = set.probe_ticket(node);
+        assert!(set.complete_probe(&ticket, Some(context), before_step));
+        assert!(set.complete_probe(&ticket, None, before_step));
+        let after_step = at(SystemTime::now(), 200);
+        assert!(set.complete_probe(&ticket, Some(context), after_step));
+        assert!(set.complete_probe(&ticket, None, after_step));
+        assert_eq!(set.health_observations(node), [after_step]);
+        assert_eq!(
+            set.group_health_observations(context.group_id)[0].observation,
+            after_step
+        );
+        let averages = set.health_samples(node)[0].1;
+        let expected = Some(Duration::from_millis(150));
+        assert_eq!((averages.moving, averages.avg10), (expected, expected));
     }
 
     #[test]

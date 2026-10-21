@@ -125,9 +125,11 @@ async fn reconcile_selector_warm(
     let previous = selected_ids.lock().clone();
     for node_id in previous.difference(&desired) {
         if let Some(runtime) = generation.get(node_id) {
-            runtime
-                .release_warm(honk_outbound::runtime::WarmRetention::Selector)
-                .await;
+            tokio::select! {
+                biased;
+                _ = stop.changed() => return,
+                _ = runtime.release_warm(honk_outbound::runtime::WarmRetention::Selector) => {}
+            }
         }
         stats.clear_warm(*node_id, crate::stats::WarmReason::Selector);
     }
@@ -461,11 +463,14 @@ pub(super) async fn run_udp_warm_coordinator<F, Fut>(
             let candidates = udp_warm_candidates(&cfg, &manager, &generation, count);
             (interval, count != 0, candidates)
         };
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            _ = reconcile_udp_warm_retention(&candidates, &generation, &stats, &retained_ids) => {}
+        }
         if !has_work {
-            reconcile_udp_warm_retention(&[], &generation, &stats, &retained_ids).await;
             return;
         }
-        reconcile_udp_warm_retention(&candidates, &generation, &stats, &retained_ids).await;
         run_udp_warm_dispatches(
             candidates,
             generation.clone(),

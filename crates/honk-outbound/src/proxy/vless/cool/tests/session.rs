@@ -1,5 +1,29 @@
 use super::*;
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn refused_end_task_closes_the_carrier() {
+    let owner = Arc::new(crate::runtime::TaskOwner::default());
+    let (session, _wire) = owner
+        .scope(async {
+            let (client, wire) = tokio::io::duplex(1 << 16);
+            Ok((connect(Box::new(client), MAX_STREAMS_PER_SESSION), wire))
+        })
+        .await
+        .unwrap();
+    let id = session
+        .allocate_id()
+        .unwrap_or_else(|_| panic!("session ID must be available"));
+    owner.abort();
+
+    assert_eq!(
+        session.schedule_end(id).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert!(session.is_closed());
+    owner.close().await;
+}
+
 #[tokio::test]
 async fn fragmented_and_coalesced_responses_are_demultiplexed() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);

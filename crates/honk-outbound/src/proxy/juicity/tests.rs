@@ -98,7 +98,7 @@ async fn handle_connection(conn: quinn::Connection, password: &'static str) {
             }
             match network[0] {
                 NETWORK_TCP => {
-                    if JuiceAddr::read_from_stream(&mut recv).await.is_err() {
+                    if read_peer(&mut recv).await.is_none() {
                         return;
                     }
                     let mut buf = [0u8; 8192];
@@ -114,19 +114,22 @@ async fn handle_connection(conn: quinn::Connection, password: &'static str) {
                     }
                 }
                 NETWORK_UDP => {
-                    if JuiceAddr::read_from_stream(&mut recv).await.is_err() {
+                    if read_peer(&mut recv).await.is_none() {
                         return;
                     }
-                    let mut payload = vec![0u8; u16::MAX as usize];
                     loop {
-                        let Ok((addr, payload_len)) = read_udp_frame(&mut recv, &mut payload).await
-                        else {
+                        let Some(peer) = read_peer(&mut recv).await else {
                             return;
                         };
-                        let mut frame = Vec::with_capacity(addr.encoded_len() + 2 + payload_len);
-                        addr.encode(&mut frame);
-                        frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
-                        frame.extend_from_slice(&payload[..payload_len]);
+                        let mut len = [0u8; 2];
+                        if read_exact(&mut recv, &mut len).await.is_err() {
+                            return;
+                        }
+                        let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
+                        if read_exact(&mut recv, &mut payload).await.is_err() {
+                            return;
+                        }
+                        let frame = wire_frame(&peer, &payload);
                         if send.write_all(&frame).await.is_err() {
                             return;
                         }
@@ -539,6 +542,17 @@ async fn captured_domain_projects_and_unknown_domains_drop() {
         recv(&*transport).await,
         ("203.0.113.9:1".parse().unwrap(), Vec::new())
     );
+
+    for name in [&b""[..], &[0xff, 0xfe][..]] {
+        let mut burst = vec![3, name.len() as u8];
+        burst.extend(name);
+        burst.extend(443u16.to_be_bytes());
+        burst.extend(5u16.to_be_bytes());
+        burst.extend(b"stale");
+        burst.extend(wire_frame(&Peer::Name("example.test", 443), b"valid"));
+        stream.cmd.send(Cmd::Bytes(burst)).unwrap();
+        assert_eq!(recv(&*transport).await, (target, b"valid".to_vec()));
+    }
 }
 
 #[tokio::test]

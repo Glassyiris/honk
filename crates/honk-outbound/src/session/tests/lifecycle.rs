@@ -319,6 +319,21 @@ async fn shutdown_before_ensure_does_not_register_janitor_or_prewarm() {
     assert_eq!(prewarm_calls.load(Ordering::Relaxed), 0);
 }
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn refused_janitor_spawn_does_not_register_a_running_worker() {
+    let owner = Arc::new(crate::runtime::TaskOwner::default());
+    let mut pool = pool(SessionPoolConfig::default());
+    pool.task_scope = owner.task_scope();
+    owner.abort();
+    let pool = Arc::new(pool);
+
+    pool.ensure_janitor(1, Duration::from_secs(60), || async {
+        Ok(TestSession::new())
+    });
+    assert!(!pool.pool.lock().janitor_running);
+}
+
 #[tokio::test(start_paused = true)]
 async fn shutdown_before_first_janitor_poll_exits_without_mutating_pool() {
     let pool = Arc::new(pool(SessionPoolConfig {
@@ -729,6 +744,37 @@ async fn dead_on_arrival_session_engages_the_breaker() {
     assert_eq!(dials.load(Ordering::Relaxed), 2);
 }
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test(start_paused = true)]
+async fn refused_dial_spawn_leaves_no_phantom_dial() {
+    let owner = Arc::new(crate::runtime::TaskOwner::default());
+    let mut pool = pool(SessionPoolConfig::default());
+    pool.task_scope = owner.task_scope();
+    owner.abort();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        pool.offer(|| async { Ok(TestSession::new()) }),
+    )
+    .await
+    .expect("refused dial must not leave an offer waiting");
+    assert!(result.is_err());
+    assert!(pool.pool.lock().dial_done.is_none());
+    assert_eq!(pool.pool.lock().dial_failures, 1);
+
+    // A fresh scope isolates registration cleanup from the terminal owner.
+    pool.task_scope = crate::runtime::TaskScope::default();
+    tokio::time::advance(pool.config.dial_backoff).await;
+    let session = tokio::time::timeout(
+        Duration::from_secs(5),
+        pool.offer(|| async { Ok(TestSession::new()) }),
+    )
+    .await
+    .expect("following offer must be able to elect a dial")
+    .unwrap();
+    assert!(!session.is_closed());
+}
+
 #[tokio::test(start_paused = true)]
 async fn closed_sessions_are_pruned() {
     let pool = pool(SessionPoolConfig::default());
@@ -792,6 +838,23 @@ async fn retirement_rejects_new_work_but_drains_live_sessions() {
     tokio::time::advance(Duration::from_millis(20)).await;
     tokio::task::yield_now().await;
     assert!(session.is_closed(), "drained sessions must close promptly");
+    assert_eq!(pool.metrics().sessions, 0);
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn refused_retirement_spawn_closes_sessions_without_a_worker() {
+    let owner = Arc::new(crate::runtime::TaskOwner::default());
+    let mut pool = pool(SessionPoolConfig::default());
+    pool.task_scope = owner.task_scope();
+    let session = TestSession::new();
+    pool.insert(&session);
+    owner.abort();
+
+    pool.retire();
+
+    assert!(session.is_closed());
+    assert_eq!(pool.state(), PoolState::Closed);
     assert_eq!(pool.metrics().sessions, 0);
 }
 

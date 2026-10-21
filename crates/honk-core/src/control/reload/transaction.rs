@@ -835,16 +835,6 @@ impl ControlPlane {
             .retire_generation(old_registry.generation());
         self.stop_udp_warm_coordinator().await;
         self.stop_selector_warm_coordinator().await;
-        #[cfg(feature = "native-api")]
-        if mode_reset_failed {
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
-            drain.start_rejecting();
-            self.drain_tracker.start_rejecting();
-            return Ok(ReloadOutcome::CommittedDegraded {
-                generation: generation.get(),
-            });
-        }
         self.start_udp_warm_coordinator(Arc::clone(&new_runtime_registry))
             .await;
         self.start_selector_warm_coordinator(new_runtime_registry)
@@ -856,6 +846,16 @@ impl ControlPlane {
                 .sync_urltest_groups(&urltest_group_registrations(&config));
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
+        }
+        #[cfg(feature = "native-api")]
+        if mode_reset_failed {
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return Ok(ReloadOutcome::CommittedDegraded {
+                generation: generation.get(),
+            });
         }
         self.open_pending_udp_admission();
         #[cfg(test)]

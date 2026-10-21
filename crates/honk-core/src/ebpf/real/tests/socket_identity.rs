@@ -1,5 +1,6 @@
 use super::raw_bpf::{EXIT, MOV64_IMM, insn, load_program};
 use super::*;
+use aya::maps::IterableMap as _;
 use aya_obj::generated::{
     bpf_attach_type::BPF_CGROUP_SOCK_OPS,
     bpf_attr,
@@ -245,6 +246,16 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
     let foreign = LegacySockOps::attach(cgroup).expect("install legacy root sock_ops program");
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-sock-ops-slot-{}", std::process::id()));
+    std::fs::create_dir(&pin_root).unwrap();
+    let foreign_pin = pin_root.join("FOREIGN_PIN");
+    let foreign_map = AyaArray::<_, u64>::create(1, 0).unwrap();
+    foreign_map.map().pin(&foreign_pin).unwrap();
+    let foreign_map_id = foreign_map.map().info().unwrap().id();
+    drop(foreign_map);
+    let routing_pin = pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP);
+    let routing_sequence = routing::open_routing_generation_sequence(&routing_pin).unwrap();
+    let routing_map_id = routing_sequence.map().info().unwrap().id();
+    drop(routing_sequence);
     let links_before = held_bpf_link_count();
     let programs_before = cgroup_attached_prog_count(foreign.cgroup.as_raw_fd());
 
@@ -271,5 +282,23 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
         programs_before,
         "failed startup retained cgroup programs"
     );
-    std::fs::remove_dir_all(pin_root).unwrap();
+    let retained = [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+        "FOREIGN_PIN",
+    ];
+    assert_eq!(
+        aya::maps::MapInfo::from_pin(&foreign_pin).unwrap().id(),
+        foreign_map_id,
+        "failed startup replaced a foreign pin"
+    );
+    assert_eq!(
+        aya::maps::MapInfo::from_pin(&routing_pin).unwrap().id(),
+        routing_map_id,
+        "failed startup replaced the persistent routing sequence"
+    );
+    for name in retained {
+        std::fs::remove_file(pin_root.join(name)).unwrap();
+    }
+    std::fs::remove_dir(pin_root).unwrap();
 }

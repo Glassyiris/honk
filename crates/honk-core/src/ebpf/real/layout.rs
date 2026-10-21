@@ -7,6 +7,12 @@ use honk_ebpf_common::event::DaeEvent;
 
 pub(super) fn validate_object(obj: &[u8]) -> anyhow::Result<()> {
     let object = aya_obj::Object::parse(obj)?;
+    for (name, map) in &object.maps {
+        anyhow::ensure!(
+            map.pinning() == aya_obj::maps::PinningType::None,
+            "eBPF object map {name} declares implicit pinning; rebuild without pinning so the loader owns every pin"
+        );
+    }
     let data = object
         .btf
         .as_ref()
@@ -250,6 +256,104 @@ pub(super) fn validate_socket_identity(bpf: &Ebpf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aya_obj::maps::{Map, PinningType};
+
+    fn unique_offset(data: &[u8], needle: &[u8]) -> usize {
+        let mut offsets = data
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset));
+        let offset = offsets.next().expect("object metadata must be present");
+        assert!(offsets.next().is_none(), "object metadata must be unique");
+        offset
+    }
+
+    fn assert_implicit_pinning_rejected(data: &[u8], pinned_name: &str) {
+        validate_object(crate::DEFAULT_BPF_OBJECT).expect("canonical object must be accepted");
+        let original = aya_obj::Object::parse(crate::DEFAULT_BPF_OBJECT).unwrap();
+        let pinned = aya_obj::Object::parse(data).unwrap();
+        let abi = |map: &Map| {
+            (
+                map.map_type(),
+                map.key_size(),
+                map.value_size(),
+                map.max_entries(),
+                map.map_flags(),
+                map.map_extra(),
+            )
+        };
+        assert_eq!(original.maps.len(), pinned.maps.len());
+        for (name, map) in &original.maps {
+            assert_eq!(map.pinning(), PinningType::None);
+            let changed = &pinned.maps[name];
+            assert_eq!(abi(map), abi(changed), "map ABI changed for {name}");
+            assert_eq!(
+                changed.pinning(),
+                if name == pinned_name {
+                    PinningType::ByName
+                } else {
+                    PinningType::None
+                },
+                "unexpected pinning for {name}"
+            );
+        }
+        let error = validate_object(data)
+            .expect_err("object-declared implicit pinning must be rejected before loading");
+        assert!(error.to_string().contains(pinned_name), "{error:#}");
+    }
+
+    #[test]
+    fn object_layout_rejects_legacy_implicit_pinning() {
+        let object = aya_obj::Object::parse(crate::DEFAULT_BPF_OBJECT).unwrap();
+        let Map::Legacy(map) = &object.maps["RECEIVE_TRACE"] else {
+            panic!("RECEIVE_TRACE must use legacy map metadata");
+        };
+        let def = map.def;
+        let metadata: Vec<_> = [
+            def.map_type,
+            def.key_size,
+            def.value_size,
+            def.max_entries,
+            def.map_flags,
+            def.id,
+            def.pinning as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        let mut data = crate::DEFAULT_BPF_OBJECT.to_vec();
+        let offset = unique_offset(&data, &metadata)
+            + core::mem::offset_of!(aya_obj::maps::bpf_map_def, pinning);
+        data[offset..offset + 4].copy_from_slice(&(PinningType::ByName as u32).to_le_bytes());
+        assert_implicit_pinning_rejected(&data, "RECEIVE_TRACE");
+    }
+
+    #[test]
+    fn object_layout_rejects_btf_implicit_pinning() {
+        let object = aya_obj::Object::parse(crate::DEFAULT_BPF_OBJECT).unwrap();
+        assert!(matches!(
+            object.maps["FLOW_INCARNATION_SEQUENCE"],
+            Map::Btf(_)
+        ));
+        let raw = object.btf.as_ref().unwrap().to_bytes();
+        let btf = btf::Btf::parse(&raw).unwrap();
+        let var = btf.find_type(14, "FLOW_INCARNATION_SEQUENCE").unwrap();
+        let def = btf.resolve_composite(btf.u32_at(var + 8).unwrap()).unwrap();
+        let flags = (0..btf.u32_at(def + 4).unwrap() & 0xffff)
+            .map(|index| def + 12 + index as usize * 12)
+            .find(|member| btf.string(btf.u32_at(*member).unwrap()) == Some("map_flags"))
+            .unwrap();
+        let entries = btf.direct_member(def, "max_entries").unwrap().0;
+        let strings =
+            btf::BTF_HEADER_LEN + u32::from_le_bytes(raw[16..20].try_into().unwrap()) as usize;
+        let pinning = unique_offset(&raw[strings..], b"pinning\0") as u32;
+        let mut data = crate::DEFAULT_BPF_OBJECT.to_vec();
+        let offset = unique_offset(&data, &raw) + flags;
+        // Omitting the zero-valued map_flags field preserves the map ABI.
+        data[offset..offset + 4].copy_from_slice(&pinning.to_le_bytes());
+        data[offset + 4..offset + 8].copy_from_slice(&entries.to_le_bytes());
+        assert_implicit_pinning_rejected(&data, "FLOW_INCARNATION_SEQUENCE");
+    }
 
     #[test]
     fn lifetime_layout_rejects_implicit_padding_and_stale_incarnation() {

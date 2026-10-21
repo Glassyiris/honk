@@ -68,6 +68,8 @@ CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
 ```
 
+A missing or incompatible `udp_recvmsg` or `udpv6_recvmsg` hook disables only that socket family's fallback; the shared `__skb_recv_udp` hook is required by both. A partial or failed fallback attachment is not retried on listener reload: restart after changing kernel/BTF support. See [receive-trace ownership](./design/control-plane.md#startup-and-shutdown).
+
 ### bpffs
 
 eBPF maps must be pinned on bpffs, not an ordinary directory:

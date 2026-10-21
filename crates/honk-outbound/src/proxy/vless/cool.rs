@@ -362,7 +362,7 @@ impl VlessCoolSession {
         }
         let session = Arc::clone(self);
         let writer = self.writer.clone();
-        let _ = self.task_scope.spawn(async move {
+        let spawned = self.task_scope.spawn(async move {
             let failure =
                 match tokio::time::timeout(WRITER_IO_TIMEOUT, writer.send(end_frame(id), true))
                     .await
@@ -376,6 +376,13 @@ impl VlessCoolSession {
                 };
             session.fail(failure);
         });
+        if spawned.is_none() {
+            self.fail(Failure::new(
+                io::ErrorKind::Interrupted,
+                "Mux.Cool runtime owner closed before END delivery",
+            ));
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         Ok(())
     }
 

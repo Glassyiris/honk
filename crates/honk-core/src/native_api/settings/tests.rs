@@ -78,6 +78,19 @@ fn invalid_cross_recorder_patch_is_atomic_and_activation_restores_config() {
         false
     );
 }
+
+#[derive(Clone, Default)]
+struct Sink(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn a_runtime_level_reaches_console_and_file_until_activation() {
     use tracing_subscriber::{EnvFilter, prelude::*};
@@ -85,17 +98,6 @@ fn a_runtime_level_reaches_console_and_file_until_activation() {
         "native_api::settings::tests::a_runtime_level_reaches_console_and_file_until_activation",
     ) {
         return;
-    }
-    #[derive(Clone, Default)]
-    struct Sink(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
     let mut config = Config::default();
     config.global.log_level = "warn".into();
@@ -145,6 +147,72 @@ fn a_runtime_level_reaches_console_and_file_until_activation() {
     assert_eq!(emitted(), [true, true]);
     owner.settings.activate(&owner, &config);
     assert_eq!(emitted(), [false, false]);
+}
+
+#[test]
+fn weak_non_loopback_tokens_warn_once_per_activation_without_logging_the_secret() {
+    if super::super::logs::tests::run_isolated(
+        "native_api::settings::tests::weak_non_loopback_tokens_warn_once_per_activation_without_logging_the_secret",
+    ) {
+        return;
+    }
+    const SECRET: &str = "123456789abcdef";
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .without_time()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let warnings = || {
+        let bytes = std::mem::take(&mut *sink.0.lock());
+        assert!(!String::from_utf8_lossy(&bytes).contains(SECRET));
+        serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<serde_json::Value>()
+            .map(Result::unwrap)
+            .filter(|event| event["level"] == "WARN")
+            .collect::<Vec<_>>()
+    };
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut config = Config::default();
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.listen = "0.0.0.0:9527".into();
+        config.experimental.native_api.secret = SECRET.into();
+        config
+            .validate_detailed()
+            .expect("a short token is still accepted");
+        let owner = NativeObservation::new(&config);
+        let startup = warnings();
+        assert_eq!(startup.len(), 1, "startup warns once");
+        assert_eq!(startup[0]["fields"]["listen"], "0.0.0.0:9527");
+        assert_eq!(startup[0]["fields"]["secret_length"], SECRET.len());
+
+        owner.settings.activate(&owner, &config);
+        assert_eq!(warnings().len(), 1, "reactivation warns once");
+
+        for (enabled, listen, secret, password_auth) in [
+            (true, "0.0.0.0:9527", "123456789abcdef0", false),
+            (true, "127.0.0.1:9527", SECRET, false),
+            (true, "[::1]:9527", SECRET, false),
+            (true, "[::ffff:127.0.0.1]:9527", SECRET, false),
+            (true, "0.0.0.0:9527", "", true),
+            (true, "127.0.0.1:9527", "", false),
+            (false, "0.0.0.0:9527", SECRET, false),
+        ] {
+            let native = &mut config.experimental.native_api;
+            native.enabled = enabled;
+            native.listen = listen.into();
+            native.secret = secret.into();
+            native.password_auth = password_auth;
+            native.allow_anonymous_loopback = secret.is_empty() && !password_auth;
+            config.validate_detailed().unwrap();
+            owner.settings.activate(&owner, &config);
+            assert!(warnings().is_empty(), "no weak-token warning for {listen}");
+        }
+    });
 }
 
 fn stream(owner: &NativeObservation, demand: Demand) -> super::super::events::Subscription {

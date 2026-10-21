@@ -71,13 +71,15 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 `degradations` 列出因故障降级但仍在运行的功能，每个组件最多一项。每项是一个安全错误（`code`、`message`、`details.reason`），另带 `component` 与 `since`；`since` 是该组件首次降级的时间，重复故障不更新。空列表表示没有已知降级；这些条目不改变 `lifecycle.state`。条目新增、变化或清除时发布 `runtime.updated`。组件：`persistence`（启动时无法打开或重置状态数据库）与 `state_cache`（无法打开其缓存表）在重启后清除；`quic_probe`（Score 组需要 QUIC 探测，但第一个 `tcp_check_url` 不是 HTTPS URL、主机无法解析或无法创建 QUIC 客户端；原因为 `restart_required` 时，启动时没有 Score 组，由重载加入）在应用的配置不再含 Score 组时清除，否则在重启后目标解析成功时清除；探测目标在启动时确定。`pname_routing`（路由规则使用了 `pname()`，但数据路径没有 cgroup v2 hook，`pname()` 条件无法获取进程名，肯定条件永不匹配，否定条件总是匹配；原因为 `comm_fallback` 时规则匹配线程名而非 argv）在每次应用配置后重新判定。使用真实 eBPF 后端时，`iface_watch`（接口监视器无法启动）在重启后清除；`udp_trace`（记录流时内核 UDP 接收追踪不可用）在每次启动 UDP 监听器时重新判定。
 
+`udp_trace` 保持错误码 `udp_trace_unavailable`；失败仅影响 IPv4 或 IPv6 listener 地址族时，`details.reason` 分别为 `ipv4_unavailable` 或 `ipv6_unavailable`，两者都受影响时为 `unavailable`。追踪仍可用的地址族继续记录内核路由证据。挂载 warning 的 `family` 字段指出缺失地址族；listener warning 带有 `ipv4_unavailable` 与 `ipv6_unavailable` 字段。Listener 启动时重新判定并不重试 fallback hook 挂载：每个真实 backend 仅尝试一次，修改内核/BTF 支持后需重启。
+
 所有认证模式都公开 `GET /api`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
 已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 返回 JSON `404 resource_not_found`；已知资源不支持的 method 返回 JSON `405 method_not_allowed`，并带 `Allow`（GET 资源含 HEAD）；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。普通观测读取不触发 probe 或选择变化；显式 `/dns/query` 是可联网的诊断请求。
 
 错误的 `details` 只指出被拒绝的对象，不回显提交或配置的值。请求边界错误给出 `header` 或请求部分（`field`：`query`、`body` 或 `target`）及 `kind`。JSON 请求体无法解析或不符合 schema 时，该端点返回 `400 invalid_request`，`details` 为 `{field,kind}`：`field` 是出错成员的点分路径（如 `sources[0].content`）、含未知键的对象或 `body`；`kind` 为 `invalid_json`、`missing`、`wrong_type`、`unknown_field`、`duplicate`、`invalid_value` 或 `too_large`。422 `unsupported_value` 给出被拒绝的 `field` 或 `fields`，并视情况给出受管条目的 `resource` 路径、`allowed` 可选值或路径、未通过的 `check`，或可放行该请求的 `settings`。
 
-原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。30 秒读空闲期限仅在连接没有进行中请求时生效（自请求 body 结束至响应完成），停滞写入另受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
+原生 server 最多拥有 64 条 HTTP/1.1 连接，每个规范化 socket 对端 IP 最多 16 条。达到全局上限时暂停 accept；超过单个对端上限的连接在 accept 后立即关闭，不返回 HTTP 响应，并记录 DEBUG 日志。Forwarded headers 不改变对端，因此同一反向代理后的客户端共享该代理的额度。Header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。30 秒读空闲期限仅在连接没有进行中请求时生效（自请求 body 结束至响应完成），停滞写入另受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
 密码模式先关闭凭据准入，再执行上述 HTTP grace，随后等待真实的阻塞凭据任务结束。五秒 HTTP 预算不限制最后的 KDF/数据库 join。
 
@@ -107,7 +109,7 @@ Media type 不区分大小写。重复或非文本的 `Content-Type` 值返回 `
 
 Setup 只信任 accept socket 的对端地址，不读取 `Forwarded`、`X-Forwarded-For` 或其他 header。允许范围为 `127.0.0.0/8`、`::1`、RFC 1918、`fc00::/7`、`169.254.0.0/16` 及 `fe80::/10`；IPv4-mapped IPv6 按 IPv4 分类。其他对端在读取账户状态或处理凭据前返回 `403 permission_denied`。
 
-Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最多 10 次。连续 5 次凭据校验失败触发 60 秒全局锁定。拒绝尝试时返回 `429 rate_limited` 与 `Retry-After`；计数器与锁定状态仅保存在进程内。 成功的 setup/login 同样计入这些窗口；连续失败锁定是全局的，不是逐 peer 锁定。
+Setup 与 login 每分钟按规范化对端 IP 最多接受 5 次尝试，全局最多 10 次。同一对端连续 5 次凭据校验失败，只锁定该对端 60 秒，自其最后一次失败起计时；其他对端的失败或成功登录不会延长或清除该锁。成功的 setup/login 只清除该对端的失败状态，但仍计入尝试窗口。拒绝尝试时返回 `429 rate_limited` 与 `Retry-After`；计数器与锁定状态仅保存在进程内。对端状态有界，尝试窗口与锁定均过期后丢弃，因此不活跃对端尚未达到阈值的连续失败记录也会过期。全局尝试窗口仍对所有对端共同生效。
 
 凭据任务最多同时运行一个，并移出 Tokio worker；重叠请求返回 429 与 `Retry-After: 1`。HTTP 取消不会释放该任务的位置或丢弃其凭据处理结果。Discovery 只读取短时持有的凭据状态，不等待跨 KDF 或数据库 I/O 的锁。
 
@@ -165,6 +167,8 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 遮蔽阈值不变：不足八字节的监听凭据值不遮蔽，启动时会发出警告。
 
 健康数据来自 producer 已完成且符合资格要求的测量，不把乐观的 alive 标志、跨 IPv4/IPv6 复制的排名信号、合成失败或从缓存恢复的延迟当作真实测量。原始 TCP、HTTP 响应头、DNS 交换和 QUIC 握手测量保留实际目标地址族与完成时间。节点行另带每个测量维度的两个平均值，仅由成功的原生探测累计，重启后清零：`moving_avg_ms` 是 URLTest 排名使用的减半平均 `(previous + sample) / 2`，`avg10_ms` 是最近十次成功探测的算术平均（预热期不足十次时按已有次数）；测量行不可用时二者为 null，针对特定组的测量中恒为 null。未知的排名和冷热状态保持 null/unknown。针对特定组的测量保留测量时的成员和叶节点，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 返回通过配置校验并应用监听凭据遮罩的 HTTP(S) URL 或 data URI，未配置为 null，不猜测或抓取图标。
+
+同一测量 key 上，完成时间早于已保留样本的健康数据会被丢弃，但若已保留样本的时间晚于当前系统时钟（时钟发生回拨），则接受新样本；同一时间戳的重放会更新该行，但不会在平均值中重复计入。针对特定组的样本最多保留 4096 个测量 key；容量已满时采用 second-chance 替换而非严格的最久未更新优先：自扫描上次经过后被刷新的 key 会被跳过，因此持续刷新的 key 比长期未更新的 key 保留得更久。
 
 `PUT /groups/{groupId}/selection` 的请求体为 `{"member_id":"<direct-member-id>","network":"tcp"}`，`network` 必填，另接受 `udp` 或 `both`。向 Selector 写入会替换其选择，报告 `source: runtime`。TCP 与 UDP 的选择分开保存，仅写入 TCP 不改变 UDP，`both` 在发布前一次校验两个网络，并原子发布选择；对自动策略组（`can_override: true`）的写入会固定该成员，报告 `source: override`；固定成员不可用时不改选同组其他成员。固定只存在于运行时，不持久化，每次配置激活（包括更改节点的订阅刷新）都会清除；未变化或为空的刷新不激活任何配置，保留固定，健康检查照常执行。`DELETE /groups/{groupId}/selection?network=` 清除 `tcp`、`udp` 或 `both`（默认）的固定，返回 `GroupOverrideCleared` 与各网络当前选择；未固定的网络保持原选择，对 Selector 返回 `409 state_conflict`。原生与 Clash 写入都由同一 control/reload 所有者串行处理，并更新既有持久化和预热逻辑，Clash 写入等价于 `both`，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧所有者，而非按当前可达叶名称删除记录；重复写入当前选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
 

@@ -270,6 +270,21 @@ impl Settings {
         };
         next.apply(owner);
         *current = next;
+        drop(current);
+        let native = &config.experimental.native_api;
+        if native.enabled
+            && !native.password_auth
+            && !native.secret.is_empty()
+            && native.secret.len() < 16
+            && let Ok(listen) = native.listen.parse::<std::net::SocketAddr>()
+            && !listen.ip().to_canonical().is_loopback()
+        {
+            tracing::warn!(
+                %listen,
+                secret_length = native.secret.len(),
+                message = "native API token secret is shorter than 16 bytes on a non-loopback listener"
+            );
+        }
     }
     pub(crate) fn flow_recording(&self) -> bool {
         self.values.lock().active()[0]

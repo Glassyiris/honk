@@ -1,5 +1,7 @@
 //! HTTP connection, observer and credential-worker ownership.
 
+use std::collections::{HashMap, hash_map::Entry};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -10,6 +12,7 @@ use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
+use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -100,6 +103,43 @@ pub(super) fn cpu_percent(previous: (Instant, Duration), now: (Instant, Duration
     let wall = now.0.checked_duration_since(previous.0)?;
     let cpu = now.1.checked_sub(previous.1)?;
     (!wall.is_zero()).then(|| cpu.as_secs_f64() / wall.as_secs_f64() * 100.0)
+}
+
+const PEER_CONNECTIONS: usize = 16;
+
+#[derive(Clone, Default)]
+struct PeerSlots(Arc<Mutex<HashMap<IpAddr, usize>>>);
+
+struct PeerSlot {
+    slots: PeerSlots,
+    peer: IpAddr,
+}
+
+impl PeerSlots {
+    fn acquire(&self, peer: IpAddr) -> Option<PeerSlot> {
+        let mut counts = self.0.lock();
+        let count = counts.entry(peer).or_default();
+        if *count >= PEER_CONNECTIONS {
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot {
+            slots: self.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        if let Entry::Occupied(mut entry) = self.slots.0.lock().entry(self.peer) {
+            if *entry.get() <= 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
 }
 
 struct NativeConsumer(Arc<ConnectionTracker>);
@@ -373,6 +413,7 @@ async fn supervise(
     let mut sampler = tokio::spawn(sample_traffic(Arc::clone(&state), sampler_receiver));
     let mut sampler_running = true;
     let mut children = JoinSet::new();
+    let peer_slots = PeerSlots::default();
     // A persistent accept error repeats every iteration; warn once per episode.
     let mut accept_failing = false;
     loop {
@@ -421,8 +462,21 @@ async fn supervise(
                     tracing::info!(message = "native HTTP listener recovered");
                 }
                 let peer = Peer(peer.ip().to_canonical());
+                let Some(slot) = peer_slots.acquire(peer.0) else {
+                    drop(stream);
+                    tracing::debug!(
+                        peer_ip = %peer.0,
+                        limit = PEER_CONNECTIONS,
+                        message = "native HTTP peer connection limit reached"
+                    );
+                    continue;
+                };
                 let service = tower::Layer::layer(&Extension(peer), router.clone());
-                children.spawn(serve(stream, service, connection_receiver.clone()));
+                let stop = connection_receiver.clone();
+                children.spawn(async move {
+                    let _slot = slot;
+                    serve(stream, service, stop).await;
+                });
             }
         }
     }
@@ -465,6 +519,39 @@ async fn supervise(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn peer_connection_slots_are_isolated_and_released_on_drop_or_abort() {
+        let slots = PeerSlots::default();
+        let a = "192.168.1.5".parse().unwrap();
+        let b = "192.168.1.6".parse().unwrap();
+        let mut held: Vec<_> = (0..PEER_CONNECTIONS)
+            .map(|_| slots.acquire(a).unwrap())
+            .collect();
+        assert!(
+            slots.acquire(a).is_none(),
+            "the seventeenth connection is refused"
+        );
+        let other = slots.acquire(b).expect("another peer retains its slots");
+        drop(held.pop());
+        let slot = slots.acquire(a).expect("normal close releases a slot");
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            slots.acquire(a).is_some(),
+            "abort releases the captured slot"
+        );
+        drop(held);
+        drop(other);
+        assert!(
+            slots.0.lock().is_empty(),
+            "idle peers are no longer tracked"
+        );
+    }
 
     async fn connect(router: axum::Router) -> (TcpStream, JoinHandle<()>, watch::Sender<bool>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

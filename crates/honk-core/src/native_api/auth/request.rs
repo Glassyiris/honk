@@ -101,7 +101,7 @@ pub(crate) async fn setup(
                 .setup(&credentials.username, &credentials.password)
             {
                 Ok(()) => {
-                    auth.rate.succeeded();
+                    auth.rate.succeeded(peer.0);
                     Ok((StatusCode::CREATED, issued(auth.sessions.issue())).into_response())
                 }
                 Err(SetupError::AlreadyCompleted) => Err(already_completed(id)),
@@ -171,10 +171,10 @@ pub(crate) async fn login(
                 .store
                 .verify(&credentials.username, &credentials.password)
             {
-                auth.rate.failed();
+                auth.rate.failed(peer.0);
                 return Err(rejected(id));
             }
-            auth.rate.succeeded();
+            auth.rate.succeeded(peer.0);
             Ok(issued(auth.sessions.issue()))
         })
         .await

@@ -335,15 +335,22 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
 #[test]
 fn udp_trace_is_reported_until_a_listener_generation_traces() {
     let degradations = crate::degradations::Degradations::default();
-    let traced = || {
+    let reason = || {
         degradations
             .get(crate::degradations::Component::UdpTrace)
-            .is_none()
+            .map(|issue| issue.reason)
     };
-    super::record_udp_trace(&degradations, true);
-    assert!(!traced());
-    super::record_udp_trace(&degradations, false);
-    assert!(traced());
+    for (unavailable, expected) in [
+        ([true, false], "ipv4_unavailable"),
+        ([false, true], "ipv6_unavailable"),
+        ([true, true], "unavailable"),
+    ] {
+        assert!(super::record_udp_trace(&degradations, unavailable));
+        assert!(!super::record_udp_trace(&degradations, unavailable));
+        assert_eq!(reason(), Some(expected));
+    }
+    super::record_udp_trace(&degradations, [false, false]);
+    assert_eq!(reason(), None);
 }
 
 async fn mock_plane(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlane {

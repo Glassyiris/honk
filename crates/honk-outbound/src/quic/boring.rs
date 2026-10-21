@@ -353,9 +353,8 @@ struct QuicCryptoState {
     /// pinSHA256 connections never resume: a resumed PSK session would
     /// bypass the pin check on a later (possibly different-pin) config.
     allow_resumption: bool,
-    /// Session-ticket cache key for `on_new_session_cb` (SNI|port — see
-    /// [`BoringQuicOptions::ticket_key`]); falls back to the server name.
-    ticket_key: Option<String>,
+    /// Fully resolved identity and verification policy shared by lookup and storage.
+    ticket_key: String,
 }
 
 static EX_DATA_INDEX: LazyLock<i32> = LazyLock::new(|| unsafe {
@@ -505,24 +504,10 @@ unsafe extern "C" fn on_new_session_cb(
     if !state.allow_resumption {
         return 0;
     }
-    // SNI|port key when the config carries one (never cross-resume between
-    // different servers sharing an SNI); the bare server name otherwise.
-    let name = match state.ticket_key.clone() {
-        Some(key) => key,
-        None => {
-            let name = unsafe {
-                boring_sys::SSL_get_servername(ssl, boring_sys::TLSEXT_NAMETYPE_host_name)
-            };
-            if name.is_null() {
-                return 0;
-            }
-            unsafe { std::ffi::CStr::from_ptr(name) }
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
     unsafe { boring_sys::SSL_SESSION_up_ref(session) };
-    SESSION_TICKETS.lock().insert(name, session as usize);
+    SESSION_TICKETS
+        .lock()
+        .insert(state.ticket_key.clone(), session as usize);
     0
 }
 
@@ -541,9 +526,9 @@ pub struct BoringQuicOptions {
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
     pub pin_sha256: Option<[u8; 32]>,
-    /// Session-ticket cache key (defaults to the server name). Servers are
-    /// identified by SNI|port so different servers sharing an SNI (e.g. one
-    /// certificate deployed on two protocol servers) never cross-resume.
+    /// Server-identity component of the ticket key (defaults to the server
+    /// name). Include SNI|port to separate servers sharing a certificate;
+    /// the backend adds the certificate-verification policy.
     pub ticket_key: Option<String>,
 }
 
@@ -555,7 +540,8 @@ pub struct BoringQuicClientConfig {
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
     has_pin: bool,
-    /// Session-ticket cache key (defaults to the server name when unset).
+    skip_cert_verify: bool,
+    /// Server-identity component; verification policy is added at lookup.
     ticket_key: Option<String>,
 }
 
@@ -608,8 +594,15 @@ impl BoringQuicClientConfig {
             chrome,
             ech_config_list,
             has_pin: pin_sha256.is_some(),
+            skip_cert_verify,
             ticket_key,
         })
+    }
+
+    fn session_ticket_key(&self, server_name: &str) -> String {
+        let identity = self.ticket_key.as_deref().unwrap_or(server_name);
+        // TLS 1.3 PSK resumption does not repeat certificate verification.
+        format!("{identity}|skip_cert_verify={}", self.skip_cert_verify)
     }
 }
 
@@ -632,8 +625,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         unsafe { boring_sys::SSL_set_early_data_enabled(ssl.as_ptr(), 1) };
         ssl.set_hostname(server_name)
             .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
-        // The hostname is also the client session-cache key — set it even
-        // with verification off, or resumption can never hit.
+        // SNI alone does not configure certificate hostname verification.
         let cache_name = std::ffi::CString::new(server_name)
             .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
         let ok = unsafe { boring_sys::SSL_set1_host(ssl.as_ptr(), cache_name.as_ptr()) };
@@ -648,11 +640,8 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         // ticket (server restart, different server behind the same SNI, or
         // a session minted under a pre-reload SSL_CTX) must not poison every
         // subsequent dial until process restart.
-        let mut resume_key = None;
-        let lookup_key = self
-            .ticket_key
-            .clone()
-            .unwrap_or_else(|| server_name.to_string());
+        let mut offered_session = None;
+        let lookup_key = self.session_ticket_key(server_name);
         if !self.has_pin
             && let Some(&session) = SESSION_TICKETS.lock().get(&lookup_key)
         {
@@ -661,7 +650,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             };
             // Remember the exact entry offered so a failure evicts it only
             // if it is still the current one.
-            resume_key = Some((lookup_key, session));
+            offered_session = Some(session);
             tracing::debug!(server_name, "QUIC TLS: offering cached session ticket");
         }
         ssl.set_alpn_protos(&self.alpn_wire)
@@ -695,7 +684,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
 
         let state = Box::new(QuicCryptoState {
             allow_resumption: !self.has_pin,
-            ticket_key: self.ticket_key.clone(),
+            ticket_key: lookup_key,
             ..Default::default()
         });
         let ok = unsafe {
@@ -718,7 +707,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             got_handshake_data: false,
             driven: false,
             cur_1rtt: None,
-            resume_key,
+            offered_session,
         }))
     }
 }
@@ -748,9 +737,8 @@ struct BoringQuicSession {
     driven: bool,
     /// Current 1-RTT (read, write) secrets for key updates.
     cur_1rtt: Option<(TrafficSecrets, TrafficSecrets)>,
-    /// Hostname whose cached ticket was offered on this handshake, plus the
-    /// offered session — evicted on failure only if still current.
-    resume_key: Option<(String, usize)>,
+    /// Offered session, evicted on failure only if still current.
+    offered_session: Option<usize>,
 }
 
 impl BoringQuicSession {
@@ -796,9 +784,10 @@ impl BoringQuicSession {
         // SSL_CTX). Evict ONLY if the entry is still the session we offered
         // — a concurrent connection may already have cached a fresh one,
         // and deleting that would repeat the failure once more.
-        if let Some((key, offered)) = self.resume_key.take() {
+        if let Some(offered) = self.offered_session.take() {
+            let key = &self.state.ticket_key;
             tracing::debug!(server_name = %key, error = %reason, "QUIC TLS: evicting rejected session ticket");
-            SESSION_TICKETS.lock().remove_if_current(&key, offered);
+            SESSION_TICKETS.lock().remove_if_current(key, offered);
         } else {
             tracing::debug!(error = %reason, "QUIC TLS: handshake failed with no ticket offered");
         }

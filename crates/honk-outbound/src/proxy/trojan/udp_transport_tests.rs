@@ -189,7 +189,7 @@ async fn unrecognised_domain_frames_are_consumed_and_the_next_decodes() {
     let transport = transport_over(client, target, Some("Example.com"));
     let numeric: SocketAddr = "203.0.113.5:9".parse().unwrap();
 
-    let big = vec![0xee; 100];
+    let big = vec![0xee; 1000];
     let mut wire = frame(wire_domain("other.example", 443), &big);
     wire.extend(frame(wire_domain("example.com", 444), b"wrong-port"));
     wire.extend(frame(wire_domain("EXAMPLE.COM", 443), b"mine"));
@@ -197,12 +197,30 @@ async fn unrecognised_domain_frames_are_consumed_and_the_next_decodes() {
     wire.extend(frame(wire_addr(numeric), b"next"));
     server.write_all(&wire).await.unwrap();
 
-    // An 8-byte buffer forces the discard path to chunk the 100 bytes.
+    // Dropped payloads may exceed both the output buffer and discard scratch.
     let mut buf = [0u8; 8];
     let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
     assert_eq!((peer, &buf[..n]), (target, &b"mine"[..]));
     let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
     assert_eq!((peer, &buf[..n]), (numeric, &b"next"[..]));
+
+    for payload in [&b"mine"[..], &b""[..]] {
+        for address in [
+            vec![0x03, 0, 0x01, 0xbb],
+            vec![0x03, 2, 0xff, 0xfe, 0x01, 0xbb],
+        ] {
+            let mut wire = frame(address, b"dropped");
+            wire.extend(frame(wire_domain("example.com", 443), payload));
+            server.write_all(&wire).await.unwrap();
+
+            let mut buf = [0u8; 16];
+            let (n, peer) = transport
+                .recv_packet(&mut buf[..payload.len()])
+                .await
+                .unwrap();
+            assert_eq!((peer, &buf[..n]), (target, payload));
+        }
+    }
 }
 
 /// Without a captured domain no domain-named frame can be projected.

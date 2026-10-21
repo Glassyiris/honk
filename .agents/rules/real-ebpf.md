@@ -61,7 +61,7 @@ its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
 The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
 TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
-native lifecycle, route-only watcher and SO_MARK socket checks. Exact nonempty
+native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher and SO_MARK socket checks. Exact nonempty
 selections in the guest gate must remain intact.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
@@ -76,6 +76,8 @@ Native builds and unprivileged tests remain supported, but Linux 6.12+ and root
 are not sufficient isolation for direct protected-suite execution. Never invoke
 the guest script directly on a host or export its VM identity markers to bypass
 the fixture guard.
+
+Keep every object map unpinned, including allocator maps; core owns explicit pin paths (see [object admission](../../doc/en/design/control-plane.md#startup-and-shutdown)).
 
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The child also strips inherited `CARGO_PROFILE_*` overrides so host profiling cannot replace the standalone kernel crate's release policy. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it, and a sidecar older than core's `build.rs` triggers a rebuild after embedding-policy changes. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`; manually built or supplied objects remain the caller's responsibility.
 

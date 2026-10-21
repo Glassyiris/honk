@@ -708,10 +708,7 @@ impl AliveDialerSet {
         self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
         if let Some(observations) = self.health_observations.write().as_mut() {
-            observations.nodes.remove(&node_id);
-            observations
-                .groups
-                .retain(|sample| sample.node_id != node_id);
+            observations.remove_node(node_id);
         }
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);

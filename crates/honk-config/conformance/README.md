@@ -7,13 +7,16 @@ two parsers do with one input, separately:
 | Key | Meaning |
 | --- | --- |
 | `id` | Stable identifier; the dialect reference links to it. |
-| `input` | A repository-relative file, usually under `cases/`; or `source = { file = "<repo path>", lines = "a-b" }` for a ```dae fence in a honk document (`a` is the first line inside the fence, `b` the last, one-based inclusive) or `source = { dae = "<path in the dae repository>", lines = "a-b" }` for an upstream file cited under `[upstream]` and fetched at its pinned commit. Exactly one of `input`/`source`. |
+| `input` | A repository-relative file, usually under `cases/`; or `source = { file = "<repo path>", fence = n }` for the body of the `n`th (one-based) ```dae fence in a honk document; or `source = { dae = "<path in the dae repository>", lines = "a-b" }` for an upstream file cited under `[upstream]` and fetched at its pinned commit (`a`-`b` are one-based inclusive lines). Prose edits do not change fence ordinals; inserting or removing a ```dae fence renumbers later ones. Exactly one of `input`/`source`. |
 | `wrap` | Optional section name that encloses a fragment before parsing, e.g. `"routing"`. |
 | `layer` | `structure`: the decoded structure is compared. `typed:<test>` / `loading:<test>`: the case exists for its acceptance and diagnostics; the named existing test owns the typed or file-loading behaviour (the runner checks the test exists, it does not run it). |
 | `honk`, `dae` | `accept` or `reject` for each parser. |
 | `honk_diagnostics` | The exact diagnostic codes honk emits for this input, in order. |
 | `compare` / `differences` | `compare = "equal"` when both accept and the structures are identical; otherwise `differences = [{ path, dae, honk, reason }]` naming every place they differ (`{ absent = true }` for a missing item). Any unrecorded difference, and any recorded one that no longer occurs, fails the case. |
 | `unknown_sections` | Root blocks honk does not recognise (dae keeps them; honk only counts them). |
+
+Fence selection counts lines whose trimmed text is exactly ```` ```dae ````;
+it does not parse Markdown nesting or comments, so markers inside them also count.
 
 To add a case: write the input under `cases/<group>/`, add a `[[case]]` with your
 expectation, then run
@@ -25,6 +28,9 @@ cargo run -p honk-config --features conformance --example project -- <file>   # 
 cd tools/dae-parse && go run . < <file>                                       # dae's
 ```
 
-A failure prints the case id, the first differing path and both values. An
-intended difference goes into `differences` with the path and a reason, never a
-whole-case waiver.
+A failure prints the case id, the first differing path and both values. Source or
+selector errors fail their own cases with path `input`; remaining cases still run.
+When `CONFORMANCE_RESULT` is set, the harness writes counts and the first failure
+as `failure: {case, path, detail}` before failing the test with all collected
+failures. An intended difference goes into `differences` with the path and a
+reason, never a whole-case waiver.

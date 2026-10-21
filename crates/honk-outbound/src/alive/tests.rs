@@ -1977,7 +1977,8 @@ fn native_observations_exclude_legacy_and_preserve_zero_and_failures() {
     let node = id(1);
     set.register_node(node, "node".into(), "127.0.0.1:1".into());
     let registration = set.registered.read().get(&node).cloned().unwrap();
-    let at = std::time::SystemTime::now();
+    // In the past, so a later failure is not mistaken for a pre-step sample.
+    let at = std::time::SystemTime::now() - Duration::from_secs(60);
     let zero = HealthObservation::probe(
         ProbeDomain::Tcp,
         HealthMeasurement::HttpHeaders,
@@ -2172,7 +2173,7 @@ fn native_group_retention_has_a_fixed_slot_bound() {
         Some(Duration::ZERO),
         std::time::SystemTime::now(),
     );
-    for member in 0..4097 {
+    for member in (0..4096).chain([0, 4096]) {
         set.record_group_health_observation(
             node,
             Some(&registration),
@@ -2186,7 +2187,8 @@ fn native_group_retention_has_a_fixed_slot_bound() {
     }
     let retained = set.group_health_observations(group);
     assert_eq!(retained.len(), 4096);
-    assert!(!retained.iter().any(|sample| sample.member_id == id(0)));
+    assert!(retained.iter().any(|sample| sample.member_id == id(0)));
+    assert!(!retained.iter().any(|sample| sample.member_id == id(1)));
     assert!(retained.iter().any(|sample| sample.member_id == id(4096)));
 }
 

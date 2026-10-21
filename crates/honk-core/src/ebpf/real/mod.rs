@@ -855,16 +855,27 @@ impl EbpfBackend for RealEbpfBackend {
     #[cfg(feature = "native-api")]
     fn receive_trace(&mut self) -> Option<std::sync::Arc<receive_trace::ReceiveTrace>> {
         if !self.receive_trace_attempted {
+            // Kernel/loader offsets are fixed for this backend, and a partially loaded Aya
+            // program cannot be loaded again on listener reload. Restart retries attachment.
             self.receive_trace_attempted = true;
             if !self.receive_trace_available {
-                warn!("kernel UDP trace unavailable: checked BTF offsets missing");
+                warn!(
+                    ipv4_unavailable = true,
+                    ipv6_unavailable = true,
+                    "kernel UDP trace unavailable: checked BTF offsets missing"
+                );
             } else {
                 let result = btf::load_kernel().and_then(|(_, kernel_btf)| {
                     receive_trace::ReceiveTrace::attach(self.bpf_mut()?, &kernel_btf)
                 });
                 match result {
                     Ok(trace) => self.receive_trace = Some(trace),
-                    Err(error) => warn!(%error, "kernel UDP trace attach unavailable"),
+                    Err(error) => warn!(
+                        error = %format_args!("{error:#}"),
+                        ipv4_unavailable = true,
+                        ipv6_unavailable = true,
+                        "kernel UDP trace attach unavailable"
+                    ),
                 }
             }
         }

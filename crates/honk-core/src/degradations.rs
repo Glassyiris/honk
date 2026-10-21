@@ -111,7 +111,10 @@ impl Degradations {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(feature = "native-api", feature = "ebpf", target_os = "linux")
+    ))]
     pub(crate) fn get(&self, component: Component) -> Option<Issue> {
         self.entries.lock()[component as usize]
             .as_ref()
