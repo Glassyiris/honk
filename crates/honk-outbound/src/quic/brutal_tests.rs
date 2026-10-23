@@ -39,3 +39,16 @@ fn pacer_runs_at_configured_rate_in_bytes() {
     assert_eq!(metrics.pacing_rate, Some(20_000_000));
 }
 
+#[test]
+fn bbr_variant_accepts_only_v1_and_v3() {
+    for (value, expected) in [
+        ("v1", Some(BbrVariant::V1)),
+        ("V3", Some(BbrVariant::V3)),
+        (" v3 ", Some(BbrVariant::V3)),
+        ("v2", None),
+        ("bbr3", None),
+        ("", None),
+    ] {
+        assert_eq!(parse_bbr_variant(value), expected, "{value:?}");
+    }
+}

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
@@ -43,19 +43,51 @@ pub(crate) use stream::{
 /// Map a congestion-control name (`cubic` / `new_reno` / `bbr`, as used by
 /// sing-box and dae node configs) to a quinn controller factory.
 ///
-/// Unknown names fall back to cubic with a warning (all three algorithms are
-/// provided by quinn-proto itself).
+/// `bbr` builds quinn's original BBR or BBRv3, chosen process-wide by
+/// `HONK_QUIC_BBR`. Unknown names fall back to cubic with a warning (all
+/// algorithms are provided by quinn-proto itself).
 pub fn congestion_factory(
     name: Option<&str>,
 ) -> Arc<dyn congestion::ControllerFactory + Send + Sync> {
     match name.unwrap_or("cubic") {
         "cubic" => Arc::new(congestion::CubicConfig::default()),
         "new_reno" => Arc::new(congestion::NewRenoConfig::default()),
-        "bbr" => Arc::new(congestion::BbrConfig::default()),
+        "bbr" => match *BBR_VARIANT {
+            BbrVariant::V1 => Arc::new(congestion::BbrConfig::default()),
+            BbrVariant::V3 => Arc::new(congestion::Bbr3Config::default()),
+        },
         other => {
             warn!("unknown QUIC congestion control '{other}', falling back to cubic");
             Arc::new(congestion::CubicConfig::default())
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BbrVariant {
+    V1,
+    V3,
+}
+
+/// quinn's original BBR ignores loss, and quinn-proto ≥0.11.16 receivers abort
+/// its uploads on high-BDP paths ("too many gaps in stream buffer"). It stays
+/// the default only until BBRv3 is validated on real paths.
+const DEFAULT_BBR: BbrVariant = BbrVariant::V1;
+
+/// `HONK_QUIC_BBR=v1|v3`, read once; any other value warns and keeps the default.
+static BBR_VARIANT: LazyLock<BbrVariant> = LazyLock::new(|| match std::env::var("HONK_QUIC_BBR") {
+    Ok(value) if !value.trim().is_empty() => parse_bbr_variant(&value).unwrap_or_else(|| {
+        warn!(value = %value, "unrecognized HONK_QUIC_BBR, using the default BBR");
+        DEFAULT_BBR
+    }),
+    _ => DEFAULT_BBR,
+});
+
+fn parse_bbr_variant(value: &str) -> Option<BbrVariant> {
+    match value.trim() {
+        value if value.eq_ignore_ascii_case("v1") => Some(BbrVariant::V1),
+        value if value.eq_ignore_ascii_case("v3") => Some(BbrVariant::V3),
+        _ => None,
     }
 }
 

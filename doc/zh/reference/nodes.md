@@ -300,7 +300,7 @@ node {
 | 协议 | 链接输入 | 节点字段 / 行为 |
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | 通用 `username` / `password`；供 `tuic_uuid` / `tuic_password` 的 handler 回退使用 |
-| TUIC | `congestion_control` | `cubic`、`new_reno` 或 `bbr`；省略时为 `cubic`；未知值告警并回退到 cubic |
+| TUIC | `congestion_control` | `cubic`、`new_reno` 或 `bbr`（quinn 原有的 BBR 或 BBRv3，由 `HONK_QUIC_BBR` 选择）；省略时为 `cubic`；未知值告警并回退到 cubic |
 | TUIC | `alpn` | 逗号分隔的 ALPN 覆盖值；分享链接默认 `tuic`；原始 Clash/Mihomo 导入使用下述来源默认值 |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | 接收窗口覆盖值 |
 | Juicity | `uuid:password` userinfo | 通用 `username` / `password`；供 `juicity_uuid` / `juicity_password` 的 handler 回退使用 |

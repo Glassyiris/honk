@@ -77,6 +77,7 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | dashboard ZIP URL 的最高优先级覆盖；已配置的外部 UI 目录需要下载时，它会覆盖 `assets.ui.url`。 |
 | `HONK_POOL_DISABLE=1` | `honk-core` | 绕过 Ready stream 与裸 TCP 两类池，每次全新拨号。代码也接受不区分大小写的 `true`；首次使用后缓存该值。 |
 | `HONK_QUIC_GSO=0|1` | QUIC 出站 | 强制关闭/开启 UDP GSO。未覆盖时，保守的 1252-byte MTU 保持关闭；显式设置更大的 `mtu` 时自动开启，并把批量限制为最多 16 个 segment。 |
+| `HONK_QUIC_BBR=v1|v3` | QUIC 出站 | 选择 `bbr` 拥塞控制背后的实现：TUIC `congestion_control: bbr`、Juicity，以及未设上传速率的 Hysteria2。`v1` 是 quinn 原有的 BBR，不响应丢包；在高带宽时延积路径上，quinn-proto 0.11.16 及以上的接收端可能以 `too many gaps in stream buffer` 中止其上传。`v3` 是 BBRv3。默认 `v1`；其它值会告警并保持默认。 |
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
 | `MIMALLOC_PURGE_DELAY` | 启用 `mimalloc` 的 `honk-core` | mimalloc 自带的 purge 延迟（毫秒）：已释放页面在归还 OS 前保持 committed 的时间。honk 启动时设为 `100`（mimalloc v3 默认 `1000`），在连接、探测与 DNS 的频繁分配场景下降低 RSS，批量 relay 的吞吐与 CPU 无可测量变化。环境变量中设置的任何值都优先，包括无法解析的值（此时保持 mimalloc 的 `1000`）。`0` 立即归还（RSS 最低、CPU 略增），`-1` 从不归还。 |
 | `TOKIO_WORKER_THREADS` | `honk-core` | Tokio 自带的 worker 数量。`honk-core` 使用默认的多线程 runtime，因此默认等于核数。必须是正整数：`0` 或非数字会使 Tokio 在启动时 panic。每个 worker 持有独立的 allocator 堆，在多核网关上调低该值可降低 RSS（实验室，4 核主机，120 条连接加 DNS：16 个 worker 约 85 MiB，8 个约 66 MiB，4 个约 60 MiB，CPU 差异在噪声内）。relay 路径运行在这些 worker 上，按流量取值。 |

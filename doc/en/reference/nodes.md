@@ -304,7 +304,7 @@ node {
 | Protocol | Link input | Node field / behavior |
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `tuic_uuid` / `tuic_password` |
-| TUIC | `congestion_control` | `cubic`, `new_reno`, or `bbr`; `cubic` when omitted; unknown values warn and fall back to cubic |
+| TUIC | `congestion_control` | `cubic`, `new_reno`, or `bbr` (quinn's original BBR or BBRv3, selected by `HONK_QUIC_BBR`); `cubic` when omitted; unknown values warn and fall back to cubic |
 | TUIC | `alpn` | Comma-separated ALPN override; share links default to `tuic`; original Clash/Mihomo imports use the source default described below |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | Receive-window overrides |
 | Juicity | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `juicity_uuid` / `juicity_password` |
