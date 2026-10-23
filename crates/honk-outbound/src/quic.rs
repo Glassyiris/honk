@@ -70,9 +70,10 @@ enum BbrVariant {
 }
 
 /// quinn's original BBR ignores loss, and quinn-proto ≥0.11.16 receivers abort
-/// its uploads on high-BDP paths ("too many gaps in stream buffer"). It stays
-/// the default only until BBRv3 is validated on real paths.
-const DEFAULT_BBR: BbrVariant = BbrVariant::V1;
+/// its uploads on high-BDP paths ("too many gaps in stream buffer"). On real
+/// Hysteria2 paths it delivered the same upload rate as BBRv3 while losing
+/// over half of what it sent, so BBRv3 is the default and `v1` stays a fallback.
+const DEFAULT_BBR: BbrVariant = BbrVariant::V3;
 
 /// `HONK_QUIC_BBR=v1|v3`, read once; any other value warns and keeps the default.
 static BBR_VARIANT: LazyLock<BbrVariant> = LazyLock::new(|| match std::env::var("HONK_QUIC_BBR") {
