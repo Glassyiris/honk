@@ -53,7 +53,7 @@ Per-release configuration changes that affect an existing configuration. One fil
 
 | Release | English | 中文 |
 | --------- | --------- | ------ |
-| `v0.1.0-beta.1` | [en/migration/v0.1.0-beta.1.md](./en/migration/v0.1.0-beta.1.md) | [zh/migration/v0.1.0-beta.1.md](./zh/migration/v0.1.0-beta.1.md) |
+| `v0.1.0-beta.1` | [en/v0.1.0-beta.1.md](./migration/en/v0.1.0-beta.1.md) | [zh/v0.1.0-beta.1.md](./migration/zh/v0.1.0-beta.1.md) |
 
 ## Operations / 运维
 
