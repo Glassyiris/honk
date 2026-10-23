@@ -4,7 +4,7 @@ honk 是 Linux 上的实验性 eBPF 透明代理引擎。本文说明普通用�
 
 > **注意**
 >
-> honk 当前仍是 `v0.0.1-alpha`。真实模式会加载 eBPF、挂接 TC/cgroup hook、创建 `dae0`/`daens`、调整 sysctl，并在默认配置下占用 NFQUEUE 320。首次部署请保留带外管理通道。
+> honk 当前仍处于 alpha 阶段。真实模式会加载 eBPF、挂接 TC/cgroup hook、创建 `dae0`/`daens`、调整 sysctl，并在默认配置下占用 NFQUEUE 320。首次部署请保留带外管理通道。
 
 ## Linux 内核要求
 
@@ -90,24 +90,27 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 ### 预编译二进制
 
-从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。无后缀名为 full 构建：
+从 [GitHub Releases](https://github.com/daeuniverse/honk/releases) 下载与设备架构匹配的包。每个包名都以变体结尾（旧版本的 full 构建不带后缀）：
 
-| 变体 | 包后缀 | 内容 |
-|---|---|---|
-| full | 无 | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
-| clash-api | `-clash-api` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
-| native-api | `-native-api` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
+| 变体 | 包后缀 | Release 标签 | 内容 |
+|---|---|---|---|
+| full | `-full` | `fullapi` | Clash API、原生 API 与内嵌 doona UI（`x86_64`/`aarch64`，gnu 与 musl） |
+| clash-api | `-clash-api` | `clashapi` | 仅 Clash API；不含原生 API 与内嵌 UI（仅 musl） |
+| native-api | `-native-api` | `nativeapi` | 仅原生 API；不含 Clash API 与内嵌 UI（仅 musl） |
 
-musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备。
+musl 包是静态二进制，适合网关部署。无 `-stock` 后缀的包使用 mimalloc，优先考虑吞吐（标签 `mimalloc`）；`-stock` 包使用系统 allocator，更适合关注内存峰值的小内存设备（标签 `stockalloc`）。每个 release 的 Downloads 一节按 `{allocator}-{API}-{arch}-{libc}` 标签列出全部归档。
 
 精简变体按 fail-closed 处理：在 `-clash-api` 上启用 `experimental.native_api`，或没有 `native-ui` 却设置 `ui: embedded`，都会启动失败。`--store db` 与原生配置管理需要 `native-api`。
 
 ```shell
-pkg=honk-core-<version>-<target>   # 按下载的包追加 -stock、-clash-api 或 -native-api
+pkg=honk-core-<version>-<target>-full   # 或按下载的包改为 -stock-full、-clash-api、-stock-native-api 等
+sha256sum -c --ignore-missing SHA256SUMS   # SHA256SUMS 从同一个 release 下载
 tar -xzf "$pkg.tar.gz"
 sudo install -m 0755 "$pkg/honk-core" /usr/local/bin/honk-core
 honk-core --version
 ```
+
+装有 GitHub CLI 时，还可以用 `gh attestation verify "$pkg.tar.gz" -R daeuniverse/honk` 确认该包由本仓库的发布 workflow 构建。
 
 release binary 已内嵌 eBPF object，不需要单独安装 `honk-ebpf`。运行时也不会调用 `ip`、`nft`、`iptables` 或 `nsenter` 子进程。
 

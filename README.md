@@ -6,7 +6,7 @@ English | [中文](./README.zh.md)
 
 honk is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapath and configuration syntax are inspired by [dae](https://github.com/daeuniverse/dae); its outbound groups, multi-protocol dialers, and Clash-compatible API follow [sing-box](https://github.com/SagerNet/sing-box) designs. It is an independent implementation, not a line-for-line port.
 
-> **Early alpha (`v0.0.1-alpha`), not recommended for production.** Expect breaking changes, incomplete features, and limited real-world validation.
+> **Early alpha, not recommended for production.** Expect breaking changes, incomplete features, and limited real-world validation.
 
 ## Capabilities
 
@@ -23,7 +23,7 @@ Implemented does not mean fully reviewed; see [review status](#review-status). T
 Real transparent proxying requires **root, Linux 6.12+, the required kernel options, and bpffs**. Initial deployment changes network hooks, namespaces, and sysctls; keep an out-of-band management path available.
 
 1. Follow the [startup guide](doc/en/how-to-start.md) for kernel checks, installation, a direct-only configuration, and connectivity verification.
-2. Download a matching binary from [Releases](https://github.com/daeuniverse/honk/releases), or follow the guide's source-build prerequisites. Release binaries embed the eBPF object; source builds require the `ebpf` feature. Plain `cargo build --release` does **not** enable the real datapath.
+2. Download a matching binary from [Releases](https://github.com/daeuniverse/honk/releases); each release's Downloads section explains every archive, and `SHA256SUMS` verifies it. Or follow the guide's source-build prerequisites. Release binaries embed the eBPF object; source builds require the `ebpf` feature. Plain `cargo build --release` does **not** enable the real datapath.
 3. Add nodes, groups, routing, and DNS using the [configuration guide](doc/en/configuration.md). The repository provides [full](config.dae) and [minimal development](config.min.dae) examples; adapt interfaces and node addresses before use.
 
 The [documentation index](doc/README.md) links all bilingual guides, references, and subsystem designs. Start with the [architecture overview](doc/en/design/overview.md), [node reference](doc/en/reference/nodes.md), or [API reference](doc/en/reference/api.md) for details.
@@ -37,6 +37,14 @@ The [documentation index](doc/README.md) links all bilingual guides, references,
 
 Build with `--features native-api` (the full and `-native-api` release artifacts include it) and configure `experimental.native_api` for independent observations and controls on `127.0.0.1:9527`: bounded flows/logs/DNS history, probes, provider status/refresh, per-network Selector control and exact connection closure. Captured `.dae` sources remain authoritative, with opt-in source/Group PATCH transactions, synchronous main-file node/provider creation and removal, and verified-geodata operations; existing entries are edited through source PUT. `--store db` records accepted sources as revisions in a state database instead. A bearer secret or password login is required unless anonymous loopback is explicitly enabled. Serve a trusted directory, or build `--features native-ui` and set `ui: embedded` for the pinned doona build without runtime downloads. Native runtime_mode and full kernel transparency remain unavailable. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api).
 
+## Versions and compatibility
+
+- Releases follow [SemVer](https://semver.org/) from `v0.1.0`; tags with `-alpha.N`, `-beta.N` or `-rc.N` are prereleases. Before `1.0`, a minor release may change configuration or behaviour, and its notes list what needs action before upgrading.
+- Requirements: root and Linux 6.12+ with the kernel options in the [startup guide](doc/en/how-to-start.md), on `x86_64` or `aarch64` with gnu or musl.
+- Configuration uses dae syntax, documented in the [configuration guide](doc/en/configuration.md).
+- The native API is served under the fixed `/api/v1` base and stays opt-in through `experimental.native_api`; before `1.0` it may change in a minor release. `GET /api/v1/version` reports the contract identity.
+- Each release lists its archives in a Downloads section and carries `SHA256SUMS` and build provenance. Security reports go through the [security policy](.github/SECURITY.md).
+
 ## Development
 
 The workspace contains configuration, shared eBPF types, NFQUEUE, outbound, core, and tooling crates. The kernel program in `crates/honk-ebpf` is built separately. Build prerequisites and commands are in the [startup guide](doc/en/how-to-start.md#build-from-source) and [Justfile](Justfile).
@@ -45,9 +53,7 @@ For unprivileged userspace development, use [mock mode](doc/en/how-to-start.md#u
 
 ### Debug builds
 
-Maintainer `debug.*` tags update the rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug), not Latest. These are release-profile binaries, not Cargo debug-profile builds. The rolling tag and assets are replaced; source tags remain, and release notes record the source commit and workflow run. Pending intermediate runs may be superseded.
-
-Publication requires all sixteen expected archives to be present and nonempty. If artifacts have expired or been deleted, use **Re-run all jobs**. Publication is not transactional; a failed update may leave the tag, notes, and assets inconsistent until recovery.
+Between releases, maintainers publish `debug.*` builds from `main`: release-profile binaries for testing, not Cargo debug-profile builds. The rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug) always holds the newest one and is never marked Latest; each debug tag also keeps its own release while it is among the newest ten. Like formal releases, they carry `SHA256SUMS`, build provenance and a Downloads section. Publication details are in [the release rules](.agents/rules/release.md).
 
 ## Review status
 

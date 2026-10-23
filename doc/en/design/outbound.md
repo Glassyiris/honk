@@ -355,10 +355,7 @@ error/excluding GOAWAY are stream errors rather than clean EOF. Already buffered
 payload precedes terminal read errors, which remain errors on later reads;
 successful receive completion remains EOF even if the write direction later
 fails. An admitted stream can finish after graceful GOAWAY; no application
-bytes are retried. The locked `h2` 0.4.19 still normalizes a missing `:status` to
-200. [Upstream fix #959](https://github.com/hyperium/h2/pull/959) is merged but not
-included in this locked release; rejection of that malformed response still
-requires upgrading to a published release containing the fix.
+bytes are retried.
 
 VMess records errors returned by its relay before closing the duplex half, so
 response-header and body-decoding failures reach the stream owner instead of EOF.
@@ -995,6 +992,12 @@ waits, least-loaded selection, and pool-owned single-flight physical dials.
 Draining sessions are excluded from the reusable cap and can overlap
 replacements while live streams finish. The pool also owns bounded retry
 classification, backoff, retirement, and idempotent force shutdown.
+A session already closed when its dial completes counts as a dial failure and
+is never published. A caller whose own dial already ran never dials again; in
+order it takes the least-loaded active session with room, waits on another caller's
+in-flight dial, fails fast inside the backoff window, or waits for room on a
+full active session, and with no active session it fails and counts a dial
+failure.
 Initialization waiters receive one `SharedError`, which clones the original
 `anyhow::Error` through an `Arc` and preserves its source chain. The pool never
 flattens a builder failure to display text before broadcasting it.
@@ -1004,9 +1007,10 @@ existing redial backoff. A refused janitor leaves no running flag, a refused
 drain worker force-closes the retained sessions, and Mux.Cool fails the carrier
 when its owner refuses END delivery.
 
-AnyTLS configures two reusable physical sessions and 128 streams per session.
-It spreads work: after the first session becomes busy, the pool establishes the
-second before adding more load, then schedules least-loaded. Consecutive dial
+AnyTLS configures eight reusable physical sessions and 128 streams per session.
+It spreads work: while every session is busy and fewer than eight exist, the
+pool establishes another before adding more load, then schedules least-loaded,
+so concurrent streams do not share one TCP carrier's head-of-line stalls. Consecutive dial
 failures use bounded backoff instead of one physical connect per proxied flow.
 H2MUX and Mux.Cool instead fill the least-loaded carrier within their caps.
 
@@ -1032,13 +1036,14 @@ last owner release drains future reuse without terminating live streams.
 ### Ordered write path
 
 Every frame crosses one `WriterQueue` and one physical writer task. Data permits
-are bounded by 896 frames and 8 MiB of queued or in-flight payload per session,
-whichever fills first. A full budget backpressures the writing stream.
+are bounded by 896 frames and 1 MiB of queued or in-flight payload per session,
+whichever fills first. A full budget backpressures the writing stream; the byte
+cap also bounds how long a new stream's SYN waits behind a saturated upload.
 Control frames retain reserved headroom; the whole queue is capped at 1,024
 commands. The byte budget bounds queued payload: a frame carries up to 65,535
 bytes, so frames alone allowed 56 MiB per session, which a line-rate upload fills.
-It does not count a stream's unqueued slot, a UoT packet before its permit, or
-the encoded batch buffer. Exhausting the 1,024-command queue or a push after
+It does not count a UoT packet before its permit or the encoded batch buffer.
+Exhausting the 1,024-command queue or a push after
 close makes the session terminal instead of growing memory. The relay reads at
 most 65,535 bytes at a time, so one nonempty read is at most one AnyTLS frame;
 a 64 KiB read became a 65,535-byte frame and a 1-byte frame. A stream's SYN and
@@ -1047,17 +1052,25 @@ so another stream cannot interleave between them.
 Abandoned mid-open registrations send FIN rather than killing the session.
 
 After one blocking pop, the writer gathers only frames already queued, up to 63
-frames or 256 KiB on top of the first frame, into one `write_all` and one `flush`. It never waits to fill
-a batch. Data permits and confirmed-write completions are released only after
+frames or 256 KiB on top of the first frame, and sends them with one `flush`. It never waits to fill
+a batch. A data frame is serialized, header included, in the one copy that
+admits its payload. Without padding the writer sends the frame's whole TLS
+records straight from that buffer and copies only control frames and the data
+bytes that do not fill a record of their own, so the batch keeps the record
+boundaries of one contiguous write.
+Data permits and confirmed-write completions are released only after
 the physical batch succeeds or the session becomes terminal.
 
 Control-only batches have a 5-second deadline (`writeControlFrame` sing-anytls
 parity); expiry fails the session. Data-containing batches have no deadline:
 congestion backpressures the cap without killing siblings.
 
-`AnyTlsStream::poll_write` is cancellation-safe through an owned outbound slot.
-It returns `Ok(n)` only after exactly those `n` bytes have entered the ordered
-queue; cancellation cannot lose a pending chunk or enqueue it twice.
+`AnyTlsStream::poll_write` is cancellation-safe because it copies nothing until
+it holds a writer-queue permit. It returns `Ok(n)` only after exactly those `n`
+bytes have entered the ordered queue, and a retried write enqueues its chunk
+once. A write that returned `Pending` accepted nothing: flush and shutdown drop
+its permit wait, so the abandoned bytes are never sent, and return without
+waiting for writer capacity.
 
 ### Non-blocking demultiplexing
 

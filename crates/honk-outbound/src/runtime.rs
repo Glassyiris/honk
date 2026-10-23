@@ -104,7 +104,7 @@ pub trait QuicRuntimeClient: Send + Sync + 'static {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
     /// Activate persistent-carrier telemetry without reporting business outcomes.
     async fn enable_metrics(&self, _quality: Arc<crate::transport_quality::TransportQuality>) {}
-    /// Close the cached connection and endpoint, awaiting any in-flight
+    /// Close the cached connection and the latest dial's endpoint, awaiting any in-flight
     /// dial so its late-arriving connection is closed too.
     async fn force_close(&self);
     /// Drop only reusable warm ownership. Existing flows keep their own

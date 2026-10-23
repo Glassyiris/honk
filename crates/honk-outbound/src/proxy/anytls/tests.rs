@@ -1,6 +1,6 @@
 use super::overflow::{OverflowAction, SESSION_OVERFLOW_HARD_CAP};
 use super::padding::write_padded;
-use super::writer::{WRITER_BATCH_MAX_BYTES, WRITER_BATCH_MAX_FRAMES};
+use super::writer::{WRITER_BATCH_MAX_BYTES, WRITER_BATCH_MAX_FRAMES, write_batch};
 use super::*;
 use crate::session::ManagedSession as _;
 mod overflow_runtime;
@@ -173,13 +173,13 @@ async fn test_writer_batch_encoding_matches_sequential_frames() {
             },
             FrameCommand::Data {
                 sid: 1,
-                payload: bytes::Bytes::from_static(b"hello"),
+                frame: data_frame(1, b"hello"),
                 _permit: p1,
                 completion: None,
             },
             FrameCommand::Data {
                 sid: 2,
-                payload: bytes::Bytes::from_static(b"world"),
+                frame: data_frame(2, b"world"),
                 _permit: p2,
                 completion: None,
             },
@@ -215,6 +215,84 @@ async fn test_writer_batch_encoding_matches_sequential_frames() {
         .unwrap();
     write_frame(&mut reference, CMD_FIN, 2, b"").await.unwrap();
     assert_eq!(&buf[..], &reference[..]);
+}
+
+/// Accepts at most one TLS record per call, like a partial-write `SslStream`.
+#[derive(Default)]
+struct RecordWriter {
+    bytes: Vec<u8>,
+    writes: Vec<usize>,
+}
+
+impl AsyncWrite for RecordWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let n = buf.len().min(16 * 1024);
+        self.bytes.extend_from_slice(&buf[..n]);
+        self.writes.push(n);
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn writer_batch_keeps_contiguous_record_boundaries() {
+    let frame_permits = Arc::new(tokio::sync::Semaphore::new(4));
+    let byte_permits = Arc::new(tokio::sync::Semaphore::new(WRITER_DATA_BYTES_CAP));
+    let mut batch = vec![FrameCommand::Control {
+        cmd: CMD_SYN,
+        sid: 1,
+        payload: bytes::Bytes::from_static(b"addr"),
+    }];
+    for (sid, len) in [(1u32, 65_535usize), (2, 65_535), (1, 5), (2, 40_000)] {
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ sid as u8).collect();
+        batch.push(FrameCommand::Data {
+            sid,
+            frame: data_frame(sid, &payload),
+            _permit: DataPermit {
+                _frame: Arc::clone(&frame_permits).acquire_owned().await.unwrap(),
+                _bytes: Arc::clone(&byte_permits)
+                    .acquire_many_owned(len as u32)
+                    .await
+                    .unwrap(),
+            },
+            completion: None,
+        });
+    }
+    batch.push(FrameCommand::Control {
+        cmd: CMD_FIN,
+        sid: 2,
+        payload: bytes::Bytes::new(),
+    });
+
+    let mut contiguous = bytes::BytesMut::new();
+    for cmd in &batch {
+        cmd.encode_into(&mut contiguous);
+    }
+    let mut writer = RecordWriter::default();
+    write_batch(&mut writer, &batch, &mut bytes::BytesMut::new())
+        .await
+        .unwrap();
+
+    assert_eq!(writer.bytes, contiguous[..]);
+    let records: Vec<usize> = contiguous.chunks(16 * 1024).map(<[u8]>::len).collect();
+    assert_eq!(writer.writes, records);
 }
 
 #[tokio::test]

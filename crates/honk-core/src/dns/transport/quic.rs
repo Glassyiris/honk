@@ -21,7 +21,8 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
     .await
 }
 
-/// Lazily-created per-family QUIC client endpoints reused across reconnects.
+/// Per-family endpoint of the latest direct dial, closed at shutdown, plus the
+/// owner of packet-backed endpoints.
 pub(super) struct SharedQuicEndpoint {
     direct: tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>,
     tasks: std::sync::Arc<honk_outbound::runtime::TaskOwner>,
@@ -35,15 +36,12 @@ impl SharedQuicEndpoint {
         }
     }
 
-    async fn get(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
-        let mut endpoints = self.direct.lock().await;
-        let endpoint = &mut endpoints[if ipv6 { 1 } else { 0 }];
-        if let Some(endpoint) = endpoint.as_ref() {
-            return Ok(endpoint.clone());
-        }
+    /// Binds a fresh socket for every direct dial, so a redial does not inherit
+    /// the local port of a black-holed flow.
+    async fn bind_direct(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
         let created = honk_outbound::quic::client_endpoint(ipv6)
             .map_err(|e| anyhow::anyhow!("QUIC client endpoint: {e}"))?;
-        *endpoint = Some(created.clone());
+        self.direct.lock().await[usize::from(ipv6)] = Some(created.clone());
         Ok(created)
     }
 
@@ -120,7 +118,7 @@ pub(super) fn with_packet_cause(
     }
 }
 
-/// Connect `config` to `addr`, using either the shared direct endpoint or an
+/// Connect `config` to `addr`, using either a freshly bound direct endpoint or an
 /// endpoint backed by the selected proxy's PacketTransport. `label` prefixes
 /// error messages (`DoQ` / `DoH3 QUIC`).
 async fn quic_connect(
@@ -153,7 +151,7 @@ async fn quic_connect(
     let endpoint = if let Some(owner) = &owner {
         owner.endpoint()
     } else {
-        direct = direct_endpoint.get(addr.is_ipv6()).await?;
+        direct = direct_endpoint.bind_direct(addr.is_ipv6()).await?;
         &direct
     };
     let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
@@ -222,6 +220,49 @@ pub(super) async fn quic_connect_endpoint(
 
 #[cfg(all(test, feature = "native-api"))]
 mod tests;
+#[cfg(test)]
+mod direct_endpoint_tests {
+    use super::*;
+    use crate::dns::transport::tests_proto::{insecure_quic_config, quic_server_endpoint};
+
+    #[tokio::test]
+    async fn every_direct_dial_binds_a_fresh_local_port() {
+        let (server, address) = quic_server_endpoint(b"doq");
+        let dial = DialContext {
+            endpoint: DnsEndpoint::parse(
+                &address.to_string(),
+                honk_config::types::DnsProtocol::Quic,
+                Some("localhost"),
+            )
+            .unwrap(),
+            query_timeout: Duration::from_secs(2),
+            dial_timeout: Duration::from_secs(2),
+            proxy: None,
+        };
+        let endpoint = SharedQuicEndpoint::new();
+        let config = insecure_quic_config(b"doq").await;
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let (client, accepted) = tokio::join!(
+                quic_connect_endpoint(
+                    &dial,
+                    &endpoint,
+                    &config,
+                    &dial.endpoint,
+                    tokio::time::Instant::now() + dial.dial_timeout,
+                    "DoQ",
+                ),
+                async { server.accept().await.unwrap().await.unwrap() },
+            );
+            let (connection, _) = client.unwrap();
+            ports.push(accepted.remote_address().port());
+            connection.close(0_u32.into(), b"redial");
+        }
+        assert_ne!(ports[0], ports[1]);
+        endpoint.close(Duration::from_secs(1)).await;
+        server.close(0_u32.into(), b"done");
+    }
+}
 #[cfg(test)]
 mod packet_cause_tests {
     use super::*;

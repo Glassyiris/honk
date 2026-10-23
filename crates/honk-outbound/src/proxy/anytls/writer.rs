@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 use super::padding::write_padded;
@@ -15,9 +15,10 @@ use super::{
 /// backpressure); control commands ride the reserved headroom so SYN/FIN
 /// can never be starved by payload.
 pub(super) enum FrameCommand {
+    /// A PSH frame, header included, serialized by [`data_frame`].
     Data {
         sid: u32,
-        payload: bytes::Bytes,
+        frame: bytes::Bytes,
         _permit: DataPermit,
         completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
@@ -28,30 +29,89 @@ pub(super) enum FrameCommand {
     },
 }
 
+/// Serialize a PSH frame in the payload's one copy, so the writer can send
+/// it without copying it again.
+pub(super) fn data_frame(sid: u32, payload: &[u8]) -> bytes::Bytes {
+    let mut frame = bytes::BytesMut::with_capacity(FRAME_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&[0; FRAME_HEADER_LEN]);
+    frame.extend_from_slice(payload);
+    seal_data_frame(sid, frame)
+}
+
+/// Write the PSH header into the `FRAME_HEADER_LEN` bytes reserved at the
+/// front of `frame`; the rest is the payload.
+pub(super) fn seal_data_frame(sid: u32, mut frame: bytes::BytesMut) -> bytes::Bytes {
+    let len = frame.len() - FRAME_HEADER_LEN;
+    frame[..FRAME_HEADER_LEN].copy_from_slice(&header(CMD_PSH, sid, len));
+    frame.freeze()
+}
+
+fn header(cmd: u8, sid: u32, len: usize) -> [u8; FRAME_HEADER_LEN] {
+    let len = u16::try_from(len).expect("AnyTLS frame payload fits u16");
+    let mut header = [0; FRAME_HEADER_LEN];
+    header[0] = cmd;
+    header[1..5].copy_from_slice(&sid.to_be_bytes());
+    header[5..].copy_from_slice(&len.to_be_bytes());
+    header
+}
+
 impl FrameCommand {
     /// Serialized size (header + payload).
     fn wire_len(&self) -> usize {
-        let payload = match self {
-            FrameCommand::Data { payload, .. } | FrameCommand::Control { payload, .. } => {
-                payload.len()
-            }
-        };
-        FRAME_HEADER_LEN + payload
+        match self {
+            FrameCommand::Data { frame, .. } => frame.len(),
+            FrameCommand::Control { payload, .. } => FRAME_HEADER_LEN + payload.len(),
+        }
     }
 
     /// Append the serialized frame to `buf`.
     pub(super) fn encode_into(&self, buf: &mut bytes::BytesMut) {
-        use bytes::BufMut as _;
-        let (cmd, sid, payload) = match self {
-            FrameCommand::Data { sid, payload, .. } => (CMD_PSH, *sid, payload),
-            FrameCommand::Control { cmd, sid, payload } => (*cmd, *sid, payload),
-        };
-        debug_assert!(payload.len() <= u16::MAX as usize);
-        buf.put_u8(cmd);
-        buf.put_u32(sid);
-        buf.put_u16(payload.len() as u16);
-        buf.extend_from_slice(payload);
+        match self {
+            FrameCommand::Data { frame, .. } => buf.extend_from_slice(frame),
+            FrameCommand::Control { cmd, sid, payload } => {
+                buf.extend_from_slice(&header(*cmd, *sid, payload.len()));
+                buf.extend_from_slice(payload);
+            }
+        }
     }
+}
+
+/// TLS plaintext per record. Every `write_all` starts a new record.
+const TLS_RECORD: usize = 16 * 1024;
+
+/// Write `batch` in order with the TLS records one contiguous write would
+/// produce. Unpadded, whole records of a data frame go out from the frame's
+/// own buffer; `buf` only gathers control frames and the bytes of data
+/// frames that do not fill a record of their own.
+pub(super) async fn write_batch<W: AsyncWrite + Unpin + ?Sized>(
+    write: &mut W,
+    batch: &[FrameCommand],
+    buf: &mut bytes::BytesMut,
+) -> std::io::Result<()> {
+    buf.clear();
+    for cmd in batch {
+        let FrameCommand::Data { frame, .. } = cmd else {
+            cmd.encode_into(buf);
+            continue;
+        };
+        let head = (TLS_RECORD - buf.len() % TLS_RECORD) % TLS_RECORD;
+        let direct = frame.len().saturating_sub(head) / TLS_RECORD * TLS_RECORD;
+        if direct == 0 {
+            buf.extend_from_slice(frame);
+            continue;
+        }
+        buf.extend_from_slice(&frame[..head]);
+        if !buf.is_empty() {
+            write.write_all(buf).await?;
+            buf.clear();
+        }
+        write.write_all(&frame[head..head + direct]).await?;
+        buf.extend_from_slice(&frame[head + direct..]);
+    }
+    if !buf.is_empty() {
+        write.write_all(buf).await?;
+    }
+    Ok(())
 }
 
 /// Total writer-queue depth (data + control headroom).
@@ -60,11 +120,10 @@ pub(super) const WRITER_QUEUE_CAP: usize = 1024;
 /// fill the queue past `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`.
 pub(super) const WRITER_CONTROL_RESERVED: usize = 128;
 /// Payload bytes queued ahead of the TLS writer, per session. The frame cap
-/// alone allowed 896 × 65,535 bytes (56 MiB) of in-flight payload: at line
-/// rate the relay fills it and RSS follows (124 MB peak measured with four
-/// upload streams). 8 MiB covers the writer's latency without changing
-/// throughput on the same run (62 MB peak).
-pub(super) const WRITER_DATA_BYTES_CAP: usize = 8 * 1024 * 1024;
+/// alone allowed 896 × 65,535 bytes (56 MiB) of in-flight payload. Every
+/// later frame, a new stream's SYN included, drains behind this backlog:
+/// 8 MiB is ~0.7 s at 100 Mbit/s, 1 MiB ~84 ms.
+pub(super) const WRITER_DATA_BYTES_CAP: usize = 1024 * 1024;
 /// sing-anytls bounds control writes at five seconds. A stuck shared writer
 /// must become terminal instead of remaining selectable by the session pool.
 /// Data batches stay unbounded like upstream: under uplink congestion the
@@ -155,17 +214,16 @@ impl WriterQueue {
 
 /// Batch caps for the writer's opportunistic gather: after the blocking
 /// pop, at most this many extra queued frames (or this many serialized
-/// bytes) ride the same `write_all` + single `flush`. Only what is already
+/// bytes) ride the same single `flush`. Only what is already
 /// queued is taken — batching never waits, so it adds no latency.
 pub(super) const WRITER_BATCH_MAX_FRAMES: usize = 64;
 pub(super) const WRITER_BATCH_MAX_BYTES: usize = 256 * 1024;
 
 /// The single writer task for a session: drains the queue in order and
-/// gather-writes whole batches per flush — one `write_all` of the
-/// concatenated frames instead of a header/payload write pair plus flush
-/// per frame (profiling showed flush-per-frame dominating CPU at line
-/// rate). Order is preserved; framing is byte-level so batches are
-/// transparent to the peer. A physical write failure kills the session
+/// gather-writes whole batches per flush instead of a header/payload write
+/// pair plus flush per frame (profiling showed flush-per-frame dominating
+/// CPU at line rate). Order is preserved; framing is byte-level so batches
+/// are transparent to the peer. A physical write failure kills the session
 /// (sing `writeControlFrame` parity) — frames already queued are lost
 /// with it.
 pub(super) async fn session_writer(
@@ -204,11 +262,6 @@ pub(super) async fn session_writer(
             WRITER_BATCH_MAX_FRAMES - 1
         };
         queue.drain_available(&mut batch, extra_frames, WRITER_BATCH_MAX_BYTES);
-        buf.clear();
-        buf.reserve(batch.iter().map(FrameCommand::wire_len).sum());
-        for cmd in &batch {
-            cmd.encode_into(&mut buf);
-        }
         packet = next_packet;
         // The activity marker for any SYN in this batch must be sampled
         // before the write: frames arriving while a blocked flush is still
@@ -219,9 +272,14 @@ pub(super) async fn session_writer(
             .any(|cmd| matches!(cmd, FrameCommand::Data { .. }));
         let write_op = async {
             if let Some(padding) = &padding {
+                buf.clear();
+                buf.reserve(batch.iter().map(FrameCommand::wire_len).sum());
+                for cmd in &batch {
+                    cmd.encode_into(&mut buf);
+                }
                 write_padded(&mut write, &buf, padding, packet).await?;
             } else {
-                write.write_all(&buf).await?;
+                write_batch(&mut write, &batch, &mut buf).await?;
             }
             write.flush().await
         };

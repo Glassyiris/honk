@@ -123,6 +123,127 @@ async fn spread_sessions_fills_idle_capacity_before_multiplexing() {
     assert_eq!(dials.load(Ordering::Relaxed), 2);
 }
 
+/// A concurrent burst can occupy the session this caller just dialed before
+/// the caller re-elects, and another caller may already be dialing. With its
+/// dial spent it cannot open a second session, so it must take the healthy
+/// one rather than fail and arm the breaker or wait on that other dial.
+#[tokio::test(start_paused = true)]
+async fn spread_reelection_with_a_spent_dial_reuses_the_busy_session() {
+    let pool = pool(SessionPoolConfig {
+        max_sessions: 2,
+        spread_sessions: true,
+        ..Default::default()
+    });
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&dials);
+    let (other_dial, _) = tokio::sync::watch::channel(DialSignal::Pending);
+    let inflight = (Arc::clone(&pool.pool), other_dial.clone());
+    let session = tokio::time::timeout(
+        Duration::from_secs(1),
+        pool.offer(move || async move {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let session = TestSession::new();
+            session.streams.store(1, Ordering::Relaxed);
+            let (pool, other_dial) = inflight;
+            pool.lock().dial_done = Some((u64::MAX, other_dial));
+            Ok(session)
+        }),
+    )
+    .await
+    .expect("a spent dial must not wait on another caller's dial")
+    .expect("a healthy dialed session must be returned");
+    assert!(!session.is_closed());
+    assert_eq!(dials.load(Ordering::Relaxed), 1);
+    pool.pool.lock().dial_done = None;
+    drop(other_dial);
+
+    let next = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .expect("the breaker must not have been armed");
+    assert!(
+        !Arc::ptr_eq(&session, &next),
+        "spreading still opens the second session"
+    );
+}
+
+/// Concurrent waiters can fill every slot of the session this caller just
+/// dialed. With its dial spent it waits for capacity rather than failing
+/// and arming the breaker for a healthy pool.
+#[tokio::test(start_paused = true)]
+async fn spread_reelection_with_a_spent_dial_waits_for_a_full_session() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        max_sessions: 2,
+        max_streams_per_session: 1,
+        spread_sessions: true,
+        ..Default::default()
+    }));
+    let dialed = Arc::new(parking_lot::Mutex::new(None));
+    let offer = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        let dialed = Arc::clone(&dialed);
+        async move {
+            pool.offer(move || async move {
+                let session = TestSession::new();
+                session.streams.store(1, Ordering::Relaxed);
+                *dialed.lock() = Some(Arc::clone(&session));
+                Ok(session)
+            })
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !offer.is_finished(),
+        "a full healthy pool must not fail the offer"
+    );
+
+    let session = dialed.lock().clone().expect("the offer dialed");
+    session.streams.store(0, Ordering::Relaxed);
+    pool.capacity_notify.notify_waiters();
+    let served = offer
+        .await
+        .unwrap()
+        .expect("freed capacity serves the waiter");
+    assert!(Arc::ptr_eq(&served, &session));
+}
+
+/// With a busy session to spread from, a fresh session that dies on arrival
+/// must still pace redials instead of letting every later offer redial at once.
+#[tokio::test(start_paused = true)]
+async fn spread_dead_on_arrival_session_still_engages_the_breaker() {
+    let pool = pool(SessionPoolConfig {
+        max_sessions: 2,
+        spread_sessions: true,
+        ..Default::default()
+    });
+    let busy = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .unwrap();
+    busy.streams.store(1, Ordering::Relaxed);
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let offer_dead = |dials: &Arc<AtomicUsize>| {
+        let dials = Arc::clone(dials);
+        pool.offer(move || async move {
+            dials.fetch_add(1, Ordering::Relaxed);
+            let session = TestSession::new();
+            session.close();
+            Ok(session)
+        })
+    };
+    let first = offer_dead(&dials).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &busy), "the busy session still serves");
+    let second = offer_dead(&dials).await.unwrap();
+    assert!(Arc::ptr_eq(&second, &busy));
+    assert_eq!(
+        dials.load(Ordering::Relaxed),
+        1,
+        "the dead session armed the breaker"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn spread_sessions_reuses_busy_session_when_extra_dial_fails() {
     let pool = pool(SessionPoolConfig {

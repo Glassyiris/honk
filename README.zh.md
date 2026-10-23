@@ -6,7 +6,7 @@
 
 honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据面和配置语法受 [dae](https://github.com/daeuniverse/dae) 启发；出站组、多协议拨号器和 Clash 兼容 API 沿用 [sing-box](https://github.com/SagerNet/sing-box) 的设计思路。honk 是独立实现，并非任一项目的逐行移植。
 
-> **早期 alpha（`v0.0.1-alpha`），不建议用于生产。** 可能发生破坏性变更，部分功能尚未完成，真实环境验证仍然有限。
+> **早期 alpha，不建议用于生产。** 可能发生破坏性变更，部分功能尚未完成，真实环境验证仍然有限。
 
 ## 功能概览
 
@@ -23,7 +23,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 真实透明代理需要 **root、Linux 6.12+、所需内核选项和 bpffs**。首次部署会修改网络 hook、命名空间和 sysctl；须保留带外管理通道。
 
 1. 按[启动指南](doc/zh/how-to-start.md)检查内核、安装程序、准备 direct-only 配置并验证连通性。
-2. 从 [Releases](https://github.com/daeuniverse/honk/releases) 下载匹配的二进制，或按指南准备源码构建依赖。发布二进制内嵌 eBPF 对象；源码构建需要启用 `ebpf` feature。仅运行 `cargo build --release` **不会**启用真实数据面。
+2. 从 [Releases](https://github.com/daeuniverse/honk/releases) 下载匹配的二进制，每个 release 的 Downloads 一节说明各个归档，可用 `SHA256SUMS` 校验；或按指南准备源码构建依赖。发布二进制内嵌 eBPF 对象；源码构建需要启用 `ebpf` feature。仅运行 `cargo build --release` **不会**启用真实数据面。
 3. 按[配置指南](doc/zh/configuration.md)添加节点、组、路由和 DNS。仓库提供[完整示例](config.dae)和[最小开发示例](config.min.dae)；使用前须调整接口和节点地址。
 
 [文档索引](doc/README.md)汇总双语指南、参考和子系统设计。实现细节可从[架构概览](doc/zh/design/overview.md)、[节点参考](doc/zh/reference/nodes.md)或 [API 参考](doc/zh/reference/api.md)开始。
@@ -39,6 +39,14 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 `.dae` 仍是唯一配置权威。启动时捕获的源支持元数据读取、离线校验、授权源 PUT 和受限组 PATCH。主文件节点/provider 的创建与删除在实际激活后才返回成功，geodata 更新 operation 激活已验证的内容。编辑已有条目继续使用源 PUT；`--store db` 将已接受的源记录为状态数据库中的 revision。凭据源只读，返回正文时遮蔽 listener secret 值。启用原生 API 时，与 Clash 共用非持久化模式；成功的显式激活（含 no-op）重置 Rule 与设置，provider/network refresh 保留它们。原生 runtime mode、暂停/恢复与完整内核 flow 观测仍未开放。详见[原生 API 参考](doc/zh/reference/api.md#原生-api)。
 
+## 版本与兼容性
+
+- 自 `v0.1.0` 起，发布遵循 [SemVer](https://semver.org/lang/zh-CN/)；带 `-alpha.N`、`-beta.N` 或 `-rc.N` 后缀的 tag 为预发布。`1.0` 之前，次版本可能改变配置或行为，其发布说明会列出升级前需要处理的事项。
+- 运行要求：root 权限与 Linux 6.12+，并启用[启动指南](doc/zh/how-to-start.md)列出的内核选项；架构为 `x86_64` 或 `aarch64`，gnu 或 musl。
+- 配置使用 dae 语法，见[配置指南](doc/zh/configuration.md)。
+- 原生 API 固定在 `/api/v1` 下，仍需通过 `experimental.native_api` 显式启用；`1.0` 之前可能在次版本中变化。`GET /api/v1/version` 返回契约标识。
+- 每个 release 的 Downloads 一节列出全部归档，并附带 `SHA256SUMS` 与构建来源证明。安全问题请按[安全策略](.github/SECURITY.md)私下报告。
+
 ## 开发
 
 工作区包含配置、共享 eBPF 类型、NFQUEUE、出站、核心和工具 crate。`crates/honk-ebpf` 中的内核程序单独构建。构建依赖和命令见[启动指南](doc/zh/how-to-start.md#从源码构建)与 [Justfile](Justfile)。
@@ -47,9 +55,7 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 ### Debug 构建
 
-维护者推送 `debug.*` tag 会更新滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)，而不是 Latest。这些是 release profile 二进制，并非 Cargo debug profile 构建。滚动 tag 和附件会被替换；源 tag 保留，release 说明记录源 commit 和 workflow run。等待中的中间运行可能被后续运行取代。
-
-发布要求十六个预期归档齐全且非空。若 artifact 已过期或被删除，使用 **Re-run all jobs**。发布不是原子操作；更新失败可能使 tag、说明和附件暂时不一致，需恢复后才能重新一致。
+两次发布之间，维护者会从 `main` 发布 `debug.*` 构建：供测试的 release profile 二进制，并非 Cargo debug profile 构建。滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)始终是最新一次构建，不会标为 Latest；每个 debug tag 在最新十个之内也保留各自的 release。与正式版一样，它们附带 `SHA256SUMS`、构建来源证明与 Downloads 一节。发布细节见[发布规则](.agents/rules/release.md)。
 
 ## Review 状态
 

@@ -82,6 +82,21 @@ impl AddrFraming {
         data: &[u8],
         max_payload: usize,
     ) -> io::Result<Bytes> {
+        self.encode_after(0, prefix, target, target_domain, data, max_payload)
+            .map(BytesMut::freeze)
+    }
+
+    /// [`Self::encode`] after `headroom` zero bytes the caller fills with its
+    /// own header, so the packet is copied once into its final buffer.
+    pub(crate) fn encode_after(
+        self,
+        headroom: usize,
+        prefix: &[u8],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        data: &[u8],
+        max_payload: usize,
+    ) -> io::Result<BytesMut> {
         validate_packet_len(data, max_payload)?;
         if target_domain
             .is_some_and(|domain| domain.is_empty() || domain.len() > usize::from(u8::MAX))
@@ -98,7 +113,8 @@ impl AddrFraming {
             (None, SocketAddr::V6(_)) => 16,
         };
         let mut frame =
-            BytesMut::with_capacity(prefix.len() + 1 + address_len + 2 + 2 + data.len());
+            BytesMut::with_capacity(headroom + prefix.len() + 1 + address_len + 2 + 2 + data.len());
+        frame.put_bytes(0, headroom);
         frame.extend_from_slice(prefix);
         match (target_domain, target) {
             (Some(domain), _) => {
@@ -118,7 +134,7 @@ impl AddrFraming {
         frame.put_u16(target.port());
         frame.put_u16(data.len() as u16);
         frame.extend_from_slice(data);
-        Ok(frame.freeze())
+        Ok(frame)
     }
 
     /// Real peer of a validated frame whose bytes up to the payload are

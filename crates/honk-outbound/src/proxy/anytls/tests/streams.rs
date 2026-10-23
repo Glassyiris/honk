@@ -176,14 +176,14 @@ async fn failed_session_preserves_node_failure_after_stream_unregistration() {
         session
             .enqueue_data_with_permit(
                 transport.sid,
-                bytes::Bytes::from_static(b"x"),
+                data_frame(transport.sid, b"x"),
                 queued_permit,
             )
             .unwrap_err(),
         session
             .enqueue_confirmed_data_with_permit(
                 transport.sid,
-                bytes::Bytes::from_static(b"x"),
+                data_frame(transport.sid, b"x"),
                 confirmed_permit,
             )
             .unwrap_err(),
@@ -383,8 +383,8 @@ pub(super) fn spawn_echo_server(
     addr_rx
 }
 
-/// poll_write cancel safety: a cancelled write neither loses the
-/// payload nor enqueues it twice; a retry reuses the stored slot.
+/// poll_write cancel safety: a cancelled write copies nothing, and the call
+/// that resumes the permit copies its own buffer and enqueues it once.
 #[tokio::test]
 async fn test_poll_write_cancel_safety() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -437,8 +437,9 @@ async fn test_poll_write_cancel_safety() {
 }
 
 /// The writer queue is bounded in payload bytes as well as frames: with the
-/// byte budget spent, a write waits even though frame slots are free, and
-/// resumes once enough bytes are released.
+/// byte budget spent, a write waits even though frame slots are free, resumes
+/// once enough bytes are released, and leaves the whole budget free once its
+/// frame has been written.
 #[tokio::test]
 async fn test_writer_queue_byte_budget_backpressures_writes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -478,57 +479,12 @@ async fn test_writer_queue_byte_budget_backpressures_writes() {
         .unwrap()
         .unwrap();
     assert_eq!(echoed, payload);
-}
 
-/// A write that waited for bytes and then got in through the fast path must
-/// not keep its waiter's reservation: once the frame has flushed, the whole
-/// byte budget is available again without the stream flushing or closing.
-#[tokio::test]
-async fn test_fast_path_retry_releases_the_waiters_reservation() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let (session, mut server) = establish_test_session("127.0.0.1:446").await;
-    expect_handshake(&mut server).await;
-    let mut addr_rx = spawn_echo_server(server);
-    let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
-    let permit = session.try_reserve().unwrap();
-    let mut stream = session.open_stream_direct(target, permit).await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
-        .await
-        .unwrap();
-
-    let payload = vec![0x3c; 4096];
-    let bytes = Arc::clone(&session.writer_q.data_bytes);
-    let hog = Arc::clone(&bytes)
-        .acquire_many_owned((WRITER_DATA_BYTES_CAP - payload.len() + 1) as u32)
-        .await
-        .unwrap();
-    // The write parks a waiter for the payload's bytes.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), stream.write(&payload))
-            .await
-            .is_err()
-    );
-    // Releasing everything lets the waiter be served and leaves room for the
-    // retry's own fast-path acquisition.
-    drop(hog);
-    tokio::time::timeout(Duration::from_secs(2), stream.write_all(&payload))
-        .await
-        .unwrap()
-        .unwrap();
-    let mut echoed = vec![0u8; payload.len()];
-    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(echoed, payload);
-
-    // The frame has flushed; nothing on this idle stream may still hold bytes.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while bytes.available_permits() != WRITER_DATA_BYTES_CAP {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{} of {} bytes still reserved after the flush",
+            "{} of {} bytes still reserved after the frame was written",
             WRITER_DATA_BYTES_CAP - bytes.available_permits(),
             WRITER_DATA_BYTES_CAP
         );
@@ -584,6 +540,70 @@ async fn a_cancelled_write_does_not_send_or_count_its_bytes() {
         .unwrap()
         .unwrap();
     assert_eq!(echoed, new, "the cancelled payload must not reach the peer");
+}
+
+/// A Pending write accepted no bytes. Flushing or shutting down afterwards
+/// must neither send the payload of the write the caller abandoned nor keep
+/// the queue slot its wait was granted.
+#[tokio::test]
+async fn flush_after_a_cancelled_write_sends_nothing() {
+    use tokio::io::AsyncWriteExt;
+
+    for (shutdown, release_first) in [(false, true), (true, true), (false, false), (true, false)] {
+        let (session, mut server) = establish_test_session("127.0.0.1:447").await;
+        expect_handshake(&mut server).await;
+        let mut stream = session
+            .open_stream_direct(
+                vec![0x01, 127, 0, 0, 1, 0x01, 0xbb],
+                session.try_reserve().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+        assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+
+        let held = Arc::clone(&session.writer_q.data_permits)
+            .try_acquire_many_owned((WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32)
+            .unwrap();
+        {
+            let write = stream.write(b"never-accepted");
+            tokio::pin!(write);
+            assert!(futures_util::poll!(&mut write).is_pending());
+        }
+        // Flushing must neither wait for the abandoned write's capacity nor
+        // send it once that capacity frees up.
+        let held = if release_first {
+            drop(held);
+            None
+        } else {
+            Some(held)
+        };
+        let close = async {
+            if shutdown {
+                stream.shutdown().await
+            } else {
+                stream.flush().await
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .expect("flush must not wait on an abandoned write's capacity")
+            .unwrap();
+        drop(held);
+        assert_eq!(
+            session.writer_q.data_permits.available_permits(),
+            WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
+            "shutdown={shutdown} release_first={release_first}: the abandoned write kept its queue slot"
+        );
+
+        let emitted =
+            tokio::time::timeout(Duration::from_millis(100), read_frame(&mut server)).await;
+        assert!(
+            emitted.is_err(),
+            "shutdown={shutdown} release_first={release_first}: the abandoned write reached the wire: {emitted:?}"
+        );
+        session.close();
+    }
 }
 
 #[tokio::test]

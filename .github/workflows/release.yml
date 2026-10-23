@@ -24,6 +24,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test Debug artifact preflight
         run: bash .github/ci/test-debug-artifacts.sh
+      - name: Test release asset table
+        run: bash .github/ci/test-release-assets.sh
+      - name: Test release version and notes scripts
+        run: |
+          bash .github/ci/test-release-version.sh
+          bash .github/ci/test-release-notes.sh
+      # A formal tag must be SemVer and equal the workspace version. The builds run
+      # in parallel; the release job needs this one, so a mismatched tag publishes nothing.
+      - name: Check the tag against the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash .github/ci/check-release-version.sh "$GITHUB_REF_NAME"
       - name: Read Rust toolchain
         id: toolchain
         run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
@@ -83,16 +94,16 @@ jobs:
           # Full: Clash API + native API + embedded doona UI. Both arches ship
           # two binaries: mimalloc (default, faster QUIC) and stock malloc
           # (lower RSS high-water on small gateways).
-          - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: ""}
-          - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: ""}
-          - {target: x86_64-unknown-linux-musl, suffix: "", variant: full, name_suffix: ""}
-          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: ""}
-          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: ""}
+          - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
           # Lean variants apply to the static gateway builds only; the gnu
-          # artifacts stay full. The unsuffixed names remain the full build.
+          # artifacts stay full. Every name carries its variant suffix.
           - {target: x86_64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
           - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
           - {target: aarch64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
@@ -280,6 +291,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/debug.')
     steps:
       - name: Download all artifacts
@@ -293,34 +306,56 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: release-source
+          # The formal notes list the commits since the previous v* tag.
+          fetch-depth: 0
 
       # GPL-3.0 section 6: the binaries embed doona, so its corresponding
       # source is published next to them.
       - name: Add doona corresponding source
         run: bash release-source/ci/fetch-doona.sh --source dist
 
-      - name: Create signature
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          cd dist
-          for FILE in *.tar.gz; do
-            {
-              echo "$(md5sum "$FILE")  md5"
-              echo "$(shasum -a 1 "$FILE")  sha1"
-              echo "$(shasum -a 256 "$FILE")  sha256"
-              echo "$(shasum -a 512 "$FILE")  sha512"
-            } >> "$FILE.dgst"
-          done
+      # One checksum file covers every published archive, formal and Debug alike; the
+      # attestation lets `gh attestation verify` tie each archive to this workflow run.
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS
 
+      # Every release body explains each archive as {allocator}-{API}-{arch}-{libc}.
+      - name: Write release notes
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          bash release-source/.github/ci/release-assets.sh dist > assets.md
+          source_lines=$(printf "Source tag: \`%s\`\n\nCommit: \`%s\`\n\nBuild: %s" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUN_URL")
+          printf "Debug build of \`%s\`.\n\n%s\n\n" "$GITHUB_REF_NAME" "$source_lines" | cat - assets.md > notes-debug.md
+          printf 'Rolling debug build: the newest published debug tag. Each tag also keeps its own release.\n\n%s\n\n' "$source_lines" | cat - assets.md > notes-rolling.md
+
+      - name: Write formal release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release-source && bash .github/ci/release-notes.sh "$GITHUB_REF_NAME") > notes-formal.md
+          printf '\n' | cat - assets.md >> notes-formal.md
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # A formal release starts as a draft: the maintainer writes the Highlights,
+      # checks the assets, then publishes it. Debug releases stay immediate.
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             dist/*.tar.gz
-            dist/*.dgst
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          generate_release_notes: true
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          draft: true
+          body_path: notes-formal.md
 
       - name: Check complete Debug artifacts
         if: startsWith(github.ref, 'refs/tags/debug.')
@@ -335,15 +370,12 @@ jobs:
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: "false"
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
           overwrite_files: true
           fail_on_unmatched_files: true
-          body: |
-            Debug build of `${{ github.ref_name }}`.
-
-            Source tag: `${{ github.ref_name }}`
-            Commit: `${{ github.sha }}`
-            Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          body_path: notes-debug.md
 
       # The rolling Debug release keeps one stable page and download URL on the newest published build; the tag release
       # above stays as the immutable copy that downstream pins name.
@@ -374,12 +406,23 @@ jobs:
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: "false"
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
           overwrite_files: true
           fail_on_unmatched_files: true
-          body: |
-            Rolling debug build: the newest published debug tag. Each tag also keeps its own release.
+          body_path: notes-rolling.md
 
-            Source tag: `${{ github.ref_name }}`
-            Commit: `${{ github.sha }}`
-            Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # Downstream pins name a per-tag Debug release, so the newest ten stay; older
+      # ones are removed from the Releases page while their source tags remain.
+      # Order by publication: a release's createdAt is its target commit's date.
+      - name: Prune old Debug releases
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,publishedAt \
+            --jq '[.[] | select(.tagName | startswith("debug."))] | sort_by(.publishedAt) | reverse | .[10:] | .[].tagName' |
+            while read -r tag; do
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            done

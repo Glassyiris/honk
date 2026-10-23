@@ -96,7 +96,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | null | TUIC QUIC receive windows; effective defaults are 8 MiB / 8 MiB, with the conn window auto-tuned up to 32 MiB |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity credentials; flat aliases must agree with `username` / `password` |
 | `anytls_password` | string? | null | AnyTLS secret copied from link userinfo |
-| `anytls_min_idle_session` | usize? | null | Requested idle-session floor from `min_idle_session`; effective default 0, bounded by the two-session pool cap |
+| `anytls_min_idle_session` | usize? | null | Requested idle-session floor from `min_idle_session`; effective default 0, bounded by the eight-session pool cap |
 | `anytls_idle_session_check_interval` | u64? | null | Parsed `idle_session_check_interval` seconds; current runtime janitor cadence remains fixed at 30 s |
 | `anytls_idle_session_timeout` | u64? | null | Idle eviction from `idle_session_timeout`; effective default 30 s |
 | `mark` | u32? | null | Structured-model outbound `SO_MARK`; not a dae share-link query |
@@ -304,7 +304,7 @@ node {
 | Protocol | Link input | Node field / behavior |
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `tuic_uuid` / `tuic_password` |
-| TUIC | `congestion_control` | `cubic`, `new_reno`, or `bbr`; `cubic` when omitted; unknown values warn and fall back to cubic |
+| TUIC | `congestion_control` | `cubic`, `new_reno`, or `bbr` (quinn's original BBR or BBRv3, selected by `HONK_QUIC_BBR`); `cubic` when omitted; unknown values warn and fall back to cubic |
 | TUIC | `alpn` | Comma-separated ALPN override; share links default to `tuic`; original Clash/Mihomo imports use the source default described below |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | Receive-window overrides |
 | Juicity | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `juicity_uuid` / `juicity_password` |
@@ -321,7 +321,7 @@ Original Clash/Mihomo `proxies` entries materialize `h3` when TUIC `alpn` is mis
 | Link input | Node field / behavior |
 | --- | --- |
 | userinfo secret | `password` and `anytls_password` |
-| `min_idle_session` | `anytls_min_idle_session`; parsed as u16 and used as the requested standby floor, bounded by the two-session pool cap |
+| `min_idle_session` | `anytls_min_idle_session`; parsed as u16 and used as the requested standby floor, bounded by the eight-session pool cap |
 | `idle_session_check_interval` | Duration stored in seconds; currently not applied, because the janitor cadence is fixed at 30 s |
 | `idle_session_timeout` | Duration stored in seconds; defaults to 30 s |
 

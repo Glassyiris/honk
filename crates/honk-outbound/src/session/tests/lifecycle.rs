@@ -717,31 +717,39 @@ async fn dial_backoff_is_capped() {
     assert_eq!(dials.load(Ordering::Relaxed), 3);
 }
 
-/// A session that dies before serving a stream counts as a dial failure:
-/// the breaker arms and the next caller fails fast instead of hot-spinning
-/// fresh dials against a server that kills every fresh session.
+/// A session that cannot serve a stream on arrival, closed or already
+/// draining, counts as a dial failure: the breaker arms and the next caller
+/// fails fast instead of hot-spinning fresh dials against a server that kills
+/// every fresh session.
 #[tokio::test(start_paused = true)]
 async fn dead_on_arrival_session_engages_the_breaker() {
-    let pool = pool(SessionPoolConfig::default());
-    let dials = Arc::new(AtomicUsize::new(0));
-    let offer_dead = |dials: &Arc<AtomicUsize>| {
-        let dials = Arc::clone(dials);
-        pool.offer(move || async move {
-            dials.fetch_add(1, Ordering::Relaxed);
-            let session = TestSession::new();
-            session.close();
-            Ok(session)
-        })
-    };
-    let error = offer_dead(&dials).await.unwrap_err().to_string();
-    assert!(error.contains("immediately unusable"), "{error}");
-    assert_eq!(dials.load(Ordering::Relaxed), 1);
-    let error = offer_dead(&dials).await.unwrap_err().to_string();
-    assert!(error.contains("backing off"), "{error}");
-    assert_eq!(dials.load(Ordering::Relaxed), 1);
-    tokio::time::advance(Duration::from_secs(2)).await;
-    let _ = offer_dead(&dials).await;
-    assert_eq!(dials.load(Ordering::Relaxed), 2);
+    let kills: [fn(&TestSession); 2] = [|s| s.close(), |s| s.begin_drain()];
+    for kill in kills {
+        let pool = pool(SessionPoolConfig::default());
+        let dials = Arc::new(AtomicUsize::new(0));
+        let offer_dead = |dials: &Arc<AtomicUsize>| {
+            let dials = Arc::clone(dials);
+            pool.offer(move || async move {
+                dials.fetch_add(1, Ordering::Relaxed);
+                let session = TestSession::new();
+                kill(&session);
+                Ok(session)
+            })
+        };
+        let error = tokio::time::timeout(Duration::from_secs(5), offer_dead(&dials))
+            .await
+            .expect("a spent dial with no live session must fail, not park")
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("immediately unusable"), "{error}");
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        let error = offer_dead(&dials).await.unwrap_err().to_string();
+        assert!(error.contains("backing off"), "{error}");
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let _ = offer_dead(&dials).await;
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+    }
 }
 
 #[cfg(feature = "owned-tasks")]

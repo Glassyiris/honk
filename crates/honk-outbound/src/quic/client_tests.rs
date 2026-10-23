@@ -517,6 +517,45 @@ async fn release_cached_keeps_client_reusable_for_a_fresh_connection() {
     assert!(second.close_reason().is_some());
 }
 
+#[tokio::test]
+async fn redial_after_carrier_loss_binds_a_fresh_local_port() {
+    let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let (ports_tx, mut ports) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let ports_tx = ports_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(conn) = incoming.await {
+                    let _ = ports_tx.send(conn.remote_address().port());
+                    conn.closed().await;
+                }
+            });
+        }
+    });
+    let client = test_client(addr.port()).await;
+    let dial = || {
+        client.connection_with(Duration::from_secs(5), |_conn| async {
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    let (first, _) = dial().await.unwrap();
+    let first_port = ports.recv().await.unwrap();
+    // A stream open that fails on a half-dead connection invalidates it.
+    client.invalidate(&first).await;
+    let (second, _) = dial().await.unwrap();
+    assert_ne!(second.stable_id(), first.stable_id());
+    let second_port = ports.recv().await.unwrap();
+    assert_ne!(second_port, first_port);
+
+    // The path watchdog or an idle timeout closes the cached connection.
+    second.close(VarInt::from_u32(0), b"QUIC path stalled");
+    let (third, _) = dial().await.unwrap();
+    assert_ne!(third.stable_id(), second.stable_id());
+    assert_ne!(ports.recv().await.unwrap(), second_port);
+    client.force_close().await;
+}
+
 /// A cold-node health probe dials QUIC through an ephemeral runtime;
 /// closing it must deterministically close the cached connection and
 /// endpoint driver (drop-alone is not relied upon).
@@ -649,7 +688,6 @@ async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
         .endpoint
         .as_ref()
         .unwrap()
-        .1
         .clone();
     assert!(endpoint.wait_idle().now_or_never().is_none());
     guard.close().await.unwrap();

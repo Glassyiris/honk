@@ -621,7 +621,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .iter()
                         .filter(|session| session.state() == SessionState::Active)
                         .count();
+                    // A caller whose dial is spent cannot open another session,
+                    // so it takes the busy candidate rather than spreading.
                     let should_spread = self.config.spread_sessions
+                        && dial.is_some()
                         && candidate.is_some_and(|session| session.active_streams() > 0)
                         && occupied_slots < self.config.max_sessions;
                     if !should_spread && let Some(candidate) = candidate {
@@ -636,7 +639,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         candidate.map_or(Step::Backoff(wait, pool.dial_failures), |session| {
                             Step::Have(Arc::clone(session))
                         })
-                    } else if occupied_slots >= self.config.max_sessions {
+                    } else if occupied_slots >= self.config.max_sessions
+                        // A spent dial cannot open a session, so with every
+                        // live session full it waits for room like any waiter.
+                        || (dial.is_none() && occupied_slots > 0)
+                    {
                         candidate.map_or(Step::Capacity, |session| Step::Have(Arc::clone(session)))
                     } else {
                         let id = pool.next_inflight_id;
@@ -685,11 +692,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     // poison it; the DialGuard is the panic backstop.
                     let Some(dial_fut) = dial.take().map(|d| d()) else {
                         // The closure was consumed by this call's earlier
-                        // Register, and the fresh session was pruned dead on
-                        // arrival. This second registration spawns no task,
+                        // Register, and the session it published is no longer
+                        // usable. This second registration spawns no task,
                         // so its inflight entry is a phantom nobody will ever
                         // signal: clear it (dropping the sender wakes waiters
-                        // to re-elect) and count the dead session as a dial
+                        // to re-elect) and count the lost session as a dial
                         // failure so the breaker paces redials.
                         let backoff = self.abandon_dial(id);
                         return Err(anyhow!(
@@ -742,6 +749,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                 }
                                 guard.armed = false;
                                 match result.expect("running pool cannot receive shutdown") {
+                                    Ok(Ok(session)) if session.is_closed() => {
+                                        let backoff = Self::record_dial_failure(&mut pool, &config);
+                                        DialSignal::Failed(crate::SharedError::new(anyhow!(
+                                            "session established but immediately unusable (backoff {backoff:?})"
+                                        )))
+                                    }
                                     Ok(Ok(session)) => {
                                         pool.dial_failures = 0;
                                         pool.next_dial_at = None;

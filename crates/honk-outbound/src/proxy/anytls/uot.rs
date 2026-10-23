@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
+use super::writer::seal_data_frame;
 use super::*;
 use crate::proxy::uot::AddrFraming;
 use crate::proxy::{MultiTargetTransport, PacketTransport};
@@ -121,37 +122,60 @@ impl AnyTlsUotTransport {
         let mut setup = self.setup.lock().await;
         let Some(request) = setup.as_ref() else {
             drop(setup);
-            let packet =
-                AddrFraming::UOT_V1.encode(&[], target, domain, data, UOT_MAX_PACKET_SIZE)?;
-            let permit = self.session.acquire_data_permit(packet.len()).await?;
-            let completed = self.enqueue(packet, permit, confirmed)?;
+            let frame = self.frame(&[], target, domain, data)?;
+            let permit = self
+                .session
+                .acquire_data_permit(frame.len() - FRAME_HEADER_LEN)
+                .await?;
+            let completed = self.enqueue(frame, permit, confirmed)?;
             admit(admitted);
             return self.flushed(completed).await;
         };
 
-        let packet =
-            AddrFraming::UOT_V1.encode(request, target, domain, data, UOT_MAX_PACKET_SIZE)?;
-        let permit = self.session.acquire_data_permit(packet.len()).await?;
-        let completed = self.enqueue(packet, permit, confirmed)?;
+        let frame = self.frame(request, target, domain, data)?;
+        let permit = self
+            .session
+            .acquire_data_permit(frame.len() - FRAME_HEADER_LEN)
+            .await?;
+        let completed = self.enqueue(frame, permit, confirmed)?;
         setup.take();
         drop(setup);
         admit(admitted);
         self.flushed(completed).await
     }
 
+    /// One PSH frame carrying `prefix` and the UoT v1 packet.
+    fn frame(
+        &self,
+        prefix: &[u8],
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+    ) -> std::io::Result<bytes::Bytes> {
+        let frame = AddrFraming::UOT_V1.encode_after(
+            FRAME_HEADER_LEN,
+            prefix,
+            target,
+            domain,
+            data,
+            UOT_MAX_PACKET_SIZE,
+        )?;
+        Ok(seal_data_frame(self.sid, frame))
+    }
+
     fn enqueue(
         &self,
-        packet: bytes::Bytes,
+        frame: bytes::Bytes,
         permit: DataPermit,
         confirmed: bool,
     ) -> std::io::Result<Option<tokio::sync::oneshot::Receiver<bool>>> {
         if confirmed {
             self.session
-                .enqueue_confirmed_data_with_permit(self.sid, packet, permit)
+                .enqueue_confirmed_data_with_permit(self.sid, frame, permit)
                 .map(Some)
         } else {
             self.session
-                .enqueue_data_with_permit(self.sid, packet, permit)
+                .enqueue_data_with_permit(self.sid, frame, permit)
                 .map(|()| None)
         }
     }

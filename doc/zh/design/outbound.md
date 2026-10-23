@@ -318,9 +318,7 @@ opening request 不设置 `END_STREAM`；TLS 请求使用 `:scheme: https`，并
 或排除当前流的 GOAWAY 会返回流错误，而不是正常 EOF。已缓存 payload 先于
 终止读取错误交付，后续读取仍保留该错误；成功完成的接收方向不会因为稍后
 的写入失败而失去 EOF。优雅 GOAWAY 允许已接受的流完成，不自动重放应用
-字节。当前锁定的 `h2` 0.4.19 仍会把缺失的 `:status` 默认解码为 200。
-[上游修复 #959](https://github.com/hyperium/h2/pull/959) 已合并，但当前锁定
-版本尚未包含；需要升级到包含修复的正式版本，才能拒绝该畸形响应。
+字节。
 
 VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及消息体解码
 失败传递到流所有者，而不是变成 EOF。
@@ -841,6 +839,9 @@ stream permit、event-driven capacity wait、least-loaded 选择与 pool 所有�
 物理拨号 single-flight。Draining session 不计入可复用 cap，并可在存活
 stream 完成期间与 replacement 重叠。
 pool 还负责有界重试分类、退避、退役与幂等的强制关闭。
+dial 完成时已关闭的 session 计为拨号失败，不会发布。自己的 dial 已执行过的调用方不会再次拨号，依次：
+取有空位且 least-loaded 的 active session、等待其他调用方进行中的 dial、在退避窗口内快速失败、在已满的 active
+session 上等待容量；没有 active session 时失败并计一次拨号失败。
 初始化 waiter 接收同一个 `SharedError`；它通过 `Arc` clone 原始
 `anyhow::Error` 并保留 source chain。pool 在广播 builder failure 前绝不会
 把它压平成 display 文本。
@@ -848,9 +849,9 @@ runtime owner 已终止而拒绝拨号任务时，pool 清除该任务自己的 
 waiter，并按一次建立失败计入既有重拨 backoff。janitor 被拒绝时不保留运行标志，drain
 worker 被拒绝时强制关闭保留的 session；Mux.Cool 的 owner 拒绝 END 发送时使 carrier 失败。
 
-AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spread：
-第一条 session 变忙后，pool 会先建立第二条，再增加复用负载，随后按
-least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每条代理 flow
+AnyTLS 配置八条可复用物理 session，每条 128 个 stream。它会 spread：
+所有 session 都忙且不足八条时，pool 会先建立新的一条，再增加复用负载，随后按
+least-loaded 调度，使并发 stream 不共享同一条 TCP carrier 的队头阻塞。连续拨号失败使用有界 backoff，而不是让每条代理 flow
 各执行一次物理连接。
 
 协商 v2 server settings（`CMD_SERVER_SETTINGS`、`v=2`）后，每个复用逻辑 stream（SID 2 及以后）的 SYN 写出后
@@ -871,28 +872,33 @@ UDP warm 所有权分别提高有效保留值；最后一个所有者释放时�
 ### 有序 write 路径
 
 所有 frame 都通过一个 `WriterQueue` 与一个物理 writer task。Data 使用两种单位的有界
-permit：每个 session 896 个 frame 与 8 MiB 已排队或在途的 payload，先满者生效，预算
-用尽时写入的 stream 被反压；control frame 保留 queue headroom，整个 queue 封顶
+permit：每个 session 896 个 frame 与 1 MiB 已排队或在途的 payload，先满者生效，预算
+用尽时写入的 stream 被反压；字节上限同时限制新 stream 的 SYN 在饱和上传之后等待的
+时间。control frame 保留 queue headroom，整个 queue 封顶
 1,024 条命令。1,024 条命令的 queue 耗尽或关闭后再 push 时 session 会转为 terminal，
 而不会继续增长内存。
 
 限制排队 payload 的是字节预算：一个 frame 最多 65,535 字节，只按 frame 计数时一个
-session 可以排队 56 MiB，线速上传会把它填满。预算不计 stream 尚未入队的 slot、取得
-permit 之前的 UoT 包与编码后的 batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
+session 可以排队 56 MiB，线速上传会把它填满。预算不计取得 permit 之前的 UoT 包与编码后的
+batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
 最多对应一个 AnyTLS frame；原先读 64 KiB 会变成一个 65,535 字节的 frame 加一个
 1 字节的 frame。stream 的 SYN 与
 第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。打开流的注册被中途放弃时，会发送 FIN，而不会终止 session。
 
 完成一次 blocking pop 后，writer 只收集已排队的 frame，最多 63 frame 或 256 KiB
-（均不含首帧），再执行一次 `write_all` 与一次 `flush`，不等待凑满 batch。只有物
+（均不含首帧），再执行一次 `flush`，不等待凑满 batch。data frame 在接纳 payload 的那一次
+复制中连同 header 一起序列化。不加 padding 时，writer 直接从该缓冲区写出其完整的 TLS
+record，只复制 control frame 与不足一个 record 的 data 字节，因此 batch 的 record 边界
+与一次连续写入相同。只有物
 理 batch 成功或 session 变为 terminal 后，才释放 data permit 与 confirmed-write
 completion。
 
 仅含控制帧的 batch 有 5 秒 deadline（与 sing-anytls `writeControlFrame` 一致），到期使 session 失败。含数据帧的 batch 没有 deadline：拥塞只对容量上限施加反压，不会终止同一 session 中的其他流。
 
-`AnyTlsStream::poll_write` 通过自有 outbound slot 保证 cancellation-safe。
-只有恰好这 `n` 字节进入有序 queue 后才返回 `Ok(n)`；取消既不会丢失
-pending chunk，也不会重复入队。
+`AnyTlsStream::poll_write` 在取得 writer queue permit 之前不复制任何字节，因此是 cancellation-safe 的。
+只有恰好这 `n` 字节进入有序 queue 后才返回 `Ok(n)`，重试的写入只入队一次。
+返回 `Pending` 的写入没有接受任何字节：flush 与 shutdown 丢弃它的 permit 等待，被放弃的字节
+不会发出，并且不等待 writer 容量即返回。
 
 ### 非阻塞 demultiplex
 
