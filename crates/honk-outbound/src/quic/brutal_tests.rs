@@ -31,3 +31,11 @@ fn loss_never_shrinks_window() {
     cc.on_congestion_event(Instant::now(), Instant::now(), false, 0);
     assert_eq!(cc.window(), before);
 }
+
+#[test]
+fn pacer_runs_at_configured_rate_in_bytes() {
+    let metrics = controller(20_000_000).metrics();
+    assert_eq!(metrics.pacer_rate, Some(2_500_000));
+    assert_eq!(metrics.pacing_rate, Some(20_000_000));
+}
+

@@ -77,10 +77,9 @@ pub fn hkdf_expand_label<H: hkdf::HmacImpl>(
 }
 
 /// Fixed-rate "brutal" sender (hysteria2 parity): paces at a constant rate
-/// and ignores loss entirely. quinn's token-bucket pacer refills at
-/// window/RTT, so reporting a window of `rate × RTT` yields the target
-/// pacing rate — the same shape as apernet's brutal sender, whose congestion
-/// window is `SendBPS × RTT`.
+/// and ignores loss entirely. The pacer releases packets at `rate`, and the
+/// window of `rate × RTT` bounds the data in flight — the same shape as
+/// apernet's brutal sender, whose congestion window is `SendBPS × RTT`.
 #[derive(Debug)]
 pub struct BrutalConfig {
     /// Target send rate in bytes per second.
@@ -158,6 +157,7 @@ impl congestion::Controller for Brutal {
         let mut metrics = congestion::ControllerMetrics::default();
         metrics.congestion_window = self.window();
         metrics.pacing_rate = Some(self.rate.saturating_mul(8));
+        metrics.pacer_rate = Some(self.rate);
         metrics
     }
 
