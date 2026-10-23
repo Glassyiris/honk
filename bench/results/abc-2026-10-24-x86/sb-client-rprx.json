@@ -1,0 +1,124 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "udp",
+        "server": "223.5.5.5"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sb0",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-vision",
+      "server": "10.10.10.70",
+      "server_port": 8443,
+      "uuid": "4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "2YRDBfueYmp0cOBq50tUUxQaoHCCUIkX5bLN-JIBYGg",
+          "short_id": "a1b2c3d4e5f60718"
+        }
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality",
+      "server": "10.10.10.70",
+      "server_port": 8444,
+      "uuid": "4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "2YRDBfueYmp0cOBq50tUUxQaoHCCUIkX5bLN-JIBYGg",
+          "short_id": "a1b2c3d4e5f60718"
+        }
+      },
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess",
+      "server": "10.10.10.70",
+      "server_port": 8446,
+      "uuid": "82166345-d1bb-48f8-bd3b-cf0c152a863c",
+      "security": "auto",
+      "bind_interface": "veth-client"
+    },
+    {
+      "type": "direct",
+      "tag": "direct",
+      "bind_interface": "veth-client"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "port": [
+          8443,
+          8444,
+          8446
+        ],
+        "outbound": "direct"
+      },
+      {
+        "port": [
+          5201,
+          8001,
+          53531
+        ],
+        "outbound": "vless-vision"
+      },
+      {
+        "port": [
+          5202,
+          8002,
+          53532
+        ],
+        "outbound": "vless-reality"
+      },
+      {
+        "port": [
+          5203,
+          8003,
+          53533
+        ],
+        "outbound": "vmess"
+      }
+    ],
+    "final": "direct"
+  }
+}

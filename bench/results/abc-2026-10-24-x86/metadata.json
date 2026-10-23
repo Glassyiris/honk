@@ -1,0 +1,138 @@
+{
+  "campaign": "abc-2026-10-24-x86",
+  "started_at_utc": "2026-10-23T20:46:56Z",
+  "ended_at_utc": "2026-10-23T21:55:50Z",
+  "topology": "canonical .70 server fixture: engine host 10.10.10.49 (Arch VM, 4 vCPU), client netns lab, physical LAN to 10.10.10.70 (20 vCPU i9-13900H, kernel 7.2.7-cachyos)",
+  "host": {
+    "engine": {
+      "host": "10.10.10.49",
+      "kernel": "7.2.3-arch1-3",
+      "arch": "x86_64",
+      "vcpus": 4,
+      "memory_mib": 1952,
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13600K (host passthrough)",
+      "wan": "ens3 10.10.10.49/24"
+    },
+    "server": {
+      "host": "10.10.10.70",
+      "kernel": "7.2.7-cachyos",
+      "arch": "x86_64",
+      "vcpus": 20,
+      "cpu": "13th Gen Intel(R) Core(TM) i9-13900H",
+      "ntp_synchronized": true
+    }
+  },
+  "engines": {
+    "honk": {
+      "source_revision": "20286c3d",
+      "base_merge": "origin/main 3d4825f6 (BBRv3 default, per-dial QUIC endpoints, AnyTLS tuning)",
+      "version_command": "honk-core 20286c3d",
+      "binary_sha256": "22cd941bfd95b305ae992019ef5e43beb71dbf7ff7c230337dcbe651c4fa81e0",
+      "target": "x86_64-unknown-linux-musl",
+      "features": ["ebpf", "native-api", "clash-api", "mimalloc", "rprx"],
+      "build_command": "just build-musl \"ebpf,native-api\"",
+      "bpf_object_embedded_bytes": 3209392,
+      "build_wall_seconds": 272
+    },
+    "dae": {
+      "tag": "v2.1.1",
+      "binary_sha256": "a217bf5edf5a5cac371e086af952b5c676e6ecaf8d7b07ba491916b656b66122"
+    },
+    "sing-box": {
+      "tag": "v1.14.3",
+      "binary_sha256": "768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93"
+    }
+  },
+  "server_fixture": {
+    "binaries": {
+      "sing-box": "1.14.3 (sha256 768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93)",
+      "anytls-go": "0.0.13 (sha256 c1a3a52cf3246a51b2cbf427283cde2482fe99b6868588a57786c24324ac44fa)",
+      "juicity-server": "v0.4.3 (sha256 16ff506d3c8d229d7fc49e550592cbdec286ac2805909f57d8ed36506882dfc0)"
+    },
+    "configs": {
+      "singbox-server.json": "86495a606d3c0e9baa1b8f55246094bed1e8d86c7cb48629cbc101afc1d6e9ec",
+      "singbox-rprx.json": "65db5ca8a18152aadea50a1372e98181a013d76e871636fbbb0b93bbf880237b",
+      "juicity-server.json": "b012dd8a1bb948e9f35d0ca890a948d8ce9f71f2f4721d10887fbde7089e398f",
+      "cert.pem": "ae9d8ee1fc91e60c5f4544a1d5932b8df80192639976e3deba69c279781f306b"
+    },
+    "tls": "self-signed RSA-2048, SAN hy2.test + test.local, 30 days",
+    "reality": {
+      "inbounds": "8443 vless+reality+vision, 8444 vless+reality, 8445 vmess+ws+tls (unused), 8446 vmess+tcp",
+      "dest": "www.microsoft.com:443",
+      "short_id": "a1b2c3d4e5f60718",
+      "note": "the documented dl.google.com dest is flaky from this host: its A records include 58.63.233.97, which does not answer, so every unauthenticated fallback stalled 5 s and the REALITY handshake failed. www.microsoft.com answers TLS 1.3 + h2 and produced zero fallback failures in the smoke test and all three arms."
+    },
+    "juicity": "official Go juicity-server v0.4.3, :2451, uuid 00000000-0000-0000-0000-000000000001 / testpass123, SNI hy2.test, congestion_control bbr",
+    "targets": {
+      "http": "8001-8006 + 8080 (1024-byte body)",
+      "iperf3": "5201-5206 + 5300",
+      "udp_echo": "53531-53536",
+      "probe_dns": "53539"
+    }
+  },
+  "shared_inputs": {
+    "harness_sha256": "dbce07cfa8e9f26bf8a92b43b27567cfea86304826c8eb5904e26f0cc0e341fa",
+    "latency_collector_sha256": "aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575",
+    "harness_delta_vs_2026-10-11": "only the stacked /run/netns/daens mount cleanup after a hard-killed engine; the measurement paths are unchanged",
+    "configs": {
+      "honk-lab.dae": "47367ce80bc911b7b7ec68f359aee22918ae829760042875261459d8648f7305",
+      "dae-lab.dae": "6e60c767d1cdc83aa9942c2af774c6c3f42f7ba15a9b62d0a0ba82baafaf2a4b",
+      "sb-client.json": "0ccafb8611cca2a845f13815839be0b65e8a6494418873b630af0fd02d08b91b",
+      "honk-rprx.dae": "a191ca422295f28aa9e7bc7fd296d9301dcca7235c9a256f7ef277e438f71964",
+      "dae-rprx.dae": "80742a69bc68f1e56617e3a12025e8363c12ebb37fec0e8d1c60a46008352432",
+      "sb-client-rprx.json": "ce9dc54f3d510cfb1e197329db07bb8ac986319b5c06076a5a4f7828cc85a166",
+      "honk-lab-juicity.dae": "491fd3f9ddd5971d5d008a9f3009097d13fbceb68167a97257303e78f7891669",
+      "dae-lab-juicity.dae": "e1982e4f1b23e6299f30a2ef31a89c4ad43609a4bad5b62ff3610a2dcff34496"
+    }
+  },
+  "campaigns": [
+    {
+      "name": "six protocols",
+      "window_utc": "2026-10-23T20:46:56Z..2026-10-23T21:27:43Z",
+      "engines": ["honk", "dae", "sing-box"],
+      "protocols": ["hy2", "tuic", "ss2022", "trojan", "anytls-sb", "anytls-go"],
+      "server_mode": "standard",
+      "command": "command-abc.txt",
+      "result": "results.tsv",
+      "stability": "stability.tsv",
+      "stdout": "campaign-abc.stdout",
+      "stderr": "campaign-abc.stderr",
+      "raw": "raw/"
+    },
+    {
+      "name": "REALITY family",
+      "window_utc": "2026-10-23T21:27:56Z..2026-10-23T21:49:11Z",
+      "engines": ["honk", "dae", "sing-box"],
+      "protocols": ["vless-vision", "vless-reality", "vmess"],
+      "index_mapping": {"VLESS_VISION_INDEX": 1, "VLESS_REALITY_INDEX": 2, "VMESS_INDEX": 3},
+      "server_mode": "rprx",
+      "command": "command-rprx.txt",
+      "result": "results-rprx.tsv",
+      "stability": "stability-rprx.tsv",
+      "stdout": "campaign-rprx.stdout",
+      "stderr": "campaign-rprx.stderr",
+      "raw": "raw-rprx/"
+    },
+    {
+      "name": "Juicity",
+      "window_utc": "2026-10-23T21:49:11Z..2026-10-23T21:55:50Z",
+      "engines": ["honk", "dae"],
+      "protocols": ["juicity"],
+      "index_mapping": {"JUICITY_INDEX": 1},
+      "server_mode": "rprx (irrelevant; the Juicity server is independent)",
+      "command": "command-juicity.txt",
+      "result": "results-juicity.tsv",
+      "stability": "stability-juicity.tsv",
+      "stdout": "campaign-juicity.stdout",
+      "stderr": "campaign-juicity.stderr",
+      "raw": "raw-juicity/"
+    }
+  ],
+  "notes": [
+    "Current honk rejects a group whose name equals a node name; all lab configs therefore use proxy-<protocol> groups.",
+    "The Juicity pass does not run sing-box: it has no Juicity outbound. Its stderr identity line still prints the driver default /root/sing-box (sha256 5110e8b8...), which is not an engine of that pass.",
+    "honk VLESS/VMess UDP rows are n/a because lab-bench.sh's supports_udp predicate excludes them; this is a harness-coverage limit, not a capability statement.",
+    "All three passes use the pinned harness and collector; the only driver delta against the 2026-10-11 archive is the stacked daens mount cleanup.",
+    "Server-side error logs retain client-cancellation and cold-handshake noise from the smoke tests; the measured arms are clean."
+  ]
+}

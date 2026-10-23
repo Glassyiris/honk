@@ -65,6 +65,11 @@ original binaries and server fixtures; the newest campaign appears first.
   VMess. No SOCKS5 endpoint is available. Juicity was absent from that matrix;
   a dedicated 2026-08-26 comparison against the existing Go server is reported
   below. The older Juicity direct-UDP offload result is not a proxy comparison.
+- REALITY fixtures need a `dest` this host can actually reach. A dest whose
+  A records are partly unreachable (historical `dl.google.com` on `.70`) makes
+  every unauthenticated fallback stall 5 s and fail the handshake; authenticated
+  clients can fail with it too once a connection needs the fallback. The
+  2026-10-24 campaign uses `www.microsoft.com:443`.
 
 ## Server fixtures
 
@@ -172,6 +177,187 @@ ssh root@10.10.10.50 \
 Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
+
+## Results (2026-10-24, full-protocol A/B/C on the canonical `.70` fixture)
+
+The merged `bench` tree (`20286c3d`, which brings in `origin/main` at
+`3d4825f6`: BBRv3 as the default BBR, per-dial QUIC endpoints, AnyTLS
+tuning) ran on the canonical topology: engine host `10.10.10.49` (Arch VM,
+four vCPUs, kernel `7.2.3-arch1-3`), client in netns `lab`, physical LAN to
+`10.10.10.70` (20 vCPUs, kernel `7.2.7-cachyos`, clock synchronized). One
+engine runs at a time. A/B/C = honk `20286c3d` (static musl,
+`ebpf,native-api,clash-api,mimalloc,rprx`) vs dae
+[v2.1.1](https://github.com/daeuniverse/dae/releases/tag/v2.1.1) (`dbae2e82`)
+vs sing-box
+[v1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3)
+(`7054cac5`).
+
+Three passes share the harness, collector, targets (1,024-byte HTTP body,
+iperf3 3.21, UDP echo) and measurement contract:
+
+1. six protocols `hy2 tuic ss2022 trojan anytls-sb anytls-go` against
+   `singbox-server.json` (HY2/TUIC/SS2022/Trojan/AnyTLS) plus anytls-go
+   0.0.13;
+2. `vless-vision vless-reality vmess` against `singbox-rprx.json`
+   (8443 VLESS REALITY+`xtls-rprx-vision`, 8444 VLESS REALITY, 8446
+   VMess/TCP), with target slots 1–3 mapped to the three proxies;
+3. `juicity` against juicity-server v0.4.3 on `:2451`, for honk and dae only:
+   sing-box has no Juicity outbound.
+
+The fixture configs, the `serve.sh standard|rprx` driver and the cert command
+are under
+[`abc-2026-10-24-x86/fixture`](../bench/results/abc-2026-10-24-x86/fixture/);
+the complete invocations are `command-abc.txt`, `command-rprx.txt` and
+`command-juicity.txt`, and all raw TSV/JSONL/JSON evidence is in the same
+[campaign directory](../bench/results/abc-2026-10-24-x86/).
+
+Two fixture facts affect reproduction:
+
+- Current honk rejects a group whose name equals a node name. The lab configs
+  therefore use `proxy-<protocol>` groups (as the frozen 2026-10-11 configs
+  already did).
+- REALITY needs a reachable `dest`. On this host `dl.google.com` resolves
+  partly to addresses that do not answer (for example `58.63.233.97`); every
+  unauthenticated REALITY fallback then stalls 5 s and fails the handshake,
+  which also broke bulk transfer for clients whose auth should have succeeded.
+  This campaign uses `www.microsoft.com:443` (TLS 1.3 + h2); the smoke test
+  and all three arms recorded no fallback failures.
+
+### Six-protocol pass: TCP throughput, process CPU and RSS
+
+Three 8-second reverse runs per route; median receiver Mbps and that run's
+process CPU, then integer RSS MiB. Process CPU excludes kernel/eBPF, softirq
+and target costs, so the eBPF direct rows read `0.00` while sing-box's TUN
+client reads `0.37`.
+
+| Protocol | honk Mbps / cores / MiB | dae Mbps / cores / MiB | sing-box Mbps / cores / MiB |
+| --- | --- | --- | --- |
+| direct | 9402 / 0.00 / 56 | 9408 / 0.00 / 53 | 9407 / 0.37 / 64 |
+| hy2 | 3054 / 0.31 / 64 | 2975 / 0.59 / 60 | 1825 / 0.51 / 69 |
+| tuic | 3586 / 0.34 / 64 | 3498 / 0.67 / 58 | 3386 / 0.77 / 67 |
+| ss2022 | 9397 / 0.33 / 61 | 9400 / 0.38 / 57 | 9399 / 0.51 / 96 |
+| trojan | 9383 / 0.35 / 59 | 9384 / 0.43 / 61 | 9371 / 0.69 / 94 |
+| anytls-sb | 9394 / 0.43 / 56 | 9390 / 0.21 / 63 | 9386 / 0.77 / 95 |
+| anytls-go | 9387 / 0.45 / 64 | 9372 / 0.24 / 59 | 9374 / 0.86 / 94 |
+
+Every SS2022/Trojan/AnyTLS row is pinned at the ~9.4 Gbps LAN ceiling, so
+those rows separate engines by CPU and tails, not throughput. HY2 and TUIC
+are crypto-bound: honk is +2.7% and +2.5% over dae and +67%/+5.9% over
+sing-box, whose HY2 moved 1825 Mbps. honk uses the fewest process cores on
+HY2/TUIC/SS2022/Trojan (0.31/0.34/0.33/0.35 vs dae 0.59/0.67/0.38/0.43 and
+sing-box 0.51/0.77/0.51/0.69); dae is cheaper on both AnyTLS routes
+(0.21/0.24 vs honk 0.43/0.45). honk's RSS is 56–64 MiB, dae 53–63 MiB,
+sing-box 64–96 MiB.
+
+### Six-protocol pass: UDP
+
+Median echo RTT from 15 pings and iperf3 `-u -b 10G -l 1200 -R` receiver
+Mbps with overload loss, plus that run's process cores.
+
+| Protocol | honk RTT / Mbps (loss) / cores | dae RTT / Mbps (loss) / cores | sing-box RTT / Mbps (loss) / cores |
+| --- | --- | --- | --- |
+| hy2 | 0.593 ms / 1154 (83.5%) / 0.68 | 0.400 ms / 1176 (83.1%) / 0.76 | 0.088 ms / 0 (-) / 1.09 |
+| tuic | 0.321 ms / 1236 (82.3%) / 0.68 | 0.538 ms / 1188 (82.9%) / 0.79 | 0.357 ms / 1065 (84.7%) / 1.41 |
+| ss2022 | 0.323 ms / 2034 (65.8%) / 0.74 | 0.256 ms / 2799 (53.0%) / 1.24 | 0.113 ms / 2860 (52.0%) / 1.37 |
+| trojan | 0.164 ms / 1713 (75.6%) / 0.71 | 0.119 ms / 2987 (55.5%) / 1.10 | 0.332 ms / 3539 (46.2%) / 1.57 |
+| anytls-sb | 0.187 ms / 1625 (75.6%) / 0.58 | 0.255 ms / 1667 (74.8%) / 0.67 | 0.084 ms / 1404 (78.1%) / 1.16 |
+| anytls-go | 0.337 ms / 1694 (75.2%) / 0.58 | 0.272 ms / 1758 (74.1%) / 0.32 | 0.319 ms / 1404 (78.5%) / 1.17 |
+
+The 10 Gbps offer is a saturating overload probe, not a WAN-loss measurement;
+loss is therefore expected in every cell. honk costs fewer cores on HY2/TUIC
+and moves more datagrams than dae on TUIC (1236 vs 1188 Mbps; HY2 is a 1154 vs
+1176 Mbps tie); dae and sing-box retain the SS2022/Trojan UDP advantage
+(+38%/+74% and +41%/+107% over honk), and sing-box's HY2 UDP arm received
+nothing at all, consistent with the 2026-10-11 result.
+
+### Six-protocol pass: loaded latency stability
+
+One reverse iperf3 stream loads the same route while 200 independent HTTP
+streams open at absolute 250 ms deadlines.
+
+| Protocol | honk load / p50 / p95 / p99 / max / failures | dae | sing-box |
+| --- | --- | --- | --- |
+| direct | 9406 / 3.274 / 4.014 / 4.246 / 4.425 ms / 0/200 | 9408 / 3.262 / 3.942 / 4.289 / 4.535 / 0/200 | 9412 / 3.324 / 3.985 / 4.124 / 4.544 / 0/200 |
+| hy2 | 3069 / 1.807 / 2.164 / 2.510 / 2.764 / 0/200 | 2968 / 1.770 / 2.230 / 2.716 / 3.473 / 0/200 | 1958 / 10.874 / 27.428 / 31.544 / 103.865 / 0/200 |
+| tuic | 3694 / 1.800 / 2.119 / 2.322 / 2.540 / 0/200 | 3427 / 1.805 / 2.082 / 2.584 / 3.045 / 0/200 | 3434 / 1.843 / 2.143 / 2.495 / 2.680 / 0/200 |
+| ss2022 | 9400 / 3.032 / 8.048 / 10.650 / 15.152 / 0/200 | 9404 / 3.559 / 8.260 / 9.812 / 13.772 / 0/200 | 9406 / 3.142 / 7.923 / 11.375 / 15.407 / 0/200 |
+| trojan | 9392 / 2.090 / 5.478 / 9.308 / 10.016 / 0/200 | 9388 / 5.937 / 16.839 / 23.754 / 25.519 / 2/200 | 9388 / 5.279 / 10.183 / 16.105 / 20.960 / 0/200 |
+| anytls-sb | 9385 / 2.531 / 6.795 / 10.528 / 16.014 / 0/200 | 9385 / 2.506 / 8.376 / 13.721 / 15.919 / 0/200 | 9381 / 2.103 / 6.484 / 13.327 / 14.923 / 0/200 |
+| anytls-go | 9377 / 2.583 / 11.239 / 17.631 / 20.323 / 0/200 | 9374 / 2.294 / 9.874 / 14.512 / 15.940 / 0/200 | 9375 / 2.202 / 9.785 / 14.548 / 20.702 / 0/200 |
+
+honk records the lowest p99 on HY2, TUIC, Trojan and AnyTLS-SB, and the only
+failures in this pass belong to dae's Trojan route (2/200). sing-box's HY2 arm
+is the outlier: ~2 Gbps of pressure with a 31.5 ms p99 and a 104 ms maximum.
+
+### REALITY pass: VLESS Vision / REALITY / VMess
+
+| Protocol | honk cold / hot p50 / p95 (ms) | bw / cores / MiB | dae cold / hot p50 / p95 | bw / cores / MiB | sing-box cold / hot p50 / p95 | bw / cores / MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| direct | 2.27 / - / - | 9404 / 0.00 / 50 | 2.03 / - / - | 9405 / 0.00 / 55 | 2.79 / - / - | 9410 / 0.38 / 94 |
+| vless-vision | 46.8 / 53.2 / 55.1 | 9342 / 0.42 / 42 | 55.5 / 54.7 / 126.5 | 9389 / 0.48 / 58 | 58.3 / 57.6 / 111.5 | 9374 / 0.70 / 95 |
+| vless-reality | 49.2 / 51.8 / 87.5 | 9381 / 0.39 / 43 | 56.0 / 59.0 / 113.9 | 9382 / 0.44 / 58 | 59.2 / 56.7 / 306.0 | 9391 / 0.68 / 97 |
+| vmess | 3.27 / 1.89 / 2.71 | 9374 / 0.44 / 49 | 3.75 / 1.92 / 2.84 | 9352 / 0.44 / 54 | 3.62 / 2.65 / 3.23 | 9373 / 0.71 / 94 |
+
+REALITY rows are TCP/REALITY end-to-end, so their open latency includes the
+server's handshake with the dest: ~47–59 ms cold and ~52–59 ms hot for all
+three engines, versus ~2 ms direct. Throughput is at the LAN ceiling for all
+nine proxied cells, which makes CPU, RSS and tail the discriminators: honk uses
+0.39–0.44 cores against dae's 0.44–0.48 and sing-box's 0.68–0.71, and 42–49
+MiB RSS against 54–58 and 94–97. honk also has the lowest cold latency and
+p95 on both VLESS rows.
+
+| Protocol | honk UDP RTT / Mbps (loss) / cores | dae UDP | sing-box UDP |
+| --- | --- | --- | --- |
+| vless-vision | n/a | 0.394 ms / 2960 (55.6%) / 1.08 | 0.257 ms / 3551 (45.1%) / 1.60 |
+| vless-reality | n/a | 0.412 ms / 2958 (56.1%) / 1.05 | 0.372 ms / 3964 (37.4%) / 1.59 |
+| vmess | n/a | 0.228 ms / 3063 (54.3%) / 1.01 | 0.165 ms / 3535 (46.3%) / 1.55 |
+
+honk's VLESS/VMess UDP rows are `n/a` because the driver's
+`supports_udp` predicate still excludes them: a harness-coverage limit, not a
+statement about honk's VLESS UDP support. dae and sing-box carried 2960–3964
+Mbps of 1200-byte datagrams.
+
+| Protocol | honk load / p50 / p95 / p99 / max / failures | dae | sing-box |
+| --- | --- | --- | --- |
+| direct | 9410 / 2.580 / 3.071 / 3.720 / 6.439 / 0/200 | 9411 / 2.487 / 3.010 / 3.134 / 3.226 / 0/200 | 9410 / 2.745 / 3.494 / 3.825 / 4.071 / 0/200 |
+| vless-vision | 9346 / 52.265 / 62.936 / 70.616 / 72.671 / 0/200 | 9375 / 54.382 / 67.856 / 374.481 / 383.057 / 10/200 | 9359 / 58.284 / 92.605 / 112.158 / 241.201 / 0/200 |
+| vless-reality | 9381 / 52.605 / 64.043 / 69.106 / 92.299 / 0/200 | 9371 / 57.697 / 75.125 / 236.901 / 243.325 / 0/200 | 9387 / 57.987 / 70.899 / 106.465 / 240.736 / 0/200 |
+| vmess | 9384 / 2.472 / 9.898 / 16.946 / 20.468 / 0/200 | 9329 / 3.099 / 13.491 / 16.631 / 18.121 / 0/200 | 9371 / 3.067 / 9.033 / 12.632 / 15.850 / 0/200 |
+
+At equal saturated load honk keeps the REALITY tail under 71 ms p99 (0
+failures); dae's Vision arm loses 10 of 200 opens and reaches 374 ms p99 (its
+REALITY arm 237 ms), and sing-box reaches 106–112 ms p99 with 241 ms maxima.
+VMess is the low-RTT case for every engine; honk's p50 is 0.6 ms lower than
+dae's while its p99 is marginally higher than sing-box's.
+
+### Juicity pass (honk vs dae)
+
+| Protocol | honk cold / hot p50 / p95 (ms) | bw / cores / MiB | dae cold / hot p50 / p95 | bw / cores / MiB |
+| --- | --- | --- | --- | --- |
+| direct | 2.36 / - / - | 9407 / 0.00 / 48 | 2.56 / - / - | 9407 / 0.00 / 53 |
+| juicity | 3.51 / 1.73 / 2.68 | 2787 / 0.30 / 50 | 8.29 / 1.71 / 2.04 | 2650 / 0.57 / 61 |
+| juicity/udp | 0.364 ms / 1230 (82.6%) / 0.40 | - | 0.343 ms / 1187 (83.1%) / 0.68 | - |
+
+honk is +5.2% on Juicity TCP at roughly half dae's process CPU, +3.6% on the
+UDP arm, and 4.8 ms faster on the cold open; RSS is 50 vs 61 MiB. Loaded
+stability is equal: honk 2709 Mbps / 1.726 / 2.076 / 2.156 / 2.345 ms / 0
+failures, dae 2612 / 1.719 / 2.000 / 2.350 / 2.667 ms / 0 failures.
+
+### Decision
+
+- The merged tree keeps honk's 2026-10-11 position on the six-protocol pass:
+  LAN-ceiling throughput on SS2022/Trojan/AnyTLS, +2.5–2.7% on HY2/TUIC, and
+  the lowest process CPU on the crypto-bound routes. sing-box's HY2 remains
+  its weak row.
+- The new REALITY pass shows the widest engine separation: equal line-rate
+  throughput, but honk needs ~0.4 cores and 42–43 MiB where dae needs
+  0.44–0.48 cores and 58 MiB and sing-box 0.68–0.71 cores and 95–97 MiB.
+  honk is also the only engine with no loaded-latency failures and a p99
+  under 71 ms on both VLESS rows.
+- Juicity: honk leads dae by 5.2% TCP / 3.6% UDP at about half the cores.
+- Absolute numbers are same-host, same-fixture comparisons. Run-to-run
+  variance on the shared lab is about ±5%; single-stream BBR/Hysteria2 rows
+  remain the most sensitive to a busy host.
 
 ## Results (2026-10-20, x86 local-fixture A/B/C)
 

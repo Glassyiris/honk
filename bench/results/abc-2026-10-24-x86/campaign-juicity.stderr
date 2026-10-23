@@ -1,0 +1,7 @@
+# host=archlinux arch=x86_64 kernel=7.2.3-arch1-3
+# honk_bin=/root/honk-bench-abc-20261024/bin/honk-core sha256=22cd941bfd95b305ae992019ef5e43beb71dbf7ff7c230337dcbe651c4fa81e0
+# dae_bin=/root/honk-bench-abc-20261024/bin/dae sha256=a217bf5edf5a5cac371e086af952b5c676e6ecaf8d7b07ba491916b656b66122
+# sing_box_bin=/root/sing-box sha256=5110e8b816d5d5ab81a9c1515a216297dad2552082d2046f0955d8d6eb62b884
+# lab-bench 2026-10-23T21:49:11Z engines=(honk dae) protos=(juicity)
+# engine=honk
+# engine=dae

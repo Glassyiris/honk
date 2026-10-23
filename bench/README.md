@@ -83,8 +83,9 @@ three binary SHA-256 identities on stderr.
   harness uses the API listener to identify the *active* engine process
   (a second honk instance parked on the singleton flock reports zero CPU
   and would poison the metrics).
-- Use non-colliding node/group names with current honk; the measured configs
-  and complete invocation are frozen in `results/abc-2026-10-11-x86/`.
+- Use non-colliding node/group names with current honk (a group name equal to
+  a node name is rejected); the measured configs and complete invocation are
+  frozen in `results/abc-2026-10-24-x86/` and `results/abc-2026-10-11-x86/`.
 - Check client/server clock skew before SS2022: its timestamp validation must
   remain enabled. The 2026-10-11 preflight rejected all three clients at a
   35-second offset before host-clock calibration.
@@ -94,6 +95,18 @@ three binary SHA-256 identities on stderr.
 - The dedicated Juicity run uses the existing official Go v0.4.3 server at
   `10.10.10.70:2451`; exact paired configs and raw evidence are archived under
   `results/quic-analysis-2026-08-26/juicity-x86/`.
+- `results/abc-2026-10-24-x86/fixture/` carries the `.70` fixture used for the
+  full-protocol campaign: sing-box 1.14.3 (hy2/tuic/ss2022/trojan/anytls-sb
+  plus VLESS-REALITY and VMess inbounds), anytls-go 0.0.13, juicity-server
+  v0.4.3, the HTTP/UDP/DNS target fixture, and `serve.sh standard|rprx`.
+  REALITY needs a reachable `dest`: use `www.microsoft.com:443` (TLS 1.3 + h2).
+  The historical `dl.google.com` dest resolves partly to addresses this host
+  cannot reach, so every unauthenticated fallback stalls 5 s and the handshake
+  fails. The rprx inbounds reuse 8443/8444/8446, so `serve.sh` swaps the
+  sing-box server between the hy2 and REALITY modes instead of running both.
+  Cert generation: `openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 30
+  -keyout key.pem -out cert.pem -subj '/CN=hy2.test'
+  -addext 'subjectAltName=DNS:hy2.test,DNS:test.local'`.
 - `latency_stability.py` must be beside the driver unless
   `STABILITY_COLLECTOR` names another path.
 

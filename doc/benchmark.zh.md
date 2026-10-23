@@ -54,6 +54,10 @@
   Trojan、两个 AnyTLS server、VLESS Vision/REALITY 与 VMess。当前仍无
   SOCKS5 endpoint。Juicity 未进入该矩阵；下文补充 2026-08-26 针对现有 Go
   server 的专用对比。较早的 Juicity direct-UDP 卸载结果不是代理对比。
+- REALITY fixture 需要一个本机确实可达的 `dest`。若 `dest` 的 A 记录部分
+  不可达（`.70` 上的历史 `dl.google.com`），每次未认证 fallback 都会卡
+  5 秒并令握手失败；已认证 client 一旦需要 fallback 也会失败。2026-10-24
+  轮改用 `www.microsoft.com:443`。
 
 ## 服务端 fixtures
 
@@ -149,6 +153,173 @@ ssh root@10.10.10.50 \
 
 候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
 点估计回退不超过 3% 时通过。
+
+## 结果（2026-10-24，canonical `.70` fixture 全协议 A/B/C）
+
+合并后的 `bench` 树（`20286c3d`，回合了 `origin/main` 的 `3d4825f6`：BBRv3
+默认、QUIC 每次拨号独立 endpoint、AnyTLS 调优）跑在 canonical 拓扑上：
+engine host `10.10.10.49`（Arch VM，4 vCPU，kernel `7.2.3-arch1-3`），client
+位于 netns `lab`，经物理 LAN 到 `10.10.10.70`（20 vCPU，kernel
+`7.2.7-cachyos`，已同步时钟）。同一时间只运行一个 engine。A/B/C = honk
+`20286c3d`（静态 musl，`ebpf,native-api,clash-api,mimalloc,rprx`）对 dae
+[v2.1.1](https://github.com/daeuniverse/dae/releases/tag/v2.1.1)（`dbae2e82`）
+对 sing-box
+[v1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3)
+（`7054cac5`）。
+
+三轮共用同一 harness、collector、目标（1,024 字节 HTTP body、iperf3 3.21、
+UDP echo）与测量契约：
+
+1. 六协议 `hy2 tuic ss2022 trojan anytls-sb anytls-go`，服务端为
+   `singbox-server.json`（HY2/TUIC/SS2022/Trojan/AnyTLS）加 anytls-go
+   0.0.13；
+2. `vless-vision vless-reality vmess`，服务端为 `singbox-rprx.json`
+   （8443 VLESS REALITY+`xtls-rprx-vision`，8444 VLESS REALITY，8446
+   VMess/TCP），target slot 1–3 分别映射到三个代理；
+3. `juicity`，服务端为 `:2451` 上的 juicity-server v0.4.3，仅 honk 与 dae
+   （sing-box 没有 Juicity outbound）。
+
+fixture 配置、`serve.sh standard|rprx` driver 与证书生成命令都在
+[`abc-2026-10-24-x86/fixture`](../bench/results/abc-2026-10-24-x86/fixture/)；
+完整调用见 `command-abc.txt`、`command-rprx.txt`、`command-juicity.txt`，
+全部原始 TSV/JSONL/JSON 证据在同一
+[campaign 目录](../bench/results/abc-2026-10-24-x86/) 下。
+
+两个 fixture 事实影响复现：
+
+- 当前 honk 拒绝与 node 同名的 group。因此 lab 配置统一使用
+  `proxy-<protocol>` group（2026-10-11 的冻结配置本来也是如此）。
+- REALITY 需要本机可达的 `dest`。本机上 `dl.google.com` 的部分 A 记录
+  不可达（例如 `58.63.233.97`），每次未认证 REALITY fallback 都会卡 5 秒并
+  令握手失败；即使认证本应成功，某些连接一旦需要 fallback 也会失败，并表现
+  为 bulk 传输中断。本轮使用 `www.microsoft.com:443`（TLS 1.3 + h2）：
+  smoke 与三轮测试都没有出现 fallback 失败。
+
+### 六协议轮：TCP 吞吐、进程 CPU 与 RSS
+
+每路由 3 次 8 秒 reverse run，取接收端 Mbps 中位数与该轮进程 CPU，再记录
+整数 RSS MiB。进程 CPU 不包含 kernel/eBPF、softirq 和目标端成本，因此 eBPF
+的 direct 行为 `0.00`，sing-box 的 TUN client 为 `0.37`。
+
+| Protocol | honk Mbps / cores / MiB | dae Mbps / cores / MiB | sing-box Mbps / cores / MiB |
+| --- | --- | --- | --- |
+| direct | 9402 / 0.00 / 56 | 9408 / 0.00 / 53 | 9407 / 0.37 / 64 |
+| hy2 | 3054 / 0.31 / 64 | 2975 / 0.59 / 60 | 1825 / 0.51 / 69 |
+| tuic | 3586 / 0.34 / 64 | 3498 / 0.67 / 58 | 3386 / 0.77 / 67 |
+| ss2022 | 9397 / 0.33 / 61 | 9400 / 0.38 / 57 | 9399 / 0.51 / 96 |
+| trojan | 9383 / 0.35 / 59 | 9384 / 0.43 / 61 | 9371 / 0.69 / 94 |
+| anytls-sb | 9394 / 0.43 / 56 | 9390 / 0.21 / 63 | 9386 / 0.77 / 95 |
+| anytls-go | 9387 / 0.45 / 64 | 9372 / 0.24 / 59 | 9374 / 0.86 / 94 |
+
+SS2022/Trojan/AnyTLS 的所有行都顶在 ~9.4 Gbps 的 LAN 上限，这些行比较的是
+CPU 与 tail 而不是吞吐。HY2/TUIC 受 crypto 限制：honk 比 dae 高 2.7%/2.5%，
+比 sing-box 高 67%/5.9%（sing-box HY2 只有 1825 Mbps）。honk 在
+HY2/TUIC/SS2022/Trojan 上进程 CPU 最低（0.31/0.34/0.33/0.35，dae 为
+0.59/0.67/0.38/0.43，sing-box 为 0.51/0.77/0.51/0.69）；两条 AnyTLS 路由
+dae 更省（0.21/0.24 对 honk 0.43/0.45）。RSS：honk 56–64 MiB，dae
+53–63 MiB，sing-box 64–96 MiB。
+
+### 六协议轮：UDP
+
+15 次 ping 的 echo RTT 中位数，以及 iperf3 `-u -b 10G -l 1200 -R` 的接收端
+Mbps、过载丢包和该轮进程 CPU。
+
+| Protocol | honk RTT / Mbps (loss) / cores | dae RTT / Mbps (loss) / cores | sing-box RTT / Mbps (loss) / cores |
+| --- | --- | --- | --- |
+| hy2 | 0.593 ms / 1154 (83.5%) / 0.68 | 0.400 ms / 1176 (83.1%) / 0.76 | 0.088 ms / 0 (-) / 1.09 |
+| tuic | 0.321 ms / 1236 (82.3%) / 0.68 | 0.538 ms / 1188 (82.9%) / 0.79 | 0.357 ms / 1065 (84.7%) / 1.41 |
+| ss2022 | 0.323 ms / 2034 (65.8%) / 0.74 | 0.256 ms / 2799 (53.0%) / 1.24 | 0.113 ms / 2860 (52.0%) / 1.37 |
+| trojan | 0.164 ms / 1713 (75.6%) / 0.71 | 0.119 ms / 2987 (55.5%) / 1.10 | 0.332 ms / 3539 (46.2%) / 1.57 |
+| anytls-sb | 0.187 ms / 1625 (75.6%) / 0.58 | 0.255 ms / 1667 (74.8%) / 0.67 | 0.084 ms / 1404 (78.1%) / 1.16 |
+| anytls-go | 0.337 ms / 1694 (75.2%) / 0.58 | 0.272 ms / 1758 (74.1%) / 0.32 | 0.319 ms / 1404 (78.5%) / 1.17 |
+
+10 Gbps offer 是饱和过载探针，不是 WAN 丢包测量，因此每个 cell 都应出现
+丢包。honk 在 HY2/TUIC 上核成本更低，TUIC 上比 dae 转发更多数据报（1236 对
+1188 Mbps；HY2 为 1154 对 1176 Mbps 的近似平手）；dae 与 sing-box 保持
+SS2022/Trojan 的 UDP 优势（相对 honk +38%/+74% 与 +41%/+107%）；sing-box
+的 HY2 UDP arm 完全收不到数据，与 2026-10-11 结果一致。
+
+### 六协议轮：loaded 延迟稳定性
+
+一条 reverse iperf3 压住同一路由，同时以绝对 250 ms deadline 打开 200 条
+独立 HTTP 流。
+
+| Protocol | honk load / p50 / p95 / p99 / max / failures | dae | sing-box |
+| --- | --- | --- | --- |
+| direct | 9406 / 3.274 / 4.014 / 4.246 / 4.425 ms / 0/200 | 9408 / 3.262 / 3.942 / 4.289 / 4.535 / 0/200 | 9412 / 3.324 / 3.985 / 4.124 / 4.544 / 0/200 |
+| hy2 | 3069 / 1.807 / 2.164 / 2.510 / 2.764 / 0/200 | 2968 / 1.770 / 2.230 / 2.716 / 3.473 / 0/200 | 1958 / 10.874 / 27.428 / 31.544 / 103.865 / 0/200 |
+| tuic | 3694 / 1.800 / 2.119 / 2.322 / 2.540 / 0/200 | 3427 / 1.805 / 2.082 / 2.584 / 3.045 / 0/200 | 3434 / 1.843 / 2.143 / 2.495 / 2.680 / 0/200 |
+| ss2022 | 9400 / 3.032 / 8.048 / 10.650 / 15.152 / 0/200 | 9404 / 3.559 / 8.260 / 9.812 / 13.772 / 0/200 | 9406 / 3.142 / 7.923 / 11.375 / 15.407 / 0/200 |
+| trojan | 9392 / 2.090 / 5.478 / 9.308 / 10.016 / 0/200 | 9388 / 5.937 / 16.839 / 23.754 / 25.519 / 2/200 | 9388 / 5.279 / 10.183 / 16.105 / 20.960 / 0/200 |
+| anytls-sb | 9385 / 2.531 / 6.795 / 10.528 / 16.014 / 0/200 | 9385 / 2.506 / 8.376 / 13.721 / 15.919 / 0/200 | 9381 / 2.103 / 6.484 / 13.327 / 14.923 / 0/200 |
+| anytls-go | 9377 / 2.583 / 11.239 / 17.631 / 20.323 / 0/200 | 9374 / 2.294 / 9.874 / 14.512 / 15.940 / 0/200 | 9375 / 2.202 / 9.785 / 14.548 / 20.702 / 0/200 |
+
+honk 在 HY2、TUIC、Trojan 与 AnyTLS-SB 上给出最低 p99；本轮唯一的失败是
+dae 的 Trojan 路由（2/200）。sing-box 的 HY2 是离群点：约 2 Gbps 压力下
+p99 31.5 ms、max 104 ms。
+
+### REALITY 轮：VLESS Vision / REALITY / VMess
+
+| Protocol | honk cold / hot p50 / p95 (ms) | bw / cores / MiB | dae cold / hot p50 / p95 | bw / cores / MiB | sing-box cold / hot p50 / p95 | bw / cores / MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| direct | 2.27 / - / - | 9404 / 0.00 / 50 | 2.03 / - / - | 9405 / 0.00 / 55 | 2.79 / - / - | 9410 / 0.38 / 94 |
+| vless-vision | 46.8 / 53.2 / 55.1 | 9342 / 0.42 / 42 | 55.5 / 54.7 / 126.5 | 9389 / 0.48 / 58 | 58.3 / 57.6 / 111.5 | 9374 / 0.70 / 95 |
+| vless-reality | 49.2 / 51.8 / 87.5 | 9381 / 0.39 / 43 | 56.0 / 59.0 / 113.9 | 9382 / 0.44 / 58 | 59.2 / 56.7 / 306.0 | 9391 / 0.68 / 97 |
+| vmess | 3.27 / 1.89 / 2.71 | 9374 / 0.44 / 49 | 3.75 / 1.92 / 2.84 | 9352 / 0.44 / 54 | 3.62 / 2.65 / 3.23 | 9373 / 0.71 / 94 |
+
+REALITY 行是端到端 TCP/REALITY，open 延迟包含服务端与 dest 的握手：三个
+引擎都在 cold ~47–59 ms、hot ~52–59 ms，而 direct 约 2 ms。九个代理 cell 的
+吞吐都到 LAN 上限，区分度来自 CPU、RSS 和 tail：honk 0.39–0.44 核，dae
+0.44–0.48，sing-box 0.68–0.71；RSS 42–49 MiB 对 54–58 与 94–97。honk 在两条
+VLESS 行上 cold 延迟与 p95 也最低。
+
+| Protocol | honk UDP RTT / Mbps (loss) / cores | dae UDP | sing-box UDP |
+| --- | --- | --- | --- |
+| vless-vision | n/a | 0.394 ms / 2960 (55.6%) / 1.08 | 0.257 ms / 3551 (45.1%) / 1.60 |
+| vless-reality | n/a | 0.412 ms / 2958 (56.1%) / 1.05 | 0.372 ms / 3964 (37.4%) / 1.59 |
+| vmess | n/a | 0.228 ms / 3063 (54.3%) / 1.01 | 0.165 ms / 3535 (46.3%) / 1.55 |
+
+honk 的 VLESS/VMess UDP 行为 `n/a`，因为 driver 的 `supports_udp` 仍未包含
+它们：这是 harness 覆盖限制，不代表 honk 的 VLESS UDP 能力。dae 与
+sing-box 各自承载了 2960–3964 Mbps 的 1200 字节数据报。
+
+| Protocol | honk load / p50 / p95 / p99 / max / failures | dae | sing-box |
+| --- | --- | --- | --- |
+| direct | 9410 / 2.580 / 3.071 / 3.720 / 6.439 / 0/200 | 9411 / 2.487 / 3.010 / 3.134 / 3.226 / 0/200 | 9410 / 2.745 / 3.494 / 3.825 / 4.071 / 0/200 |
+| vless-vision | 9346 / 52.265 / 62.936 / 70.616 / 72.671 / 0/200 | 9375 / 54.382 / 67.856 / 374.481 / 383.057 / 10/200 | 9359 / 58.284 / 92.605 / 112.158 / 241.201 / 0/200 |
+| vless-reality | 9381 / 52.605 / 64.043 / 69.106 / 92.299 / 0/200 | 9371 / 57.697 / 75.125 / 236.901 / 243.325 / 0/200 | 9387 / 57.987 / 70.899 / 106.465 / 240.736 / 0/200 |
+| vmess | 9384 / 2.472 / 9.898 / 16.946 / 20.468 / 0/200 | 9329 / 3.099 / 13.491 / 16.631 / 18.121 / 0/200 | 9371 / 3.067 / 9.033 / 12.632 / 15.850 / 0/200 |
+
+在相同的饱和压力下，honk 把 REALITY tail 保持在 71 ms p99 以内且 0 失败；
+dae 的 Vision arm 在 200 次 open 中失败 10 次、p99 到 374 ms（REALITY arm
+p99 237 ms）；sing-box 的 p99 为 106–112 ms、max 241 ms。VMess 是所有引擎的低
+RTT case；honk p50 比 dae 低 0.6 ms，p99 略高于 sing-box。
+
+### Juicity 轮（honk vs dae）
+
+| Protocol | honk cold / hot p50 / p95 (ms) | bw / cores / MiB | dae cold / hot p50 / p95 | bw / cores / MiB |
+| --- | --- | --- | --- | --- |
+| direct | 2.36 / - / - | 9407 / 0.00 / 48 | 2.56 / - / - | 9407 / 0.00 / 53 |
+| juicity | 3.51 / 1.73 / 2.68 | 2787 / 0.30 / 50 | 8.29 / 1.71 / 2.04 | 2650 / 0.57 / 61 |
+| juicity/udp | 0.364 ms / 1230 (82.6%) / 0.40 | - | 0.343 ms / 1187 (83.1%) / 0.68 | - |
+
+honk 的 Juicity TCP 高 5.2%，进程 CPU 约为 dae 的一半；UDP 高 3.6%；cold
+open 快 4.8 ms；RSS 50 对 61 MiB。loaded 稳定性相当：honk 2709 Mbps /
+1.726 / 2.076 / 2.156 / 2.345 ms / 0 失败，dae 2612 / 1.719 / 2.000 /
+2.350 / 2.667 ms / 0 失败。
+
+### 结论
+
+- 合并后的树保持 honk 在 2026-10-11 六协议轮的位置：SS2022/Trojan/AnyTLS
+  达到 LAN 上限，HY2/TUIC 高 2.5–2.7%，crypto-bound 路由进程 CPU 最低。
+  sing-box 的 HY2 仍是其弱项。
+- 新的 REALITY 轮引擎差异最大：吞吐同为线速，但 honk 只需约 0.4 核与
+  42–43 MiB，dae 为 0.44–0.48 核与 58 MiB，sing-box 为 0.68–0.71 核与
+  95–97 MiB。两条 VLESS 路由上 honk 也是唯一 0 失败且 p99 低于 71 ms 的
+  引擎。
+- Juicity：honk 的 TCP 高 dae 5.2%、UDP 高 3.6%，核数约一半。
+- 绝对数字是同机同 fixture 对比。共享 lab 的轮间方差约 ±5%；单流
+  BBR/Hysteria2 行对主机负载最敏感。
 
 ## 结果（2026-10-20，x86 本地 fixture A/B/C）
 

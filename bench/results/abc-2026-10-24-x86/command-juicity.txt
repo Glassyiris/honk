@@ -1,0 +1,14 @@
+env -u RUST_LOG T=10.10.10.70 N=lab \
+HONK_BIN=/root/honk-bench-abc-20261024/bin/honk-core \
+HONK_CONFIG=/root/honk-bench-abc-20261024/honk-lab-juicity.dae \
+DAE_BIN=/root/honk-bench-abc-20261024/bin/dae \
+DAE_CONFIG=/root/honk-bench-abc-20261024/dae-lab-juicity.dae \
+JUICITY_INDEX=1 \
+TSV=/root/honk-bench-abc-20261024/results-juicity.tsv \
+STABILITY_TSV=/root/honk-bench-abc-20261024/stability-juicity.tsv \
+STABILITY_DIR=/root/honk-bench-abc-20261024/raw-juicity \
+RUN_ID=abc-20261024-juicity \
+HOT_N=15 BW_RUNS=3 BW_TIME=8 COLD_RUNS=3 \
+LATENCY_STABILITY=1 STABILITY_SAMPLES=200 STABILITY_INTERVAL_MS=250 \
+STABILITY_TIMEOUT=5 STABILITY_RETRIES=2 \
+bash /root/honk-bench-abc-20261024/lab-bench.sh 'honk dae' 'juicity'

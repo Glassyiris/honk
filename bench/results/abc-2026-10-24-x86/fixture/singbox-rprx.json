@@ -1,0 +1,87 @@
+{
+  "log": { "level": "warn", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-vision",
+      "listen": "10.10.10.70",
+      "listen_port": 8443,
+      "users": [
+        { "uuid": "4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a", "flow": "xtls-rprx-vision" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": "www.microsoft.com", "server_port": 443 },
+          "private_key": "EKbXHjymHWUdBH90YeQpPZ0V6b1vdU_t94CN48e5tUI",
+          "short_id": ["a1b2c3d4e5f60718"]
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality",
+      "listen": "10.10.10.70",
+      "listen_port": 8444,
+      "users": [
+        { "uuid": "4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": "www.microsoft.com", "server_port": 443 },
+          "private_key": "EKbXHjymHWUdBH90YeQpPZ0V6b1vdU_t94CN48e5tUI",
+          "short_id": ["a1b2c3d4e5f60718"]
+        }
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp",
+      "listen": "10.10.10.70",
+      "listen_port": 8446,
+      "users": [
+        { "uuid": "82166345-d1bb-48f8-bd3b-cf0c152a863c" }
+      ]
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws-tls",
+      "listen": "10.10.10.70",
+      "listen_port": 8445,
+      "users": [
+        { "uuid": "216b9040-3f89-4103-b4d6-5f013ee0b1c4" }
+      ],
+      "transport": { "type": "ws", "path": "/vmess" },
+      "tls": {
+        "enabled": true,
+        "server_name": "test.local",
+        "certificate_path": "/root/bench-20261024/cert.pem",
+        "key_path": "/root/bench-20261024/key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_cidr": ["10.10.10.70/32"],
+        "port": [
+          8001, 8002, 8003, 8004, 8005, 8006, 8080,
+          5201, 5202, 5203, 5204, 5205, 5206, 5300,
+          53531, 53532, 53533, 53534, 53535, 53536, 53539
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      { "action": "reject" }
+    ],
+    "final": "direct"
+  }
+}
