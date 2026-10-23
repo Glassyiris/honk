@@ -181,6 +181,7 @@ strip = true
 # honk rprx fork: preset X25519 keyshare + ClientHello fixup hooks (REALITY)
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b65ecaa69b7eefe3c2fecd074b97facd2" }
 # honk fork (branch `honk-0.11` = upstream 0.11.x + patches, auto-merged): bound receive fragmentation, expose delivery and flow-control state,
-# allow runtime flow-control window tuning, and auto-tune the connection receive window.
-quinn = { git = "https://github.com/Glassyiris/quinn", rev = "8669cdb8f8a1740a1583ebe44ec1b623cdb11e61" }
-quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "8669cdb8f8a1740a1583ebe44ec1b623cdb11e61" }
+# allow runtime flow-control window tuning, auto-tune the connection receive window, report per-packet events to congestion controllers,
+# let a controller pace by rate, and provide BBRv3 (Glassyiris/quinn#12).
+quinn = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }

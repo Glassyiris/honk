@@ -2812,7 +2812,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.11.12"
-source = "git+https://github.com/Glassyiris/quinn?rev=8669cdb8f8a1740a1583ebe44ec1b623cdb11e61#8669cdb8f8a1740a1583ebe44ec1b623cdb11e61"
+source = "git+https://github.com/Glassyiris/quinn?rev=11f1de84c28305a3c98ace6d681c35219a8d1e6c#11f1de84c28305a3c98ace6d681c35219a8d1e6c"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2832,7 +2832,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.19"
-source = "git+https://github.com/Glassyiris/quinn?rev=8669cdb8f8a1740a1583ebe44ec1b623cdb11e61#8669cdb8f8a1740a1583ebe44ec1b623cdb11e61"
+source = "git+https://github.com/Glassyiris/quinn?rev=11f1de84c28305a3c98ace6d681c35219a8d1e6c#11f1de84c28305a3c98ace6d681c35219a8d1e6c"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2856,14 +2856,14 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.5.16"
-source = "git+https://github.com/Glassyiris/quinn?rev=8669cdb8f8a1740a1583ebe44ec1b623cdb11e61#8669cdb8f8a1740a1583ebe44ec1b623cdb11e61"
+source = "git+https://github.com/Glassyiris/quinn?rev=11f1de84c28305a3c98ace6d681c35219a8d1e6c#11f1de84c28305a3c98ace6d681c35219a8d1e6c"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
