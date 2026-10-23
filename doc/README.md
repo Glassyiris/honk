@@ -47,6 +47,14 @@ Field-by-field configuration and API reference. / 逐字段的配置与 API 参�
 | Clash API + `/stats` | [en/reference/api.md](./en/reference/api.md) | [zh/reference/api.md](./zh/reference/api.md) |
 | CLI (`honk-core` + `honk-tool`) | [en/reference/cli.md](./en/reference/cli.md) | [zh/reference/cli.md](./zh/reference/cli.md) |
 
+## Migration / 迁移
+
+Per-release configuration changes that affect an existing configuration. One file per release tag, named after the tag. / 每个发行版中会影响已有配置的变更；每个发行 tag 一个文件，以 tag 命名。
+
+| Release | English | 中文 |
+| --------- | --------- | ------ |
+| `v0.1.0-beta.1` | [en/migration/v0.1.0-beta.1.md](./en/migration/v0.1.0-beta.1.md) | [zh/migration/v0.1.0-beta.1.md](./zh/migration/v0.1.0-beta.1.md) |
+
 ## Operations / 运维
 
 | Document | English | 中文 |
