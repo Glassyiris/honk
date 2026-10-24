@@ -29,7 +29,13 @@
       "version_command": "honk-core 20286c3d",
       "binary_sha256": "22cd941bfd95b305ae992019ef5e43beb71dbf7ff7c230337dcbe651c4fa81e0",
       "target": "x86_64-unknown-linux-musl",
-      "features": ["ebpf", "native-api", "clash-api", "mimalloc", "rprx"],
+      "features": [
+        "ebpf",
+        "native-api",
+        "clash-api",
+        "mimalloc",
+        "rprx"
+      ],
       "build_command": "just build-musl \"ebpf,native-api\"",
       "bpf_object_embedded_bytes": 3209392,
       "build_wall_seconds": 272
@@ -73,7 +79,7 @@
   "shared_inputs": {
     "harness_sha256": "dbce07cfa8e9f26bf8a92b43b27567cfea86304826c8eb5904e26f0cc0e341fa",
     "latency_collector_sha256": "aa00f02920569a242eaf7b2fe29e5a1ef0ffb2166089f9954ccd39555ee9e575",
-    "harness_delta_vs_2026-10-11": "only the stacked /run/netns/daens mount cleanup after a hard-killed engine; the measurement paths are unchanged",
+    "harness_delta_vs_2026-10-11": "the daens mount cleanup, plus (after the campaign) the CPU denominator fix: when the iperf3 command outlives its transfer by more than one second, the run JSON transfer duration replaces the command wall. Ordinary rows keep the command denominator.",
     "configs": {
       "honk-lab.dae": "47367ce80bc911b7b7ec68f359aee22918ae829760042875261459d8648f7305",
       "dae-lab.dae": "6e60c767d1cdc83aa9942c2af774c6c3f42f7ba15a9b62d0a0ba82baafaf2a4b",
@@ -83,14 +89,26 @@
       "sb-client-rprx.json": "ce9dc54f3d510cfb1e197329db07bb8ac986319b5c06076a5a4f7828cc85a166",
       "honk-lab-juicity.dae": "491fd3f9ddd5971d5d008a9f3009097d13fbceb68167a97257303e78f7891669",
       "dae-lab-juicity.dae": "e1982e4f1b23e6299f30a2ef31a89c4ad43609a4bad5b62ff3610a2dcff34496"
-    }
+    },
+    "harness_sha256_cpu_window_fix": "56f27644dbb202bccd2057dc041b2a198040d50b3a38887c0beb8737af01baad"
   },
   "campaigns": [
     {
       "name": "six protocols",
       "window_utc": "2026-10-23T20:46:56Z..2026-10-23T21:27:43Z",
-      "engines": ["honk", "dae", "sing-box"],
-      "protocols": ["hy2", "tuic", "ss2022", "trojan", "anytls-sb", "anytls-go"],
+      "engines": [
+        "honk",
+        "dae",
+        "sing-box"
+      ],
+      "protocols": [
+        "hy2",
+        "tuic",
+        "ss2022",
+        "trojan",
+        "anytls-sb",
+        "anytls-go"
+      ],
       "server_mode": "standard",
       "command": "command-abc.txt",
       "result": "results.tsv",
@@ -102,9 +120,21 @@
     {
       "name": "REALITY family",
       "window_utc": "2026-10-23T21:27:56Z..2026-10-23T21:49:11Z",
-      "engines": ["honk", "dae", "sing-box"],
-      "protocols": ["vless-vision", "vless-reality", "vmess"],
-      "index_mapping": {"VLESS_VISION_INDEX": 1, "VLESS_REALITY_INDEX": 2, "VMESS_INDEX": 3},
+      "engines": [
+        "honk",
+        "dae",
+        "sing-box"
+      ],
+      "protocols": [
+        "vless-vision",
+        "vless-reality",
+        "vmess"
+      ],
+      "index_mapping": {
+        "VLESS_VISION_INDEX": 1,
+        "VLESS_REALITY_INDEX": 2,
+        "VMESS_INDEX": 3
+      },
       "server_mode": "rprx",
       "command": "command-rprx.txt",
       "result": "results-rprx.tsv",
@@ -116,9 +146,16 @@
     {
       "name": "Juicity",
       "window_utc": "2026-10-23T21:49:11Z..2026-10-23T21:55:50Z",
-      "engines": ["honk", "dae"],
-      "protocols": ["juicity"],
-      "index_mapping": {"JUICITY_INDEX": 1},
+      "engines": [
+        "honk",
+        "dae"
+      ],
+      "protocols": [
+        "juicity"
+      ],
+      "index_mapping": {
+        "JUICITY_INDEX": 1
+      },
       "server_mode": "rprx (irrelevant; the Juicity server is independent)",
       "command": "command-juicity.txt",
       "result": "results-juicity.tsv",
@@ -126,6 +163,27 @@
       "stdout": "campaign-juicity.stdout",
       "stderr": "campaign-juicity.stderr",
       "raw": "raw-juicity/"
+    },
+    {
+      "name": "AnyTLS CPU correction",
+      "window_utc": "2026-10-24T04:45:37Z..2026-10-24T05:03:27Z",
+      "engines": [
+        "honk",
+        "dae",
+        "sing-box"
+      ],
+      "protocols": [
+        "anytls-sb",
+        "anytls-go"
+      ],
+      "server_mode": "standard",
+      "command": "anytls-cpu/README.md",
+      "result": "anytls-cpu/results.tsv",
+      "stability": "anytls-cpu/stability.tsv",
+      "stdout": "anytls-cpu/stdout",
+      "stderr": "anytls-cpu/stderr",
+      "raw": "anytls-cpu/raw/",
+      "driver": "anytls-cpu/lab-bench-cpu-window.sh"
     }
   ],
   "notes": [
@@ -133,6 +191,33 @@
     "The Juicity pass does not run sing-box: it has no Juicity outbound. Its stderr identity line still prints the driver default /root/sing-box (sha256 5110e8b8...), which is not an engine of that pass.",
     "honk VLESS/VMess UDP rows are n/a because lab-bench.sh's supports_udp predicate excludes them; this is a harness-coverage limit, not a capability statement.",
     "All three passes use the pinned harness and collector; the only driver delta against the 2026-10-11 archive is the stacked daens mount cleanup.",
-    "Server-side error logs retain client-cancellation and cold-handshake noise from the smoke tests; the measured arms are clean."
-  ]
+    "Server-side error logs retain client-cancellation and cold-handshake noise from the smoke tests; the measured arms are clean.",
+    "AnyTLS CPU cells in the published 2026-10-24 tables are from the corrected re-measurement (anytls-cpu/); the campaign results.tsv keeps the original whole-command values as evidence of what first ran."
+  ],
+  "anytls_cpu_correction": {
+    "problem": "the original harness divided process CPU by the whole iperf3 command wall; dae's AnyTLS client keeps the command open 18.02 s for an 8.00 s transfer",
+    "method": "bench/results/abc-2026-10-24-x86/anytls-cpu/probe.py samples /proc/<pid>/stat every 50 ms and integrates the tick delta over the transfer window reported by iperf3",
+    "dae_anytls_sb": {
+      "cores_command": [
+        0.21,
+        0.228
+      ],
+      "cores_transfer": [
+        0.471,
+        0.509
+      ]
+    },
+    "dae_anytls_go": {
+      "cores_command": [
+        0.218,
+        0.224
+      ],
+      "cores_transfer": [
+        0.489,
+        0.501
+      ]
+    },
+    "unaffected": "honk 8.05-8.10 s and sing-box 8.01-8.02 s command walls; dae 5201-5204 8.008-8.018 s",
+    "supersedes": "the AnyTLS CPU cells in results.tsv, results-rprx.tsv (none) and results-juicity.tsv (none); results.tsv keeps the uncorrected cells as run evidence"
+  }
 }

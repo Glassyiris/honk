@@ -131,7 +131,9 @@ Per engine × protocol:
   failures, and scheduling lag; retain every attempt as JSONL plus the paired
   iperf3 JSON so a failed or low-pressure load cannot look "stable".
 - **cpu** — engine CPU cores during the median bandwidth run
-  (`/proc/<pid>/stat` utime+stime delta over wall time). The honk pid is
+  (`/proc/<pid>/stat` utime+stime delta over the iperf3 transfer window;
+  a client that lingers after the test, such as dae's AnyTLS, would otherwise
+  inflate the denominator). The honk pid is
   anchored on the clash-API listener so a second instance parked on the
   singleton flock (zero CPU) can't poison the metric.
 - **rss** — integer MiB (`VmRSS / 1024`) after the bandwidth runs.
@@ -242,17 +244,20 @@ client reads `0.37`.
 | tuic | 3586 / 0.34 / 64 | 3498 / 0.67 / 58 | 3386 / 0.77 / 67 |
 | ss2022 | 9397 / 0.33 / 61 | 9400 / 0.38 / 57 | 9399 / 0.51 / 96 |
 | trojan | 9383 / 0.35 / 59 | 9384 / 0.43 / 61 | 9371 / 0.69 / 94 |
-| anytls-sb | 9394 / 0.43 / 56 | 9390 / 0.21 / 63 | 9386 / 0.77 / 95 |
-| anytls-go | 9387 / 0.45 / 64 | 9372 / 0.24 / 59 | 9374 / 0.86 / 94 |
+| anytls-sb † | 9402 / 0.41 / 57 | 9387 / 0.50 / 61 | 9387 / 0.75 / 96 |
+| anytls-go † | 9394 / 0.43 / 60 | 9370 / 0.54 / 63 | 9382 / 0.86 / 96 |
 
 Every SS2022/Trojan/AnyTLS row is pinned at the ~9.4 Gbps LAN ceiling, so
 those rows separate engines by CPU and tails, not throughput. HY2 and TUIC
 are crypto-bound: honk is +2.7% and +2.5% over dae and +67%/+5.9% over
 sing-box, whose HY2 moved 1825 Mbps. honk uses the fewest process cores on
 HY2/TUIC/SS2022/Trojan (0.31/0.34/0.33/0.35 vs dae 0.59/0.67/0.38/0.43 and
-sing-box 0.51/0.77/0.51/0.69); dae is cheaper on both AnyTLS routes
-(0.21/0.24 vs honk 0.43/0.45). honk's RSS is 56–64 MiB, dae 53–63 MiB,
-sing-box 64–96 MiB.
+sing-box 0.51/0.77/0.51/0.69) and on both AnyTLS routes once CPU is measured
+over the transfer window (0.41/0.43 vs dae 0.50/0.54 and sing-box 0.75/0.86).
+honk's RSS is 56–64 MiB, dae 53–63 MiB, sing-box 64–96 MiB. † The AnyTLS rows
+were re-measured after the CPU-denominator fix below; their bandwidth, CPU and
+RSS come from that run (the loaded-latency table is a separate phase and the
+fix does not touch it).
 
 ### Six-protocol pass: UDP
 
@@ -265,8 +270,8 @@ Mbps with overload loss, plus that run's process cores.
 | tuic | 0.321 ms / 1236 (82.3%) / 0.68 | 0.538 ms / 1188 (82.9%) / 0.79 | 0.357 ms / 1065 (84.7%) / 1.41 |
 | ss2022 | 0.323 ms / 2034 (65.8%) / 0.74 | 0.256 ms / 2799 (53.0%) / 1.24 | 0.113 ms / 2860 (52.0%) / 1.37 |
 | trojan | 0.164 ms / 1713 (75.6%) / 0.71 | 0.119 ms / 2987 (55.5%) / 1.10 | 0.332 ms / 3539 (46.2%) / 1.57 |
-| anytls-sb | 0.187 ms / 1625 (75.6%) / 0.58 | 0.255 ms / 1667 (74.8%) / 0.67 | 0.084 ms / 1404 (78.1%) / 1.16 |
-| anytls-go | 0.337 ms / 1694 (75.2%) / 0.58 | 0.272 ms / 1758 (74.1%) / 0.32 | 0.319 ms / 1404 (78.5%) / 1.17 |
+| anytls-sb | 0.259 ms / 1546 (77.2%) / 0.55 | 0.348 ms / 1616 (76.1%) / 0.65 | 0.209 ms / 1385 (78.6%) / 1.16 |
+| anytls-go | 0.190 ms / 1722 (74.8%) / 0.58 | 0.196 ms / 1772 (73.8%) / 0.71 | 0.283 ms / 1388 (78.9%) / 1.17 |
 
 The 10 Gbps offer is a saturating overload probe, not a WAN-loss measurement;
 loss is therefore expected in every cell. honk costs fewer cores on HY2/TUIC
@@ -274,6 +279,28 @@ and moves more datagrams than dae on TUIC (1236 vs 1188 Mbps; HY2 is a 1154 vs
 1176 Mbps tie); dae and sing-box retain the SS2022/Trojan UDP advantage
 (+38%/+74% and +41%/+107% over honk), and sing-box's HY2 UDP arm received
 nothing at all, consistent with the 2026-10-11 result.
+
+#### AnyTLS CPU denominator correction
+
+The first 2026-10-24 pass divided process CPU by the whole `iperf3` command
+wall. dae's AnyTLS client keeps that command open for 18.02 s while the
+transfer lasts 8.00 s (honk 8.05–8.10 s, sing-box 8.01–8.02 s), so dae's
+original 0.21/0.24 cores were CPU divided by dead wall time: an artifact, not
+a cheaper engine. A 50 ms timestamped probe integrated over the transfer
+window that iperf3 reports reads **0.47–0.51** cores on AnyTLS-SB and
+**0.49–0.50** on AnyTLS-Go for dae, while honk (0.40–0.44) and sing-box
+(0.75–0.93) agree between the two methods. The same artifact also deflated
+dae's AnyTLS-Go UDP cell (0.32 → 0.71 cores).
+
+Only the AnyTLS rows are affected: every other protocol's client returned
+within 0.02 s of its transfer (dae 5201–5204: 8.008–8.018 s). `lab-bench.sh`
+now uses the run JSON's transfer duration whenever the command outlives it by
+more than one second, for both the TCP and UDP arms; ordinary rows keep their
+command denominator, so their published cells do not move. The AnyTLS rows
+above were re-measured with that driver (3 bandwidth runs, 15 hot requests,
+200 loaded opens per engine); the probe, both driver revisions and the raw
+evidence are in
+[`anytls-cpu/`](../bench/results/abc-2026-10-24-x86/anytls-cpu/).
 
 ### Six-protocol pass: loaded latency stability
 
@@ -352,8 +379,8 @@ failures, dae 2612 / 1.719 / 2.000 / 2.350 / 2.667 ms / 0 failures.
 
 - The merged tree keeps honk's 2026-10-11 position on the six-protocol pass:
   LAN-ceiling throughput on SS2022/Trojan/AnyTLS, +2.5–2.7% on HY2/TUIC, and
-  the lowest process CPU on the crypto-bound routes. sing-box's HY2 remains
-  its weak row.
+  the lowest process CPU on the crypto-bound routes and on both AnyTLS routes
+  after the transfer-window correction. sing-box's HY2 remains its weak row.
 - The new REALITY pass shows the widest engine separation: equal line-rate
   throughput, but honk needs ~0.4 cores and 42–43 MiB where dae needs
   0.44–0.48 cores and 58 MiB and sing-box 0.68–0.71 cores and 95–97 MiB.

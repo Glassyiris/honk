@@ -10,7 +10,7 @@
 #   cold   — first-request latency on a freshly restarted engine, 3 runs
 #   hot    — open-stream latency over 15 requests, p50/p95
 #   bw     — iperf3 -R (download) 3 runs, median receiver bitrate
-#   cpu    — engine CPU cores during the median bandwidth run
+#   cpu    — engine CPU cores during the median bandwidth run (transfer window)
 #   rss    — engine RSS after the bandwidth runs
 #   stability — 200 paced opens while one same-route reverse stream is loaded
 # Plus a direct-path baseline per engine (no proxy involved).
@@ -109,6 +109,26 @@ cpu_ticks() {
 
 now_ns() {
     python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+# Process cores over the iperf3 transfer window. A client that lingers well
+# past the test (dae's AnyTLS kept the command open for 10 extra seconds)
+# divides the same CPU by dead wall time and understates the engine. When the
+# command clearly outlives the transfer, use the duration in the run JSON;
+# ordinary rows keep their whole-command denominator.
+cpu_cores() { # json ticks0 ticks1 ns0 ns1 → cores
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json, sys
+path, ticks0, ticks1, ns0, ns1 = sys.argv[1:6]
+seconds = (int(ns1) - int(ns0)) / 1e9
+try:
+    duration = float(json.load(open(path))["end"]["sum_received"]["seconds"])
+    if seconds > duration + 1:
+        seconds = duration
+except Exception:
+    pass
+print(f"{(int(ticks1) - int(ticks0)) / 100 / seconds:.2f}")
+PY
 }
 
 rss_mb() {
@@ -296,7 +316,8 @@ try:
 except Exception: print(0)')
         ns1=$(now_ns)
         ticks1=$(cpu_ticks "$pid")
-        cores=$(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ns1-$ns0)/1e9):.2f}')")
+        cores=$(cpu_cores "$STABILITY_DIR/$engine-$port.tcp-$i.json" \
+            "$ticks0" "$ticks1" "$ns0" "$ns1")
         results="$results$bw:$cores\n"
     done
     # median by bandwidth; report that run's cpu alongside
@@ -445,7 +466,8 @@ try:
 except Exception: print("0(-)")')
     ns1=$(now_ns)
     ticks1=$(cpu_ticks "$pid")
-    echo "$res $(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ns1-$ns0)/1e9):.2f}')")"
+    echo "$res $(cpu_cores "$STABILITY_DIR/$engine-$port.udp.json" \
+        "$ticks0" "$ticks1" "$ns0" "$ns1")"
 }
 
 if [ "$LATENCY_STABILITY" = 1 ] && [ ! -r "$STABILITY_COLLECTOR" ]; then

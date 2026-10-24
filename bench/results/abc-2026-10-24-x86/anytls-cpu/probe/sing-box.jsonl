@@ -1,0 +1,4 @@
+{"port": 5205, "rep": 0, "mbps": 9384.4, "wall": 8.02, "transfer_seconds": 8.0, "cores_command": 0.751, "cores_transfer": 0.749, "samples": 161}
+{"port": 5205, "rep": 1, "mbps": 9388.8, "wall": 8.008, "transfer_seconds": 8.0, "cores_command": 0.751, "cores_transfer": 0.733, "samples": 161}
+{"port": 5206, "rep": 0, "mbps": 9373.0, "wall": 8.017, "transfer_seconds": 8.0, "cores_command": 0.928, "cores_transfer": 0.933, "samples": 161}
+{"port": 5206, "rep": 1, "mbps": 9379.2, "wall": 8.007, "transfer_seconds": 8.0, "cores_command": 0.838, "cores_transfer": 0.835, "samples": 161}

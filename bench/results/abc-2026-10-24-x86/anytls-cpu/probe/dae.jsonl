@@ -1,0 +1,9 @@
+{"port": 5205, "rep": 0, "mbps": 9390.6, "wall": 18.019, "transfer_seconds": 8.001, "cores_command": 0.228, "cores_transfer": 0.509, "samples": 360}
+{"port": 5205, "rep": 1, "mbps": 9393.0, "wall": 18.02, "transfer_seconds": 8.001, "cores_command": 0.216, "cores_transfer": 0.487, "samples": 360}
+{"port": 5205, "rep": 2, "mbps": 9384.3, "wall": 18.021, "transfer_seconds": 8.001, "cores_command": 0.21, "cores_transfer": 0.471, "samples": 360}
+{"port": 5206, "rep": 0, "mbps": 9370.7, "wall": 18.022, "transfer_seconds": 8.0, "cores_command": 0.224, "cores_transfer": 0.501, "samples": 360}
+{"port": 5206, "rep": 1, "mbps": 9373.7, "wall": 18.022, "transfer_seconds": 8.001, "cores_command": 0.218, "cores_transfer": 0.489, "samples": 360}
+{"port": 5206, "rep": 2, "mbps": 9378.0, "wall": 18.019, "transfer_seconds": 8.0, "cores_command": 0.221, "cores_transfer": 0.494, "samples": 361}
+{"port": 5201, "rep": 0, "mbps": 3095.3, "wall": 8.013, "transfer_seconds": 8.001, "cores_command": 0.624, "cores_transfer": 0.623, "samples": 161}
+{"port": 5201, "rep": 1, "mbps": 2907.5, "wall": 8.01, "transfer_seconds": 8.001, "cores_command": 0.602, "cores_transfer": 0.604, "samples": 161}
+{"port": 5201, "rep": 2, "mbps": 2963.6, "wall": 8.008, "transfer_seconds": 8.0, "cores_command": 0.608, "cores_transfer": 0.607, "samples": 161}

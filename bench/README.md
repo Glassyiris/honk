@@ -16,7 +16,9 @@ Per engine × protocol:
   already warm); only 2xx/3xx responses count, otherwise the row is `invalid`
 - **bw** — iperf3 `-R` download, 3 runs, median receiver bitrate
 - **cpu** — engine CPU cores during the median bandwidth run
-  (`/proc/<pid>/stat` utime+stime delta over wall time)
+  (`/proc/<pid>/stat` utime+stime delta over the iperf3 transfer window; a
+  client that lingers after the test, such as dae's AnyTLS, would otherwise
+  inflate the denominator)
 - **rss** — integer MiB (`VmRSS / 1024`) after the bandwidth runs
 - **loaded latency stability** — 200 new HTTP streams at a fixed 250 ms
   cadence while one reverse iperf3 stream loads the same outbound; reports
