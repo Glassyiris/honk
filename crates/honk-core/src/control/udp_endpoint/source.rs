@@ -702,7 +702,8 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
         pool: Arc::clone(&pool),
         owner: Arc::clone(&owner),
     };
-    let mut buf = [0u8; 65536];
+    // Heap, not inline: an inline array adds 64 KiB to every source task.
+    let mut buf = vec![0u8; 65536];
     let mut alternate_reply_sockets = Vec::new();
 
     loop {

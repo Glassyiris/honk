@@ -33,7 +33,8 @@ pub(super) async fn receive_loop(
     // The normal fixed-target path keeps using the pre-created socket without
     // allocating. Full-cone sources populate this small endpoint-local cache.
     let mut alternate_reply_sockets = Vec::new();
-    let mut buf = [0u8; 65536];
+    // Heap, not inline: an inline array adds 64 KiB to every endpoint task.
+    let mut buf = vec![0u8; 65536];
     let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
     tokio::pin!(reply_idle_timeout);
     loop {
