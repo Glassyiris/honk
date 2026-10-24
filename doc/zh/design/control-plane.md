@@ -171,13 +171,18 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 | 保留 TCP pool | 2048 | 每个 1 = 2048 |
 | 临时出站 dial | 1024 | 每个 1 = 1024 |
 | VLESS 物理 carrier | 8192 | 每个 1 = 8192 |
-| UDP endpoint | 8192 | 每个 10 = 81,920 |
-| **合计** |  | **191,744** |
+| UDP endpoint | 32,768 | 每个 10 = 327,680 |
+| **合计** |  | **437,504** |
 
 一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流和全部八个
 anyfrom reply socket 记账。一个 TCP 流为 accepted/outbound socket 和两组
 各含两个 FD 的 splice pipe 记账。更小限制使用相同的饱和分区；VLESS carrier
 结果为零时保持零。
+
+启动时还把 UDP endpoint 限制在 `MemTotal` 的四分之一以内，每个 endpoint 按
+64 KiB 计：2 GiB 为 8,192，8 GiB 起达到 32,768 硬上限。实测一个 Shadowsocks
+共享 source 约 35 KiB，每多一个目的地约 11 KiB，因此该预算为每流状态更多的
+transport 留有余量。不读取 cgroup 内存限制。
 
 进程 VLESS-carrier semaphore 由 traffic generation 与 DNS runtime fork 共享。
 carrier 在 actual I/O 的 provisional、active、draining 与 idle 状态中始终持有

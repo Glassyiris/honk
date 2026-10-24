@@ -181,13 +181,19 @@ is:
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
 | VLESS physical carriers | 8192 | 1 each = 8192 |
-| UDP endpoints | 8192 | 10 each = 81,920 |
-| **Total** |  | **191,744** |
+| UDP endpoints | 32,768 | 10 each = 327,680 |
+| **Total** |  | **437,504** |
 
 One UDP endpoint budgets a relay socket, a possible SOCKS5 control stream, and
 all eight possible anyfrom reply sockets. One TCP flow budgets the accepted and
 outbound sockets plus two two-FD splice pipes. Smaller limits use the same
 saturating partition; a zero VLESS-carrier result stays zero.
+
+Startup also caps UDP endpoints at a quarter of `MemTotal`, budgeting 64 KiB per
+endpoint: 8,192 at 2 GiB and the 32,768 hard cap from 8 GiB. A Shadowsocks shared
+source measured about 35 KiB and each further destination about 11 KiB, so the
+budget leaves room for transports with more per-flow state. A cgroup memory
+limit is not consulted.
 
 The process VLESS-carrier semaphore is shared by traffic generations and DNS
 runtime forks. A carrier holds its permit during actual I/O through provisional,
