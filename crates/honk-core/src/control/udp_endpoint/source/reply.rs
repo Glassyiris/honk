@@ -35,10 +35,9 @@ impl UdpEndpointPool {
             return match owner.scope.reply {
                 ReplyProjection::ActualPeer => {
                     let state = owner.state.lock();
-                    if state.foreign_replies_disabled
-                        || state
-                            .retired_reply_peers
-                            .contains(&normalize_socket_addr(peer))
+                    if state
+                        .retired_reply_peers
+                        .contains(&normalize_socket_addr(peer))
                     {
                         SourceReplyTarget::Drop
                     } else {
@@ -90,7 +89,6 @@ impl UdpEndpointPool {
         let peer = normalize_socket_addr(peer);
         if !matches!(owner.scope.reply, ReplyProjection::ActualPeer)
             || state.retirement.is_some()
-            || state.foreign_replies_disabled
             || state.retired_reply_peers.contains(&peer)
             || state.active_foreign_reply.is_some()
         {
