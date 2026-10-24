@@ -123,7 +123,7 @@ path, ticks0, ticks1, ns0, ns1 = sys.argv[1:6]
 seconds = (int(ns1) - int(ns0)) / 1e9
 try:
     duration = float(json.load(open(path))["end"]["sum_received"]["seconds"])
-    if seconds > duration + 1:
+    if duration > 0 and seconds > duration + 1:
         seconds = duration
 except Exception:
     pass

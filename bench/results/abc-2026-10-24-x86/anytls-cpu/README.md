@@ -39,3 +39,8 @@ Re-measured rows (3 bandwidth runs, 15 hot requests, 200 loaded opens):
 | anytls-go | 0.43 cores, 9394 Mbps, 60 MiB | 0.54 cores, 9370 Mbps, 63 MiB | 0.86 cores, 9382 Mbps, 96 MiB |
 | anytls-sb/udp | 0.55 cores, 1546 Mbps (77.2%) | 0.65 cores, 1616 Mbps (76.1%) | 1.16 cores, 1385 Mbps (78.6%) |
 | anytls-go/udp | 0.58 cores, 1722 Mbps (74.8%) | 0.71 cores, 1772 Mbps (73.8%) | 1.17 cores, 1388 Mbps (78.9%) |
+
+The repo driver later gained a zero-duration guard: a run JSON whose
+`sum_received.seconds` is 0 falls back to the command wall instead of
+dividing by zero. Completed runs take the same path as the driver archived
+here.
