@@ -65,7 +65,10 @@
 | --- | --- | --- |
 | hy2 server | sing-box 1.14.3 | `:8443`,密码 `testpass123`,证书 CN `hy2.test` |
 | TUIC server | sing-box 1.14.3 | `:2444`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,要求 SNI `hy2.test` |
-| Juicity server（历史 fixture，不在本轮矩阵中） | 官方 Go `juicity-server` v0.4.3 | `:2451`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,SNI `hy2.test` |
+| Juicity server | 官方 Go `juicity-server` v0.4.3 | `:2451`,uuid `00000000-0000-0000-0000-000000000001` / `testpass123`,SNI `hy2.test`,`congestion_control: bbr` |
+| VLESS REALITY + Vision | sing-box 1.14.3 | `:8443`,uuid `4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a`,flow `xtls-rprx-vision`,REALITY `dest www.microsoft.com:443`,short id `a1b2c3d4e5f60718` |
+| VLESS REALITY | sing-box 1.14.3 | `:8444`,同一 uuid、无 flow,REALITY 参数相同 |
+| VMess server | sing-box 1.14.3 | `:8446` TCP,uuid `82166345-d1bb-48f8-bd3b-cf0c152a863c`(`:8445` VMess/WS+TLS 已配置但未使用) |
 | AnyTLS server | sing-box 1.14.3 | `:2445`,密码 `testpass123` |
 | AnyTLS server | 官方 anytls-go 0.0.13 | `:2443`,`-p testpass123` |
 | SS 2022 server | sing-box 1.14.3 | `:2447`,`2022-blake3-aes-128-gcm`,psk `8JCsHssyVTFyPy5lYdNhZg==` |
@@ -74,12 +77,14 @@
 
 常规引擎配置按目标端口路由,无需 API 切换：`5201/8001 → hy2`、
 `5202/8002 → tuic`、`5203/8003 → ss2022`、`5204/8004 → trojan`、
-`5205/8005 → anytls-sb`、`5206/8006 → anytls-go`。专用 honk-only rprx
-配置通过 harness index override 把 VLESS Vision/REALITY/VMess 复用到在线
-目标槽 1–3；专用 Juicity 配置复用槽 1 完成 honk/dae 配对。当前上游 dae
-支持完整六协议矩阵；历史 ARM 对照使用四协议共有面。节点服务端口为
+`5205/8005 → anytls-sb`、`5206/8006 → anytls-go`。专用 rprx 配置
+（honk、dae、sing-box）通过 harness index override 把 VLESS
+Vision/REALITY/VMess 复用到在线目标槽 1–3；专用 Juicity 配置复用槽 1
+完成 honk/dae 配对（sing-box 没有 Juicity outbound）。当前上游 dae 支持
+完整六协议矩阵；历史 ARM 对照使用四协议共有面。节点服务端口为
 `direct(must)`，未匹配的目的地回落 direct。每个客户端配置（包括 sing-box）
-都必须显式路由 UDP echo 端口。
+都必须显式路由 UDP echo 端口。rprx inbounds 与 HY2 共用 8443，因此两轮
+之间 fixture 会切换 `singbox-server.json` 与 `singbox-rprx.json`。
 
 ## 方法学
 

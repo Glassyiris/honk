@@ -77,7 +77,10 @@ original binaries and server fixtures; the newest campaign appears first.
 | --- | --- | --- |
 | hy2 server | sing-box 1.14.3 | `:8443`, password `testpass123`, cert CN `hy2.test` |
 | TUIC server | sing-box 1.14.3 | `:2444`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, requires SNI `hy2.test` |
-| Juicity server (historical, not in the current matrix) | official Go `juicity-server` v0.4.3 | `:2451`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, SNI `hy2.test` |
+| Juicity server | official Go `juicity-server` v0.4.3 | `:2451`, uuid `00000000-0000-0000-0000-000000000001` / `testpass123`, SNI `hy2.test`, `congestion_control: bbr` |
+| VLESS REALITY + Vision | sing-box 1.14.3 | `:8443`, uuid `4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a`, flow `xtls-rprx-vision`, REALITY `dest www.microsoft.com:443`, short id `a1b2c3d4e5f60718` |
+| VLESS REALITY | sing-box 1.14.3 | `:8444`, same uuid without flow, same REALITY parameters |
+| VMess server | sing-box 1.14.3 | `:8446` TCP, uuid `82166345-d1bb-48f8-bd3b-cf0c152a863c` (`:8445` VMess/WS+TLS is configured but unused) |
 | AnyTLS server | sing-box 1.14.3 | `:2445`, password `testpass123` |
 | AnyTLS server | official anytls-go 0.0.13 | `:2443`, `-p testpass123` |
 | SS 2022 server | sing-box 1.14.3 | `:2447`, `2022-blake3-aes-128-gcm`, psk `8JCsHssyVTFyPy5lYdNhZg==` |
@@ -87,13 +90,15 @@ original binaries and server fixtures; the newest campaign appears first.
 Standard engine configs route by destination port so no API switching is
 needed: `5201/8001 → hy2`, `5202/8002 → tuic`, `5203/8003 → ss2022`,
 `5204/8004 → trojan`, `5205/8005 → anytls-sb`, `5206/8006 → anytls-go`.
-The dedicated honk-only rprx configs remap VLESS Vision/REALITY/VMess onto the
-live target slots 1–3 via harness index overrides; the dedicated Juicity
-configs reuse slot 1 for a paired honk/dae run. Current upstream dae supports
-the full six-protocol matrix; historical ARM comparisons used the shared
-four-protocol surface. Node server ports are `direct(must)` and unmatched
-destinations fall back to direct. UDP echo ports must be routed explicitly
-in every client config, including sing-box.
+The dedicated rprx configs (honk, dae and sing-box) remap VLESS
+Vision/REALITY/VMess onto the live target slots 1–3 via harness index
+overrides; the dedicated Juicity configs reuse slot 1 for the honk/dae pair
+(sing-box has no Juicity outbound). Current upstream dae supports the full
+six-protocol matrix; historical ARM comparisons used the shared four-protocol
+surface. Node server ports are `direct(must)` and unmatched destinations fall
+back to direct. UDP echo ports must be routed explicitly in every client
+config, including sing-box. The rprx inbounds share port 8443 with HY2, so the
+fixture swaps `singbox-server.json` for `singbox-rprx.json` between passes.
 
 ## Methodology
 
