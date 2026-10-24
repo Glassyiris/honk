@@ -1,0 +1,60 @@
+2026-10-24T07:00:00.402556+00:00  INFO honk_core: honk-core 20286c3d starting
+2026-10-24T07:00:00.402576+00:00  INFO honk_core: Config: /root/honk-bench-abc-20261024/honk-lab.dae
+2026-10-24T07:00:00.402578+00:00  WARN honk_config::diagnostic: list quoting is deprecated; quote list items individually or use bare items code="legacy-quoted-list" setting=config value=<redacted>
+2026-10-24T07:00:00.402585+00:00  WARN honk_config::diagnostic: list quoting is deprecated; quote list items individually or use bare items code="legacy-quoted-list" setting=config value=<redacted>
+2026-10-24T07:00:00.402586+00:00  INFO honk_core: Runtime data directory configured directory=/var/lib/honk
+2026-10-24T07:00:00.405345+00:00  INFO honk_core: Raised NOFILE rlimit to 524288 (hard=524288)
+2026-10-24T07:00:00.410843+00:00  INFO honk_core: Group 'proxy-hy2' resolved 1 node(s)
+2026-10-24T07:00:00.410854+00:00  INFO honk_core: Group 'proxy-tuic' resolved 1 node(s)
+2026-10-24T07:00:00.410855+00:00  INFO honk_core: Group 'proxy-ss2022' resolved 1 node(s)
+2026-10-24T07:00:00.410856+00:00  INFO honk_core: Group 'proxy-trojan' resolved 1 node(s)
+2026-10-24T07:00:00.410857+00:00  INFO honk_core: Group 'proxy-anytls-sb' resolved 1 node(s)
+2026-10-24T07:00:00.410857+00:00  INFO honk_core: Group 'proxy-anytls-go' resolved 1 node(s)
+2026-10-24T07:00:00.410858+00:00  INFO honk_core: Loaded 8 nodes, 6 groups, 7 routing rules
+2026-10-24T07:00:00.411485+00:00  INFO honk_core::daens: daens FD source: /proc/thread-self/ns/net -> net:[4026532405]
+2026-10-24T07:00:00.411518+00:00  INFO honk_core::daens: Created daens network namespace (FD-owned)
+2026-10-24T07:00:00.411835+00:00  INFO honk_core::daens: Created dae0/dae0peer link pair kind=Netkit
+2026-10-24T07:00:00.412099+00:00  INFO honk_core::daens: net.ipv4.conf.dae0.rp_filter = 0
+2026-10-24T07:00:00.412111+00:00  INFO honk_core::daens: net.ipv4.conf.dae0.accept_local = 1
+2026-10-24T07:00:00.412473+00:00  INFO honk_core: dae0 link created before eBPF load (ifindex=5681)
+2026-10-24T07:00:00.412478+00:00  INFO honk_core: Loading real eBPF backend from built-in object
+2026-10-24T07:00:00.450116+00:00  INFO honk_core::ebpf::real::attach: Loading eBPF programs (3209392 bytes)
+2026-10-24T07:00:00.450179+00:00  INFO honk_core::ebpf::real::attach: Kernel 7.2.0 supports bpf_redirect_peer, enabling
+2026-10-24T07:00:00.469462+00:00  INFO honk_core::ebpf::real::attach: process-name routing uses argv[0] basename
+2026-10-24T07:00:00.482439+00:00  INFO honk_core::ebpf::real::attach: Attached 6 required cgroup programs to /sys/fs/cgroup
+2026-10-24T07:00:00.482797+00:00  INFO honk_core::ebpf::real::attach: Attaching eBPF TC programs to LAN interface: veth-lab (configured: veth-lab)
+2026-10-24T07:00:01.024162+00:00  INFO honk_core::ebpf::real::attach: eBPF loaded and attached
+2026-10-24T07:00:01.038137+00:00  INFO honk_core::ebpf::real: dae0_ingress attached and link held
+2026-10-24T07:00:01.038153+00:00  INFO honk_core: dae0 programs attached
+2026-10-24T07:00:01.047408+00:00  INFO honk_core::daens: Moved dae0peer to daens
+2026-10-24T07:00:01.047798+00:00  INFO honk_core::daens: Configured daens namespace (mark=0x8000000)
+2026-10-24T07:00:01.047808+00:00  INFO honk_core: dae0peer moved to daens netns
+2026-10-24T07:00:01.048055+00:00  INFO honk_core::ebpf::real: tproxy_sk_lookup attached to daens namespace
+2026-10-24T07:00:01.048059+00:00  INFO honk_core: tproxy_sk_lookup attached in daens
+2026-10-24T07:00:01.053098+00:00  INFO honk_core::ebpf::real: dae0peer_ingress attached and link held
+2026-10-24T07:00:01.053113+00:00  INFO honk_core: dae0peer_ingress attached in daens
+2026-10-24T07:00:01.053115+00:00  INFO honk_core: Using eBPF TC redirect datapath (tproxy_mark=0x8000000)
+2026-10-24T07:00:01.053146+00:00  INFO honk_core: Router ready with 7 compiled routes
+2026-10-24T07:00:01.053163+00:00  INFO honk_core: Proxy registry ready (11 handlers)
+2026-10-24T07:00:01.053185+00:00  INFO honk_core: DNS upstream config: name=alidns addr=223.5.5.5:53 proto=Udp outbound=None
+2026-10-24T07:00:01.053196+00:00  INFO honk_core: DNS forwarder ready
+2026-10-24T07:00:01.053229+00:00  INFO honk_core::control::bootstrap: Registered 6/8 nodes for health check (2 skipped: not in any group)
+2026-10-24T07:00:01.053271+00:00  INFO honk_core::control::bootstrap: Control-plane descriptor budget nofile=524288 fixed=256 tcp_flows=16384 tcp_max=32768 tcp_pool=2048 dials=64 dial_ceiling=1024 vless_carriers=8192 udp_endpoints=8192 udp_slow=256 dns_slow=256
+2026-10-24T07:00:01.547171+00:00  INFO honk_core: DNS upstream pool attached to SharedGroupManager + traffic Router
+2026-10-24T07:00:01.547619+00:00  INFO honk_core::control::cache: state db: restored 1 persisted delay sample(s)
+2026-10-24T07:00:01.547708+00:00  INFO honk_core: Starting control plane listeners and accept loop
+2026-10-24T07:00:01.547717+00:00  INFO honk_core: honk-core is running.
+2026-10-24T07:00:01.547956+00:00  WARN honk_core::control::runtime: LAN self-protection coverage could not be confirmed; review explicit direct(must) rules for management access, excluding port 53 if transparent DNS is intended; configured routing is unchanged lan_interfaces=["veth-lab"] local_addresses=["10.10.10.49/32", "192.0.2.55/32", "192.168.222.1/32", "240e:3b6:32b4:e50:2a0:98ff:fe04:2a4b/128", "fd00:abab::2a0:98ff:fe04:2a4b/128"]
+2026-10-24T07:00:01.547986+00:00  INFO honk_core::control::lifecycle: Control plane listening for TPROXY TCPv4 on 0.0.0.0:12345
+2026-10-24T07:00:01.547998+00:00  INFO honk_core::control::lifecycle: Control plane listening for TPROXY TCPv6 on [::]:12345
+2026-10-24T07:00:01.548020+00:00  INFO honk_core::control::lifecycle: Control plane listening for TPROXY UDPv4 x4 on 0.0.0.0:12345
+2026-10-24T07:00:01.548017+00:00  INFO honk_core::clash_api: clash API listening on http://127.0.0.1:9090
+2026-10-24T07:00:01.548041+00:00  INFO honk_core::control::lifecycle: Control plane listening for TPROXY UDPv6 x4 on [::]:12345
+2026-10-24T07:00:01.550147+00:00  INFO honk_core::control::janitor: BPF janitor: started (tick=2s; conn-state sweep is watermark-driven)
+2026-10-24T07:00:01.556187+00:00  INFO honk_outbound::tls: TLS mode: tls (Chrome fingerprint=false)
+2026-10-24T07:00:01.562423+00:00  INFO honk_outbound::alive: HTTP health check enabled (url=http://cp.cloudflare.com, method=HEAD)
+2026-10-24T07:00:01.562443+00:00  INFO honk_core::control::lifecycle: UDP health check enabled (dns=8.8.8.8:53)
+2026-10-24T07:00:01.562445+00:00  INFO honk_core::control::lifecycle: Starting health check loop (interval=3600s, timeout=5s)
+2026-10-24T07:00:01.562454+00:00  INFO honk_core::control::drain: DrainTracker: accepting new connections again
+2026-10-24T07:00:01.562476+00:00  INFO honk_core::control::preconnect: Preconnect warmup started for 2 nodes (max 4 concurrent)
+2026-10-24T07:00:01.562589+00:00  WARN honk_core::control::runtime: LAN self-protection coverage could not be confirmed; review explicit direct(must) rules for management access, excluding port 53 if transparent DNS is intended; configured routing is unchanged lan_interfaces=["veth-lab"] local_addresses=["10.10.10.49/32", "192.0.2.55/32", "192.168.222.1/32", "240e:3b6:32b4:e50:2a0:98ff:fe04:2a4b/128", "fd00:abab::2a0:98ff:fe04:2a4b/128"]

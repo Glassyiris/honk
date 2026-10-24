@@ -317,9 +317,46 @@ streams open at absolute 250 ms deadlines.
 | anytls-sb | 9385 / 2.531 / 6.795 / 10.528 / 16.014 / 0/200 | 9385 / 2.506 / 8.376 / 13.721 / 15.919 / 0/200 | 9381 / 2.103 / 6.484 / 13.327 / 14.923 / 0/200 |
 | anytls-go | 9377 / 2.583 / 11.239 / 17.631 / 20.323 / 0/200 | 9374 / 2.294 / 9.874 / 14.512 / 15.940 / 0/200 | 9375 / 2.202 / 9.785 / 14.548 / 20.702 / 0/200 |
 
-honk records the lowest p99 on HY2, TUIC, Trojan and AnyTLS-SB, and the only
-failures in this pass belong to dae's Trojan route (2/200). sing-box's HY2 arm
-is the outlier: ~2 Gbps of pressure with a 31.5 ms p99 and a 104 ms maximum.
+In this single pass honk records the lowest p99 on HY2, TUIC, Trojan and
+AnyTLS-SB, and the only failures belong to dae's Trojan route (2/200).
+sing-box's HY2 arm is the outlier: ~2 Gbps of pressure with a 31.5 ms p99 and
+a 104 ms maximum. One- to three-millisecond p99 gaps at 200 samples are noise:
+p99 is the second-largest sample, and a repeat of the AnyTLS rows inverted
+both the hot and the p99 rankings (see below).
+
+#### Hot and tail variance
+
+The hot p50 columns are a single 15-request burst on a freshly restarted
+engine (one warmup), measured immediately after the previous row's 50 s
+stability load; p50 is the eighth sample. Re-running the same rows later
+flipped every small ranking:
+
+| Row (honk / dae) | Campaign | Repeat A | Repeat B |
+| --- | --- | --- | --- |
+| hot anytls-go | 1.95 / 1.31 ms | 1.18 / 1.50 ms | 1.50 / 1.30 ms |
+| hot anytls-sb | 1.83 / 1.73 ms | – | 1.36 / 1.35 ms |
+| hot tuic | 1.87 / 1.76 ms | – | 1.62 / 1.81 ms |
+| hot ss2022 | 2.16 / 1.97 ms | – | 1.39 / 1.49 ms |
+| loaded p99 anytls-go | 17.63 / 14.51 ms | 13.06 / 15.58 ms | 15.62 / 20.50 ms |
+| loaded p99 anytls-sb | 10.53 / 13.72 ms | – | 16.07 / 12.19 ms |
+| loaded p99 ss2022 | 10.65 / 9.81 ms | – | 13.64 / 16.31 ms |
+
+Repeat A is the AnyTLS-Go row and repeat B the four-row pass; both use the
+same harness, configs and binaries. A steady-state probe away from the
+harness (5 warmups, 30 samples, idle host) is within 0.05 ms of dae on every
+route and faster on TUIC/SS2022 (1.40 vs 1.62 ms, 1.50 vs 1.72 ms; AnyTLS-SB
+1.13 vs 1.08, AnyTLS-Go 1.03 vs 1.02). No engine-side mechanism explains the
+campaign's hot gap: the client-side connect is ~0.06 ms (eBPF intercept), an
+AnyTLS stream opens optimistically (SYN+PSH queued, no SYNACK wait), and one
+upstream AnyTLS session served 20 sequential requests (1 SYN for honk, 2 for
+dae). The p99 outliers are scattered in time rather than periodic, and honk
+and dae have comparable counts above 10 ms (12 vs 10 for AnyTLS-Go, 3 vs 2
+for SS2022).
+
+Treat these single-run hot and p99 deltas as observations, not rankings; a
+defensible ordering needs interleaved repetitions (as in the Juicity campaign)
+or many more samples. Probe scripts and both repeats are in
+[`latency-analysis/`](../bench/results/abc-2026-10-24-x86/latency-analysis/).
 
 ### REALITY pass: VLESS Vision / REALITY / VMess
 
@@ -384,8 +421,8 @@ failures, dae 2612 / 1.719 / 2.000 / 2.350 / 2.667 ms / 0 failures.
 - The new REALITY pass shows the widest engine separation: equal line-rate
   throughput, but honk needs ~0.4 cores and 42–43 MiB where dae needs
   0.44–0.48 cores and 58 MiB and sing-box 0.68–0.71 cores and 95–97 MiB.
-  honk is also the only engine with no loaded-latency failures and a p99
-  under 71 ms on both VLESS rows.
+  in that pass honk is also the only engine with no loaded-latency failures
+  and a p99 under 71 ms on both VLESS rows.
 - Juicity: honk leads dae by 5.2% TCP / 3.6% UDP at about half the cores.
 - Absolute numbers are same-host, same-fixture comparisons. Run-to-run
   variance on the shared lab is about ±5%; single-stream BBR/Hysteria2 rows

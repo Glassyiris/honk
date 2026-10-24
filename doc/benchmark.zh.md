@@ -279,9 +279,39 @@ AnyTLS-Go 上是 **0.49–0.50** 核；honk（0.40–0.44）与 sing-box（0.75�
 | anytls-sb | 9385 / 2.531 / 6.795 / 10.528 / 16.014 / 0/200 | 9385 / 2.506 / 8.376 / 13.721 / 15.919 / 0/200 | 9381 / 2.103 / 6.484 / 13.327 / 14.923 / 0/200 |
 | anytls-go | 9377 / 2.583 / 11.239 / 17.631 / 20.323 / 0/200 | 9374 / 2.294 / 9.874 / 14.512 / 15.940 / 0/200 | 9375 / 2.202 / 9.785 / 14.548 / 20.702 / 0/200 |
 
-honk 在 HY2、TUIC、Trojan 与 AnyTLS-SB 上给出最低 p99；本轮唯一的失败是
-dae 的 Trojan 路由（2/200）。sing-box 的 HY2 是离群点：约 2 Gbps 压力下
-p99 31.5 ms、max 104 ms。
+单轮结果里 honk 在 HY2、TUIC、Trojan 与 AnyTLS-SB 上给出最低 p99；唯一的
+失败是 dae 的 Trojan 路由（2/200）。sing-box 的 HY2 是离群点：约 2 Gbps 压力
+下 p99 31.5 ms、max 104 ms。200 样本下 1–3 ms 的 p99 差异属于噪声：p99 就是
+第二大的样本；AnyTLS 行重跑后 hot 与 p99 排名同时反转（见下）。
+
+#### hot 与 tail 的方差
+
+hot p50 列是刚重启引擎后的一次 15 请求突发（1 次预热），紧接上一行 50 秒
+稳定性负载；p50 是第 8 个样本。间隔一段时间重跑同一批行，所有小差距都反转：
+
+| 行（honk / dae） | 本轮 | 重跑 A | 重跑 B |
+| --- | --- | --- | --- |
+| hot anytls-go | 1.95 / 1.31 ms | 1.18 / 1.50 ms | 1.50 / 1.30 ms |
+| hot anytls-sb | 1.83 / 1.73 ms | – | 1.36 / 1.35 ms |
+| hot tuic | 1.87 / 1.76 ms | – | 1.62 / 1.81 ms |
+| hot ss2022 | 2.16 / 1.97 ms | – | 1.39 / 1.49 ms |
+| loaded p99 anytls-go | 17.63 / 14.51 ms | 13.06 / 15.58 ms | 15.62 / 20.50 ms |
+| loaded p99 anytls-sb | 10.53 / 13.72 ms | – | 16.07 / 12.19 ms |
+| loaded p99 ss2022 | 10.65 / 9.81 ms | – | 13.64 / 16.31 ms |
+
+重跑 A 是 AnyTLS-Go 单行，重跑 B 是四行批次；两者使用同一 harness、配置与
+binary。脱离 harness 的稳态探针（5 次预热、30 样本、空载主机）显示 honk 与
+dae 在每条路由上相差不超过 0.05 ms，TUIC/SS2022 上更快（1.40 对 1.62 ms、
+1.50 对 1.72 ms；AnyTLS-SB 1.13 对 1.08，AnyTLS-Go 1.03 对 1.02）。没有
+引擎侧机制能解释本轮的 hot 差距：client 侧 connect 约 0.06 ms（eBPF 拦截），
+AnyTLS stream 是乐观打开（SYN+PSH 入队，不等 SYNACK），20 个顺序请求共用
+一条上游 AnyTLS session（honk 1 个 SYN，dae 2 个）。p99 离群样本在时间上
+分散、不呈周期，honk 与 dae 的 >10 ms 样本数相当（AnyTLS-Go 12 对 10，
+SS2022 3 对 2）。
+
+这些单轮 hot/p99 差距只能当观察，不能当排名；可辩护的顺序需要交替重复
+（如 Juicity 轮）或显著更多样本。探针脚本与两次重跑证据在
+[`latency-analysis/`](../bench/results/abc-2026-10-24-x86/latency-analysis/)。
 
 ### REALITY 轮：VLESS Vision / REALITY / VMess
 
@@ -340,7 +370,7 @@ open 快 4.8 ms；RSS 50 对 61 MiB。loaded 稳定性相当：honk 2709 Mbps /
   传输窗口修正后进程 CPU 最低。sing-box 的 HY2 仍是其弱项。
 - 新的 REALITY 轮引擎差异最大：吞吐同为线速，但 honk 只需约 0.4 核与
   42–43 MiB，dae 为 0.44–0.48 核与 58 MiB，sing-box 为 0.68–0.71 核与
-  95–97 MiB。两条 VLESS 路由上 honk 也是唯一 0 失败且 p99 低于 71 ms 的
+  95–97 MiB。该轮中两条 VLESS 路由上 honk 也是唯一 0 失败且 p99 低于 71 ms 的
   引擎。
 - Juicity：honk 的 TCP 高 dae 5.2%、UDP 高 3.6%，核数约一半。
 - 绝对数字是同机同 fixture 对比。共享 lab 的轮间方差约 ±5%；单流

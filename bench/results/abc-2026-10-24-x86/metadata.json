@@ -192,7 +192,8 @@
     "honk VLESS/VMess UDP rows are n/a because lab-bench.sh's supports_udp predicate excludes them; this is a harness-coverage limit, not a capability statement.",
     "All three passes use the pinned harness and collector; the only driver delta against the 2026-10-11 archive is the stacked daens mount cleanup.",
     "Server-side error logs retain client-cancellation and cold-handshake noise from the smoke tests; the measured arms are clean.",
-    "AnyTLS CPU cells in the published 2026-10-24 tables are from the corrected re-measurement (anytls-cpu/); the campaign results.tsv keeps the original whole-command values as evidence of what first ran."
+    "AnyTLS CPU cells in the published 2026-10-24 tables are from the corrected re-measurement (anytls-cpu/); the campaign results.tsv keeps the original whole-command values as evidence of what first ran.",
+    "Hot p50 and loaded p99 cells are single-run observations, not rankings: two repeats of the AnyTLS rows inverted both rankings, and the steady-state probe shows no engine-side hot-path deficit. See latency-analysis/."
   ],
   "anytls_cpu_correction": {
     "problem": "the original harness divided process CPU by the whole iperf3 command wall; dae's AnyTLS client keeps the command open 18.02 s for an 8.00 s transfer",
@@ -219,5 +220,72 @@
     },
     "unaffected": "honk 8.05-8.10 s and sing-box 8.01-8.02 s command walls; dae 5201-5204 8.008-8.018 s",
     "supersedes": "the AnyTLS CPU cells in results.tsv, results-rprx.tsv (none) and results-juicity.tsv (none); results.tsv keeps the uncorrected cells as run evidence"
+  },
+  "latency_analysis": {
+    "reason": "the campaign hot p50 columns are a single 15-request burst on a fresh engine (1 warmup) and loaded p99 is the second-largest of 200 samples under load; repeats flip every small ranking",
+    "repeat_anytls_go": {
+      "window_utc": "2026-10-24T06:48:32Z..",
+      "hot_p50_ms": {
+        "honk": 1.179,
+        "dae": 1.5
+      },
+      "loaded_p99_ms": {
+        "honk": 13.06,
+        "dae": 15.58
+      },
+      "campaign": {
+        "hot_p50_ms": {
+          "honk": 1.95,
+          "dae": 1.313
+        },
+        "loaded_p99_ms": {
+          "honk": 17.63,
+          "dae": 14.51
+        }
+      }
+    },
+    "repeat_four_rows": {
+      "window_utc": "2026-10-24T06:56:21Z..",
+      "hot_p50_ms": {
+        "tuic": {
+          "honk": 1.624,
+          "dae": 1.812
+        },
+        "ss2022": {
+          "honk": 1.389,
+          "dae": 1.492
+        },
+        "anytls-sb": {
+          "honk": 1.362,
+          "dae": 1.346
+        },
+        "anytls-go": {
+          "honk": 1.495,
+          "dae": 1.296
+        }
+      },
+      "loaded_p99_ms": {
+        "tuic": {
+          "honk": 2.597,
+          "dae": 2.39
+        },
+        "ss2022": {
+          "honk": 13.638,
+          "dae": 16.312
+        },
+        "anytls-sb": {
+          "honk": 16.066,
+          "dae": 12.194
+        },
+        "anytls-go": {
+          "honk": 15.62,
+          "dae": 20.496
+        }
+      }
+    },
+    "steady_state_probe": "latency-analysis/steady: 5 warmups + 30 samples per route on an idle host; honk within 0.05 ms of dae everywhere and faster on TUIC (1.40 vs 1.62) and SS2022 (1.50 vs 1.72)",
+    "connection_reuse": "one upstream AnyTLS session served 20 sequential AnyTLS-Go requests (1 client SYN for honk, 2 for dae); stream open is optimistic (SYN+PSH, no SYNACK wait)",
+    "p99_shape": "outlier timestamps are scattered, not periodic; honk/dae >10 ms counts are 12/10 for AnyTLS-Go and 3/2 for SS2022",
+    "evidence": "latency-analysis/ (README, probe scripts, repeats, raw)"
   }
 }

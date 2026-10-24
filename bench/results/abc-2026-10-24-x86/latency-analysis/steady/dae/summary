@@ -1,0 +1,6 @@
+tuic udp_source_ports=0
+ss2022 upstream_syns=0
+trojan upstream_syns=0
+anytls-sb upstream_syns=0
+anytls-go upstream_syns=0
+hy2 udp_source_ports=0

@@ -1,0 +1,16 @@
+| engine | protocol | cold(s) | hot p50(s) | hot p95(s) | bw(Mbps) | cpu(cores) | rss(MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.002330 | - | - | 9403 | 0.00 | 54 |
+| honk | anytls-go | 0.002926 | 0.001179 | 0.002292 | 9379 | 0.42 | 56 |
+| honk | anytls-go/udp | 0.000158 | - | - | 1712(74.8%) | 0.59 | - |
+| dae | direct | 0.001624 | - | - | 9410 | 0.00 | 54 |
+| dae | anytls-go | 0.004645 | 0.001500 | 0.001842 | 9375 | 0.50 | 62 |
+| dae | anytls-go/udp | 0.000216 | - | - | 1737(74.3%) | 0.73 | - |
+
+## loaded latency stability (200 samples, 250ms cadence)
+| engine | protocol | load(Mbps) | p50(ms) | p95(ms) | p99(ms) | max(ms) | failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 9407 | 2.450 | 3.226 | 3.499 | 4.150 | 0/200 |
+| honk | anytls-go | 9368 | 2.437 | 9.941 | 13.059 | 15.308 | 0/200 |
+| dae | direct | 9410 | 2.568 | 3.508 | 3.795 | 4.168 | 0/200 |
+| dae | anytls-go | 9371 | 2.143 | 9.778 | 15.583 | 17.039 | 0/200 |
